@@ -9,7 +9,7 @@ An unofficial VR mod for Bloodborne.
 
 ## Supported game version
 
-Bloodborne for PS4, CUSA03173, version 1.09.
+Bloodborne for PS4, version 1.09. Tested with CUSA03173 and CUSA00900.
 
 ---
 
