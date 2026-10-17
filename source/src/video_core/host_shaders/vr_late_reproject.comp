@@ -1,0 +1,438 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// VR late warp (vr.ini late_warp), pass 1 of 2: the DIBR capture S re-seen from V, the head at this
+// XR frame's display time. Recorded by VrLateWarp (renderer_vulkan/vr_late_warp.cpp) on the frame
+// thread, every XR frame. V has S's intrinsics and V's orientation; pass 2 (vr_dibr_warp.comp built
+// with LATE_WARP) makes both eyes from V exactly as the game-rate warp does from S, every source
+// column looked up through this pass's map.
+// Math and the scan: renderer_vulkan/vr_late_warp_math.h (March is the CPU reference of main()).
+//   V pixel p is a ray; its point of source inverse depth r projects into S at q(r) = q0 + r g (a
+//   straight line, linear in r); the surface V sees is the nearest root of W(q(r)) = r, scanned
+//   from the near end down in half-pixel steps of the line:
+//   - W between texels: bilinear where the 2x2 texels are one surface (|dW| <= tau), else the
+//     nearest texel (flat footprints up to the edge, the 1D scan's half-pixel footprints);
+//   - a crossing on one surface: the root, linear between the two samples (exact on planes);
+//   - a crossing onto a nearer surface: its edge when the ray was in front of it there, else the
+//     ray is behind it (hidden from S) and the scan goes on until it leaves that surface again: in
+//     front of what follows (a ray passing behind a thin object) or behind it (a hole: what S never
+//     saw, filled with that surface's colour next to the edge);
+//   - a crossing onto a farther surface the ray is already behind at the edge: a hole too.
+//   The scanned range [r_lo, r_hi] is the min/max of W over the source tiles the workgroup's lines
+//   can reach (the prep pass's tiles, .ba), so the scan starts in front of everything.
+// late_warp_motion (cw.w = 1): the world also moved since S was drawn (the game camera walking
+// or turning, VrLate::MotionBetween): the world's texels are seen from V through S' (S moved with
+// the world: lc.rwv*, lc.cw), the hunter's own body texels (vr_late_classify.comp's signed 1/z)
+// through S as before. Two layered scans: the body layer (only body texels, the rest empty) on V's
+// line into S; where it hits nothing, the world layer on V's line into S' (a body texel is empty
+// space in front of the body's depth, where S saw through to the body, and an occluder behind it);
+// where that finds what S never saw (the world behind the hunter: a hole, or a ray behind the body
+// all along) the plain scan instead (that background as S saw it, not moved on). VrLate::March
+// (layered) is the CPU reference.
+// Outputs, per V pixel: the source position (texel coordinates, centres at integers; a hole adds
+// HOLE_OFFSET to x), V's disparity D (vr_dibr_prep.comp's: K * w through the knee, cap and snap; w
+// = V's inverse depth) and V's 16x16 tiles (min, max D): pass 2's inputs in place of the prep's.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D w_tex;    // S: 1/z (game units), 0 = sky
+layout(set = 0, binding = 1) uniform texture2D wtile_tex; // S: per 16x16 tile, .b = min, .a = max 1/z
+layout(set = 0, binding = 2, rg32f) uniform writeonly image2D q_img; // V -> S position
+layout(set = 0, binding = 3, rg32f) uniform writeonly image2D d_img; // V: D px, true 1/z for TAA
+layout(set = 0, binding = 4, rgba32f) uniform writeonly image2D t_img; // V: tiles (min, max D)
+layout(set = 0, binding = 5, std140) uniform LateConstants {
+    vec4 rsv0;    // V camera axes -> S camera axes (rows, xyz)
+    vec4 rsv1;
+    vec4 rsv2;
+    vec4 c;       // xyz: V's centre in S's camera frame (game units); w: tau (1/z edge)
+    vec4 intr;    // fx, fy, cx, cy: continuous pixels (texel i's centre at i + 0.5), S's and V's
+    ivec4 region; // V pixels computed: x0, y0 (multiples of 16), x1, y1 (exclusive)
+    ivec4 size;   // S's (and V's) width, height; S's tile grid width, height
+    vec4 disp;    // k_px, knee_px, floor_px, max_px (vr_dibr_prep.comp's constants)
+    vec4 misc;    // snap_px, r_cap (the largest 1/z: 1 / near), step_px, max_steps
+    vec4 rwv0;    // late_warp_motion: V camera axes -> S' camera axes (S moved with the world)
+    vec4 rwv1;
+    vec4 rwv2;
+    vec4 cw;      // xyz: V's centre in S'; w: bits 1 motion, 2 debug body, 4 body mask available
+} lc;
+layout(set = 0, binding = 6) uniform texture2D sw_tex; // S: signed 1/z (body < 0), motion or TAA
+layout(set = 0, binding = 7) uniform texture2D lt_tex; // S: per tile world min, max, body min, max
+
+const float HOLE_OFFSET = 1.0e6;
+const float OCCLUDER = 1.0e20; // VrLate::kOccluderW
+const int LAYER_PLAIN = 0;
+const int LAYER_BODY = 1;
+const int LAYER_WORLD = 2;
+const uint KIND_NONE = 0u;
+const uint KIND_SURFACE = 1u;
+const uint KIND_EDGE = 2u;
+const uint KIND_HOLE = 3u;
+
+shared uint s_wmin_bits; // 1/z >= 0: float bits order like uint
+shared uint s_wmax_bits;
+shared uint s_lmin_bits[2]; // late_warp_motion: the world [0] and body [1] layers' ranges
+shared uint s_lmax_bits[2];
+shared float s_min[256];
+shared float s_max[256];
+
+// vr_dibr_prep.comp's FinishDisparity of K * w.
+float Disparity(float w) {
+    if (!(w > 0.0)) {
+        return 0.0;
+    }
+    float D = lc.disp.x * w;
+    if (lc.disp.z > lc.disp.y && D > lc.disp.y) {
+        const float r = lc.disp.z - lc.disp.y;
+        D = lc.disp.y + r * tanh(min((D - lc.disp.y) / r, 10.0));
+    }
+    D = min(D, lc.disp.w);
+    return D < lc.misc.x ? 0.0 : D;
+}
+
+// A texel's 1/z in a layer for a ray at source inverse depth r: plain (S as drawn), body (the
+// world's texels empty: 0) or world (VrLate::WorldLayerW: a body texel is empty, 0, while the ray
+// is in front of the body there, an occluder behind it).
+float WAt(int x, int y, int layer, float r) {
+    const ivec2 t = ivec2(clamp(x, 0, lc.size.x - 1), clamp(y, 0, lc.size.y - 1));
+    if (layer == LAYER_PLAIN) {
+        return texelFetch(w_tex, t, 0).r;
+    }
+    const float v = texelFetch(sw_tex, t, 0).r;
+    if (layer == LAYER_BODY) {
+        return v < 0.0 ? -v : 0.0;
+    }
+    return v >= 0.0 ? v : (r > -v ? 0.0 : OCCLUDER);
+}
+
+// VrLate::SampleInverseDepth: continuous position q.
+float SampleW(vec2 q, int layer, float r) {
+    const vec2 t = q - 0.5;
+    const vec2 b = floor(t);
+    const vec2 f = t - b;
+    const ivec2 i = ivec2(b);
+    const float w00 = WAt(i.x, i.y, layer, r);
+    const float w10 = WAt(i.x + 1, i.y, layer, r);
+    const float w01 = WAt(i.x, i.y + 1, layer, r);
+    const float w11 = WAt(i.x + 1, i.y + 1, layer, r);
+    const float lo = min(min(w00, w10), min(w01, w11));
+    const float hi = max(max(w00, w10), max(w01, w11));
+    if (hi - lo <= lc.c.w) {
+        return mix(mix(w00, w10, f.x), mix(w01, w11, f.x), f.y);
+    }
+    return f.x < 0.5 ? (f.y < 0.5 ? w00 : w01) : (f.y < 0.5 ? w10 : w11);
+}
+
+struct Line {
+    vec2 q0;
+    vec2 g;
+    float dz;
+};
+
+// VrLate::LineFor: V's continuous pixel pc, into S (rows r0..r2, V's centre c) or S'.
+Line LineThrough(vec2 pc, vec3 r0, vec3 r1, vec3 r2, vec3 c) {
+    const vec3 dv = vec3((pc.x - lc.intr.z) / lc.intr.x, -(pc.y - lc.intr.w) / lc.intr.y, -1.0);
+    const vec3 d = vec3(dot(r0, dv), dot(r1, dv), dot(r2, dv));
+    Line line;
+    line.dz = -d.z;
+    const vec3 dn = vec3(d.xy / max(line.dz, 1e-3), -1.0);
+    const vec3 e = c + dn * c.z;
+    line.q0 = vec2(lc.intr.z + lc.intr.x * dn.x, lc.intr.w - lc.intr.y * dn.y);
+    line.g = vec2(lc.intr.x * e.x, -lc.intr.y * e.y);
+    return line;
+}
+
+Line LineFor(vec2 pc) {
+    return LineThrough(pc, lc.rsv0.xyz, lc.rsv1.xyz, lc.rsv2.xyz, lc.c.xyz);
+}
+
+Line WorldLineFor(vec2 pc) {
+    return LineThrough(pc, lc.rwv0.xyz, lc.rwv1.xyz, lc.rwv2.xyz, lc.cw.xyz);
+}
+
+struct Hit {
+    vec2 q;
+    float r;
+    uint kind;
+    bool occluded; // layered: behind the body from the first sample to the last
+};
+
+// VrLate::March: the nearest surface along `line` in [r_lo, r_hi] of one layer.
+Hit March(Line line, float r_lo, float r_hi, int layer) {
+    Hit h;
+    h.q = vec2(0.0);
+    h.r = 0.0;
+    h.kind = KIND_NONE;
+    h.occluded = false;
+    const float tau = lc.c.w;
+    const float glen = length(line.g);
+    const bool layered = layer != LAYER_PLAIN;
+    if (!layered && glen * (r_hi - r_lo) <= 0.25) {
+        // No measurable parallax (the head only turned): the rotation-only point, refined once
+        // at its surface's depth.
+        const float r0 = SampleW(line.q0 + (0.5 * (r_lo + r_hi)) * line.g, layer, 0.0);
+        h.q = line.q0 + r0 * line.g;
+        h.r = SampleW(h.q, layer, 0.0);
+        h.kind = KIND_SURFACE;
+        return h;
+    }
+    const float dr = max(lc.misc.z / glen, (r_hi - r_lo) / lc.misc.w);
+    bool hidden = false;
+    bool has_bg = true; // false: hidden from the first sample (layered)
+    vec2 bg_q = vec2(0.0);
+    float bg_r = 0.0;
+    float pr = 0.0;
+    vec2 pq = vec2(0.0);
+    float ps = 0.0;
+    float r = r_hi;
+    for (int n = 0; n < 4096; ++n) {
+        const vec2 q = line.q0 + r * line.g;
+        const float s = SampleW(q, layer, r);
+        const float delta = r - s;
+        if (n == 0 && layered && s >= 0.5 * OCCLUDER) {
+            hidden = true; // behind the hunter's body from the start
+            has_bg = false;
+        }
+        if (n > 0) {
+            const bool jump = abs(s - ps) > tau;
+            const float rb = 0.5 * (r + pr); // an edge lies between the two samples
+            const vec2 qb = 0.5 * (q + pq);
+            // The crossing of depth s beyond the edge: from (qb, rb) to (q, r).
+            const float tb = rb > r ? clamp((rb - s) / (rb - r), 0.0, 1.0) : 1.0;
+            if (!hidden) {
+                const float pd = pr - ps;
+                if (pd <= 0.0) {
+                    // Behind a surface from the start (the range missed it): that surface.
+                    h.q = pq;
+                    h.r = ps;
+                    h.kind = KIND_SURFACE;
+                    return h;
+                }
+                if (delta <= 0.0) {
+                    if (!jump) {
+                        const float t = pd / (pd - delta);
+                        h.q = mix(pq, q, t);
+                        h.r = mix(ps, s, t);
+                        h.kind = KIND_SURFACE;
+                        return h;
+                    }
+                    if (s > ps) {
+                        if (rb >= s) {
+                            h.q = mix(qb, q, tb);
+                            h.r = s;
+                            h.kind = KIND_EDGE;
+                            return h;
+                        }
+                        hidden = true;
+                        has_bg = ps > 0.0 || !layered; // not from a body texel's empty space
+                        bg_q = pq;
+                        bg_r = ps;
+                    } else {
+                        if (rb >= s) {
+                            h.q = mix(qb, q, tb);
+                            h.kind = KIND_SURFACE;
+                        } else {
+                            h.q = q;
+                            h.kind = KIND_HOLE;
+                        }
+                        h.r = s;
+                        return h;
+                    }
+                }
+            } else if (jump && s < ps) {
+                if (rb > s) {
+                    hidden = false; // out from behind it, in front of what follows
+                    if (delta <= 0.0) {
+                        h.q = mix(qb, q, tb);
+                        h.r = s;
+                        h.kind = KIND_SURFACE;
+                        return h;
+                    }
+                } else {
+                    h.q = q;
+                    h.r = s;
+                    h.kind = KIND_HOLE;
+                    return h;
+                }
+            } else if (!jump && delta > 0.0) {
+                hidden = false; // through the surface from behind it (a back face)
+            }
+        }
+        pr = r;
+        pq = q;
+        ps = s;
+        if (r <= r_lo) {
+            break;
+        }
+        r = max(r - dr, r_lo);
+    }
+    if (hidden && has_bg) {
+        h.q = bg_q;
+        h.r = bg_r;
+        h.kind = KIND_HOLE;
+    } else if (hidden) {
+        h.q = pq;
+        h.r = 0.0;
+        h.occluded = true;
+    } else {
+        h.q = pq;
+        h.r = ps;
+    }
+    return h;
+}
+
+// A layer's scanned range from its gathered tile bounds (float bits); false: no texel of it.
+bool LayerRange(uint lo_bits, uint hi_bits, out float r_lo, out float r_hi) {
+    const float lo = uintBitsToFloat(lo_bits);
+    const float hi = uintBitsToFloat(hi_bits);
+    r_lo = max(lo * 0.99 - 1e-4, 0.0);
+    r_hi = max(hi * 1.01 + 1e-4, r_lo);
+    return lo <= hi;
+}
+
+void main() {
+    const ivec2 base = ivec2(gl_WorkGroupID.xy) * 16 + lc.region.xy;
+    const ivec2 p = base + ivec2(gl_LocalInvocationID.xy);
+    const uint li = gl_LocalInvocationIndex;
+
+    // ---- 1. the range of 1/z the workgroup's lines can meet: the tiles their segments cross ----
+    const int flags = int(lc.cw.w);
+    const bool motion = (flags & 1) != 0;
+    if (li == 0u) {
+        s_wmin_bits = floatBitsToUint(3.0e38);
+        s_wmax_bits = 0u;
+        for (int k = 0; k < 2; ++k) {
+            s_lmin_bits[k] = floatBitsToUint(3.0e38);
+            s_lmax_bits[k] = 0u;
+        }
+    }
+    barrier();
+    {
+        vec2 lo = vec2(1.0e30);
+        vec2 hi = vec2(-1.0e30);
+        for (int k = 0; k < 4; ++k) {
+            const vec2 corner = vec2(base + ivec2((k & 1) * 16, (k >> 1) * 16));
+            const Line l = LineFor(corner);
+            const vec2 a = l.q0;
+            const vec2 b = l.q0 + lc.misc.y * l.g;
+            lo = min(lo, min(a, b));
+            hi = max(hi, max(a, b));
+            if (motion) {
+                const Line m = WorldLineFor(corner);
+                const vec2 ma = m.q0;
+                const vec2 mb = m.q0 + lc.misc.y * m.g;
+                lo = min(lo, min(ma, mb));
+                hi = max(hi, max(ma, mb));
+            }
+        }
+        // 3 px: the 2x2 footprint and the lines' curvature across the tile.
+        const ivec2 t0 = clamp(ivec2(floor(lo - 3.0)), ivec2(0), lc.size.xy - 1) / 16;
+        const ivec2 t1 = clamp(ivec2(ceil(hi + 3.0)), ivec2(0), lc.size.xy - 1) / 16;
+        const int ntx = t1.x - t0.x + 1;
+        const int ntiles = ntx * (t1.y - t0.y + 1);
+        for (int i = int(li); i < ntiles; i += 256) {
+            const ivec2 tile = ivec2(t0.x + i % ntx, t0.y + i / ntx);
+            const vec2 mm = texelFetch(wtile_tex, tile, 0).ba;
+            atomicMin(s_wmin_bits, floatBitsToUint(max(mm.x, 0.0)));
+            atomicMax(s_wmax_bits, floatBitsToUint(max(mm.y, 0.0)));
+            if (motion) {
+                const vec4 layers = texelFetch(lt_tex, tile, 0);
+                atomicMin(s_lmin_bits[0], floatBitsToUint(max(layers.x, 0.0)));
+                atomicMax(s_lmax_bits[0], floatBitsToUint(max(layers.y, 0.0)));
+                atomicMin(s_lmin_bits[1], floatBitsToUint(max(layers.z, 0.0)));
+                atomicMax(s_lmax_bits[1], floatBitsToUint(max(layers.w, 0.0)));
+            }
+        }
+    }
+    barrier();
+    const float r_lo = max(uintBitsToFloat(s_wmin_bits) * 0.99 - 1e-4, 0.0);
+    const float r_hi = max(uintBitsToFloat(s_wmax_bits) * 1.01 + 1e-4, r_lo);
+
+    // ---- 2. the scan (VrLate::March) ----
+    const bool inside = all(lessThan(p, min(lc.region.zw, lc.size.xy)));
+    vec2 hit_q = vec2(0.0);
+    float hit_r = 0.0;
+    uint kind = KIND_NONE;
+    float D = 0.0;
+    if (inside) {
+        const vec2 pc = vec2(p) + 0.5;
+        const Line line = LineFor(pc);
+        Line used = line; // the line of the hit (V's inverse depth from it)
+        vec3 used_c = lc.c.xyz;
+        bool done = false;
+        bool body_hit = false;
+        if (motion) {
+            float lo_b, hi_b, lo_w, hi_w;
+            if (LayerRange(s_lmin_bits[1], s_lmax_bits[1], lo_b, hi_b)) {
+                // The hunter's own body, where it was (it moves with the head, not the world).
+                const Hit hb = March(line, lo_b, hi_b, LAYER_BODY);
+                if (hb.kind == KIND_SURFACE || hb.kind == KIND_EDGE) {
+                    hit_q = hb.q;
+                    hit_r = hb.r;
+                    kind = hb.kind;
+                    done = true;
+                    body_hit = true;
+                }
+            }
+            if (!done && LayerRange(s_lmin_bits[0], s_lmax_bits[0], lo_w, hi_w)) {
+                // The world, moved on with the game camera.
+                const Line wl = WorldLineFor(pc);
+                const Hit hw = March(wl, lo_w, hi_w, LAYER_WORLD);
+                // What S never saw (behind the hunter's body) is shown as the plain warp shows
+                // it (that background where it was) rather than filled: no streaks.
+                if (!hw.occluded && hw.kind != KIND_HOLE) {
+                    hit_q = hw.q;
+                    hit_r = hw.r;
+                    kind = hw.kind;
+                    used = wl;
+                    used_c = lc.cw.xyz;
+                    done = true;
+                }
+            }
+        }
+        if (!done) {
+            const Hit h = March(line, r_lo, r_hi, LAYER_PLAIN);
+            hit_q = h.q;
+            hit_r = h.r;
+            kind = h.kind;
+        }
+        if (!(used.dz > 1e-3)) {
+            hit_r = 0.0; // the ray points behind S: the border's colour, at infinity
+        }
+        const float w = hit_r * used.dz / max(1.0 + hit_r * used_c.z, 1e-3);
+        D = Disparity(w);
+        vec2 qt = hit_q - 0.5; // texel coordinates
+        if (kind == KIND_HOLE || (body_hit && (flags & 2) != 0)) {
+            qt.x += HOLE_OFFSET;
+        }
+        imageStore(q_img, p, vec4(qt, 0.0, 0.0));
+        // eye_taa_follow (.g, vr_dibr_warp.comp StoreEyeW; vr_eye_taa_math.h DecodeEyeW): the
+        // DISPLAYED view's 1/z, not S's. A surface the scan found: w. The hunter's body (it moves
+        // with the head, not the world; classified only while the world moves: no history then)
+        // or nothing in front of S: -1. A late-warp hole or the plain fallback while the world
+        // moved (invented, or where it was): -(w + 2), colour-clamped history only.
+        const ivec2 st = clamp(ivec2(floor(hit_q)), ivec2(0), lc.size.xy - 1);
+        const bool body = body_hit || ((flags & 4) != 0 && texelFetch(sw_tex, st, 0).r < 0.0);
+        float view_w = -1.0;
+        if (kind != KIND_NONE && !body && used.dz > 1e-3) {
+            const bool reliable = (kind == KIND_SURFACE || kind == KIND_EDGE) && (!motion || done);
+            view_w = reliable ? w : -(w + 2.0);
+        }
+        imageStore(d_img, p, vec4(D, view_w, 0.0, 0.0));
+    }
+
+    // ---- 3. V's tiles (min, max D), as the prep pass's ----
+    s_min[li] = inside ? D : 3.0e38;
+    s_max[li] = inside ? D : 0.0;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (li < stride) {
+            s_min[li] = min(s_min[li], s_min[li + stride]);
+            s_max[li] = max(s_max[li], s_max[li + stride]);
+        }
+        barrier();
+    }
+    if (li == 0u) {
+        imageStore(t_img, base / 16, vec4(s_min[0], s_max[0], 0.0, 0.0));
+    }
+}

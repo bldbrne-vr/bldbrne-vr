@@ -1,0 +1,327 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// VR eye upscale and sharpen (vr.ini eye_upscale / eye_sharpen; renderer_vulkan/vr_eye_upscale.cpp).
+// The DIBR and late-warp eyes have the render's own pixels (about 9 - 12 px per degree at the
+// centre); the compositor used to stretch them bilinearly onto the headset's ~25 px per degree.
+// Here each eye is enlarged once with a sharp edge-adaptive filter instead (AMD FidelityFX Super
+// Resolution 1: EASU, an edge-directed Lanczos-2), optionally followed by FSR 1's robust
+// contrast-adaptive sharpening (RCAS), so the compositor's own resample is nearly 1:1. Nothing is
+// invented: the detail is the render's.
+//   VR_EASU: in_tex = one eye at the render's pixels (its own image, so the clamped fetches stop
+//            the kernel at that eye's edge) -> out_img's rect pc.dst.
+//   VR_RCAS: in_tex = the image holding the eye at pc.src (clamped to that rect) -> out_img's rect
+//            pc.dst (the same size).
+// Both work on the stored bytes: the eyes hold sRGB-encoded values (perceptual space, what FSR 1
+// expects), in R8G8B8A8 storage images that may hold B8G8R8A8 bytes (the luma weights of both
+// filters treat R and B alike, so the order does not matter). Alpha is written 1.
+//   VR_VIGNETTE (with either): this dispatch writes the eye last (the late warp, vr.ini
+//            vignette_in_warp): the frame's vignettes are blended into it on the way out
+//            (renderer_vulkan/vr_vignette_warp.h, mirrored line by line below).
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(push_constant) uniform UpscalePush {
+    uvec4 con0; // EASU: FsrEasuCon's four constants; RCAS: con0 = FsrRcasCon's
+    uvec4 con1;
+    uvec4 con2;
+    uvec4 con3;
+    ivec4 dst; // output rect in out_img: x, y, w, h
+    ivec4 src; // VR_RCAS: the input rect in in_tex: x, y, w, h (reads are clamped to it)
+    uvec4 vig; // VR_VIGNETTE: x = the eye (0 left, 1 right)
+    vec4 color;
+} pc;
+
+#include "vr_color.glsl"
+
+layout(constant_id = 1) const bool OutputAdjustmentEnabled = true;
+
+vec3 VgSrgbToLinear(vec3 c) {
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), greaterThan(c, vec3(0.04045)));
+}
+vec3 VgLinearToSrgb(vec3 c) {
+    return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055,
+               greaterThan(c, vec3(0.0031308)));
+}
+
+bool OutputAdjustmentActive() {
+    return OutputAdjustmentEnabled &&
+           (VrColorActive(pc.color) || uintBitsToFloat(pc.vig.y) != 1.0);
+}
+
+vec3 OutputLinear(vec3 stored) {
+    vec3 color = VgSrgbToLinear(clamp(stored, 0.0, 1.0));
+    if (VrColorActive(pc.color)) {
+        if (pc.color.w != 0.0) color = color.bgr;
+        color = VrColorGrade(color, pc.color);
+        if (pc.color.w != 0.0) color = color.bgr;
+    }
+    return color;
+}
+
+vec3 EncodeOutput(vec3 color) {
+    const float gamma = uintBitsToFloat(pc.vig.y);
+    color = clamp(color, 0.0, 1.0);
+    const vec3 lo = 12.92 * color / gamma;
+    const vec3 hi = 1.055 * pow(color, vec3(1.0 / (2.4 + 1.0 - gamma))) - 0.055;
+    return clamp(mix(hi, lo, lessThan(color, vec3(0.0031308))), 0.0, 1.0);
+}
+
+vec3 ApplyOutputAdjustment(vec3 stored) {
+    return OutputAdjustmentActive() ? EncodeOutput(OutputLinear(stored)) : stored;
+}
+
+#define A_GPU 1
+#define A_GLSL 1
+
+#include "fsr/ffx_a.h"
+
+layout(set = 0, binding = 0) uniform texture2D in_tex;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D out_img;
+
+#ifdef VR_EASU
+#define FSR_EASU_F 1
+// textureGather's 2x2 footprint at normalized `p` (i0j1, i1j1, i1j0, i0j0), channel `c`, with
+// texel fetches clamped to the image (no sampler: the eye's own image, so its edge is the clamp).
+// EASU only gathers at texel corners, so the footprint is exact.
+AF4 Gather(AF2 p, int c) {
+    const ivec2 size = textureSize(in_tex, 0);
+    const ivec2 i = ivec2(floor(p * vec2(size) - 0.5));
+    const ivec2 hi = size - 1;
+    return AF4(texelFetch(in_tex, clamp(i + ivec2(0, 1), ivec2(0), hi), 0)[c],
+               texelFetch(in_tex, clamp(i + ivec2(1, 1), ivec2(0), hi), 0)[c],
+               texelFetch(in_tex, clamp(i + ivec2(1, 0), ivec2(0), hi), 0)[c],
+               texelFetch(in_tex, clamp(i, ivec2(0), hi), 0)[c]);
+}
+AF4 FsrEasuRF(AF2 p) {
+    return Gather(p, 0);
+}
+AF4 FsrEasuGF(AF2 p) {
+    return Gather(p, 1);
+}
+AF4 FsrEasuBF(AF2 p) {
+    return Gather(p, 2);
+}
+#endif
+
+#ifdef VR_RCAS
+#define FSR_RCAS_F 1
+AF4 FsrRcasLoadF(ASU2 p) {
+    const ivec2 q = clamp(ivec2(p), pc.src.xy, pc.src.xy + pc.src.zw - 1);
+    return texelFetch(in_tex, q, 0);
+}
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+#endif
+
+#include "fsr/ffx_fsr1.h"
+
+#ifdef VR_VIGNETTE
+layout(set = 0, binding = 2, std140) uniform VignetteData {
+    uvec4 vg_head;      // x = the count, y = 1: the eyes hold B8G8R8A8 bytes
+    vec4 vg_field;      // what the headset shows: degrees left, right, up, down (0: unknown)
+    vec4 vg_eye_rot[6]; // eye e: the columns 3e .. 3e + 2 of its rotation (eye -> local space)
+    vec4 vg_eye_pos[2]; // in local space
+    vec4 vg_tan[2];     // tan of angleLeft, angleRight, angleUp, angleDown
+    vec4 vg_item[42];   // 7 per vignette: axis x, y, z (normal), origin (w = distance), colour
+                        // (linear rgb, a = opacity), params (x, y, z power, w mode), wedge
+};
+
+// The ring mesh's profile (aux.y) at a ring angle (VrOverlay::BuildMesh(MeshId::Vignette)).
+float VgRingProfile(float a) {
+    const float t = clamp((a - 26.0) / (56.0 - 26.0), 0.0, 1.0);
+    const float s = t * t * (3.0 - 2.0 * t);
+    return s * s;
+}
+
+// The mesh's aux (angle in degrees, profile) as rasterised at plane radius r (its rings every 3
+// degrees from 26 to 59, then 66, 75, 85; linear in r between two rings); false off the mesh.
+// The ring pair from r's angle: no table (a dynamically indexed constant array is kept per
+// invocation).
+bool VgSampleRing(float r, out float angle, out float profile) {
+    angle = 0.0;
+    profile = 0.0;
+    if (!(r >= tan(radians(26.0)) * 0.99999) || r > tan(radians(85.0)) * 1.00001) {
+        return false;
+    }
+    const float a = degrees(atan(r));
+    float lo;
+    float hi;
+    if (a < 59.0) {
+        lo = 26.0 + 3.0 * floor(max(a - 26.0, 0.0) / 3.0);
+        hi = lo + 3.0;
+    } else if (a < 66.0) {
+        lo = 59.0;
+        hi = 66.0;
+    } else if (a < 75.0) {
+        lo = 66.0;
+        hi = 75.0;
+    } else {
+        lo = 75.0;
+        hi = 85.0;
+    }
+    const float ra = tan(radians(lo));
+    const float rb = tan(radians(hi));
+    const float f = clamp((r - ra) / (rb - ra), 0.0, 1.0);
+    angle = lo + (hi - lo) * f;
+    const float pa = VgRingProfile(lo);
+    profile = pa + (VgRingProfile(hi) - pa) * f;
+    return true;
+}
+
+// vr_overlay.frag's ShadeVignette at plane coordinates t of vignette i.
+float VgAlpha(uint i, vec2 t) {
+    const vec4 color = vg_item[7u * i + 4u];
+    const vec4 params = vg_item[7u * i + 5u];
+    const vec4 wedge_p = vg_item[7u * i + 6u];
+    const float r = length(t);
+    float angle;
+    float ring;
+    if (!VgSampleRing(r, angle, ring)) {
+        return 0.0;
+    }
+    float profile = clamp(ring, 0.0, 1.0);
+    const int vmode = int(params.w + 0.5);
+    if (vmode != 0) {
+        if (vmode == 3) {
+            const vec4 f = vg_field.x > 1.0 ? vg_field : vec4(54.0, 54.0, 44.0, 55.0);
+            const vec2 ang = degrees(atan(t));
+            const vec2 q = vec2(ang.x / max(ang.x < 0.0 ? f.x : f.y, 1.0),
+                                ang.y / max(ang.y > 0.0 ? f.z : f.w, 1.0));
+            profile = smoothstep(params.x, params.y, length(q));
+        } else if (vmode == 1) {
+            const float s = smoothstep(params.x, params.y, angle);
+            profile = s * s;
+        } else {
+            profile = smoothstep(params.x - 3.0, params.x + 1.0, angle) *
+                      (1.0 - smoothstep(params.y - 1.0, params.y + 3.0, angle));
+        }
+    }
+    if (params.z != 1.0) {
+        profile = pow(profile, max(params.z, 0.01));
+    }
+    if (wedge_p.w > 0.0) {
+        const float c = r > 1e-6 ? dot(t / r, wedge_p.xy) : 0.0;
+        const float wedge = pow(max(0.5 + 0.5 * c, 0.0), max(wedge_p.z, 0.01));
+        profile *= (1.0 - wedge_p.w) + wedge_p.w * wedge;
+    }
+    return color.a * profile;
+}
+
+// The eye pixel `pos` of this dispatch's rect (stored sRGB bytes, the eyes' order): each vignette
+// over it in order, in linear light, where the pixel's ray meets its plane.
+vec3 ApplyVignettes(vec3 stored, AU2 pos) {
+    const uint count = min(vg_head.x, 6u);
+    const float health = clamp(uintBitsToFloat(vg_head.z), 0.0, 0.45);
+    const float desaturation = clamp(uintBitsToFloat(vg_head.w), 0.0, 0.75);
+    const bool adjusting = OutputAdjustmentActive();
+    if (count == 0u && health <= 0.0001 && desaturation <= 0.0001 && !adjusting) {
+        return stored;
+    }
+    const uint eye = min(pc.vig.x, 1u);
+    const vec2 uv = (vec2(pos) + 0.5) / vec2(pc.dst.zw);
+    const vec4 tn = vg_tan[eye];
+    const vec3 d_eye = vec3(mix(tn.x, tn.y, uv.x), mix(tn.z, tn.w, uv.y), -1.0);
+    const mat3 rot = mat3(vg_eye_rot[3u * eye].xyz, vg_eye_rot[3u * eye + 1u].xyz,
+                          vg_eye_rot[3u * eye + 2u].xyz);
+    const vec3 d = rot * d_eye;
+    const vec3 p = vg_eye_pos[eye].xyz;
+    // Decoded at the first vignette that reaches the pixel: one none reaches (the clear middle)
+    // is left as it was.
+    vec3 c = stored;
+    bool decoded = false;
+    if (adjusting) {
+        c = OutputLinear(stored);
+        if (uintBitsToFloat(pc.vig.y) != 1.0) {
+            const vec3 encoded = EncodeOutput(c);
+            if (count == 0u && health <= 0.0001 && desaturation <= 0.0001) {
+                return encoded;
+            }
+            c = VgSrgbToLinear(encoded);
+        }
+        decoded = true;
+    }
+    if (health > 0.0001 || desaturation > 0.0001) {
+        if (!decoded) c = VgSrgbToLinear(stored);
+        if (vg_head.y != 0u) c = c.bgr;
+        const float gray = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        c = mix(c, vec3(gray), desaturation);
+        c *= 1.0 - 0.3 * desaturation; // out of stamina: drained and dimmer (vital_color.h)
+        const float edge = smoothstep(0.30, 1.00, length(uv * 2.0 - 1.0));
+        c = mix(c, vec3(0.16, 0.008, 0.012), health * edge * edge);
+        if (vg_head.y != 0u) c = c.bgr;
+        decoded = true;
+    }
+    for (uint i = 0u; i < count; ++i) {
+        const vec3 ax = vg_item[7u * i].xyz;
+        const vec3 ay = vg_item[7u * i + 1u].xyz;
+        const vec3 az = vg_item[7u * i + 2u].xyz;
+        const vec4 origin = vg_item[7u * i + 3u];
+        const float denom = dot(az, d);
+        const vec3 rel_p = p - origin.xyz;
+        if (abs(denom) < 1e-8) {
+            continue;
+        }
+        const float s = -dot(az, rel_p) / denom;
+        if (!(s > 0.0)) {
+            continue;
+        }
+        const vec3 q = rel_p + s * d;
+        const vec2 t = vec2(dot(ax, q), dot(ay, q)) / origin.w;
+        const float a = clamp(VgAlpha(i, t), 0.0, 1.0);
+        if (!(a > 0.0)) {
+            continue;
+        }
+        if (!decoded) {
+            c = VgSrgbToLinear(stored);
+            decoded = true;
+        }
+        vec3 col = vg_item[7u * i + 4u].rgb;
+        if (vg_head.y != 0u) {
+            col = col.bgr;
+        }
+        c = c + (col - c) * a;
+    }
+    return decoded ? clamp(VgLinearToSrgb(c), 0.0, 1.0) : stored;
+}
+#endif
+
+void Filter(AU2 pos) {
+    if (pos.x >= uint(pc.dst.z) || pos.y >= uint(pc.dst.w)) {
+        return;
+    }
+    AF3 c = AF3(0.0);
+    if (pc.src.z < 0) { // VR_UPSCALE_DEBUG=1: a solid fill (are the writes landing?)
+        imageStore(out_img, ivec2(pos) + pc.dst.xy, vec4(1.0, 0.0, 1.0, 1.0));
+        return;
+    }
+#ifdef VR_EASU
+    FsrEasuF(c, pos, pc.con0, pc.con1, pc.con2, pc.con3);
+#endif
+#ifdef VR_RCAS
+    if (pc.con0.x == 0u) {
+        c = FsrRcasLoadF(ASU2(ivec2(pos) + pc.src.xy)).rgb;
+    } else {
+        FsrRcasF(c.r, c.g, c.b, AU2(ivec2(pos) + pc.src.xy), pc.con0);
+    }
+#endif
+#ifdef VR_VIGNETTE
+    c = ApplyVignettes(clamp(c, 0.0, 1.0), pos);
+#else
+    c = ApplyOutputAdjustment(c);
+#endif
+    imageStore(out_img, ivec2(pos) + pc.dst.xy, vec4(clamp(c, 0.0, 1.0), 1.0));
+}
+
+layout(local_size_x = 64) in;
+void main() {
+    // FSR 1's dispatch: each 64-thread group does a 16x16 tile, 4 pixels per thread.
+    AU2 gxy = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
+    Filter(gxy);
+    gxy.x += 8u;
+    Filter(gxy);
+    gxy.y += 8u;
+    Filter(gxy);
+    gxy.x -= 8u;
+    Filter(gxy);
+}

@@ -1,0 +1,19 @@
+Beast Cutter recall audio
+
+The source recording is CC0 1.0 (public-domain dedication).
+https://creativecommons.org/publicdomain/zero/1.0/
+License/source pages checked 2026-10-12. No attribution is required; credit retained here.
+
+beast_chain_clink.pcm:
+  DenisChardonnet, "Medium chain #2", BigSoundBank sound 0361
+  https://bigsoundbank.com/chaine-moyenne-2-s0361.html
+  https://bigsoundbank.com/UPLOAD/bwf-en/0361.wav
+  Excerpt 0.275-0.405 seconds; mono, filtered, DC removed, 2 ms attack/30 ms tail fades,
+  RMS normalization with -3 dBFS sample peak ceiling; 24 kHz S16LE.
+
+Rebuild with scripts/prepare_whip_audio.py and the original download.
+The preparation script checks true peaks at 192 kHz. At runtime the clink loops back
+to back while the chain reels in (0.48, scaled by recall speed; 5 ms on/12 ms off), and
+closes the reel until the game's own close sound has been decoded from the player's
+files (core/vr/game_sounds.h). Constant-power stereo pan, then the emulator/game output
+volume. This small excerpt is embedded in the executable; no extra runtime download or audio device.

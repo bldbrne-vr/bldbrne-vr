@@ -1,0 +1,57 @@
+# Build products and local configuration
+[Bb]uild/
+build-*/
+cmake-build-*/
+out/
+.vs/
+.vscode/
+.idea/
+CMakeUserPresets.json
+compile_commands.json
+*.user
+*.suo
+*.obj
+*.o
+*.pch
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.[dD][lL][lL]
+*.dll.a
+*.exe
+*.log
+*.stackdump
+__pycache__/
+*.pyc
+node_modules/
+.env
+.env.*
+
+# DLL module, ABI headers, host adapters and boundary-test code (kept locally)
+/source/src/physical_interactions/
+/source/src/core/vr/*interaction*
+/source/tests/*interaction*
+/source/tests/*dll*
+/source/tests/*DLL*
+
+# Local developer material and game/user data
+/scratchpad/
+/.claude/
+/.codex/
+/.agents/
+/ROM/
+/user/
+/vr_cache/
+/runtime/
+dump_f*_i*.bin
+mem_*.bin
+/source/src/common/scm_rev.cpp
+**/.DS_Store
+
+# Keep nested project builds and local data out of the public repository
+/source/scratchpad/
+/source/ROM/
+/source/user/
+/source/vr_cache/
+/source/runtime/

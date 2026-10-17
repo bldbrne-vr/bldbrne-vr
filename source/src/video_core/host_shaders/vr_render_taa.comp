@@ -1,0 +1,341 @@
+// SPDX-FileCopyrightText: 2021 Advanced Micro Devices, Inc. (the RCAS formula of FSR 1)
+// SPDX-FileCopyrightText: MJP (Matt Pettineo) (SampleTextureCatmullRom)
+// SPDX-License-Identifier: GPL-2.0-or-later AND MIT
+
+// aa_mode=taa: temporal anti-aliasing in the game frame (renderer_vulkan/vr_render_taa.h; the
+// maths and its CPU mirror: core/vr/render_taa.h). Runs in place of the game's FXAA draw: B (the
+// game's copy of the tonemapped scene, rendered with this frame's sub-pixel jitter) -> A (what the
+// composite, the glow, our DIBR capture and the eyes read), in the UNJITTERED pixel grid.
+//
+// Per output pixel p (centre p + 0.5):
+//  1. The current frame's 3x3: tap q holds the scene at q + 0.5 - jitter, filtered at p + 0.5
+//     (a Gaussian of taa_filter_px sigma, flags bits 5..7), with its YCoCg mean and sigma.
+//  2. Reprojection: the 3x3's nearest depth (so a moving edge brings its silhouette), the view
+//     point through this frame's projection, into the previous render camera (M, t: exact for the
+//     static world), the previous pixel. Off-screen or no history: the current frame alone.
+//  3. The history there (Catmull-Rom, 5 bilinear taps) and its count n (alpha channel).
+//  4. Disocclusion: the previous stable depth nearer than the point's expected depth in the
+//     previous view by more than depth_reject all over its 2x2 (the farthest of the four): n = 0.
+//     4b (taa_occluder): the other way round, the whole 2x2 farther than all of the 3x3: n = 0.
+//  5. The history clipped to the current YCoCg mean +- gamma sigma (toward the mean); far off
+//     (> 2x): n halved. Blend alpha = max(1 / (n + 1), alpha_min), luma-weighted by
+//     1 / (1 + taa_luma_weight luma) (anti-flicker; 0 = plain, glints keep their energy);
+//     in the near field (taa_near_m: the weapon and hands, no motion vectors) at least
+//     taa_near_alpha, its current frame filtered at least 0.45 px wide, and no sharpening.
+//  6. Writes A (with B's own alpha), the history (rgb, n + 1 capped at 1 / alpha_min) and the
+//     stable depth for the DIBR (the 3x3 depth tap nearest the previous stable depth; on flat
+//     surfaces or without a history the tap nearest the unjittered centre).
+// The HUD is drawn after this pass (after the composite marker): it never enters the history.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D cur_tex;   // B as R8G8B8A8_UNORM
+layout(set = 0, binding = 1) uniform texture2D depth_tex; // the game's depth (depth aspect)
+layout(set = 0, binding = 2) uniform sampler2D hist_tex;  // previous history, RGBA16F, linear
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D hist_out;
+layout(set = 0, binding = 4, rgba8) uniform writeonly image2D dst_img; // A as R8G8B8A8_UNORM
+layout(set = 0, binding = 5) uniform texture2D zst_prev; // previous stable depth, R32F
+layout(set = 0, binding = 6, r32f) uniform writeonly image2D zst_out;
+
+layout(push_constant) uniform TaaPush {
+    ivec2 size;       // the render (A, B, history) size
+    ivec2 depth_size; // the depth read size (nearest texel when it differs)
+    vec2 jitter;      // window px: B[q] holds the unjittered scene at q + 0.5 - jitter
+    float m0, m1, m2, m3, m4, m5, m6, m7, m8; // current view -> previous view rotation (rows)
+    float t0, t1, t2;                          // ... and translation (game units)
+    float fx, fy;     // this frame's focal lengths (px)
+    float pfx, pfy;   // the previous frame's
+    float da, db, dsky;    // this frame's depth: 1/z = da - db d, 0 at d >= dsky
+    float pda, pdb, pdsky; // the previous frame's (the stable depth history's)
+    float alpha_min;
+    float gamma;
+    float depth_reject;
+    // 1: history valid, 2: window y grows downward, 4/8: debug (1..3), 16: A is written by the
+    // sharpen pass instead, bits 5..7: the filter's sigma (0.2 + 0.05 code px), bits 8..15: the
+    // sharpen amount (0..255 = 0..1), bits 16..23: the near field's least alpha (/255), bits
+    // 24..31: its distance (0.05 m steps, 0 = off).
+    uint flags;
+    // Round 2 (2026-10-08): bits 0..7: the blend's luma weight k (/255: weights 1 / (1 + k luma);
+    // 255 = round 1's full anti-flicker weighting, 0 = a plain blend that keeps glints' energy);
+    // bit 8: the occluder test (step 4b); bits 16..23: the sharpening's lift (/255 x 0.5).
+    uint flags2;
+} pc;
+
+float InverseDepth(float d) {
+    return d < pc.dsky ? max(pc.da - pc.db * d, 0.0) : 0.0;
+}
+
+float PrevInverseDepth(float d) {
+    return d < pc.pdsky ? max(pc.pda - pc.pdb * d, 0.0) : 0.0;
+}
+
+vec3 RgbToYCoCg(vec3 c) {
+    return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b,
+                -0.25 * c.r + 0.5 * c.g - 0.25 * c.b);
+}
+
+vec3 YCoCgToRgb(vec3 c) {
+    return vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
+ivec2 DepthCoord(ivec2 q) {
+    return pc.depth_size == pc.size ? q : min((q * pc.depth_size) / pc.size, pc.depth_size - 1);
+}
+
+// Catmull-Rom through 5 bilinear taps (the corners' weights dropped), at window position `pos`
+// (after MJP's SampleTextureCatmullRom, MIT; see NOTICE.md).
+vec3 SampleHistory(vec2 pos) {
+    const vec2 inv = 1.0 / vec2(pc.size);
+    const vec2 t1 = floor(pos - 0.5) + 0.5;
+    const vec2 f = pos - t1;
+    const vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    const vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    const vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    const vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    const vec2 w12 = w1 + w2;
+    const vec2 t0 = (t1 - 1.0) * inv;
+    const vec2 t3 = (t1 + 2.0) * inv;
+    const vec2 t12 = (t1 + w2 / w12) * inv;
+    vec3 c = textureLod(hist_tex, vec2(t12.x, t0.y), 0.0).rgb * (w12.x * w0.y);
+    c += textureLod(hist_tex, vec2(t0.x, t12.y), 0.0).rgb * (w0.x * w12.y);
+    c += textureLod(hist_tex, t12, 0.0).rgb * (w12.x * w12.y);
+    c += textureLod(hist_tex, vec2(t3.x, t12.y), 0.0).rgb * (w3.x * w12.y);
+    c += textureLod(hist_tex, vec2(t12.x, t3.y), 0.0).rgb * (w12.x * w3.y);
+    const float w = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    return max(c / w, vec3(0.0));
+}
+
+#ifdef TAA_SHARPEN
+// taa_sharpen: contrast-adaptive sharpening (the RCAS formula of AMD FSR 1, MIT) of the new
+// history into A, faded out in the near field (the game's depth, binding 1). The history itself
+// stays unsharpened (it is the next frame's input).
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size))) {
+        return;
+    }
+    const ivec2 last = pc.size - 1;
+    const vec3 e = texelFetch(hist_tex, p, 0).rgb;
+    const vec3 b = texelFetch(hist_tex, clamp(p + ivec2(0, -1), ivec2(0), last), 0).rgb;
+    const vec3 d = texelFetch(hist_tex, clamp(p + ivec2(-1, 0), ivec2(0), last), 0).rgb;
+    const vec3 f = texelFetch(hist_tex, clamp(p + ivec2(1, 0), ivec2(0), last), 0).rgb;
+    const vec3 h = texelFetch(hist_tex, clamp(p + ivec2(0, 1), ivec2(0), last), 0).rgb;
+    const vec3 mn4 = min(min(b, d), min(f, h));
+    const vec3 mx4 = max(max(b, d), max(f, h));
+    // The near field (taa_near_m, flags bits 24..31): the weapon and hands are at least
+    // taa_near_alpha this frame's jittered image (they move without motion vectors), and
+    // sharpening them brings the jitter's flicker back (2026-10-08: the blade blinked 2.5-12x
+    // SMAA's at 0.7 with the lift). The sharpening and its lift fade out with the main pass's
+    // smoothstep (none within near_m, full from 1.5 near_m) by the nearest depth of the 3x3 and
+    // the cross 2 px out: the pixels whose resolves took the near field's alpha and that this
+    // cross reads.
+    float fade = 1.0;
+    const float near_m = float((pc.flags >> 24u) & 255u) * 0.05;
+    if (near_m > 0.0) {
+        float iz = 0.0;
+        for (int k = 0; k < 13; ++k) {
+            const ivec2 o = k < 9 ? ivec2(k % 3 - 1, k / 3 - 1)
+                                  : ivec2(k == 9 ? -2 : (k == 10 ? 2 : 0),
+                                          k == 11 ? -2 : (k == 12 ? 2 : 0));
+            const ivec2 q = clamp(p + o, ivec2(0), last);
+            iz = max(iz, InverseDepth(texelFetch(depth_tex, DepthCoord(q), 0).r));
+        }
+        if (iz > 0.0) {
+            fade = smoothstep(near_m, 1.5 * near_m, 1.0 / iz);
+        }
+    }
+    // taa_sharpen_lift (flags2 bits 16..23, /255 x 0.5): RCAS keeps its output above black, so a
+    // dark texture (a neighbourhood min near 0) gets almost no sharpening; the lift moves that
+    // floor below black for the limit (the result is clamped at 0 as before). 0 = RCAS as is.
+    const float lift = float((pc.flags2 >> 16u) & 255u) * (0.5 / 255.0) * fade;
+    const vec3 hit_min = (min(mn4, e) + lift) / max(4.0 * (mx4 + lift), vec3(1e-5));
+    const vec3 hit_max = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, vec3(-1e-5));
+    const vec3 lobe3 = max(-hit_min, hit_max);
+    const float amount = float((pc.flags >> 8u) & 255u) / 255.0 * fade;
+    const float lobe =
+        max(-0.1875, min(max(lobe3.r, max(lobe3.g, lobe3.b)), 0.0)) * amount;
+    const vec3 c = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
+    imageStore(dst_img, p, vec4(clamp(c, 0.0, 1.0), texelFetch(cur_tex, p, 0).a));
+}
+#else
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size))) {
+        return;
+    }
+    const uint debug = (pc.flags >> 2u) & 3u;
+    const float ysign = (pc.flags & 2u) != 0u ? -1.0 : 1.0;
+    const ivec2 last = pc.size - 1;
+    const float fsig = 0.2 + 0.05 * float((pc.flags >> 5u) & 7u);
+    const float fk = 0.5 / (fsig * fsig);
+    // The near field's filter: at least round 1's 0.45 px (its current frame is >= taa_near_alpha
+    // of the result, so a narrower filter shows the jitter there as flicker).
+    const float nsig = max(fsig, 0.45);
+    const float nk = 0.5 / (nsig * nsig);
+
+    // 1. The current frame's 3x3.
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+    vec3 nsum = vec3(0.0);
+    float nwsum = 0.0;
+    vec3 m1 = vec3(0.0);
+    vec3 m2 = vec3(0.0);
+    float dtap[9];
+    float best_iz = -1.0;
+    const ivec2 centre_off = ivec2(round(pc.jitter));
+    float centre_depth = 0.0;
+    float alpha = 1.0;
+    int i = 0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            const ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), last);
+            const vec4 c = texelFetch(cur_tex, q, 0);
+            const vec2 o = vec2(float(dx), float(dy)) - pc.jitter;
+            const float w = exp(-fk * dot(o, o));
+            sum += c.rgb * w;
+            wsum += w;
+            const float nw = exp(-nk * dot(o, o));
+            nsum += c.rgb * nw;
+            nwsum += nw;
+            const vec3 y = RgbToYCoCg(c.rgb);
+            m1 += y;
+            m2 += y * y;
+            const float d = texelFetch(depth_tex, DepthCoord(q), 0).r;
+            dtap[i] = d;
+            best_iz = max(best_iz, InverseDepth(d));
+            if (dx == centre_off.x && dy == centre_off.y) {
+                centre_depth = d;
+            }
+            if (dx == 0 && dy == 0) {
+                alpha = c.a;
+            }
+            ++i;
+        }
+    }
+    const vec3 mean = m1 / 9.0;
+    const vec3 sigma = sqrt(max(m2 / 9.0 - mean * mean, vec3(0.0)));
+
+    // 2. Reprojection through the nearest depth of the 3x3.
+    const vec2 uv = vec2(p) + 0.5;
+    const vec2 c0 = 0.5 * vec2(pc.size);
+    const float vx = (uv.x - c0.x) / pc.fx;
+    const float vy = ysign * (uv.y - c0.y) / pc.fy;
+    const float iz = max(best_iz, 0.0);
+    // The near field's weight (taa_near_m, flags bits 24..31: 1 within near_m, 0 from 1.5 near_m):
+    // its wider filter here, its least alpha in step 5.
+    const float near_m = float((pc.flags >> 24u) & 255u) * 0.05;
+    const float near_w =
+        near_m > 0.0 && iz > 0.0 ? 1.0 - smoothstep(near_m, 1.5 * near_m, 1.0 / iz) : 0.0;
+    const vec3 cur = mix(sum / wsum, nsum / nwsum, near_w);
+    const vec3 P = vec3(pc.m0 * vx + pc.m1 * vy + pc.m2 + pc.t0 * iz,
+                        pc.m3 * vx + pc.m4 * vy + pc.m5 + pc.t1 * iz,
+                        pc.m6 * vx + pc.m7 * vy + pc.m8 + pc.t2 * iz);
+    bool has_history = (pc.flags & 1u) != 0u && debug != 2u && P.z > 1e-6;
+    vec2 prev = vec2(0.0);
+    if (has_history) {
+        prev = c0 + vec2(pc.pfx * P.x, ysign * pc.pfy * P.y) / P.z;
+        has_history = all(greaterThanEqual(prev, vec2(0.0))) && all(lessThan(prev, vec2(pc.size)));
+    }
+
+    vec3 result = cur;
+    float n_out = 1.0;
+    bool rejected = !has_history;
+    float stable_prev = 0.0;
+    if (has_history) {
+        // 3. The history and its count.
+        const ivec2 pi = clamp(ivec2(prev), ivec2(0), last);
+        float n = texelFetch(hist_tex, pi, 0).a;
+        const vec3 hist = SampleHistory(prev);
+        stable_prev = texelFetch(zst_prev, pi, 0).r;
+
+        // 4. Disocclusion: the history's surface nearer than the point all over its 2x2 (the
+        //    farthest of the four: a thin feature this frame's jitter did not sample - a twig, a
+        //    railing's edge - still has its background beside it and is left to the clip).
+        const ivec2 b = clamp(ivec2(floor(prev - 0.5)), ivec2(0), last - 1);
+        const float hz00 = PrevInverseDepth(texelFetch(zst_prev, b, 0).r);
+        const float hz10 = PrevInverseDepth(texelFetch(zst_prev, b + ivec2(1, 0), 0).r);
+        const float hz01 = PrevInverseDepth(texelFetch(zst_prev, b + ivec2(0, 1), 0).r);
+        const float hz11 = PrevInverseDepth(texelFetch(zst_prev, b + ivec2(1, 1), 0).r);
+        const float h_iz = min(min(hz00, hz10), min(hz01, hz11));
+        const float expect_iz = iz / P.z;
+        if (h_iz > expect_iz * (1.0 + pc.depth_reject) + 1e-7) {
+            n = 0.0;
+        }
+        // 4b. The occluder test (flags2 bit 8): something without motion vectors moved in front
+        //     (an enemy's leading edge, a bird against the sky): the history's 2x2, even its
+        //     nearest, lies farther than every tap of this frame's 3x3 (its farthest, seen from
+        //     the previous view) by more than 4 depth_reject + 1%. A static scene always has its
+        //     own surface among the 3x3 (silhouettes keep their background taps), so it never
+        //     fires there.
+        if ((pc.flags2 & 256u) != 0u) {
+            float far_iz = best_iz;
+            for (int k = 0; k < 9; ++k) {
+                far_iz = min(far_iz, InverseDepth(dtap[k]));
+            }
+            const float pz_far = pc.m6 * vx + pc.m7 * vy + pc.m8 + pc.t2 * far_iz;
+            const float far_prev = pz_far > 1e-6 ? far_iz / pz_far : 0.0;
+            const float h_near = max(max(hz00, hz10), max(hz01, hz11));
+            if (far_prev > 0.0 && h_near * (1.0 + 4.0 * pc.depth_reject + 0.01) < far_prev) {
+                n = 0.0;
+            }
+        }
+
+        // 5. Clip and blend.
+        const vec3 ext = pc.gamma * sigma + 1.0 / 512.0;
+        const vec3 hy = RgbToYCoCg(hist);
+        const vec3 d = hy - mean;
+        const vec3 r = abs(d) / max(ext, vec3(1e-5));
+        const float outside = max(r.x, max(r.y, r.z));
+        const vec3 clipped = YCoCgToRgb(outside > 1.0 ? mean + d / outside : hy);
+        if (outside > 2.0) {
+            n *= 0.5;
+        }
+        rejected = n < 0.5;
+        float a = max(1.0 / (n + 1.0), pc.alpha_min);
+        const float near_a = float((pc.flags >> 16u) & 255u) / 255.0;
+        a = max(a, near_a * near_w);
+        const float luma_k = float(pc.flags2 & 255u) / 255.0;
+        const float lc = RgbToYCoCg(cur).x;
+        const float lh = RgbToYCoCg(clipped).x;
+        const float wc = a / (1.0 + luma_k * lc);
+        const float wh = (1.0 - a) / (1.0 + luma_k * lh);
+        result = (cur * wc + clipped * wh) / max(wc + wh, 1e-6);
+        n_out = min(n + 1.0, 1.0 / max(pc.alpha_min, 1e-3));
+    }
+
+    // 6. The stable depth: the tap nearest the previous stable depth (moved into this view by the
+    //    point's own depth ratio), or the tap nearest the unjittered centre.
+    float lo = dtap[0], hi = dtap[0];
+    for (int k = 1; k < 9; ++k) {
+        lo = min(lo, dtap[k]);
+        hi = max(hi, dtap[k]);
+    }
+    float stable = centre_depth;
+    const float lo_iz = InverseDepth(hi), hi_iz = InverseDepth(lo);
+    if (has_history && hi_iz - lo_iz > 0.02 * hi_iz) {
+        const float want_iz = PrevInverseDepth(stable_prev) * P.z;
+        float best = dtap[0];
+        float best_err = abs(InverseDepth(dtap[0]) - want_iz);
+        for (int k = 1; k < 9; ++k) {
+            const float e = abs(InverseDepth(dtap[k]) - want_iz);
+            if (e < best_err) {
+                best_err = e;
+                best = dtap[k];
+            }
+        }
+        stable = best;
+    }
+
+    vec3 shown = result;
+    if (debug == 1u) {
+        shown = vec3(rejected ? 1.0 : 0.0, n_out * pc.alpha_min, has_history ? 0.0 : 1.0);
+    }
+    if ((pc.flags & 16u) == 0u) {
+        imageStore(dst_img, p, vec4(clamp(shown, 0.0, 1.0), alpha));
+    }
+    imageStore(hist_out, p, vec4(result, n_out));
+    imageStore(zst_out, p, vec4(stable, 0.0, 0.0, 0.0));
+}
+#endif

@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x=8, local_size_y=8) in;
+layout(binding=0) uniform texture2D scene_color;
+layout(binding=1) uniform texture2D scene_depth;
+layout(binding=2, rgba16f) uniform writeonly image2D canonical_color;
+layout(binding=3, r32f) uniform writeonly image2D canonical_depth;
+// copy_mask: 1 colour, 2 depth (bit 46 copies only the inputs NGX cannot read in place).
+layout(push_constant) uniform Constants { uvec2 size; uint copy_mask; };
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(p), size))) return;
+    if ((copy_mask & 1u) != 0u)
+        imageStore(canonical_color, p, texelFetch(scene_color, p, 0));
+    if ((copy_mask & 2u) != 0u)
+        imageStore(canonical_depth, p, vec4(texelFetch(scene_depth, p, 0).r));
+}

@@ -1,0 +1,20 @@
+Gun reload and empty-click audio (24 kHz mono S16LE, embedded in the executable)
+
+CC0 1.0 Universal: https://creativecommons.org/publicdomain/zero/1.0/
+
+Sources, retrieved 2026-10-13:
+- Brian MacIntosh (BMacZero), Gun Reload Sound Effects
+  https://opengameart.org/content/gun-reload-sound-effects
+  https://opengameart.org/sites/default/files/clipload1.wav
+  https://opengameart.org/sites/default/files/clipload2.wav
+  Both listed as CC0; optional credit Brian MacIntosh.
+- LFA, Equipment Clicks II
+  https://opengameart.org/content/equipment-clicks-ii
+  https://opengameart.org/sites/default/files/equipmentclicks.wav
+  Listed as CC0; credit appreciated but not required.
+
+Edits: excerpts, filtering, fades, resampling and gain. gun_reload.pcm combines
+clipload2 (0-.205 s), clipload1 (0-.250 s), and equipmentclicks (1.03-1.25 s)
+at 0, .18 and .38 seconds. gun_empty.pcm uses the equipmentclicks excerpt.
+Reproduce with scripts/prepare_reload_audio.py (Python + ffmpeg), with the three
+source WAV files in Build/reload-sources. Output duration: .56 s / .22 s.

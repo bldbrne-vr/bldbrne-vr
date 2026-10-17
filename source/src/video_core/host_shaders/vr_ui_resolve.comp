@@ -1,0 +1,1149 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// VR: the game's UI on its own compositor layer (renderer_vulkan/vr_ui_layer.h). Every UI draw
+// after the game's composite was also drawn into two VR-owned targets: K (cleared to black) and W
+// (cleared to grey g). For every blend that is affine in the destination colour (over, additive,
+// premultiplied multiply) the game's final image is X = K + T * S per channel, with S the scene
+// before the UI, emission K and transmittance T = (W - K) / g. This shader turns K and W into the
+// UI layer and is compiled once per MODE (the host defines it after the #version line):
+//   0  veil: estimates the game's own full-screen dim (a uniform veil: transmittance T_v and
+//      emission K_v per channel, e.g. the menu dim) from the band's left and right edge strips,
+//      and clears the frame's counters.
+//   1  atlas: the UI layer, premultiplied, in the swapchain's byte order: the top half is the
+//      whole 16:9 band, the bottom half the band without the HUD band's fixed regions (the
+//      "rest"). A veil is taken out (T' = T / T_v, K' = K - T' * K_v, exact for a uniform veil
+//      under the UI): it goes into the eye images instead (mode 2), so the world dims with no edge
+//      around the UI. Also the bounding box of the UI in the dialog region (a dialog's crop), or
+//      in a full menu's frame over the whole band without the gameplay HUD's footprint (the
+//      menu's crop); each cut-out's own bounding box (where the HUD band's pieces have content);
+//      in a gameplay frame, the UI pixels of the dynamic region as a bit mask (mode 4) and the
+//      status clusters' footprint (16 x 16 px cells holding UI, kept for the menus).
+//   2  scene veil: the scene copy the eyes are made from becomes K_v + T_v * S (the game's
+//      encoded domain).
+//   3  check (ui_layer=2): compares X with K + T * S over the band (LSB statistics).
+//   4  split rows (gameplay frames with a dynamic region): per row of the dynamic region, the
+//      extent of its HUD elements (runs of UI, gaps bridged, at least min_width wide), dilated
+//      over the neighbouring rows (VR::Ui::HudSplit).
+//   5  split: in the dynamic region the HUD elements leave the rest half and everything else
+//      leaves the top half (the HUD band shows only the HUD, the rest quad the rest).
+//   6  menu gone: a full-screen menu's frame with no UI outside the HUD clusters (the menu is
+//      not drawn yet, or no longer: the game's menu state is a frame or three off its drawing)
+//      clears the clusters from the top half, so the menu canvas never shows the gameplay HUD
+//      blown up.
+//   7  menu HUD: a full-screen menu's frame. The game draws its HUD first and the menu over it
+//      (the inventory's panels hide its HP bar); k_tex / w_tex are then the HUD alone, K and W
+//      as they were just before the menu's first draw (VrUiLayer::SnapshotHud). The status
+//      clusters' UI from them, inside the gameplay HUD's footprint cells only, goes into the
+//      bottom half's status cuts (unused in a menu's frame): HP, stamina and the items shown
+//      under the menu canvas. The menu's dim comes after them; should it have been kept too (a
+//      HUD box drawn like it, learnt as the HUD's), its uniform veil, seen at the band's edges
+//      just below the clusters, is taken back out of the HUD under it.
+//   8  lock-on marker box (a frame that drew the lock-on marker into its own pair, the marker
+//      textures Km / Wm, ui_lock_marker_scale / ui_lock_marker_alpha): the box of its pixels.
+//      Mode 1 then puts the marker, scaled about that box's centre and dimmed, over the rest of
+//      the UI when nothing was drawn after it (the game draws it last, over the target's HP bar),
+//      else under it (core/vr/ui_lock_marker.h has the same math, unit tested).
+// The game blends in its encoded (sRGB) domain, the compositor in linear light, so alpha comes
+// from a two-point fit, exact over a black and over a white world and for opaque UI, text, black
+// dims and additive glows: 1 - alpha = luma(G(min(k + T, 1)) - G(k)), colour bytes = E(k), with
+// E the eyes' post-process encode (the user's gamma; E = identity at gamma 1) and G its decode.
+// A pixel no UI drew on (K and W still hold their clear values to within one 8-bit step) is
+// exactly transparent (EmptyPixel, FLAG_EMPTY: ui_empty_snap).
+// The status build-up meter (FLAG_CONDITIONS, ui_conditions=view; core/vr/ui_conditions.h): cut 3
+// is its rows' rect. Mode 1 moves its pixels into the strip below the atlas's two halves (its
+// first row StripTop(), the cut's top-left at the strip's), leaves them out of both halves and
+// of the other cuts (first match: the HP cluster's box, the tray's width, never holds them), and
+// clears the rest of the strip, so the presenter's conditions piece samples only this frame's
+// rows.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+#if MODE == 0 || MODE == 4
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#else
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+#endif
+
+layout(set = 0, binding = 0) uniform texture2D k_tex; // K, read through X's component mapping
+layout(set = 0, binding = 1) uniform texture2D w_tex; // W
+#if MODE == 1 || MODE == 5 || MODE == 6 || MODE == 7
+layout(set = 0, binding = 2, rgba8) uniform writeonly image2D atlas_img;
+#endif
+#if MODE == 1 || MODE == 8
+layout(set = 0, binding = 8) uniform texture2D mk_tex; // the lock-on marker alone: its K ...
+layout(set = 0, binding = 9) uniform texture2D mw_tex; // ... and W (FLAG_MARKER)
+#endif
+layout(set = 0, binding = 3, std430) buffer UiStats {
+    uint words[64];
+} stats;
+#if MODE == 2
+layout(set = 0, binding = 4, rgba8) uniform image2D scene_img; // raw channels, identity view
+#endif
+#if MODE == 3
+layout(set = 0, binding = 5) uniform texture2D final_tex; // X after the UI
+layout(set = 0, binding = 6) uniform texture2D scene_tex; // S, the scene copy at the composite
+#endif
+// The dynamic region's split: per row its HUD extent (x0, x1 band px; x0 > x1: none), then the
+// UI bit mask (one bit per pixel, rows of `mask_words` words); at FOOTPRINT_BASE in it the
+// status clusters' footprint: one word per 16 x 16 band px cell (a mode 1 workgroup), rows of
+// FOOTPRINT_STRIDE cells, 1 = the gameplay HUD drew there (written by every gameplay frame).
+layout(set = 0, binding = 7, std430) buffer UiSplit {
+    uint row_lr[2048];
+    uint mask[];
+} split;
+const uint FOOTPRINT_BASE = 786432u; // 3 MB into mask[] (the bit mask needs at most 512 KB)
+const uint FOOTPRINT_STRIDE = 256u;  // cells per row: bands up to 4096 px wide
+const uint FOOTPRINT_ROWS = 160u;    // ... up to 2560 px tall
+
+layout(push_constant) uniform UiParams {
+    ivec4 band;      // x, y, w, h of the 16:9 band in the render (K, W, X and S pixels)
+    ivec4 cut[4];    // the HUD band's regions (band pixels: x0, y0, x1, y1, exclusive)
+    ivec4 box;       // the dialog box is measured in this band rect (x0, y0, x1, y1)
+    ivec2 scene_size;
+    float grey;      // W's clear value
+    uint flags;
+    uint cut_count;
+    uint raw_order;  // bits 0..7: the scene's raw channel i holds true component
+                     // (raw_order >> 2i) & 3; bits 8..19 the lock-on marker's scale (1/1024),
+                     // bits 20..31 its alpha factor (1/4095) (VR::Ui::LockMarker::Pack)
+    float gamma;     // the eyes' post-process gamma (1 = sRGB)
+    uint split_px;   // the split, band px: min width (11 bits), gap, dilate, margin (7 bits each)
+} pc;
+
+const uint FLAG_BGRA = 1u << 0;          // the atlas holds B, G, R, A bytes
+const uint FLAG_LINEAR_SOURCE = 1u << 1; // X holds linear values (a float target)
+const uint FLAG_SRGB_RT = 1u << 2;       // the UI blended through sRGB views (in linear light)
+const uint FLAG_VEIL = 1u << 3;          // take a uniform veil out (ui_veil)
+const uint FLAG_GAMEPLAY = 1u << 4;      // a gameplay frame: the dynamic region is split
+const uint FLAG_FULL_MENU = 1u << 5;     // a full-screen menu's frame (the canvas shows it whole)
+const uint FLAG_FOOTPRINT = 1u << 6;     // a gameplay frame: write the status clusters' footprint
+const uint FLAG_MENU_BOX = 1u << 7;      // a full menu: the box without the footprint, not cuts
+const uint STATUS_SHIFT = 8u;            // bits 8..11: cuts left out of the dialog box
+const uint DYNAMIC_SHIFT = 12u;          // bits 12..15: the dynamic cut (at most one)
+const uint FLAG_MARKER = 1u << 16;       // the lock-on marker was drawn into mk_tex / mw_tex
+const uint FLAG_MARKER_OVER = 1u << 17;  // ... and no UI after it: it goes over the rest
+const uint FLAG_EMPTY = 1u << 18;        // empty pixels exactly transparent (ui_empty_snap)
+const uint FLAG_DIALOGUE = 1u << 22;
+const uint FLAG_ITEM_PICKUP = 1u << 21;
+const uint FLAG_ACTION_PROMPT = 1u << 20; // explicit game prompt; independent of fading pixel width
+const uint FLAG_CONDITIONS = 1u << 19;   // cut 3 is the build-up meter: into the strip
+const uint FLAG_AREA_NAME = 1u << 23;    // an area name is up: its corner whole on the band
+const uint FLAG_AREA_KEY = 1u << 24;     // ... and its dark backing keyed (KeyAreaName)
+// The strip's stage columns (VR::Ui::Conditions::MaxRect: x 836 .. 1088): what it clears.
+const float STRIP_STAGE_X0 = 836.0;
+const float STRIP_STAGE_X1 = 1088.0;
+
+// Stats words (VrUiLayer::Stats mirrors them).
+const uint W_VEIL = 0;      // float: T_v (1 = none)
+const uint W_VEIL_ON = 1;   // 1: a veil was found
+const uint W_STRIP_T = 2;   // float: mean luma(T) in the edge strips
+const uint W_STRIP_D = 3;   // float: its spread (max - min)
+const uint W_STRIP_K = 4;   // float: the largest luma(dec(K)) there
+const uint W_CONTENT = 5;   // band pixels with alpha > 4/255
+const uint W_REST = 6;      // ... of them left in the rest half
+const uint W_BORDER = 7;    // ... within 8 px of the band's border
+const uint W_CUT0 = 8;      // ... inside cut-out 0..3
+const uint W_OPAQUE = 12;   // band pixels with alpha > 250/255
+const uint W_SPLIT_RIGHT = 13; // the dynamic region's HUD elements' right end (band px + 1; 0: none)
+const uint W_CHECK_N = 16;  // check: pixels compared
+const uint W_CHECK_BAD = 17; // ... more than 3 LSB off
+const uint W_CHECK_MAX = 18; // ... the largest error (LSB)
+const uint W_CHECK_SUM = 19; // ... the sum of the errors (LSB)
+const uint W_CHECK_BAD2 = 20; // ... more than 8 LSB off
+const uint W_SATURATED = 21; // band pixels where W clipped at 1 (an additive glow: T taken as 1)
+const uint W_SPLIT_ROWS = 22; // dynamic region rows holding a HUD element
+const uint W_SPLIT_OUT = 23;  // dynamic region UI pixels left on the rest quad (not HUD)
+const uint W_MENU_GONE = 24;  // 1: a full menu's frame without the menu (mode 6 cleared it)
+const uint W_MENU_HUD = 25;   // mode 7: HUD pixels (alpha > 4/255) put under the menu canvas
+const uint W_MENU_HUD_OUT = 26; // ... and UI pixels of the clusters left out (not footprint)
+const uint W_MENU_HUD_VEIL = 27; // 1: the kept K and W held the menu's dim (taken back out)
+const uint W_OPAQUE_BOX = 28; // the content box of the opaque UI only (alpha > 250/255; 28..31)
+const uint W_VEIL_T = 32;   // floats: the veil's transmittance per channel (32..34)
+const uint W_VEIL_K = 35;   // floats: its emission per channel, encoded (35..37)
+const uint W_STRIP_KD = 38; // float: the spread of luma(dec(K)) in the strips
+const uint W_BOX = 40;      // the content box (band px): min x, min y, max x, max y (40..43)
+const uint W_CUT_BOX = 44;  // each cut-out's content box, 4 words each (44..59)
+const uint W_MARK_BOX = 60; // the lock-on marker's box (band px): min x, min y, max x, max y
+
+vec3 SrgbToLinear(vec3 c) {
+    return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, lessThanEqual(c, vec3(0.04045)));
+}
+
+vec3 LinearToSrgb(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, 12.92 * c, lessThan(c, vec3(0.0031308)));
+}
+
+// post_process.frag's encode of the eyes (gamma 1 = the sRGB OETF), plus a clamp.
+vec3 EncodeEyes(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    const vec3 lo = 12.92 * c / pc.gamma;
+    const vec3 hi = 1.055 * pow(c, vec3(1.0 / (2.4 + 1.0 - pc.gamma))) - 0.055;
+    return mix(hi, lo, lessThan(c, vec3(0.0031308)));
+}
+
+float Luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// The emission in linear light.
+vec3 EmissionLinear(vec3 k) {
+    return (pc.flags & FLAG_LINEAR_SOURCE) != 0u ? k : SrgbToLinear(k);
+}
+
+// Per-channel transmittance in the domain the game blended in. W clips at 1 where the UI adds
+// more than 1 - g over the grey (an additive glow): there T = (W - K) / g comes out too low (the
+// glow would darken the world), so a clipped channel takes the largest T of its unclipped ones,
+// or 1 (exact for a pure additive blend) when all are clipped.
+vec3 Transmittance(vec3 k, vec3 w, out bool saturated) {
+    vec3 t;
+    if ((pc.flags & FLAG_SRGB_RT) != 0u) {
+        t = clamp((SrgbToLinear(w) - SrgbToLinear(k)) / pc.grey, 0.0, 1.0);
+    } else {
+        t = clamp((w - k) / pc.grey, 0.0, 1.0);
+    }
+    const bvec3 clipped = bvec3(w.r >= 254.5 / 255.0 && k.r < w.r - 1.5 / 255.0,
+                                w.g >= 254.5 / 255.0 && k.g < w.g - 1.5 / 255.0,
+                                w.b >= 254.5 / 255.0 && k.b < w.b - 1.5 / 255.0);
+    saturated = any(clipped);
+    if (saturated) {
+        float free_t = -1.0;
+        for (int c = 0; c < 3; ++c) {
+            if (!clipped[c]) {
+                free_t = max(free_t, t[c]);
+            }
+        }
+        const float fill = free_t >= 0.0 ? free_t : 1.0;
+        for (int c = 0; c < 3; ++c) {
+            if (clipped[c]) {
+                t[c] = max(t[c], fill);
+            }
+        }
+    }
+    return t;
+}
+
+vec3 Transmittance(vec3 k, vec3 w) {
+    bool saturated;
+    return Transmittance(k, w, saturated);
+}
+
+// No UI drew here, to within the targets' 8-bit steps: K still black (its clear value, exact)
+// and W the grey it was cleared to, as the GPU stored it (any rounding within 0.6 LSB: 0.5 is
+// stored as 127 or 128 of 255; the grey encoded when the UI drew through sRGB views). Such a
+// pixel is exactly transparent (K = 0, T = 1): through Transmittance the grey's own rounding
+// reads as T = 127 / 127.5, a black veil of alpha 2/255 over every pixel without UI (the rest
+// quad: 86% of its area, the whole view 0.8% darker; 4/255 in the lock-on marker's box, its own
+// pair adding its floor). Anything a pixel like that drops changed the game's own image by about
+// 1.5 LSB at most (3.5 on a GPU storing 0.5 as 128, where it read as that 2/255 before); any UI
+// that moved K or W further is resolved exactly as before. FLAG_EMPTY: ui_empty_snap
+// (VR::Ui::Empty mirrors this, unit tested).
+bool EmptyPixel(vec3 k, vec3 w) {
+    if ((pc.flags & FLAG_EMPTY) == 0u) {
+        return false;
+    }
+    const float g = (pc.flags & FLAG_SRGB_RT) != 0u ? LinearToSrgb(vec3(pc.grey)).g : pc.grey;
+    return all(lessThan(k, vec3(0.5 / 255.0))) &&
+           all(lessThanEqual(abs(w - vec3(g)), vec3(0.6 / 255.0)));
+}
+
+// K and its transmittance T from K and W (raw channels); an empty pixel is exactly K = 0, T = 1.
+vec3 ReadKT(inout vec3 k, vec3 w, out bool saturated) {
+    if (EmptyPixel(k, w)) {
+        k = vec3(0.0);
+        saturated = false;
+        return vec3(1.0);
+    }
+    return Transmittance(k, w, saturated);
+}
+
+// The game blended in this domain (its encoded values, or linear light through sRGB views).
+vec3 BlendDomain(vec3 c) {
+    return (pc.flags & FLAG_SRGB_RT) != 0u ? SrgbToLinear(c) : c;
+}
+vec3 RawDomain(vec3 c) {
+    return (pc.flags & FLAG_SRGB_RT) != 0u ? LinearToSrgb(c) : clamp(c, 0.0, 1.0);
+}
+
+uint SplitMinWidth() {
+    return pc.split_px & 0x7FFu;
+}
+uint SplitGap() {
+    return (pc.split_px >> 11) & 0x7Fu;
+}
+uint SplitDilate() {
+    return (pc.split_px >> 18) & 0x7Fu;
+}
+uint SplitMargin() {
+    return (pc.split_px >> 25) & 0x7Fu;
+}
+
+// The dynamic cut's index (-1: none).
+int DynamicCut() {
+    const uint bits = (pc.flags >> DYNAMIC_SHIFT) & 0xFu;
+    return bits == 0u ? -1 : findLSB(bits);
+}
+
+uint MaskWords(ivec4 r) {
+    return uint(r.z - r.x + 31) / 32u;
+}
+
+// One pixel of the UI layer from K and its transmittance T: premultiplied, in the atlas's byte
+// order. `unveil`: a uniform veil found under the UI (the frame's mode 0) is taken out of it.
+vec4 UiPixelKT(vec3 k, vec3 t, bool unveil) {
+    if (unveil && stats.words[W_VEIL_ON] != 0u) {
+        // A uniform veil under the UI: X = K_m + T_m * (K_v + T_v * S). The UI alone is
+        // T_m = T / T_v, K_m = K - T_m * K_v (a nearly black fade is not divided out: it
+        // stays in the layer as well as in the eyes).
+        const vec3 tv = vec3(uintBitsToFloat(stats.words[W_VEIL_T]),
+                             uintBitsToFloat(stats.words[W_VEIL_T + 1u]),
+                             uintBitsToFloat(stats.words[W_VEIL_T + 2u]));
+        const vec3 kv = vec3(uintBitsToFloat(stats.words[W_VEIL_K]),
+                             uintBitsToFloat(stats.words[W_VEIL_K + 1u]),
+                             uintBitsToFloat(stats.words[W_VEIL_K + 2u]));
+        if (min(tv.r, min(tv.g, tv.b)) >= 0.02) {
+            t = clamp(t / tv, 0.0, 1.0);
+            k = max(k - t * kv, vec3(0.0));
+        }
+    }
+    // The emission and the result over a white world, in linear light, as the game blended
+    // (in its encoded domain, or through sRGB views / a float target in linear light).
+    const vec3 k_lin = EmissionLinear(k);
+    const vec3 white_lin = (pc.flags & (FLAG_LINEAR_SOURCE | FLAG_SRGB_RT)) != 0u
+                               ? min(k_lin + t, vec3(1.0))
+                               : SrgbToLinear(min(k + t, vec3(1.0)));
+    vec3 bytes;
+    float transmit;
+    if (abs(pc.gamma - 1.0) < 1e-4) {
+        // The eyes are plain sRGB: the game's own bytes (bit exact).
+        bytes = (pc.flags & FLAG_LINEAR_SOURCE) != 0u ? LinearToSrgb(k) : k;
+        transmit = Luma(white_lin - k_lin);
+    } else {
+        // Through the eyes' gamma, like the world behind it.
+        bytes = EncodeEyes(k_lin);
+        transmit = Luma(SrgbToLinear(EncodeEyes(white_lin)) - SrgbToLinear(bytes));
+    }
+    const float alpha = clamp(1.0 - transmit, 0.0, 1.0);
+    vec4 px = vec4(bytes, alpha);
+    if ((pc.flags & FLAG_BGRA) != 0u) {
+        px = px.bgra;
+    }
+    return px;
+}
+
+// The same from K and W.
+vec4 UiPixel(vec3 k, vec3 w, bool unveil, out bool saturated) {
+    const vec3 t = ReadKT(k, w, saturated);
+    return UiPixelKT(k, t, unveil);
+}
+
+#if MODE == 1 || MODE == 5
+// An area name's corner while one is up (FLAG_AREA_NAME): from stage x 900, y 780 (VR::Ui::
+// AreaNameKeyX0 / AreaNameKeyY0) to the band's right and bottom edges. It goes to the HUD band
+// whole (mode 5).
+bool InAreaName(ivec2 p) {
+    const float k = float(pc.band.z) / 1920.0;
+    return (pc.flags & FLAG_AREA_NAME) != 0u && p.x >= int(floor(900.0 * k)) &&
+           p.y >= int(floor(780.0 * k));
+}
+// ... and its backing keyed from stage x 600 (VR::Ui::AreaNameKeyLeftX): the piece shows from
+// ~x 753 (CentreAreaName), and the ink smear's tail left of 900 stayed as a dark block with a hard
+// edge at 900 (2026-10-13). The routing above keeps 900 (a lock-on mark, an enemy tag left of it).
+// Only while the HUD movie still has its dark strip (FLAG_AREA_KEY: VR::IsAreaDimRemoved false);
+// with it taken out, the smoke stays as the game draws it.
+bool InAreaKey(ivec2 p) {
+    const float k = float(pc.band.z) / 1920.0;
+    return (pc.flags & FLAG_AREA_KEY) != 0u && p.x >= int(floor(600.0 * k)) &&
+           p.y >= int(floor(780.0 * k));
+}
+#endif
+
+#if MODE == 1
+// The name's dark backing (its ink smear and dim) keyed out, its words and rule kept: a pixel
+// whose own colour (unpremultiplied, the brightest channel) is below AREA_KEY_LO is the backing's
+// (gone, its emission with it), above AREA_KEY_HI the name's; its alpha at most what light of the
+// words' brightness (AREA_KEY_INK) needs for its emission (the backing's dim under the words'
+// edges taken out). Scale-free: the name's fade scales colour bytes and alpha alike.
+const float AREA_KEY_LO = 0.18;
+const float AREA_KEY_HI = 0.42;
+const float AREA_KEY_INK = 0.85;
+vec4 KeyAreaName(vec4 px) {
+    if (px.a <= 0.0) {
+        return px;
+    }
+    const float e = max(px.r, max(px.g, px.b));
+    const float w = smoothstep(AREA_KEY_LO, AREA_KEY_HI, e / px.a);
+    return vec4(px.rgb * w, min(px.a, e / AREA_KEY_INK) * w);
+}
+#endif
+
+#if MODE == 1 || MODE == 8
+// A pixel of the lock-on marker's own pair holds some of it (anything but the clear values).
+bool MarkerPixel(vec3 k, vec3 w) {
+    return any(greaterThan(BlendDomain(k), vec3(1.5 / 255.0))) ||
+           any(lessThan(Transmittance(k, w), vec3(1.0 - 1.5 / 255.0)));
+}
+#endif
+
+#if MODE == 1
+float MarkerScale() {
+    return max(float((pc.raw_order >> 8) & 0xFFFu) / 1024.0, 0.05);
+}
+float MarkerAlpha() {
+    return float((pc.raw_order >> 20) & 0xFFFu) / 4095.0;
+}
+
+// The lock-on marker (FLAG_MARKER) at band pixel p: sampled at c + (p - c) / s about the centre
+// c of its box (mode 8), bilinear over its own pixels, dimmed by the factor a (emission a * Km,
+// transmittance 1 - a * (1 - Tm)) and put over the rest of the UI (k raw, t): Km + Tm * K,
+// Tm * T (FLAG_MARKER_OVER: nothing was drawn after it, as the game draws it), else under it:
+// K + T * Km, T * Tm, in the domain the game blended in. VR::Ui::LockMarker mirrors this.
+void MarkerCompose(ivec2 p, inout vec3 k, inout vec3 t) {
+    const uvec4 b = uvec4(stats.words[W_MARK_BOX], stats.words[W_MARK_BOX + 1u],
+                          stats.words[W_MARK_BOX + 2u], stats.words[W_MARK_BOX + 3u]);
+    if (b.z < b.x || b.w < b.y || b.x == 0xFFFFFFFFu) {
+        return; // no marker pixel in this frame
+    }
+    const float s = MarkerScale();
+    const vec2 c = 0.5 * vec2(float(b.x + b.z + 1u), float(b.y + b.w + 1u));
+    const vec2 lo = floor(c + s * (vec2(b.xy) - c)) - 1.0;
+    const vec2 hi = ceil(c + s * (vec2(b.zw + 1u) - c));
+    if (float(p.x) < lo.x || float(p.y) < lo.y || float(p.x) > hi.x || float(p.y) > hi.y) {
+        return;
+    }
+    const vec2 src = c + (vec2(p) + 0.5 - c) / s - 0.5; // pixel centres at integers
+    const ivec2 i0 = ivec2(floor(src));
+    const vec2 f = src - vec2(i0);
+    vec3 km = vec3(0.0);
+    vec3 tm = vec3(0.0);
+    for (int dy = 0; dy < 2; ++dy) {
+        for (int dx = 0; dx < 2; ++dx) {
+            const float wgt = (dx != 0 ? f.x : 1.0 - f.x) * (dy != 0 ? f.y : 1.0 - f.y);
+            const ivec2 q = i0 + ivec2(dx, dy);
+            if (q.x < int(b.x) || q.y < int(b.y) || q.x > int(b.z) || q.y > int(b.w)) {
+                tm += wgt; // empty: emission 0, transmittance 1
+                continue;
+            }
+            vec3 kq = texelFetch(mk_tex, pc.band.xy + q, 0).rgb;
+            const vec3 wq = texelFetch(mw_tex, pc.band.xy + q, 0).rgb;
+            bool saturated;
+            const vec3 tq = ReadKT(kq, wq, saturated); // empty: exactly 0, 1
+            km += wgt * BlendDomain(kq);
+            tm += wgt * tq;
+        }
+    }
+    const float a = MarkerAlpha();
+    km *= a;
+    tm = 1.0 - a * (1.0 - tm);
+    if ((pc.flags & FLAG_MARKER_OVER) != 0u) {
+        k = RawDomain(km + tm * BlendDomain(k));
+    } else {
+        k = RawDomain(BlendDomain(k) + t * km);
+    }
+    t = t * tm;
+}
+#endif
+
+#if MODE == 0
+
+shared float s_min[256];
+shared float s_max[256];
+shared vec3 s_sum[256];
+shared vec3 s_ksum[256];
+shared float s_kmin[256];
+shared float s_kmax[256];
+shared uint s_n[256];
+
+void main() {
+    const uint i = gl_LocalInvocationIndex;
+    // Edge strips: band x 0..15 and w-16..w-1, y 400..1040 of a 1440 px band (away from every
+    // HUD cluster; the menus' own dim covers them).
+    const int y0 = pc.band.w * 400 / 1440;
+    const int y1 = pc.band.w * 1040 / 1440;
+    const int rows = max(y1 - y0, 1);
+    const int total = 32 * rows;
+    float mn = 1e9;
+    float mx = -1e9;
+    vec3 sum = vec3(0.0);
+    vec3 ksum = vec3(0.0);
+    float kmin = 1e9;
+    float kmax = 0.0;
+    uint n = 0u;
+    for (int p = int(i); p < total; p += 256) {
+        const int col = p % 32;
+        const int row = p / 32;
+        const int bx = col < 16 ? col : pc.band.z - 32 + col;
+        const ivec2 q = pc.band.xy + ivec2(bx, y0 + row);
+        const vec3 k = texelFetch(k_tex, q, 0).rgb;
+        const vec3 w = texelFetch(w_tex, q, 0).rgb;
+        const vec3 t = Transmittance(k, w);
+        const float tl = Luma(t);
+        mn = min(mn, tl);
+        mx = max(mx, tl);
+        sum += t;
+        ksum += k;
+        const float kl = Luma(EmissionLinear(k));
+        kmin = min(kmin, kl);
+        kmax = max(kmax, kl);
+        ++n;
+    }
+    s_min[i] = mn;
+    s_max[i] = mx;
+    s_sum[i] = sum;
+    s_ksum[i] = ksum;
+    s_kmin[i] = kmin;
+    s_kmax[i] = kmax;
+    s_n[i] = n;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (i < stride) {
+            s_min[i] = min(s_min[i], s_min[i + stride]);
+            s_max[i] = max(s_max[i], s_max[i + stride]);
+            s_sum[i] += s_sum[i + stride];
+            s_ksum[i] += s_ksum[i + stride];
+            s_kmin[i] = min(s_kmin[i], s_kmin[i + stride]);
+            s_kmax[i] = max(s_kmax[i], s_kmax[i + stride]);
+            s_n[i] += s_n[i + stride];
+        }
+        barrier();
+    }
+    if (i < 32u && i > W_STRIP_K) {
+        stats.words[i] = 0u; // this frame's counters
+    }
+    if (i >= W_BOX && i < W_BOX + 4u) {
+        stats.words[i] = i < W_BOX + 2u ? 0xFFFFFFFFu : 0u; // an empty box
+    }
+    if (i >= W_OPAQUE_BOX && i < W_OPAQUE_BOX + 2u) {
+        stats.words[i] = 0xFFFFFFFFu; // an empty box (its max words were cleared above)
+    }
+    if (i >= W_CUT_BOX && i < W_CUT_BOX + 16u) {
+        stats.words[i] = ((i - W_CUT_BOX) & 3u) < 2u ? 0xFFFFFFFFu : 0u;
+    }
+    if (i >= W_MARK_BOX && i < W_MARK_BOX + 4u) {
+        stats.words[i] = i < W_MARK_BOX + 2u ? 0xFFFFFFFFu : 0u;
+    }
+    if (i == 0u) {
+        const float count = max(float(s_n[0]), 1.0);
+        const vec3 t_mean = s_sum[0] / count;
+        const vec3 k_mean = s_ksum[0] / count;
+        const float mean = Luma(t_mean);
+        const float spread = s_max[0] - s_min[0];
+        const float k_spread = s_kmax[0] - s_kmin[0];
+        // A uniform dim or fade over the whole screen (the strips agree), not a uniform tint
+        // that lets everything through.
+        const bool veil = (pc.flags & FLAG_VEIL) != 0u && s_n[0] > 0u && spread < 0.03 &&
+                          k_spread < 0.01 && mean < 0.97;
+        stats.words[W_VEIL] = floatBitsToUint(veil ? mean : 1.0);
+        stats.words[W_VEIL_ON] = veil ? 1u : 0u;
+        stats.words[W_STRIP_T] = floatBitsToUint(mean);
+        stats.words[W_STRIP_D] = floatBitsToUint(spread);
+        stats.words[W_STRIP_K] = floatBitsToUint(s_kmax[0]);
+        stats.words[W_STRIP_KD] = floatBitsToUint(k_spread);
+        for (uint c = 0u; c < 3u; ++c) {
+            stats.words[W_VEIL_T + c] = floatBitsToUint(veil ? t_mean[c] : 1.0);
+            stats.words[W_VEIL_K + c] = floatBitsToUint(veil ? k_mean[c] : 0.0);
+        }
+    }
+}
+
+#elif MODE == 1
+
+// The build-up meter's cut (FLAG_CONDITIONS): cut 3.
+bool InConditions(ivec2 p) {
+    if ((pc.flags & FLAG_CONDITIONS) == 0u || pc.cut_count < 4u) {
+        return false;
+    }
+    const ivec4 r = pc.cut[3];
+    return p.x >= r.x && p.y >= r.y && p.x < r.z && p.y < r.w;
+}
+
+// The strip's first row: at least 8 rows below the bottom half, on a multiple of 8
+// (VR::Ui::Conditions::StripTop).
+int StripTop() {
+    return (2 * pc.band.w + 15) & ~7;
+}
+
+// Band pixel `p` clears its strip pixel unless the meter's own pixel at that offset writes it
+// (an atlas without the strip: nothing), and the gap rows between the bottom half and the strip
+// across the whole width (nothing else writes them: the strip's top edge, the bottom half's last
+// row and their mips never sample stale memory). The cleared columns reach a mip-2 texel (4 px)
+// and more past the widest cut, on a multiple of 8.
+void StripClear(ivec2 p) {
+    const int top = StripTop();
+    const int rows = imageSize(atlas_img).y - top;
+    if (rows <= 0) {
+        return;
+    }
+    const int gap = top - 2 * pc.band.w;
+    if (p.y < gap) {
+        imageStore(atlas_img, ivec2(p.x, 2 * pc.band.w + p.y), vec4(0.0));
+    }
+    const float k = float(pc.band.z) / 1920.0;
+    const int cols = (int(ceil(STRIP_STAGE_X1 * k)) - int(floor(STRIP_STAGE_X0 * k)) + 8 + 7) & ~7;
+    if (p.x >= cols || p.y >= rows) {
+        return;
+    }
+    const bool on = (pc.flags & FLAG_CONDITIONS) != 0u && pc.cut_count > 3u;
+    const ivec2 size = on ? pc.cut[3].zw - pc.cut[3].xy : ivec2(0);
+    if (p.x < size.x && p.y < size.y) {
+        return;
+    }
+    imageStore(atlas_img, ivec2(p.x, top + p.y), vec4(0.0));
+}
+
+shared uint s_count[10];
+shared uint s_box[4];
+shared uint s_obox[4]; // the box of the opaque UI only (W_OPAQUE_BOX)
+shared uint s_cut_box[16];
+shared uint s_mask[16][2]; // this group's rows of the dynamic region's bit mask
+shared uint s_foot;        // gameplay: this group's cell holds status-cluster UI
+shared uint s_foot_seen;   // a full menu: the gameplay HUD drew in this group's cell
+
+void main() {
+    const uint li = gl_LocalInvocationIndex;
+    const uint cell = gl_WorkGroupID.y * FOOTPRINT_STRIDE + gl_WorkGroupID.x;
+    const bool cell_ok = gl_WorkGroupID.x < FOOTPRINT_STRIDE && gl_WorkGroupID.y < FOOTPRINT_ROWS;
+    if (li < 10u) {
+        s_count[li] = 0u;
+    }
+    if (li < 4u) {
+        s_box[li] = li < 2u ? 0xFFFFFFFFu : 0u;
+        s_obox[li] = li < 2u ? 0xFFFFFFFFu : 0u;
+    }
+    if (li < 16u) {
+        s_cut_box[li] = (li & 3u) < 2u ? 0xFFFFFFFFu : 0u;
+    }
+    if (li < 32u) {
+        s_mask[li / 2u][li % 2u] = 0u;
+    }
+    if (li == 0u) {
+        s_foot = 0u;
+        s_foot_seen = (pc.flags & FLAG_MENU_BOX) != 0u && cell_ok
+                          ? split.mask[FOOTPRINT_BASE + cell]
+                          : 0u;
+    }
+    barrier();
+    const int dyn = (pc.flags & FLAG_GAMEPLAY) != 0u ? DynamicCut() : -1;
+    const ivec4 dr = dyn >= 0 ? pc.cut[dyn] : ivec4(0);
+    // The group's first column in the mask (its 16 columns straddle at most two words).
+    const int group_x0 = int(gl_WorkGroupID.x) * 16;
+    const int word0 = dyn >= 0 ? (group_x0 - dr.x) >> 5 : 0;
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x < pc.band.z && p.y < pc.band.w) {
+        const ivec2 q = pc.band.xy + p;
+        const vec3 w = texelFetch(w_tex, q, 0).rgb;
+        vec3 k = texelFetch(k_tex, q, 0).rgb;
+        bool saturated;
+        vec3 t = ReadKT(k, w, saturated);
+        if ((pc.flags & FLAG_MARKER) != 0u) {
+            MarkerCompose(p, k, t);
+        }
+        vec4 px = UiPixelKT(k, t, true);
+        // An area name's corner without its dark backing (not while another lower-group box with
+        // its own backing is up). The split's rows still see the name as drawn (it is found by
+        // them, VR::Ui::StepAreaName).
+        const float split_alpha = px.a;
+        if (InAreaKey(p) &&
+            (pc.flags & (FLAG_ACTION_PROMPT | FLAG_ITEM_PICKUP | FLAG_DIALOGUE)) == 0u) {
+            px = KeyAreaName(px);
+        }
+        const float alpha = px.a;
+        // The build-up meter leaves both halves for the strip (FLAG_CONDITIONS).
+        const bool cond = InConditions(p);
+        imageStore(atlas_img, p, cond ? vec4(0.0) : px);
+        if (cond) {
+            imageStore(atlas_img, ivec2(p.x - pc.cut[3].x, StripTop() + p.y - pc.cut[3].y), px);
+        }
+        StripClear(p);
+        bool cut = false;
+        bool status = false;
+        for (uint c = 0u; c < pc.cut_count && c < 4u; ++c) {
+            if (cond && c != 3u) {
+                continue; // its pixels belong to the meter's cut alone (first match)
+            }
+            const ivec4 r = pc.cut[c];
+            if (p.x >= r.x && p.y >= r.y && p.x < r.z && p.y < r.w) {
+                // The dynamic region is split later (mode 5); outside gameplay it stays whole.
+                if (int(c) != DynamicCut()) {
+                    cut = true;
+                }
+                if (((pc.flags >> (STATUS_SHIFT + c)) & 1u) != 0u) {
+                    status = true;
+                }
+                if (alpha > 4.0 / 255.0) {
+                    atomicAdd(s_count[3u + c], 1u);
+                }
+                if (alpha > 16.0 / 255.0) {
+                    atomicMin(s_cut_box[4u * c], uint(p.x));
+                    atomicMin(s_cut_box[4u * c + 1u], uint(p.y));
+                    atomicMax(s_cut_box[4u * c + 2u], uint(p.x));
+                    atomicMax(s_cut_box[4u * c + 3u], uint(p.y));
+                }
+            }
+        }
+        imageStore(atlas_img, ivec2(p.x, p.y + pc.band.w), cut ? vec4(0.0) : px);
+        if (alpha > 4.0 / 255.0) {
+            atomicAdd(s_count[0], 1u);
+            if (!cut) {
+                atomicAdd(s_count[1], 1u);
+            }
+            if (p.x < 8 || p.y < 8 || p.x >= pc.band.z - 8 || p.y >= pc.band.w - 8) {
+                atomicAdd(s_count[2], 1u);
+            }
+        }
+        if (alpha > 250.0 / 255.0) {
+            atomicAdd(s_count[7], 1u);
+        }
+        if (saturated) {
+            atomicAdd(s_count[8], 1u);
+        }
+        if ((pc.flags & FLAG_FOOTPRINT) != 0u && status && alpha > 4.0 / 255.0) {
+            atomicOr(s_foot, 1u);
+        }
+        // A dialog's box leaves the status clusters out; a full menu's only the gameplay HUD's
+        // footprint in them (its own title or tabs there count).
+        const bool left_out =
+            (pc.flags & FLAG_MENU_BOX) != 0u ? status && s_foot_seen != 0u : status;
+        if (alpha > 0.25 && !left_out && p.x >= pc.box.x && p.y >= pc.box.y && p.x < pc.box.z &&
+            p.y < pc.box.w) {
+            atomicMin(s_box[0], uint(p.x));
+            atomicMin(s_box[1], uint(p.y));
+            atomicMax(s_box[2], uint(p.x));
+            atomicMax(s_box[3], uint(p.y));
+            // The opaque UI alone (a page such as Status, not a dim over the menu).
+            if (alpha > 250.0 / 255.0) {
+                atomicMin(s_obox[0], uint(p.x));
+                atomicMin(s_obox[1], uint(p.y));
+                atomicMax(s_obox[2], uint(p.x));
+                atomicMax(s_obox[3], uint(p.y));
+            }
+        }
+        if (dyn >= 0 && split_alpha > 16.0 / 255.0 && p.x >= dr.x && p.y >= dr.y && p.x < dr.z &&
+            p.y < dr.w) {
+            const int bit = p.x - dr.x;
+            atomicOr(s_mask[gl_LocalInvocationID.y][(bit >> 5) - word0], 1u << (bit & 31));
+        }
+    }
+    barrier();
+    if (li < 9u && s_count[li] != 0u) {
+        const uint word = li < 3u   ? W_CONTENT + li
+                          : li < 7u ? W_CUT0 + li - 3u
+                          : li == 7u ? W_OPAQUE
+                                     : W_SATURATED;
+        atomicAdd(stats.words[word], s_count[li]);
+    }
+    if (li == 0u && s_box[2] >= s_box[0]) {
+        atomicMin(stats.words[W_BOX], s_box[0]);
+        atomicMin(stats.words[W_BOX + 1u], s_box[1]);
+        atomicMax(stats.words[W_BOX + 2u], s_box[2]);
+        atomicMax(stats.words[W_BOX + 3u], s_box[3]);
+    }
+    if (li == 1u && s_obox[2] >= s_obox[0]) {
+        atomicMin(stats.words[W_OPAQUE_BOX], s_obox[0]);
+        atomicMin(stats.words[W_OPAQUE_BOX + 1u], s_obox[1]);
+        atomicMax(stats.words[W_OPAQUE_BOX + 2u], s_obox[2]);
+        atomicMax(stats.words[W_OPAQUE_BOX + 3u], s_obox[3]);
+    }
+    if (li < 4u && s_cut_box[4u * li + 2u] >= s_cut_box[4u * li]) {
+        atomicMin(stats.words[W_CUT_BOX + 4u * li], s_cut_box[4u * li]);
+        atomicMin(stats.words[W_CUT_BOX + 4u * li + 1u], s_cut_box[4u * li + 1u]);
+        atomicMax(stats.words[W_CUT_BOX + 4u * li + 2u], s_cut_box[4u * li + 2u]);
+        atomicMax(stats.words[W_CUT_BOX + 4u * li + 3u], s_cut_box[4u * li + 3u]);
+    }
+    if (li == 0u && (pc.flags & FLAG_FOOTPRINT) != 0u && cell_ok) {
+        split.mask[FOOTPRINT_BASE + cell] = s_foot; // every cell, every gameplay frame
+    }
+    if (dyn >= 0 && li < 32u) {
+        const uint row = li / 2u;
+        const uint bits = s_mask[row][li % 2u];
+        const int y = int(gl_WorkGroupID.y) * 16 + int(row);
+        const int word = word0 + int(li % 2u);
+        const uint words = MaskWords(dr);
+        if (bits != 0u && y >= dr.y && y < dr.w && word >= 0 && uint(word) < words) {
+            atomicOr(split.mask[uint(y - dr.y) * words + uint(word)], bits);
+        }
+    }
+}
+
+#elif MODE == 2
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.scene_size.x || p.y >= pc.scene_size.y || stats.words[W_VEIL_ON] == 0u) {
+        return;
+    }
+    // S' = K_v + T_v * S per true channel (raw channel c holds true component raw_order[c]).
+    vec4 tv = vec4(1.0);
+    vec4 kv = vec4(0.0);
+    for (uint c = 0u; c < 4u; ++c) {
+        const uint comp = (pc.raw_order >> (2u * c)) & 3u;
+        if (comp < 3u) {
+            tv[c] = uintBitsToFloat(stats.words[W_VEIL_T + comp]);
+            kv[c] = uintBitsToFloat(stats.words[W_VEIL_K + comp]);
+        }
+    }
+    imageStore(scene_img, p, clamp(kv + tv * imageLoad(scene_img, p), 0.0, 1.0));
+}
+
+#elif MODE == 3
+
+shared uint s_count[4];
+
+void main() {
+    const uint li = gl_LocalInvocationIndex;
+    if (li < 4u) {
+        s_count[li] = 0u;
+    }
+    barrier();
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x < pc.band.z && p.y < pc.band.w) {
+        const ivec2 q = pc.band.xy + p;
+        const vec3 k = texelFetch(k_tex, q, 0).rgb;
+        const vec3 w = texelFetch(w_tex, q, 0).rgb;
+        const vec3 x = texelFetch(final_tex, q, 0).rgb;
+        const vec3 s = texelFetch(scene_tex, q, 0).rgb;
+        vec3 predicted;
+        if ((pc.flags & FLAG_SRGB_RT) != 0u) {
+            predicted = LinearToSrgb(SrgbToLinear(k) + Transmittance(k, w) * SrgbToLinear(s));
+        } else {
+            predicted = clamp(k + Transmittance(k, w) * s, 0.0, 1.0);
+        }
+        const vec3 d = abs(predicted - x) * 255.0;
+        const uint err = uint(round(max(d.r, max(d.g, d.b))));
+        atomicAdd(s_count[0], 1u);
+        if (err > 3u) {
+            atomicAdd(s_count[1], 1u);
+        }
+        if (err > 8u) {
+            atomicAdd(s_count[3], 1u);
+        }
+        atomicMax(stats.words[W_CHECK_MAX], err);
+        atomicAdd(s_count[2], err);
+    }
+    barrier();
+    if (li == 0u) {
+        atomicAdd(stats.words[W_CHECK_N], s_count[0]);
+        atomicAdd(stats.words[W_CHECK_BAD], s_count[1]);
+        atomicAdd(stats.words[W_CHECK_SUM], s_count[2]);
+        atomicAdd(stats.words[W_CHECK_BAD2], s_count[3]);
+    }
+}
+
+#elif MODE == 4
+
+shared uint s_l[1024];
+shared uint s_r[1024];
+
+void main() {
+    const uint i = gl_LocalInvocationIndex;
+    const int dyn = DynamicCut();
+    const ivec4 dr = dyn >= 0 ? pc.cut[dyn] : ivec4(0);
+    const uint rows = uint(clamp(dr.w - dr.y, 0, 1024));
+    const uint words = MaskWords(dr);
+    const uint min_width = SplitMinWidth();
+    const uint gap = SplitGap();
+    // Per row: the union of its runs at least min_width wide (mask bits, gaps <= gap bridged).
+    for (uint r = i; r < rows; r += 256u) {
+        uint lo = 0xFFFFFFFFu;
+        uint hi = 0u;
+        bool open = false;
+        uint start = 0u;
+        uint last = 0u;
+        for (uint wi = 0u; wi < words; ++wi) {
+            uint bits = split.mask[r * words + wi];
+            while (bits != 0u) {
+                const uint x = wi * 32u + uint(findLSB(bits));
+                uint end = x;
+                if (bits == 0xFFFFFFFFu) {
+                    end = wi * 32u + 31u; // a full word in one step
+                    bits = 0u;
+                } else {
+                    bits &= bits - 1u;
+                }
+                if (open && x <= last + gap + 1u) {
+                    last = end;
+                } else {
+                    if (open && last - start + 1u >= min_width) {
+                        lo = min(lo, start);
+                        hi = max(hi, last);
+                    }
+                    open = true;
+                    start = x;
+                    last = end;
+                }
+            }
+        }
+        if (open && last - start + 1u >= min_width) {
+            lo = min(lo, start);
+            hi = max(hi, last);
+        }
+        s_l[r] = lo;
+        s_r[r] = hi;
+    }
+    barrier();
+    // Dilated over the neighbouring rows (band px), the UI left out of it counted, the mask
+    // cleared for the next frame (the same rows as above: no barrier needed).
+    const int dilate = int(SplitDilate());
+    const uint margin = SplitMargin();
+    uint found = 0u;
+    uint left_out = 0u;
+    uint right = 0u;
+    for (uint r = i; r < 1024u; r += 256u) {
+        uint lo = 0xFFFFFFFFu;
+        uint hi = 0u;
+        if (r < rows) {
+            const int a = max(int(r) - dilate, 0);
+            const int b = min(int(r) + dilate, int(rows) - 1);
+            for (int j = a; j <= b; ++j) {
+                if (s_l[j] <= s_r[j]) {
+                    lo = min(lo, s_l[j]);
+                    hi = max(hi, s_r[j]);
+                }
+            }
+            if (s_l[r] <= s_r[r]) {
+                ++found;
+            }
+            // Mask bits outside [lo - margin, hi + margin] stay on the rest quad.
+            const int in0 = lo <= hi ? int(lo) - int(margin) : 1;
+            const int in1 = lo <= hi ? int(hi) + int(margin) : 0;
+            for (uint wi = 0u; wi < words; ++wi) {
+                const uint bits = split.mask[r * words + wi];
+                if (bits == 0u) {
+                    continue;
+                }
+                split.mask[r * words + wi] = 0u;
+                const int w0 = int(wi * 32u);
+                const int a0 = clamp(in0 - w0, 0, 32);
+                const int a1 = clamp(in1 - w0 + 1, 0, 32);
+                uint inside = 0u;
+                if (a1 > a0) {
+                    const uint upto = a1 >= 32 ? 0xFFFFFFFFu : (1u << uint(a1)) - 1u;
+                    const uint from = a0 >= 32 ? 0u : ~((1u << uint(a0)) - 1u);
+                    inside = upto & from;
+                }
+                left_out += uint(bitCount(bits & ~inside));
+            }
+        }
+        const bool any_hud = lo <= hi;
+        if (any_hud) {
+            right = max(right, uint(dr.x) + hi + 1u);
+        }
+        split.row_lr[2u * r] = any_hud ? uint(dr.x) + lo : 1u;
+        split.row_lr[2u * r + 1u] = any_hud ? uint(dr.x) + hi : 0u;
+    }
+    if (found != 0u) {
+        atomicAdd(stats.words[W_SPLIT_ROWS], found);
+    }
+    if (left_out != 0u) {
+        atomicAdd(stats.words[W_SPLIT_OUT], left_out);
+    }
+    if (right != 0u) {
+        atomicMax(stats.words[W_SPLIT_RIGHT], right);
+    }
+}
+
+#elif MODE == 5
+
+void main() {
+    const int dyn = DynamicCut();
+    const ivec4 dr = dyn >= 0 ? pc.cut[dyn] : ivec4(0);
+    const ivec2 p = dr.xy + ivec2(gl_GlobalInvocationID.xy);
+    if (dyn < 0 || p.x >= dr.z || p.y >= dr.w || p.x >= pc.band.z || p.y >= pc.band.w) {
+        return;
+    }
+    const uint row = uint(p.y - dr.y);
+    bool hud = false;
+    if (row < 1024u) {
+        const int lo = int(split.row_lr[2u * row]);
+        const int hi = int(split.row_lr[2u * row + 1u]);
+        const int margin = int(SplitMargin());
+        hud = lo <= hi && p.x >= lo - margin && p.x <= hi + margin;
+    }
+    // The action prompt's stage bounds (491..1416, 868..946), with room for its
+    // backing and fade animation. A faint/narrow first frame must never land on the
+    // much larger world-aligned rest quad before the width classifier recognizes it.
+    // Only the active prompt's region is reserved; enemy tags elsewhere still use
+    // the existing content classifier. This is routing only: no colour/alpha filter.
+    const float k = float(pc.band.z) / 1920.0;
+    if ((pc.flags & FLAG_ACTION_PROMPT) != 0u &&
+        p.x >= int(floor(460.0 * k)) && p.x < int(ceil(1460.0 * k)) &&
+        p.y >= int(floor(844.0 * k)) && p.y < int(ceil(972.0 * k))) {
+        hud = true;
+    }
+    // The game exposes the item-get queue before the confirmation fades in. Keep
+    // that lower-HUD popup on its final layer, even before its pixels form a wide row.
+    if ((pc.flags & (FLAG_ITEM_PICKUP | FLAG_DIALOGUE)) != 0u) {
+        hud = true; // this invocation is already confined to the lower dynamic cut
+    }
+    // An area name's corner: whole on its piece (its keyed words' rows are no wide runs, its
+    // backing's faint edges never on the rest quad).
+    if (InAreaName(p)) {
+        hud = true;
+    }
+    if (hud) {
+        imageStore(atlas_img, ivec2(p.x, p.y + pc.band.w), vec4(0.0)); // off the rest quad
+    } else {
+        imageStore(atlas_img, p, vec4(0.0)); // off the HUD band
+    }
+}
+
+#elif MODE == 6
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if ((pc.flags & FLAG_FULL_MENU) == 0u || stats.words[W_REST] != 0u || p.x >= pc.band.z ||
+        p.y >= pc.band.w) {
+        return; // the menu is there
+    }
+    if (p == ivec2(0)) {
+        stats.words[W_MENU_GONE] = 1u;
+    }
+    for (uint c = 0u; c < pc.cut_count && c < 4u; ++c) {
+        const ivec4 r = pc.cut[c];
+        if (((pc.flags >> (STATUS_SHIFT + c)) & 1u) != 0u && p.x >= r.x && p.y >= r.y &&
+            p.x < r.z && p.y < r.w) {
+            imageStore(atlas_img, p, vec4(0.0));
+            return;
+        }
+    }
+}
+
+#elif MODE == 7
+
+shared uint s_count[2];
+shared uint s_foot; // the gameplay HUD drew in this group's cell (the footprint, mode 1)
+shared uint s_cut_box[16]; // the HUD's content box per cut (ui_menu_hud_off_canvas: K and W
+                           // lost it in the HUD's rows, so mode 1 did not see it there)
+shared vec3 s_strip_t[32];
+shared vec3 s_strip_k[32];
+shared vec4 s_veil; // the kept K and W's own veil (T_v luma < 1: the menu's dim got in), K_v
+shared vec3 s_veil_t;
+
+void main() {
+    const uint li = gl_LocalInvocationIndex;
+    if (li < 2u) {
+        s_count[li] = 0u;
+    }
+    if (li < 16u) {
+        s_cut_box[li] = (li & 3u) < 2u ? 0xFFFFFFFFu : 0u;
+    }
+    if (li == 0u) {
+        const bool cell_ok = gl_WorkGroupID.x < FOOTPRINT_STRIDE && gl_WorkGroupID.y < FOOTPRINT_ROWS;
+        s_foot = cell_ok ? split.mask[FOOTPRINT_BASE + gl_WorkGroupID.y * FOOTPRINT_STRIDE +
+                                      gl_WorkGroupID.x]
+                         : 0u;
+    }
+    // The band's edge columns just below the status clusters (inside the rows kept, never the
+    // HUD's): if the menu's dim was kept too (a box of the HUD drawn like it, learnt as the
+    // HUD's), its uniform veil shows there and is taken back out of the HUD under it.
+    if (li < 32u) {
+        const int x = li < 16u ? 4 : pc.band.z - 5;
+        const int y = pc.band.w * 250 / 1080 + 6 + int(li % 16u);
+        const ivec2 q = pc.band.xy + ivec2(x, y);
+        const vec3 k = texelFetch(k_tex, q, 0).rgb;
+        s_strip_t[li] = Transmittance(k, texelFetch(w_tex, q, 0).rgb);
+        s_strip_k[li] = BlendDomain(k);
+    }
+    barrier();
+    if (li == 0u) {
+        vec3 t_sum = vec3(0.0);
+        vec3 k_sum = vec3(0.0);
+        float t_min = 1e9;
+        float t_max = -1e9;
+        for (uint i = 0u; i < 32u; ++i) {
+            t_sum += s_strip_t[i];
+            k_sum += s_strip_k[i];
+            t_min = min(t_min, Luma(s_strip_t[i]));
+            t_max = max(t_max, Luma(s_strip_t[i]));
+        }
+        const vec3 tv = t_sum / 32.0;
+        const bool veil = t_max - t_min < 0.03 && Luma(tv) < 0.97 && min(tv.r, min(tv.g, tv.b)) >= 0.04;
+        s_veil = vec4(k_sum / 32.0, veil ? 1.0 : 0.0);
+        s_veil_t = tv;
+    }
+    barrier();
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    bool status = false;
+    uint status_cut = 0u;
+    if (p.x < pc.band.z && p.y < pc.band.w) {
+        for (uint c = 0u; c < pc.cut_count && c < 4u; ++c) {
+            const ivec4 r = pc.cut[c];
+            if (((pc.flags >> (STATUS_SHIFT + c)) & 1u) != 0u && p.x >= r.x && p.y >= r.y &&
+                p.x < r.z && p.y < r.w) {
+                status = true;
+                status_cut = c;
+            }
+        }
+    }
+    if (status) {
+        // K and W just before the menu's first draw: the HUD alone, under no veil.
+        const ivec2 q = pc.band.xy + p;
+        vec3 k = texelFetch(k_tex, q, 0).rgb;
+        vec3 w = texelFetch(w_tex, q, 0).rgb;
+        if (s_veil.w > 0.5) {
+            // The HUD under a uniform veil: K = K_v + T_v * K_h, T = T_v * T_h (blend domain).
+            const vec3 tv = s_veil_t;
+            const vec3 t_h = clamp(Transmittance(k, w) / tv, 0.0, 1.0);
+            const vec3 k_h = clamp((BlendDomain(k) - s_veil.rgb) / tv, 0.0, 1.0);
+            k = RawDomain(k_h);
+            w = RawDomain(min(k_h + pc.grey * t_h, vec3(1.0)));
+        }
+        bool saturated;
+        const vec4 px = UiPixel(k, w, false, saturated);
+        const bool keep = s_foot != 0u;
+        imageStore(atlas_img, ivec2(p.x, p.y + pc.band.w), keep ? px : vec4(0.0));
+        if (px.a > 4.0 / 255.0) {
+            atomicAdd(s_count[keep ? 0u : 1u], 1u);
+        }
+        if (keep && px.a > 16.0 / 255.0) {
+            atomicMin(s_cut_box[4u * status_cut], uint(p.x));
+            atomicMin(s_cut_box[4u * status_cut + 1u], uint(p.y));
+            atomicMax(s_cut_box[4u * status_cut + 2u], uint(p.x));
+            atomicMax(s_cut_box[4u * status_cut + 3u], uint(p.y));
+        }
+    }
+    barrier();
+    if (li < 4u && s_cut_box[4u * li + 2u] >= s_cut_box[4u * li]) {
+        atomicMin(stats.words[W_CUT_BOX + 4u * li], s_cut_box[4u * li]);
+        atomicMin(stats.words[W_CUT_BOX + 4u * li + 1u], s_cut_box[4u * li + 1u]);
+        atomicMax(stats.words[W_CUT_BOX + 4u * li + 2u], s_cut_box[4u * li + 2u]);
+        atomicMax(stats.words[W_CUT_BOX + 4u * li + 3u], s_cut_box[4u * li + 3u]);
+    }
+    if (li < 2u && s_count[li] != 0u) {
+        atomicAdd(stats.words[li == 0u ? W_MENU_HUD : W_MENU_HUD_OUT], s_count[li]);
+    }
+    if (li == 2u && s_veil.w > 0.5) {
+        atomicMax(stats.words[W_MENU_HUD_VEIL], 1u);
+    }
+}
+
+#elif MODE == 8
+
+shared uint s_mbox[4];
+
+void main() {
+    const uint li = gl_LocalInvocationIndex;
+    if (li < 4u) {
+        s_mbox[li] = li < 2u ? 0xFFFFFFFFu : 0u;
+    }
+    barrier();
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x < pc.band.z && p.y < pc.band.w) {
+        const ivec2 q = pc.band.xy + p;
+        if (MarkerPixel(texelFetch(mk_tex, q, 0).rgb, texelFetch(mw_tex, q, 0).rgb)) {
+            atomicMin(s_mbox[0], uint(p.x));
+            atomicMin(s_mbox[1], uint(p.y));
+            atomicMax(s_mbox[2], uint(p.x));
+            atomicMax(s_mbox[3], uint(p.y));
+        }
+    }
+    barrier();
+    if (li == 0u && s_mbox[2] >= s_mbox[0] && s_mbox[0] != 0xFFFFFFFFu) {
+        atomicMin(stats.words[W_MARK_BOX], s_mbox[0]);
+        atomicMin(stats.words[W_MARK_BOX + 1u], s_mbox[1]);
+        atomicMax(stats.words[W_MARK_BOX + 2u], s_mbox[2]);
+        atomicMax(stats.words[W_MARK_BOX + 3u], s_mbox[3]);
+    }
+}
+
+#endif

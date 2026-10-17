@@ -1,0 +1,449 @@
+<?xml version='1.0' encoding='utf-8'?>
+<Patch>
+    <TitleID>
+        <ID>CUSA00207</ID>
+        <ID>CUSA00208</ID>
+        <ID>CUSA00299</ID>
+        <ID>CUSA00900</ID>
+        <ID>CUSA01363</ID>
+		<ID>CUSA03014</ID>
+        <ID>CUSA03023</ID>
+        <ID>CUSA03173</ID>
+    </TitleID>
+    <Metadata Title="Bloodborne" Name="Skip Intro + warning message" Author="illusion, Kyo" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true">
+        <PatchList>
+            <Line Type="bytes32" Address="0x04d99138" Value="0x00000000" />
+            <Line Type="bytes32" Address="0x04d99154" Value="0x00000000" />
+            <Line Type="bytes32" Address="0x04d9916e" Value="0x00000000" />
+            <Line Type="bytes" Address="0x0202EE1C" Value="EB73" />
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Bloodborne" Name="Disable Motion Blur (Perf Increase)" Note="Disable Motion Blur constructor, which also disables the velomap render, performance increase." Author="Kyo" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true">
+        <PatchList>
+            <Line Type="bytes" Address="0x026C2549" Value="00" />
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Bloodborne" Name="Disable Chromatic Aberration" Author="illusion" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true">
+        <PatchList>
+            <Line Type="bytes" Address="0x0269faa8" Value="c783ac000000000000009090" />
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Bloodborne" Name="Disable AA" Note="Disables Anti-Aliasing constructor. Off in VR since 2026-10-04: depth-based stereo (DIBR) keeps the game AA (smoother edges, no fps cost measured)." Author="Kyo" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="false">
+        <PatchList>
+			<Line Type="bytes" Address="0x026C254A" Value="00" />
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Bloodborne" Name="Disable DoF" Note="Disables Depth of Field" Author="Kyo" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true">
+        <PatchList>
+            <Line Type="bytes" Address="0x025D7BBC" Value="E9DF00000090" />
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Bloodborne" Name="60 FPS++" Note="Changes some frame settings like the frame skip, vsync, frame tearing, etc.. \nWill help with better input delay/response times for 60 FPS." Author="Kyo" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true">
+        <PatchList>
+            <Line Type="bytes" Address="0x0183A4C3" Value="CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183A8C1" Value="CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183A4CD" Value="CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183A8CB" Value="CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183A4D7" Value="CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183A8D5" Value="CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183A4E1" Value="CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183A8DF" Value="CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183A4F5" Value="CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183A8F3" Value="CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183A4FF" Value="CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183A8FD" Value="CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183A509" Value="8FC2753C" />
+            <Line Type="bytes" Address="0x0183A907" Value="8FC2753C" />
+            <Line Type="bytes" Address="0x0183A527" Value="CDCC4C3E" />
+            <Line Type="bytes" Address="0x0183A925" Value="CDCC4C3E" />
+            <Line Type="bytes" Address="0x0183A531" Value="CDCC4C3E" />
+            <Line Type="bytes" Address="0x0183A92F" Value="CDCC4C3E" />
+            <Line Type="bytes" Address="0x0183A53B" Value="9A99193E" />
+            <Line Type="bytes" Address="0x0183A939" Value="9A99193E" />
+            <Line Type="bytes" Address="0x0183A649" Value="C2B8323F" />
+            <Line Type="bytes" Address="0x0183AA47" Value="C2B8323F" />
+            <Line Type="bytes" Address="0x0183A653" Value="0AD7233D" />
+            <Line Type="bytes" Address="0x0183AA51" Value="0AD7233D" />
+            <Line Type="bytes" Address="0x0183A65D" Value="9A99193E" />
+            <Line Type="bytes" Address="0x0183AA5B" Value="9A99193E" />
+            <Line Type="bytes" Address="0x01915FAF" Value="BD314103" />
+            <Line Type="bytes" Address="0x0192C405" Value="14000000" />
+            <Line Type="bytes" Address="0x04CF6420" Value="CDCC4C3DCDCC4C3DCDCC4C3DCDCC4C3D" />
+            <Line Type="bytes" Address="0x00a3fc3f" Value="8988883C" />
+            <Line Type="bytes" Address="0x012b5458" Value="8988883C" />
+            <Line Type="bytes" Address="0x012b55b6" Value="8988883C" />
+            <Line Type="bytes" Address="0x013734f3" Value="8988883C" />
+            <Line Type="bytes" Address="0x016efe5c" Value="8988883C" />
+            <Line Type="bytes" Address="0x01bf9b74" Value="8988883C" />
+            <Line Type="bytes" Address="0x01c0ca9a" Value="8988883C" />
+            <Line Type="bytes" Address="0x01daa65e" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ea4003" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ea40a0" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ea4146" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ea49ce" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ea4bda" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ea5248" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ea5476" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ea552d" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ea57c0" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ea5ac5" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ea6015" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ea6045" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ea6275" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ea62a5" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ea632f" Value="8988883C" />
+            <Line Type="bytes" Address="0x01eb540b" Value="8988883C" />
+            <Line Type="bytes" Address="0x01eb54dc" Value="8988883C" />
+            <Line Type="bytes" Address="0x01eb90aa" Value="8988883C" />
+            <Line Type="bytes" Address="0x01eb9117" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ebb111" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ebf0d3" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ec3f69" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ec3f9a" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ec3fd8" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ec4009" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ec404e" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ec40a4" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ec40e0" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ec4136" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ec4167" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ec41a5" Value="8988883C" />
+            <Line Type="bytes" Address="0x01ec41dc" Value="8988883C" />
+            <Line Type="bytes" Address="0x01f032f2" Value="8988883C" />
+            <Line Type="bytes" Address="0x01f03762" Value="8988883C" />
+            <Line Type="bytes" Address="0x01f6aa32" Value="8988883C" />
+            <Line Type="bytes" Address="0x01f96d9a" Value="8988883C" />
+            <Line Type="bytes" Address="0x0200d8e2" Value="8988883C" />
+            <Line Type="bytes" Address="0x0200e142" Value="8988883C" />
+            <Line Type="bytes" Address="0x0200e2d4" Value="8988883C" />
+            <Line Type="bytes" Address="0x0200fa52" Value="8988883C" />
+            <Line Type="bytes" Address="0x020119d2" Value="8988883C" />
+            <Line Type="bytes" Address="0x02012652" Value="8988883C" />
+            <Line Type="bytes" Address="0x020127cc" Value="8988883C" />
+            <Line Type="bytes" Address="0x02012932" Value="8988883C" />
+            <Line Type="bytes" Address="0x02012ac4" Value="8988883C" />
+            <Line Type="bytes" Address="0x02012c32" Value="8988883C" />
+            <Line Type="bytes" Address="0x0222bcd7" Value="8988883C" />
+            <Line Type="bytes" Address="0x02418e39" Value="8988883C" />
+            <Line Type="bytes" Address="0x02418f38" Value="8988883C" />
+            <Line Type="bytes" Address="0x0243485f" Value="8988883C" />
+            <Line Type="bytes" Address="0x02434883" Value="8988883C" />
+            <Line Type="bytes" Address="0x024348b8" Value="8988883C" />
+            <Line Type="bytes" Address="0x0243460c" Value="8988883C" />
+            <Line Type="bytes" Address="0x04befdcc" Value="8988883C" />
+            <Line Type="bytes" Address="0x04c88688" Value="8988883C" />
+            <Line Type="bytes" Address="0x04cad65c" Value="8988883C" />
+            <Line Type="bytes" Address="0x04cad660" Value="8988883C" />
+            <Line Type="bytes" Address="0x04cad664" Value="8988883C" />
+            <Line Type="bytes" Address="0x04cadc08" Value="8988883C" />
+            <Line Type="bytes" Address="0x04cadd28" Value="8988883C" />
+            <Line Type="bytes" Address="0x04caf1bc" Value="8988883C" />
+            <Line Type="bytes" Address="0x04caf290" Value="8988883C" />
+            <Line Type="bytes" Address="0x04caf294" Value="8988883C" />
+            <Line Type="bytes" Address="0x04caf340" Value="8988883C" />
+            <Line Type="bytes" Address="0x04caf344" Value="8988883C" />
+            <Line Type="bytes" Address="0x04cb03b8" Value="8988883C" />
+            <Line Type="bytes" Address="0x04cb03bc" Value="8988883C" />
+            <Line Type="bytes" Address="0x04ccc3f4" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d25844" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d2585c" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d25864" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d265fc" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d26618" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d26c9c" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d270e4" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d27250" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d27258" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d27554" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d275f4" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d27720" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d27c4c" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d28418" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d28e98" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d29124" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d29128" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d29b80" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d29e74" Value="8988883C" />
+            <Line Type="bytes" Address="0x00fbc40f" Value="eb1d" />
+            <Line Type="bytes32" Address="0x02434806" Value="0x08516348" />
+            <Line Type="bytes" Address="0x021bc181" Value="488d3d70437803" />
+            <Line Type="bytes" Address="0x021bc188" Value="488b3f" />
+            <Line Type="bytes" Address="0x021bc18b" Value="c5fa598764020000" />
+            <Line Type="bytes" Address="0x021bc193" Value="90909090909090909090" />
+            <Line Type="bytes" Address="0x021bc19d" Value="e96e010000" />
+            <Line Type="bytes" Address="0x021bc308" Value="e974feffff" />
+            <Line Type="bytes" Address="0x021bc30d" Value="909090" />
+            <Line Type="bytes" Address="0x02418E3D" Value="817B188988083D741EC745C88988083DF30F108364020000F30F5F4318F30F5D45C8F30F1145C8" />
+            <Line Type="bytes" Address="0x02418E64" Value="488D05A5765203" />
+            <Line Type="bytes" Address="0x024347F3" Value="8B11" />
+            <Line Type="bytes" Address="0x024348A2" Value="EB3D" />
+            <Line Type="bytes" Address="0x024348F0" Value="EB08" />
+            <Line Type="bytes" Address="0x02434907" Value="EB08" />
+            <Line Type="bytes" Address="0x0243491A" Value="EB21" />
+            <Line Type="bytes" Address="0x0243494E" Value="EB0C" />
+            <Line Type="bytes" Address="0x02434D98" Value="9090" />
+            <Line Type="bytes" Address="0x0243480F" Value="41C744241001000000" />
+            <Line Type="bytes" Address="0x02434820" Value="41C744241001000000" />
+            <Line Type="bytes" Address="0x02434831" Value="41C744241001000000" />
+            <Line Type="bytes" Address="0x0243484B" Value="41C744241001000000" />
+            <Line Type="bytes" Address="0x0243486F" Value="41C744241001000000" />
+            <Line Type="bytes" Address="0x024348A4" Value="41C744241001000000" />
+            <Line Type="bytes" Address="0x02434818" Value="41C644241401" />
+            <Line Type="bytes" Address="0x02434829" Value="41C644241401" />
+            <Line Type="bytes" Address="0x0243483A" Value="41C644241401" />
+            <Line Type="bytes" Address="0x02434854" Value="41C644241401" />
+            <Line Type="bytes" Address="0x02434878" Value="41C644241401" />
+            <Line Type="bytes" Address="0x024348AD" Value="41C644241401" />
+            <Line Type="bytes" Address="0x02434840" Value="41C7442418610B363C" />
+            <Line Type="bytes" Address="0x0243485A" Value="41C7442418610B363C" />
+            <Line Type="bytes" Address="0x0243487E" Value="41C7442418610B363C" />
+            <Line Type="bytes" Address="0x024348B3" Value="41C7442418610B363C" />
+            <Line Type="bytes" Address="0x024349D5" Value="448B3B" />
+            <Line Type="bytes" Address="0x02434863" Value="48B90000000000000000" />
+            <Line Type="bytes" Address="0x02434887" Value="48B90000000000000000" />
+            <Line Type="bytes" Address="0x0243565E" Value="41C7460C02000000" />
+            <Line Type="bytes" Address="0x0575A920" Value="A2EC9B0500000000" />
+            <Line Type="bytes" Address="0x0575A930" Value="72EC9B0500000000" />
+            <Line Type="bytes" Address="0x02483EC1" Value="C390909090" />
+            <Line Type="bytes" Address="0x02C0118A" Value="EB4E" />
+            <Line Type="bytes" Address="0x02C011EB" Value="EB4A" />
+            <Line Type="bytes" Address="0x02C012CA" Value="EB56" />
+            <Line Type="bytes" Address="0x00463300" Value="81FF102700007E05BF10270000E956CBB502" />
+            <Line Type="bytes" Address="0x02C0137D" Value="E87E1F86FD" />
+            <Line Type="bytes" Address="0x04D27FD4" Value="CDCC4CBD" />
+            <Line Type="bytes" Address="0x04D27FE0" Value="CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183DC96" Value="E9D6050000" />
+            <Line Type="bytes" Address="0x0183DCFE" Value="00" />
+            <Line Type="bytes" Address="0x0183FF29" Value="41C7859C010000CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183FF34" Value="41C785A0010000CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183FF3F" Value="41C785A4010000CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183FF4A" Value="41C785A8010000CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183FF55" Value="41C785B0010000CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183FF60" Value="41C785B4010000CDCC4C3D" />
+            <Line Type="bytes" Address="0x0183FF6B" Value="E90B010000" />
+            <Line Type="bytes" Address="0x01840799" Value="41C78538020000C2B8323F" />
+            <Line Type="bytes" Address="0x018407A4" Value="41C7853C0200000AD7233D" />
+            <Line Type="bytes" Address="0x018407AF" Value="41C785B80100008FC2753C" />
+            <Line Type="bytes" Address="0x018407BA" Value="41C785C4010000CDCC4C3E" />
+            <Line Type="bytes" Address="0x018407C5" Value="41C785C8010000CDCC4C3E" />
+            <Line Type="bytes" Address="0x018407D0" Value="41C785CC0100009A99193E" />
+            <Line Type="bytes" Address="0x018407DB" Value="41C785400200009A99193E" />
+            <Line Type="bytes" Address="0x018407E6" Value="E91E000000" />
+            <Line Type="bytes" Address="0x047DF584" Value="0000803E" />
+            <Line Type="bytes" Address="0x04D25E68" Value="CDCCCC3C" />
+            <Line Type="bytes" Address="0x02434FA8" Value="89F8FFFF" />
+            <Line Type="bytes" Address="0x02434FAC" Value="89F8FFFF" />
+            <Line Type="bytes" Address="0x02434FB0" Value="89F8FFFF" />
+            <Line Type="bytes" Address="0x02434FB4" Value="89F8FFFF" />
+            <Line Type="bytes" Address="0x02434FB8" Value="89F8FFFF" />
+            <Line Type="bytes32" Address="0x04D0b5b0" Value="0x3F7BA901" />
+            <Line Type="bytes32" Address="0x04D0b5b4" Value="0x3F7BA901" />
+            <Line Type="bytes32" Address="0x04D0b5b8" Value="0x3F7BA901" />
+            <Line Type="bytes32" Address="0x04D0b5bc" Value="0x3F7BA901" />
+            <Line Type="bytes" Address="0x03ABC208" Value="01000000" />
+            <Line Type="bytes" Address="0x03ABC42D" Value="EB" />
+            <Line Type="bytes" Address="0x03ABC459" Value="14000000" />
+            <Line Type="bytes" Address="0x03ABC67E" Value="EB" />
+            <Line Type="bytes" Address="0x03ABC6AA" Value="C8000000" />
+            <Line Type="bytes" Address="0x03ABC8CF" Value="EB" />
+            <Line Type="bytes" Address="0x03ABC8FB" Value="C8000000" />
+            <Line Type="bytes" Address="0x03ABCB20" Value="EB" />
+            <Line Type="bytes" Address="0x01972A80" Value="8988883D" />
+            <Line Type="bytes" Address="0x04caf1c0" Value="8988883D" />
+            <Line Type="bytes" Address="0x04d2577c" Value="8988883D" />
+            <Line Type="bytes" Address="0x04d29170" Value="8988883C" />
+            <Line Type="bytes" Address="0x04d26364" Value="8988083D" />
+            <Line Type="bytes" Address="0x04d27284" Value="8988883D" />
+            <Line Type="bytes" Address="0x04d2728c" Value="8988083D" />
+            <Line Type="bytes" Address="0x04D25E94" Value="8988883D" />
+            <Line Type="bytes" Address="0x00F383CA" Value="8988883C" />
+            <Line Type="bytes" Address="0x04CAD7FC" Value="00007042" />
+            <Line Type="bytes" Address="0x04D02F10" Value="00007042" />
+            <Line Type="bytes" Address="0x04D02F14" Value="00007042" />
+            <Line Type="bytes" Address="0x04D02F18" Value="00007042" />
+            <Line Type="bytes" Address="0x04D02F1C" Value="00007042" />
+            <Line Type="bytes" Address="0x04D02F70" Value="00007042" />
+            <Line Type="bytes" Address="0x04D02F74" Value="00007042" />
+            <Line Type="bytes" Address="0x04D02F78" Value="00007042" />
+            <Line Type="bytes" Address="0x04D02F7C" Value="00007042" />
+            <Line Type="bytes" Address="0x04C9F358" Value="00007042" />
+            <Line Type="bytes" Address="0x026FB39F" Value="00007042" />
+            <Line Type="bytes" Address="0x023DEDE6" Value="00007042" />
+            <Line Type="bytes" Address="0x023DD026" Value="00007042" />
+            <Line Type="bytes" Address="0x01C9F889" Value="00007042" />
+            <Line Type="bytes" Address="0x01CA975A" Value="00007042" />
+            <Line Type="bytes" Address="0x01CA9892" Value="00007042" />
+            <Line Type="bytes" Address="0x0203ACB7" Value="00007042" />
+            <Line Type="bytes" Address="0x01AB67EF" Value="00007042" />
+            <Line Type="bytes" Address="0x021BB004" Value="00007042" />
+            <Line Type="bytes" Address="0x0187305D" Value="00007042" />
+            <Line Type="bytes" Address="0x0187458D" Value="00007042" />
+            <Line Type="bytes" Address="0x018B254D" Value="00007042" />
+            <Line Type="bytes" Address="0x018B382D" Value="00007042" />
+            <Line Type="bytes" Address="0x0187AFEC" Value="00007042" />
+            <Line Type="bytes" Address="0x0187B0AD" Value="00007042" />
+            <Line Type="bytes" Address="0x01880CFD" Value="00007042" />
+            <Line Type="bytes" Address="0x01880E1A" Value="00007042" />
+            <Line Type="bytes" Address="0x013EF51C" Value="00007042" />
+            <Line Type="bytes" Address="0x013EF6EC" Value="00007042" />
+            <Line Type="bytes" Address="0x0575A908" Value="8988883C" />
+            <Line Type="bytes" Address="0x02418E3D" Value="F30F108364020000F30F5F4318F30F5D0512D59002F30F1145C8F30F1105A91A3403488D05AA7652039090909090" />
+            <Line Type="bytes" Address="0x0131E60B" Value="F9C24304" />
+            <Line Type="bytes" Address="0x0131F7BB" Value="49B14304" />
+            <Line Type="bytes" Address="0x0131F80B" Value="F9B04304" />
+            <Line Type="bytes" Address="0x01320218" Value="ECA64304" />
+            <Line Type="bytes" Address="0x0132024F" Value="B5A64304" />
+            <Line Type="bytes" Address="0x01337A68" Value="9C2E4204" />
+            <Line Type="bytes" Address="0x01337A9F" Value="652E4204" />
+            <Line Type="bytes" Address="0x016AB710" Value="F4F10A04" />
+            <Line Type="bytes" Address="0x016ABE73" Value="91EA0A04" />
+            <Line Type="bytes" Address="0x016ABEDB" Value="29EA0A04" />
+            <Line Type="bytes" Address="0x016AC3EE" Value="16E50A04" />
+            <Line Type="bytes" Address="0x016AC5FE" Value="06E30A04" />
+            <Line Type="bytes" Address="0x016AC7CE" Value="36E10A04" />
+            <Line Type="bytes" Address="0x016AC96E" Value="96DF0A04" />
+            <Line Type="bytes" Address="0x016ACB0E" Value="F6DD0A04" />
+            <Line Type="bytes" Address="0x016AD845" Value="BFD00A04" />
+            <Line Type="bytes" Address="0x016ADF24" Value="E0C90A04" />
+            <Line Type="bytes" Address="0x01BB55F1" Value="1353BA03" />
+            <Line Type="bytes" Address="0x01BB5758" Value="AC51BA03" />
+            <Line Type="bytes" Address="0x01BB5777" Value="8D51BA03" />
+            <Line Type="bytes" Address="0x01C0F64B" Value="B9B2B403" />
+            <Line Type="bytes" Address="0x01BF9D2A" Value="DA0BB603" />
+            <Line Type="bytes" Address="0x0232300D" Value="F7784303" />
+            <Line Type="bytes" Address="0x0232303D" Value="C7784303" />
+            <Line Type="bytes" Address="0x01444947" Value="BD5F3104" />
+            <Line Type="bytes" Address="0x01CBC4FB" Value="09E4A903" />
+            <Line Type="bytes" Address="0x01CBC511" Value="F3E3A903" />
+            <Line Type="bytes" Address="0x02377D4E" Value="B62B3E03" />
+            <Line Type="bytes" Address="0x0267784F" Value="B5300E03" />
+            <Line Type="bytes" Address="0x02677896" Value="6E300E03" />
+            <Line Type="bytes" Address="0x02713DBB" Value="496B0403" />
+            <Line Type="bytes" Address="0x02715D75" Value="8F4B0403" />
+            <Line Type="bytes" Address="0x02713DB1" Value="536B0403" />
+            <Line Type="bytes" Address="0x00EB9F11" Value="F3098A04" />
+            <Line Type="bytes" Address="0x00B6FBD4" Value="047DF603" />
+            <Line Type="bytes" Address="0x025629F0" Value="BF74400000" />
+            <Line Type="bytes" Address="0x00B6E67A" Value="BB01000000909090909090" />
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Bloodborne" Name="Resolution Patch 1456x1576 VR" Note="Generated from Kyo's 4:3 patch: render 1456x1576, UI canvas 1920x2078. Needs extra_dmem_in_mbytes 4000." Author="Kyo (template), bloodborne-vr" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true">
+        <PatchList>
+            <Line Type="bytes" Address="0x04b36dda" Value="00f7" />
+            <Line Type="bytes" Address="0x04b36de2" Value="00a0" />
+            <Line Type="bytes32" Address="0x055289f8" Value="0x000000a0" />
+            <Line Type="bytes32" Address="0x055289fc" Value="0x0000005a" />
+            <Line Type="bytes" Address="0x0183A35D" Value="F3816C3F" />
+            <Line Type="bytes32" Address="0x02196A6B" Value="0x0005B0B8" />
+            <Line Type="bytes32" Address="0x02196A6F" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x02196A73" Value="00" />
+            <Line Type="bytes32" Address="0x02358554" Value="0x0005B0B8" />
+            <Line Type="bytes32" Address="0x02358558" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x0235855C" Value="00" />
+            <Line Type="bytes32" Address="0x02196A7A" Value="0x000628B8" />
+            <Line Type="bytes32" Address="0x02196A7E" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x02196A82" Value="00" />
+            <Line Type="bytes32" Address="0x0235855D" Value="0x000628B9" />
+            <Line Type="bytes32" Address="0x02358561" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x02358565" Value="00" />
+            <Line Type="bytes32" Address="0x019E83AF" Value="0x000780B8" />
+            <Line Type="bytes32" Address="0x019E83B3" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x019E83B7" Value="00" />
+            <Line Type="bytes32" Address="0x01FFD491" Value="0x000780B8" />
+            <Line Type="bytes32" Address="0x01FFD495" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x01FFD499" Value="00" />
+            <Line Type="bytes32" Address="0x01FFD4D1" Value="0x00081EB8" />
+            <Line Type="bytes32" Address="0x01FFD4D5" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x01FFD4D9" Value="00" />
+            <Line Type="bytes32" Address="0x01A44357" Value="0x000780B8" />
+            <Line Type="bytes32" Address="0x01A4435B" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x01A4435F" Value="00" />
+            <Line Type="bytes32" Address="0x01A44C55" Value="0x000780B8" />
+            <Line Type="bytes32" Address="0x01A44C59" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x01A44C5D" Value="00" />
+            <Line Type="bytes32" Address="0x01A452C7" Value="0x000780B8" />
+            <Line Type="bytes32" Address="0x01A452CB" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x01A452CF" Value="00" />
+            <Line Type="bytes32" Address="0x01A44365" Value="0x00081EB8" />
+            <Line Type="bytes32" Address="0x01A44369" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x01A4436D" Value="00" />
+            <Line Type="bytes32" Address="0x01A44C63" Value="0x00081EB8" />
+            <Line Type="bytes32" Address="0x01A44C67" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x01A44C6B" Value="00" />
+            <Line Type="bytes32" Address="0x01A452D5" Value="0x00081EB8" />
+            <Line Type="bytes32" Address="0x01A452D9" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x01A452DD" Value="00" />
+            <Line Type="bytes16" Address="0x01FFD473" Value="0x9066" />
+            <Line Type="bytes16" Address="0x01FFD4CF" Value="0x9066" />
+            <Line Type="bytes16" Address="0x01A54DD9" Value="0x9066" />
+            <Line Type="bytes16" Address="0x01A54E1A" Value="0x9066" />
+            <Line Type="bytes32" Address="0x01A4140A" Value="0x00401F0F" />
+            <Line Type="bytes32" Address="0x0212C674" Value="0x000780BE" />
+            <Line Type="bytes32" Address="0x0212C678" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x0212C67C" Value="00" />
+            <Line Type="bytes32" Address="0x0241848F" Value="0x000780B8" />
+            <Line Type="bytes32" Address="0x02418493" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x02418497" Value="00" />
+            <Line Type="bytes32" Address="0x02438BB9" Value="0x000780B8" />
+            <Line Type="bytes32" Address="0x02438BBD" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x02438BC1" Value="00" />
+            <Line Type="bytes32" Address="0x02438F59" Value="0x000780B8" />
+            <Line Type="bytes32" Address="0x02438F5D" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x02438F61" Value="00" />
+            <Line Type="bytes32" Address="0x0212C6A4" Value="0x00081EBE" />
+            <Line Type="bytes32" Address="0x0212C6A8" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x0212C6AC" Value="00" />
+            <Line Type="bytes32" Address="0x02418498" Value="0x00081EB9" />
+            <Line Type="bytes32" Address="0x0241849C" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x024184A0" Value="00" />
+            <Line Type="bytes32" Address="0x02438BC7" Value="0x00081EB8" />
+            <Line Type="bytes32" Address="0x02438BCB" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x02438BCF" Value="00" />
+            <Line Type="bytes32" Address="0x02438F67" Value="0x00081EB8" />
+            <Line Type="bytes32" Address="0x02438F6B" Value="0x401F0F00" />
+            <Line Type="bytes" Address="0x02438F6F" Value="00" />
+            <Line Type="bytes32" Address="0x04D26EA4" Value="0x44F00000" />
+            <Line Type="bytes32" Address="0x04D26EA8" Value="0x4501E000" />
+            <Line Type="bytes32" Address="0x04CF9A00" Value="0x3F000000" />
+            <Line Type="bytes32" Address="0x04CF9A10" Value="0x3F000000" />
+            <Line Type="bytes32" Address="0x04CF9A14" Value="0x3E850D0F" />
+            <Line Type="bytes32" Address="0x04CF9A60" Value="0x3F000000" />
+            <Line Type="bytes32" Address="0x04CF9A70" Value="0x3F000000" />
+            <Line Type="bytes32" Address="0x04CF9A74" Value="0x3E850D0F" />
+            <Line Type="bytes32" Address="0x04CF9AD0" Value="0x3F000000" />
+            <Line Type="bytes32" Address="0x04CF9AE0" Value="0x3F000000" />
+            <Line Type="bytes32" Address="0x04CF9AE4" Value="0x3E850D0F" />
+            <Line Type="bytes" Address="0x026C3DE4" Value="B8A0000000" />
+            <Line Type="bytes" Address="0x026C3DF0" Value="B85A00000090" />
+            <Line Type="bytes" Address="0x026C45BA" Value="48B8A00000005A0000004889842400020000909090" />
+            <Line Type="bytes" Address="0x024B56D2" Value="9090909090909090909090" />
+            <Line Type="bytes" Address="0x00E73A60" Value="31C0C3" />
+            <Line Type="bytes" Address="0x00E73AA0" Value="31C0C3" />
+            <Line Type="bytes" Address="0x00FC96ED" Value="EB13" />
+            <Line Type="bytes" Address="0x00FC96FD" Value="9090909090" />
+            <Line Type="bytes" Address="0x00FE93D1" Value="9090909090" />
+            <Line Type="bytes" Address="0x00FF35C2" Value="9090909090" />
+            <Line Type="bytes" Address="0x00FF35E9" Value="9090909090" />
+            <Line Type="bytes" Address="0x00FF37A2" Value="9090909090" />
+            <Line Type="bytes" Address="0x00FF37C9" Value="9090909090" />
+            <Line Type="bytes" Address="0x00FF2952" Value="9090909090" />
+            <Line Type="bytes" Address="0x00FF2975" Value="9090909090" />
+            <Line Type="bytes" Address="0x02594AA6" Value="418D4DFF83F97F7718C78424A0000000B0050000C78424A400000028060000EB1E418B8CC480010000898C24A0000000418B8CC484010000898C24A40000004D8DB4C484010000C68424B000000057C78424A80000003C000000C68424AC00000001498B8CC48801000048898C24BC000000C68424C400000003C68424C80000000390" />
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Bloodborne" Name="VR Light Grid 728x788" Note="Light-grid tile = render/2 (see Kyo Light Grid notes). " Author="Kyo (template), bloodborne-vr" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true">
+        <PatchList>
+            <Line Type="bytes" Address="0x02695CB6" Value="C783A8780000D8020000" />
+            <Line Type="bytes" Address="0x02695CC0" Value="C783AC78000014030000" />
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Bloodborne" Name="VR limiter 16667us" Note="Pins the 60 FPS++ frame limiter to exactly 60.0 fps (16667 us) so frames line up with the 60 Hz output; removes a periodic hitch in VR." Author="bloodborne-vr" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true"><PatchList><Line Type="bytes" Address="0x025629F0" Value="BF1B410000" /></PatchList></Metadata>
+    <Metadata Title="Bloodborne" Name="Infinite Stamina" Note="Attacks, dodges and sprinting use no stamina (current stamina is refilled to max every time the game reads it). GoldHEN cheat for CUSA03173 1.09; set isEnabled to false to turn it off." Author="Encapsulate (GoldHEN cheat), bloodborne-vr" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="false"><PatchList><Line Type="bytes" Address="0x054DB836" Value="8B88380100008988340100008B80340100004189442434E98FC081FC" /><Line Type="bytes" Address="0x01CF78DB" Value="E9563F7E0390" /></PatchList></Metadata>
+    <Metadata Title="Bloodborne" Name="Model LOD -2 (Highest model detail)" Note="Kyo, auser1337 (also in Kyo's Performance Patch): every object keeps its full model at any distance. In VR since 2026-10-06: distant fence posts and trees keep their shape, and the clinic hall draws ~110 fewer objects per frame (1510 -> 1400): the GPU command processor 2 ms faster there (mock); GPU time unchanged. Set isEnabled to false for the game's own LOD." Author="Kyo, auser1337" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true"><PatchList><Line Type="bytes" Address="0x0216fc09" Value="b9FEFFFFFF90" /></PatchList></Metadata>
+    <Metadata Title="Bloodborne" Name="Better AA" Note="Kyo: the game's AA forced to FXAA2 + DLAA (two passes). Still edges have 18 - 45% fewer stair-steps, a little softer in dark detailed places (the clinic). Set isEnabled to true to use it." Author="Kyo" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="false">
+        <PatchList>
+            <Line Type="bytes" Address="0x026A07A6" Value="498D9C24C81B00004889DF488DB520F5FFFFE8338FBBFEC643090183630C004889DFBA34000000EB05" />
+            <Line Type="bytes" Address="0x026A07D4" Value="488DB560F7FFFFB9090000004C8B8578F1FFFFE86484BBFEC7430C030000004889DF488DB560F7FFFFBA34000000B9090000004C8B8578F1FFFFE83D84BBFE41B7010F1F4000" />
+        </PatchList>
+    </Metadata>
+<Metadata Title="Bloodborne" Name="Scratch limiter sleep path" Author="scratchpad" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true"><PatchList><Line Type="bytes" Address="0x02434ADA" Value="E99B00000090" /></PatchList></Metadata><Metadata Title="Bloodborne" Name="Scratch limiter 1ms tail" Author="scratchpad" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true"><PatchList><Line Type="bytes" Address="0x02434BAC" Value="E0478F02" /><Line Type="bytes" Address="0x02434BB6" Value="9E498F02" /></PatchList></Metadata></Patch>

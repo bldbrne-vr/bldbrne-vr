@@ -1,0 +1,198 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// VR eye temporal anti-aliasing (vr.ini eye_taa; renderer_vulkan/vr_late_warp.cpp). Every headset
+// refresh the late warp makes each eye again from the game frame on display, at a new sub-pixel
+// position: a stair-stepped edge then sits on other pixels every refresh and crawls, and each new
+// game frame steps it again. Here each eye as warped is blended with the previous refreshes' result
+// (the history) moved to where this refresh sees it, so the steps and the crawl average out.
+//   - The history is moved exactly for the eye's motion since the last warp: this eye pixel's
+//     surface (its 1/z, written by the warp) seen from the previous refresh's eye. With
+//     eye_taa_follow (renderer_vulkan/vr_eye_taa_math.h Choose) that is the displayed eye in the
+//     game world, so the history also follows walking and smooth turns; else the head's own
+//     motion while the world stands still (the baseline filter).
+//   - Ghosts are kept out by clamping the history to the 3x3 neighbourhood of this refresh's eye
+//     (whatever moved on its own, an enemy, the hunter's arms, fire, is rejected within a refresh).
+//   - The history is sampled with Catmull-Rom (anti-ringing clamped), so moving it does not blur.
+//   - FLAG_MOVING (the world moved since the history): surfaces at different depths now move
+//     apart, so a history tap NEARER than this pixel's surface by more than the gate's parallax
+//     (it hid this surface a refresh ago: a disocclusion) and the body / HUD taps are dropped;
+//     farther taps stay (the colour clamp handles them, as above); depth edges with parallax keep
+//     at most eye_taa_edge_cap of history. Without it the filter above runs exactly as before.
+// The eyes hold sRGB-encoded bytes in an R8G8B8A8 view that may hold B8G8R8A8 data: every
+// operation here is per channel, so the order does not matter. The history is RGBA16F: .a holds
+// the surface's 1/z in metres for the next moving warp (vr_eye_taa_math.h HistUnknown, HistNone).
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D cur_tex;  // this refresh's eye as warped
+layout(set = 0, binding = 1) uniform texture2D hist_tex; // the previous refresh's result
+// The shown surface's 1/z (game units; vr_eye_taa_math.h DecodeEyeW): >= 0 a surface, <= -2
+// -(1/z + 2) a surface with colour-clamped history only, else none.
+layout(set = 0, binding = 2) uniform texture2D w_tex;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D hist_out;
+layout(set = 0, binding = 4, rgba8) uniform writeonly image2D out8; // `eyes` when not upscaled
+
+layout(push_constant) uniform TaaPush {
+    vec4 m0;     // rows of M: the previous eye's axes <- this eye's axes; m0.w: this refresh's weight
+    vec4 m1;     // m1.w: metres per game unit
+    vec4 m2;     // m2.w: FLAG_MOVING's gate, px of parallax per refresh (eye_taa_gate_px)
+    vec4 t;      // xyz: this eye's position in the previous eye's frame (metres); w: FLAG_MOVING's
+                 // most history at a depth edge with parallax (eye_taa_edge_cap)
+    vec4 intr;   // this eye: fx, fy, cx, cy (eye-image pixels, texel i's centre at i + 0.5)
+    vec4 intr_p; // the previous eye's
+    ivec4 size;  // this eye's w, h; the previous eye's w, h
+    ivec4 misc;  // x: this eye's column in w_tex; y, z: its place in out8; w: flags
+} pc;
+
+const int FLAG_HISTORY = 1;  // the history is valid (else: this refresh only)
+const int FLAG_WRITE8 = 2;   // also into out8
+const int FLAG_DEBUG = 4;    // VR_TAA_DEBUG: red where the history was rejected
+const int FLAG_MOVING = 8;   // eye_taa_follow: the world moved since the history
+
+vec4 CatmullRomWeights(float f) {
+    return vec4(((-0.5 * f + 1.0) * f - 0.5) * f, (1.5 * f - 2.5) * f * f + 1.0,
+                ((-1.5 * f + 2.0) * f + 0.5) * f, (0.5 * f - 0.5) * f * f);
+}
+
+vec4 Hist(ivec2 p) {
+    return texelFetch(hist_tex, clamp(p, ivec2(0), pc.size.zw - 1), 0);
+}
+
+// The history at texel coordinates q (centres at integers), Catmull-Rom clamped to the range of its
+// 2x2 bilinear footprint (no ringing); f00 .. f11: that footprint (its .a for FLAG_MOVING).
+vec3 HistoryAt(vec2 q, out vec4 f00, out vec4 f10, out vec4 f01, out vec4 f11) {
+    const vec2 b = floor(q);
+    const vec2 f = q - b;
+    const ivec2 i = ivec2(b);
+    const vec4 wx = CatmullRomWeights(f.x);
+    const vec4 wy = CatmullRomWeights(f.y);
+    vec3 acc = vec3(0.0);
+    for (int dy = -1; dy <= 2; ++dy) {
+        vec3 row = vec3(0.0);
+        for (int dx = -1; dx <= 2; ++dx) {
+            row += wx[dx + 1] * Hist(i + ivec2(dx, dy)).rgb;
+        }
+        acc += wy[dy + 1] * row;
+    }
+    f00 = Hist(i);
+    f10 = Hist(i + ivec2(1, 0));
+    f01 = Hist(i + ivec2(0, 1));
+    f11 = Hist(i + ivec2(1, 1));
+    return clamp(acc, min(min(f00.rgb, f10.rgb), min(f01.rgb, f11.rgb)),
+                 max(max(f00.rgb, f10.rgb), max(f01.rgb, f11.rgb)));
+}
+
+// Mirrors VrEyeTaa::TapUsable: never the body / HUD (.a -2); a fill's (-1) and any farther or
+// slightly nearer surface yes; a surface NEARER by more than `gate` px of parallax no (it hid
+// this one a refresh ago). k: px of parallax per 1/m.
+bool TapUsable(float stored, float expected, float k, float gate) {
+    if (stored < -1.5) {
+        return false;
+    }
+    if (stored < 0.0 || expected < 0.0) {
+        return true;
+    }
+    const float nearer = stored - expected;
+    return nearer * k <= gate || nearer <= 2e-3 * max(stored, expected);
+}
+
+float DecodeW(float v) {
+    return v <= -1.5 ? -v - 2.0 : v;
+}
+
+void main() {
+    const ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    if (o.x >= pc.size.x || o.y >= pc.size.y) {
+        return;
+    }
+    const vec3 c = texelFetch(cur_tex, o, 0).rgb;
+    vec3 result = c;
+    bool rejected = true;
+    const bool moving = (pc.misc.w & FLAG_MOVING) != 0;
+    const float v = texelFetch(w_tex, ivec2(o.x + pc.misc.x, o.y), 0).r;
+    const bool clamp_only = v <= -1.5;
+    const float w = DecodeW(v);
+    if ((pc.misc.w & FLAG_HISTORY) != 0) {
+        if (w >= 0.0) {
+            const mat3 m = mat3(pc.m0.xyz, pc.m1.xyz, pc.m2.xyz); // columns = the rows given
+            const vec3 dir = vec3((float(o.x) + 0.5 - pc.intr.z) / pc.intr.x,
+                                  -(float(o.y) + 0.5 - pc.intr.w) / pc.intr.y, -1.0);
+            // This pixel's surface in the previous eye's frame (w = 0: at infinity, direction only).
+            const vec3 pp = w > 0.0 ? (dir * (pc.m1.w / w)) * m + pc.t.xyz : dir * m;
+            if (pp.z < -1e-5) {
+                const vec2 q = vec2(pc.intr_p.z + pc.intr_p.x * (pp.x / -pp.z),
+                                    pc.intr_p.w - pc.intr_p.y * (pp.y / -pp.z)) - 0.5;
+                if (all(greaterThanEqual(q, vec2(-0.5))) &&
+                    all(lessThanEqual(q, vec2(pc.size.zw) - 0.5))) {
+                    vec3 lo = c;
+                    vec3 hi = c;
+                    float w_lo = w;
+                    float w_hi = w;
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            const ivec2 n = clamp(o + ivec2(dx, dy), ivec2(0), pc.size.xy - 1);
+                            const vec3 s = texelFetch(cur_tex, n, 0).rgb;
+                            lo = min(lo, s);
+                            hi = max(hi, s);
+                            if (moving) {
+                                const float nw =
+                                    DecodeW(texelFetch(w_tex, ivec2(n.x + pc.misc.x, n.y), 0).r);
+                                if (nw >= 0.0) {
+                                    w_lo = min(w_lo, nw);
+                                    w_hi = max(w_hi, nw);
+                                }
+                            }
+                        }
+                    }
+                    vec4 f00, f10, f01, f11;
+                    vec3 h = HistoryAt(q, f00, f10, f01, f11);
+                    float weight = pc.m0.w; // this refresh's
+                    bool use = true;
+                    if (moving) {
+                        // Mirrors VrEyeTaa::ParallaxPx, MovingWeights and ParallaxEdge.
+                        const float k =
+                            pc.intr_p.x * length(pc.t.xy + (pp.xy / -pp.z) * pc.t.z);
+                        // A fill's depth is a guess: only the body / HUD taps go there.
+                        const float kt = clamp_only ? 0.0 : k;
+                        const float e = w > 0.0 ? 1.0 / -pp.z : 0.0;
+                        const vec2 fr = q - floor(q);
+                        const vec4 wt = vec4((1.0 - fr.x) * (1.0 - fr.y), fr.x * (1.0 - fr.y),
+                                             (1.0 - fr.x) * fr.y, fr.x * fr.y);
+                        const vec4 kept = wt * vec4(TapUsable(f00.a, e, kt, pc.m2.w),
+                                                    TapUsable(f10.a, e, kt, pc.m2.w),
+                                                    TapUsable(f01.a, e, kt, pc.m2.w),
+                                                    TapUsable(f11.a, e, kt, pc.m2.w));
+                        const float support = kept.x + kept.y + kept.z + kept.w;
+                        if (support < 0.25) {
+                            use = false;
+                        } else if (any(notEqual(kept, wt))) {
+                            // Without the dropped taps: bilinear over the rest.
+                            h = (kept.x * f00.rgb + kept.y * f10.rgb + kept.z * f01.rgb +
+                                 kept.w * f11.rgb) / support;
+                        }
+                        if ((w_hi - w_lo) / pc.m1.w * k > pc.m2.w) {
+                            weight = max(weight, 1.0 - pc.t.w);
+                        }
+                    }
+                    if (use) {
+                        const vec3 hc = clamp(h, lo, hi);
+                        result = mix(hc, c, weight);
+                        rejected = false;
+                    }
+                }
+            }
+        }
+    }
+    // The next warp's view of this surface (vr_eye_taa_math.h HistUnknown, HistNone).
+    const float a = w < 0.0 ? -2.0 : (moving && clamp_only ? -1.0 : w / pc.m1.w);
+    imageStore(hist_out, o, vec4(result, a));
+    if ((pc.misc.w & FLAG_WRITE8) != 0) {
+        vec3 shown = result;
+        if ((pc.misc.w & FLAG_DEBUG) != 0 && rejected) {
+            shown = vec3(1.0, 0.0, 0.0);
+        }
+        imageStore(out8, o + pc.misc.yz, vec4(clamp(shown, 0.0, 1.0), 1.0));
+    }
+}

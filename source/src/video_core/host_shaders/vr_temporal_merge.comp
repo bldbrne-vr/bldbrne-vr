@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport's HDR merge rule: reconstruct RGB, preserve the game's postprocessing alpha.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x=8, local_size_y=8) in;
+layout(binding=0) uniform texture2D reconstructed;
+layout(binding=1) uniform texture2D original_color;
+layout(binding=2, rgba16f) uniform image2D scene;
+layout(push_constant) uniform Constants { uvec2 size; uvec2 input_size; uint direct_alpha; };
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(p), size))) return;
+    // Same nearest-neighbour source texel as the former reduced-to-native blit.
+    ivec2 source = min(ivec2((vec2(p) + 0.5) * vec2(input_size) / vec2(size)), ivec2(input_size)-1);
+    float alpha = direct_alpha != 0 ? texelFetch(original_color, source, 0).a : imageLoad(scene, p).a;
+    imageStore(scene, p, vec4(texelFetch(reconstructed, p, 0).rgb, alpha));
+}

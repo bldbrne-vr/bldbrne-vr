@@ -1,0 +1,157 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// VR DIBR stereo (stereo_mode=2), pass 1 of 2: scene depth -> per-eye disparity in pixels.
+// Recorded by VrStereoWarp::CaptureDepth (renderer_vulkan/vr_stereo_warp.cpp) at the HUD
+// boundary, i.e. before the first post-composite (HUD) draw has touched the depth/stencil surface.
+//
+// The game's projection is D3D left-handed, depth 0 at near and 1 at far, NOT reversed-Z:
+//   1/z = 1/n - z_ndc * (1/n - 1/f)        (affine in the stored depth)
+// An eye camera moved by b along the camera's right axis sees a point at view depth z shifted by
+//   D = K / z  pixels,   K = fx * b,   fx = (W/2) * cot(vfov/2) / aspect
+// The stored value is |D| for ONE eye: the warp applies +D for the left eye, -D for the right.
+// Near field: monotonic C1 knee (identity below knee_px, never above floor_px).
+// Sky / cleared depth / far plane -> 0. |D| < snap_px -> 0 (bit-exact copy path in the warp).
+// Depth proxy (proxy_on > 0): a capsule given in pixels and 1/z (the game's vial in the hunter's
+// hand, whose glass writes no depth) raises D to its own disparity where it covers the pixel, so
+// what lies behind the glass warps with the vial and anything nearer (his fingers) stays in front.
+// The math is mirrored on the CPU by VrStereo::DepthToDisparity (vr_stereo_warp_math.h).
+//
+// Outputs: disp_img (R32F, scene colour size) and tile_img (RGBA32F, one texel per 16x16 tile:
+// r = min D, g = max D) which bounds the warp's per-workgroup search window. With write_w > 0 (the
+// late warp, vr.ini late_warp) also each pixel's true inverse depth 1/z in game units (w_img, R32F:
+// no knee, no cap; 0 = sky; the proxy's where it covers the pixel) and its tile's min / max
+// (tile_img .b / .a): what the late warp re-sees from the head at the display time.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Depth-aspect view of the game's depth target (D32 / D32S8 / D16), or an R32F copy of it.
+layout(set = 0, binding = 0) uniform texture2D depth_tex;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D disp_img;
+layout(set = 0, binding = 2, rgba32f) uniform writeonly image2D tile_img;
+layout(set = 0, binding = 3, r32f) uniform writeonly image2D w_img;
+// aa_mode=taa (vr_render_taa.comp): the resolve's stable depth (the same depth units, R32F) and
+// the game's own (jittered) depth it stands in for. depth_tex is our in-frame items' private copy
+// (the game's depth plus our items) or the game's depth itself: where it is nearer than the
+// game's, our items are kept; elsewhere the stable depth is read, so an edge pixel keeps its side
+// (foreground or background disparity) while the jitter moves the edge by +-0.5 px.
+layout(set = 0, binding = 4) uniform texture2D stable_tex;
+layout(set = 0, binding = 5) uniform texture2D raw_tex;
+
+layout(push_constant) uniform PrepConstants {
+    ivec2 size;           // disparity image size (= captured scene colour size)
+    ivec2 depth_size;     // depth view size (nearest texel when it differs from size)
+    float k_px;           // K = fx * b
+    float inv_near;       // 1/n (game units)
+    float inv_range;      // 1/n - 1/f
+    float depth_min;      // viewport minDepth
+    float inv_depth_span; // 1 / (maxDepth - minDepth)
+    float knee_px;        // near-field compression knee
+    float floor_px;       // ... and ceiling; <= knee_px disables the compression
+    float snap_px;        // 1/64
+    float max_px;         // hard cap (keeps the warp's LDS window unclipped)
+    float proxy_ax;       // depth proxy: capsule end a (disparity image pixels) ...
+    float proxy_ay;
+    float proxy_bx;       // ... and end b
+    float proxy_by;
+    float proxy_inv_za;   // 1/z at a and b (game units)
+    float proxy_inv_zb;
+    float proxy_r_fx;     // radius * fx: the radius in pixels at view depth z is proxy_r_fx / z
+    float proxy_on;       // > 0: stamp the proxy
+    float write_w;        // > 0: also write w_img and the 1/z tile range (the late warp)
+    float stable_on;      // > 0: read stable_tex where depth_tex is not nearer than raw_tex
+} pc;
+
+const float SKY_NDC = 1.0 - 1e-7;
+
+shared float s_min[256];
+shared float s_max[256];
+shared float s_wmin[256];
+shared float s_wmax[256];
+
+// K / z through the near-field knee, the cap and the snap.
+float FinishDisparity(float D) {
+    if (pc.floor_px > pc.knee_px && D > pc.knee_px) {
+        const float r = pc.floor_px - pc.knee_px;
+        D = pc.knee_px + r * tanh(min((D - pc.knee_px) / r, 10.0));
+    }
+    D = min(D, pc.max_px);
+    return D < pc.snap_px ? 0.0 : D;
+}
+
+// The stored depth's 1/z in game units (affine in it); 0 for the sky, cleared depth, far plane.
+float InverseDepth(float d) {
+    const float zn = (d - pc.depth_min) * pc.inv_depth_span;
+    if (!(zn < SKY_NDC)) {
+        return 0.0; // (and NaN)
+    }
+    return max(pc.inv_near - max(zn, 0.0) * pc.inv_range, 0.0);
+}
+
+float DepthToDisparity(float d) {
+    return FinishDisparity(pc.k_px * InverseDepth(d));
+}
+
+// The proxy's 1/z at pixel centre q (0 outside the capsule): 1/z is affine along its projected
+// axis. Mirrored by VrStereo::ProxyDisparity.
+float ProxyInverseDepth(vec2 q) {
+    const vec2 a = vec2(pc.proxy_ax, pc.proxy_ay);
+    const vec2 ab = vec2(pc.proxy_bx, pc.proxy_by) - a;
+    const float t = clamp(dot(q - a, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+    const float inv_z = mix(pc.proxy_inv_za, pc.proxy_inv_zb, t);
+    const vec2 d = q - (a + ab * t);
+    const float r = pc.proxy_r_fx * inv_z;
+    return dot(d, d) > r * r ? 0.0 : inv_z;
+}
+
+float ProxyDisparity(vec2 q) {
+    const float inv_z = ProxyInverseDepth(q);
+    return inv_z > 0.0 ? FinishDisparity(pc.k_px * inv_z) : 0.0;
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const uint li = gl_LocalInvocationIndex;
+    const bool inside = all(lessThan(p, pc.size));
+    float D = 0.0;
+    float W = 0.0;
+    if (inside) {
+        const ivec2 dp = min((p * pc.depth_size) / pc.size, pc.depth_size - 1);
+        float d = texelFetch(depth_tex, dp, 0).r;
+        if (pc.stable_on > 0.0 && !(d < texelFetch(raw_tex, dp, 0).r)) {
+            d = texelFetch(stable_tex, dp, 0).r;
+        }
+        W = InverseDepth(d);
+        D = FinishDisparity(pc.k_px * W);
+        if (pc.proxy_on > 0.0) {
+            const float proxy = ProxyInverseDepth(vec2(p) + 0.5);
+            if (proxy > 0.0) {
+                D = max(D, FinishDisparity(pc.k_px * proxy));
+                W = max(W, proxy);
+            }
+        }
+        imageStore(disp_img, p, vec4(D, 0.0, 0.0, 0.0));
+        if (pc.write_w > 0.0) {
+            imageStore(w_img, p, vec4(W, 0.0, 0.0, 0.0));
+        }
+    }
+    s_min[li] = inside ? D : 3.0e38;
+    s_max[li] = inside ? D : 0.0;
+    s_wmin[li] = inside ? W : 3.0e38;
+    s_wmax[li] = inside ? W : 0.0;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (li < stride) {
+            s_min[li] = min(s_min[li], s_min[li + stride]);
+            s_max[li] = max(s_max[li], s_max[li + stride]);
+            s_wmin[li] = min(s_wmin[li], s_wmin[li + stride]);
+            s_wmax[li] = max(s_wmax[li], s_wmax[li + stride]);
+        }
+        barrier();
+    }
+    if (li == 0u) {
+        imageStore(tile_img, ivec2(gl_WorkGroupID.xy),
+                   vec4(s_min[0], s_max[0], s_wmin[0], s_wmax[0]));
+    }
+}

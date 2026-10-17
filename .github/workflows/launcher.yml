@@ -1,0 +1,27 @@
+name: Native VR launcher
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'source/launcher/**'
+      - 'source/src/core/vr/vr_ini.h'
+      - '.github/workflows/launcher.yml'
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Fetch UI and JSON dependencies
+        run: git submodule update --init source/externals/dear_imgui source/externals/json
+      - name: Configure
+        run: cmake -S source/launcher -B build/launcher -A x64 -DBBVR_RELEASES_URL=https://github.com/bldbrne-vr/bldbrne-vr/releases
+      - name: Build
+        run: cmake --build build/launcher --config Release --parallel
+      - name: Test configuration and launch integration
+        run: ctest --test-dir build/launcher -C Release --output-on-failure
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-launcher-windows
+          path: build/launcher/Release/BloodborneVR.exe

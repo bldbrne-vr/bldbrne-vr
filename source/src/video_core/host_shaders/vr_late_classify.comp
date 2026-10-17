@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// VR late warp with late_warp_motion (renderer_vulkan/vr_late_warp.h): once per capture, which of
+// its texels are the hunter's own body (his arms and weapons follow the controllers in tracking
+// space, his torso and legs the 6DoF origin) and which are the world (walking and turning move it
+// between the game's frames). A texel's surface point (from its 1/z) inside one of the body
+// capsules above the floor plane (the capture's camera frame, game units; VrLate::BodyShapes,
+// VrLate::InBody) is body, and so is every texel our in-frame items cover (held items, the
+// quick-item cards: they stay in tracking space; the capture's item mask, reach.y = 1).
+// Outputs: S's 1/z signed (body texels negative; vr_late_reproject.comp scans the two layers
+// apart) and per 16x16 tile the range of each layer's 1/z (world min, max, body min, max; an
+// empty layer min 3e38, max 0).
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D w_tex;                   // S: 1/z, 0 = sky
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D sw_img;     // S: signed 1/z
+layout(set = 0, binding = 2, rgba32f) uniform writeonly image2D lt_img;  // S: layer tiles
+layout(set = 0, binding = 3, std140) uniform ClassifyConstants {
+    vec4 intr;     // fx, fy, cx, cy (continuous pixels)
+    ivec4 size;    // S's width, height; capsule count
+    vec4 reach;    // x: 1 / the capsules' reach (a texel with a smaller 1/z is never body);
+                   // y: 1 = item_tex is the capture's item mask
+    vec4 floor_plane; // body points above it: dot(xyz, p) + w > 0 (xyz = 0: no floor)
+    vec4 caps[16]; // capsule i: [2i] = a.xyz, radius; [2i + 1] = b.xyz, behind (Capsule::behind:
+                   // at most this much farther from the camera than its nearest axis point)
+} cc;
+layout(set = 0, binding = 4) uniform texture2D item_tex; // S: our in-frame items' coverage (R8)
+
+shared float s_wmin[256];
+shared float s_wmax[256];
+shared float s_bmin[256];
+shared float s_bmax[256];
+
+vec3 ClosestOnSegment(vec3 p, vec3 a, vec3 b) {
+    const vec3 ab = b - a;
+    const float len2 = dot(ab, ab);
+    const float t = len2 > 0.0 ? clamp(dot(p - a, ab) / len2, 0.0, 1.0) : 0.0;
+    return a + ab * t;
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const uint li = gl_LocalInvocationIndex;
+    const bool inside = all(lessThan(p, cc.size.xy));
+    const float w = inside ? texelFetch(w_tex, p, 0).r : 0.0;
+    bool body = false;
+    if (inside && w > 0.0 && w >= cc.reach.x) {
+        const float z = 1.0 / w;
+        const vec3 x = vec3((float(p.x) + 0.5 - cc.intr.z) / cc.intr.x * z,
+                            -(float(p.y) + 0.5 - cc.intr.w) / cc.intr.y * z, -z);
+        const bool above = dot(cc.floor_plane.xyz, x) + cc.floor_plane.w > 0.0 ||
+                           dot(cc.floor_plane.xyz, cc.floor_plane.xyz) == 0.0;
+        const float dist = length(x); // the camera at the origin
+        for (int i = 0; i < cc.size.z && above && !body; ++i) {
+            const vec3 axis = ClosestOnSegment(x, cc.caps[2 * i].xyz, cc.caps[2 * i + 1].xyz);
+            body = length(x - axis) <= cc.caps[2 * i].w &&
+                   dist <= length(axis) + cc.caps[2 * i + 1].w;
+        }
+    }
+    if (inside && w > 0.0 && !body && cc.reach.y > 0.5) {
+        const ivec2 ms = textureSize(item_tex, 0);
+        body = all(lessThan(p, ms)) && texelFetch(item_tex, p, 0).r > 0.5;
+    }
+    if (inside) {
+        imageStore(sw_img, p, vec4(body ? -w : w, 0.0, 0.0, 0.0));
+    }
+    s_wmin[li] = inside && !body ? w : 3.0e38;
+    s_wmax[li] = inside && !body ? w : 0.0;
+    s_bmin[li] = body ? w : 3.0e38;
+    s_bmax[li] = body ? w : 0.0;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (li < stride) {
+            s_wmin[li] = min(s_wmin[li], s_wmin[li + stride]);
+            s_wmax[li] = max(s_wmax[li], s_wmax[li + stride]);
+            s_bmin[li] = min(s_bmin[li], s_bmin[li + stride]);
+            s_bmax[li] = max(s_bmax[li], s_bmax[li + stride]);
+        }
+        barrier();
+    }
+    if (li == 0u) {
+        imageStore(lt_img, ivec2(gl_WorkGroupID.xy), vec4(s_wmin[0], s_wmax[0], s_bmin[0], s_bmax[0]));
+    }
+}

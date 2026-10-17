@@ -1,0 +1,792 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// VR DIBR stereo (stereo_mode=2), pass 2 of 2: both eyes from the single centre frame.
+// Recorded by VrStereoWarp::Warp (renderer_vulkan/vr_stereo_warp.cpp). One workgroup = 64x4
+// output pixels of one eye (gl_WorkGroupID.z selects the eye), one source row per output row.
+// Each eye writes only its crop (CropToEyes rect, source pixels) into its own storage image.
+//
+// Model (no head roll: eyes on the camera's unrolled right axis, as the presenter submits):
+//   source (centre) pixel i lands in this eye at x = i + s*D[i]  (s = +1 left eye, -1 right eye)
+//   For output pixel p find the source position q with q + s*D(q) = p. When several q qualify
+//   (occlusion), the one with the largest D (nearest surface) is visible.
+// Exact "segment scan":
+//   - neighbours i, i+1 with |D[i+1]-D[i]| <= tau form a linear surface segment. It is exact on
+//     planes (1/z, hence D, is affine in screen x on a plane). A segment whose eye positions
+//     fold (1 + s*dD <= 0) is back-facing for this eye and skipped.
+//   - a larger jump is a depth edge: each side keeps a constant half-pixel footprint (1-px poles
+//     survive) and the space between the two footprints is a disocclusion gap ("hole").
+//   - source columns are scanned from the far end of the window towards p, so the first hit is
+//     the largest-disparity root: early exit == forward z-buffer result.
+//   - 8-px blocks whose max D cannot reach the remaining t are skipped (empty-space skipping).
+// Holes: depth-aware background fill (4 taps on the background side, spread over a kernel that
+// grows with the distance into the hole).
+// Colour: Catmull-Rom along the row when all 4 taps are one surface (anti-ringing clamp), linear
+// otherwise, nearest on edge footprints (no foreground/background bleeding). Filtering happens in
+// linear light (sRGB views, or a software decode); the output is encoded with post_process.frag's
+// curve (gamma = 1.0 is exact sRGB, so a D = 0 pixel round-trips to the same byte).
+// HUD (after the warp, at a constant whole-pixel disparity so text stays crisp):
+//   diff: where the final image (scene + HUD) differs from the pre-HUD scene copy, show it.
+//     Over our in-frame items (FLAG_ITEM_MASK, their coverage; near, 0.3-0.6 m) a HUD element's
+//     darkening is applied to the warped item as a ratio and only what it brightens (text, icons)
+//     is shown as HUD: replacing the item's pixels at the HUD's disparity would cut it along the
+//     element's edge (a prompt's backdrop gradient over a quick-item card).
+//   premultiplied: out = H.rgb + (1 - H.a) * scene, blended in the game's encoded domain.
+// Depth (FLAG_DEPTH, for XR_KHR_composition_layer_depth): every eye pixel also gets the true
+// depth of the surface it shows (the prep's near-field knee undone: the compositor's positional
+// timewarp must move it by its real parallax), as a standard 0..1 projection depth between the
+// fixed planes the presenter submits; the HUD at its stereo depth, sky / nothing at the far plane.
+// The CPU reference (scratchpad dibrtest/dibr_cpu.cpp) is a line-by-line port of this file.
+// LATE_WARP (compiled with that define for the late warp, renderer_vulkan/vr_late_warp.cpp): the
+// "source" is V, the capture re-seen from the head at the XR frame's display time
+// (vr_late_reproject.comp): disp_tex / tile_tex are V's, and every source column's colour is looked
+// up through V's map into the capture (q_tex), once, at the position the scan settles on: Catmull-
+// Rom in 2D where the capture's texels it uses are one surface (the same test as along the row, on
+// their disparity), else bilinear over one surface, else nearest. late_warp_edge_blend (edge_k >=
+// 0, VrLate::EdgeBlendWeight): at a depth edge whose two sides move apart by less than its
+// threshold between the capture and V, the nearest texel is mixed toward the bilinear colour (the
+// capture's own anti-aliased edge slides with V's sub-pixel phase instead of flipping a texel every
+// refresh), and edge footprints and V's columns beside a late-warp edge take V's filtered colour.
+// The HUD (diff) stays in screen space: V's pixels are the capture's screen pixels, so it is
+// head-locked.
+// FLAG_EYE_W (LATE_WARP, vr.ini eye_taa): every eye pixel's shown surface's 1/z (game units) into
+// eye_w_img (eye 1 from column depth_base1), for the eyes' temporal anti-aliasing
+// (vr_eye_taa.comp): with FLAG_EYE_W_VIEW (eye_taa_follow) the DISPLAYED view's, with its
+// history class (renderer_vulkan/vr_eye_taa_math.h DecodeEyeW); else the capture's (-1 under the
+// HUD).
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+#ifndef LATE_WARP
+#include "vr_color.glsl"
+#endif
+
+layout(local_size_x = 64, local_size_y = 4, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D disp_tex;  // R32F |D| px (prep pass)
+layout(set = 0, binding = 1) uniform texture2D tile_tex;  // RGBA32F per 16x16 tile (min, max)
+layout(set = 0, binding = 2) uniform texture2D scene_tex; // pre-HUD centre frame
+layout(set = 0, binding = 3) uniform texture2D hud_tex;   // final frame (diff) or HUD layer
+layout(set = 0, binding = 4, rgba8) uniform writeonly image2D eye0_img; // left eye target
+layout(set = 0, binding = 5, rgba8) uniform writeonly image2D eye1_img; // right eye target
+// Per-eye depth, crop-sized rows (eye 0 from 0, eye 1 from depth_base1), when FLAG_DEPTH is set.
+layout(set = 0, binding = 6, std430) writeonly buffer EyeDepth {
+    float eye_depth[];
+};
+layout(set = 0, binding = 7) uniform texture2D item_tex; // in-frame items' coverage (R8)
+#ifdef LATE_WARP
+// V pixel -> capture position (texel coordinates; x >= HOLE_OFFSET / 2: a late-warp hole, x minus
+// HOLE_OFFSET), and the capture's 1/z (game units) for the colour filter's surface test.
+layout(set = 0, binding = 8) uniform texture2D q_tex;
+layout(set = 0, binding = 9) uniform texture2D srcw_tex;
+layout(set = 0, binding = 10, r32f) uniform writeonly image2D eye_w_img;
+#endif
+
+layout(push_constant) uniform WarpConstants {
+    ivec4 crop[2];    // per eye: source rect x, y, w, h (render pixels)
+    ivec4 dst[2];     // per eye: x, y = target offset of the rect origin; z = HUD shift px
+    ivec2 src_size;   // render (scene) size
+    float tau;        // depth-edge threshold, px of disparity between neighbours (1.0)
+    float reach;      // largest D the prep pass can emit
+    float hud_thresh; // HUD diff threshold in linear units (0 = any change)
+    float gamma;      // post_process gamma (1.0 = sRGB)
+    uint flags;
+    uint first_eye;   // eye of gl_WorkGroupID.z == 0
+    // FLAG_DEPTH: depth = clamp(z_a - z_b * D_lin, 0, 1), D_lin = D with the prep's knee undone
+    // (knee_r = 0: no knee); the HUD at z_hud.
+    float knee_px;
+    float knee_r;
+    float z_a;
+    float z_b;
+    float z_hud;
+    uint depth_base1; // first float of eye 1 in eye_depth
+    float k_px;       // LATE_WARP: K, for the disparity of the capture's 1/z (knee_px / knee_r too)
+    // LATE_WARP, late_warp_edge_blend (VrLate::EdgeBlendScale): < 0 off; else the capture -> V
+    // parallax per unit of 1/z, in units of the blend's threshold.
+    float edge_k;
+} pc;
+
+const uint FLAG_CATMULL_ROM = 1u << 0;
+const uint FLAG_HUD_DIFF = 1u << 1;
+const uint FLAG_HUD_PREMUL = 1u << 2;
+const uint FLAG_BGRA0 = 1u << 3;
+const uint FLAG_BGRA1 = 1u << 4;
+const uint FLAG_DEBUG_HOLES = 1u << 5;
+const uint FLAG_DECODE_SCENE = 1u << 6;
+const uint FLAG_DECODE_HUD = 1u << 7;
+const uint FLAG_DEBUG_HUD = 1u << 8;
+const uint FLAG_DEPTH = 1u << 9;
+const uint FLAG_ITEM_MASK = 1u << 10;
+const uint FLAG_EYE_W = 1u << 11;
+const uint FLAG_EYE_W_VIEW = 1u << 12;
+const uint FLAG_EYE_W_MOVING = 1u << 13;
+
+const int GW = 64;
+const int ROWS = 4;
+const int SPAN = 256;
+const int TILE = 16;
+const float SNAP = 1.0 / 64.0;
+
+shared float s_d[ROWS][SPAN];
+shared float s_bmax[ROWS][SPAN / 8];
+shared uint s_tmax_bits; // D >= 0, so float bits order like uint
+shared uint s_tmin_bits;
+
+float LD(int row, int l) {
+    return s_d[row][clamp(l, 0, SPAN - 1)];
+}
+
+vec3 SrgbToLinear(vec3 c) {
+    return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, lessThanEqual(c, vec3(0.04045)));
+}
+
+vec3 LinearToSrgb(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, 12.92 * c, lessThan(c, vec3(0.0031308)));
+}
+
+// post_process.frag's encode (gamma = 1.0 is the sRGB OETF), plus a clamp.
+vec3 Encode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    const vec3 lo = 12.92 * c / pc.gamma;
+    const vec3 hi = 1.055 * pow(c, vec3(1.0 / (2.4 + 1.0 - pc.gamma))) - 0.055;
+    return mix(hi, lo, lessThan(c, vec3(0.0031308)));
+}
+
+vec3 Scene(ivec2 p) {
+    const vec3 c = texelFetch(scene_tex, p, 0).rgb;
+    return (pc.flags & FLAG_DECODE_SCENE) != 0u ? SrgbToLinear(c) : c;
+}
+
+vec3 SceneAt(int x, int y) {
+    return Scene(ivec2(clamp(x, 0, pc.src_size.x - 1), y));
+}
+
+vec3 HudLinear(ivec2 p) {
+    const vec3 c = texelFetch(hud_tex, p, 0).rgb;
+    return (pc.flags & FLAG_DECODE_HUD) != 0u ? SrgbToLinear(c) : c;
+}
+
+bool ItemAt(int x, int y) {
+    return (pc.flags & FLAG_ITEM_MASK) != 0u &&
+           texelFetch(item_tex, ivec2(clamp(x, 0, pc.src_size.x - 1), y), 0).r > 0.5;
+}
+
+#ifdef LATE_WARP
+const float HOLE_OFFSET = 1.0e6;
+
+// V's column x of row y: where it is in the capture (texel coordinates) and whether it is a hole.
+vec2 Q(int x, int y, out bool hole) {
+    vec2 q = texelFetch(q_tex, ivec2(clamp(x, 0, pc.src_size.x - 1), y), 0).rg;
+    hole = q.x > 0.5 * HOLE_OFFSET;
+    q.x -= hole ? HOLE_OFFSET : 0.0;
+    return q;
+}
+
+ivec2 SrcClamp(ivec2 t) {
+    return clamp(t, ivec2(0), pc.src_size - 1);
+}
+
+vec3 SrcNearest(vec2 q) {
+    return Scene(SrcClamp(ivec2(floor(q + 0.5))));
+}
+
+// FLAG_EYE_W_VIEW: V's 1/z for the eyes' TAA (pass 1's disp_tex.g), else not read.
+float ViewW(int x, int y) {
+    return (pc.flags & FLAG_EYE_W_VIEW) != 0u
+               ? texelFetch(disp_tex, ivec2(clamp(x, 0, pc.src_size.x - 1), y), 0).g
+               : -1.0;
+}
+
+bool ItemAtSrc(vec2 q) {
+    const ivec2 t = SrcClamp(ivec2(floor(q + 0.5)));
+    return (pc.flags & FLAG_ITEM_MASK) != 0u && texelFetch(item_tex, t, 0).r > 0.5;
+}
+
+// FLAG_EYE_W for eye pixel o showing the capture at q. FLAG_EYE_W_VIEW: `v`, V's 1/z from pass 1
+// (disp_tex.g: >= 0 a surface, <= -2 -(w + 2) colour-clamped history only, else none; V's true
+// depth is unchanged by the sideways eye offset). Under the HUD none. Held items and the near
+// field (the knee compresses it: not where its ray says) none while the world moves, else as the
+// rest. `fill` (invented here): colour-clamped history only. Else the capture's 1/z at q.
+// late_warp_edge_blend leaves the depth and class as they were (the shown column's / the nearest
+// texel's): it only blends where the edge's two sides lie within its threshold (<= 1 px) of each
+// other, so either side's 1/z moves the history to within that, and the 3x3 clamp takes the rest.
+void StoreEyeW(uint eye, ivec2 o, vec2 q, float v, float disparity, bool hud, bool item,
+               bool fill) {
+    if ((pc.flags & FLAG_EYE_W) == 0u) {
+        return;
+    }
+    float w;
+    if ((pc.flags & FLAG_EYE_W_VIEW) == 0u) {
+        w = hud ? -1.0 : texelFetch(srcw_tex, SrcClamp(ivec2(floor(q + 0.5))), 0).r;
+    } else {
+        w = fill && v >= 0.0 ? -(v + 2.0) : v;
+        const bool near = item || (pc.knee_r > 0.0 && disparity > pc.knee_px);
+        if (hud || (near && (pc.flags & FLAG_EYE_W_MOVING) != 0u)) {
+            w = -1.0;
+        }
+    }
+    imageStore(eye_w_img, ivec2(o.x + (eye == 0u ? 0 : int(pc.depth_base1)), o.y),
+               vec4(w, 0.0, 0.0, 0.0));
+}
+
+// The disparity of the capture's texel t (vr_dibr_prep.comp's, without the cap and snap): the same
+// units as the row's surface test.
+float SrcD(ivec2 t) {
+    float D = pc.k_px * texelFetch(srcw_tex, SrcClamp(t), 0).r;
+    if (pc.knee_r > 0.0 && D > pc.knee_px) {
+        D = pc.knee_px + pc.knee_r * tanh(min((D - pc.knee_px) / pc.knee_r, 10.0));
+    }
+    return D;
+}
+
+float SrcW(ivec2 t) {
+    return texelFetch(srcw_tex, SrcClamp(t), 0).r;
+}
+
+// VrLate::EdgeColour: the capture's colour at q at a depth edge (texel i = floor(q), fractions f;
+// fx / fy: that column / row carries weight). The nearest texel, as before, mixed toward the
+// bilinear colour by how little the footprint's two sides move apart between the capture and V
+// (late_warp_edge_blend; pc.edge_k < 0: the nearest texel).
+vec3 EdgeColour(vec2 q, ivec2 i, vec2 f, bool fx, bool fy) {
+    const vec3 nearest = SrcNearest(q);
+    if (pc.edge_k < 0.0) {
+        return nearest;
+    }
+    const float w00 = SrcW(i);
+    const float w10 = fx ? SrcW(i + ivec2(1, 0)) : w00;
+    const float w01 = fy ? SrcW(i + ivec2(0, 1)) : w00;
+    const float w11 = fx && fy ? SrcW(i + ivec2(1, 1)) : w01;
+    const float spread = max(max(w00, w10), max(w01, w11)) - min(min(w00, w10), min(w01, w11));
+    const float a = clamp(2.0 - 2.0 * pc.edge_k * spread, 0.0, 1.0);
+    if (a <= 0.0) {
+        return nearest;
+    }
+    const vec3 c00 = Scene(SrcClamp(i));
+    const vec3 c10 = Scene(SrcClamp(i + ivec2(1, 0)));
+    const vec3 c01 = Scene(SrcClamp(i + ivec2(0, 1)));
+    const vec3 c11 = Scene(SrcClamp(i + ivec2(1, 1)));
+    const vec2 fw = vec2(fx ? f.x : 0.0, fy ? f.y : 0.0); // a texel without weight takes none
+    return mix(nearest, mix(mix(c00, c10, fw.x), mix(c01, c11, fw.x), fw.y), a);
+}
+
+vec4 CatmullRomWeights(float f) {
+    return vec4(((-0.5 * f + 1.0) * f - 0.5) * f, (1.5 * f - 2.5) * f * f + 1.0,
+                ((-1.5 * f + 2.0) * f + 0.5) * f, (0.5 * f - 0.5) * f * f);
+}
+
+// The capture's colour at q (texel coordinates). `sharp`: Catmull-Rom where every texel it uses is
+// one surface with its neighbours (|dD| <= tau along the rows and down the columns that carry
+// weight: a row exactly at a texel centre is the row filter's 4 taps), anti-ringing clamped to the
+// bilinear footprint; else bilinear over one surface; else the nearest texel (EdgeColour).
+vec3 SrcFiltered(vec2 q, bool sharp) {
+    const vec2 b = floor(q);
+    const vec2 f = q - b;
+    const ivec2 i = ivec2(b);
+    const bool fx = f.x > 1e-4;
+    const bool fy = f.y > 1e-4;
+    // The bilinear footprint: the texels with weight.
+    const float d00 = SrcD(i);
+    const float d10 = fx ? SrcD(i + ivec2(1, 0)) : d00;
+    const float d01 = fy ? SrcD(i + ivec2(0, 1)) : d00;
+    const float d11 = fx && fy ? SrcD(i + ivec2(1, 1)) : d01;
+    if (abs(d10 - d00) > pc.tau || abs(d01 - d00) > pc.tau || abs(d11 - d01) > pc.tau ||
+        abs(d11 - d10) > pc.tau) {
+        return EdgeColour(q, i, f, fx, fy);
+    }
+    const vec3 c00 = Scene(SrcClamp(i));
+    const vec3 c10 = Scene(SrcClamp(i + ivec2(1, 0)));
+    const vec3 c01 = Scene(SrcClamp(i + ivec2(0, 1)));
+    const vec3 c11 = Scene(SrcClamp(i + ivec2(1, 1)));
+    const vec3 bilinear = mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+    if (!sharp || (pc.flags & FLAG_CATMULL_ROM) == 0u) {
+        return bilinear;
+    }
+    // The 4x4 kernel: rows -1..2 and columns -1..2 that carry weight, each one surface with its
+    // neighbour.
+    const int y0 = fy ? -1 : 0;
+    const int y1 = fy ? 2 : 0;
+#ifdef WARP_FETCH_ONCE
+    // vr.ini late_warp_fetch_once: the same tests on the same values, each texel's 1/z fetched
+    // once (the footprint's four reused; the loop below fetches up to 44 times).
+    float g[4][4];
+    for (int dy = y0; dy <= y1; ++dy) {
+        for (int dx = -1; dx <= 2; ++dx) {
+            float d;
+            if (dy == 0 && dx == 0) {
+                d = d00;
+            } else if (dy == 0 && dx == 1 && fx) {
+                d = d10;
+            } else if (dy == 1 && dx == 0 && fy) {
+                d = d01;
+            } else if (dy == 1 && dx == 1 && fx && fy) {
+                d = d11;
+            } else {
+                d = SrcD(i + ivec2(dx, dy));
+            }
+            g[dy + 1][dx + 1] = d;
+        }
+        for (int dx = 0; dx <= 2; ++dx) {
+            if (abs(g[dy + 1][dx + 1] - g[dy + 1][dx]) > pc.tau) {
+                return bilinear;
+            }
+        }
+        if (dy > y0) {
+            for (int dx = -1; dx <= 2; ++dx) {
+                if (abs(g[dy + 1][dx + 1] - g[dy][dx + 1]) > pc.tau) {
+                    return bilinear;
+                }
+            }
+        }
+    }
+#else
+    for (int dy = y0; dy <= y1; ++dy) {
+        float prev = SrcD(i + ivec2(-1, dy));
+        for (int dx = 0; dx <= 2; ++dx) {
+            const float d = SrcD(i + ivec2(dx, dy));
+            if (abs(d - prev) > pc.tau) {
+                return bilinear;
+            }
+            prev = d;
+        }
+        if (dy > y0) {
+            for (int dx = -1; dx <= 2; ++dx) {
+                if (abs(SrcD(i + ivec2(dx, dy)) - SrcD(i + ivec2(dx, dy - 1))) > pc.tau) {
+                    return bilinear;
+                }
+            }
+        }
+    }
+#endif
+    const vec4 wx = CatmullRomWeights(f.x);
+    const vec4 wy = fy ? CatmullRomWeights(f.y) : vec4(0.0, 1.0, 0.0, 0.0);
+    vec3 acc = vec3(0.0);
+    for (int dy = y0; dy <= y1; ++dy) {
+        vec3 row = vec3(0.0);
+        for (int dx = -1; dx <= 2; ++dx) {
+#ifdef WARP_FETCH_ONCE
+            // The footprint's four colours as fetched above (the same texels), the rest once.
+            vec3 c;
+            if (dy == 0 && dx == 0) {
+                c = c00;
+            } else if (dy == 0 && dx == 1) {
+                c = c10;
+            } else if (dy == 1 && dx == 0) {
+                c = c01;
+            } else if (dy == 1 && dx == 1) {
+                c = c11;
+            } else {
+                c = Scene(SrcClamp(i + ivec2(dx, dy)));
+            }
+            row += wx[dx + 1] * c;
+#else
+            row += wx[dx + 1] * Scene(SrcClamp(i + ivec2(dx, dy)));
+#endif
+        }
+        acc += wy[dy + 1] * row;
+    }
+    // anti-ringing: inside the range of the bilinear footprint
+    return clamp(acc, min(min(c00, c10), min(c01, c11)), max(max(c00, c10), max(c01, c11)));
+}
+
+// The colour of V's columns lo..lo+1 at fraction f: interpolated between their capture positions
+// when those are next to each other (one surface in the capture, no hole), else the nearer one's
+// (late_warp_edge_blend: that column's filtered colour, not its nearest texel; a hole's: nearest).
+// `view_w` (FLAG_EYE_W_VIEW): the shown column's V 1/z (pass 1's class), or both interpolated.
+vec3 SrcBetween(int lo, int y, float f, bool sharp, out vec2 q, out float view_w) {
+    bool hole_a, hole_b;
+    const vec2 qa = Q(lo, y, hole_a);
+    const vec2 qb = Q(lo + 1, y, hole_b);
+    const float va = ViewW(lo, y);
+    const float vb = ViewW(lo + 1, y);
+    if (hole_a || hole_b || any(greaterThan(abs(qb - qa), vec2(1.75)))) {
+        q = f < 0.5 ? qa : qb;
+        view_w = f < 0.5 ? va : vb;
+        const bool hole = f < 0.5 ? hole_a : hole_b;
+        return pc.edge_k >= 0.0 && !hole ? SrcFiltered(q, false) : SrcNearest(q);
+    }
+    q = mix(qa, qb, f);
+    const bool depth_a = va >= 0.0 || va <= -1.5;
+    const bool depth_b = vb >= 0.0 || vb <= -1.5;
+    if (va >= 0.0 && vb >= 0.0) {
+        view_w = mix(va, vb, f);
+    } else if (depth_a && depth_b) {
+        // One is colour-clamped only: so is the mix.
+        view_w = -(mix(va >= 0.0 ? va : -va - 2.0, vb >= 0.0 ? vb : -vb - 2.0, f) + 2.0);
+    } else {
+        view_w = -1.0;
+    }
+    return SrcFiltered(q, sharp);
+}
+#endif
+
+// `item_src`: `col` shows one of our in-frame items (its source pixel is covered).
+vec3 ApplyHud(vec3 col, ivec2 p, int shift, bool item_src, out bool hud) {
+    hud = false;
+    if ((pc.flags & (FLAG_HUD_DIFF | FLAG_HUD_PREMUL)) == 0u) {
+        return col;
+    }
+    const ivec2 hp = ivec2(clamp(p.x - shift, 0, pc.src_size.x - 1), p.y);
+    if ((pc.flags & FLAG_HUD_DIFF) != 0u) {
+        const vec3 f = HudLinear(hp);
+        const vec3 b = Scene(hp);
+        if (!any(greaterThan(abs(f - b), vec3(pc.hud_thresh)))) {
+            return col;
+        }
+        if (item_src || ItemAt(hp.x, hp.y)) {
+            const vec3 ratio = clamp(f / max(b, vec3(1e-3)), 0.0, 1.0);
+            const vec3 lift = f - b;
+            const float w = smoothstep(0.02, 0.12, max(max(lift.r, lift.g), lift.b));
+            hud = w > 0.5;
+            if ((pc.flags & FLAG_DEBUG_HUD) != 0u) {
+                return mix(vec3(0.0, 1.0, 1.0), vec3(1.0, 0.0, 1.0), w); // cyan: item ratio
+            }
+            return mix(col * ratio, f, w);
+        }
+        hud = true;
+        return (pc.flags & FLAG_DEBUG_HUD) != 0u ? vec3(1.0, 0.0, 1.0) : f;
+    }
+    // Premultiplied HUD layer stored in the game's encoded domain (raw UNORM view).
+    const vec4 h = texelFetch(hud_tex, hp, 0);
+    if (h.a <= 0.0 && all(lessThanEqual(h.rgb, vec3(0.0)))) {
+        return col;
+    }
+    hud = h.a > 0.5;
+    return SrgbToLinear(clamp(h.rgb + (1.0 - h.a) * LinearToSrgb(col), 0.0, 1.0));
+}
+
+// 0..1 projection depth of a surface with (prep-compressed) disparity D; D = 0 is the far plane.
+float OutDepth(float D) {
+    if (!(D > 0.0)) {
+        return 1.0;
+    }
+    if (pc.knee_r > 0.0 && D > pc.knee_px) {
+        const float x = min((D - pc.knee_px) / pc.knee_r, 0.999);
+        D = pc.knee_px + pc.knee_r * 0.5 * log((1.0 + x) / (1.0 - x)); // atanh
+    }
+    return clamp(pc.z_a - pc.z_b * D, 0.0, 1.0);
+}
+
+// `o`: the crop-local pixel (the eye image's own pixel).
+void StoreDepth(uint eye, ivec2 o, float D, bool hud) {
+    if ((pc.flags & FLAG_DEPTH) == 0u) {
+        return;
+    }
+    const uint base = eye == 0u ? 0u : pc.depth_base1;
+    eye_depth[base + uint(o.y) * uint(pc.crop[eye].z) + uint(o.x)] = hud ? pc.z_hud : OutDepth(D);
+}
+
+void Store(uint eye, ivec2 q, vec3 lin) {
+#ifndef LATE_WARP
+    if (VrColorEnabled && pc.dst[0].w != 0) {
+        lin = VrColorGrade(lin, VrColorDecode(uint(pc.dst[0].w)));
+    }
+#endif
+    vec4 e = vec4(Encode(lin), 1.0);
+    if ((pc.flags & (eye == 0u ? FLAG_BGRA0 : FLAG_BGRA1)) != 0u) {
+        e = e.bgra; // R8G8B8A8 storage image holding B8G8R8A8 bytes (bit copy to a BGRA swapchain)
+    }
+    if (eye == 0u) {
+        imageStore(eye0_img, q, e);
+    } else {
+        imageStore(eye1_img, q, e);
+    }
+}
+
+void main() {
+    const uint eye = pc.first_eye + gl_WorkGroupID.z;
+    const ivec4 crop = pc.crop[eye];
+    const ivec2 gbase = ivec2(gl_WorkGroupID.xy) * ivec2(GW, ROWS);
+    if (gbase.x >= crop.z || gbase.y >= crop.w) {
+        return; // the other eye's crop is larger: uniform for the whole workgroup
+    }
+    const ivec2 lid = ivec2(gl_LocalInvocationID.xy);
+    const ivec2 o = gbase + lid;                       // crop-local pixel
+    const bool inside = o.x < crop.z && o.y < crop.w;
+    const float s = eye == 0u ? 1.0 : -1.0;
+    const int px0 = crop.x + gbase.x;                  // first eye column of this workgroup
+    const int y = clamp(crop.y + o.y, 0, pc.src_size.y - 1); // source row (no roll)
+    const int row = lid.y;
+    const ivec2 p = ivec2(crop.x + o.x, y);            // eye pixel in render coordinates
+    const ivec2 out_px = pc.dst[eye].xy + o;
+    const int hud_shift = pc.dst[eye].z;
+
+    // ---- 1. search window [t_lo, t_hi] from the 16x16 tiles that can reach this span ----
+    if (lid.x == 0 && lid.y == 0) {
+        s_tmax_bits = 0u;
+        s_tmin_bits = floatBitsToUint(3.0e38);
+    }
+    barrier();
+    {
+        const int reach = int(ceil(pc.reach)) + 1;
+        const int lo = s > 0.0 ? px0 - reach : px0 - 1;
+        const int hi = s > 0.0 ? px0 + GW : px0 + GW - 1 + reach;
+        const int tx0 = clamp(lo, 0, pc.src_size.x - 1) / TILE;
+        const int tx1 = clamp(hi, 0, pc.src_size.x - 1) / TILE;
+        const int y0 = clamp(crop.y + gbase.y, 0, pc.src_size.y - 1);
+        const int y1 = clamp(crop.y + gbase.y + ROWS - 1, 0, pc.src_size.y - 1);
+        const int ty0 = y0 / TILE;
+        const int ty1 = y1 / TILE;
+        const int ntx = tx1 - tx0 + 1;
+        const int ntiles = ntx * (ty1 - ty0 + 1);
+        for (int idx = lid.y * GW + lid.x; idx < ntiles; idx += GW * ROWS) {
+            const vec2 mm = texelFetch(tile_tex, ivec2(tx0 + idx % ntx, ty0 + idx / ntx), 0).rg;
+            atomicMax(s_tmax_bits, floatBitsToUint(mm.y));
+            atomicMin(s_tmin_bits, floatBitsToUint(mm.x));
+        }
+    }
+    barrier();
+    const float win_max = uintBitsToFloat(s_tmax_bits);
+
+    // ---- 2. sky / infinity: nothing in reach has disparity -> bit-exact copy (mono control) ----
+    if (win_max < SNAP) {
+        if (inside) {
+            bool hud;
+#ifdef LATE_WARP
+            bool hole;
+            const vec2 sq = Q(p.x, y, hole);
+            vec3 sky = hole ? SrcNearest(sq) : SrcFiltered(sq, true);
+            if (hole && (pc.flags & FLAG_DEBUG_HOLES) != 0u) {
+                sky = vec3(0.0, 1.0, 0.0);
+            }
+            Store(eye, out_px, ApplyHud(sky, p, hud_shift, ItemAtSrc(sq), hud));
+            StoreEyeW(eye, o, sq, ViewW(p.x, p.y), 0.0, hud, ItemAtSrc(sq), hole);
+#else
+            Store(eye, out_px, ApplyHud(Scene(ivec2(clamp(p.x, 0, pc.src_size.x - 1), y)), p,
+                                        hud_shift, false, hud));
+#endif
+            StoreDepth(eye, o, 0.0, hud);
+        }
+        return; // uniform for the whole workgroup: no barrier follows on this path
+    }
+    const float t_hi = win_max + 1.0;
+    const float t_lo = max(uintBitsToFloat(s_tmin_bits) - 1.0, 0.0);
+
+    // ---- 3. this workgroup's source span into LDS (+ 8-px block maxima) ----
+    int a = s > 0.0 ? px0 - int(ceil(t_hi)) - 2 : px0 + int(floor(t_lo)) - 2;
+    int b = s > 0.0 ? px0 + GW - 1 - int(floor(t_lo)) + 2 : px0 + GW - 1 + int(ceil(t_hi)) + 2;
+    if (b - a + 1 > SPAN) {
+        // Unreachable with D <= kMaxDisparityPx (184); keep the nearest-surface end if it happens.
+        if (s > 0.0) {
+            b = a + SPAN - 1;
+        } else {
+            a = b - SPAN + 1;
+        }
+    }
+    const int n = b - a + 1;
+    for (int c = lid.x; c < n; c += GW) {
+        s_d[row][c] = texelFetch(disp_tex, ivec2(clamp(a + c, 0, pc.src_size.x - 1), y), 0).r;
+    }
+    barrier();
+    for (int blk = lid.x; blk < (n + 7) / 8; blk += GW) {
+        float m = 0.0;
+        for (int k = 0; k < 8; ++k) {
+            m = max(m, LD(row, min(blk * 8 + k, n - 1)));
+        }
+        s_bmax[row][blk] = m;
+    }
+    barrier();
+    if (!inside) {
+        return;
+    }
+
+    // ---- 4. nearest-first segment scan (local LDS index l <-> source column a + l) ----
+    const float pl = float(p.x - a); // pixel centres at integer positions
+    int kind = 0;                    // 0 none, 1 surface, 2 edge footprint, 3 hole
+    float q = pl;                    // local source position of the hit
+    float d_hit = 0.0;               // kind 2: the footprint's disparity
+    int gap_bg = -1;
+    int gap_fg = -1;
+    float gap_edge = 0.0;
+    const int dir = s > 0.0 ? 1 : -1;
+    int l = s > 0.0 ? max(int(floor(pl - t_hi)) - 1, 0) : min(int(ceil(pl + t_hi)) + 1, n - 1);
+    const int l_end =
+        s > 0.0 ? min(int(ceil(pl - t_lo)) + 1, n - 1) : max(int(floor(pl + t_lo)) - 1, 1);
+    for (int guard = 0; guard < SPAN && (s > 0.0 ? l < l_end : l >= l_end); ++guard) {
+        // empty-space skip at a block entry
+        if ((l & 7) == (s > 0.0 ? 0 : 7)) {
+            const int blk = l >> 3;
+            const float q_near = float(blk * 8 + (s > 0.0 ? 7 : 0));
+            if (s_bmax[row][blk] < s * (pl - q_near) - 1.0) {
+                l += 7 * dir; // keep the segment straddling the block end
+                continue;
+            }
+        }
+        const int lo = s > 0.0 ? l : l - 1;
+        const int hi = lo + 1;
+        const float Dl = LD(row, lo);
+        const float Dh = LD(row, hi);
+        if (abs(Dh - Dl) <= pc.tau) {
+            const float xa = float(lo) + s * Dl;
+            const float xb = float(hi) + s * Dh;
+            if (xb > xa && pl >= xa && pl < xb) {
+                q = float(lo) + (pl - xa) / (xb - xa);
+                kind = 1;
+                break;
+            }
+        } else {
+            // two constant half-pixel footprints, in scan order
+            const float first_D = s > 0.0 ? Dl : Dh;
+            const float second_D = s > 0.0 ? Dh : Dl;
+            const float first_a = s > 0.0 ? float(lo) : float(hi) - 0.5;
+            const float second_a = s > 0.0 ? float(lo) + 0.5 : float(lo);
+            if (pl >= first_a + s * first_D && pl < first_a + 0.5 + s * first_D) {
+                q = pl - s * first_D;
+                d_hit = first_D;
+                kind = 2;
+                break;
+            }
+            if (pl >= second_a + s * second_D && pl < second_a + 0.5 + s * second_D) {
+                q = pl - s * second_D;
+                d_hit = second_D;
+                kind = 2;
+                break;
+            }
+            const float ga = float(lo) + 0.5 + s * Dl;
+            const float gb = float(lo) + 0.5 + s * Dh;
+            if (gap_bg < 0 && pl >= min(ga, gb) && pl < max(ga, gb)) {
+                gap_bg = Dl < Dh ? lo : hi;
+                gap_fg = Dl < Dh ? hi : lo;
+                gap_edge = float(lo) + 0.5 + s * min(Dl, Dh);
+            }
+        }
+        l += dir;
+    }
+    if (kind == 0 && gap_bg >= 0) {
+        kind = 3;
+    }
+
+    // ---- 5. colour (linear light) and the disparity of the surface shown ----
+    vec3 col;
+    float d_sel;
+    int src_x = p.x; // the source column shown (FLAG_ITEM_MASK)
+#ifdef LATE_WARP
+    vec2 shown_q = vec2(0.0); // its place in the capture
+    float view_w = -1.0;
+    if (kind == 1) {
+        const int i = int(floor(q));
+        const float f = q - float(i);
+        src_x = a + i + (f >= 0.5 ? 1 : 0);
+        d_sel = mix(LD(row, i), LD(row, i + 1), f);
+        // Sharp where the row's four columns are one surface (as below), the capture's own test.
+        const bool sharp = i >= 1 && i + 2 < n && abs(LD(row, i) - LD(row, i - 1)) <= pc.tau &&
+                           abs(LD(row, i + 2) - LD(row, i + 1)) <= pc.tau;
+        col = SrcBetween(a + i, y, f, sharp, shown_q, view_w);
+    } else if (kind == 2) {
+        src_x = a + int(floor(q + 0.5));
+        bool hole;
+        shown_q = Q(src_x, y, hole);
+        // edge footprint: the nearest V column; its colour the capture's nearest texel, or
+        // (late_warp_edge_blend) V's filtered colour there (EdgeColour at a capture depth edge).
+        col = pc.edge_k >= 0.0 && !hole ? SrcFiltered(shown_q, false) : SrcNearest(shown_q);
+        view_w = ViewW(src_x, y);
+        d_sel = d_hit;
+    } else if (kind == 3) {
+        const float away = gap_fg > gap_bg ? -1.0 : 1.0; // into the background
+        const float Dbg = LD(row, gap_bg);
+        d_sel = Dbg; // filled with the background
+        const float k = max(abs(pl - gap_edge), 1.0);    // eye px into the hole
+        vec3 acc = vec3(0.0);
+        float wsum = 0.0;
+        for (int t = 0; t < 4; ++t) {
+            const float qq = float(gap_bg) + away * (1.0 + k * (float(t) + 0.5) * 0.25);
+            const int qi = int(floor(qq + 0.5));
+            const float Dq =
+                (qi >= 0 && qi < n)
+                    ? LD(row, qi)
+                    : texelFetch(disp_tex, ivec2(clamp(a + qi, 0, pc.src_size.x - 1), y), 0).r;
+            if (abs(Dq - Dbg) <= 2.0 + 0.1 * Dbg) { // background only
+                bool hole;
+                acc += SrcNearest(Q(a + qi, y, hole));
+                wsum += 1.0;
+            }
+        }
+        bool hole;
+        shown_q = Q(a + gap_bg, y, hole);
+        col = wsum > 0.0 ? acc / wsum : SrcNearest(shown_q);
+        src_x = a + gap_bg;
+        view_w = ViewW(src_x, y);
+        if ((pc.flags & FLAG_DEBUG_HOLES) != 0u) {
+            col = vec3(0.0, 1.0, 0.0); // debug: holes in green
+        }
+    } else {
+        bool hole;
+        shown_q = Q(p.x, y, hole);
+        col = SrcNearest(shown_q); // no root in the window (only at the render border)
+        const vec2 dw = texelFetch(disp_tex, ivec2(clamp(p.x, 0, pc.src_size.x - 1), y), 0).rg;
+        d_sel = dw.x;
+        view_w = dw.y;
+    }
+    {
+        // Debug: the late warp's own holes (what the capture never saw) in green too.
+        bool hole;
+        Q(src_x, y, hole);
+        if (hole && (pc.flags & FLAG_DEBUG_HOLES) != 0u) {
+            col = vec3(0.0, 1.0, 0.0);
+        }
+    }
+    bool hud;
+    Store(eye, out_px, ApplyHud(col, p, hud_shift, ItemAtSrc(shown_q), hud));
+    StoreDepth(eye, o, d_sel, hud);
+    // Fills (kind 3) and no root: invented here, colour-clamped history only.
+    StoreEyeW(eye, o, shown_q, view_w, d_sel, hud, ItemAtSrc(shown_q), kind != 1 && kind != 2);
+#else
+    if (kind == 1) {
+        const int i = int(floor(q));
+        const float f = q - float(i);
+        src_x = a + i + (f >= 0.5 ? 1 : 0);
+        const vec3 c1 = SceneAt(a + i, y);
+        const vec3 c2 = SceneAt(a + i + 1, y);
+        col = mix(c1, c2, f);
+        d_sel = mix(LD(row, i), LD(row, i + 1), f); // affine in 1/z on a plane: exact
+        if ((pc.flags & FLAG_CATMULL_ROM) != 0u && i >= 1 && i + 2 < n &&
+            abs(LD(row, i) - LD(row, i - 1)) <= pc.tau &&
+            abs(LD(row, i + 2) - LD(row, i + 1)) <= pc.tau) {
+            const vec3 c0 = SceneAt(a + i - 1, y);
+            const vec3 c3 = SceneAt(a + i + 2, y);
+            const float w0 = ((-0.5 * f + 1.0) * f - 0.5) * f;
+            const float w1 = (1.5 * f - 2.5) * f * f + 1.0;
+            const float w2 = ((-1.5 * f + 2.0) * f + 0.5) * f;
+            const float w3 = (0.5 * f - 0.5) * f * f;
+            const vec3 cr = w0 * c0 + w1 * c1 + w2 * c2 + w3 * c3;
+            // anti-ringing: stay inside the local range of the four taps
+            col = clamp(cr, min(min(c0, c1), min(c2, c3)), max(max(c0, c1), max(c2, c3)));
+        }
+    } else if (kind == 2) {
+        src_x = a + int(floor(q + 0.5));
+        col = SceneAt(src_x, y); // edge footprint: nearest
+        d_sel = d_hit;
+    } else if (kind == 3) {
+        const float away = gap_fg > gap_bg ? -1.0 : 1.0; // into the background
+        const float Dbg = LD(row, gap_bg);
+        d_sel = Dbg; // filled with the background
+        const float k = max(abs(pl - gap_edge), 1.0);    // eye px into the hole
+        vec3 acc = vec3(0.0);
+        float wsum = 0.0;
+        for (int t = 0; t < 4; ++t) {
+            const float qq = float(gap_bg) + away * (1.0 + k * (float(t) + 0.5) * 0.25);
+            const int qi = int(floor(qq + 0.5));
+            const float Dq =
+                (qi >= 0 && qi < n)
+                    ? LD(row, qi)
+                    : texelFetch(disp_tex, ivec2(clamp(a + qi, 0, pc.src_size.x - 1), y), 0).r;
+            if (abs(Dq - Dbg) <= 2.0 + 0.1 * Dbg) { // background only
+                acc += SceneAt(a + qi, y);
+                wsum += 1.0;
+            }
+        }
+        col = wsum > 0.0 ? acc / wsum : SceneAt(a + gap_bg, y);
+        src_x = a + gap_bg;
+        if ((pc.flags & FLAG_DEBUG_HOLES) != 0u) {
+            col = vec3(0.0, 1.0, 0.0); // debug: holes in green
+        }
+    } else {
+        col = SceneAt(p.x, y); // no root in the window (only at the render border)
+        d_sel = texelFetch(disp_tex, ivec2(clamp(p.x, 0, pc.src_size.x - 1), y), 0).r;
+    }
+
+    // ---- 6. HUD after the warp, at a constant whole-pixel disparity ----
+    bool hud;
+    Store(eye, out_px, ApplyHud(col, p, hud_shift, ItemAt(src_x, y), hud));
+    StoreDepth(eye, o, d_sel, hud);
+#endif
+}
