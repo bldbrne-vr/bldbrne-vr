@@ -118,3 +118,8 @@ SPDX-License-Identifier = "MIT"
 path = ["src/resources/vr/gun_reload.pcm", "src/resources/vr/gun_empty.pcm"]
 SPDX-FileCopyrightText = "Brian MacIntosh and LFA"
 SPDX-License-Identifier = "CC0-1.0"
+
+[[annotations]]
+path = "src/resources/vr/beast_chain_clink.pcm"
+SPDX-FileCopyrightText = "DenisChardonnet"
+SPDX-License-Identifier = "CC0-1.0"
