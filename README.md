@@ -10,8 +10,10 @@ An unofficial, independent VR mod for Bloodborne. No game files are included.
 
 ## Download
 
-- [Installer (Windows)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/BloodborneVR-vr-win-Setup.exe)
-- [Portable (zip)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/BloodborneVR-vr-win-Portable.zip)
+- [Installer (Windows)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Setup.exe)
+- [Portable (zip)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Portable.zip)
+
+Already on 0.2.6 or earlier? Let the launcher update, then choose **Install the new version** on the Play page once. Your settings and saves come with you.
 
 ## Supported game version
 
@@ -19,7 +21,7 @@ Bloodborne for PS4, version 1.09. Tested with CUSA03173 and CUSA00900.
 
 ## How to use
 
-1. Install the mod (or extract the portable ZIP) and open `BloodborneVR.exe`.
+1. Install the mod (or extract the portable ZIP) and open `Bldbrne-VR.exe`.
 2. Connect your headset and start your VR software.
 3. Choose your **Game folder** — the Bloodborne 1.09 folder containing `eboot.bin`.
 4. **Have an existing save?** Choose your shadPS4 `savedata` folder under **Save home folder**. Otherwise, skip this step.
