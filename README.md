@@ -225,6 +225,7 @@ Defaults below are for a fresh configuration of this version; existing saved set
 | Option | Default | What it does |
 | --- | --- | --- |
 | **Scaling** | 0% (headset resolution) | Changes resolution relative to what the headset requests. Higher values give a sharper image at a higher rendering cost. |
+| **DLSS** | Off | NVIDIA RTX cards: renders smaller and reconstructs both eyes. Choose a profile (Balanced is the default) and use **SAVE AND RESTART**: the change applies from the next start. FSR 4 and DLSS 5 are not included yet. |
 
 </details>
 
