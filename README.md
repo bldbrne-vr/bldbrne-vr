@@ -24,10 +24,10 @@ Bloodborne for PS4, version 1.09. Tested with CUSA03173 and CUSA00900.
 1. Install the mod (or extract the portable ZIP) and open `Bldbrne-VR.exe`.
 2. Connect your headset and start your VR software.
 3. Choose your **Game folder** — the Bloodborne 1.09 folder containing `eboot.bin`.
-4. **Have an existing save?** Choose your shadPS4 `savedata` folder under **Save home folder**. Otherwise, skip this step.
+4. **Have an existing save from shadPS4?** Choose its home folder under **Saves folder (optional)**. Otherwise, skip this step: your saves stay with the mod.
 5. Launch the game, put on your headset, and enjoy the hunt!
 
-**Keep "Use the included VR runtime" ticked on the Play page.** The mod only works with the shadPS4 build it ships with: another shadPS4 lacks the VR renderer, its fixes and patches, and the game will crash.
+**No separate shadPS4 is needed.** The mod ships its own VR build of shadPS4 and always uses it; it is updated together with the launcher.
 
 The first launch may stutter while shaders are built. Existing saves are used in place; use **Save backups** in the launcher to back them up before playing.
 
