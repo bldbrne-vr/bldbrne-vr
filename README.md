@@ -15,6 +15,21 @@ An unofficial, independent VR mod for Bloodborne. No game files are included.
 
 Already on 0.2.6 or earlier? Let the launcher update, then choose **Install the new version** on the Play page once. Your settings and saves come with you.
 
+## What's new in 0.3.5
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.3.5)
+
+- Fixed the reproduced stretched/ghost triangles after death or travel by keeping motion-index GPU readbacks out of newly loaded game memory.
+- Reduced rendering and synchronization work in equipment and weapon menus; menus stay in the normal stereo eye images.
+- Fixed an audio cancellation deadlock that could freeze cinematic skips and sound shutdown.
+- Prevented closing a menu with B from leaking into an unintended blood-vial action.
+- Enabled Windows guest red-zone protection for **all users**, including existing profiles, and cached its analysis to reduce repeat startup work.
+- Bounded texture cleanup during transitions while preserving healthy caches for same-area travel.
+- Improved DLSS reliability by ignoring empty geometry draws during temporal scene checks.
+- Added the hunter VR app icon to the launcher and installer.
+
+The bundled runtime is an optimized PGO/ThinLTO Release build with logging and memory-write tracing compiled out. The geometry fix passed the reproduced headset respawn, rest, and travel checks; it is a targeted fix, not a replacement of the whole memory system.
+
 ## Supported game version
 
 Bloodborne for PS4, version 1.09. Tested with CUSA03173 and CUSA00900.
