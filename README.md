@@ -15,6 +15,15 @@ An unofficial, independent VR mod for Bloodborne. No game files are included.
 
 Already on 0.2.6 or earlier? Let the launcher update, then choose **Install the new version** on the Play page once. Your settings and saves come with you.
 
+## What's new in 0.3.6
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.3.6)
+
+- Fixed flip-ordering races that could cause an internal assertion during gameplay.
+- Made live SMAA, FXAA, and Off switching apply at completed frame boundaries.
+
+Optimized PGO/ThinLTO Release build with normal logging off. FOV settings are unchanged.
+
 ## What's new in 0.3.5
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.3.5)
