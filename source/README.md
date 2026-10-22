@@ -65,7 +65,7 @@ These are the default **Motion** controls with **Move with: Left stick**, using 
 - **Physical gestures:** near the Doll, bow, point/wave, or raise a hand for rally/approval. Make Contact is also recognised; see the guide below for its pose and encounter. The corresponding gesture must be learned. Hold **Y**, then press **B** for the normal gesture menu.
 - **Levers:** with **Physical levers** enabled, grip and pull with either hand.
 
-[Full controls and weapon guide](docs/controls.md) — weapon-specific transformations, bow use, paired blades, gestures and alternate controls.
+[Full controls and weapon guide](https://github.com/bldbrne-vr/bldbrne-vr/blob/main/CONTROLS.md) — weapon-specific transformations, bow use, paired blades, gestures and alternate controls.
 
 **Using different controls?** Hold both stick clicks for one second to switch Motion / Buttons. **Move with: Right stick** swaps sticks, stick clicks and face-button actions; triggers, grips and weapon hands stay in place.
 
