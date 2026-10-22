@@ -10,34 +10,10 @@ An unofficial, independent VR mod for Bloodborne. No game files are included.
 
 ## Download
 
-- [Installer (Windows)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Setup.exe)
 - [Portable (zip)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Portable.zip)
+- [Installer (Windows)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Setup.exe)
 
 Already on 0.2.6 or earlier? Let the launcher update, then choose **Install the new version** on the Play page once. Your settings and saves come with you.
-
-## What's new in 0.3.6
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.3.6)
-
-- Fixed flip-ordering races that could cause an internal assertion during gameplay.
-- Made live SMAA, FXAA, and Off switching apply at completed frame boundaries.
-
-Optimized PGO/ThinLTO Release build with normal logging off. FOV settings are unchanged.
-
-## What's new in 0.3.5
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.3.5)
-
-- Fixed the reproduced stretched/ghost triangles after death or travel by keeping motion-index GPU readbacks out of newly loaded game memory.
-- Reduced rendering and synchronization work in equipment and weapon menus; menus stay in the normal stereo eye images.
-- Fixed an audio cancellation deadlock that could freeze cinematic skips and sound shutdown.
-- Prevented closing a menu with B from leaking into an unintended blood-vial action.
-- Enabled Windows guest red-zone protection for **all users**, including existing profiles, and cached its analysis to reduce repeat startup work.
-- Bounded texture cleanup during transitions while preserving healthy caches for same-area travel.
-- Improved DLSS reliability by ignoring empty geometry draws during temporal scene checks.
-- Added the hunter VR app icon to the launcher and installer.
-
-The bundled runtime is an optimized PGO/ThinLTO Release build with logging and memory-write tracing compiled out. The geometry fix passed the reproduced headset respawn, rest, and travel checks; it is a targeted fix, not a replacement of the whole memory system.
 
 ## Supported game version
 
@@ -52,6 +28,8 @@ Bloodborne for PS4, version 1.09. Tested with CUSA03173 and CUSA00900.
 5. Launch the game, put on your headset, and enjoy the hunt!
 
 **No separate shadPS4 is needed.** The mod ships its own VR build of shadPS4 and always uses it; it is updated together with the launcher.
+
+Weaker graphics card, or the game crashes often? Tick **Use DIBR** on the Play page.
 
 The first launch may stutter while shaders are built. Existing saves are used in place; use **Save backups** in the launcher to back them up before playing.
 
@@ -251,7 +229,9 @@ Defaults below are for a fresh configuration of this version; existing saved set
 | Option | Default | What it does |
 | --- | --- | --- |
 | **Scaling** | 0% (headset resolution) | Changes resolution relative to what the headset requests. Higher values give a sharper image at a higher rendering cost. |
-| **DLSS** | Off | NVIDIA RTX cards: renders smaller and reconstructs both eyes. Choose a profile (Balanced is the default) and use **SAVE AND RESTART**: the change applies from the next start. FSR 4 and DLSS 5 are not included yet. |
+| **DLSS** | Off | NVIDIA RTX cards: renders smaller and reconstructs both eyes. Use **SAVE AND RESTART**: the change applies from the next start. |
+| **FSR** | Off | FSR 4 or FSR 3.1.5: renders smaller and reconstructs both eyes. Turns DLSS off. |
+| **Profile** | Balanced | Ultra Performance (33% of the output size), Performance (50%), Balanced (58%) or Quality (67%). DLSS and FSR remember their own profile. |
 
 </details>
 
@@ -272,3 +252,44 @@ Bloodborne and PlayStation are trademarks of Sony Interactive Entertainment. Rig
 No game files are included. You must provide your own lawfully obtained copy of Bloodborne. Please do not request or share game files here.
 
 For software licences, third-party notices and attribution, see [Notices](source/NOTICE.md), [Licence](source/LICENSE) and [Credits](source/CREDITS.md).
+
+## Changelog
+
+### 0.5.0
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.5.0)
+
+- **Weighted weapons:** weapon-specific weight, balance and air resistance, with Off, Light and Regular settings.
+- **Steadier hands:** improved hand smoothing for steadier aiming and weapon movement.
+- **Physical summon bells:** take out the bell and shake it to summon an NPC.
+- **Quick 180° turn:** hold the right stick down briefly to turn around.
+- **Combat upgrades:** gun headshots, stronger knockback on heavy kills, charged Stake Driver punches, and shootable Molotovs for mid-air explosions.
+- **Adjustable outgoing damage:** -30% to +30%, in the VR menu.
+- **Performance scan** in the launcher, to help choose settings for your PC and headset.
+- **FSR 3.1.5**, and an **Ultra Performance** preset for DLSS and FSR.
+- **Use DIBR** on the Play page: a less demanding rendering option for weaker graphics cards, or if the game crashes often.
+- Smoother loading transitions, upscaler fixes, and protection of data written by the graphics card.
+
+### 0.3.6
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.3.6)
+
+- Fixed flip-ordering races that could cause an internal assertion during gameplay.
+- Made live SMAA, FXAA, and Off switching apply at completed frame boundaries.
+
+Optimized PGO/ThinLTO Release build with normal logging off. FOV settings are unchanged.
+
+### 0.3.5
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.3.5)
+
+- Fixed the reproduced stretched/ghost triangles after death or travel by keeping motion-index GPU readbacks out of newly loaded game memory.
+- Reduced rendering and synchronization work in equipment and weapon menus; menus stay in the normal stereo eye images.
+- Fixed an audio cancellation deadlock that could freeze cinematic skips and sound shutdown.
+- Prevented closing a menu with B from leaking into an unintended blood-vial action.
+- Enabled Windows guest red-zone protection for **all users**, including existing profiles, and cached its analysis to reduce repeat startup work.
+- Bounded texture cleanup during transitions while preserving healthy caches for same-area travel.
+- Improved DLSS reliability by ignoring empty geometry draws during temporal scene checks.
+- Added the hunter VR app icon to the launcher and installer.
+
+The bundled runtime is an optimized PGO/ThinLTO Release build with logging and memory-write tracing compiled out. The geometry fix passed the reproduced headset respawn, rest, and travel checks; it is a targeted fix, not a replacement of the whole memory system.
