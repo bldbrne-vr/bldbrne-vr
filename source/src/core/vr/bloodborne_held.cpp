@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -14,15 +20,14 @@
 #include "core/vr/bloodborne_assets.h"
 #include "core/vr/bloodborne_body.h"
 #include "core/vr/bloodborne_gun.h"
+#include "core/vr/body_channel.h"
 #include "core/vr/bloodborne_heal.h"
 #include "core/vr/bloodborne_held.h"
-#include "core/vr/body_channel.h"
 #include "core/vr/held_item.h"
-#include "core/vr/hook_util.h"
 #include "core/vr/inframe.h"
-#include "core/vr/interaction_native_vial_visual.h"
-#include "core/vr/lever_channel.h"
 #include "core/vr/music_box.h"
+#include "core/vr/lever_channel.h"
+#include "core/vr/hook_util.h"
 #include "core/vr/quick_channel.h"
 #include "core/vr/quick_items.h"
 #include "core/vr/quick_settings.h"
@@ -37,24 +42,6 @@ namespace {
 namespace H = VR::Held;
 using Hook::Plausible;
 using Hook::Read;
-
-VR::Interactions::Module* g_held_visual_module{};
-bool g_held_visual_fault{};
-VR::Interactions::NativeVialVisualRuntime g_held_visual;
-void InitHeldVisualDll() {
-    if (!VR::Interactions::DllRequested() || g_held_visual_module)
-        return;
-    // Pose updates are serialized by the body's guard; site A is its startup alternative.
-    g_held_visual_module = new VR::Interactions::Module();
-    g_held_visual_module->EnableFaultBroadcast();
-    g_held_visual.Bind(*g_held_visual_module, g_held_visual_fault);
-    if (!g_held_visual_module->LoadBesideExecutable()) {
-        g_held_visual_fault = true;
-        g_held_visual_module->ReportFault();
-        LOG_ERROR(Core, "VR held visual: interaction DLL unavailable: {}",
-                  g_held_visual_module->Diagnostic());
-    }
-}
 
 // Module-relative addresses in the 1.09 eboot (patch file address - 0x400000).
 // SfxSlotRequest, `void(SfxCtl* ctl, s32 slot, s32 ffx, const s32* dummy, u8 repeat)`: TAE event
@@ -238,6 +225,7 @@ struct Side {
     u32 ours_updates{0};
     bool ours_game_alive{false};
     bool ours_unready_logged{false};
+    VR::Held::ArmedLook ours_look{}; // full, or empty when armed with no Blood Vials left
 };
 Side g_side{};
 
@@ -361,6 +349,7 @@ void FailArm(Side& s, const char* why) {
 // the game's own again, or ours not ready): the renderer stops drawing it with this very update.
 void EndOurs(Side& s, const char* why) {
     g_ours_ns.store(0, std::memory_order_release);
+    s.ours_look.Reset();
     if (s.ours_updates != 0) {
         LOG_INFO(Core, "VR held: drain: our vial gone after {} updates ({})", s.ours_updates, why);
         s.ours_updates = 0;
@@ -375,8 +364,7 @@ void Tick(u8* chr, const HeldGate& gate, const char* site) {
     // that puts the vial away before it clears the word, so a cleared word read here comes with
     // that request: never a full vial for an update at the end of a drain.
     const u64 drain_word = VR::LatestVialDrain();
-    const u64 request_word = VR::LatestHeldRequest();
-    const H::Request request = H::UnpackRequest(request_word);
+    const H::Request request = H::UnpackRequest(VR::LatestHeldRequest());
     // A quick item from the arc: the game's held effect of that item (none: only the gun is
     // hidden and the in-frame renderer draws our mesh in the palm).
     const bool item = request.kind == H::Kind::Item;
@@ -390,48 +378,31 @@ void Tick(u8* chr, const HeldGate& gate, const char* site) {
     }
     // An item request with no item: the quick-item arc is open (quick_arc_hide_gun_open): the
     // gun is hidden, the fingers stay open (they reach for a card).
-    PiNativeVialVisualInput input{};
-    input.operation = PI_VV_HELD;
-    input.now_ns = now;
-    auto& facts = input.held;
-    facts.request_word = request_word;
-    facts.drain_word = drain_word;
-    facts.cinematic = VR::CinematicActive();
-    facts.menu = VR::IsGameMenuOpen();
-    facts.gate_valid = gate.valid;
-    facts.gate_reason = static_cast<uint32_t>(gate.reason);
-    facts.owner = static_cast<uint32_t>(gate.owner);
-    facts.held = gate.held;
-    const u8* const data = DataModule(chr);
-    facts.hp = data != nullptr ? Read<s32>(data + OffsetHp) : 1;
-    facts.item_use_state = Read<s32>(chr + OffsetItemUseState);
-    facts.item_goods = item_goods;
+    s.grip_goods = item ? item_goods : 1000;
+    s.grip = !item            ? VR::Quick::GripVial
+             : item_goods >= 0 ? VR::Quick::HeldLookOf(item_goods).grip
+                               : u8{0};
+    H::Inputs in{};
+    in.request = request;
+    in.age_ms = H::RequestAgeMs(request, now / Ms);
+    in.cinematic = VR::CinematicActive();
+    in.menu = VR::IsGameMenuOpen();
+    in.gate_valid = gate.valid;
+    in.reason = gate.reason;
+    in.owner = gate.owner;
+    in.held = gate.held;
+    const u8* const module = DataModule(chr);
+    in.hp = module != nullptr ? Read<s32>(module + OffsetHp) : 1; // unknown: not a reason
+    in.item_use_state = Read<s32>(chr + OffsetItemUseState);
     const auto& settings = VR::GetSettings();
-    facts.hide_left = settings.vial_hide_left;
-    facts.hide_two_handed = settings.vial_hide_two_handed;
-    facts.hide_gun = VR::Quick::GetQuickSettings().hide_gun;
-    facts.dry_run = g_dry_run;
-    facts.failed = s.failed;
-    facts.arm_failed = s.arm_failed;
-    facts.owner_changed = chr != s.chr;
-    // Coarse read optimization only: eligibility and render hand-over remain DLL-owned.
-    if (request.kind == H::Kind::Vial && (request.flags & H::FlagDrain)) {
-        facts.model_available = VR::Assets::GetModel(VialModel) != nullptr;
-        facts.renderer_available = VR::InFrame::Available();
-        facts.inframe_enabled = VR::Quick::GetQuickSettings().inframe;
-        facts.carried = CarriedBloodVials();
+    H::Policy policy{};
+    policy.hide_left = static_cast<u8>(std::clamp(settings.vial_hide_left, 0, 2));
+    policy.hide_two_handed = settings.vial_hide_two_handed;
+    if (item) {
+        // The open arc's request (no item) asks for the hide itself (quick_arc_hide_gun_open).
+        policy.hide_left = item_goods < 0 || VR::Quick::GetQuickSettings().hide_gun ? 1 : 0;
     }
-    const auto reply = g_held_visual.Call(input);
-    PiHeldVisibilityOutput decision{};
-    decision.reason = PI_HR_FAULT;
-    decision.grip_goods = -1;
-    if (reply.applied)
-        decision = reply.held;
-    s.grip_goods = decision.grip_goods;
-    s.grip = static_cast<u8>(decision.grip);
-    const H::Decision d{decision.requested != 0, decision.show != 0,
-                        static_cast<u8>(decision.hide_mask), decision.ours != 0,
-                        PhysicalInteractions::HeldVisibility::Reason(decision.reason)};
+    const H::Decision d = H::Decide(in, policy);
 
     if (chr != s.chr) {
         s.chr = chr; // a new character (loading): the old slot nodes went with the old one
@@ -486,14 +457,16 @@ void Tick(u8* chr, const HeldGate& gate, const char* site) {
     // point of the palm: the game's effect is not refreshed (an older one ends in this update's
     // effect update), the left weapon stays hidden and the vial grip closed. Only once our model
     // is loaded and the in-frame renderer draws (else the game's vial, full to the end).
-    const bool ours = decision.render_ours;
-    if (d.ours && !g_dry_run && !ours) {
+    bool ours = !item && d.ours && !g_dry_run;
+    if (ours && (VR::Assets::GetModel(VialModel) == nullptr || !VR::InFrame::Available() ||
+                 !VR::Quick::GetQuickSettings().inframe)) {
+        ours = false;
         EndOurs(s, "not ready");
         if (!s.ours_unready_logged) {
             s.ours_unready_logged = true;
             LOG_INFO(Core, "VR held: drain: our vial is not ready ({}): the game's vial stays full",
-                     !facts.model_available ? "model s10002 not loaded"
-                                            : "the in-frame renderer is off");
+                     VR::Assets::GetModel(VialModel) == nullptr ? "model s10002 not loaded"
+                                                                : "the in-frame renderer is off");
         }
     }
     if (ours) {
@@ -533,8 +506,9 @@ void Tick(u8* chr, const HeldGate& gate, const char* site) {
         s.state = H::State::Shown;
         s.reason = "";
         // Armed with no Blood Vials left: an empty vial (a stab is refused, nothing drains).
-        const u64 word = decision.look_word;
-        if (decision.look_fresh && decision.empty) {
+        bool fresh = false;
+        const u64 word = s.ours_look.Word(drain_word, CarriedBloodVials(), fresh);
+        if (fresh && s.ours_look.Empty()) {
             LOG_INFO(Core, "VR held: drain: no Blood Vials left: the vial in the hand is empty");
         }
         g_ours_word.store(word, std::memory_order_relaxed);
@@ -696,7 +670,7 @@ void Tick(u8* chr, const HeldGate& gate, const char* site) {
                                                         : -1,
             length, s.nodes_created, s.rotations, s.arms, OverrideText(chr), s.consumed, s.hides,
             static_cast<double>(s.tick_ns_max) * 1e-3, VR::Body::GateReasonName(gate.reason),
-            VR::Body::AnimClassName(gate.owner), gate.held ? 1 : 0, facts.hp, facts.item_use_state);
+            VR::Body::AnimClassName(gate.owner), gate.held ? 1 : 0, in.hp, in.item_use_state);
         s.tick_ns_max = 0;
     }
 }
@@ -787,7 +761,9 @@ DmyPolyFn g_torch_dmy = nullptr;
 struct TorchState {
     s32 weapon{-2};
     bool torch{false};
+    VR::Torch::SampledLift lift{};
     int copies{0};
+    int verify_frames{0};
     s32 ffx{0};
     s32 dummy{0};
     const char* source{"none"};
@@ -905,11 +881,7 @@ void TorchTick(u8* chr) {
     if (weapon != t.weapon) {
         t = {};
         t.weapon = weapon;
-        PiNativeVialVisualInput owner{};
-        owner.operation = PI_VV_TORCH_OWNER;
-        owner.torch.weapon_id = weapon;
-        const auto selected = g_held_visual.Call(owner);
-        t.torch = selected.applied && selected.torch.torch != 0;
+        t.torch = weapon >= 0 && VR::Torch::IsTorchFamily(weapon / 100000);
         if (t.torch) {
             LOG_INFO(Core, "VR torch: {} in the left hand: hold it up for more light", weapon);
         }
@@ -936,9 +908,24 @@ void TorchTick(u8* chr) {
                                  t.dummy)) {
             t.source = "its own";
             LOG_INFO(Core, "VR torch: its flame is effect {} on dummy {}", t.ffx, t.dummy);
-        } else if (!t.explained) {
-            t.explained = true;
-            ExplainTorch(t, nodes, count);
+        } else {
+            // The stock torch is a resident weapon effect, not a character slot effect.
+            // Require its known equipment row and a live flame dummy before using the fallback.
+            const u8* row = GunWeaponParamRow(t.weapon);
+            const auto flame = row != nullptr
+                ? VR::Torch::ResidentFlame(t.weapon / 100000, Read<s32>(row),
+                                          Read<s32>(row + 0x4C), Read<s16>(row + 0x110))
+                : VR::Torch::Flame{};
+            std::array<float, 3> flame_at{};
+            if (flame.ffx > 0 && TorchDummyAt(chr, flame.dummy, flame_at)) {
+                t.ffx = flame.ffx;
+                t.dummy = flame.dummy;
+                t.source = "resident torch effect (1.09)";
+                LOG_INFO(Core, "VR torch: resident flame effect {} on dummy {}", t.ffx, t.dummy);
+            } else if (!t.explained) {
+                t.explained = true;
+                ExplainTorch(t, nodes, count);
+            }
         }
     }
     if (t.dummy == 0 && t.ffx > 0 && !t.explained) {
@@ -951,35 +938,51 @@ void TorchTick(u8* chr) {
     if (t.dummy == 0 && t.ffx > 0 && t.far_dummy > 0) {
         t.dummy = t.far_dummy;
     }
+    // Read both snapshots before the age-check clock: a concurrently published hand sample
+    // must not look "from the future" just because TorchTick began before its publication.
     VR::Body::HandsSample hands{};
-    PiNativeVialVisualInput lift{};
-    lift.operation = PI_VV_TORCH;
-    lift.now_ns = now;
-    auto& facts = lift.torch;
-    facts.enabled = ts.enabled;
-    facts.hidden = HeldLeftHidden();
-    facts.have_hands = VR::Body::LatestHands(hands);
-    facts.hands_ns = hands.steady_ns;
-    facts.head_valid = hands.head_valid;
-    facts.position_valid = hands.hand[0].position_valid;
-    facts.hand[0] = hands.hand[0].p.x;
-    facts.hand[1] = hands.hand[0].p.y;
-    facts.hand[2] = hands.hand[0].p.z;
-    facts.head_y = hands.head_p.y;
-    facts.raised_m = ts.raised_m;
-    facts.high_m = ts.high_m;
-    facts.hysteresis_m = ts.hysteresis_m;
-    facts.max_copies = ts.copies;
-    facts.ffx = t.ffx;
-    facts.dummy = t.dummy;
-    const auto lifted = g_held_visual.Call(lift);
-    const PiTorchOutput decision = lifted.applied ? lifted.torch : PiTorchOutput{};
-    const int level = static_cast<int>(decision.level), copies = static_cast<int>(decision.copies);
+    VR::Body::BodyStatus body{};
+    const bool have_body = VR::Body::LatestBodyStatus(body);
+    const bool have_hands = VR::Body::LatestHands(hands);
+    const s64 sample_now = SteadyNs();
+    const bool body_fresh = have_body && VR::Torch::SampledLift::Fresh(sample_now, body.steady_ns);
+    const u8* equip = Read<u8*>(chr + OffsetChrEquip);
+    const s32 style = Plausible(equip) ? Read<s32>(equip + 8) : -1;
+    // A confirmed hide/stow is immediate. Missing status or tracking is only a short gap;
+    // it must neither erase the height hysteresis nor renew the last valid sample's age.
+    const bool allowed = !HeldLeftHidden() && style != 2 && style != 3 &&
+        !(body_fresh && (body.left_weapon_family != t.weapon / 100000 ||
+                         body.drawn_weight[0] < 0.9f));
+    std::array<float, 3> flame_at{};
+    const bool valid = style >= 0 && body_fresh && have_hands &&
+        VR::Torch::SampledLift::Fresh(sample_now, hands.steady_ns) &&
+        hands.head_valid && hands.hand[0].position_valid &&
+        VR::Body::IsFinite(hands.head_p) && VR::Body::IsFinite(hands.hand[0].p) &&
+        t.dummy > 0 && TorchDummyAt(chr, t.dummy, flame_at);
+    const s64 sample_ns = valid ? std::min(body.steady_ns, hands.steady_ns) : 0;
+    const int level = t.lift.Step(sample_now, allowed, sample_ns,
+                                  valid ? hands.hand[0].p.y - hands.head_p.y : 0.0f, ts);
+    const int copies = t.ffx > 0 && t.dummy > 0 ? VR::Torch::Copies(level, ts) : 0;
     if (copies != t.copies) {
         LOG_INFO(Core, "VR torch: {} ({} more flame{}, effect {} on dummy {}, {})",
                  level == 2 ? "held high" : level == 1 ? "raised" : "lowered", copies,
                  copies == 1 ? "" : "s", t.ffx, t.dummy, t.source);
         t.copies = copies;
+        t.verify_frames = 0;
+    }
+    if (copies > 0 && t.verify_frames < 8 && ++t.verify_frames == 8) {
+        int alive = 0;
+        u8* node = Read<u8*>(ctl + OffsetCtlHead);
+        for (u32 hops = 0; node != nullptr && hops < MaxHops && Plausible(node); ++hops) {
+            const s32 slot = Read<s32>(node + OffsetNodeSlot);
+            if (slot >= FirstTorchSlot && slot < FirstTorchSlot + copies &&
+                Read<u8*>(node) == g_torch_base + NodeVtableRva &&
+                (Read<u16>(node + OffsetNodeFlags) & 0x7FFF) == NodeSlotFlags &&
+                Read<s32>(node + OffsetNodeCur) == t.ffx && Alive(node)) ++alive;
+            node = Read<u8*>(node + OffsetNodeNext);
+        }
+        LOG_INFO(Core, "VR torch: extra flame instances alive {}/{} (effect {}, dummy {})",
+                 alive, copies, t.ffx, t.dummy);
     }
     for (int i = 0; i < copies; ++i) {
         const s32 dummy = t.dummy;
@@ -1006,7 +1009,6 @@ void InstallTorch(u8* module, u64 size) {
         LOG_WARNING(Core, "VR torch: the effect sites do not match; torch_lift off");
         return;
     }
-    InitHeldVisualDll();
     g_torch_base = module;
     g_torch_sfx = reinterpret_cast<SfxSlotRequestFn>(module + SfxSlotRequestRva);
     if (std::memcmp(module + DmyPolyRva, DmyPolySig.data(), DmyPolySig.size()) == 0) {
@@ -1122,7 +1124,6 @@ void InstallHeld(VAddr base, u64 size) {
         g_log = std::max(std::atoi(value), 1);
     }
     g_dry_run = std::getenv("VR_HELD_DRYRUN") != nullptr;
-    InitHeldVisualDll();
     g_ready = true;
     LOG_INFO(
         Core,

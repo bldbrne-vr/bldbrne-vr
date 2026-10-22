@@ -1,13 +1,14 @@
-#include "../../../scratchpad/dual-eye-perf/draw_registers.h"
-#include "../../../scratchpad/dual-eye-perf/profile_scopes.h"
-#include "../../../scratchpad/dual-eye-perf/push_state_memo.h"
-#include "../../../scratchpad/fast-renderer/b_handler_profile.h"
-#include "../../../scratchpad/fast-renderer/packet_codec.h"
+#include "video_core/native_stereo/draw_registers.h"
+#include "video_core/native_stereo/profile_scopes.h"
+#include "video_core/native_stereo/push_state_memo.h"
+#include "video_core/fast/b_handler_profile.h"
+#include "video_core/fast/packet_codec.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
-#include "../../../scratchpad/dual-eye-perf/lighting_reconstruction.h"
+#include "video_core/native_stereo/native_stereo.h"
+#include "video_core/native_stereo/lighting_reconstruction.h"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -31,6 +32,8 @@
 #include <vulkan/vulkan_format_traits.hpp>
 
 #include "common/alignment.h"
+#include "common/slow_scope.h"
+#include "common/memory_write_trace.h"
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -41,8 +44,8 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/fast_render.h"
-#include "../../../scratchpad/fast-renderer/drain_audit.h"
-#include "../../../scratchpad/dual-eye-perf/diag_skip.h"
+#include "video_core/fast/drain_audit.h"
+#include "video_core/native_stereo/diag_skip.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_gpu_pass_profiler.h"
@@ -56,6 +59,7 @@
 #include "video_core/renderer_vulkan/vr_inframe.h"
 #include "video_core/renderer_vulkan/vr_perf.h"
 #include "video_core/renderer_vulkan/vr_render_taa.h"
+#include "video_core/renderer_vulkan/vr_dibr_dlss.h"
 #include "video_core/renderer_vulkan/vr_smaa.h"
 #include "video_core/renderer_vulkan/vr_temporal_capture.h"
 #include "video_core/texture_cache/download_log.h"
@@ -2926,7 +2930,7 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     return push_data;
 }
 
-#include "../../../scratchpad/dual-eye-perf/native_audit.inl"
+#include "video_core/native_stereo/native_audit.inl"
 
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
                        AmdGpu::Liverpool* liverpool_)
@@ -4249,7 +4253,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
                 vr_eye_extent = {state.width, state.height};
             if (world)
                 vr.shift =
-                    .5f * NativeStereo::Ipd() * r.world_scale / (VrHalfTan(r.vfov) * r.aspect);
+                    .5f * NativeStereo::Ipd(r) * r.world_scale / (VrHalfTan(r.vfov) * r.aspect);
             VrNativeDrawValues(pipeline, r);
         }
         push_data.vr_shift = vr.shift;
@@ -4483,7 +4487,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
                 vr_eye_extent = {state.width, state.height};
             if (world)
                 vr.shift =
-                    .5f * NativeStereo::Ipd() * r.world_scale / (VrHalfTan(r.vfov) * r.aspect);
+                    .5f * NativeStereo::Ipd(r) * r.world_scale / (VrHalfTan(r.vfov) * r.aspect);
             VrNativeDrawValues(pipeline, r);
         }
         push_data.vr_shift = vr.shift;
@@ -4944,6 +4948,9 @@ void Rasterizer::DispatchDirectRecord(const ComputePipeline* pipeline) {
     const auto& cs_program = ScratchDraw::ComputeRegisters(liverpool);
     VrNativeAudit(pipeline, nullptr);
     const auto& cs = pipeline->GetStage(Shader::LogicalStage::Compute);
+    if (VrLogDispatch(pipeline, false)) {
+        return; // the draw inspector's `skipcs`
+    }
     if (vr_temporal_enabled)
         VrTemporalDispatch(cs.pgm_hash);
     if (ExecuteShaderHLE(cs, std::as_const(ScratchDraw::Registers(liverpool)), cs_program, *this)) {
@@ -5060,6 +5067,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr address, u32 offset,
                                         u32 size) {
     ScratchCapturedInputs captured_inputs{pipeline};
+    if (VrLogDispatch(pipeline, true)) {
+        return; // the draw inspector's `skipcs`
+    }
     if (vr_temporal_enabled)
         VrTemporalDispatch(pipeline->GetStage(Shader::LogicalStage::Compute).pgm_hash);
     if (!BindResources(pipeline)) {
@@ -5338,7 +5348,7 @@ void Rasterizer::OnSubmit() {
         buffer_cache.ProcessFaultBuffer();
     }
     texture_cache.ProcessDownloadImages();
-    texture_cache.RunGarbageCollector();
+    texture_cache.RunGarbageCollector(VR::TakeTransitionTextureCleanupRequest());
     buffer_cache.RunGarbageCollector();
 }
 
@@ -5897,7 +5907,7 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     // Ensure shader only has 2 bound buffers
     const auto& cs_pgm = std::as_const(ScratchDraw::ComputeRegisters(liverpool));
     const auto& info = pipeline->GetStage(Shader::LogicalStage::Compute);
-    // VR_PERF_PROBE (tests; documents/vr-gpu-guide.md 2.5 B): why a two-buffer compute shader is
+    // VR_PERF_PROBE (tests): why a two-buffer compute shader is
     // not turned into an image copy, logged once per shader and reason (64 at most), with both
     // buffers and the images at their addresses. No effect on what is recorded.
     const auto reject = [&](const char* why) {
@@ -6019,7 +6029,7 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
 }
 
 // FAST bit 55 (gpu_plan.md item 4, G'): the game's clear shader cs 8b355b5a, which
-// IsComputeImageClear refuses (13 calls/f in claude_mode_smaa_hs, about 10.5 us each as two
+// IsComputeImageClear refuses (13 calls/f in the SMAA headset mode, about 10.5 us each as two
 // dispatches and two global barriers), recorded as vkCmdFillBuffer of exactly the bytes it writes,
 // in both eyes. Audited from its GCN dump (one binary for all four permutations): 64 threads per
 // group; s_buffer_load_dwordx4 of the clear vector from the V# in s[8:11] at offset 0; then
@@ -6387,6 +6397,8 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
             },
         .extent = image1.info.resources,
     };
+    Common::MemoryWriteTrace::Event("compute.image.clear", buf1.base_address, buf1.GetSize(),
+        info.pgm_hash, Common::MemoryWriteTrace::SourceWord(values, 16));
     image1.Clear(clear, range);
     image1.flags |= VideoCore::ImageFlagBits::GpuModified;
     image1.flags &= ~VideoCore::ImageFlagBits::Dirty;
@@ -6637,6 +6649,7 @@ bool Rasterizer::IsComputeClearFill(const Pipeline* pipeline) {
     // read, as Buffer::shader_reads_visible expects of writes GetBarrier does not see.
     NativeStereo::Barrier(scheduler);
     const auto cmdbuf = scheduler.Commands();
+    Common::MemoryWriteTrace::Event("compute.buffer.fill", address, bytes, *word, info.pgm_hash);
     cmdbuf.fillBuffer(left, offset, bytes, *word);
     if (paired) {
         cmdbuf.fillBuffer(right, offset, bytes, *word);
@@ -6950,6 +6963,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     // with a camera record of light_view_scale; only then is its light list (buffer 1) paired.
     bool light_view_paired = false;
     float light_view_scale = 0.f;
+    float light_view_ipd = 0.f;
     // Second pass to re-bind buffers that were updated after binding
     for (u32 i = 0; i < buffer_bindings.size(); i++) {
         const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
@@ -7046,8 +7060,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             light_view_paired = true;
             // Stage A paired the ring copy with the packet's record (PrepareConstants); without
             // one the scale stays 0 and LightListBuffer refuses.
-            if (ring_light)
+            if (ring_light) {
                 light_view_scale = binding_packet ? binding_packet->camera.world_scale : 0.f;
+                light_view_ipd = binding_packet ? NativeStereo::Ipd(binding_packet->camera) : 0.f;
+            } else {
+                light_view_ipd = NativeStereo::Ipd(VR::DrawFrameRecord());
+            }
         }
         // The light shafts' and the glow god rays' centre per eye (NativeStereo::ScreenPointShader).
         const bool screen_point =
@@ -7101,7 +7119,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                                           constant->raw.offset)
                          : reinterpret_cast<const float*>(vsharp.base_address),
                 u32(size), alignment, constant == nullptr, stage.pgm_hash, light_view_scale,
-                native_camera);
+                light_view_ipd, native_camera);
         if (g_camera_audit && NativeStereo::AsymmetricProjection() && !desc.IsSpecial() &&
             !desc.is_written &&
             (size == 864 || size == 208 || size == 272 || size == 336 || size == 416) &&
@@ -8555,14 +8573,16 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     return value;
 }
 
-bool Rasterizer::InvalidateMemory(VAddr addr, u64 size) {
+bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool emulator_write,
+                                  bool protection_only) {
+    Common::Slow::Scope slow{Common::Slow::GuestInvalidate, size};
     if (DA::Enabled() && !liverpool->IsRecordingThread())
         DA::Get().Write({{addr, size}, DA::Kind::CpuFault});
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
-    buffer_cache.InvalidateMemory(addr, size);
+    buffer_cache.InvalidateMemory(addr, size, emulator_write, protection_only);
     texture_cache.InvalidateMemory(addr, size);
     return true;
 }
@@ -8719,6 +8739,7 @@ void Rasterizer::VerifyWriteFault(VAddr addr, VAddr start, u64 window, bool wind
 }
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
+    Common::MemoryWriteTrace::Event("cpu.read.fault", addr, size);
     DrainDrawPipe(DrawPipe::RasterizerEntry);
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
@@ -8757,6 +8778,7 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    Common::MemoryWriteTrace::Event("gpu.unmap", addr, size);
     DrainDrawPipe(DrawPipe::RasterizerEntry);
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.UnmapMemory(addr, size);

@@ -1,4 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #pragma once
 #include <algorithm>
 #include <array>
@@ -42,6 +47,7 @@ public:
         uint32_t provider_flags{}; // ProviderFlag
         // DLSS model (vr_dlss_preset.h, FAST bit 52); 0 = the bridge's own. DLSS only.
         uint32_t dlss_preset{};
+        uint32_t views{2}; // 1: DIBR center; 2: native stereo. Part of the resource key.
         bool operator==(const Plan&) const = default;
     };
     struct Device { VkDevice logical{}; VkPhysicalDevice physical{}; };
@@ -92,7 +98,9 @@ public:
             dlss_twin_state = 0;
             dlss_twin_current = false;
             if (key.provider == VR::Graphics::Upscaler::Off) return Result::Disabled;
-            if (!Valid(plan) || uint32_t(key.profile) > 2 || !device.logical || !device.physical ||
+            if (!Valid(plan) || (plan.views == 1 &&
+                (accepted.upscaler != VR::Graphics::Upscaler::Dlss || accepted.dlss5 || plan.provider_flags)) ||
+                uint32_t(key.profile) > 2 || !device.logical || !device.physical ||
                 !command || ticket <= completed) {
                 failed = true;
                 return Result::Invalid;
@@ -110,7 +118,7 @@ public:
                     return BbDlssFeature{s.input_width, s.input_height, s.output_width,
                                          s.output_height, quality, int(plan.inverted), 0, 1};
                 };
-                for (unsigned eye = 0; eye < 2; ++eye) {
+                for (unsigned eye = 0; eye < plan.views; ++eye) {
                     if (dlss->Create(eye, command, feature(eye), ticket) != VrDlssSession::Result::Ready) {
                         failed = true;
                         return Result::Failed;
@@ -122,7 +130,7 @@ public:
                     dlss_twin_state =
                         dlss->CreateTwin(command, feature(DlssTwinEye(plan.provider_flags)), ticket)
                             ? 1u : 2u;
-            } else if (key.provider == VR::Graphics::Upscaler::Fsr4) {
+            } else if (VR::Graphics::IsFsr(key.provider)) {
                 const auto activated = activate_fsr();
                 fsr = activated.session;
                 if (!fsr) { failed = true; return Result::Unavailable; }
@@ -166,7 +174,7 @@ public:
         }
         if (key.provider == VR::Graphics::Upscaler::Off) return Result::Disabled;
         if (failed) return Result::Failed;
-        ready = dlss ? dlss->CanProduceMotion() : fsr && fsr->CanProduceMotion();
+        ready = dlss ? dlss->CanProduceMotion(key.plan.views) : fsr && fsr->CanProduceMotion();
         return ready ? Result::Ready : Result::Pending;
     }
     bool NeedsConfiguration(const VR::Graphics::Config& c, const Plan& p) const {
@@ -216,7 +224,7 @@ public:
             reset = false;
             return Result::Ready;
         }
-        for (unsigned eye = 0; eye < 2; ++eye) {
+        for (unsigned eye = 0; eye < key.plan.views; ++eye) {
             auto f = frame.eyes[eye];
             f.reset = f.reset || restart;
             if (dlss) {
@@ -314,10 +322,13 @@ private:
         return c.upscaler == VR::Graphics::Upscaler::Off ? Key{} : next;
     }
     static bool Valid(const Plan& plan) {
-        for (const auto& s : plan.eyes)
+        if (plan.views != 1 && plan.views != 2) return false;
+        for (unsigned eye = 0; eye < plan.views; ++eye) {
+            const auto& s = plan.eyes[eye];
             if (!s.input_width || !s.input_height || s.input_width > s.output_width ||
                 s.input_height > s.output_height || s.output_width > 16384 ||
                 s.output_height > 16384) return false;
+        }
         return true;
     }
     bool Validate(const Frame& frame) const {
@@ -329,7 +340,7 @@ private:
         // Bit 46 scene views go to plain DLSS only: FSR's backend assumes COLOR aspect, layer 0,
         // and DLSS 5's chain hands the depth input on to its own feature.
         if (frame.direct_inputs && (!dlss || key.neural)) return false;
-        for (unsigned eye = 0; eye < 2; ++eye) {
+        for (unsigned eye = 0; eye < key.plan.views; ++eye) {
             const auto& f = frame.eyes[eye];
             const auto& size = key.plan.eyes[eye];
             // A direct input is this eye's array layer of the scene, in a format whose values
@@ -366,13 +377,14 @@ private:
         }
         // Canonical single-layer inputs and outputs belong to one eye only; disallow aliasing
         // writes with either eye's inputs, and any accidental shared motion/depth/color history.
-        for (unsigned i = 0; i < 2; ++i) for (unsigned j = 0; j < 2; ++j) {
+        for (unsigned i = 0; i < key.plan.views; ++i) for (unsigned j = 0; j < key.plan.views; ++j) {
             const auto& out = frame.eyes[i].output;
             const auto& other = frame.eyes[j];
             if (out.image == other.color.image || out.image == other.depth.image ||
                 out.image == other.motion.image || (i != j && out.image == other.output.image))
                 return false;
         }
+        if (key.plan.views == 1 && frame.verify_output.image) return false;
         if (const auto& verify = frame.verify_output; verify.image) {
             if (frame.verify_eye > 1) return false;
             const auto& size = key.plan.eyes[frame.verify_eye];
@@ -398,6 +410,7 @@ private:
                     if (twin.motion.image == other.motion.image) return false;
             }
         }
+        if (key.plan.views == 1) return true;
         if (frame.direct_inputs) {
             // One scene image per kind for both eyes: distinct layers and views instead.
             const auto distinct = [](const BbDlssImage& a, const BbDlssImage& b) {

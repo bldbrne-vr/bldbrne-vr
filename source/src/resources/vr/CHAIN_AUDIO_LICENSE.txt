@@ -17,10 +17,3 @@ to back while the chain reels in (0.48, scaled by recall speed; 5 ms on/12 ms of
 closes the reel until the game's own close sound has been decoded from the player's
 files (core/vr/game_sounds.h). Constant-power stereo pan, then the emulator/game output
 volume. This small excerpt is embedded in the executable; no extra runtime download or audio device.
-
-Provenance verification, 2026-10-16:
-The source page explicitly identifies the recording as CC0.
-Original recording SHA-256: 8d858237409595586f3923ae56b6ae153c57823aefa67eacd3d3fc23cca6e737
-Bundled PCM SHA-256: 69ef3a9c8b19ec2a8b27407b0bb842ae3fcb035660ffeec93f2bcfe1cf2ceaf1
-Rebuilding the documented excerpt from that recording reproduced the bundled PCM
-byte for byte.

@@ -1,4 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #pragma once
 #include "core/vr/graphics_settings.h"
 #include <cmath>
@@ -38,10 +43,15 @@ inline void PublishStatus(const Config& c, RunState state, Extent input = {}, Ex
 inline std::string SizeText(Extent e) {
     return std::to_string(e.width) + "x" + std::to_string(e.height);
 }
-inline std::string StatusText(Config c, RunStatus s, Extent applied, bool restart) {
-    const std::string name = c.upscaler == Upscaler::Fsr4 ? "FSR 4"
+// `files`: the chosen upscaler's files are beside the runtime (false: it cannot start at all; a
+// test build without its folder showed the choice as if it ran, 2026-10-18).
+inline std::string StatusText(Config c, RunStatus s, Extent applied, bool restart,
+                              bool files = true) {
+    const std::string name = IsFsr(c.upscaler) ? UpscalerName(c.upscaler)
                              : c.dlss5                    ? "DLSS 5"
                                                           : "DLSS";
+    if (c.upscaler != Upscaler::Off && !files)
+        return name + " unavailable | Its files are missing: reinstall Bldbrne-VR.";
     const auto profile = EffectiveProfile(c);
     const bool matches = s.provider == c.upscaler && s.profile == profile && s.neural == c.dlss5;
     if (c.upscaler != Upscaler::Off && matches) {
@@ -73,8 +83,8 @@ inline std::string StatusText(Config c, RunStatus s, Extent applied, bool restar
     }
     return name + " saved | Waiting for a complete scene";
 }
-inline std::string RuntimeStatusText() {
+inline std::string RuntimeStatusText(bool files = true) {
     return StatusText(Accepted(), UnpackStatus(run_status.load(std::memory_order_relaxed)),
-                      AppliedResolution(), ResolutionRestartRequired());
+                      AppliedResolution(), ResolutionRestartRequired(), files);
 }
 } // namespace VR::Graphics

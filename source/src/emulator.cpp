@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -550,7 +551,9 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     Common::Log::Switch((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
                                                                           : "shad_log.txt");
 #ifdef _WIN32
-    // Windows static guest red-zone protection
+    // The runtime enforces this even when an existing profile contains Disabled.
+    LOG_INFO(Core, "Windows guest red-zone protection: always enabled in this Bloodborne build "
+                   "(existing Disabled settings are ignored)");
     if (WindowsGuestRedZoneProtection::IsStaticPatchingEnabled()) {
         LOG_INFO(Core,
                  "Windows guest red-zone static protection uses module EH metadata and cannot "
@@ -848,7 +851,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 }
 
 // The window closed: its own close, or the headset's exit (OpenXR CheckSessionExit pushed the
-// quit: Quit in the headset's menu, EXITING). core/vr/exit_sequence.h: the user's 2026-10-09 log
+// quit: Quit in the headset's menu, EXITING). core/vr/exit_sequence.h: the 2026-10-09 log
 // had the play time and the shader cache written and then a process that never ended (stuck in
 // quick_exit's end - its handlers or ExitProcess - with the OpenXR session still alive).
 void Emulator::EndAfterClose(const std::string& serial) {

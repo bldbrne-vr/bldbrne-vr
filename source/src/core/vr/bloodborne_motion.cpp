@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -16,7 +22,6 @@
 #include "core/vr/body_channel.h"
 #include "core/vr/hook_util.h"
 #include "core/vr/motion_camera.h"
-#include "core/vr/interaction_native_camera.h"
 #include "core/vr/vr_session.h"
 
 namespace VR::Bloodborne {
@@ -24,33 +29,6 @@ namespace VR::Bloodborne {
 namespace {
 
 namespace M = VR::Motion;
-// Player update and status reads serialize one context under the publication mutex.
-// Render owns a separate context. Native reads and publication stay here.
-class MotionRuntime {
-public:
-    VR::Interactions::NativeCameraRuntime& Get() {
-        if(!attempted_) {
-            attempted_ = true;
-            if (VR::Interactions::DllRequested()) {
-                module_ = new VR::Interactions::Module();
-                module_->EnableFaultBroadcast();
-                runtime_.Bind(*module_, fault_);
-                if (!module_->LoadBesideExecutable()) {
-                    fault_ = true;
-                    module_->ReportFault();
-                    LOG_ERROR(Core, "VR motion: interaction DLL unavailable: {}",
-                              module_->Diagnostic());
-                }
-            }
-        }
-        return runtime_;
-    }
-
-private:
-    VR::Interactions::Module* module_{};
-    VR::Interactions::NativeCameraRuntime runtime_;
-    bool attempted_{}, fault_{};
-};
 using Hook::Plausible;
 using Hook::Read;
 using namespace Layout;
@@ -135,6 +113,7 @@ constexpr u32 OffsetInvincible = 0x1BC; // action flags (u32), bit 1
 constexpr u32 OffsetMoveFlags = 0x3C;   // HKS action state (u8)
 constexpr u8 FlagNoGravity = 0x10;
 constexpr u8 FlagNoFallAnim = 0x20;
+constexpr s64 DuplicateNs = 100 * M::Millis; // the same clip again this soon: a layered duplicate
 
 s64 NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -163,8 +142,12 @@ bool g_iframe = false;   // logging
 bool g_flags = false;    // logging
 bool g_first = false;    // the first update was logged
 u8* g_phys_vtable = nullptr;
+s32 g_clip = -1;
+s64 g_clip_ns = 0;
+s64 g_clip_seen_ns = 0; // last report, not the animation start
 std::atomic<float> g_jump_lift{0.f};
 std::atomic<s64> g_jump_lift_ns{0};
+u32 g_clip_serial = 0;
 s8 g_last_ladder = -1;
 bool g_last_sp = false;
 
@@ -173,7 +156,8 @@ std::mutex g_signals_mutex;
 M::Signals g_signals{};
 // Input needs ladder detection while the cinematic screen bypasses the comfort camera.
 // Updated at the player hook; published with g_signals under g_signals_mutex.
-MotionRuntime g_input_motion_runtime;
+M::Gate g_input_motion_gate{};
+M::Phase g_input_motion_phase{};
 
 M::Signals LoadSignals() {
     std::scoped_lock lock{g_signals_mutex};
@@ -234,7 +218,8 @@ struct CsvRow {
 };
 
 struct CameraSide {
-    MotionRuntime runtime;
+    M::Gate gate{};
+    M::ComfortCamera comfort{};
     M::DodgeStats stats{};
     M::Signals signals{}; // the last tick's copy
     // The dodge being measured.
@@ -467,7 +452,7 @@ void Observe(const EyeTick& tick, const M::Phase& phase, const M::V3& base,
 
 M::Phase StepGate(CameraSide& c, s64 now) {
     c.signals = LoadSignals();
-    const M::Phase phase = c.runtime.Get().Gate(c.signals, now);
+    const M::Phase phase = c.gate.Step(c.signals, now);
     if (phase.ladder_dead != c.ladder_dead) {
         c.ladder_dead = phase.ladder_dead;
         LOG_INFO(Core, "VR dodge: ladder dead latch {} (ladder state {}, HP {})",
@@ -508,12 +493,16 @@ AirSample LatestAir() {
 
 bool LadderActive() {
     std::scoped_lock lock{g_signals_mutex};
-    return g_input_motion_runtime.Get().MotionStatus(NowNs()).ladder;
+    const s64 age = NowNs() - g_signals.update_ns;
+    return g_input_motion_phase.ladder && g_signals.valid && age >= 0 && age <= M::Gate::StaleNs;
 }
 
 s64 LatestLadderStartNs() {
     std::scoped_lock lock{g_signals_mutex};
-    return g_input_motion_runtime.Get().MotionStatus(NowNs()).ladder_start_ns;
+    const s64 age = NowNs() - g_signals.update_ns;
+    return g_signals.valid && age >= 0 && age <= M::Gate::StaleNs
+               ? g_input_motion_phase.ladder_start_ns
+               : 0;
 }
 
 bool InitMotion(VAddr base, u64 size, bool site_ok, bool main_ok) {
@@ -659,57 +648,50 @@ void MotionUpdate(u8* player) {
     }
     g_last_sp = sp;
 
-    // Copy the native ring in its original order. DLL policy selects clips and
-    // asks whether the original first/new-clip vtable proof is required.
+    // The newest motion clip of the last behaviour step.
     u8* const time_act = module(OffsetTimeActModule);
-    PiNativeCameraInput ring_input{};
-    ring_input.operation = PI_NC_MOTION_RING;
-    ring_input.now_ns = now;
-    static_assert(TimeActRingSize == std::size(ring_input.ring.ids));
-    ring_input.ring.command = PI_MOTION_RING_BEGIN;
-    ring_input.ring.first = first;
     if (g_ring && time_act != nullptr) {
         const s32 write = Read<s32>(time_act + OffsetTimeActWrite);
         const s32 read = Read<s32>(time_act + OffsetTimeActRead);
         if (write >= 0 && write < TimeActRingSize && read >= 0 && read < TimeActRingSize) {
-            ring_input.ring.have_ring = 1;
-            for (s32 i = read; i != write; i = (i + 1) % TimeActRingSize)
-                ring_input.ring.ids[ring_input.ring.count++] =
-                    Read<s32>(time_act + OffsetTimeActRing + i * TimeActEntrySize);
+            s32 picked = -1;
+            bool jump = false;
+            for (s32 i = read; i != write; i = (i + 1) % TimeActRingSize) {
+                const s32 id = Read<s32>(time_act + OffsetTimeActRing + i * TimeActEntrySize);
+                const M::Kind kind = M::ClassifyMotionClip(id).kind;
+                if (kind != M::Kind::None) {
+                    picked = id;
+                }
+                // The jump, and the fall and landing it turns into off a ledge.
+                jump = jump || kind == M::Kind::Jump || kind == M::Kind::JumpFall ||
+                       kind == M::Kind::Falling || kind == M::Kind::Land;
+            }
+            // The module's vtable: on the first update and on every new motion clip.
+            if ((first || picked >= 0) && Read<u8*>(time_act) != g_base + TimeActVtableRva) {
+                g_ring = false;
+                LOG_WARNING(Core,
+                            "VR dodge: WARNING TimeAct module {} has vtable {} (expected +{:#x}); "
+                            "motion clips off",
+                            fmt::ptr(time_act), Vtable(time_act), TimeActVtableRva);
+            } else {
+                s.ring_valid = true;
+                if (picked >= 0 && (picked != g_clip || now - g_clip_seen_ns > DuplicateNs)) {
+                    g_clip = picked;
+                    g_clip_ns = now;
+                    ++g_clip_serial;
+                }
+                if (picked >= 0) g_clip_seen_ns = now;
+                if (jump) {
+                    g_jump_updates.fetch_add(1, std::memory_order_relaxed);
+                    g_jump_ns.store(now, std::memory_order_relaxed);
+                }
+                g_jump_read_ns.store(now, std::memory_order_release);
+            }
         }
     }
-    const auto call_ring = [&](const PiNativeCameraInput& input) {
-        std::scoped_lock lock{g_signals_mutex};
-        return g_input_motion_runtime.Get().Call(input).ring;
-    };
-    const auto begin = call_ring(ring_input);
-    if (!begin.token)
-        return;
-    bool accepted = ring_input.ring.have_ring;
-    if (begin.check_vtable && Read<u8*>(time_act) != g_base + TimeActVtableRva) {
-        g_ring = false;
-        accepted = false;
-        LOG_WARNING(
-            Core,
-            "VR dodge: WARNING TimeAct module {} has vtable {} (expected +{:#x}); motion clips off",
-            fmt::ptr(time_act), Vtable(time_act), TimeActVtableRva);
-    }
-    ring_input.ring = {};
-    ring_input.ring.command = PI_MOTION_RING_COMMIT;
-    ring_input.ring.token = begin.token;
-    ring_input.ring.accepted = accepted;
-    const auto clips = call_ring(ring_input);
-    if (!clips.token)
-        return;
-    s.ring_valid = clips.ring_valid;
-    s.clip = clips.clip;
-    s.clip_ns = clips.clip_ns;
-    s.clip_serial = clips.clip_serial;
-    if (clips.ring_valid) {
-        g_jump_updates.store(clips.jump_updates, std::memory_order_relaxed);
-        g_jump_ns.store(clips.jump_ns, std::memory_order_relaxed);
-        g_jump_read_ns.store(clips.jump_read_ns, std::memory_order_release);
-    }
+    s.clip = g_clip;
+    s.clip_ns = g_clip_ns;
+    s.clip_serial = g_clip_serial;
 
     // The physics module: the landed byte and the position (the camera pivot's source). Its
     // vtable is recorded on the first update and must stay the same.
@@ -787,20 +769,22 @@ void MotionUpdate(u8* player) {
 
     std::scoped_lock lock{g_signals_mutex};
     g_signals = s;
-    g_input_motion_runtime.Get().Gate(s, now);
+    g_input_motion_phase = g_input_motion_gate.Step(s, now);
 }
 
 void PublishJumpLift(float lift, s64 now) {
-    g_jump_lift.store(lift, std::memory_order_relaxed);
-    g_jump_lift_ns.store(now, std::memory_order_release);
+    g_jump_lift.store(std::isfinite(lift)?std::clamp(lift,0.f,1.5f):0.f,
+                      std::memory_order_relaxed);
+    g_jump_lift_ns.store(now,std::memory_order_release);
 }
 
 VR::Vec3 ComfortEye(const EyeTick& tick, const char* reset) {
     auto& c = Cam();
     const M::Phase phase = StepGate(c, tick.now_ns);
     M::ComfortConfig cfg = CurrentConfig();
-    const auto lift_ns = g_jump_lift_ns.load(std::memory_order_acquire);
-    const float lift = g_jump_lift.load(std::memory_order_relaxed);
+    const auto lift_ns=g_jump_lift_ns.load(std::memory_order_acquire);
+    if(lift_ns>0 && tick.now_ns>=lift_ns && tick.now_ns-lift_ns<150*M::Millis)
+        cfg.jump_lift=g_jump_lift.load(std::memory_order_relaxed);
     // A second eye's pair lock as the VR body decided it at this frame's pose copy (it placed the
     // hands for that eye): the camera follows it (core/vr/body_frame.h PairLock).
     M::LockDecision lock{};
@@ -812,9 +796,14 @@ VR::Vec3 ComfortEye(const EyeTick& tick, const char* reset) {
     // pivot (which the game derives from that position), so this is read apart from the value
     // that failed.
     const M::Signals& signals = c.signals;
-    const M::ComfortOut out = c.runtime.Get().Comfort(
-        ToMotion(tick.target), tick.pair_first, tick.now_ns, phase, cfg, reset, lock, nullptr,
-        &signals, VR::GetSettings().fp_eye_height_m, lift_ns, lift, &cfg.jump_lift);
+    const M::Fallback fallback{{signals.phys.x,
+                                signals.phys.y + VR::GetSettings().fp_eye_height_m * cfg.scale,
+                                signals.phys.z},
+                               signals.update_ns};
+    const bool have_fallback = signals.valid && signals.phys_valid;
+    const M::ComfortOut out =
+        c.comfort.Step(ToMotion(tick.target), tick.pair_first, tick.now_ns, phase, cfg, reset,
+                       &lock, have_fallback ? &fallback : nullptr);
     if (out.rejected && c.rejected++ % 600 == 0) {
         const char* shown = out.fallback ? (out.stale ? "the body's last known physics position"
                                                       : "the body's physics position")

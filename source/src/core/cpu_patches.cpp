@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
@@ -28,6 +29,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include "core/red_zone_cache.h"
 #else
 #if defined(__FreeBSD__)
 #include <machine/npx.h>
@@ -1008,12 +1010,12 @@ static void TryPatchAot(void* code_address, u64 code_size) {
 namespace WindowsGuestRedZoneProtection {
 namespace {
 
-std::atomic active_mode{WindowsGuestRedZoneProtectionMode::Disabled};
+std::atomic active_mode{DefaultMode};
 
 } // namespace
 
 void SetActiveMode(WindowsGuestRedZoneProtectionMode mode) noexcept {
-    active_mode.store(mode, std::memory_order_release);
+    active_mode.store(EffectiveMode(mode), std::memory_order_release);
 }
 
 WindowsGuestRedZoneProtectionMode GetActiveMode() noexcept {
@@ -1679,7 +1681,8 @@ const PatchInfo* FindMatchingPatch(const DecodedCodeInstruction& decoded) {
 } // namespace
 
 RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
-                                                  std::span<const uintptr_t> function_starts) {
+                                                  std::span<const uintptr_t> function_starts,
+                                                  const std::filesystem::path& cache_directory) {
     RedZonePatchResult result{};
     auto* module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
     if (module == nullptr || function_starts.empty()) {
@@ -1699,6 +1702,9 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
     starts.erase(unique_end, starts.end());
 
     std::unique_lock lock{module->mutex};
+    RedZoneAnalysisCache cache(cache_directory, segment_addr, segment_size, starts);
+    result.analysis_cache_hit = cache.Hit();
+    const bool needs_sse4a_substitutions = FilterNoSSE4a(nullptr);
     for (size_t function_index = 0; function_index < starts.size(); ++function_index) {
         const uintptr_t function_start = starts[function_index];
         const uintptr_t function_end =
@@ -1708,18 +1714,61 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
         }
 
         ++result.function_count;
+        if (cache.Hit() && !cache.NeedsAnalysis(function_index, needs_sse4a_substitutions)) {
+            result.instruction_count += cache.InstructionCount(function_index);
+            continue;
+        }
+        if (cache.Hit() && cache.CanPatchDirectly(function_index)) {
+            // These functions have no red-zone accesses and only standalone CPU substitutions
+            // at least five bytes long. Re-decode the cached sites, not the entire function.
+            // No relocated machine code or process-specific TLS slot is read from disk.
+            result.instruction_count += cache.InstructionCount(function_index);
+            for (const auto& site : cache.DirectSites(function_index)) {
+                const uintptr_t address = segment_addr + site[1];
+                const auto decoded = DecodeCodeInstruction(address, function_end);
+                const auto* patch = FindMatchingPatch(decoded);
+                if (patch && !TryPatch(reinterpret_cast<u8*>(address), module).first &&
+                    patch->trampoline) {
+                    // With long, verified instructions TryPatch can only refuse a matching
+                    // trampoline when its storage is exhausted. The full relocation pass
+                    // cannot recover from that either; preserve its coverage accounting.
+                    ++result.cpu_patch_instruction_count;
+                    ++result.unsupported_cpu_patch_instruction_count;
+                }
+            }
+            continue;
+        }
+        ++result.decoded_function_count;
         auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
         AnalyzeRedZoneLiveness(function);
         result.instruction_count += function.instructions.size();
 
         std::map<uintptr_t, InstructionRewrite> rewrite_sites;
+        uint8_t requirements = function.uses_red_zone ? RedZoneAnalysisCache::Always : 0;
+        bool direct_cpu_only = !function.uses_red_zone;
+        std::vector<uintptr_t> cpu_sites;
 
         // Apply existing instruction substitutions ahead of time now that only verified
         // instruction boundaries are being visited. Short trampoline patches are combined with
         // the relocation pass below.
         for (auto& [address, decoded] : function.instructions) {
             const PatchInfo* matching_patch = FindMatchingPatch(decoded);
-            const auto [patched, _] = TryPatch(reinterpret_cast<u8*>(address), module);
+            // Store CPU requirements, not this host's decision. A cache made on an SSE4a
+            // host must still retain these functions when later loaded on a CPU without it.
+            const auto mnemonic = decoded.instruction.mnemonic;
+            if (mnemonic == ZYDIS_MNEMONIC_EXTRQ || mnemonic == ZYDIS_MNEMONIC_INSERTQ ||
+                IsInPlaceMemoryPatch(mnemonic)) {
+                requirements |= RedZoneAnalysisCache::WithoutSSE4a;
+            } else if (matching_patch != nullptr) {
+                requirements |= RedZoneAnalysisCache::Always;
+            }
+            if (matching_patch || mnemonic == ZYDIS_MNEMONIC_EXTRQ ||
+                mnemonic == ZYDIS_MNEMONIC_INSERTQ || IsInPlaceMemoryPatch(mnemonic)) {
+                direct_cpu_only &= decoded.instruction.length >= NearJumpSize;
+                cpu_sites.push_back(address - segment_addr);
+            }
+            const bool patched =
+                matching_patch != nullptr && TryPatch(reinterpret_cast<u8*>(address), module).first;
             if (IsInPlaceMemoryPatch(decoded.instruction.mnemonic)) {
                 const RedZoneMask red_zone_live = decoded.red_zone_live;
                 decoded = DecodeCodeInstruction(address, function_end);
@@ -1730,6 +1779,17 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
             } else if (matching_patch != nullptr && matching_patch->trampoline) {
                 rewrite_sites.emplace(address, InstructionRewrite{.cpu_patch = matching_patch});
                 ++result.cpu_patch_instruction_count;
+            }
+        }
+
+        // Eligibility was collected from the original instructions, before substitutions.
+        if (direct_cpu_only && !cpu_sites.empty()) {
+            requirements |= RedZoneAnalysisCache::DirectCpu;
+        }
+        cache.Record(function_index, function.instructions.size(), requirements);
+        if (!cache.Hit() && (requirements & RedZoneAnalysisCache::DirectCpu)) {
+            for (const auto offset : cpu_sites) {
+                cache.AddDirectSite(function_index, offset);
             }
         }
 
@@ -2196,12 +2256,14 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
             patched_spans.emplace_back(site_span.patch_start, site_span.continuation);
         }
     }
+    result.analysis_cache_written = cache.Save();
     return result;
 }
 
 #else
 
-RedZonePatchResult PatchRedZoneMemoryInstructions(u64, u64, std::span<const uintptr_t>) {
+RedZonePatchResult PatchRedZoneMemoryInstructions(u64, u64, std::span<const uintptr_t>,
+                                                  const std::filesystem::path&) {
     return {};
 }
 

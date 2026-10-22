@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "common/hash.h"
@@ -12,12 +18,12 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_prepared_bindings.h"
-#include "../../../scratchpad/dual-eye-perf/shader_header_read.h"
-#include "../../../scratchpad/dual-eye-perf/draw_registers.h"
-#include "../../../scratchpad/dual-eye-perf/graphics_packet_replay.h"
-#include "../../../scratchpad/dual-eye-perf/graphics_submission_scan.h"
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
-#include "../../../scratchpad/dual-eye-perf/register_delta.h"
+#include "video_core/native_stereo/shader_header_read.h"
+#include "video_core/native_stereo/draw_registers.h"
+#include "video_core/native_stereo/graphics_packet_replay.h"
+#include "video_core/native_stereo/graphics_submission_scan.h"
+#include "video_core/native_stereo/native_stereo.h"
+#include "video_core/native_stereo/register_delta.h"
 #include <magic_enum/magic_enum.hpp>
 #include <algorithm>
 #include <array>
@@ -30,8 +36,8 @@
 #include <stop_token>
 #include <string>
 #include <thread>
-#include "../../../scratchpad/dual-eye-perf/speculative_pool.h"
-#include "../../../scratchpad/dual-eye-perf/speculative_read.h"
+#include "video_core/native_stereo/speculative_pool.h"
+#include "video_core/native_stereo/speculative_read.h"
 
 namespace Vulkan {
 namespace {
@@ -40,7 +46,7 @@ bool ReadRaw(void (*read)(void*), void* context) {
 #ifdef _WIN32
     return ScratchDraw::TrySpeculativeRead(read, context);
 #else
-    // The Windows scratchpad does not install a POSIX speculative fault boundary.
+    // Windows does not install a POSIX speculative fault boundary.
     return false;
 #endif
 }
@@ -292,7 +298,7 @@ std::optional<PrepProgramResult> PipelineCache::PrepareProgramLocked(const PrepS
     if (module == program.modules.end()) return {};
     return PrepProgramResult{module->id, // the permutation's id, as GetProgram returns it
                              &program.info, &owned, module->module, module->spec.fetch_shader_data,
-                             std::move(fetch_source)};
+                             std::move(fetch_source), module->vertex_output_locations};
 }
 
 namespace {
@@ -1262,6 +1268,8 @@ bool PipelineCache::PrepareGraphicsStage(PipelineSelection& selected, Shader::St
     context.fetch[index] = std::move(prepared->fetch_source);
     selected.infos[index] = &info;
     selected.modules[index] = prepared->module;
+    if (logical == Shader::LogicalStage::Vertex)
+        selected.vertex_output_locations = prepared->vertex_output_locations;
     selected.graphics_key.stage_hashes[index] = prepared->hash;
     if (prepared->fetch)
         selected.fetch_shader = std::move(prepared->fetch);

@@ -1,10 +1,16 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
 #include <cstdint>
 
-// VR: what closes the emulator from the headset's side. The user's rule (2026-10-09, after the
+// VR: what closes the emulator from the headset's side. The tester's rule (2026-10-09, after the
 // game closed when they took the headset off): "ONLY WHEN WE KILL IT! Like either kill it in meta
 // link by hitting 'quit app' or we close it on windows." So only two things close it:
 //  - EXITING: the runtime's explicit end (the OpenXR spec's "the application should end"; the Meta
@@ -12,7 +18,7 @@
 //    presenter pushes the window's quit (CheckSessionExit) and the emulator closes the normal way
 //    (the play time, the shader cache, the OpenXR teardown, TerminateProcess:
 //    core/vr/exit_sequence.h);
-//  - the window's close: the user closing it in Windows, or Meta Link closing it after a Quit that
+//  - the window's close: the player closing it in Windows, or Meta Link closing it after a Quit that
 //    sent no EXITING (the 2026-10-08 runtime: STOPPING, IDLE, then the window closed 10-15 s later,
 //    usertest_2880 / usertest_3200fix / usertest_hold10's last lines; once it never came and the
 //    window had to be closed by hand, usertest_tilt_live) - emulator.cpp EndAfterClose.
@@ -25,7 +31,7 @@
 //    2026-10-09 a stop with a controller in use was taken as a Quit and closed the emulator 3 s
 //    into IDLE (vr.ini xr_exit_on_stop_s, now retired): usertest_1116_headsetoff.txt 15944-15980,
 //    the headset taken off while holding the controllers (no profile change before the stop),
-//    closed the game the user was playing;
+//    closed the game the player was playing;
 //  - LOSS_PENDING (the session being lost: a Link cable or connection drop, the runtime gone): VR
 //    goes off, the game keeps running on the desktop until its window is closed.
 // The headset's presence (XR_EXT_user_presence) is not offered by the Quest runtime over Link

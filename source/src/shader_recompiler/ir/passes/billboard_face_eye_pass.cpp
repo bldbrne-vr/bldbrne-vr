@@ -1,6 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
-// Eye-facing sprites (on in native stereo; VR_BILLBOARD_FACE_EYE=0 off, =1 on everywhere): the
+// Eye-facing sprites (on in native stereo and DIBR; VR_BILLBOARD_FACE_EYE=0 off, =1 everywhere): the
 // game's camera-facing sprites face the eye instead of the view plane (billboard_face_eye.h), so
 // turning your head no longer turns them. Recognized from IR only, never by shader hash, in two
 // forms:
@@ -714,10 +720,9 @@ void RewriteGeometrySprites(IR::Program& program) {
 } // namespace
 
 void BillboardFaceEyePass(IR::Program& program, const RuntimeInfo& runtime_info) {
-    // In native stereo every camera-facing sprite faces the eye; VR_BILLBOARD_FACE_EYE=0 turns it
-    // off (with a fresh shader cache), any other value turns it on outside native stereo too.
-    static const char* setting = std::getenv("VR_BILLBOARD_FACE_EYE");
-    const bool enabled = setting ? setting[0] != '0' : runtime_info.native_stereo;
+    // The selection is part of the shader specialization, including its cached representation.
+    // DIBR uses the center camera; native stereo retains its existing per-eye camera path.
+    const bool enabled = runtime_info.billboard_face_eye;
     if (enabled && program.info.stage == Stage::Geometry) {
         RewriteGeometrySprites(program);
         return;

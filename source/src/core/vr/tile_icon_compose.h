@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -14,11 +20,11 @@
 #include "core/vr/vr_tile_goggles_layer.h"
 
 // The VR tile's icon, composited at install from OUR goggles layer (core/vr/vr_tile_goggles_layer.h)
-// and the empty parchment cell of the user's own icon atlas (MENU_Common_00100 of
-// game asset, the cell at (720, 160) px): no pixel of the game is in the source. Header
+// and the empty parchment cell of the player's own icon atlas (MENU_Common_00100 of
+// menu/common.tpf.dcx, the cell at (720, 160) px): no pixel of the game is in the source. Header
 // only, no emulator dependencies (core/vr/bloodborne_vrtile.cpp PrepareAtlas, tests/test_vr_tile.cpp).
 //
-// The steps are the ones our icon was authored with (scratchpad vrmenu/goggles/tile.py compose,
+// The steps are the ones our icon was authored with (its compose step,
 // which laid the 4x supersampled render over the parchment upsampled bicubic, then downsampled it
 // Lanczos and sharpened it), reordered so only an 80 x 80 layer ships:
 //  1. the parchment cell, BC1-decoded (as Pillow decodes BC1);
@@ -28,7 +34,7 @@
 //  4. an unsharp mask (Gaussian sigma 1 px, 60 %, threshold 2);
 //  5. BC1-encoded (4-colour blocks: the principal axis, 4 least-squares refits and a +-1 local
 //     search over both endpoints, as our earlier icon was encoded offline).
-// Measured on the user's v1.09 atlas (scratchpad overnight/ipclean/tile): step 4's image is
+// Measured on the player's v1.09 atlas (offline analysis): step 4's image is
 // within PSNR 46.7 dB of the icon as it was authored, and the encoded icon's decode matches the
 // old shipped icon's decode to within BC1's own error.
 namespace VR::TileIcon {

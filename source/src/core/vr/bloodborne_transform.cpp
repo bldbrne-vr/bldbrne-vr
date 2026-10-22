@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -37,7 +43,7 @@ using Hook::Plausible;
 using Hook::Read;
 
 // Module-relative addresses in the 1.09 eboot (patch file address - 0x400000). Every signature is
-// unique in the eboot (scratchpad/transform/sigs.py).
+// unique in the eboot (offline analysis).
 
 // PlayerIns vt+0x118 (0x18F84F0, Game:Main): after the ChrAsm model update it picks the first
 // non-locomotion TimeAct entry (id in r14d, its clip time stored at [rbp-0x58]) and updates every
@@ -524,10 +530,7 @@ struct Run {
 
 struct TickState {
     const u8* chr{nullptr};
-    u64 character_generation{};
     T::PullLatch latch{};
-    Combat::TransformPull claimed_pull{};
-    bool have_claimed_pull{};
     Run run{};
     u32 runs{0};
     s32 weapon{-1};
@@ -668,27 +671,6 @@ const char* StartBlock(u8* chr, const MeleeBody& body, const TickState& t, s64 n
 void Event(Combat::TransformEventKind kind, u32 serial, float a, float b, s64 now,
            const char* why = "") {
     Combat::PushTransformEvent({kind, serial, a, b, now, why});
-}
-
-// Retire a character or disabled transport without reading a possibly destroyed guest object.
-void RetireDetached(TickState& t, s64 now, const char* why) {
-    if (t.have_claimed_pull) {
-        Event(Combat::TransformEventKind::Denied, t.claimed_pull.serial, 0, 0, now, why);
-        t.have_claimed_pull = false;
-        t.latch.pending = 0;
-    }
-    if (t.run.active) {
-        t.run.active = false;
-        PublishHook(t.run, nullptr);
-        PublishInfo(t.run);
-        {
-            std::scoped_lock lock{g_switch_mutex};
-            if (g_switch_req.run == t.run.id)
-                g_switch_due.store(0, std::memory_order_release);
-        }
-        Event(Combat::TransformEventKind::Aborted, t.run.serial, t.run.switched ? 1.f : 0.f, 0, now,
-              why);
-    }
 }
 
 void StartRun(u8* chr, TickState& t, u32 serial, s64 now, bool flick, u32 window,
@@ -1137,11 +1119,6 @@ void TransformPoseTick(u8* chr, const MeleeBody& body) {
     status.ns = now;
     status.installed = g_installed;
     if (!g_installed || !g_native) {
-        RetireDetached(t, now, "native transform unavailable");
-        Combat::TransformPull refused{};
-        if (Combat::ClaimTransformPull(refused))
-            Event(Combat::TransformEventKind::Denied, refused.serial, 0, 0, now,
-                  "native transform unavailable");
         status.why = g_vanilla || g_installed ? "transform=vanilla" : "not installed";
         g_swing_block = nullptr;
         Combat::PublishTransformStatus(status);
@@ -1156,13 +1133,15 @@ void TransformPoseTick(u8* chr, const MeleeBody& body) {
         return;
     }
     if (chr != t.chr) {
-        RetireDetached(t, now, "character changed");
+        // A new character object (a load): a run of the old one is over without a switch.
+        if (t.run.active) {
+            t.run.active = false;
+            PublishHook(t.run, nullptr);
+        }
         const T::PullLatch latch = t.latch;
         const u32 runs = t.runs;
-        const u64 generation = t.character_generation + 1;
         t = {};
         t.chr = chr;
-        t.character_generation = generation;
         t.latch = latch;
         t.latch.pending = 0;
         t.runs = runs;
@@ -1182,21 +1161,7 @@ void TransformPoseTick(u8* chr, const MeleeBody& body) {
 
     const char* block = StartBlock(chr, body, t, now);
     Combat::TransformPull pull{};
-    if (!t.have_claimed_pull)
-        t.have_claimed_pull = Combat::ClaimTransformPull(t.claimed_pull);
-    bool have = t.have_claimed_pull || Combat::LatestTransformPull(pull);
-    if (t.have_claimed_pull) {
-        pull = t.claimed_pull; // retain all request facts while StepPull buffers the claim
-        if (!Combat::TransformContextMatches(pull, t.character_generation, t.weapon, t.style,
-                                             t.slot)) {
-            Event(Combat::TransformEventKind::Denied, pull.serial, 0, 0, now,
-                  "character or equipment changed before execution");
-            t.have_claimed_pull = false;
-            t.latch.handled = pull.serial;
-            t.latch.pending = 0;
-            have = false;
-        }
-    }
+    const bool have = Combat::LatestTransformPull(pull);
     T::PullInput in{};
     in.have = have;
     in.serial = pull.serial;
@@ -1212,13 +1177,11 @@ void TransformPoseTick(u8* chr, const MeleeBody& body) {
     const T::PullStep step = T::StepPull(t.latch, in);
     switch (step) {
     case T::PullStep::Start:
-        t.have_claimed_pull = false; // the running animation now owns the claim
         StartRun(chr, t, pull.serial, now, pull.flick && T::GetTransformSettings().flick,
                  pull.window, pull.press_ns != 0 ? pull.press_ns : now, pull.no_join);
         t.last_wait = nullptr;
         break;
     case T::PullStep::Deny:
-        t.have_claimed_pull = false;
         Event(Combat::TransformEventKind::Denied, serial, 0.0f, 0.0f, now,
               block != nullptr ? block : "stale");
         LOG_INFO(Core, "VR transform: #{} refused ({}) after {:.0f} ms", serial,
@@ -1254,8 +1217,6 @@ void TransformPoseTick(u8* chr, const MeleeBody& body) {
     status.busy = t.run.active;
     status.weapon_id = t.weapon;
     status.style = t.style;
-    status.character_generation = t.character_generation;
-    status.weapon_slot = t.slot;
     status.clip = t.choice.clip != nullptr ? t.choice.clip->clip : -1;
     status.handled = t.latch.handled;
     status.why = !body.body                 ? "body off"

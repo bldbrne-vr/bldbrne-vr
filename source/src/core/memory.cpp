@@ -1,13 +1,15 @@
 #include "video_core/host_copies.h"
 #include <atomic>
 #include <cstdlib>
-#include "../../scratchpad/dual-eye-perf/parallel_copy.h"
-#include "../../scratchpad/dual-eye-perf/profile_scopes.h"
-#include "../../scratchpad/fast-renderer/b_handler_profile.h"
+#include "video_core/native_stereo/parallel_copy.h"
+#include "video_core/native_stereo/profile_scopes.h"
+#include "video_core/fast/b_handler_profile.h"
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/alignment.h"
+#include "common/slow_scope.h"
+#include "common/memory_write_trace.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
@@ -107,7 +109,7 @@ MemoryManager::MemoryManager() {
     }
 
     // Pre-initialize direct backing
-    auto total_size = ORBIS_KERNEL_TOTAL_MEM_DEV_PRO;
+    auto total_size = InitialDirectMemorySize();
     s32 extra_dmem = EmulatorSettings.GetExtraDmemInMBytes();
     if (extra_dmem != 0) {
         total_size += extra_dmem * 1_MB;
@@ -436,6 +438,8 @@ bool MemoryManager::VerifySparseHit(const ScratchSparse::RangeCache::Entry& hit,
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
+    Common::MemoryWriteTrace::Event("backing.begin", virtual_addr, size,
+        Common::MemoryWriteTrace::SourceWord(data, size));
     // FAST_CPU_SPARSE_FAST: this hold changes no area, so its release keeps every thread's cached
     // areas (each guest fence write used to send every thread's copies back to the tree).
     AreaReadHold lk{mutex, sparse_fast};
@@ -468,7 +472,10 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
                 std::max<u64>(start_in_vma, phys_handle->first) - phys_handle->first;
             u8* backing = impl.BackingBase() + phys_handle->second.base + start_in_dma;
             u64 copy_size = std::min<u64>(size, phys_handle->second.size - start_in_dma);
+            Common::MemoryWriteTrace::Event("backing.copy", vma.base + phys_handle->first + start_in_dma, copy_size,
+                reinterpret_cast<std::uintptr_t>(backing), Common::MemoryWriteTrace::SourceWord(data, copy_size));
             memcpy(backing, data, copy_size);
+            data = static_cast<const u8*>(data) + copy_size;
             size -= copy_size;
         }
     }
@@ -652,6 +659,7 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
 }
 
 s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32 mtype) {
+    Common::Slow::Scope slow{Common::Slow::PoolCommit, size};
     std::scoped_lock lk{unmap_mutex};
     std::unique_lock lk2{mutex};
     FastRender::WaitHostCopies(FastRender::CopyWait::Mapping);
@@ -791,6 +799,7 @@ MemoryManager::VMAHandle MemoryManager::CreateArea(VAddr virtual_addr, u64 size,
 s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, MemoryProt prot,
                              MemoryMapFlags flags, VMAType type, std::string_view name,
                              bool validate_dmem, PAddr phys_addr, u64 alignment) {
+    Common::Slow::Scope slow{Common::Slow::MapMemory, size};
     // Certain games perform flexible mappings on loop to determine
     // the available flexible memory size. Questionable but we need to handle this.
     if (type == VMAType::Flexible && flexible_usage + size > total_flexible_size) {
@@ -973,6 +982,7 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
 
 s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, MemoryProt prot,
                            MemoryMapFlags flags, s32 fd, s64 phys_addr) {
+    Common::Slow::Scope slow{Common::Slow::MapMemory, size};
     uintptr_t handle = 0;
     std::scoped_lock lk{unmap_mutex};
     // Get the file to map
@@ -1179,6 +1189,7 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
 }
 
 s32 MemoryManager::UnmapMemory(VAddr virtual_addr, u64 size) {
+    Common::Slow::Scope slow{Common::Slow::UnmapMemory, size};
     if (size == 0) {
         return ORBIS_OK;
     }
@@ -1382,6 +1393,7 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
 }
 
 s32 MemoryManager::Protect(VAddr addr, u64 size, MemoryProt prot) {
+    Common::Slow::Scope slow{Common::Slow::Protect, size};
     // If size is zero, then there's nothing to protect
     if (size == 0) {
         return ORBIS_OK;
@@ -1707,8 +1719,18 @@ s32 MemoryManager::GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPool
 }
 
 void MemoryManager::InvalidateMemory(const VAddr addr, const u64 size) const {
+    Common::MemoryWriteTrace::Event("cpu.invalidate", addr, size);
     if (rasterizer) {
-        rasterizer->InvalidateMemory(addr, size);
+        rasterizer->InvalidateMemory(addr, size, true); // the emulator's own write
+    }
+}
+
+void MemoryManager::InvalidateProtection(const VAddr addr, const u64 size) const {
+    if (rasterizer) {
+        // As a write of the whole range (its pages forgotten, none kept aside): keeping the
+        // GPU's bytes of a protection change copied every GPU-written page of the range at once
+        // (the sewers' stutter suspect, 2026-10-15); no ghost-triangle loss came from here.
+        rasterizer->InvalidateMemory(addr, size, true, false);
     }
 }
 

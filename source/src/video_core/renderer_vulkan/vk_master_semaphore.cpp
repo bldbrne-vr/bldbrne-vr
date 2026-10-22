@@ -6,6 +6,9 @@
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 
 #include "common/assert.h"
+#include "common/crash_record.h"
+#include "video_core/renderer_vulkan/vk_timeline_wait.h"
+#include <cstdio>
 
 namespace Vulkan {
 
@@ -62,7 +65,17 @@ void MasterSemaphore::Wait(u64 tick) {
         .pValues = &tick,
     };
 
-    while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
+    const auto result = WaitForTimelineResult([&] {
+        return static_cast<VkResult>(instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT));
+    });
+    if (result != VK_SUCCESS) {
+        // Preserve the reason in logs-off builds too. Never return as if the GPU
+        // completed: callers may immediately recycle resources after this wait.
+        char message[128];
+        std::snprintf(message, sizeof(message), "GPU timeline wait failed: VkResult=%d, tick=%llu",
+                      static_cast<int>(result), static_cast<unsigned long long>(tick));
+        Common::CrashRecord::Note(message);
+        UNREACHABLE_MSG("GPU timeline wait failed: {}", vk::to_string(vk::Result(result)));
     }
     Refresh();
 }

@@ -1,5 +1,6 @@
-#include "../../../scratchpad/dual-eye-perf/push_state_memo.h"
+#include "video_core/native_stereo/push_state_memo.h"
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -444,6 +445,10 @@ public:
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish();
 
+    /// bbport: retire submitted work without ending the partially recorded command buffer.
+    /// Covers this scheduler's game queue only, not a separate OpenXR/SteamVR queue.
+    void WaitSubmitted();
+
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
 
@@ -479,7 +484,7 @@ public:
 
     /// VR_GPU_PASSES (profiling): times one piece of work outside a render pass (a game
     /// dispatch), summed under `key` in the `VR gpu passes:` line. No-ops otherwise.
-    bool GpuCategoryBegin(u64 key); // scratchpad, non-nesting
+    bool GpuCategoryBegin(u64 key); // non-nesting
     void GpuWorkBegin(u64 key, u32 x, u32 y);
     void GpuWorkEnd();
 

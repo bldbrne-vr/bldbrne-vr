@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -122,7 +123,7 @@ public:
     /// FAST bit 39: a tiled colour image re-tiled into a guest buffer (TileImage: the 3d5ebf4e
     /// direct image-to-buffer copy, texel-buffer resyncs) is read by the tiler itself through a
     /// same-size R*_UINT view, instead of being downloaded into a linear scratch buffer first
-    /// (documents/vr-gpu-guide.md 2.5 C; bbport docs/parallel_gpu.md:542-548 names this
+    /// (bbport docs/parallel_gpu.md:542-548 names this
     /// image-sourced copy chain as its next GPU item). Off: exactly the download + tiler of before.
     static constexpr auto TileFromImage = static_cast<FastRender::Bit>(39);
     /// FAST bit 60 (needs bit 39): the same for a 32-bit float depth image (gpu_plan #5, R1; bbport

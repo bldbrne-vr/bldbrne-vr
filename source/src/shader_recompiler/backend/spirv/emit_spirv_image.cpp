@@ -78,10 +78,12 @@ Id EmitImageSampleRaw(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address1,
 Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id bias,
                               const IR::Value& offset) {
     const auto& texture = ctx.images[handle & 0xFFFF];
-    const Id image = ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id));
+    const Id image = ctx.NativeNonUniform(
+        ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id)));
     const Id result_type = texture.data_types->Get(4);
     const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
-    const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);
+    const Id sampled_image =
+        ctx.NativeNonUniform(ctx.OpSampledImage(texture.sampled_type, image, sampler));
     ImageOperands operands;
     operands.Add(spv::ImageOperandsMask::Bias, bias);
     operands.AddOffset(ctx, offset);
@@ -93,10 +95,12 @@ Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
 Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod,
                               const IR::Value& offset) {
     const auto& texture = ctx.images[handle & 0xFFFF];
-    const Id image = ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id));
+    const Id image = ctx.NativeNonUniform(
+        ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id)));
     const Id result_type = texture.data_types->Get(4);
     const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
-    const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);
+    const Id sampled_image =
+        ctx.NativeNonUniform(ctx.OpSampledImage(texture.sampled_type, image, sampler));
     ImageOperands operands;
     operands.Add(spv::ImageOperandsMask::Lod, lod);
     operands.AddOffset(ctx, offset);
@@ -108,10 +112,12 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
 Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id dref,
                                   Id bias, const IR::Value& offset) {
     const auto& texture = ctx.images[handle & 0xFFFF];
-    const Id image = ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id));
+    const Id image = ctx.NativeNonUniform(
+        ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id)));
     const Id result_type = texture.data_types->Get(1);
     const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
-    const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);
+    const Id sampled_image =
+        ctx.NativeNonUniform(ctx.OpSampledImage(texture.sampled_type, image, sampler));
     ImageOperands operands;
     operands.Add(spv::ImageOperandsMask::Bias, bias);
     operands.AddOffset(ctx, offset);
@@ -125,10 +131,12 @@ Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, 
 Id EmitImageSampleDrefExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id dref,
                                   Id lod, const IR::Value& offset) {
     const auto& texture = ctx.images[handle & 0xFFFF];
-    const Id image = ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id));
+    const Id image = ctx.NativeNonUniform(
+        ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id)));
     const Id result_type = texture.data_types->Get(1);
     const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
-    const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);
+    const Id sampled_image =
+        ctx.NativeNonUniform(ctx.OpSampledImage(texture.sampled_type, image, sampler));
     ImageOperands operands;
     operands.Add(spv::ImageOperandsMask::Lod, lod);
     operands.AddOffset(ctx, offset);
@@ -142,10 +150,12 @@ Id EmitImageSampleDrefExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, 
 Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
                    const IR::Value& offset) {
     const auto& texture = ctx.images[handle & 0xFFFF];
-    const Id image = ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id));
+    const Id image = ctx.NativeNonUniform(
+        ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id)));
     const Id result_type = texture.data_types->Get(4);
     const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
-    const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);
+    const Id sampled_image =
+        ctx.NativeNonUniform(ctx.OpSampledImage(texture.sampled_type, image, sampler));
     const u32 comp = inst->Flags<IR::TextureInstInfo>().gather_comp.Value();
     ImageOperands operands;
     operands.AddOffset(ctx, offset, true);
@@ -157,10 +167,12 @@ Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
 Id EmitImageGatherDref(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
                        const IR::Value& offset, Id dref) {
     const auto& texture = ctx.images[handle & 0xFFFF];
-    const Id image = ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id));
+    const Id image = ctx.NativeNonUniform(
+        ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id)));
     const Id result_type = texture.data_types->Get(4);
     const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
-    const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);
+    const Id sampled_image =
+        ctx.NativeNonUniform(ctx.OpSampledImage(texture.sampled_type, image, sampler));
     ImageOperands operands;
     operands.AddOffset(ctx, offset, true);
     const Id texels = ctx.OpImageDrefGather(result_type, sampled_image, coords, dref, operands.mask,
@@ -170,7 +182,8 @@ Id EmitImageGatherDref(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
 
 Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod, bool has_mips) {
     const auto& texture = ctx.images[handle & 0xFFFF];
-    const Id image = ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id));
+    const Id image = ctx.NativeNonUniform(
+        ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id)));
     const auto sharp = ctx.info.images[handle & 0xFFFF].GetSharp(ctx.info);
     const Id zero = ctx.u32_zero_value;
     const auto mips{[&] { return has_mips ? ctx.OpImageQueryLevels(ctx.U32[1], image) : zero; }};
@@ -196,9 +209,11 @@ Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod
 
 Id EmitImageQueryLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords) {
     const auto& texture = ctx.images[handle & 0xFFFF];
-    const Id image = ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id));
+    const Id image = ctx.NativeNonUniform(
+        ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id)));
     const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
-    const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);
+    const Id sampled_image =
+        ctx.NativeNonUniform(ctx.OpSampledImage(texture.sampled_type, image, sampler));
     const Id zero{ctx.f32_zero_value};
     return ctx.OpImageQueryLod(ctx.F32[2], sampled_image, coords);
 }
@@ -206,10 +221,12 @@ Id EmitImageQueryLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords) {
 Id EmitImageGradient(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id derivatives_dx,
                      Id derivatives_dy, const IR::Value& offset, const IR::Value& lod_clamp) {
     const auto& texture = ctx.images[handle & 0xFFFF];
-    const Id image = ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id));
+    const Id image = ctx.NativeNonUniform(
+        ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id)));
     const Id result_type = texture.data_types->Get(4);
     const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
-    const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);
+    const Id sampled_image =
+        ctx.NativeNonUniform(ctx.OpSampledImage(texture.sampled_type, image, sampler));
     ImageOperands operands;
     operands.AddDerivatives(ctx, derivatives_dx, derivatives_dy);
     operands.AddOffset(ctx, offset);
@@ -224,7 +241,8 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod
     ImageOperands operands;
     Id texel;
     if (!texture.is_storage) {
-        const Id image = ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id));
+        const Id image = ctx.NativeNonUniform(
+            ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id)));
         if (texture.view_type == AmdGpu::ImageType::Color2DMsaa) {
             // GCN hardware wraps out-of-range MSAA sample indices
             if (Sirit::ValidId(ms)) {
@@ -258,7 +276,7 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod
             image_ptr = ctx.runtime_info.native_stereo ? ctx.NativeImagePointer(texture.image_type, texture.id, lod) : ctx.OpAccessChain(single_image_ptr_type, image_ptr, std::array{lod});
 #endif
         }
-        const Id image = ctx.OpLoad(texture.image_type, image_ptr);
+        const Id image = ctx.NativeNonUniform(ctx.OpLoad(texture.image_type, image_ptr));
         texel = ctx.OpImageRead(color_type, image, coords, operands.mask, operands.operands);
     }
     return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], texel) : texel;
@@ -280,7 +298,7 @@ void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id 
             ctx.TypePointer(spv::StorageClass::UniformConstant, texture.image_type);
         image_ptr = ctx.runtime_info.native_stereo ? ctx.NativeImagePointer(texture.image_type, texture.id, lod) : ctx.OpAccessChain(single_image_ptr_type, image_ptr, std::array{lod});
     }
-    const Id image = ctx.OpLoad(texture.image_type, image_ptr);
+    const Id image = ctx.NativeNonUniform(ctx.OpLoad(texture.image_type, image_ptr));
     const Id texel = texture.is_integer ? ctx.OpBitcast(color_type, color) : color;
     ctx.OpImageWrite(image, coords, texel, operands.mask, operands.operands);
 }

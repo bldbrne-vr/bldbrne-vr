@@ -1,17 +1,21 @@
-#include "../../../scratchpad/dual-eye-perf/profile_scopes.h"
-#include "../../../scratchpad/dual-eye-perf/stream_watch.h"
-#include "../../../scratchpad/dual-eye-perf/stream_copy.h"
+#include <optional>
+#include "video_core/native_stereo/profile_scopes.h"
+#include "video_core/native_stereo/stream_watch.h"
+#include "video_core/native_stereo/stream_copy.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
+#include "video_core/native_stereo/native_stereo.h"
 #include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
 
 #include "common/alignment.h"
+#include "common/slow_scope.h"
 #include "common/assert.h"
+#include "video_core/vma_fallback.h"
 #include "common/logging/log.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/read_barrier_logic.h"
@@ -43,7 +47,7 @@ std::string_view BufferTypeName(MemoryUsage type) {
 
 // Where the stream buffer (StreamBuffer with MemoryUsage::Stream: the 64 MB ring that every small
 // read-only buffer of every draw is copied into, ~8,600 copies and 7.7 MB per clinic-hall frame)
-// keeps its data (documents/bloodborne-vr.md "Performance"). VR_STREAM_MEM:
+// keeps its data. VR_STREAM_MEM:
 //   device: upstream's placement, the GPU's BAR when it has one. Its write-combined CPU writes go
 //           over PCIe and every later locked instruction waits for them: ~2.3 ms of the command
 //           processor per clinic frame (RTX 5080).
@@ -132,11 +136,18 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
 
     const VkBufferCreateInfo buffer_ci_unsafe = static_cast<VkBufferCreateInfo>(buffer_ci);
     VkBuffer unsafe_buffer{};
-    VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
-                                      &allocation, out_alloc_info);
+    std::optional<Common::Slow::Scope> slow_alloc{std::in_place, Common::Slow::BufferAlloc,
+                                                  buffer_ci.size};
+    const VkResult result =
+        VideoCore::CreateWithFallback("a buffer", alloc_ci, [&](const VmaAllocationCreateInfo& ci) {
+            return vmaCreateBuffer(allocator, &buffer_ci_unsafe, &ci, &unsafe_buffer, &allocation,
+                                   out_alloc_info);
+        });
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
                vk::to_string(vk::Result{result}));
     buffer = vk::Buffer{unsafe_buffer};
+    slow_alloc.reset();
+    Common::Slow::Scope slow_twin{Common::Slow::StereoTwin, buffer_ci.size};
     native_entry = NativeStereo::RegisterBuffer(buffer, buffer_ci.size, allocator, usage == MemoryUsage::Stream || usage == MemoryUsage::Upload);
 
     if (with_bda) {

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -19,9 +20,11 @@
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/multi_level_page_table.h"
+#include <source_location>
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
+#include "video_core/texture_cache/memory_policy.h"
 #include "video_core/texture_cache/sampler.h"
 #include "video_core/texture_cache/tile_manager.h"
 
@@ -83,6 +86,9 @@ public:
     TextureCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                  AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache, PageManager& tracker);
     ~TextureCache();
+
+    /// Allocation-failure recovery for VR scene storage (outside the cache lock).
+    u64 ReclaimMemory(u64 bytes);
 
     TileManager& GetTileManager() noexcept {
         return tile_manager;
@@ -331,7 +337,7 @@ public:
     }
 
     /// Runs the garbage collector.
-    void RunGarbageCollector();
+    void RunGarbageCollector(u64 transition_request = 0);
 
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
@@ -398,7 +404,12 @@ private:
     void DownloadedImagesThread(const std::stop_token& token);
 
     /// Create an image from the given parameters
-    [[nodiscard]] ImageId InsertImage(const ImageInfo& info, VAddr cpu_addr);
+    [[nodiscard]] ImageId InsertImage(const ImageInfo& info);
+
+    /// Caller holds mutex; only inactive guest-backed textures may be destroyed immediately.
+    u64 ReclaimMemoryFor(VAddr addr, size_t size, u64 bytes,
+                         u64 max_tick = std::numeric_limits<u64>::max(),
+                         size_t image_limit = std::numeric_limits<size_t>::max());
 
     /// Register image in the page table
     void RegisterImage(ImageId image);
@@ -419,7 +430,8 @@ private:
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 
     /// Removes the image and any views/surface metas that reference it.
-    void DeleteImage(ImageId image_id);
+    void DeleteImage(ImageId image_id, bool immediate = false);
+    void EraseImage(ImageId image_id);
 
     /// Touch the image in the LRU cache.
     void TouchImage(const Image& image);
@@ -427,11 +439,18 @@ private:
     /// GetImage's touch when its tick test did not skip it (FAST_CPU_LRU_TICK).
     void GetImageTouch(Image& image);
 
-    void FreeImage(ImageId image_id) {
+    void FreeImage(ImageId image_id,
+                   std::source_location where = std::source_location::current()) {
+        if constexpr (Common::Log::Enabled) {
+            NoteTargetFreed(image_id, where.line());
+        }
         UntrackImage(image_id);
         UnregisterImage(image_id);
         DeleteImage(image_id);
     }
+    /// Freeze/blink hunt (logs-on builds): a render or depth target freed, and by which line
+    /// (the chest items' scene depth changing identity, 2026-10-18).
+    void NoteTargetFreed(ImageId image_id, u32 line);
 
     void GarbageCollectImages();
     void GarbageCollectSamplers();
@@ -457,6 +476,8 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    TextureMemory::AgeCutoff reclaim_age;
+    TextureMemory::TransitionCleanup transition_cleanup;
     /// FAST_CPU_LRU_TICK (on unless '0') without FAST_CPU_LRU_TICK_VERIFY=1, read once at
     /// start-up: GetImage skips the touch of an image touched in this GC period.
     static const bool lru_tick_skip;

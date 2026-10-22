@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
@@ -32,6 +33,13 @@ enum class ShadPs4ReturnCode : u32 {
 
 namespace Common::Log {
 bool g_should_append = false;
+bool BenchmarkEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BBVR_BENCHMARK");
+        return value && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
 
 namespace {
 std::atomic<SinkTimingHook> g_sink_timing_hook{nullptr};
@@ -347,7 +355,7 @@ void Setup(std::string_view shadps4_filename) {
         std::at_quick_exit(Flush);
         std::set_terminate(Terminate);
     });
-    if constexpr (!Enabled) {
+    if (!Enabled && !BenchmarkEnabled()) {
         return; // the play build: no loggers, console output or log file (log.h)
     }
 
@@ -382,7 +390,7 @@ void Setup(std::string_view shadps4_filename) {
 }
 
 void Switch(std::string_view game_filename) {
-    if constexpr (!Enabled) {
+    if (!Enabled && !BenchmarkEnabled()) {
         return;
     }
     UpdateSinks();
@@ -426,21 +434,24 @@ void Terminate() {
         }
 
         LOG_CRITICAL(Debug, "Exiting without exception");
+        LOG_BENCHMARK_WARNING(Debug, "Benchmark fatal: exiting without exception");
 
         std::quick_exit(std::to_underlying(ShadPs4ReturnCode::TERMINATE_WITHOUT_EXCEPTION));
     } catch (const std::exception& exception) {
         LOG_CRITICAL(Debug, "Exception: {}", exception);
+        LOG_BENCHMARK_WARNING(Debug, "Benchmark fatal exception: {}", exception.what());
 
         std::quick_exit(std::to_underlying(ShadPs4ReturnCode::TERMINATE_WITH_EXCEPTION));
     } catch (...) {
         LOG_CRITICAL(Debug, "Unknown exception caught");
+        LOG_BENCHMARK_WARNING(Debug, "Benchmark fatal: unknown exception");
 
         std::quick_exit(std::to_underlying(ShadPs4ReturnCode::TERMINATE_WITH_UNKNOWN_EXCEPTION));
     }
 }
 
 void UpdateSinks() {
-    if constexpr (!Enabled) {
+    if (!Enabled && !BenchmarkEnabled()) {
         return;
     }
     std::initializer_list<spdlog::sink_ptr> sinks{g_console_sink, g_shad_file_sink};
@@ -481,7 +492,7 @@ void UpdateSinks() {
 }
 
 void UpdateLogLevels(std::string_view log_filter) {
-    if constexpr (!Enabled) {
+    if (!Enabled && !BenchmarkEnabled()) {
         return;
     }
     spdlog::level default_log_level = spdlog::level::info;
@@ -521,7 +532,7 @@ void UpdateLogLevels(std::string_view log_filter) {
 }
 
 void UpdateLogFlushLevel(std::string_view log_flush_level) {
-    if constexpr (!Enabled) {
+    if (!Enabled && !BenchmarkEnabled()) {
         return;
     }
     if (!log_flush_level.empty()) {

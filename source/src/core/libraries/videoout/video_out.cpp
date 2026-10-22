@@ -1,6 +1,7 @@
 #include "video_core/flip_order_trace.h"
-#include "../../../../scratchpad/dual-eye-perf/pacing_audit.h"
+#include "video_core/native_stereo/pacing_audit.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
@@ -351,38 +352,38 @@ s32 PS4_SYSV_ABI sceVideoOutGetBufferLabelAddress(s32 handle, uintptr_t* label_a
     return 16;
 }
 
-s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, void** unk) {
+s32 PrepareEopFlip(s32 handle, u32 buf_id, u64& ticket) {
     auto* port = driver->GetPort(handle);
-    if (!port) {
-        return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
-    }
-
-    // VR: the camera update of the frame being flipped, taken here on the submitting guest
-    // thread (the flip itself happens later, when the GPU thread reaches it).
-    const u64 vr_flip = VR::OnFlipSubmitted();
+    if (!port || !port->is_open) return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
+    if (buf_id >= port->buffer_labels.size() || port->buffer_slots[buf_id].group_index < 0)
+        return ORBIS_VIDEO_OUT_ERROR_INVALID_INDEX;
+    // Capture the submitting thread's camera ticket, carried by this exact packet.
+    ticket = VR::OnFlipSubmitted();
     FlipOrderTrace::SetLabels(reinterpret_cast<uintptr_t>(port->buffer_labels.data()));
-    FlipOrderTrace::Event("register", reinterpret_cast<uintptr_t>(&port->buffer_labels[buf_id]),
-                          buf_id, 8, vr_flip);
+    FlipOrderTrace::Event("prepare", reinterpret_cast<uintptr_t>(&port->buffer_labels[buf_id]),
+                          buf_id, 8, ticket);
     static const bool trace_flip = std::getenv("VR_FLIP_ORDER_TRACE") != nullptr;
     if (trace_flip)
-        LOG_INFO(Lib_VideoOut, "Flip order register: buffer={} ticket={}", buf_id, vr_flip);
-    Platform::IrqC::Instance()->RegisterOnce(
-        Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
-            ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
-            if (trace_flip)
-                LOG_INFO(Lib_VideoOut, "Flip order callback: buffer={} ticket={} label={}", buf_id,
-                         vr_flip, port->buffer_labels[buf_id]);
-            FlipOrderTrace::Event("callback",
-                                  reinterpret_cast<uintptr_t>(&port->buffer_labels[buf_id]),
-                                  port->buffer_labels[buf_id], 8, vr_flip);
-            ASSERT_MSG(port->buffer_labels[buf_id] == 1,
-                       "Out of order flip IRQ: buffer={} ticket={} label={}", buf_id, vr_flip,
-                       port->buffer_labels[buf_id]);
-            const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true, vr_flip);
-            ASSERT_MSG(result, "EOP flip submission failed");
-        });
-
+        LOG_INFO(Lib_VideoOut, "Flip order prepare: buffer={} ticket={}", buf_id, ticket);
     return ORBIS_OK;
+}
+
+void ExecuteEopFlip(const FlipPacket& flip) {
+    auto* port = driver->GetPort(flip.handle);
+    ASSERT_MSG(port && flip.buffer < port->buffer_labels.size(), "Invalid flip packet target");
+    if (!port || flip.buffer >= port->buffer_labels.size()) return;
+    static const bool trace_flip = std::getenv("VR_FLIP_ORDER_TRACE") != nullptr;
+    if (trace_flip)
+        LOG_INFO(Lib_VideoOut, "Flip order execute: buffer={} ticket={} label={}",
+                 flip.buffer, flip.ticket, port->buffer_labels[flip.buffer]);
+    FlipOrderTrace::Event("execute",
+                          reinterpret_cast<uintptr_t>(&port->buffer_labels[flip.buffer]),
+                          port->buffer_labels[flip.buffer], 8, flip.ticket);
+    ASSERT_MSG(port->buffer_labels[flip.buffer] == 1,
+               "Out of order flip packet: buffer={} ticket={} label={}",
+               flip.buffer, flip.ticket, port->buffer_labels[flip.buffer]);
+    const auto result = driver->SubmitFlip(port, flip.buffer, flip.argument, true, flip.ticket);
+    ASSERT_MSG(result, "EOP flip submission failed");
 }
 
 s32 PS4_SYSV_ABI sceVideoOutGetDeviceCapabilityInfo(

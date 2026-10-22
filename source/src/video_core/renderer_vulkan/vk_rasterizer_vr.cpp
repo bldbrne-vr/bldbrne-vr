@@ -1,7 +1,8 @@
 #include <utility>
 #include "video_core/fast_render.h"
-#include "../../../scratchpad/dual-eye-perf/draw_registers.h"
+#include "video_core/native_stereo/draw_registers.h"
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // VR additions to the rasterizer: the VR_DEBUG_DRAWS draw log, the DIBR stereo capture
@@ -33,8 +34,8 @@
 // the game is locked on, a UI draw sampling that atlas (known by its content, wherever the game
 // loaded it) goes into the marker's own pair instead of K and W; the resolve scales and dims it.
 
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
-#include "../../../scratchpad/dual-eye-perf/asymmetric_projection.h"
+#include "video_core/native_stereo/native_stereo.h"
+#include "video_core/native_stereo/asymmetric_projection.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -61,6 +62,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vr_inframe.h"
 #include "video_core/renderer_vulkan/vr_render_taa.h"
+#include "video_core/renderer_vulkan/vr_dibr_dlss.h"
 #include "video_core/renderer_vulkan/vr_stereo_warp.h"
 #include "video_core/renderer_vulkan/vr_temporal_capture.h"
 #include "video_core/renderer_vulkan/vr_ui_layer.h"
@@ -365,12 +367,14 @@ void Rasterizer::VrBeforeDraw(const GraphicsPipeline* pipeline) {
         logged = true;
         LOG_INFO(Render_Vulkan, "VR dibr: the composite writes depth; depth captured before it");
     }
-    vr_dibr.depth_done = VrCaptureDepth({});
+    // DLSS cannot read the raw scene depth after this composite overwrites it.
+    // Preserve a base-size capture for the regular DIBR fallback on this frame.
+    vr_dibr.depth_done = VrCaptureDepth({}, false);
 }
 
 // Scene depth -> disparity (prep pass) from the best depth candidate, for a `scene`-sized
 // colour capture (the depth's own size when `scene` is 0x0). False: nothing captured.
-bool Rasterizer::VrCaptureDepth(vk::Extent2D scene) {
+bool Rasterizer::VrCaptureDepth(vk::Extent2D scene, bool allow_dlss_resize) {
     if (NativeStereo::Enabled()) return false;
     // The camera update the frame was built with: the one its first draw pointed at (the oldest
     // flip not reached yet, else the newest update). By the time the composite is reached the
@@ -417,6 +421,8 @@ bool Rasterizer::VrCaptureDepth(vk::Extent2D scene) {
     const vk::Extent2D depth_extent{depth->info.size.width, depth->info.size.height};
     if (scene.width == 0 || scene.height == 0) {
         scene = depth_extent;
+        if (allow_dlss_resize && vr_dibr_dlss && vr_ui_layer && VR::UiLayerFrameMode() == 1)
+            scene = vr_dibr_dlss->DesiredSize(scene);
     }
 
     const auto& s = VR::GetSettings();
@@ -522,6 +528,7 @@ bool Rasterizer::VrCaptureDepth(vk::Extent2D scene) {
         total_draws += candidate.draws;
     }
     vr_dibr.depth_extent = depth_extent;
+    vr_dibr.depth_output_extent = scene;
     g_depth_source =
         fmt::format("depth {}x{} {} s{}, z [{}, {}]", depth_extent.width, depth_extent.height,
                     vk::to_string(depth->backing->image.image_ci.format),
@@ -770,10 +777,52 @@ void Rasterizer::VrDibrCaptureAtMarker() {
         WarnOnce(1u << 8, "the composite target went away during the capture");
         return;
     }
-    target->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
-    if (!vr_warp->CaptureColor(scheduler.CommandBuffer(), target->GetImage(),
-                               vk::ImageLayout::eTransferSrcOptimal, x_format, x_extent,
-                               static_cast<vk::SampleCountFlagBits>(x_samples), x_components)) {
+    VrDibrDlss::Output reconstructed{};
+    // Opt-in experiment: the UI stays on its own layer; no HUD-difference comparison
+    // between the reconstructed scene and the game's smaller composite.
+    // An early depth capture means the composite overwrites the raw depth.
+    // Use its preserved DIBR capture instead of feeding overwritten depth to DLSS.
+    if (!vr_dibr.depth_done && DibrDlss::Requested() && vr_ui_layer && VR::UiLayerFrameMode() == 1) {
+        const VrDepthCandidate* best = nullptr;
+        for (const auto& candidate : vr_dibr.depth)
+            if (candidate.draws && (!best || candidate.draws > best->draws)) best = &candidate;
+        auto* depth = best ? texture_cache.TryGetImage(best->id, best->uid) : nullptr;
+        VR::CameraRecord rec{};
+        if (depth && best->zero_to_w && best->zmin == 0.f && best->zmax == 1.f &&
+            VR::GetRecord(vr_warp->GetCaptureInfo().frame_tag, rec)) {
+            if (!vr_dibr_dlss) vr_dibr_dlss = std::make_unique<VrDibrDlss>(instance, scheduler);
+            reconstructed = vr_dibr_dlss->Record(*target, *depth, x_components, rec,
+                vr_taa.xscale < 0 ? -1.f : 1.f, vr_taa.yscale < 0 ? -1.f : 1.f,
+                vr_dibr.taa_resolved);
+        }
+    }
+    if (reconstructed.image && reconstructed.extent != vr_dibr.depth_output_extent &&
+        !VrCaptureDepth(reconstructed.extent)) reconstructed = {};
+    if (!reconstructed.image && vr_dibr.depth_output_extent != x_extent) {
+        // Never recapture depth that the composite already overwrote. A failed
+        // size correction must also invalidate the capture, not reuse old depth.
+        if (vr_dibr.depth_done || !VrCaptureDepth(x_extent)) {
+            vr_warp->BeginFrame(0);
+            return;
+        }
+    }
+    vr_dibr.dlss = bool(reconstructed.image);
+    if (reconstructed.image && vr_render_taa) {
+        // Previous frames (and this frame's depth capture) may still reference TAA.
+        // Release after this command buffer completes, without stalling the GPU.
+        scheduler.DeferOperation([retired = std::move(vr_render_taa)]() mutable {
+            retired.reset();
+        });
+    }
+    if (!reconstructed.image)
+        target->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
+    if (!vr_warp->CaptureColor(scheduler.CommandBuffer(),
+                               reconstructed.image ? reconstructed.image : target->GetImage(),
+                               vk::ImageLayout::eTransferSrcOptimal,
+                               reconstructed.image ? vk::Format::eR8G8B8A8Unorm : x_format,
+                               reconstructed.image ? reconstructed.extent : x_extent,
+                               static_cast<vk::SampleCountFlagBits>(x_samples),
+                               reconstructed.image ? vk::ComponentMapping{} : x_components)) {
         return;
     }
     if (!vr_warp->HasCapture()) {
@@ -839,15 +888,54 @@ bool Rasterizer::VrInjectInFrame() {
     if (rec.menu || !rec.driven || !rec.has_projection) {
         return false;
     }
+    // The scene depth: the largest candidate (all have the frame's aspect), the most draws only
+    // between equal sizes. By draws alone a reduced-size pass of the scene (532x584 beside the
+    // 1840x2016 depth, DLSS Balanced) won some frames: our items were then depth-tested against
+    // the wrong depth, blinking on the chest and the held vial hidden (2026-10-18). A candidate
+    // whose image is gone is passed over rather than ending the items' frame.
     const VrDepthCandidate* best = nullptr;
+    VideoCore::Image* depth = nullptr;
+    u64 best_area = 0;
     for (const auto& candidate : vr_dibr.depth) {
-        if (candidate.draws != 0 && (best == nullptr || candidate.draws > best->draws)) {
+        if (candidate.draws == 0) {
+            continue;
+        }
+        VideoCore::Image* image = texture_cache.TryGetImage(candidate.id, candidate.uid);
+        if (image == nullptr) {
+            continue;
+        }
+        const u64 area = u64{image->info.size.width} * image->info.size.height;
+        if (best == nullptr || area > best_area ||
+            (area == best_area && candidate.draws > best->draws)) {
             best = &candidate;
+            depth = image;
+            best_area = area;
         }
     }
-    VideoCore::Image* depth = best ? texture_cache.TryGetImage(best->id, best->uid) : nullptr;
     if (depth == nullptr || !best->zero_to_w || depth->backing->num_samples != 1) {
         return false;
+    }
+    if constexpr (Common::Log::Enabled) {
+        // Its identity: a new uid is a new image (freed and made again), the blink hunt's clue.
+        static u64 logged_uid = 0;
+        static u32 logs = 0;
+        if (best->uid != logged_uid && logs < 48) {
+            logged_uid = best->uid;
+            ++logs;
+            std::string all;
+            for (const auto& c : vr_dibr.depth) {
+                if (c.draws == 0) {
+                    continue;
+                }
+                const VideoCore::Image* image = texture_cache.TryGetImage(c.id, c.uid);
+                all += image ? fmt::format(" [{}x{} uid {} {} draws]", image->info.size.width,
+                                           image->info.size.height, c.uid, c.draws)
+                             : fmt::format(" [gone uid {} {} draws]", c.uid, c.draws);
+            }
+            LOG_INFO(Render_Vulkan, "VR inframe: scene depth now {}x{} uid {} ({} draws); all:{}",
+                     depth->info.size.width, depth->info.size.height, best->uid, best->draws,
+                     all);
+        }
     }
     const vk::Extent2D depth_extent{depth->info.size.width, depth->info.size.height};
     const VrColorTarget* color = nullptr;
@@ -920,7 +1008,7 @@ bool Rasterizer::VrInjectInFrame() {
             projections = {}; // same all-or-neither fallback as the scene camera
         }
     }
-    const float eye_half_width = stereo ? 0.5f * NativeStereo::Ipd() * rec.world_scale : 0.0f;
+    const float eye_half_width = stereo ? 0.5f * NativeStereo::Ipd(rec) * rec.world_scale : 0.0f;
     float horizontal_extent = 1.0f, vertical_extent = 1.0f;
     for (const auto& projection : projections) {
         if (projection.valid) {
@@ -932,7 +1020,23 @@ bool Rasterizer::VrInjectInFrame() {
     }
     // Whole off-screen holsters need neither the light probe nor a private depth copy.
     // Use this frame's actual render projection, before any command-buffer transitions.
-    if (!VR::InFrame::Take(rec.id, list) ||
+    const bool taken = VR::InFrame::Take(rec.id, list);
+    if constexpr (Common::Log::Enabled) {
+        // A list missing while newer ones wait: the frame drew late and its own was dropped (the
+        // chest's items blinking, 2026-10-18). A frame with nothing to show has no list at all.
+        if (!taken) {
+            const u64 newest = VR::InFrame::NewestRecord();
+            static u32 logs = 0;
+            if (newest > rec.id + 2 && logs < 64) {
+                ++logs;
+                LOG_INFO(Render_Vulkan,
+                         "VR inframe: no item list for this frame's record {} (the newest is {}, "
+                         "{} records later)",
+                         rec.id, newest, newest - rec.id);
+            }
+        }
+    }
+    if (!taken ||
         VR::InFrame::CullInvisible(list, rec.proj_vfov, aspect, eye_half_width,
                                   horizontal_extent, vertical_extent) == 0) {
         static bool warmed = false;
@@ -1217,6 +1321,11 @@ void Rasterizer::VrUiArm(s32 mode) {
     }
 }
 
+namespace {
+PassMerge::DepthStencilUse DepthStencilOfRegisters(const AmdGpu::Regs& regs,
+                                                  const RenderState& state);
+}
+
 // Every draw after the composite of an armed frame: true = draw it into K and W too (a colour
 // draw into X). Counted for the `VR ui:` line.
 bool Rasterizer::VrUiPrepare(const GraphicsPipeline* pipeline, const RenderState& state) {
@@ -1231,10 +1340,13 @@ bool Rasterizer::VrUiPrepare(const GraphicsPipeline* pipeline, const RenderState
         if (vr_ui_ds_wrote && vr_temporal) {
             vr_temporal->s1.ui_ds_dirty = true;
         }
-        const auto& dc = std::as_const(ScratchDraw::Registers(liverpool)).depth_control;
+        // Testing a Scaleform clipping mask does not change it. Only real writes or a clear
+        // invalidate the full-resolution twin; otherwise every item in a menu recopies it.
+        const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
         vr_ui_ds_wrote = state.depth_stencil_attachment.image_view &&
-                         (dc.stencil_enable || (dc.depth_enable && dc.depth_write_enable) ||
-                          state.depth_stencil_attachment.is_clear);
+                         (state.depth_stencil_attachment.depth_clear ||
+                          state.depth_stencil_attachment.stencil_clear ||
+                          PassMerge::WritesDepthStencil(DepthStencilOfRegisters(regs, state)));
     }
     if (state.num_color_attachments == 0 || !cb_descs[0].first ||
         !state.color_attachments[0].image_view) {
@@ -1714,6 +1826,12 @@ void Rasterizer::VrUiShadowDraw(const GraphicsPipeline* pipeline, const RenderSt
             }
         }
     }
+    // Only view zero enters the UI atlas. Preserve both views' tests for any shader
+    // with memory side effects; changing its discarded view could change those writes.
+    bool shared_mask = std::as_const(ScratchDraw::Registers(liverpool)).vgt_strmout_config.raw == 0;
+    for (const Shader::Info* stage : pipeline->GetStages()) {
+        shared_mask = shared_mask && (stage == nullptr || !PipelineSkip::StageMayWrite(*stage));
+    }
     auto& merge = vr_ui_merge;
     for (const auto which : pair) {
         // FAST_GPU_PASS_MERGE (vk_pass_merge.h): no explicit end while TargetView records nothing
@@ -1766,9 +1884,18 @@ void Rasterizer::VrUiShadowDraw(const GraphicsPipeline* pipeline, const RenderSt
                 // again from it (outside the pass) when a draw tests it after the game wrote it.
                 const auto& dc = std::as_const(ScratchDraw::Registers(liverpool)).depth_control;
                 auto* ds = db_desc.first ? &texture_cache.GetImage(db_desc.first) : nullptr;
+                // Shadow draws never write depth. ALWAYS/NEVER tests do not depend on its
+                // contents, even if the guest left depth testing enabled for stencil clipping.
+                const bool reads_depth = dc.depth_bounds_enable ||
+                    (dc.depth_enable && dc.depth_func != AmdGpu::CompareFunc::Always &&
+                     dc.depth_func != AmdGpu::CompareFunc::Never);
                 const vk::ImageView twin =
                     ds && vr_temporal ? vr_temporal->S1UiDepth(
-                                            *ds, dc.stencil_enable || dc.depth_enable)
+                                            *ds, (dc.stencil_enable ? vk::ImageAspectFlagBits::eStencil
+                                                                   : vk::ImageAspectFlags{}) |
+                                                     (reads_depth ? vk::ImageAspectFlagBits::eDepth
+                                                                      : vk::ImageAspectFlags{}),
+                                            shared_mask)
                                       : vk::ImageView{};
                 if (!twin) {
                     vr_ui.incomplete = true;

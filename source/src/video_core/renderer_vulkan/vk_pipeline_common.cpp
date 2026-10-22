@@ -1,10 +1,10 @@
-#include "../../../scratchpad/dual-eye-perf/profile_scopes.h"
-#include "../../../scratchpad/dual-eye-perf/push_state_memo.h"
-#include "../../../scratchpad/fast-renderer/b_handler_profile.h"
+#include "video_core/native_stereo/profile_scopes.h"
+#include "video_core/native_stereo/push_state_memo.h"
+#include "video_core/fast/b_handler_profile.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
+#include "video_core/native_stereo/native_stereo.h"
 #include <boost/container/static_vector.hpp>
 #include <cstring>
 #include <bit>

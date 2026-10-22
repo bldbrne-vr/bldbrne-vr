@@ -1,5 +1,6 @@
 <!--
-SPDX-License-Identifier: GPL-2.0-or-later
+SPDX-FileCopyrightText: 2026 BB-VR contributors
+SPDX-License-Identifier: AGPL-3.0-or-later
 -->
 
 # Credits
@@ -12,6 +13,11 @@ Bloodborne VR builds on the work of many people. Licences and notices are in
 - **The shadPS4 team and contributors**: the emulator this project modifies
   ([shadPS4](https://github.com/shadps4-emu/shadPS4)). Their README credits the projects that
   helped them.
+
+- **Supermedo's Windows bbport**: texture cleanup progress, synchronous write-back ordering,
+  and allocation-failure reclamation/retry, adapted for this renderer
+  ([source commit 5f56ed6a](https://github.com/Supermedo/bloodborne_pc/commit/5f56ed6a7ca47c37049cbf737a244707a3ecc4d2),
+  GPL-2.0-or-later).
 
 ## The camera
 
@@ -30,10 +36,8 @@ Bloodborne VR builds on the work of many people. Licences and notices are in
 - **Kyo**: the resolution and light-grid patch templates that this project's own resolution,
   light-grid and frame-limiter lines follow. Kyo, **illusion**, **auser1337** and **Encapsulate**
   also wrote the community patches (60 FPS++, skip intro, AA, depth of field, motion blur,
-  chromatic aberration, model LOD). The launcher includes community patch entries in
-  `launcher/bbvr_patch.xml` carrying those author labels. The project author reports
-  independent recreation; the labels and matching upstream patch records still need
-  provenance reconciliation. Attribution alone does not establish redistribution rights.
+  chromatic aberration, model LOD) that the VR presets apply. Those patches are included, with
+  their authors' names, in `launcher/bbvr_patch.xml`.
 
 ## VR body, hands and items: ideas and tuning
 
@@ -72,14 +76,3 @@ Bloodborne VR builds on the work of many people. Licences and notices are in
 
 - The **OpenXR SDK** (The Khronos Group) and every library in `externals/`; see
   [NOTICE.md](NOTICE.md).
-
-## Bundled VR resources
-
-- **CDmir**, [Human Skull](https://opengameart.org/content/human-skull-0), CC0: the credited
-  base mesh for `src/resources/vr/sangiran17.bin`. The final mesh also cites photographic
-  and profile references whose provenance remains unverified. The final asset is not cleared
-  for release by this acknowledgement.
-- `src/resources/vr/music_box_regal.dds`: compiled from an AI-generated texture atlas.
-  Generation records and an exact rebuild corroborate its origin; applicable generation
-  terms and third-party rights must still be respected.
-- Reload/click and chain audio sources and edits are listed in the adjacent audio license files.

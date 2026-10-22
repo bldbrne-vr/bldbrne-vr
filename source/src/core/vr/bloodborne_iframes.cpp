@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -17,7 +23,6 @@
 #include "core/vr/bloodborne_layout.h"
 #include "core/vr/hook_util.h"
 #include "core/vr/iframe_extend.h"
-#include "core/vr/interaction_native_timing.h"
 #include "core/vr/motion_camera.h"
 #include "core/vr/vr_session.h"
 
@@ -137,6 +142,11 @@ std::atomic<u64> g_cuts{0};
 std::atomic<u64> g_cut_clears{0};
 std::atomic<u64> g_cut_pending{0};    // cuts that arrived before their dodge's window opened
 std::atomic<u64> g_cut_pending_hit{0}; // ... whose window then opened cut
+// IframesLeanGrant: the newest request (ms; taken by the next hook call) and its text.
+std::atomic<u32> g_lean_request{0};
+std::atomic<const char*> g_lean_what{"lean"};
+std::atomic<u64> g_leans{0};
+std::atomic<u64> g_lean_asserts{0};
 
 using Clock = std::chrono::steady_clock;
 
@@ -209,6 +219,7 @@ struct Push {
 
 struct HookState {
     u8* player{};
+    I::Extender ext{};
     bool first_logged{};
     bool af_warned{};
     u8* phys_vtable{};
@@ -239,25 +250,17 @@ struct HookState {
     // Level 2: per-update lines after the last dodge-related update.
     u32 trailing{};
     Clock::time_point last_stats{};
-
+    // The dodge clip stepped last (-1: none; the cut's lifetime, I::Input::dodge_clip) and whether
+    // an F8 window of it started (a cut before it waits for it: pending).
+    s32 dodge_id{-1};
+    bool dodge_windowed{};
+    // Lean i-frames: the grant, and its updates for the log.
+    I::LeanGrant lean{};
+    u32 lean_asserted{};
+    u32 lean_covered{};
+    float lean_time{}; // their game time (s)
 };
 HookState g_hook{};
-VR::Interactions::NativeIframesRuntime g_iframes; // Main player update owner only.
-VR::Interactions::Module* g_iframes_module{};
-bool g_iframes_fault{};
-void InitIframesDll() {
-    if (!VR::Interactions::DllRequested() || g_iframes_module)
-        return;
-    g_iframes_module = new VR::Interactions::Module();
-    g_iframes_module->EnableFaultBroadcast();
-    g_iframes.Bind(*g_iframes_module, g_iframes_fault);
-    if (!g_iframes_module->LoadBesideExecutable()) {
-        g_iframes_fault = true;
-        g_iframes_module->ReportFault();
-        LOG_ERROR(Core, "VR iframes: interaction DLL unavailable: {}",
-                  g_iframes_module->Diagnostic());
-    }
-}
 
 struct Sample {
     bool tae{};
@@ -297,6 +300,10 @@ void ReadRing(HookState& h, u8* bag, Sample& s) {
         p.t0 = Read<float>(entry + 4);
         p.t1 = Read<float>(entry + 8);
         p.f2 = Read<float>(entry + 12);
+        if (I::IsInterruptClip(p.id)) {
+            s.interrupted = true;
+            s.interrupt_clip = p.id;
+        }
     }
     h.ring_write = write;
 }
@@ -378,7 +385,7 @@ void LogWindowEnd(const HookState& h, const I::Output& o, bool sp392, Clock::tim
              "+{:.1f} ms wall; target +{:.1f} ms) end={}{} dt={:.1f} ms",
              ClipText(h.win_clip), clock, h.win_start, h.win_end, h.vanilla_updates,
              h.win_game * 1000.0, Ms(h.ext_wall0 - h.win_wall0), h.ext_end, h.ext_updates,
-             h.ext_time * 1000.0, Ms(now - h.ext_wall0), g_iframes.Extra() * 1000.0f, I::EndName(o.end),
+             h.ext_time * 1000.0, Ms(now - h.ext_wall0), h.ext.Extra() * 1000.0f, I::EndName(o.end),
              g_dry ? " DRYRUN" : "", h.dt_end * 1000.0f);
 }
 
@@ -435,16 +442,22 @@ void PS4_SYSV_ABI IframesHook(u8* player, u8* /*saved_ymm*/) {
     const auto now = Clock::now();
     if (player != h.player) {
         // A new player instance (load): the old one and any bit on it are gone.
+        const float extra = h.ext.Extra();
         const bool logged = h.first_logged;
         h = HookState{};
-        g_iframes.Reset();
+        h.ext.SetExtra(extra);
         h.first_logged = logged;
         h.player = player;
         h.last_stats = now;
     }
+    const float extra = static_cast<float>(Assists::live.DodgeFrames()) * I::GameFrame;
+    if (h.ext.Extra() != extra) {
+        h.ext.SetExtra(extra);
+        LOG_INFO(Core, "VR iframes: live extra {:.1f} ms (next window)", extra * 1000.0f);
+    }
     g_updates.fetch_add(1, std::memory_order_relaxed);
 
-    Sample s = ReadSample(h, player, bag, af);
+    const Sample s = ReadSample(h, player, bag, af);
     const float dt = std::isfinite(s.dt) ? std::clamp(s.dt, 0.0f, I::MaxDt) : I::GameFrame;
     if (!h.first_logged) {
         h.first_logged = true;
@@ -461,24 +474,50 @@ void PS4_SYSV_ABI IframesHook(u8* player, u8* /*saved_ymm*/) {
     in.dodge = s.sp392;
     in.grounded = s.grounded;
     in.alive = s.hp > 0;
+    in.interrupted = s.interrupted;
     in.dt = s.dt;
     in.cut = g_cut_request.exchange(false, std::memory_order_acq_rel);
-    static_assert(TimeActRingSize == PI_TIMING_CLIP_CAPACITY);
-    auto facts = PhysicalInteractions::NativeTiming::Pack(in);
-    facts.sp393 = s.sp393;
-    facts.push_count = static_cast<uint32_t>(s.push_count);
-    for (s32 i = 0; i < s.push_count; ++i) {
-        facts.pushes[i] = {s.pushes[i].id, s.pushes[i].t0};
+    // Lean i-frames first: our bit from the last update, should it survive a skipped reset, is
+    // not this update's F8 for the extender.
+    I::LeanInput lean_in{};
+    lean_in.request = g_lean_request.exchange(0, std::memory_order_acq_rel);
+    lean_in.dt = s.dt;
+    lean_in.tae = s.tae;
+    lean_in.reset_ran = s.reset_ran;
+    lean_in.alive = s.hp > 0;
+    lean_in.interrupted = s.interrupted;
+    // An attack now, or one that already ended this dodge's i-frames (its F8 bit is cleared).
+    lean_in.cut = in.cut || h.ext.Cut();
+    const I::LeanOutput lo = h.lean.Step(lean_in);
+    if (lo.clear_bit && !h.ext.Extending()) {
+        in.tae = false; // ours alone (an extending Extender finds its own stale bit itself)
     }
-    const I::Output o = g_iframes.StepRaw(facts);
-    const auto& frame = g_iframes.Frame();
-    const bool was_pending = frame.was_pending;
-    const s32 dodge_id = frame.dodge_id;
-    in.dodge_clip = frame.dodge_clip;
-    in.dodge_start = frame.dodge_start;
-    in.interrupted = frame.interrupted;
-    s.interrupted = frame.interrupted;
-    s.interrupt_clip = frame.interrupt_clip;
+    // The dodge clip of this update (from the ring: a push from 0 is a start; an update without
+    // any push, the behaviour idle, keeps the last one's) and the dodge SpEffects.
+    s32 dodge_id = -1;
+    bool dodge_start = false;
+    for (s32 i = 0; i < s.push_count; ++i) {
+        if (I::IsDodgeClip(s.pushes[i].id)) {
+            dodge_start = dodge_start || s.pushes[i].t0 <= 0.0f;
+            dodge_id = s.pushes[i].id;
+        }
+    }
+    if (s.push_count == 0) {
+        dodge_id = h.dodge_id;
+    } else {
+        dodge_start = dodge_start || (dodge_id >= 0 && h.dodge_id < 0);
+    }
+    h.dodge_id = dodge_id;
+    in.dodge_clip = dodge_id >= 0 || s.sp392 || s.sp393;
+    in.dodge_start = dodge_start;
+    if (dodge_start) {
+        h.dodge_windowed = false;
+    }
+    const bool was_pending = h.ext.CutPending();
+    const I::Output o = h.ext.Step(in);
+    if (o.window_start) {
+        h.dodge_windowed = true;
+    }
     if (o.window_start && was_pending && o.cut_bit) {
         g_cut_pending_hit.fetch_add(1, std::memory_order_relaxed);
         LOG_INFO(Core,
@@ -495,6 +534,38 @@ void PS4_SYSV_ABI IframesHook(u8* player, u8* /*saved_ymm*/) {
             bits.fetch_and(static_cast<u8>(~BitIframe), std::memory_order_relaxed);
         }
     }
+    if (!g_dry) {
+        std::atomic_ref<u8> bits(af[OffsetFlagBits]);
+        if (lo.clear_bit && !o.assert_bit) {
+            bits.fetch_and(static_cast<u8>(~BitIframe), std::memory_order_relaxed);
+        } else if (lo.assert_bit && !o.cut_bit) {
+            bits.fetch_or(BitIframe, std::memory_order_relaxed);
+        }
+    }
+    if (lo.start) {
+        g_leans.fetch_add(1, std::memory_order_relaxed);
+        h.lean_asserted = 0;
+        h.lean_covered = 0;
+        h.lean_time = 0.0f;
+    }
+    if (lo.assert_bit) {
+        g_lean_asserts.fetch_add(1, std::memory_order_relaxed);
+        ++h.lean_asserted;
+    }
+    if (lo.covered) {
+        ++h.lean_covered;
+    }
+    if (lo.assert_bit || lo.covered) {
+        h.lean_time += dt;
+    }
+    if (lo.end != nullptr) {
+        LOG_INFO(Core,
+                 "VR iframes: LEAN ({}) {} game updates invulnerable ({} ours, {} the game's own; "
+                 "{:.1f} ms of game time; end: {}){}",
+                 g_lean_what.load(std::memory_order_relaxed), h.lean_asserted + h.lean_covered,
+                 h.lean_asserted, h.lean_covered, h.lean_time * 1000.0f, lo.end,
+                 g_dry ? " DRYRUN" : "");
+    }
     if (o.cut_bit) {
         g_cut_clears.fetch_add(1, std::memory_order_relaxed);
     }
@@ -507,7 +578,7 @@ void PS4_SYSV_ABI IframesHook(u8* player, u8* /*saved_ymm*/) {
     }
     if (o.cut_start) {
         g_cuts.fetch_add(1, std::memory_order_relaxed);
-        const bool pending = frame.pending_wait;
+        const bool pending = h.ext.CutPending() && !h.dodge_windowed && in.dodge_clip;
         if (pending) {
             g_cut_pending.fetch_add(1, std::memory_order_relaxed);
         }
@@ -519,7 +590,7 @@ void PS4_SYSV_ABI IframesHook(u8* player, u8* /*saved_ymm*/) {
                  g_cut_what.load(std::memory_order_relaxed),
                  g_cut_serial.load(std::memory_order_relaxed), lag / 1'000'000,
                  p != nullptr ? ClipText(p->id) : std::string{"-"},
-                 g_iframes.InWindow() ? fmt::format("in its ({} updates)", g_iframes.WindowUpdates())
+                 h.ext.InWindow() ? fmt::format("in its ({} updates)", h.ext.WindowUpdates())
                  : o.extension_end ? std::string{"in its extension (ended)"}
                  : pending         ? std::string{"pending: waits for its"}
                  : !in.dodge_clip  ? std::string{"before any dodge clip: waits an update for its"}
@@ -581,7 +652,7 @@ void PS4_SYSV_ABI IframesHook(u8* player, u8* /*saved_ymm*/) {
             h.bs_f8 = true;
         }
     }
-    if (g_iframes.InWindow() && s.tae) {
+    if (h.ext.InWindow() && s.tae) {
         g_f8_updates.fetch_add(1, std::memory_order_relaxed);
         h.game_t += dt;
         const Push* const p = h.anim ? FindPush(s, h.win_clip) : nullptr;
@@ -592,14 +663,14 @@ void PS4_SYSV_ABI IframesHook(u8* player, u8* /*saved_ymm*/) {
         }
         h.win_end = h.anim ? p->t1 : h.game_t;
         h.win_game = h.game_t;
-        h.vanilla_updates = g_iframes.WindowUpdates();
+        h.vanilla_updates = h.ext.WindowUpdates();
         h.dt_end = dt;
     }
 
     // Backsteps: SpEffect 393 without any F8 window.
     if (s.sp393 && !h.sp393) {
         const Push* const p = PickClip(s);
-        h.bs_f8 = g_iframes.InWindow();
+        h.bs_f8 = h.ext.InWindow();
         h.bs_asserts = 0;
         h.bs_updates = 0;
         h.bs_clip = p != nullptr ? p->id : -1;
@@ -635,8 +706,8 @@ void PS4_SYSV_ABI IframesHook(u8* player, u8* /*saved_ymm*/) {
                      s.sp393 ? 1 : 0, s.grounded ? 1 : 0, s.hp,
                      o.assert_bit ? "ASSERT" : (o.clear_bit ? "CLEAR" : "-"),
                      s.interrupted ? fmt::format(" interrupt={}", s.interrupt_clip) : "",
-                     o.window_start ? " START" : "", g_iframes.Left() * 1000.0f, g_iframes.WindowUpdates(),
-                     g_iframes.ExtensionUpdates(), ring);
+                     o.window_start ? " START" : "", h.ext.Left() * 1000.0f, h.ext.WindowUpdates(),
+                     h.ext.ExtensionUpdates(), ring);
         }
     }
     if (g_log >= 1) {
@@ -701,10 +772,6 @@ void InstallIframes(VAddr base, u64 size) {
     const s32 frames = settings.dodge_iframes_extra;
     // dodge_attack with dodge_attack_iframes=0 needs the hook to end a dodge's i-frames.
     const bool cut = settings.dodge_attack && !settings.dodge_attack_iframes;
-    if (frames <= 0 && !cut) {
-        LOG_INFO(Core, "VR iframes: dodge_iframes_extra=0, vanilla dodge i-frames (not installed)");
-        return;
-    }
     if (size <= WorldChrManRva + 8) {
         LOG_WARNING(Core, "VR iframes: eboot too small ({:#x}); not installed", size);
         return;
@@ -762,8 +829,7 @@ void InstallIframes(VAddr base, u64 size) {
                       PostUpdateRva);
             return;
         }
-        InitIframesDll();
-        g_iframes.SetExtra(static_cast<float>(frames) * I::GameFrame);
+        g_hook.ext.SetExtra(static_cast<float>(frames) * I::GameFrame);
         g_is_invincible = reinterpret_cast<IsInvincibleFn>(module + IsInvincibleRva);
         Hook::WriteJump(site, PostUpdateLen, entry);
         g_installed = true;
@@ -773,8 +839,10 @@ void InstallIframes(VAddr base, u64 size) {
     }
     LOG_INFO(Core,
              "VR iframes: installed at {:#x} (PlayerIns vt+0xE8 entry) extra={} frames ({:.1f} ms) "
-             "after quickstep/roll i-frames, an attack during a dodge {} ({}) log={}{}",
+             "after quickstep/roll i-frames, {} on a quick lean, an attack during a dodge {} ({}) "
+             "log={}{}",
              PostUpdateRva, frames, static_cast<float>(std::max(frames, 0)) * I::GameFrame * 1000.0f,
+             fmt::format("{} ms", settings.lean_iframes_ms),
              !settings.dodge_attack      ? "waits for its window (dodge_attack=0)"
              : cut                       ? "ends its i-frames (dodge_attack_iframes=0)"
                                          : "keeps them (dodge_attack_iframes=1)",
@@ -855,6 +923,15 @@ void IframesAttackCut(const char* what, u32 serial) {
     g_cut_serial.store(serial, std::memory_order_relaxed);
     g_cut_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
     g_cut_request.store(true, std::memory_order_release);
+}
+
+bool IframesLeanGrant(u32 ms, const char* what) {
+    if (ms == 0 || !g_installed) {
+        return false;
+    }
+    g_lean_what.store(what != nullptr ? what : "lean", std::memory_order_relaxed);
+    g_lean_request.store(std::min(ms, I::LeanGrant::MaxMs), std::memory_order_release);
+    return true;
 }
 
 bool IsIframesInstalled() {

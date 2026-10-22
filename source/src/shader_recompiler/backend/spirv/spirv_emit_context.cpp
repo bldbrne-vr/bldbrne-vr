@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
@@ -79,6 +80,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
 
     AddCapability(spv::Capability::Shader);
     DefineArithmeticTypes();
+    info.vertex_output_locations = 0;
     DefineInterfaces();
     DefineSharedMemory();
     DefineBuffers();
@@ -197,6 +199,15 @@ Id EmitContext::NativeImagePointer(Id type, Id image, Id lod) {
     const Id ptr = OpAccessChain(TypePointer(spv::StorageClass::UniformConstant, type), image, index);
     Decorate(ptr, spv::Decoration::NonUniform);
     return ptr;
+}
+Id EmitContext::NativeNonUniform(Id resource) {
+    // NonUniform does not propagate from the descriptor access chain. Decorate the
+    // image/sampled image consumed by an image instruction, or the texel pointer
+    // consumed by an atomic, so selecting a resource by ViewIndex is portable.
+    if (runtime_info.native_stereo) {
+        Decorate(resource, spv::Decoration::NonUniform);
+    }
+    return resource;
 }
 Id EmitContext::PushF32(u32 index, std::optional<u32> component) {
     const Id type = TypePointer(spv::StorageClass::PushConstant, F32[1]);
@@ -647,7 +658,6 @@ void EmitContext::DefineOutputs() {
             const bool needs_clip_distance_emulation =
                 stage == Stage::Vertex && profile.needs_clip_distance_emulation &&
                 info.stores.GetAny(IR::Attribute::ClipDistance);
-            u32 num_attrs = 0u;
             for (u32 i = 0; i < IR::NumParams; i++) {
                 const IR::Attribute param{IR::Attribute::Param0 + i};
                 if (!info.stores.GetAny(param)) {
@@ -659,7 +669,6 @@ void EmitContext::DefineOutputs() {
                 Name(id, fmt::format("out_attr{}", i));
                 output_params[i] =
                     GetAttributeInfo(AmdGpu::NumberFormat::Float, id, num_components, true);
-                ++num_attrs;
             }
 
             if (VertexMotion()) {
@@ -674,8 +683,6 @@ void EmitContext::DefineOutputs() {
             }
             if (needs_clip_distance_emulation) {
                 clip_distances = Id{DefineOutput(F32[MaxEmulatedClipDistances], 0)};
-                output_params[num_attrs] = GetAttributeInfo(
-                    AmdGpu::NumberFormat::Float, clip_distances, MaxEmulatedClipDistances, true);
                 Name(clip_distances, fmt::format("cldist_attr{}", 0));
             }
         }

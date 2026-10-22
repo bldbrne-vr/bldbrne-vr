@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -17,9 +23,10 @@
 
 #include "core/vr/c0000_skeleton.h"
 
-// Builds the hunter's Skeleton (core/vr/c0000_skeleton.h) from the user's own game data: the
-// Havok reference pose (the hkaSkeleton "Master", read from game memory) and the
-// player model's bind pose and dummy polys. Pure functions, no emulator
+// Builds the hunter's Skeleton (core/vr/c0000_skeleton.h) from the player's own game data: the
+// Havok reference pose (the hkaSkeleton "Master" of chr/c0000.anibnd.dcx -> skeleton.hkx; the
+// emulator reads it from the game's memory, where the game loaded that file) and c0000.flver
+// (chr/c0000.chrbnd.dcx: its bones' bind pose and its dummy polys). Pure functions, no emulator
 // dependencies (core/vr/bloodborne_skeleton.cpp at runtime, the unit tests).
 //
 // The math is the reference extraction's, in double precision and in the same order (no FMA
@@ -50,7 +57,7 @@ using s64 = std::int64_t;
 #endif
 
 // FNV-1a 64 of the retail v1.09 inputs (HavokDigest of the hkaSkeleton's parents and reference
-// pose; FlverDigest of the player model's bones and body dummies). Hashes only: no game data.
+// pose; FlverDigest of c0000.flver's bones and body dummies). Hashes only: no game data.
 constexpr u64 RetailHavokDigest = 0x10880e822f3bbfc8ull;
 constexpr u64 RetailFlverDigest = 0x0432cc484d7ab5daull;
 
@@ -579,7 +586,7 @@ inline void FinishModel(Skeleton& s) {
 }
 
 // The Skeleton from the reference pose (`local`, parents as c0000_skeleton.h's, checked by the
-// caller with CheckInterop) and the player model's bones and dummies. False (and why) when the FLVER
+// caller with CheckInterop) and c0000.flver's bones and dummies. False (and why) when the FLVER
 // lacks a bone name or one of the body's dummies.
 inline bool Build(const std::array<Transform, BoneCount>& local, const FlverRig& flver,
                   Skeleton& out, std::string& why) {

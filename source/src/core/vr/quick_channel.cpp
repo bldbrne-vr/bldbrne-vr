@@ -1,12 +1,16 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <atomic>
 #include <chrono>
-#include <limits>
 
 #include "core/vr/quick_channel.h"
 #include "core/vr/seqlock.h"
-#include "core/vr/quick_interaction_mailbox.h"
 
 namespace VR::Quick {
 
@@ -16,12 +20,6 @@ struct Channel {
     SeqLock<VialContact::Sample> vial_contact;
     SeqLock<Snapshot> snapshot;
     SeqLock<Request> request;
-    InteractionMailbox interactions;
-    std::atomic<bool> identified{false};
-    std::atomic<uint64_t> request_id{};
-    uintptr_t actor{}; // game thread only
-    uint32_t actor_handle{};
-    uint64_t generation{};
     SeqLock<Result> result;
     SeqLock<Scene> scene;
     SeqLock<Holsters::Targets> holsters; // render-camera hook is the only writer
@@ -51,74 +49,20 @@ void PublishVialContact(const VialContact::Sample& s) { C().vial_contact.Store(s
 bool LatestVialContact(VialContact::Sample& s) { return C().vial_contact.Load(s); }
 
 void PublishSnapshot(const Snapshot& snapshot) {
-    auto copied = snapshot;
-    copied.character_generation = C().actor ? C().generation : 0;
-    C().snapshot.Store(copied);
+    C().snapshot.Store(snapshot);
 }
 bool LatestSnapshot(Snapshot& out) {
     return C().snapshot.Load(out);
-}
-
-void EnableInteractionTransport() { C().identified.store(true, std::memory_order_release); }
-void ObserveInteractionActor(uintptr_t actor, uint32_t handle) {
-    auto& c = C();
-    if (actor != c.actor || handle != c.actor_handle) {
-        c.actor = actor; c.actor_handle = handle;
-        if (c.generation != std::numeric_limits<uint64_t>::max()) ++c.generation;
-        else c.actor = 0; // exhausted identity cannot authorize guest execution
-    }
-}
-uint64_t InteractionActorGeneration(uintptr_t actor, uint32_t handle) {
-    const auto& c=C();return actor && actor==c.actor && handle==c.actor_handle ? c.generation : 0;
-}
-uint64_t NextInteractionRequestId() {
-    auto& counter = C().request_id;
-    auto old = counter.load(std::memory_order_relaxed);
-    while (old != std::numeric_limits<uint64_t>::max()) {
-        if (counter.compare_exchange_weak(old,old+1,std::memory_order_relaxed)) return old+1;
-    }
-    return 0;
-}
-uint32_t SubmitInteractionRequest(const PiQuickRequest& request) {
-    const auto ticket = C().interactions.Submit(request);
-    if (ticket) {
-        auto& counter = C().request_id;
-        auto old = counter.load(std::memory_order_relaxed);
-        while (old < request.request_id &&
-               !counter.compare_exchange_weak(old, request.request_id, std::memory_order_relaxed)) {}
-    }
-    return ticket;
-}
-bool CancelInteractionRequest(uint32_t ticket) {
-    return C().interactions.Cancel(ticket);
-}
-bool ClaimInteractionRequest(uint64_t character_generation, Request& out) {
-    return C().interactions.Claim(character_generation, out);
-}
-bool FinishInteractionRequest(const Result& result) {
-    return C().interactions.Finish(result);
-}
-bool PollInteractionResult(PiQuickResult& out) {
-    return C().interactions.Poll(out);
-}
-bool InteractionRequestBusy() {
-    return C().interactions.Busy();
 }
 
 void PublishRequest(const Request& request) {
     C().request.Store(request);
 }
 bool LatestRequest(Request& out) {
-    if (C().identified.load(std::memory_order_acquire))
-        return C().interactions.Claim(C().actor ? C().generation : 0,out);
     return C().request.Load(out);
 }
 
 void PublishResult(const Result& result) {
-    if (C().identified.load(std::memory_order_acquire)) {
-        C().interactions.Finish(result);
-        return;
-    }
     C().result.Store(result);
 }
 bool LatestResult(Result& out) {

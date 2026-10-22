@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -35,14 +41,6 @@
 #include "core/vr/tpf_patch.h"
 #include "core/vr/vr_session.h"
 #include "core/vr/whip_chain.h"
-#include "core/vr/interaction_chain.h"
-#include "core/vr/interaction_whip_control.h"
-#include "core/vr/interaction_native_whip.h"
-#include "core/vr/interaction_native_whip_pose.h"
-#include "core/vr/interaction_native_whip_motion.h"
-#include "core/vr/interaction_native_whip_rest.h"
-#include "core/vr/interaction_native_hierarchy.h"
-#include "core/vr/interaction_native_whip_frame.h"
 #include "core/vr/whip_audio.h"
 #include "core/vr/whip_flick.h"
 #include "core/vr/whip_idle.h"
@@ -137,9 +135,18 @@ constexpr s32 RootBladeDummy = 12110;
 constexpr int MaxBones = 64;
 
 constexpr s64 Ms = 1'000'000;
+constexpr s64 WindowFreshNs = 300 * Ms;
 // The presenter's swing speed older than this: none (the hand is not tracked, a menu).
 constexpr s64 SpeedFreshNs = 150 * Ms;
+// A heavy / charged window's reach lasts this long after it closed (its lash's follow-through).
+constexpr s64 HeavyHoldNs = 400 * Ms;
+// The chain hurts while its tip was at HurtTipSpeed within this; a hit's speed: its fastest in it.
+constexpr s64 FastRecentNs = 150 * Ms; // was 100: the lash that just hit the ground still counts
+constexpr s64 TipRecentNs = 120 * Ms;
 // The attack of a window that closed lives on while the chain is out and fast, this long at most.
+constexpr s64 HoldAfterCloseNs = 300 * Ms;
+// ... the Beast Cutter's heavy chain: 350 ms (2026-10-15: the tester, a little more forgiving).
+constexpr s64 CutterHoldAfterCloseNs = 350 * Ms;
 constexpr float BlendS = 0.15f; // the chain eases in / out over this
 
 using DmyPolyFn = s32(PS4_SYSV_ABI*)(void* chr, void* out, const s32* ids, u32 max);
@@ -161,7 +168,7 @@ bool g_untested = false; // VR_WHIP_UNTESTED: the whips the mock has not swung t
 // hits) one frame of hand motion ahead of the chain. Extrapolated, the lead puts the tip dummy
 // within 10 cm of the chain in 80-90% of the mock's checks (60% without), but the extrapolated
 // root jitters and the chain folded (bends past 90 degrees) in 4% of the frames instead of 0.5%:
-// off by default (scratchpad/whip/investigate.md; the clean fix is this frame's hand from the
+// off by default (offline analysis; the clean fix is this frame's hand from the
 // body solver).
 bool g_lead = false;
 
@@ -251,22 +258,22 @@ bool DummyAt(u8* chr, s32 id, B::Vec3& out) {
     return true;
 }
 
-bool NativeWhipFramePolicy(PiNativeWhipFrameInput& input, PiNativeWhipFrameOutput& output);
-
 // The weapon part's frame (the right hand's dummy it is attached to, 300: the part's model space).
 bool GripFrame(u8* chr, W::Frame& f, s32 dummy = GripDummy) {
     std::array<float, 12> m{};
     if (!DummyMtx(chr, dummy, m)) {
         return false;
     }
-    PiNativeWhipFrameInput input{};
-    input.operation = PI_WF_DUMMY;
-    std::copy(m.begin(), m.end(), input.matrix);
-    PiNativeWhipFrameOutput output{};
-    if (!NativeWhipFramePolicy(input, output) || !output.valid)
+    // Rows of [R | t]: the columns are the dummy's axes.
+    const B::Vec3 x = B::Normalize(B::Vec3{m[0], m[4], m[8]});
+    const B::Vec3 y = B::Normalize(B::Vec3{m[1], m[5], m[9]});
+    const B::Vec3 z = B::Normalize(B::Cross(x, y));
+    if (B::LengthSq(x) == 0.0f || B::LengthSq(z) == 0.0f) {
         return false;
-    f = PhysicalInteractions::ChainPackets::Unpack(output.frame);
-    return true;
+    }
+    f.q = B::FromBasis(x, B::Cross(z, x), z);
+    f.t = {m[3], m[7], m[11]};
+    return B::IsFinite(f.t) && B::IsFinite(f.q);
 }
 
 std::string BoneName(const u8* bones, s32 i) {
@@ -310,74 +317,58 @@ s32 Variation(const u8* chr) {
 
 // ---- The hook (Game:Main, inside the part update) -----------------------------------------------
 
-// Guest detours remain installed until process exit. Retain this module/context for that
-// lifetime rather than unloading code while a callback could still be executing. It is
-// allocated once before installing the hook, and only Game:Main mutates its context.
-VR::Interactions::Module* g_chain_module{};
-bool g_chain_fault{};
-bool g_chain_dll{};
-
 struct HookState {
-    VR::Interactions::ChainRuntime chain{};
+    W::Chain chain{};
     W::ChainConfig cfg{};
     u8* node{nullptr};
     bool have_rest{false};
     std::array<B::Vec3, W::MaxPoints> rest{};   // the simulation's idle shape (RestToBlade)
     std::array<B::Quat, W::MaxPoints> rest_q{};
+    std::array<B::Vec3, W::MaxPoints> rest_raw{}; // ... as the idle clip has it
     bool flipped{false};                        // turned to the blade side (the cane)
     float links{0.84f}; // the idle chain's length along its links (m)
-    VR::Interactions::ChainDrive drive{}; // driven through a transform's clip (a flick into the whip)
+    W::DriveState drive{}; // driven through a transform's clip (a flick into the whip)
+    bool tried_builtin{false};
     s32 playing_logged{-1};
-    VR::Interactions::NativeWhipMotion motion{};
-    VR::Interactions::ChainPoseClock clock{};
+    W::Frame prev{};
+    bool have_prev{false};
+    W::PoseClock clock{};
     float weight{0.0f};
-    s64 last_bad_log_ns{0}; // host diagnostic throttling only
-    VR::Interactions::ChainRecallSound recall_sound{};
-    VR::Interactions::ChainPullRecall recall{};
-    VR::Interactions::ChainWristFlick flick{}; // the Beast Cutter's flick recall (core/vr/whip_flick.h)
-    VR::Interactions::ChainPayout payout{}; // the extension the swing's speed asks for
-
-    bool compact_logged{false}; // diagnostic transition only
+    // The lash in progress (logs).
+    u32 lash{0};
+    bool lashing{false};
+    u32 lash_window{0};
+    float lash_peak_s{1.0f};
+    float lash_peak_tip{0.0f};
+    float lash_reach{0.0f};
+    float lash_bend{0.0f};
+    u32 lash_frames{0};
+    s64 lash_ns{0};
+    s64 last_frame_log_ns{0};
+    s64 last_bad_log_ns{0};
+    std::array<std::array<float, 3>, 4> hist{};
+    W::Frame raw{}; // the hand's frame as read last time (the lead)
+    float dt_avg{1.0f / 60.0f}; // the game's frame time, averaged
+    bool have_raw{false};
+    W::RecallSoundGate recall_sound{};
+    W::PullRecall recall{};
+    W::WristFlick flick{}; // the Beast Cutter's flick recall (core/vr/whip_flick.h)
+    W::Payout payout{}; // the extension the swing's speed asks for
+    bool full{false};   // at the full payout (locked out)
+    u32 locks{0};       // ... counted (the presenter's tick)
+    u32 reels{0};       // reel-ins started (counted)
+    s64 fast_ns{0};
+    std::array<std::pair<s64, float>, 8> tips{}; // the tip's speed, the last frames
+    u32 tip_next{0};
+    // The hunter last frame (the chain is carried round with a snap turn).
+    B::Vec3 body_pos{};
+    B::Vec3 body_fwd{};
+    bool have_body{false};
+    s64 body_ns{0};
+    u32 carries{0};
+    bool compact_logged{false}; // the Cutter's compact state, as last logged
 };
 HookState g_hs{};
-
-bool WhipHierarchy(const Rig& r, const B::QsTransform* local, B::QsTransform* model,
-                   s32 playing = 0, bool flipped = false, B::QsTransform* root_out = nullptr,
-                   bool* corrected = nullptr) {
-    if (corrected)
-        *corrected = false;
-    if (r.count < 1 || r.count > MaxBones ||
-        (g_chain_dll &&
-         (!g_chain_module || g_chain_fault || VR::Interactions::ProcessFaultLatch().Tripped())))
-        return false;
-    namespace S = PhysicalInteractions::NativeSkeletonPackets;
-    PiNativeHierarchyInput p{};
-    p.operation = root_out ? PI_NH_WHIP_ROOT : PI_NH_MODEL;
-    p.count = r.count;
-    p.variation = r.variation;
-    p.playing = playing;
-    p.flipped = flipped;
-    p.root = r.chain[0];
-    for (s32 i = 0; i < r.count; ++i) {
-        p.local[i] = S::Pack(local[i]);
-        p.parent[i] = r.parents[i];
-    }
-    if (root_out && p.root >= 0 && p.root < r.count && p.parent[p.root] >= 0 &&
-        p.parent[p.root] < r.count)
-        p.root_parent = S::Pack(model[p.parent[p.root]]);
-    PiNativeHierarchyOutput o{};
-    if (!VR::Interactions::NativeHierarchy(g_chain_module, p, o) || !o.valid)
-        return false;
-    if (p.operation == PI_NH_MODEL || o.corrected)
-        for (s32 i = 0; i < r.count; ++i)
-            model[i] = S::Unpack(o.model[i]);
-    if (o.corrected) {
-        *root_out = S::Unpack(o.root_local);
-        if (corrected)
-            *corrected = true;
-    }
-    return true;
-}
 
 // Opt-in, bounded recording of the ACTUAL game-side input and solver output. Replay this when
 // headset feel disagrees with a scripted mock. Never enabled during normal play or benchmarks.
@@ -390,8 +381,7 @@ void TraceMotion(const Rig& rig, const HookState& h, const W::Frame& grip,
         if (f) {
             std::fputs("ns,variation,pose_ns,current_pose,dt,px,py,pz,qx,qy,qz,qw,speed,target,"
                        "extension,floor,tip_x,tip_y,tip_z,tip_speed,bend,carries,gaze,"
-                       "eye_x,eye_y,eye_z,forward_x,forward_y,forward_z,compact\n",
-                       f);
+                       "eye_x,eye_y,eye_z,forward_x,forward_y,forward_z,compact\n", f);
             LOG_INFO(Core, "VR whip: recording up to 9000 live motion samples to {}", path);
         }
         return f;
@@ -405,35 +395,25 @@ void TraceMotion(const Rig& rig, const HookState& h, const W::Frame& grip,
         static_cast<long long>(now), rig.variation, static_cast<long long>(rig.grip_ns),
         int(current_pose), dt, grip.t.x, grip.t.y, grip.t.z, grip.q.x, grip.q.y, grip.q.z,
         grip.q.w, speed, target, h.chain.Extension(), h.cfg.floor_y, tip.x, tip.y, tip.z,
-        h.chain.TipSpeed(), h.chain.MaxBend(), h.motion.Carries(), int(gaze.active), gaze.eye.x,
+        h.chain.TipSpeed(), h.chain.MaxBend(), h.carries, int(gaze.active), gaze.eye.x,
         gaze.eye.y, gaze.eye.z, gaze.forward.x, gaze.forward.y, gaze.forward.z,
         int(h.cfg.lock_closed));
     if (++count % 60 == 0) std::fflush(file);
 }
 
-// Rest policy/cache outlives native part switches. The DLL owns acknowledged cache entries;
-// the host keeps only copied current shape buffers and native asset access.
-VR::Interactions::NativeWhipRest g_rest_policy{};
-PiNativeWhipRestInput RestInput(const Rig& r, uint32_t operation) {
-    PiNativeWhipRestInput p{};
-    p.operation = operation;
-    p.variation = r.variation;
-    p.count = r.n;
-    p.bones = r.count;
-    return p;
-}
-void ApplyRestShape(HookState& h, const Rig& r, const PiNativeWhipRestOutput& shape) {
-    if (!shape.found)
-        return;
-    namespace C = PhysicalInteractions::ChainPackets;
-    for (s32 k = 0; k < r.n; ++k) {
-        h.rest[k] = C::Vec(shape.rest[k]);
-        h.rest_q[k] = C::Quat(shape.rest_q[k]);
-    }
-    h.flipped = shape.flipped;
-    h.links = shape.links;
-    h.have_rest = h.chain.Init(h.rest.data(), r.n);
-}
+// The idle shape of each whip as last seen (a new part object of the same whip, after a weapon
+// switch or a load, drives at once instead of waiting for its idle clip: a flick into the whip as
+// the first transform of a session).
+struct RestCache {
+    s32 variation{-1};
+    s32 n{0};
+    std::array<B::Vec3, W::MaxPoints> rest{};
+    std::array<B::Quat, W::MaxPoints> rest_q{};
+    std::array<B::Vec3, W::MaxPoints> raw{};
+    bool flipped{false};
+    float links{0.0f};
+};
+std::array<RestCache, 4> g_rest_cache{};
 
 // The whips' idle lines from the game's own files (core/vr/whip_idle.h: the part's skeleton and
 // the first frame of its idle clip a999), read once at install: the rest shape of a whip whose
@@ -526,44 +506,35 @@ const W::WhipRest* FindIdle(s32 variation) {
     return nullptr;
 }
 
-bool NativeWhipPolicy(PiNativeWhipInput& input, PiNativeWhipOutput& output);
-bool WhipSpacePolicy(PiNativeWhipInput& input, uint32_t operation, const B::HandsSample& hands,
-                     bool have_hands, const B::Anchor& anchor, bool have_anchor, B::Vec3 grip,
-                     s64 now, PiNativeWhipOutput& output) {
-    namespace C = PhysicalInteractions::ChainPackets;
-    input.operation = operation;
-    input.now_ns = now;
-    auto& f = input.space;
-    f.have_hands = have_hands;
-    f.have_anchor = have_anchor;
-    f.head_valid = hands.head_valid;
-    f.anchor_valid = anchor.valid;
-    f.hands_ns = hands.steady_ns;
-    f.anchor_ns = anchor.steady_ns;
-    C::Pack(f.head_p, hands.head_p);
-    C::Pack(f.head_q, hands.head_q);
-    C::Pack(f.eye_world, anchor.eye_world);
-    C::Pack(f.head_k, anchor.head_k);
-    f.base_yaw = anchor.base_yaw;
-    f.world_scale = anchor.world_scale;
-    C::Pack(f.grip, grip);
-    return NativeWhipPolicy(input, output);
+float MaxExtension(const Rig& r, u8 kind) {
+    const W::WhipMoves* const w = W::FindWhip(r.variation);
+    if (w == nullptr) {
+        return 1.0f;
+    }
+    const float scale = W::GetWhipSettings().reach_scale;
+    if (r.variation == 2400) {
+        // Final grip-to-tip caps in metres at scale 1: light, heavy, charged.
+        // These replace the Cutter's stacked reach boosts.
+        constexpr std::array<float, 3> reach{4.7f, 6.6f, 7.4f};
+        return W::PayoutFor(reach, kind, scale, w->idle_tip, g_hs.links);
+    }
+    return W::ReachExtension(r.variation, W::PayoutFor(
+        w->reach, kind, scale, w->idle_tip, g_hs.links),
+        w->idle_tip, g_hs.links);
 }
 
 bool HunterFrame(const u8* chr, B::Vec3& pos, B::Vec3& fwd, B::Vec3& left); // (below)
+// The chain lies on the ground at the hunter's feet, this far above them (its links' thickness).
+constexpr float FloorLiftM = 0.03f;
+// The hunter turning more than this in one game frame carries the chain round with him (a snap
+// turn is 30 degrees at once; a smooth turn at 120 deg/s is 2 a frame).
+constexpr float CarryTurnDeg = 12.0f;
 
 void PS4_SYSV_ABI WhipHook(u8* node) {
     MeleeBowPartPose(node); // native bowstring shares this signature-checked pose tail
     g_hook_calls.fetch_add(1, std::memory_order_relaxed);
     Rig r{};
     if (!g_rig.Load(r) || r.node != node || r.n < 3) {
-        return;
-    }
-    if (g_chain_dll &&
-        (!g_chain_module || g_chain_fault || VR::Interactions::ProcessFaultLatch().Tripped())) {
-        g_out.Store(HookOut{});
-        W::PublishWhipFeel({});
-        W::PublishRecallAudio({}, false, 0, NowNs());
         return;
     }
     HookState& h = g_hs;
@@ -575,123 +546,110 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
         return;
     }
     const s32 playing = Read<s32>(r.state + OffsetStatePlaying);
+    const bool idle = playing == IdleClip;
     std::array<B::QsTransform, MaxBones> loc{};
     std::array<B::QsTransform, MaxBones> mod{};
     for (s32 i = 0; i < count; ++i) {
         loc[i] = B::FromHavok(local[i]);
     }
-    if (!WhipHierarchy(r, loc.data(), mod.data())) {
+    if (!B::LocalToModel(loc.data(), r.parents.data(), count, mod.data())) {
         return;
     }
     W::Frame grip{};
-    PiNativeWhipFrameInput source{};
-    source.operation = PI_WF_SELECT;
-    source.now_ns = now;
-    source.pose_ns = r.grip_ns;
-    source.pose = PhysicalInteractions::ChainPackets::Pack(r.grip);
-    PiNativeWhipFrameOutput selected_pose{};
-    if (!NativeWhipFramePolicy(source, selected_pose) || !selected_pose.valid)
+    const bool pose_grip = r.grip_ns > 0 && now >= r.grip_ns && now - r.grip_ns < 100 * Ms;
+    if (pose_grip) {
+        grip = r.grip;
+    } else if (!GripFrame(r.chr, grip, r.dummy)) {
         return;
-    const bool pose_grip = selected_pose.use_pose;
-    if (pose_grip)
-        grip = PhysicalInteractions::ChainPackets::Unpack(selected_pose.frame);
-    else if (!GripFrame(r.chr, grip, r.dummy))
-        return;
+    }
     if (node != h.node) {
         h = {}; // another part (a weapon switch, a load): start again
         h.node = node;
-        if (g_chain_module) {
-            h.chain.Bind(*g_chain_module, g_chain_fault);
-            h.motion.Bind(*g_chain_module, g_chain_fault);
-            g_rest_policy.Bind(*g_chain_module, g_chain_fault);
-            h.payout.Bind(h.chain);
-            h.recall.Bind(h.chain);
-            h.flick.Bind(h.chain);
-            h.drive.Bind(h.chain);
-            h.recall_sound.Bind(h.chain);
-            h.clock.Bind(h.chain);
-        }
-        const auto shape = g_rest_policy.Call(RestInput(r, PI_WR_LOOKUP));
-        if (shape.found) {
-            ApplyRestShape(h, r, shape);
-            if (g_log >= 1)
-                LOG_INFO(Core, "VR whip: rest shape of variation {} from the cache ({})",
-                         r.variation, h.have_rest ? "ok" : "REJECTED");
+        for (const RestCache& c : g_rest_cache) {
+            if (c.variation == r.variation && c.n == r.n && r.variation >= 0) {
+                std::copy_n(c.rest.begin(), c.n, h.rest.begin());
+                std::copy_n(c.rest_q.begin(), c.n, h.rest_q.begin());
+                std::copy_n(c.raw.begin(), c.n, h.rest_raw.begin());
+                h.flipped = c.flipped;
+                h.links = c.links;
+                h.have_rest = h.chain.Init(h.rest.data(), r.n);
+                if (g_log >= 1) {
+                    LOG_INFO(Core, "VR whip: rest shape of variation {} from the cache ({})",
+                             r.variation, h.have_rest ? "ok" : "REJECTED");
+                }
+                break;
+            }
         }
     }
-    // A copied successful solver init skips acquisition; missing-rest policy is DLL-owned.
-    bool capture_rest = false;
-    if (!h.have_rest) {
-        auto plan = RestInput(r, PI_WR_PLAN_CAPTURE);
-        plan.playing = playing; plan.have_rest = h.have_rest;
-        capture_rest = g_rest_policy.Call(plan).capture_rest != 0;
-    }
-    if (capture_rest) {
-        // Capture once: repeated evaluation must never recapture our simulated pose.
-        auto p = RestInput(r, PI_WR_CAPTURE);
-        for (s32 k = 0; k < r.n; ++k)
-            p.model[k] = PhysicalInteractions::NativeSkeletonPackets::Pack(mod[r.chain[k]]);
-        const auto shape = g_rest_policy.Call(p);
-        ApplyRestShape(h, r, shape);
-        h.motion.ClearPrevious();
-        if (shape.cacheable) {
-            auto ack = RestInput(r, PI_WR_ACK);
-            ack.token = shape.token;
-            ack.accepted = h.have_rest;
-            g_rest_policy.Call(ack);
+    if (idle && !h.have_rest) {
+        // Capture once. A repeated part evaluation can still contain our previous output;
+        // recapturing it would feed the simulated bend back as a new rest shape and reset it.
+        bool changed = !h.have_rest;
+        float links = 0.0f;
+        for (s32 k = 0; k < r.n; ++k) {
+            const B::Vec3 p = mod[r.chain[k]].t;
+            changed = changed || B::Length(p - h.rest_raw[k]) > 0.002f;
+            h.rest_raw[k] = p;
+            h.rest[k] = p;
+            h.rest_q[k] = B::Normalize(mod[r.chain[k]].q);
+            if (k > 0) {
+                links += B::Length(h.rest[k] - h.rest[k - 1]);
+            }
         }
-        if (g_log >= 1) {
-            LOG_INFO(
-                Core,
-                "VR whip: rest shape: {} chain bones, links {:.3f} m, the last {:.3f} m "
-                "from the grip ({}{})",
-                r.n, h.links, B::Length(h.rest[r.n - 1]), h.have_rest ? "ok" : "REJECTED",
-                h.flipped
-                    ? "; the idle clip holds it back along the forearm: turned to the blade side"
-                    : "");
+        if (changed) {
+            h.flipped = W::RestToBlade(h.rest.data(), h.rest_q.data(), r.n);
+            h.have_rest = h.chain.Init(h.rest.data(), r.n);
+            h.links = links;
+            h.have_prev = false;
+            if (h.have_rest && r.variation >= 0) {
+                // Remembered for the next part object of this whip.
+                RestCache* slot = &g_rest_cache[0];
+                for (RestCache& c : g_rest_cache) {
+                    if (c.variation == r.variation || c.variation < 0) {
+                        slot = &c;
+                        break;
+                    }
+                }
+                slot->variation = r.variation;
+                slot->n = r.n;
+                std::copy_n(h.rest.begin(), r.n, slot->rest.begin());
+                std::copy_n(h.rest_q.begin(), r.n, slot->rest_q.begin());
+                std::copy_n(h.rest_raw.begin(), r.n, slot->raw.begin());
+                slot->flipped = h.flipped;
+                slot->links = links;
+            }
+            if (g_log >= 1) {
+                LOG_INFO(Core,
+                         "VR whip: rest shape: {} chain bones, links {:.3f} m, the last {:.3f} m "
+                         "from the grip ({}{})",
+                         r.n, links, B::Length(h.rest[r.n - 1]), h.have_rest ? "ok" : "REJECTED",
+                         h.flipped ? "; the idle clip holds it back along the forearm: turned to "
+                                     "the blade side"
+                                   : "");
+            }
         }
     }
-    bool try_builtin = false;
-    if (!h.have_rest) {
-        auto plan = RestInput(r, PI_WR_PLAN_BUILTIN);
-        plan.have_rest = h.have_rest;
-        try_builtin = g_rest_policy.Call(plan).try_builtin != 0;
-    }
-    if (try_builtin) {
+    if (!h.have_rest && !h.tried_builtin) {
         // Not seen in its idle clip yet (the part appears at a transform's switch: a flick into
         // the whip as the first transform of the session): the idle line from the game's files.
+        h.tried_builtin = true;
         const W::WhipRest* const b = FindIdle(r.variation);
-        auto p = RestInput(r, PI_WR_BUILTIN);
-        if (b != nullptr) {
-            p.have_asset = 1;
-            p.asset_count = b->n;
-            p.asset_bones = b->bones;
-            p.links = b->links;
-            // Bounds guard for host-owned asset arrays; DLL checks skeleton compatibility.
-            if (b->n >= 0 && static_cast<std::size_t>(b->n) <= b->t.size() && b->n <= W::MaxPoints)
-                for (s32 k = 0; k < b->n; ++k) {
-                    p.model[k] = {{b->t[k][0], b->t[k][1], b->t[k][2]},
-                                  {b->q[k][0], b->q[k][1], b->q[k][2], b->q[k][3]},
-                                  {1, 1, 1}};
-                }
-            else
-                p.have_asset = 0;
+        if (b != nullptr && b->n == r.n && b->bones == r.count) {
+            for (s32 k = 0; k < r.n; ++k) {
+                h.rest[k] = {b->t[k][0], b->t[k][1], b->t[k][2]};
+                h.rest_q[k] = B::Normalize(B::Quat{b->q[k][0], b->q[k][1], b->q[k][2], b->q[k][3]});
+                h.rest_raw[k] = h.rest[k];
+            }
+            h.flipped = W::RestToBlade(h.rest.data(), h.rest_q.data(), r.n);
+            h.links = b->links;
+            h.have_rest = h.chain.Init(h.rest.data(), r.n);
         }
-        ApplyRestShape(h, r, g_rest_policy.Call(p));
         if (g_log >= 1) {
             LOG_INFO(Core, "VR whip: rest shape of variation {} from the game's files ({}{})",
                      r.variation,
-                     b == nullptr   ? "none"
-                     : !h.have_rest ? "REJECTED (another skeleton)"
-                                    : "ok",
+                     b == nullptr ? "none" : !h.have_rest ? "REJECTED (another skeleton)" : "ok",
                      h.flipped ? ", turned to the blade side" : "");
         }
-    }
-    if (g_chain_dll && (g_chain_fault || VR::Interactions::ProcessFaultLatch().Tripped())) {
-        g_out.Store(HookOut{});
-        W::PublishWhipFeel({});
-        W::PublishRecallAudio({}, false, 0, now);
-        return;
     }
     if (!h.have_rest) {
         return;
@@ -699,20 +657,32 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
     // RestToBlade already corrects the Cane's simulated basis. Correct the animation's
     // chain root too, before capturing its handoff pose or blending it with physics.
     // Child locals retain the original coil/uncoil animation and the handle stays put.
-    B::QsTransform corrected_root{};
-    bool root_corrected = false;
-    if (!WhipHierarchy(r, loc.data(), mod.data(), playing, h.flipped, &corrected_root, &root_corrected)) return;
-    if (root_corrected) {
+    if (r.variation == 2200 && h.flipped && (idle || W::IsTransformClip(playing))) {
         const s32 root = r.chain[0];
-        loc[root] = corrected_root;
-        B::ToHavok(corrected_root, local[root]);
+        const auto corrected = W::ClipRootToBlade(mod[r.parents[root]], loc[root]);
+        if (!B::IsFinite(corrected)) return;
+        loc[root] = corrected;
+        if (!B::LocalToModel(loc.data(), r.parents.data(), count, mod.data())) return;
+        B::ToHavok(corrected, local[root]);
     }
     const float dt = h.clock.Step(pose_grip ? r.grip_ns : now);
-    grip = h.motion.Lead(grip, dt, pose_grip, g_lead);
-    if (h.chain.Faulted()) {
-        g_out.Store(HookOut{});
-        W::PublishWhipFeel({});
-        return;
+    // VR_WHIP_LEAD: the hand's frame as the part will be placed with it (the dummy 300 read here
+    // is one game frame behind the placement: the last frame's motion applied once more).
+    const W::Frame raw = grip;
+    if (!pose_grip && g_lead && h.have_raw && dt > 0.0f && dt < 0.1f) {
+        // One typical frame of the last frame's motion (a hitch's long frame is not repeated:
+        // repeated whole, the 0.12-0.13 s frames of an eye dump folded the chain).
+        const float k = std::clamp(h.dt_avg / dt, 0.0f, 1.0f);
+        grip.t = raw.t + (raw.t - h.raw.t) * k;
+        grip.q = B::Normalize(
+            B::ScaleRotation(B::Normalize(raw.q * B::Conjugate(h.raw.q)), k) * raw.q);
+    }
+    if (dt > 0.0f) {
+        h.dt_avg += (std::min(dt, 0.05f) - h.dt_avg) * 0.1f;
+    }
+    if (dt > 0.0f || !h.have_raw) {
+        h.raw = raw;
+        h.have_raw = true;
     }
     // The swing's speed pays the chain out (core/vr/whip_spin.h Payout: a flail under centrifugal
     // force): toward the light move's reach, or a heavy / charged window's while it is open and
@@ -720,45 +690,19 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
     // motion. Out, it also takes the chain over from a transform's clip in the whip form (a flick
     // into the whip lashes it).
     Combat::MeleeWindow w{};
-    const bool have_window = Combat::LatestMeleeWindow(w);
+    const bool have_w = Combat::LatestMeleeWindow(w) && now - w.ns < WindowFreshNs;
     const auto& ws = W::GetWhipSettings();
+    const bool heavy_w = have_w && w.committed && !w.unpaid && w.kind > 0 &&
+                         (w.open || (w.close_ns != 0 && now - w.close_ns < HeavyHoldNs));
+    const u8 kind = heavy_w ? w.kind : 0;
+    W::PayoutConfig pc{};
+    pc.v_full = ws.payout_speed;
+    pc.v_start = ws.payout_speed * W::PayoutStartShare;
+    pc.v_keep = ws.payout_speed * W::PayoutKeepShare;
+    pc.hold_s = W::HoldFor(r.variation, ws.hold_s);
     const W::SwingInput input = W::LatestSwingInput(now, SpeedFreshNs);
-    PiNativeWhipInput setup_input{};
-    setup_input.operation = PI_NWH_SETUP;
-    setup_input.variation = r.variation;
-    setup_input.now_ns = now;
-    auto& setup = setup_input.setup;
-    setup.window_ns = w.ns;
-    setup.close_ns = w.close_ns;
-    setup.have_window = have_window;
-    setup.committed = w.committed;
-    setup.unpaid = w.unpaid;
-    setup.kind = w.kind;
-    setup.open = w.open;
-    setup.drive = r.drive;
-    setup.trigger = input.compact;
-    setup.swing_speed = input.speed;
-    setup.payout_speed = ws.payout_speed;
-    setup.hold_s = ws.hold_s;
-    setup.reach_scale = ws.reach_scale;
-    setup.links = h.links;
-    setup_input.gates.have_previous = h.motion.HavePrevious();
-    setup_input.gates.chain_ready = h.chain.Ready();
-    setup_input.gates.flick_recall = ws.flick_recall;
-    setup_input.gates.dt = dt;
-    PiNativeWhipOutput setup_output{};
-    if (!NativeWhipPolicy(setup_input, setup_output)) {
-        g_out.Store(HookOut{});
-        W::PublishWhipFeel({});
-        return;
-    }
-    const bool have_w = setup_output.have_window;
-    const u8 kind = static_cast<u8>(setup_output.kind);
-    const auto pc = PhysicalInteractions::ChainPackets::Unpack(setup_output.payout);
-    const float speed = setup_output.speed;
-    const bool compact = setup_output.compact;
-    const float cap = setup_output.cap;
-    const float light_cap = setup_output.light_cap;
+    const float speed = r.drive ? input.speed : 0.0f;
+    const bool compact = W::CompactCutter(r.variation, true, r.drive, input.compact);
     if (compact != h.compact_logged) {
         // Always logged: a Cutter whose chain never pays out is held compact, or is not driven
         // (the tick's "not driving" line).
@@ -767,17 +711,28 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
                      ? "held compact (the right trigger): no payout"
                      : "released from compact: pays out again");
     }
+    const float cap = MaxExtension(r, kind);
+    const float light_cap = MaxExtension(r, 0);
     bool recall = false;
-    if (setup_output.pull_allowed) {
+    if (r.variation == 2400 && r.drive && !compact && h.have_prev && h.chain.Ready()) {
         B::Vec3 feet{}, fwd{}, left{};
-        const bool body =
-            HunterFrame(r.chr, feet, fwd, left) && B::IsFinite(feet) && B::IsFinite(fwd);
-        const auto motion =
-            h.motion.Motion(PI_WM_PULL, grip, feet, fwd, body, now, dt, h.rest[1] - h.rest[0],
-                            h.chain.Point(r.n - 1) - h.chain.Point(0), h.rest[0]);
-        recall = motion.motion_valid ? h.recall.Step(motion.radial, motion.gesture, speed,
-                                                     h.chain.Extension(), dt, pc)
-                                     : h.recall.Step(0, 0, 0, h.chain.Extension(), 0, pc);
+        const bool body = HunterFrame(r.chr, feet, fwd, left) && B::IsFinite(feet) &&
+                          B::IsFinite(fwd) && h.have_body && now - h.body_ns < 100 * Ms;
+        const float turn = body ? B::Angle(fwd, h.body_fwd) : B::Pi;
+        if (body && turn < CarryTurnDeg * B::Deg && dt > 0.0f && dt <= 0.05f) {
+            const auto axis = B::Normalize(h.rest[1] - h.rest[0]);
+            const auto probe = h.rest[0] + axis * 0.25f;
+            const auto delta = W::Apply(grip, probe) - W::Apply(h.prev, probe) -
+                               (feet - h.body_pos);
+            const auto velocity = delta * (1.0f / dt);
+            const auto to_tip = B::Normalize(h.chain.Point(r.n - 1) - h.chain.Point(0));
+            const float pull = std::min(B::Dot(velocity, to_tip),
+                                        B::Dot(velocity, B::Rotate(grip.q, axis)));
+            recall = h.recall.Step(pull, B::Length(velocity), speed,
+                                   h.chain.Extension(), dt, pc);
+        } else {
+            recall = h.recall.Step(0, 0, 0, h.chain.Extension(), 0, pc);
+        }
     } else {
         h.recall.Reset();
     }
@@ -787,7 +742,8 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
     // taken out as the carry below does. A crack is the same wrist snap thrown out: only a snap
     // lifting the weapon back recalls (core/vr/whip_flick.h; whip_flick_recall=any: any snap).
     bool flick = false;
-    if (setup_output.flick_allowed) {
+    if (r.variation == 2400 && r.drive && !compact && ws.flick_recall && h.have_prev &&
+        h.chain.Ready()) {
         const W::FlickConfig fc = ws.flick_any ? W::AnyDirectionFlick() : W::FlickConfig{};
         W::FlickInput in{};
         in.dt = dt;
@@ -795,14 +751,25 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
         in.asked_out = h.payout.Out();
         in.valid = false;
         B::Vec3 feet{}, fwd{}, left{};
-        const bool body = dt > 0.0f && HunterFrame(r.chr, feet, fwd, left) && B::IsFinite(feet) &&
-                          B::IsFinite(fwd);
-        const auto motion = h.motion.Motion(PI_WM_FLICK, grip, feet, fwd, body, now, dt,
-                                            h.rest[r.n - 1] - h.rest[0]);
-        in.omega = motion.omega;
-        in.hand_speed = motion.hand_speed;
-        in.lift = motion.lift;
-        in.valid = motion.motion_valid;
+        if (dt > 0.0f && HunterFrame(r.chr, feet, fwd, left) && B::IsFinite(feet) &&
+            B::IsFinite(fwd) && h.have_body && now - h.body_ns < 100 * Ms) {
+            const float turn = std::atan2(h.body_fwd.z * fwd.x - h.body_fwd.x * fwd.z,
+                                          B::Dot(h.body_fwd, fwd));
+            if (std::abs(turn) < CarryTurnDeg * B::Deg) {
+                const B::Quat rq = B::AxisAngle({0.0f, 1.0f, 0.0f}, turn);
+                const W::Frame carried{feet + B::Rotate(rq, h.prev.t - h.body_pos),
+                                       B::Normalize(rq * h.prev.q)};
+                in.omega = B::AngleBetween(carried.q, B::Normalize(grip.q)) / dt;
+                in.hand_speed = B::Length(grip.t - carried.t) / dt;
+                // The weapon's axis (its idle line, grip to tip) then and now: the far end lifting.
+                const B::Vec3 stick = B::Normalize(h.rest[r.n - 1] - h.rest[0]);
+                const B::Vec3 from = B::Rotate(carried.q, stick);
+                const B::Vec3 to = B::Rotate(B::Normalize(grip.q), stick);
+                in.lift = W::FlickLift({from.x, from.y, from.z}, {to.x, to.y, to.z},
+                                       {fwd.x, fwd.y, fwd.z}, dt);
+                in.valid = true;
+            }
+        }
         flick = h.flick.Step(in, fc);
         if (h.flick.Fired()) {
             const auto snap = h.flick.Last();
@@ -824,11 +791,11 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
     // Do not let the speed of the recall flick immediately pay the chain out again.
     const float s_target = h.payout.Step(speed, cap, dt, pc, compact || recall || flick);
     if (h.payout.Reeled()) {
-        h.motion.Reel();
+        ++h.reels;
     }
     const bool swing = h.payout.Out();
     const bool was_taken = h.drive.taken;
-    const bool want = h.drive.Step(r.drive, playing, swing || compact);
+    const bool want = W::StepDrive(h.drive, r.drive, playing, swing || compact);
     if (g_log >= 1 && h.drive.taken && !was_taken) {
         LOG_INFO(Core,
                  "VR whip: window #{} lashes during the transform clip {}: the chain is the "
@@ -840,41 +807,16 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
                  want ? "driven" : "the clip's pose");
         h.playing_logged = playing;
     }
-    h.weight = h.chain.Blend(want, dt, BlendS);
-    setup_input.gates.have_previous = h.motion.HavePrevious();
-    setup_input.gates.chain_ready = h.chain.Ready();
-    setup_input.gates.want = want;
-    setup_input.gates.swing = swing;
-    setup_input.gates.weight = h.weight;
-    setup_input.gates.target_extension = s_target;
-    setup_input.operation = PI_NWH_HOOK_CONFIG;
-    setup.recall = recall;
-    if (!NativeWhipPolicy(setup_input, setup_output)) {
-        g_out.Store(HookOut{}); W::PublishWhipFeel({}); return;
-    }
-    const bool lash = setup_output.hook_lash;
-    setup_input.gates.lash = lash; // approved fact for subsequent gaze/audio queries
-    const float solver_extension = setup_output.solver_extension;
-    h.cfg = PhysicalInteractions::ChainPackets::Unpack(setup_output.config);
-    if (setup_output.clip_follow) {
+    h.weight = std::clamp(h.weight + (want ? 1.0f : -1.0f) * dt / BlendS, 0.0f, 1.0f);
+    if (!want && h.weight <= 0.0f) {
         // Not driven: the chain follows the clip's pose (a seamless start when it takes over).
-        PiNativeWhipPoseInput clip{};
-        clip.count = r.n;
-        clip.clip_follow = 1;
-        clip.grip = PhysicalInteractions::ChainPackets::Pack(grip);
-        for (s32 k = 0; k < r.n; ++k)
-            clip.clip[k] = PhysicalInteractions::NativeSkeletonPackets::Pack(mod[r.chain[k]]);
-        PiNativeWhipPoseOutput followed{};
-        if (!VR::Interactions::NativeWhipPose(g_chain_module, clip, followed) || !followed.write) {
-            g_out.Store(HookOut{}); W::PublishWhipFeel({});
-            W::PublishRecallAudio({}, false, 0, now);
-            return;
-        }
         std::array<B::Vec3, W::MaxPoints> pts{};
-        for (s32 k = 0; k < r.n; ++k)
-            pts[k] = PhysicalInteractions::ChainPackets::Vec(followed.points[k]);
+        for (s32 k = 0; k < r.n; ++k) {
+            pts[k] = W::Apply(grip, mod[r.chain[k]].t);
+        }
         h.chain.ResetTo(pts.data(), 1.0f);
-        h.motion.Commit(grip);
+        h.prev = grip;
+        h.have_prev = true;
         h.payout.Reset();
         h.recall.Reset();
         h.flick.Reset();
@@ -883,138 +825,147 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
         HookOut o{};
         o.ns = now;
         g_out.Store(o);
-        const auto& feedback = h.motion.FeedbackState();
-        W::PublishWhipFeel(
-            {now, 0.0f, 0.0f, feedback.locks, feedback.reels, false, feedback.lash, false});
+        W::PublishWhipFeel({now, 0.0f, 0.0f, h.locks, h.reels, false, h.lash, false});
         return;
     }
-    if (setup_output.reset_chain) {
+    if (!h.have_prev || !h.chain.Ready()) {
         h.chain.Reset(grip);
-        h.motion.Commit(grip);
+        h.prev = grip;
+        h.have_prev = true;
     }
+    // The payout: the chain to the extension the swing's speed asks for.
+    const bool lash = want && swing;
+    h.cfg = W::ConfigFor(r.variation);
+    if (recall) h.cfg.t_in = 0.24f;
+    if (compact) { h.cfg.t_in = 0.18f; h.cfg.lock_closed = true; }
+    h.cfg.release = W::ReleaseForSpeed(speed, pc.v_keep, h.cfg); // slow: the chain hangs
+    h.cfg.side_damp = W::SideDampForSpeed(speed, pc.v_keep, h.cfg); // ... and stops circling
     // The ground at the hunter's feet: the chain out and slow lies on it instead of hanging
     // through the floor (an approximation: a flat floor at his feet; walls still pass).
     {
         B::Vec3 feet{}, fwd{}, left{};
         const bool body =
             HunterFrame(r.chr, feet, fwd, left) && B::IsFinite(feet) && B::IsFinite(fwd);
-        const auto motion = h.motion.Motion(PI_WM_BODY, grip, feet, fwd, body, now);
-        h.cfg.floor_y = motion.floor_y;
-        if (motion.carry) {
-            namespace C = PhysicalInteractions::ChainPackets;
-            h.chain.Carry(C::Quat(motion.rotation), C::Vec(motion.carry_from),
-                          C::Vec(motion.carry_to));
-            if (g_log >= 1) {
-                LOG_INFO(Core,
-                         "VR whip: the hunter turned {:.0f} deg in a frame: the chain "
-                         "carried round with him (#{})",
-                         motion.turn / B::Deg, motion.carries);
+        h.cfg.floor_y = body ? feet.y + FloorLiftM : W::ChainConfig{}.floor_y;
+        // The hunter turned more than CarryTurnDeg in one frame (a snap turn, the game's own
+        // quick turns): the chain goes round with him rigidly instead of being left behind and
+        // springing back (its last frame's hand with it, so the step sees no jump).
+        if (body && h.have_body && now - h.body_ns < 100 * Ms) {
+            const float turn = std::atan2(h.body_fwd.z * fwd.x - h.body_fwd.x * fwd.z,
+                                          B::Dot(h.body_fwd, fwd));
+            if (std::abs(turn) > CarryTurnDeg * B::Deg) {
+                const B::Quat rq = B::AxisAngle({0.0f, 1.0f, 0.0f}, turn);
+                h.chain.Carry(rq, h.body_pos, feet);
+                h.prev = {feet + B::Rotate(rq, h.prev.t - h.body_pos),
+                          B::Normalize(rq * h.prev.q)};
+                ++h.carries;
+                if (g_log >= 1) {
+                    LOG_INFO(Core, "VR whip: the hunter turned {:.0f} deg in a frame: the chain "
+                                   "carried round with him (#{})",
+                             turn / B::Deg, h.carries);
+                }
             }
         }
+        h.body_pos = feet;
+        h.body_fwd = fwd;
+        h.have_body = body;
+        h.body_ns = now;
     }
     W::GazeAssist gaze{};
     B::HandsSample hands{};
     B::Anchor anchor{};
-    if (setup_output.gaze_possible) {
-        const bool have_hands = B::LatestHands(hands), have_anchor = B::LatestAnchor(anchor);
-        PiNativeWhipOutput spatial{};
-        if (!WhipSpacePolicy(setup_input, PI_NWH_NATIVE_GAZE, hands, have_hands, anchor,
-                             have_anchor, grip.t, now, spatial)) {
-            g_out.Store(HookOut{});
-            W::PublishWhipFeel({});
-            W::PublishRecallAudio({}, false, 0, now);
-            return;
-        }
-        gaze.active = spatial.gaze_active;
-        gaze.eye = PhysicalInteractions::ChainPackets::Vec(spatial.eye);
-        gaze.forward = PhysicalInteractions::ChainPackets::Vec(spatial.forward);
+    if (r.variation == 2400 && lash && speed >= pc.v_keep && B::LatestHands(hands) &&
+        hands.head_valid && now >= hands.steady_ns && now - hands.steady_ns < 100 * Ms &&
+        B::LatestAnchor(anchor) && anchor.valid && now >= anchor.steady_ns &&
+        now - anchor.steady_ns < 100 * Ms && B::IsFinite(hands.head_q) &&
+        B::Dot(hands.head_q, hands.head_q) > 0.5f) {
+        gaze.active = true;
+        gaze.eye = anchor.eye_world + B::TrackingToWorld(hands.head_p - anchor.head_k,
+                                                         anchor.base_yaw, anchor.world_scale);
+        gaze.forward = B::TrackingToWorld(
+            B::Rotate(B::Normalize(hands.head_q), {0.0f, 0.0f, -1.0f}), anchor.base_yaw, 1.0f);
     }
-    if (h.chain.Step(h.motion.Previous(), grip, dt, solver_extension, h.cfg, gaze) < 0) {
-        g_out.Store(HookOut{});
-        W::PublishWhipFeel({});
-        W::PublishRecallAudio({}, false, 0, NowNs());
-        return;
-    }
-    if (h.chain.Faulted()) {
-        g_out.Store(HookOut{});
-        W::PublishWhipFeel({});
-        return;
-    }
+    h.chain.Step(h.prev, grip, dt, want ? s_target : 1.0f, h.cfg, gaze);
     TraceMotion(r, h, grip, gaze, now, dt, speed, want ? s_target : 1.0f, pose_grip);
-    h.motion.Commit(grip);
+    h.prev = grip;
     // Locked out (the full payout reached: the presenter's tick), and free again below half.
     const float ext = h.chain.Extension();
-    // Query/dispatch approved audio intent; geometry remains in the chain DLL.
-    bool have_audio_hands = false, have_audio_anchor = false;
-    if (setup_output.audio_possible) {
-        have_audio_hands = B::LatestHands(hands);
-        have_audio_anchor = B::LatestAnchor(anchor);
+    if (dt > 0.0f) {
+        const bool audible = r.variation == 2400 && r.drive && want;
+        // The clink waits for the links to settle into the closed blade (the chain is at `grip`).
+        const float shape = audible && ext <= 1.001f ? h.chain.ClosedDeviation(grip) : 0.0f;
+        const auto sound = h.recall_sound.Step(audible, s_target <= 1.001f, ext, shape, dt);
+        float pan = 0.0f;
+        if (audible && B::LatestHands(hands) && hands.head_valid &&
+            B::LatestAnchor(anchor) && anchor.valid && now >= hands.steady_ns &&
+            now - hands.steady_ns < 100 * Ms && now >= anchor.steady_ns &&
+            now - anchor.steady_ns < 100 * Ms) {
+            const auto eye = anchor.eye_world + B::TrackingToWorld(
+                hands.head_p - anchor.head_k, anchor.base_yaw, anchor.world_scale);
+            const auto right = B::TrackingToWorld(B::Rotate(hands.head_q, {1, 0, 0}),
+                                                  anchor.base_yaw, 1.0f);
+            pan = std::clamp(B::Dot(B::Normalize(grip.t - eye), right), -0.85f, 0.85f);
+        }
+        W::PublishRecallAudio(sound, audible, pan, now);
+        if (sound.clink && g_log >= 1) LOG_INFO(Core, "VR whip: Cutter recall closed (chain clink)");
     }
-    setup_input.extension = ext;
-    PiNativeWhipOutput audio{};
-    if (!WhipSpacePolicy(setup_input, PI_NWH_RECALL_AUDIO, hands, have_audio_hands, anchor,
-                         have_audio_anchor, grip.t, now, audio)) {
-        g_out.Store(HookOut{});
-        W::PublishWhipFeel({});
-        W::PublishRecallAudio({}, false, 0, now);
-        return;
+    if (!h.full && cap > 1.5f && ext >= 1.0f + 0.95f * (cap - 1.0f)) {
+        h.full = true;
+        ++h.locks;
+    } else if (h.full && ext < 1.0f + 0.5f * (cap - 1.0f)) {
+        h.full = false;
     }
-    if (audio.audio_step) {
-        const float shape = audio.shape_needed ? h.chain.ClosedDeviation(grip) : 0.f;
-        const auto sound = h.recall_sound.Step(audio.audible, audio.closed, ext, shape, dt);
-        W::PublishRecallAudio(sound, audio.audible, audio.pan, now);
-        if (sound.clink && g_log >= 1)
-            LOG_INFO(Core, "VR whip: Cutter recall closed (chain clink)");
-    }
-    h.motion.Lock(cap, ext);
-    // Copied animation and chain facts; the DLL builds and approves the complete pose
-    // before the host writes any native bone. Keep identifiers and Havok storage here.
-    PiNativeWhipPoseInput pose_input{};
-    pose_input.count = r.n;
-    pose_input.grip = PhysicalInteractions::ChainPackets::Pack(grip);
-    pose_input.parent =
-        PhysicalInteractions::NativeSkeletonPackets::Pack(mod[r.parents[r.chain[0]]]);
-    pose_input.weight = h.weight;
-    pose_input.links = h.links;
-    pose_input.extension = h.chain.Extension();
+    // The bone frames in the part's space, written into the clip's locals (blended by the weight).
+    std::array<B::Vec3, W::MaxPoints> p{};
     for (s32 k = 0; k < r.n; ++k) {
-        PhysicalInteractions::ChainPackets::Pack(pose_input.points[k], h.chain.Point(k));
-        PhysicalInteractions::ChainPackets::Pack(pose_input.rest_q[k], h.rest_q[k]);
-        pose_input.clip[k] = PhysicalInteractions::NativeSkeletonPackets::Pack(loc[r.chain[k]]);
+        p[k] = W::ApplyInverse(grip, h.chain.Point(k));
     }
-    PiNativeWhipPoseOutput pose_output{};
-    if (!VR::Interactions::NativeWhipPose(g_chain_module, pose_input, pose_output)) {
-        g_out.Store(HookOut{});
-        W::PublishWhipFeel({});
-        return;
+    std::array<B::Quat, W::MaxPoints> q{};
+    W::ChainRotations(p.data(), h.rest_q.data(), r.n, q.data());
+    // The locals, all checked before any is written. Every rotation is renormalised: the clip's
+    // decompressed quaternions are not exactly unit, and LocalFromModel / Compose down 26 bones
+    // square that error at every bone (a 0.2% error became a garbage pose in the first test: a
+    // tip dummy kilometres away, a capsule across the whole map).
+    std::array<B::QsTransform, W::MaxPoints> clip{};
+    for (s32 k = 0; k < r.n; ++k) {
+        clip[k] = loc[r.chain[k]];
     }
-    const char* bad = pose_output.write                              ? nullptr
-                      : pose_output.reason == PI_WHIP_POSE_LONG_LINK ? "a link too long"
-                      : pose_output.reason == PI_WHIP_POSE_END ? "the chain's end off its point"
-                                                               : "not finite";
+    std::array<B::QsTransform, W::MaxPoints> out{};
+    const B::QsTransform end = W::ChainLocals(mod[r.parents[r.chain[0]]], p.data(), q.data(),
+                                              clip.data(), r.n, h.weight, out.data());
+    const float link_max = h.links / static_cast<float>(std::max(r.n - 1, 1)) *
+                               std::max(h.chain.Extension(), 1.0f) * 1.5f +
+                           0.02f;
+    const char* bad = nullptr;
+    for (s32 k = 0; k < r.n && bad == nullptr; ++k) {
+        if (!B::IsFinite(out[k])) {
+            bad = "not finite";
+        } else if (k > 0 &&
+                   B::Length(out[k].t) > std::max(link_max, B::Length(clip[k].t) * 1.5f + 0.02f)) {
+            bad = "a link too long"; // (while blending out to a clip: its own links may be long)
+        }
+    }
+    if (bad == nullptr && h.weight >= 1.0f && B::Length(end.t - p[r.n - 1]) > 0.01f) {
+        bad = "the chain's end off its point";
+    }
     if (bad != nullptr) {
         // Never hand the game a broken pose: the clip's stays this frame.
         if (g_log >= 1 && now - h.last_bad_log_ns > 1000 * Ms) {
             h.last_bad_log_ns = now;
-            LOG_WARNING(
-                Core,
-                "VR whip: pose not written ({}; the part plays {}, weight {:.2f}, x{:.2f}); "
-                "the clip's pose kept",
-                bad, playing, h.weight, h.chain.Extension());
+            LOG_WARNING(Core,
+                        "VR whip: pose not written ({}; the part plays {}, weight {:.2f}, x{:.2f}); "
+                        "the clip's pose kept",
+                        bad, playing, h.weight, h.chain.Extension());
         }
         HookOut o{};
         o.ns = now;
         g_out.Store(o);
         return;
     }
-    std::array<B::Vec3, W::MaxPoints> p{};
-    for (s32 k = 0; k < r.n; ++k)
-        p[k] = PhysicalInteractions::ChainPackets::Vec(pose_output.points[k]);
     for (s32 k = 0; k < r.n; ++k) {
         const s32 b = r.chain[k];
-        const auto blended =
-            PhysicalInteractions::NativeSkeletonPackets::Unpack(pose_output.local[k]);
-        if (g_log >= 3 && h.motion.FeedbackState().lashing && (k == 0 || k == r.n - 1)) {
+        const B::QsTransform& blended = out[k];
+        if (g_log >= 3 && h.lashing && (k == 0 || k == r.n - 1)) {
             LOG_INFO(Core,
                      "VR whip: write bone {} (chain {}) local t ({:.4f},{:.4f},{:.4f}) q "
                      "({:.4f},{:.4f},{:.4f},{:.4f}) s ({:.3f},{:.3f},{:.3f}) | clip's t "
@@ -1028,70 +979,72 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
     // The lash's statistics and logs (a lash: the chain asked out by the swing's speed, until it
     // is back on its stick).
     const float tip_speed = h.chain.TipSpeed();
-    const float reach = pose_output.reach;
-    PiWhipFeedbackFacts feedback_facts{};
-    feedback_facts.lash = lash;
-    feedback_facts.window = w.serial;
-    feedback_facts.log_level = static_cast<uint32_t>(std::max(g_log, 0));
-    feedback_facts.extension = ext;
-    feedback_facts.light_cap = light_cap;
-    feedback_facts.tip_speed = tip_speed;
-    feedback_facts.reach = reach;
-    feedback_facts.bend = h.chain.MaxBend();
-    PhysicalInteractions::ChainPackets::Pack(feedback_facts.tip, h.chain.Point(r.n - 1));
-    const auto feedback = h.motion.Feedback(feedback_facts, now);
-    if (h.chain.Faulted()) {
-        g_out.Store(HookOut{});
-        W::PublishWhipFeel({});
-        return;
+    const float reach = B::Length(p[r.n - 1]);
+    if (tip_speed >= W::HurtTipSpeed) {
+        h.fast_ns = now; // the chain hurts (bloodborne_melee.cpp: WhipChainNow)
     }
-    if (feedback.started) {
+    h.tips[h.tip_next++ % h.tips.size()] = {now, tip_speed};
+    if (lash && !h.lashing) {
+        h.lashing = true;
+        ++h.lash;
+        h.lash_window = w.serial;
+        h.lash_peak_s = 1.0f;
+        h.lash_peak_tip = 0.0f;
+        h.lash_reach = 0.0f;
+        h.lash_bend = 0.0f;
+        h.lash_frames = 0;
+        h.lash_ns = now;
+        h.last_frame_log_ns = now;
         if (g_log >= 1) {
             LOG_INFO(Core,
                      "VR whip: lash #{} pays out (the swing {:.1f} m/s; toward x{:.2f} of x{:.2f}: "
                      "the {} reach {:.2f} m x{:.2f}; window #{}{})",
-                     feedback.lash, speed, s_target, cap,
-                     M::MoveKindName(static_cast<M::MoveKind>(kind)),
+                     h.lash, speed, s_target, cap, M::MoveKindName(static_cast<M::MoveKind>(kind)),
                      W::FindWhip(r.variation) != nullptr
                          ? W::FindWhip(r.variation)->reach[std::min<std::size_t>(kind, 2)]
                          : 0.0f,
                      ws.reach_scale, w.serial,
-                     !have_w    ? " none"
-                     : w.open   ? " open"
-                     : w.unpaid ? " not registered"
-                                : " closed");
+                     !have_w        ? " none"
+                     : w.open       ? " open"
+                     : w.unpaid     ? " not registered"
+                                    : " closed");
         }
     }
-    if (feedback.active) {
+    if (h.lashing) {
+        ++h.lash_frames;
+        h.lash_peak_s = std::max(h.lash_peak_s, ext);
+        h.lash_peak_tip = std::max(h.lash_peak_tip, tip_speed);
+        h.lash_reach = std::max(h.lash_reach, reach);
+        h.lash_bend = std::max(h.lash_bend, h.chain.MaxBend());
         if (g_log >= 2) {
             const B::Vec3 tip = h.chain.Point(r.n - 1);
             LOG_INFO(Core,
                      "VR whip: #{} f{} t={:.3f} s x{:.2f} (target x{:.2f}, swing {:.1f} m/s, slow "
                      "{:.2f} s) tip ({:.3f},{:.3f},{:.3f}) {:.2f} m from the grip, {:.1f} m/s, "
                      "bend {:.0f} deg, dt {:.1f} ms",
-                     feedback.lash, feedback.frames,
-                     static_cast<double>(now - feedback.lash_ns) * 1e-9, ext, s_target, speed,
-                     h.payout.Slow(), tip.x, tip.y, tip.z, reach, tip_speed,
+                     h.lash, h.lash_frames, static_cast<double>(now - h.lash_ns) * 1e-9, ext,
+                     s_target, speed, h.payout.Slow(), tip.x, tip.y, tip.z, reach, tip_speed,
                      h.chain.MaxBend() / B::Deg, dt * 1000.0f);
-        } else if (feedback.frame_log) {
+        } else if (g_log >= 1 && now - h.last_frame_log_ns >= 400 * Ms) {
             // A long lash (a spin): where the chain is every 0.4 s.
+            h.last_frame_log_ns = now;
             const B::Vec3 d = h.chain.Point(r.n - 1) - grip.t;
             LOG_INFO(Core,
                      "VR whip: lash #{} out {:.2f} s: x{:.2f} (target x{:.2f}), the swing {:.1f} "
                      "m/s, the chain's end {:.2f} m from the grip ({:+.2f} m above it), tip {:.1f} "
                      "m/s, bend {:.0f} deg",
-                     feedback.lash, static_cast<double>(now - feedback.lash_ns) * 1e-9, ext,
-                     s_target, speed, reach, d.y, tip_speed, h.chain.MaxBend() / B::Deg);
+                     h.lash, static_cast<double>(now - h.lash_ns) * 1e-9, ext, s_target, speed,
+                     reach, d.y, tip_speed, h.chain.MaxBend() / B::Deg);
         }
-        if (feedback.ended) {
+        if (!lash && ext <= 1.001f) {
+            h.lashing = false;
             if (g_log >= 1) {
                 LOG_INFO(Core,
                          "VR whip: lash #{} done after {:.0f} ms, {} frames: out x{:.2f}, the "
                          "chain's end {:.2f} m from the grip at most, tip {:.1f} m/s peak, bend "
                          "{:.0f} deg max",
-                         feedback.lash, static_cast<double>(now - feedback.lash_ns) * 1e-6,
-                         feedback.frames, feedback.peak_extension, feedback.reach,
-                         feedback.peak_tip, feedback.bend / B::Deg);
+                         h.lash, static_cast<double>(now - h.lash_ns) * 1e-6, h.lash_frames,
+                         h.lash_peak_s, h.lash_reach, h.lash_peak_tip, h.lash_bend / B::Deg);
             }
         }
     }
@@ -1107,19 +1060,26 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
     o.reach = reach;
     o.variation = r.variation;
     o.grip = grip.t;
-    o.fast_ns = feedback.fast_ns;
-    o.tip_recent = feedback.tip_recent;
+    o.fast_ns = h.fast_ns;
+    for (const auto& [ns, v] : h.tips) {
+        if (now - ns <= TipRecentNs) {
+            o.tip_recent = std::max(o.tip_recent, v);
+        }
+    }
     const B::Vec3 tip = h.chain.Point(r.n - 1);
     o.tip = {tip.x, tip.y, tip.z};
-    for (std::size_t i = 0; i < o.hist.size(); ++i)
-        o.hist[i] = {feedback.history[i][0], feedback.history[i][1], feedback.history[i][2]};
+    for (std::size_t i = h.hist.size() - 1; i > 0; --i) {
+        h.hist[i] = h.hist[i - 1];
+    }
+    h.hist[0] = o.tip;
+    o.hist = h.hist;
     o.tip_index = r.n - 1;
-    o.lash = feedback.lash;
+    o.lash = h.lash;
     o.driving = want;
     g_out.Store(o);
-    W::PublishWhipFeel(
-        {now, feedback.feel, tip_speed, feedback.locks, feedback.reels, want, feedback.lash, lash,
-         lash && h.flick.Lifting()});
+    W::PublishWhipFeel({now, light_cap > 1.0f ? (ext - 1.0f) / (light_cap - 1.0f) : 0.0f,
+                        tip_speed, h.locks, h.reels, want, h.lash, lash,
+                        lash && h.flick.Lifting()});
 }
 
 bool InstallHook(u8* module) {
@@ -1213,48 +1173,58 @@ bool ResolveChain(const u8* skel, Rig& r, std::string& why) {
         why = fmt::format("skeleton not readable (count {})", count);
         return false;
     }
-    if (g_chain_dll &&
-        (!g_chain_module || g_chain_fault || VR::Interactions::ProcessFaultLatch().Tripped())) {
-        why = "interaction DLL unavailable";
-        return false;
-    }
     r.count = count;
-    PiNativeHierarchyInput input{};
-    input.operation = PI_NH_PARENTS;
-    // Validate each copied prefix before reading the next native parent, retaining the
-    // original fail-stop read order without a host-side hierarchy decision.
     for (s32 i = 0; i < count; ++i) {
         r.parents[i] = Read<s16>(parents + 2 * i);
-        input.parent[i] = r.parents[i];
-        input.count = i + 1;
-        PiNativeHierarchyOutput checked{};
-        if (!VR::Interactions::NativeHierarchy(g_chain_module, input, checked) || !checked.valid) {
+        if (r.parents[i] >= i) {
             why = "the skeleton's parents are not in order";
             return false;
         }
     }
-    input.root = -1;
-    for (s32 i = 0; i < count; ++i)
+    s32 root = -1;
+    for (s32 i = 0; i < count; ++i) {
         if (BoneName(bones, i) == "B_blade_root") {
-            input.root = i;
+            root = i;
             break;
         }
-    input.operation = PI_NH_WHIP_CHAIN;
-    input.count = count;
-    PiNativeHierarchyOutput resolved{};
-    if (!VR::Interactions::NativeHierarchy(g_chain_module, input, resolved)) {
-        why = "interaction DLL unavailable";
+    }
+    if (root < 0) {
+        why = "no B_blade_root (not a whip part)";
         return false;
     }
-    r.n = static_cast<s32>(resolved.chain_count);
-    r.tip_blade = resolved.tip_blade;
-    for (s32 i = 0; i < r.n; ++i)
-        r.chain[i] = static_cast<s16>(resolved.chain[i]);
-    if (!resolved.valid) {
-        why = resolved.reason == PI_NH_CHAIN_NO_ROOT ? "no B_blade_root (not a whip part)"
-              : resolved.reason == PI_NH_CHAIN_PARENTS
-                  ? "the skeleton's parents are not in order"
-                  : fmt::format("a chain of {} bones only", r.n);
+    const auto has_children = [&](s32 b) {
+        for (s32 i = b + 1; i < count; ++i) {
+            if (r.parents[i] == b) {
+                return true;
+            }
+        }
+        return false;
+    };
+    s32 cur = root;
+    r.n = 0;
+    while (r.n < W::MaxPoints) {
+        s32 next = -1;
+        for (s32 i = cur + 1; i < count; ++i) {
+            if (r.parents[i] == cur && has_children(i)) {
+                next = i;
+                break;
+            }
+        }
+        if (next < 0) {
+            break;
+        }
+        r.chain[r.n++] = static_cast<s16>(next);
+        cur = next;
+    }
+    r.tip_blade = -1;
+    for (s32 i = cur + 1; i < count; ++i) {
+        if (r.parents[i] == cur) {
+            r.tip_blade = i;
+            break;
+        }
+    }
+    if (r.n < 8) {
+        why = fmt::format("a chain of {} bones only", r.n);
         return false;
     }
     return true;
@@ -1267,23 +1237,11 @@ bool HunterFrame(const u8* chr, B::Vec3& pos, B::Vec3& fwd, B::Vec3& left) {
         return false;
     }
     const u8* w = ctrl + OffsetCtrlWorld;
-    PiNativeWhipFrameInput input{};
-    input.operation = PI_WF_HUNTER;
-    input.matrix[3] = Read<float>(w + 0x0C);
-    input.matrix[7] = Read<float>(w + 0x1C);
-    input.matrix[11] = Read<float>(w + 0x2C);
-    input.matrix[2] = Read<float>(w + 0x08);
-    input.matrix[10] = Read<float>(w + 0x28);
-    input.matrix[0] = Read<float>(w + 0x00);
-    input.matrix[8] = Read<float>(w + 0x20);
-    PiNativeWhipFrameOutput output{};
-    if (!NativeWhipFramePolicy(input, output) || !output.valid)
-        return false;
-    namespace C = PhysicalInteractions::ChainPackets;
-    pos = C::Vec(output.position);
-    fwd = C::Vec(output.forward);
-    left = C::Vec(output.left);
-    return true;
+    pos = {Read<float>(w + 0x0C), Read<float>(w + 0x1C), Read<float>(w + 0x2C)};
+    // c0000 model space: -Z forward, +X the character's left; W's columns are its axes.
+    fwd = B::Normalize(B::Vec3{-Read<float>(w + 0x08), 0.0f, -Read<float>(w + 0x28)});
+    left = B::Normalize(B::Vec3{Read<float>(w + 0x00), 0.0f, Read<float>(w + 0x20)});
+    return B::LengthSq(fwd) > 0.0f && B::LengthSq(left) > 0.0f;
 }
 
 std::string Rel(B::Vec3 p, B::Vec3 pos, B::Vec3 fwd, B::Vec3 left) {
@@ -1352,18 +1310,6 @@ void InstallWhip(VAddr base, u64 size) {
     g_ref = std::getenv("VR_WHIP_REF") != nullptr;
     g_untested = std::getenv("VR_WHIP_UNTESTED") != nullptr;
     g_lead = std::getenv("VR_WHIP_LEAD") != nullptr;
-    g_chain_dll = VR::Interactions::DllRequested();
-    // Stateless row/hold policy is needed even when chain physics is disabled.
-    if (g_chain_dll && !g_chain_module) {
-        g_chain_module = new VR::Interactions::Module();
-        g_chain_module->EnableFaultBroadcast();
-        if (!g_chain_module->LoadBesideExecutable()) {
-            LOG_ERROR(Core, "VR whip: DLL unavailable: {}", g_chain_module->Diagnostic());
-            g_chain_fault = true;
-        }
-    }
-    if (g_chain_dll && (g_chain_fault || VR::Interactions::ProcessFaultLatch().Tripped()))
-        g_physical = false;
     if (size <= WorldChrManRva + 8) {
         LOG_INFO(Core, "VR whip: eboot too small ({:#x}) for Bloodborne 1.09; whips canned", size);
         return;
@@ -1483,10 +1429,11 @@ void WhipPoseTick(u8* chr, const MeleeBody& body) {
             t.rig.node = node;
         }
         if (g_log >= 1) {
-            LOG_INFO(Core, "VR whip: right form-B part {} (anim node {}): {}", fmt::ptr(part),
-                     fmt::ptr(node),
-                     t.rig_ok ? fmt::format("a chain of {} bones of {} (the tip blade {})", t.rig.n,
-                                            t.rig.count, t.rig.tip_blade)
+            LOG_INFO(Core,
+                     "VR whip: right form-B part {} (anim node {}): {}",
+                     fmt::ptr(part), fmt::ptr(node),
+                     t.rig_ok ? fmt::format("a chain of {} bones of {} (the tip blade {})",
+                                            t.rig.n, t.rig.count, t.rig.tip_blade)
                               : fmt::format("no whip chain ({})", err));
         }
     }
@@ -1499,71 +1446,26 @@ void WhipPoseTick(u8* chr, const MeleeBody& body) {
     const s32 variation = Variation(chr);
     const W::WhipMoves* const whip = W::FindWhip(variation);
     const s32 style = Style(chr);
-    PiNativeWhipInput acquisition{};
-    acquisition.operation = PI_NWH_ACQUIRE;
-    acquisition.variation = variation;
-    auto& facts = acquisition.acquire;
-    facts.native_failure = why != nullptr;
-    facts.physical = g_physical;
-    facts.allow_untested = g_untested;
-    facts.style = style;
-    facts.rig_ok = t.rig_ok;
-    facts.body_on = bool(body.body);
-    facts.hooked = g_hooked;
-    PiNativeWhipOutput decision{};
-    bool policy_ok = NativeWhipPolicy(acquisition, decision);
-    for (int step = 0; policy_ok && decision.next_read && step < 3; ++step) {
-        facts.phase = decision.next_read;
-        switch (decision.next_read) {
-        case PI_WA_READ_MODE:
-            facts.mode = Read<s32>(part + OffsetPartMode);
-            break;
-        case PI_WA_READ_LOW:
-            facts.dummy_low = Read<s32>(part + OffsetPartDummy);
-            break;
-        case PI_WA_READ_HIGH:
-            facts.dummy_high = Read<s32>(part + OffsetPartDummy);
-            break;
-        }
-        acquisition.operation = PI_NWH_ATTACH;
-        policy_ok = NativeWhipPolicy(acquisition, decision);
+    if (why == nullptr) {
+        why = !g_physical                         ? "whip=canned"
+              : whip == nullptr                   ? "not a whip"
+              : !(whip->tested || g_untested)     ? "an untested whip (VR_WHIP_UNTESTED)"
+              : style < 3 || style > 5            ? "not in form B"
+              : !t.rig_ok                         ? "no whip chain on the part"
+              : !body.body                        ? "body off"
+              : Read<s32>(part + OffsetPartMode) != 2 ||
+                        Read<s32>(part + OffsetPartDummy) < 300 ||
+                        Read<s32>(part + OffsetPartDummy) >= 340
+                  ? "the part is not in the right hand"
+                  : nullptr;
     }
-    if (policy_ok && decision.next_read) {
-        policy_ok = false;
-        if (g_chain_module)
-            g_chain_module->ReportFault();
-    }
-    static constexpr const char* reasons[] = {nullptr,
-                                              nullptr,
-                                              "whip=canned",
-                                              "not a whip",
-                                              "an untested whip (VR_WHIP_UNTESTED)",
-                                              "not in form B",
-                                              "no whip chain on the part",
-                                              "body off",
-                                              "the part is not in the right hand"};
-    if (!policy_ok)
-        why = "interaction DLL unavailable";
-    else if (decision.acquire_reason != PI_WA_NATIVE)
-        why = reasons[decision.acquire_reason];
-    const bool drive = policy_ok && decision.drive;
+    const bool drive = why == nullptr;
     if (t.rig_ok) {
         t.rig.variation = variation;
-        t.rig.drive = policy_ok && decision.rig_drive;
+        t.rig.drive = drive && g_hooked;
         // The part's model space is the hand dummy it hangs on (300; the Threaded Cane's too).
-        PiNativeWhipInput attachment{};
-        attachment.operation = PI_NWH_DUMMY;
-        attachment.acquire.dummy = Read<s32>(part + OffsetPartDummy);
-        PiNativeWhipOutput selected{};
-        if (!NativeWhipPolicy(attachment, selected)) {
-            t.rig.drive = false;
-            g_rig.Store(t.rig);
-            g_node_cmp = 0;
-            g_out.Store(HookOut{});
-            W::PublishWhipFeel({});
-            return;
-        }
-        t.rig.dummy = selected.dummy;
+        const s32 dummy = Read<s32>(part + OffsetPartDummy);
+        t.rig.dummy = dummy >= 300 && dummy < 340 ? dummy : GripDummy;
         t.rig.grip_ns = 0;
         // The body has just written this pose; its synchronized dummy is still one frame old.
         // Copy only the attachment frame into the seqlock, never the borrowed pose pointers.
@@ -1571,27 +1473,13 @@ void WhipPoseTick(u8* chr, const MeleeBody& body) {
         if (skeleton && body.pose_locals && body.pose_frame && body.pose_ns > 0 &&
             t.rig.dummy == skeleton->right_weapon_base.id) {
             const auto& d = skeleton->right_weapon_base;
-            const auto bone =
-                B::ModelOf(body.pose_locals, B::C0000::Parents.data(), B::C0000::BoneCount, d.bone);
-            if (bone) {
-                namespace C = PhysicalInteractions::ChainPackets;
-                PiNativeWhipFrameInput input{};
-                input.operation = PI_WF_ATTACHMENT;
-                input.character_valid = body.pose_frame->valid;
-                std::copy(body.pose_frame->R.begin(), body.pose_frame->R.end(), input.character_r);
-                C::Pack(input.character_t, body.pose_frame->t);
-                C::Pack(input.character_q, body.pose_frame->q);
-                input.bone = PhysicalInteractions::NativeSkeletonPackets::Pack(*bone);
-                for (int i = 0; i < 3; ++i) {
-                    input.offset[i] = d.position[i];
-                    input.forward[i] = d.forward[i];
-                    input.up[i] = d.up[i];
-                }
-                PiNativeWhipFrameOutput output{};
-                if (NativeWhipFramePolicy(input, output) && output.valid) {
-                    t.rig.grip = C::Unpack(output.frame);
-                    t.rig.grip_ns = body.pose_ns;
-                }
+            const auto bone = B::ModelOf(body.pose_locals, B::C0000::Parents.data(),
+                                         B::C0000::BoneCount, d.bone);
+            if (bone && W::AttachmentFrame(*body.pose_frame, *bone,
+                    {d.position[0], d.position[1], d.position[2]},
+                    {d.forward[0], d.forward[1], d.forward[2]},
+                    {d.up[0], d.up[1], d.up[2]}, t.rig.grip)) {
+                t.rig.grip_ns = body.pose_ns;
             }
         }
         g_rig.Store(t.rig);
@@ -1672,104 +1560,76 @@ void WhipPoseTick(u8* chr, const MeleeBody& body) {
     }
 }
 
-namespace {
-bool NativeWhipFramePolicy(PiNativeWhipFrameInput& input, PiNativeWhipFrameOutput& output) {
-    if (g_chain_dll &&
-        (!g_chain_module || g_chain_fault || VR::Interactions::ProcessFaultLatch().Tripped())) {
-        output = {};
-        return false;
-    }
-    return VR::Interactions::NativeWhipFrame(g_chain_module, input, output);
-}
-bool NativeWhipPolicy(PiNativeWhipInput& input, PiNativeWhipOutput& output) {
-    if (g_chain_dll &&
-        (!g_chain_module || g_chain_fault || VR::Interactions::ProcessFaultLatch().Tripped())) {
-        output = {};
-        return false;
-    }
-    return VR::Interactions::NativeWhip(g_chain_module, input, output);
-}
-} // namespace
 const VR::Melee::WeaponMoves* WhipMovesFor(s32 variation, const VR::Melee::WeaponMoves* base) {
-    PiNativeWhipInput input{};
-    input.operation = PI_NWH_ROWS;
-    input.variation = variation;
-    input.hooked = g_hooked;
-    input.physical = g_physical;
-    input.have_base = base != nullptr;
-    input.allow_untested = g_untested;
-    PiNativeWhipOutput output{};
-    if (!NativeWhipPolicy(input, output))
-        return nullptr;
-    if (!output.use)
+    if (!g_hooked || !g_physical || base == nullptr) {
         return base;
-    // Host-side immutable storage memoization; eligibility and exact row values are DLL-owned.
+    }
+    const W::WhipMoves* const w = W::FindWhip(variation);
+    if (w == nullptr || !(w->tested || g_untested)) {
+        return base;
+    }
+    // Built once per whip (the table is fixed).
     static std::array<VR::Melee::WeaponMoves, W::Whips.size()> built{};
     static std::array<bool, W::Whips.size()> made{};
-    const auto index = static_cast<size_t>(output.index);
-    if (!made[index]) {
-        if (!base)
-            return nullptr;
-        built[index] = *base;
-        for (int i = 0; i < 3; ++i)
-            built[index].rows[3 + i] =
-                PhysicalInteractions::NativeWhipPackets::Unpack(output.rows[i]);
-        made[index] = true;
+    const std::size_t i = static_cast<std::size_t>(w - W::Whips.data());
+    if (!made[i]) {
+        built[i] = W::WithWhipRows(*base, *w);
+        made[i] = true;
     }
-    return &built[index];
+    return &built[i];
 }
 
 bool IsWhipRow(const VR::Melee::MoveRow* row) {
-    PiNativeWhipInput input{};
-    input.operation = PI_NWH_MATCH;
-    input.have_row = row != nullptr;
-    if (row)
-        input.row = PhysicalInteractions::NativeWhipPackets::Pack(*row);
-    PiNativeWhipOutput output{};
-    return NativeWhipPolicy(input, output) && output.match;
+    if (row == nullptr) {
+        return false;
+    }
+    const auto same = [row](const M::MoveRow& r) {
+        return r.judge == row->judge && r.dmy1 == row->dmy1 && r.dmy2 == row->dmy2 &&
+               r.stamina == row->stamina && r.mv == row->mv;
+    };
+    for (const W::WhipMoves& w : W::Whips) {
+        for (const M::MoveRow& r : w.rows) {
+            if (same(r)) {
+                return true;
+            }
+        }
+        // The flick into the whip: its transform attack's capsules hang on the chain too.
+        if (const M::MoveRow* tr = W::WhipTransformRow(w.variation); tr != nullptr && same(*tr)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool WhipHoldsWindow(const Combat::MeleeWindow& w, s64 now_ns) {
-    PiNativeWhipInput input{};
-    input.operation = PI_NWH_HOLD;
-    input.hooked = g_hooked;
-    input.window_open = w.open;
-    input.close_ns = w.close_ns;
-    input.now_ns = now_ns;
-    HookOut output{};
-    // Preserve the original short-circuit shared-output read before supplying copied facts.
-    if (g_hooked && !w.open && w.close_ns != 0 && g_out.Load(output)) {
-        input.have_output = 1;
-        input.driving = output.driving;
-        input.compact = output.compact;
-        input.output_ns = output.ns;
-        input.fast_ns = output.fast_ns;
-        input.extension = output.s;
+    if (!g_hooked || w.open || w.close_ns == 0) {
+        return false;
     }
-    PiNativeWhipOutput decision{};
-    return NativeWhipPolicy(input, decision) && decision.hold;
+    HookOut o{};
+    if (!g_out.Load(o) || !o.driving || o.compact || now_ns - o.ns > 100 * Ms) {
+        return false;
+    }
+    // Still out after the window (the lash's follow-through) and still fast enough to hurt.
+    const s64 hold = o.variation == 2400 ? CutterHoldAfterCloseNs : HoldAfterCloseNs;
+    return now_ns - w.close_ns < hold && o.s > 1.3f &&
+           now_ns - o.fast_ns <= FastRecentNs;
 }
 
 bool WhipWipePoints(u8* chr, std::span<B::Vec3> points, int& count) {
     count = 0;
     if (!g_hooked || !g_physical || !chr || W::FindWhip(Variation(chr)) == nullptr ||
-        Style(chr) < 3 || Style(chr) > 5)
-        return false;
+        Style(chr) < 3 || Style(chr) > 5) return false;
     // Read the final bone locals, including animation/physics blending, at the same
     // render tick as the paper and grip. Simulation points alone can be a frame ahead.
     Rig r{};
-    if (!g_rig.Load(r) || r.chr != chr || r.variation != Variation(chr) || r.n < 2 ||
-        r.n > static_cast<int>(points.size()) || r.n > static_cast<int>(r.chain.size()) ||
-        r.count < 1 || r.count > MaxBones)
+    if (!g_rig.Load(r) || r.chr != chr || r.variation != Variation(chr) ||
+        r.n < 2 || r.n > static_cast<int>(points.size()) || r.count < 1 || r.count > MaxBones)
         return true;
     const auto* parts = Read<const u8*>(chr + OffsetChrAsm);
-    if (!Plausible(parts))
-        return true;
+    if (!Plausible(parts)) return true;
     const auto* part = Read<const u8*>(parts + OffsetAsmParts + 8 * WhipPartSlot);
-    if (part != r.part || !Plausible(part) ||
-        Read<const u8*>(part) != g_base + WeaponPartVtableRva ||
-        Read<s32>(part + OffsetPartMode) != 2)
-        return true;
+    if (part != r.part || !Plausible(part) || Read<const u8*>(part) != g_base + WeaponPartVtableRva ||
+        Read<s32>(part + OffsetPartMode) != 2) return true;
     const auto* anim = Read<const u8*>(part + OffsetPartAnim);
     const auto* state = Plausible(anim) ? Read<const u8*>(anim) : nullptr;
     const auto* player = Plausible(state) ? Read<const u8*>(state + OffsetStatePlayer) : nullptr;
@@ -1783,52 +1643,31 @@ bool WhipWipePoints(u8* chr, std::span<B::Vec3> points, int& count) {
     if (Read<s32>(pose + OffsetPoseLocalSize) != r.count ||
         !Plausible(reinterpret_cast<const u8*>(local), 16))
         return true;
-    // One copied packet owns both FK and the final world-space contact path. Keep native
-    // reads here; do not use simulation points from a different tick for rendered contact.
-    if (g_chain_dll &&
-        (!g_chain_module || g_chain_fault || VR::Interactions::ProcessFaultLatch().Tripped()))
-        return true;
-    namespace S = PhysicalInteractions::NativeSkeletonPackets;
-    namespace C = PhysicalInteractions::ChainPackets;
-    PiNativeHierarchyInput input{};
-    input.operation = PI_NH_WHIP_POINTS;
-    input.count = r.count;
-    input.point_count = r.n;
-    input.grip = C::Pack(grip);
-    for (int i = 0; i < r.count; ++i) {
-        input.local[i] = S::Pack(B::FromHavok(local[i]));
-        input.parent[i] = r.parents[i];
+    std::array<B::QsTransform, MaxBones> loc{}, mod{};
+    for (int i = 0; i < r.count; ++i) loc[i] = B::FromHavok(local[i]);
+    if (!B::LocalToModel(loc.data(), r.parents.data(), r.count, mod.data())) return true;
+    for (int i = 0; i < r.n; ++i) {
+        if (r.chain[i] < 0 || r.chain[i] >= r.count) return true;
+        points[i] = W::Apply(grip, mod[r.chain[i]].t);
+        if (!B::IsFinite(points[i])) return true;
     }
-    for (int i = 0; i < r.n; ++i) input.point_bone[i] = r.chain[i];
-    PiNativeHierarchyOutput output{};
-    if (!VR::Interactions::NativeHierarchy(g_chain_module, input, output) || !output.valid)
-        return true;
-    for (uint32_t i = 0; i < output.point_count; ++i) points[i] = C::Vec(output.points[i]);
-    count = static_cast<int>(output.point_count);
+    count = r.n;
     return true;
 }
 
 WhipChainState WhipChainNow(s64 now_ns) {
-    PiNativeWhipInput input{};
-    input.operation = PI_NWH_CHAIN_SNAPSHOT;
-    input.hooked = g_hooked;
-    input.now_ns = now_ns;
-    HookOut source{};
-    if (g_hooked) input.have_output = g_out.Load(source);
-    if (input.have_output) {
-        input.output_ns = source.ns;
-        input.fast_ns = source.fast_ns;
-        input.driving = source.driving;
-        input.compact = source.compact;
-        input.extension = source.s;
-        input.variation = source.variation;
-        input.contact = {source.tip_recent, {source.grip.x, source.grip.y, source.grip.z}};
+    WhipChainState st{};
+    HookOut o{};
+    if (!g_hooked || !g_out.Load(o) || !o.driving || now_ns < o.ns || now_ns - o.ns > 150 * Ms) {
+        return st;
     }
-    PiNativeWhipOutput output{};
-    if (!NativeWhipPolicy(input, output)) return {};
-    const auto& c = output.chain;
-    return {c.applies != 0, c.fast != 0, c.tip, c.variation,
-            {c.grip[0], c.grip[1], c.grip[2]}};
+    if (o.compact && o.s <= 1.02f) return st; // compact club uses normal blade-speed gates
+    st.applies = true;
+    st.fast = o.fast_ns != 0 && now_ns - o.fast_ns <= FastRecentNs;
+    st.tip = o.tip_recent;
+    st.variation = o.variation;
+    st.grip = o.grip;
+    return st;
 }
 
 } // namespace VR::Bloodborne

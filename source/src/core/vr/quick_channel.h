@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -7,7 +13,6 @@
 
 #include "core/vr/quick_items.h"
 #include "core/vr/vial_contact.h"
-#include "physical_interactions/quick_action_api.h"
 
 // Quick items in VR: the records the threads hand each other (core/vr/quick_items.h has the
 // types). Every record is a single-writer seqlock (core/vr/seqlock.h): no thread ever waits for
@@ -31,24 +36,6 @@ bool LatestVialContact(VialContact::Sample& out);
 
 void PublishSnapshot(const Snapshot& snapshot);
 bool LatestSnapshot(Snapshot& out);
-
-// Startup selection only; both LatestRequest and PublishResult switch together.
-void EnableInteractionTransport();
-// Game-thread only, immediately before publishing the quick-item snapshot. Actor keys
-// remain in the host; the DLL receives only the monotonically increasing generation.
-void ObserveInteractionActor(uintptr_t actor, uint32_t handle);
-uint64_t NextInteractionRequestId();
-// Game-thread only: verify the current observed actor without changing its generation.
-uint64_t InteractionActorGeneration(uintptr_t actor, uint32_t handle);
-
-// Identified consumable transport. Presenter and game hook select it together at startup
-// in DLL mode. Ticket 0 means not submitted.
-uint32_t SubmitInteractionRequest(const PiQuickRequest& request);
-bool CancelInteractionRequest(uint32_t ticket);
-bool ClaimInteractionRequest(uint64_t character_generation, Request& out);
-bool FinishInteractionRequest(const Result& result);
-bool PollInteractionResult(PiQuickResult& out);
-bool InteractionRequestBusy();
 
 void PublishRequest(const Request& request);
 bool LatestRequest(Request& out);

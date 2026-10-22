@@ -1,12 +1,16 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
 #include "common/types.h"
 #include "core/vr/grab_camera.h"
 #include "core/vr/vr_session.h"
-
-namespace VR::Interactions { class NativeCameraRuntime; }
 
 // Bloodborne (v1.09 eboot) VR body: the hunter's arms on your controllers, his torso turned and
 // moved under your eyes, his head hidden (first person; VR_BODY_DRYRUN solves everything and
@@ -51,9 +55,8 @@ void OnEbootRelocated(VAddr base, u64 size);
 
 // Fresh, untouched animated eye during an enemy grab; or (`own_throw`) during a freehand throw
 // the hunter performs, his facing and his victim's root. False outside those animations.
-// Called only by the render hook with its existing camera runtime/sequence.
-[[nodiscard]] bool BodyGrabEye(s64 now, VR::GrabCamera::Sample& sample,
-                               VR::Interactions::NativeCameraRuntime& camera);
+[[nodiscard]] bool BodyGrabEye(s64 now, VR::GrabCamera::Sample& sample);
+[[nodiscard]] bool BodyThrowPlacement(s64 now, float scale, VR::GrabCamera::ThrowPlacement& out);
 
 // Render-camera hook (loop thread), once per rendered frame after the camera is placed: `result`
 // and `position` (the final render camera position, game units) of a driven frame, `fp_follow` =

@@ -123,7 +123,7 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      std::optional<const Shader::Gcn::FetchShaderData> fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     bool preloading, u64 vertex_output_locations = 0);
     ~GraphicsPipeline();
 
     const std::optional<const Shader::Gcn::FetchShaderData>& GetFetchShader() const noexcept {

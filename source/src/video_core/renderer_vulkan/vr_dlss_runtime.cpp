@@ -1,5 +1,11 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #include <algorithm>
+#include "video_core/renderer_vulkan/vr_dibr_dlss.h"
 #include <cstdlib>
 #include <cstring>
 #include "common/logging/log.h"
@@ -73,6 +79,7 @@ VrDlssRuntime& VrDlssRuntime::Get() {
 }
 void VrDlssRuntime::PrepareDriverAddressSpace() {
 #ifdef _WIN32
+    if (!std::getenv("VR_NATIVE_STEREO") && !DibrDlss::Requested()) return;
     if (early_attempted || VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Dlss)
         return;
     early_attempted = true;
@@ -161,6 +168,11 @@ void VrDlssRuntime::Fail(const char* reason) {
     problem = reason;
 }
 bool VrDlssRuntime::Load() {
+    // A saved native-upscaler preference must not load NGX or reserve its memory in DIBR.
+    if (!std::getenv("VR_NATIVE_STEREO") && !DibrDlss::Requested()) {
+        problem = "Disabled in DIBR mode; native-stereo preference preserved";
+        return false;
+    }
     if (attempted)
         return api != nullptr;
     attempted = true;

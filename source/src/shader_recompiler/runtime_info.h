@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -100,7 +101,7 @@ using OutputMap = std::array<Output, 4>;
 struct VertexRuntimeInfo : protected CommonEsVsRuntimeInfo {
     u32 num_outputs;
     std::array<OutputMap, 3> outputs;
-    u32 foreground_probe{}; // scratchpad: 1 explicit eye, 2 multiview
+    u32 foreground_probe{}; // 1 explicit eye, 2 multiview
     bool tess_emulated_primitive{};
     bool emulate_depth_negative_one_to_one{};
     bool clip_disable{};
@@ -273,6 +274,7 @@ struct ComputeRuntimeInfo {
 struct RuntimeInfo {
     VrMotion vr_motion{};
     bool native_stereo;
+    bool billboard_face_eye{};
     bool native_multiview;
     // VrPushData (vr_push_data.h): the hardware vertex or geometry stage remaps each eye with the
     // projection the draw pushes, and native_projection stays zero. Otherwise the projection is
@@ -311,6 +313,7 @@ struct RuntimeInfo {
     }
 
     bool operator==(const RuntimeInfo& other) const noexcept {
+        if (billboard_face_eye != other.billboard_face_eye) return false;
         if (vr_motion != other.vr_motion) {
             return false;
         }

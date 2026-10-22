@@ -1,10 +1,15 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
 #include "common/types.h"
 
-// Bloodborne (v1.09 eboot) VR difficulty tuning, both off at 0 (nothing patched):
 //
 // - player_hp_bonus_pct (default 20): the hunter's max HP is +N%. SpEffectMgr::GetMaxHpRateProduct
 //   (0x17E46E0) is detoured and its result multiplied for the main player's SpEffect manager only,
@@ -24,7 +29,6 @@ namespace VR::Bloodborne {
 // OnEbootLoaded (VR enabled; before guest threads exist): checks every site and installs.
 void InstallTuning(VAddr base, u64 size);
 
-// Main player update (Site A, the player's update thread): logs and the autotest only.
 void TuningUpdate(u8* player);
 
 [[nodiscard]] bool IsHpBonusInstalled();

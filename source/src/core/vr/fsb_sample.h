@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -7,7 +13,7 @@
 #include <string_view>
 #include <vector>
 
-// One named sample of a Bloodborne FMOD sound bank (FSB5, ATRAC9: game asset), read
+// One named sample of a Bloodborne FMOD sound bank (FSB5, ATRAC9: dvdroot_ps4/sound/*.fsb), read
 // from the player's own game files at runtime (nothing of the game is shipped), decoded with
 // LibAtrac9 and handed to the VR mixers as mono S16LE at 24 kHz (core/vr/whip_audio.h). Empty when
 // the bank or the sample is not there, or anything about it is not as expected.

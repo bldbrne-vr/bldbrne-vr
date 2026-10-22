@@ -404,7 +404,7 @@ s32 PS4_SYSV_ABI sceKernelMprotect(const void* addr, u64 size, s32 prot) {
 
     s32 result = memory_manager->Protect(aligned_addr, aligned_size, protection_flags);
     if (result == ORBIS_OK) {
-        memory_manager->InvalidateMemory(aligned_addr, aligned_size);
+        memory_manager->InvalidateProtection(aligned_addr, aligned_size);
     }
     return result;
 }
@@ -437,7 +437,7 @@ s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s3
     s32 result = memory_manager->Protect(aligned_addr, aligned_size, protection_flags);
     if (result == ORBIS_OK) {
         memory_manager->SetDirectMemoryType(aligned_addr, aligned_size, mtype);
-        memory_manager->InvalidateMemory(aligned_addr, aligned_size);
+        memory_manager->InvalidateProtection(aligned_addr, aligned_size);
     }
     return result;
 }

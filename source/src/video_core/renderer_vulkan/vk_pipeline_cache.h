@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -11,7 +12,7 @@
 #include <span>
 #include <type_traits>
 #include <unordered_map>
-#include "../../../scratchpad/dual-eye-perf/srt_read_plan.h"
+#include "video_core/native_stereo/srt_read_plan.h"
 
 #include <variant>
 #include <cstdlib>
@@ -66,6 +67,7 @@ struct Program {
         // hash, its meta's and binary's name; never 0, unique in the program. The index in
         // `modules` is only where the lookups find it.
         u64 id{};
+        u64 vertex_output_locations{};
         std::shared_ptr<const Shader::Gcn::FetchShaderSnapshot> fetch_snapshot;
         u32 fetch_snapshot_tries{}; // failed snapshot lookups: retried every 64th selection
     };
@@ -111,15 +113,16 @@ struct Program {
     Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)
         : info{stage, l_stage, params} {}
 
-    void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec, u64 id) {
-        modules.emplace_back(module, std::move(spec), id);
+    void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec, u64 id,
+                   u64 vertex_output_locations) {
+        modules.emplace_back(module, std::move(spec), id, vertex_output_locations);
         PerfMemo::BumpEpoch();
     }
 
     void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
-                      size_t perm_idx, u64 id) {
+                      size_t perm_idx, u64 id, u64 vertex_output_locations) {
         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
-        modules[perm_idx] = {module, std::move(spec), id};
+        modules[perm_idx] = {module, std::move(spec), id, vertex_output_locations};
         PerfMemo::BumpEpoch();
     }
 
@@ -140,6 +143,7 @@ struct PipelineSelection {
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
     GraphicsPipelineKey graphics_key{};
+    u64 vertex_output_locations{};
     u32 vr_probe_mode{};
     Shader::VrMotion vr_motion{};
     u32 vr_fs_cut{};
@@ -183,6 +187,7 @@ struct PrepProgramResult {
     vk::ShaderModule module{};
     std::optional<Shader::Gcn::FetchShaderData> fetch;
     std::shared_ptr<const Shader::Gcn::FetchShaderSnapshot> fetch_source;
+    u64 vertex_output_locations{};
 };
 // One preparation worker's reusable whole-draw selection state (steady state allocates
 // nothing per draw except the StageSpecialization's fetch copy).

@@ -1,14 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <AL/al.h>
 #include <AL/alc.h>
+#include <AL/alext.h>
 
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -48,6 +52,10 @@ struct DeviceContext {
     ALCcontext* context{nullptr};
     std::string device_name;
     int port_count{0};
+    // Opened as the system default (follows it when it changes), and the context's attributes,
+    // for alcReopenDeviceSOFT.
+    bool follows_default{false};
+    std::vector<ALCint> attrs;
 
     bool IsValid() const {
         return device != nullptr && context != nullptr;
@@ -77,15 +85,17 @@ public:
         return instance;
     }
 
+    // The devices map key: "Default Device" stays one stable key (not the default's current name),
+    // so ports keep finding it after the system default changes and the device follows it.
+    static std::string KeyOf(const std::string& device_name) {
+        return device_name.empty() ? std::string{"Default Device"} : device_name;
+    }
+
     // Register a port that uses this device
     bool RegisterPort(const std::string& device_name) {
         std::lock_guard<std::mutex> lock(mutex);
 
-        // Handle "Default Device" alias
-        std::string actual_device_name = device_name;
-        if (actual_device_name.empty() || actual_device_name == "Default Device") {
-            actual_device_name = GetDefaultDeviceName();
-        }
+        const std::string actual_device_name = KeyOf(device_name);
 
         // Find or create device context for this device name
         auto it = devices.find(actual_device_name);
@@ -115,10 +125,7 @@ public:
     void UnregisterPort(const std::string& device_name) {
         std::lock_guard<std::mutex> lock(mutex);
 
-        std::string actual_device_name = device_name;
-        if (actual_device_name.empty() || actual_device_name == "Default Device") {
-            actual_device_name = GetDefaultDeviceName();
-        }
+        const std::string actual_device_name = KeyOf(device_name);
 
         auto it = devices.find(actual_device_name);
         if (it != devices.end()) {
@@ -137,12 +144,8 @@ public:
     bool MakeCurrent(const std::string& device_name) {
         std::lock_guard<std::mutex> lock(mutex);
 
-        std::string actual_device_name = device_name;
-        if (actual_device_name.empty() || actual_device_name == "Default Device") {
-            actual_device_name = GetDefaultDeviceName();
-        }
-
-        auto it = devices.find(actual_device_name);
+        FollowOutputLocked();
+        auto it = devices.find(KeyOf(device_name));
         if (it == devices.end() || !it->second.IsValid()) {
             return false;
         }
@@ -151,6 +154,11 @@ public:
         // thread-local storage)
         current_context = it->second.context;
         return alcMakeContextCurrent(it->second.context);
+    }
+
+    // Counts the devices moved to another output; a port seeing it change restarts its queue.
+    u32 Reopens() const {
+        return reopens.load(std::memory_order_acquire);
     }
 
     void ReleaseContext() {
@@ -209,6 +217,78 @@ private:
 
     OpenALDevice(const OpenALDevice&) = delete;
     OpenALDevice& operator=(const OpenALDevice&) = delete;
+
+    // Windows output switching: OpenAL Soft only reports a new system default
+    // (ALC_SOFT_system_events), it does not move an open device. A device opened as the default
+    // is moved to the new default with alcReopenDeviceSOFT (sources, buffers and the context
+    // stay). Any device that lost its output (unplugged) is reopened too, checked once a second.
+    // A move that failed stays pending and is tried again at each once-a-second check, until one
+    // works or the default changes again. Called with the mutex held, from MakeCurrent (every
+    // audio output).
+    void FollowOutputLocked() {
+        const bool event = default_changed.exchange(false, std::memory_order_acq_rel);
+        follow_pending = follow_pending || event;
+        const auto now = std::chrono::steady_clock::now();
+        if (!event && now < next_output_check)
+            return;
+        next_output_check = now + std::chrono::seconds(1);
+        if (!reopen)
+            return;
+        const bool changed = std::exchange(follow_pending, false);
+        for (auto& [key, ctx] : devices) {
+            if (!ctx.IsValid())
+                continue;
+            ALCint connected = ALC_TRUE;
+            alcGetIntegerv(ctx.device, ALC_CONNECTED, 1, &connected);
+            if (!(changed && ctx.follows_default) && connected)
+                continue;
+            const ALCchar* target = ctx.follows_default ? nullptr : ctx.device_name.c_str();
+            ALCboolean ok = reopen(ctx.device, target, ctx.attrs.data());
+            if (!ok && target)
+                ok = reopen(ctx.device, nullptr, ctx.attrs.data());
+            if (ok) {
+                reopens.fetch_add(1, std::memory_order_acq_rel);
+            } else if (ctx.follows_default && connected) {
+                follow_pending = true; // still on the old output: again in a second
+            }
+            const ALCchar* name = alcGetString(ctx.device, ALC_ALL_DEVICES_SPECIFIER);
+            LOG_INFO(Lib_AudioOut, "OpenAL device '{}' {}: {}", key,
+                     connected ? "follows the new system default" : "lost its output, reopened",
+                     ok ? (name ? name : "?") : "failed");
+        }
+    }
+
+    static void ALC_APIENTRY OnSystemEvent(ALCenum event, ALCenum device_type, ALCdevice*,
+                                           ALCsizei, const ALCchar*, void* user) noexcept {
+        if (event == ALC_EVENT_TYPE_DEFAULT_DEVICE_CHANGED_SOFT &&
+            device_type == ALC_PLAYBACK_DEVICE_SOFT)
+            static_cast<OpenALDevice*>(user)->default_changed.store(true,
+                                                                    std::memory_order_release);
+    }
+
+    // Once, with the first device: the reopen entry point and the default-changed event.
+    void InstallFollowLocked(ALCdevice* device) {
+        if (follow_installed)
+            return;
+        follow_installed = true;
+        if (alcIsExtensionPresent(device, "ALC_SOFT_reopen_device"))
+            reopen = reinterpret_cast<LPALCREOPENDEVICESOFT>(
+                alcGetProcAddress(device, "alcReopenDeviceSOFT"));
+        bool events = false;
+        if (alcIsExtensionPresent(nullptr, "ALC_SOFT_system_events")) {
+            auto* callback = reinterpret_cast<LPALCEVENTCALLBACKSOFT>(
+                alcGetProcAddress(nullptr, "alcEventCallbackSOFT"));
+            auto* control = reinterpret_cast<LPALCEVENTCONTROLSOFT>(
+                alcGetProcAddress(nullptr, "alcEventControlSOFT"));
+            if (callback && control) {
+                callback(&OnSystemEvent, this);
+                const ALCenum types[] = {ALC_EVENT_TYPE_DEFAULT_DEVICE_CHANGED_SOFT};
+                events = control(1, types, ALC_TRUE) == ALC_TRUE;
+            }
+        }
+        LOG_INFO(Lib_AudioOut, "OpenAL output following: reopen {}, default-change events {}",
+                 reopen ? "yes" : "no", events ? "yes" : "no");
+    }
 
     bool InitializeDevice(DeviceContext& ctx, const std::string& device_name) {
         // Handle disabled audio
@@ -279,6 +359,8 @@ private:
             attrs[attr_count++] = hrtf_value;
         }
         attrs[attr_count] = 0;
+        ctx.attrs.assign(attrs.begin(), attrs.begin() + attr_count + 1);
+        ctx.follows_default = device_name.empty() || device_name == "Default Device";
 
         ctx.context = alcCreateContext(ctx.device, attrs.data());
         if (!ctx.context) {
@@ -323,6 +405,7 @@ private:
         }
 
         LogDeviceTiming(ctx);
+        InstallFollowLocked(ctx.device);
         LOG_INFO(Lib_AudioOut, "OpenAL device initialized: '{}'{}", ctx.device_name,
                  binaural ? " (VR binaural)" : "");
         return true;
@@ -391,6 +474,12 @@ private:
     std::unordered_map<std::string, DeviceContext> devices;
     mutable std::mutex mutex;
     ALCcontext* current_context{nullptr}; // For thread-local tracking
+    std::atomic<bool> default_changed{false};
+    std::atomic<u32> reopens{0};
+    bool follow_pending{false}; // a default change not followed yet (the mutex)
+    std::chrono::steady_clock::time_point next_output_check{};
+    LPALCREOPENDEVICESOFT reopen{nullptr};
+    bool follow_installed{false};
 };
 
 } // namespace Libraries::AudioOut

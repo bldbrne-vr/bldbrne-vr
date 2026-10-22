@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2013 Dolphin Emulator Project
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <ctime>
@@ -19,7 +20,7 @@
 #include <pthread.h>
 #elif defined(_WIN32)
 #include <windows.h>
-#include "../../scratchpad/dual-eye-perf/reusable_sleep.h"
+#include "video_core/native_stereo/reusable_sleep.h"
 #include "common/string_util.h"
 #else
 #if defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
@@ -253,6 +254,14 @@ void AccurateTimer::End() {
     auto now = std::chrono::high_resolution_clock::now();
     total_wait +=
         target_interval - std::chrono::duration_cast<std::chrono::nanoseconds>(now - start_time);
+}
+
+u32 CurrentThreadId() {
+#ifdef _WIN32
+    return static_cast<u32>(::GetCurrentThreadId());
+#else
+    return 0;
+#endif
 }
 
 std::string GetCurrentThreadName() {

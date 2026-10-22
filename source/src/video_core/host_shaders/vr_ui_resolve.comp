@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 // VR: the game's UI on its own compositor layer (renderer_vulkan/vr_ui_layer.h). Every UI draw
 // after the game's composite was also drawn into two VR-owned targets: K (cleared to black) and W
@@ -46,7 +52,7 @@
 // The game blends in its encoded (sRGB) domain, the compositor in linear light, so alpha comes
 // from a two-point fit, exact over a black and over a white world and for opaque UI, text, black
 // dims and additive glows: 1 - alpha = luma(G(min(k + T, 1)) - G(k)), colour bytes = E(k), with
-// E the eyes' post-process encode (the user's gamma; E = identity at gamma 1) and G its decode.
+// E the eyes' post-process encode (the player's gamma; E = identity at gamma 1) and G its decode.
 // A pixel no UI drew on (K and W still hold their clear values to within one 8-bit step) is
 // exactly transparent (EmptyPixel, FLAG_EMPTY: ui_empty_snap).
 // The status build-up meter (FLAG_CONDITIONS, ui_conditions=view; core/vr/ui_conditions.h): cut 3

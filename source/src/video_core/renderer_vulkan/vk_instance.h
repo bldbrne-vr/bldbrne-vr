@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -124,6 +125,9 @@ public:
         return profiler_context;
     }
 
+    // Packaged FSR 3.1.5 LDR shaders declare Shader, StorageImageExtendedFormats,
+    // and ImageQuery; they do not require FSR4's INT8/dot/derivative features.
+    bool IsVrFsr31Supported() const { return features.shaderStorageImageExtendedFormats; }
     bool IsVrFsr4Supported() const { return vr_fsr4_supported; }
 
     /// Returns true if anisotropic filtering is supported

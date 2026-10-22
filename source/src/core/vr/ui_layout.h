@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -186,6 +192,14 @@ inline HudSegments ComputeHudLayout(HudLayout layout, float deg_per_px, float pi
     return out;
 }
 
+// A raised boss bar (bloodborne_enemy_bars.cpp, ui_boss_bar=1) sits in the status clusters'
+// rows (stage y ~160): while it is up, the HP cluster's cut out of the rest quad stops here (the
+// cluster's content ends by x ~377), so the whole bar stays on the rest quad, centred as the game
+// lays it out, the same in both eyes (2026-10-18: cut at x 960, its left part went with the HP
+// cluster and the rest started at the view's middle). The HP piece is unchanged (it samples the
+// whole band); a longer HP bar's end shows where the game draws it meanwhile.
+constexpr float StatusLeftBossCutX = 400.0f;
+
 // Dialogue must never be split between the lower HUD and the world-aligned rest
 // quad: they have different sizes/depths. Include both margins and the final five
 // stage rows, otherwise the subtitle backing leaves a detached bottom strip.
@@ -302,7 +316,7 @@ inline void CentreAreaName(HudSegments& hud, float centre_x = AreaNameCenterX,
 //    NPC talks, `talking`: their subtitles) or a gun, and never below `lower_alpha` for your own
 //    hands, arms and body (ui_hud_lower_alpha, default 1: they do not fade it at all); the lowest
 //    of those. Before 2026-10-09 an action prompt also faded to 15% behind your hands looking down
-//    at an item (the user: keep the blade's 45%, drop the hands' and the body's 15%).
+//    at an item (feedback: keep the blade's 45%, drop the hands' and the body's 15%).
 //  - the lower group with nothing to read (the boss bar alone): as the clusters, and whole behind
 //    the blade alone while an NPC talks, as it always was.
 // 1: the piece does not fade.
@@ -385,7 +399,7 @@ constexpr bool CountersRaised(CountersMode mode, bool looking_down, bool wanted,
 // Where the counters go when you look down (CountersRaised says they are placed by the look-down
 // switch): LowerMiddle (the default) centred below the view's centre, larger, together with the
 // HP / stamina / items cluster (status_left) when that too is shown by looking down: you look down
-// and they appear down there, one tidy group (the user, 2026-10-05). Corner: their HUD corner;
+// and they appear down there, one tidy group (2026-10-05). Corner: their HUD corner;
 // Raised: ui_counters_raise_deg above it (the HUD-feel lane's placement).
 enum class CountersPos : s32 {
     LowerMiddle = 0,
@@ -608,7 +622,7 @@ inline DeathTitleSize DeathTitleQuad(float distance_m, float text_deg) {
 // PREY SLAUGHTERED x 252..1667, BLOOD ECHOES RETRIEVED x 385..1536, y 214..312.
 // Start below the normal HUD item-name baseline near y 198.
 // A new message retains the existing anchor and restarts the minimum lifetime.
-// game asset has clips only for these SetTextEffect slots. Keep event detection and
+// fe.gfx has clips only for these SetTextEffect slots. Keep event detection and
 // native backdrop removal on the same list (including victory/multiplayer results).
 constexpr bool BannerTextEffect(u32 type) {
     return type == 1 || type == 2 || type == 4 || type == 5 || type == 7 || type == 15 ||
@@ -618,6 +632,40 @@ constexpr bool BannerTextEffect(u32 type) {
 constexpr StageRect BannerTitleRect{200.0f, 202.0f, 1720.0f, 330.0f};
 constexpr float BannerTextWidthPx = 1415.0f;
 constexpr float BannerHoldS = 6.0f;
+
+// A text effect whose type was not seen (queued and played between two samples, type 0) is a
+// banner only with a banner's screen-wide dim within UnknownBannerNs: an item pickup and an item use
+// queue one too (2026-10-22: 50-degree titles of whatever the HUD showed in the banner's rows).
+// While the hunter is dead such a one is still the death screen (the caller never waits then).
+constexpr s64 UnknownBannerNs = 1'000'000'000;
+struct UnknownBannerGate {
+    bool pending{false};
+    s64 started_ns{0};
+
+    // `now_ns` is the steady clock, not the clamped UI animation delta: flat frames
+    // and loading must not pause this deadline. Expire before accepting a late dim.
+    // `dropped` reports an expired pending event once. A new event opens a new window.
+    constexpr bool Step(bool unknown, bool screen_wide, s64 now_ns, bool& dropped) {
+        dropped = false;
+        if (unknown) {
+            pending = true;
+            started_ns = now_ns;
+        }
+        if (!pending) {
+            return false;
+        }
+        if (now_ns < started_ns || now_ns - started_ns >= UnknownBannerNs) {
+            *this = {};
+            dropped = true;
+            return false;
+        }
+        if (screen_wide) {
+            *this = {};
+            return true;
+        }
+        return false;
+    }
+};
 
 // The title's cut-out: YOU DIED's (`death`), or the banner's of text-effect `type` (1 PREY
 // SLAUGHTERED, 4 BLOOD ECHOES RETRIEVED; any other, BannerTitleRect).
@@ -1364,7 +1412,7 @@ inline bool IsWholeBandBox(const std::array<s32, 4>& box, float band_w, float ba
 // 1-8% of the band is opaque, like a dim (mock menufix/runs/f3, v1: 3.8, 1.1, 4.8, 2.0, 8.2%, then
 // the book at 64%). IsScreenWidePage takes it only once the book is opaque, so the cross-fade
 // played in the grid's crop for 166-235 ms (the middle of the book 1.5x too large), then the crop
-// jumped to the whole band (menufix/verify.md). With the grid's cursor on Stats, the first box over
+// jumped to the whole band. With the grid's cursor on Stats, the first box over
 // the whole band is the page and the crop takes the band at once. The box is measured a frame
 // late, so the grid's crop still shows the cross-fade's first frame, the grid nearly whole; from
 // the next frame on, the grid fading out and the book fading in, everything is at Status's size.

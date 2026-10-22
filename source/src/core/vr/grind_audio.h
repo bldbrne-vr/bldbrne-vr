@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #pragma once
 
 #include <algorithm>
@@ -9,10 +15,10 @@
 #include <type_traits>
 #include <vector>
 
-// The blades' grind (vr.ini blade_grind; the user's 2026-10-14 pick of the auditions "A" and "B"):
+// The blades' grind (vr.ini blade_grind; the tester's 2026-10-14 pick of the auditions "A" and "B"):
 // one blade drawn along the other grinds on as long as it slides, louder and brighter the faster
 // it goes, silent the moment it stops (core/vr/blade_sounds.h GrindLevel). The sound is the game's
-// own sparks loop (game asset w_cs_spark_loop, the Whirligig Saw's), read from the player's
+// own sparks loop (sprj_main_eng.fsb w_cs_spark_loop, the Whirligig Saw's), read from the player's
 // game files and decoded at startup (core/vr/fsb_sample.h); the katana's shing still marks each
 // stroke (the game's PlaySound). Mixed into the first main audio port, as the whip's drag.
 namespace VR::Grind {

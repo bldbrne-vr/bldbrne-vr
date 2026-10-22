@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -15,7 +21,7 @@
 // VR: the process's end after a close (emulator.cpp Emulator::EndAfterClose; vr.ini
 // xr_exit_teardown_ms, xr_exit_terminate).
 //
-// The user's 2026-10-09 log (Quit in the Meta Link menu): the session went STOPPING, IDLE,
+// The tester's 2026-10-09 log (Quit in the Meta Link menu): the session went STOPPING, IDLE,
 // EXITING; the emulator closed the normal way (the play time and the shader cache written, then
 // std::quick_exit) - and the process never ended until it was killed (which worked at once).
 // quick_exit runs its handlers, then ExitProcess: the loader lock, every other thread killed (the

@@ -11,6 +11,9 @@
 
 namespace Core {
 
+// Keep the initial direct-memory range and its physical backing on the same bound.
+[[nodiscard]] u64 InitialDirectMemorySize();
+
 enum class MemoryPermission : u32 {
     None = 0,
     Read = 1 << 0,

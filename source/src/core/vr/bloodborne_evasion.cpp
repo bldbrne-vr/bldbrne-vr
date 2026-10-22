@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -18,8 +24,8 @@
 #include "core/vr/combat_channel.h"
 #include "core/vr/evasion.h"
 #include "core/vr/evasion_hitgeom.h"
-#include "core/vr/interaction_evasion.h"
 #include "core/vr/head_room.h"
+#include "core/vr/visceral_clearance.h"
 #include "core/vr/hook_util.h"
 #include "core/vr/player_body.h"
 #include "core/vr/seqlock.h"
@@ -119,6 +125,8 @@ struct WallCast {
     float radius_m;
 };
 constexpr std::array<WallCast, 2> WallCasts{{{1.25f, 0.15f}, {1.55f, 0.10f}}};
+constexpr float WallCastMinLean = 0.05f; // m of gained head offset: smaller leans cast nothing
+constexpr float WallNearExtra = 0.15f;   // root casts this far past the reach: a wall is near
 // Independent check (logs): from the Spine02 / Head01 hurtboxes' actual positions along the lean.
 constexpr std::array<std::pair<E::Body, float>, 2> GapBodies{
     {{E::Spine02, 0.144f}, {E::Head01, 0.094f}}};
@@ -192,6 +200,8 @@ constexpr s64 AttackEndNs = 300'000'000; // an attack with no cast this long is 
 constexpr s64 WhooshCooldownNs = 600'000'000;
 constexpr s64 WhooshDelayNs = 100'000'000;  // an attack this long without a cast has passed
 constexpr float LeanedHitTolerance = 0.02f; // m: the model's own precision (S vs the game)
+constexpr s64 WallKnockCooldownNs = 500'000'000;
+constexpr float WallKnockMin = 0.03f; // m of lean the wall must hold back for a knock
 
 // The hook's record of the last targets it moved (logs only; relaxed).
 struct Applied {
@@ -208,23 +218,7 @@ bool g_installed = false;
 int g_log = 0;
 
 // Loop thread only.
-VR::Interactions::EvasionRuntime g_model;
-VR::Interactions::Module* g_evasion_module{};
-bool g_evasion_fault{};
-void InitEvasionDll() {
-    if (!VR::Interactions::DllRequested() || g_evasion_module)
-        return;
-    // Installed hooks retain this exclusive render-owner context through process exit.
-    g_evasion_module = new VR::Interactions::Module();
-    g_evasion_module->EnableFaultBroadcast();
-    g_model.Bind(*g_evasion_module, g_evasion_fault);
-    if (!g_evasion_module->LoadBesideExecutable()) {
-        g_evasion_fault = true;
-        g_evasion_module->ReportFault();
-        LOG_ERROR(Core, "VR evade: interaction DLL unavailable: {}",
-                  g_evasion_module->Diagnostic());
-    }
-}
+E::Model g_model;
 u8* g_ragdoll = nullptr;
 u8* g_player = nullptr; // its owner
 bool g_map_ok = false;
@@ -259,7 +253,12 @@ struct WallStats {
 };
 WallStats g_wall;
 s64 g_last_wall_log_ns = 0;
+bool g_wall_was_limited = false;
 float g_wall_dir[2]{}; // the lean direction of the last probe (world x, z)
+// The gained head displacement the last two ticks published (world, m): the hurtboxes the render
+// tick reads back stand at the keyframe of the one before last.
+std::array<E::Vec3, 2> g_head_cmd{};
+s64 g_last_knock_ns = 0;
 
 // Hit log.
 int g_hitlog = 0;         // VR_EVADE_HITLOG level
@@ -600,6 +599,24 @@ float DuckCap(const VR::Settings& s) {
                                                               s.fp_eye_height_m));
 }
 
+E::Config ConfigFromSettings(const VR::Settings& s) {
+    E::Config cfg;
+    cfg.gain = s.evasion_gain;
+    cfg.max_m = std::min(s.evasion_max_m, s.positional_limit_m);
+    cfg.lean_m = s.evasion_lean_m;
+    cfg.duck_m = DuckCap(s);
+    cfg.wall_margin_m = s.evasion_wall_margin_m;
+    cfg.wall_rise_mps = s.evasion_wall_rise_mps;
+    cfg.hold_s = s.evasion_hold_ms * 0.001f;
+    cfg.hold_tau_s = s.evasion_hold_tau_ms * 0.001f;
+    cfg.settle_s = s.evasion_settle_ms * 0.001f;
+    cfg.settle_tau_s = s.evasion_settle_tau_ms * 0.001f;
+    cfg.pelvis = s.evasion_pelvis;
+    cfg.shift_reach = g_shift_reach;
+    cfg.lean_reach = g_lean_reach;
+    return cfg;
+}
+
 // The hknp body positions the hurtboxes are at now (logs).
 bool ReadBodyPosition(u8* ragdoll, size_t bone, std::array<float, 3>& out) {
     u8* const system = Read<u8*>(ragdoll + OffsetRagdollSystem);
@@ -631,13 +648,18 @@ struct Capsule {
     float r{};
     std::array<float, 3> origin{}; // the body's translation
 };
-bool ReadCapsule(u8* ragdoll, size_t bone, Capsule& out) {
+bool ReadCapsule(u8* ragdoll, size_t bone, Capsule& out, u8* module = nullptr) {
+    const bool target = module != nullptr;
+    if (!module) module = g_base;
     u8* const system = Read<u8*>(ragdoll + OffsetRagdollSystem);
-    if (!Plausible(system) || Read<s32>(system + OffsetSystemBodyCount) != E::BodyCount) {
+    if (!Plausible(system)) return false;
+    const s32 count = Read<s32>(system + OffsetSystemBodyCount);
+    if (count <= 0 || count > 128 || bone >= static_cast<size_t>(count) ||
+        (!target && count != E::BodyCount)) {
         return false;
     }
     u8* const ids = Read<u8*>(system + OffsetSystemBodyIds);
-    u8* const world = Read<u8*>(g_base + PhysWorldRva);
+    u8* const world = Read<u8*>(module + PhysWorldRva);
     u8* const a = Plausible(world) ? Read<u8*>(world + 0x28) : nullptr;
     u8* const b = Plausible(a) ? Read<u8*>(a + 0x08) : nullptr;
     u8* const bodies = Plausible(b) ? Read<u8*>(b + 0x20) : nullptr;
@@ -652,12 +674,14 @@ bool ReadCapsule(u8* ragdoll, size_t bone, Capsule& out) {
     float m[16];
     std::memcpy(m, body, sizeof(m));
     u8* const shape = Read<u8*>(body + BodyShape);
-    if (!Plausible(shape) || Read<u8*>(shape) != g_base + CapsuleVtableRva) {
+    if (!Plausible(shape)) return false;
+    const bool sphere = target && Read<u8*>(shape) == module + SphereVtableRva;
+    if (!sphere && Read<u8*>(shape) != module + CapsuleVtableRva) {
         return false;
     }
     float la[4], lb[4];
-    std::memcpy(la, shape + CapsuleA, sizeof(la));
-    std::memcpy(lb, shape + CapsuleB, sizeof(lb));
+    std::memcpy(la, shape + (sphere ? SphereCenter : CapsuleA), sizeof(la));
+    std::memcpy(lb, shape + (sphere ? SphereCenter : CapsuleB), sizeof(lb));
     out.r = Read<float>(shape + ShapeRadius);
     for (int k = 0; k < 3; ++k) {
         out.origin[k] = m[12 + k];
@@ -669,7 +693,7 @@ bool ReadCapsule(u8* ragdoll, size_t bone, Capsule& out) {
             return false;
         }
     }
-    return std::isfinite(out.r) && out.r > 0.0f && out.r < 1.0f;
+    return std::isfinite(out.r) && out.r > 0.0f && out.r < (target ? 3.0f : 1.0f);
 }
 
 // Once per ragdoll (logs): each hurtbox capsule's radius and length (the HKX has Pelvis01 0.123,
@@ -751,45 +775,52 @@ std::string GapText(float scale) {
     return text;
 }
 
-// Native collision facts only; profile conversion, delayed-head compensation and
-// root/closed-loop response selection belong to the DLL's captured evasion frame.
-void ReadClosedLoop(float ux, float uz, float reach_m, float scale, uint32_t query_mask,
-                    PiEvasionWallFacts& facts) {
+// The wall limit's closed loop: from the Spine02 and Head01 hurtboxes where they are now (the
+// physics state of the keyframe two ticks back), the head offset along (ux, uz) at which one of
+// them would touch the map. It catches what a cast from the root cannot see: a vanilla head ahead
+// of the root, a pose that carries the visual body's shift differently than assumed. Metres of
+// head offset; -1 = clear within `reach_m` of where they are.
+float ClosedLoopFree(float ux, float uz, const E::Output& want, const E::Config& cfg, float reach_m,
+                     float scale) {
     u8* const world = PhysWorldWrapper();
-    if (world == nullptr || g_ragdoll == nullptr || !g_map_ok)
-        return;
+    if (world == nullptr || g_ragdoll == nullptr || !g_map_ok) {
+        return -1.0f;
+    }
+    const float cmd = g_head_cmd[1].x * ux + g_head_cmd[1].z * uz;
+    // How far each body moves per metre of head offset (evasion.h's profile).
+    const float a = std::max(cfg.lean_m, 0.0f);
+    const float pivot = std::min(want.lean_want_m, a);
+    const float step = std::max(want.lean_want_m - a, 0.0f);
+    const float head_profile = pivot + step;
     const float reach = reach_m * scale;
-    for (size_t body = 0; body < E::BodyCount; ++body) {
-        if (!(query_mask & (1u << body)))
-            continue;
+    float best = -1.0f;
+    for (const auto& [body, radius] : GapBodies) {
         Capsule c;
-        if (!ReadCapsule(g_ragdoll, static_cast<size_t>(g_bone_of_body[body]), c))
+        if (!ReadCapsule(g_ragdoll, static_cast<size_t>(g_bone_of_body[body]), c)) {
             continue;
-        facts.body_mask |= 1u << static_cast<uint32_t>(body);
-        const std::array<std::array<float, 3>, 2> ends{c.a, c.b};
-        for (size_t i = 0; i < ends.size(); ++i) {
-            facts.ends[body][i] = CastFree(world, ends[i].data(), ux, uz, reach, c.r);
-            ++g_wall.casts;
         }
+        float free = reach;
+        bool inside = false;
+        for (const auto& end : {c.a, c.b}) {
+            const float d = CastFree(world, end.data(), ux, uz, reach, c.r);
+            ++g_wall.casts;
+            inside |= d == -2.0f;
+            if (d >= 0.0f) {
+                free = std::min(free, d);
+            }
+        }
+        if (inside) {
+            free = 0.0f; // touching already: no further this way
+        } else if (free >= reach - 1e-5f) {
+            continue;
+        }
+        const float ratio = body == E::Head01 || head_profile <= 1e-4f
+                                ? 1.0f
+                                : (E::LeanWeight(body) * pivot + step) / head_profile;
+        const float limit = cmd + free / scale / std::max(ratio, 0.3f);
+        best = best < 0.0f ? limit : std::min(best, limit);
     }
-}
-const char* EvasionReason(uint32_t reason, const char* block) {
-    switch (reason) {
-    case PI_ER_ON:
-        return "on";
-    case PI_ER_RAGDOLL:
-        return "no ragdoll";
-    case PI_ER_FIRST_PERSON:
-        return "not first person";
-    case PI_ER_NECK:
-        return "no neck";
-    case PI_ER_BODY:
-        return "body not driven";
-    case PI_ER_BLOCKED:
-        return block ? block : "body gate";
-    default:
-        return "interaction DLL fault";
-    }
+    return best;
 }
 
 void Log(const E::Output& out, const E::Input& in, const char* reason, float scale, s64 now) {
@@ -1481,6 +1512,36 @@ bool CastMapSphere(const float from[3], const float to[3], float radius, float h
     return true;
 }
 
+// The render-camera hook reads the same live Havok bodies as physical evasion.
+// Restrict the query to the verified victim's ragdoll; a camera-layer world cast
+// cannot distinguish the hunter, another enemy, and the intended victim.
+GrabCamera::SurfaceRay CastVisceralSurface(const u8* victim, Body::Vec3 eye,
+                                           Body::Vec3 root, Body::Vec3 facing, float scale) {
+    if (!g_map_base || !Plausible(victim)) return {};
+    u8* const ctrl = Read<u8*>(victim + OffsetChrCtrl);
+    if (!Plausible(ctrl) || Read<const u8*>(ctrl + OffsetCtrlOwner) != victim) return {};
+    u8* const ragdoll = Read<u8*>(ctrl + OffsetRagdoll);
+    if (!Plausible(ragdoll) || Read<u8*>(ragdoll) != g_map_base + RagdollVtableRva ||
+        Read<const u8*>(ragdoll + OffsetRagdollOwner) != victim) return {};
+    u8* const system = Read<u8*>(ragdoll + OffsetRagdollSystem);
+    if (!Plausible(system)) return {};
+    const s32 count = Read<s32>(system + OffsetSystemBodyCount);
+    if (count <= 0 || count > 128) return {};
+    std::array<GrabCamera::CollisionCapsule, 128> shapes{};
+    size_t used = 0;
+    for (s32 i = 0; i < count; ++i) {
+        Capsule c{};
+        if (!ReadCapsule(ragdoll, i, c, g_map_base)) continue;
+        const Body::Vec3 a{c.a[0], c.a[1], c.a[2]}, b{c.b[0], c.b[1], c.b[2]};
+        // Reject stale/reused body IDs and obviously unrelated transforms.
+        if (Body::Length(a - root) > 6.0f * scale ||
+            Body::Length(b - root) > 6.0f * scale) continue;
+        shapes[used++] = {a, b, c.r};
+    }
+    return GrabCamera::CastVictimSurface(eye, root, facing, scale,
+                                        std::span{shapes.data(), used});
+}
+
 void EvasionEbootLoaded(VAddr base, u64 size) {
     if (g_map_cast == nullptr) {
         // The map cast alone (CastMapSphere), whatever physical_evasion says.
@@ -1545,7 +1606,6 @@ void EvasionEbootLoaded(VAddr base, u64 size) {
         void* const stub = EmitStub(*g_code, site);
         g_base = module;
         Hook::WriteJump(site, TargetSiteSig.size(), stub);
-        InitEvasionDll();
         g_installed = true;
         const auto& s = VR::GetSettings();
         InstallWall(module, size);
@@ -1596,120 +1656,135 @@ void EvasionRenderTick(const VR::CameraOverride* result, bool fp_follow) {
         LogCapsules(ragdoll);
     }
 
+    E::Input in{};
+    in.t = static_cast<double>(now) * 1e-9;
+    const char* reason = "on";
     VR::Body::BodyStatus status{};
-    PiEvasionRawFacts raw{};
-    raw.have_body = VR::Body::LatestBodyStatus(status);
-    raw.body_ns = status.steady_ns;
-    raw.driven = status.driven;
-    raw.evade_ok = status.evade_ok;
-    raw.ragdoll = g_map_ok;
-    raw.camera = result != nullptr;
-    raw.fp_follow = fp_follow;
-    const float scale = result != nullptr ? result->world_scale : 1.0f;
-    raw.scale = scale;
-    if (result) {
-        raw.neck_valid = result->neck_valid;
-        raw.head_tracked = result->head_tracked;
-        raw.neck[0] = result->neck_offset.x;
-        raw.neck[1] = result->neck_offset.y;
-        raw.neck[2] = result->neck_offset.z;
+    const bool status_ok = VR::Body::LatestBodyStatus(status) &&
+                           now - status.steady_ns <= StatusMaxAgeNs && status.driven;
+    if (!g_map_ok) {
+        reason = "no ragdoll";
+    } else if (result == nullptr || !fp_follow) {
+        reason = "not first person";
+    } else if (!result->neck_valid) {
+        reason = "no neck";
+    } else if (!status_ok) {
+        reason = "body not driven";
     }
-    std::copy(status.upper_shift.begin(), status.upper_shift.end(), raw.upper_shift);
-    std::copy(status.upper_lean.begin(), status.upper_lean.end(), raw.upper_lean);
-    raw.ik_left = status.drawn_weight[0];
-    raw.ik_right = status.drawn_weight[1];
-    raw.look_only = status.look_only;
-    raw.body_offset_m = VR::HeightBodyOffsetM();
-    raw.eye_offset_m = VR::HeightEyeOffsetM();
-    raw.fp_eye_m = settings.fp_eye_height_m;
-    raw.gain = settings.evasion_gain;
-    raw.max_m = settings.evasion_max_m;
-    raw.lean_m = settings.evasion_lean_m;
-    raw.duck_m = settings.evasion_duck_m;
-    raw.wall_margin_m = settings.evasion_wall_margin_m;
-    raw.wall_rise_mps = settings.evasion_wall_rise_mps;
-    raw.hold_ms = settings.evasion_hold_ms;
-    raw.hold_tau_ms = settings.evasion_hold_tau_ms;
-    raw.settle_ms = settings.evasion_settle_ms;
-    raw.settle_tau_ms = settings.evasion_settle_tau_ms;
-    raw.pelvis = settings.evasion_pelvis;
-    raw.shift_reach = g_shift_reach;
-    raw.lean_reach = g_lean_reach;
-    raw.positional_m = settings.positional_limit_m;
-    raw.positional_down_m = settings.positional_limit_down_m;
-    raw.feedback = settings.evasion_feedback;
-    raw.wall_enabled = settings.evasion_wall;
-    raw.wall_available = g_wall_method != WallMethod::Off;
-    E::Output out = g_model.Frame(raw, now);
-    if (g_model.Publication().frame.cast_required) {
-        const auto& plan = g_model.Publication().frame;
-        PiEvasionWallFacts facts{};
-        facts.token = plan.token;
-        facts.root_free_m = -1.0f;
+    in.enabled = std::strcmp(reason, "on") == 0;
+    const float scale = result != nullptr ? result->world_scale : 1.0f;
+    if (in.enabled) {
+        in.tracked = result->head_tracked;
+        in.neck = {result->neck_offset.x, result->neck_offset.y, result->neck_offset.z};
+        // Your height (player_body.h): your lean and duck count as 1 / k, k the body scale of
+        // the body's standing eye (HeightBodyOffsetM; a tall player's lean is longer for the same
+        // body angle); nothing changes As the hunter + 0 cm. The eye offset itself never reaches
+        // the hurtboxes: the neck is measured from your real head at the origin.
+        if (const float body_k = VR::PlayerBody::BodyScaleFor(VR::HeightBodyOffsetM());
+            body_k != 1.0f) {
+            in.neck = {in.neck.x / body_k, in.neck.y / body_k, in.neck.z / body_k};
+        }
+        in.active = status.evade_ok;
+        if (!in.active) {
+            reason = status.evade_block;
+        }
+        const float inv = scale > 1e-4f ? 1.0f / scale : 1.0f;
+        in.pose_shift = {status.upper_shift[0] * inv, status.upper_shift[1] * inv,
+                         status.upper_shift[2] * inv};
+        in.pose_lean = {status.upper_lean[0] * inv, status.upper_lean[1] * inv,
+                        status.upper_lean[2] * inv};
+        in.ik_left = status.drawn_weight[0];
+        in.ik_right = status.drawn_weight[1];
+        in.look_only = status.look_only;
+    }
+    const E::Config cfg = ConfigFromSettings(settings);
+    if (in.enabled && settings.evasion_wall && g_wall_method != WallMethod::Off) {
+        // Aim the casts with this tick's lean before the wall (a probe step on a copy: the
+        // model's state is only advanced once, below).
+        E::Model probe = g_model;
+        const E::Output want = probe.Step(in, cfg);
+        const float head_m = std::max(cfg.gain, 0.0f) * want.lean_want_m;
+        const float len = std::hypot(want.counted.x, want.counted.z);
         float root[3];
-        if (ReadRoot(root)) {
-            const float ux = plan.cast_dir[0], uz = plan.cast_dir[1];
+        if (want.weight > 0.0f && head_m > WallCastMinLean && len > 1e-4f && ReadRoot(root)) {
+            const float ux = want.counted.x / len;
+            const float uz = want.counted.z / len;
             g_wall_dir[0] = ux;
             g_wall_dir[1] = uz;
             const s64 t0 = VR::Body::SteadyNowNs();
-            facts.root_free_m = WallFree(root, ux, uz, plan.root_reach_m, scale);
-            if (facts.root_free_m >= 0.0f)
-                ReadClosedLoop(ux, uz, plan.closed_reach_m, scale, plan.body_query_mask, facts);
+            // From the root, a little beyond the reach (a hit out there limits nothing: it only
+            // tells the hurtboxes' own casts below that a wall is near enough to look).
+            const float reach = head_m + cfg.wall_margin_m;
+            in.wall_m = WallFree(root, ux, uz, reach + WallNearExtra, scale);
+            if (in.wall_m >= 0.0f) {
+                const float closed = ClosedLoopFree(ux, uz, want, cfg, reach + 0.05f, scale);
+                if (closed > -0.5f && closed < in.wall_m) {
+                    in.wall_m = std::max(closed, 0.0f);
+                    ++g_wall.closer;
+                }
+            }
             const s64 spent = VR::Body::SteadyNowNs() - t0;
             g_wall.ns += spent;
             g_wall.max_ns = std::max(g_wall.max_ns, spent);
         }
-        out = g_model.Finish(facts, now);
     }
-    const auto& publication = g_model.Publication();
-    if (publication.frame.wall_closer)
-        ++g_wall.closer;
+    const E::Output out = g_model.Step(in, cfg);
     if (out.wall_limited) {
         ++g_wall.limited;
     }
-    if (publication.wall_knock) {
-        VR::Combat::PushEvadeEvent({VR::Combat::EvadeEventKind::Wall, -1,
-                                    publication.wall_knock_m, now});
+    {
+        const float h = std::hypot(out.counted.x, out.counted.z);
+        const float k = h > 1e-6f ? std::max(cfg.gain, 0.0f) * out.lean_m * out.weight / h : 0.0f;
+        g_head_cmd[1] = g_head_cmd[0];
+        g_head_cmd[0] = {out.counted.x * k, 0.0f, out.counted.z * k};
     }
 
-    const bool publish_live = g_map_ok && publication.frame.reason != PI_ER_FAULT;
+    // The wall knock: a faint tick on both hands when the wall first holds a lean back.
+    if (out.wall_limited && !g_wall_was_limited && settings.evasion_feedback &&
+        out.lean_want_m * cfg.gain - out.wall_limit_m > WallKnockMin &&
+        now - g_last_knock_ns > WallKnockCooldownNs) {
+        g_last_knock_ns = now;
+        VR::Combat::PushEvadeEvent({VR::Combat::EvadeEventKind::Wall, -1,
+                                    out.lean_want_m * cfg.gain - out.wall_limit_m, now});
+    }
+    g_wall_was_limited = out.wall_limited;
+
     Published p{};
-    p.ragdoll = publish_live ? reinterpret_cast<u64>(ragdoll) : 0;
-    p.player = publish_live ? reinterpret_cast<u64>(g_player) : 0;
+    p.ragdoll = g_map_ok ? reinterpret_cast<u64>(ragdoll) : 0;
+    p.player = g_map_ok ? reinterpret_cast<u64>(g_player) : 0;
     p.frame = g_frame;
-    p.view_yaw = publish_live && result != nullptr ? result->view_yaw : 0.0f;
+    p.view_yaw = result != nullptr ? result->view_yaw : 0.0f;
     for (size_t bone = 0; bone < E::BodyCount; ++bone) {
         p.body_of_bone[bone] = g_map_ok ? static_cast<s8>(g_body_of_bone[bone]) : s8{-1};
     }
-    p.unit = publish_live && scale > 1e-4f ? scale : 1.0f;
-    std::copy_n(publication.frame.world_shift, 3, p.shift.begin());
-    std::copy_n(publication.frame.world_lean, 3, p.lean.begin());
-    if (publish_live) {
+    p.unit = scale > 1e-4f ? scale : 1.0f;
+    if (in.enabled) {
+        p.shift = status.upper_shift;
+        p.shift[1] = E::FollowedShiftY(p.shift[1], p.unit);
+        p.lean = status.upper_lean;
+    }
+    if (g_map_ok) {
         for (size_t b = 0; b < E::BodyCount; ++b) {
             const auto bone = static_cast<size_t>(g_bone_of_body[b]);
             p.offset[bone] = {out.offset[b].x * scale, out.offset[b].y * scale,
                               out.offset[b].z * scale};
-            p.shift_k[bone] = publication.shift_k[b];
-            p.lean_k[bone] = publication.lean_k[b];
+            // How much of the shift the model subtracted for this body (evasion.h: shift_reach of
+            // it under UpperPos, less for an arm on IK, times the fade weight).
+            const float ik = E::IsLeftArm(b)    ? std::clamp(in.ik_left, 0.0f, 1.0f)
+                             : E::IsRightArm(b) ? std::clamp(in.ik_right, 0.0f, 1.0f)
+                                                : 0.0f;
+            p.shift_k[bone] = in.enabled && E::UnderUpperPos(b)
+                                  ? cfg.shift_reach * out.comp_weight * (1.0f - ik)
+                                  : 0.0f;
+            p.lean_k[bone] = in.enabled && E::UnderUpperPos(b)
+                                 ? cfg.lean_reach * E::LeanReach(b) * out.comp_weight * (1.0f - ik)
+                                 : 0.0f;
         }
     }
     g_published.Store(p);
 
     if (g_log > 0) {
-        const auto& f = publication.frame;
-        E::Input in{};
-        in.t = double(now) * 1e-9;
-        in.enabled = f.enabled;
-        in.active = f.active;
-        in.tracked = f.tracked;
-        in.look_only = f.look_only;
-        in.neck = PhysicalInteractions::EvasionPackets::Get(f.neck);
-        in.pose_shift = PhysicalInteractions::EvasionPackets::Get(f.pose_shift);
-        in.pose_lean = PhysicalInteractions::EvasionPackets::Get(f.pose_lean);
-        in.ik_left = f.ik_left;
-        in.ik_right = f.ik_right;
-        in.wall_m = f.input_wall_m;
-        Log(out, in, EvasionReason(f.reason, status.evade_block), scale, now);
+        Log(out, in, reason, scale, now);
     }
     if (g_hit_hooks) {
         HitLogTick(now);

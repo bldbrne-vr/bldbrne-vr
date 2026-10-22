@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 // VR DIBR stereo (stereo_mode=2), pass 2 of 2: both eyes from the single centre frame.
 // Recorded by VrStereoWarp::Warp (renderer_vulkan/vr_stereo_warp.cpp). One workgroup = 64x4
@@ -35,7 +41,7 @@
 // depth of the surface it shows (the prep's near-field knee undone: the compositor's positional
 // timewarp must move it by its real parallax), as a standard 0..1 projection depth between the
 // fixed planes the presenter submits; the HUD at its stereo depth, sky / nothing at the far plane.
-// The CPU reference (scratchpad dibrtest/dibr_cpu.cpp) is a line-by-line port of this file.
+// The CPU reference (offline analysis) is a line-by-line port of this file.
 // LATE_WARP (compiled with that define for the late warp, renderer_vulkan/vr_late_warp.cpp): the
 // "source" is V, the capture re-seen from the head at the XR frame's display time
 // (vr_late_reproject.comp): disp_tex / tile_tex are V's, and every source column's colour is looked

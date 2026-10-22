@@ -1,6 +1,7 @@
 #include "video_core/flip_order_trace.h"
-#include "../../../../scratchpad/dual-eye-perf/pacing_audit.h"
+#include "video_core/native_stereo/pacing_audit.h"
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
@@ -21,6 +22,7 @@
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
@@ -249,8 +251,27 @@ void VideoOutDriver::Flip(const Request& req) {
     // Present the frame.
     presenter->Present(req.frame);
 
-    // Update flip status.
     auto* port = req.port;
+    // Release the previous surface BEFORE publishing completion. A flip event (or
+    // polling flip_status) can immediately wake the game to reuse that surface;
+    // clearing its label afterward can overwrite the next frame's WriteData(1).
+    // Reset prev flip label
+    static const bool trace_flip = std::getenv("VR_FLIP_ORDER_TRACE") != nullptr;
+    if (trace_flip)
+        LOG_INFO(Lib_VideoOut, "Flip order release: previous={} presented={}", port->prev_index,
+                 req.index);
+    if (port->prev_index != -1) {
+        const auto label_address =
+            reinterpret_cast<uintptr_t>(&port->buffer_labels[port->prev_index]);
+        FlipOrderTrace::Write("release_begin", label_address, 0, 8, req.index);
+        port->buffer_labels[port->prev_index] = 0;
+        FlipOrderTrace::Write("release_end", label_address, 0, 8, req.index);
+        port->SignalVoLabel();
+    }
+    // save to prev buf index
+    port->prev_index = req.index;
+
+    // Update flip status.
     {
         std::unique_lock lock{port->port_mutex};
         auto& flip_status = port->flip_status;
@@ -277,21 +298,6 @@ void VideoOutDriver::Flip(const Request& req) {
         }
     }
 
-    // Reset prev flip label
-    static const bool trace_flip = std::getenv("VR_FLIP_ORDER_TRACE") != nullptr;
-    if (trace_flip)
-        LOG_INFO(Lib_VideoOut, "Flip order release: previous={} presented={}", port->prev_index,
-                 req.index);
-    if (port->prev_index != -1) {
-        const auto label_address =
-            reinterpret_cast<uintptr_t>(&port->buffer_labels[port->prev_index]);
-        FlipOrderTrace::Write("release_begin", label_address, 0, 8, req.index);
-        port->buffer_labels[port->prev_index] = 0;
-        FlipOrderTrace::Write("release_end", label_address, 0, 8, req.index);
-        port->SignalVoLabel();
-    }
-    // save to prev buf index
-    port->prev_index = req.index;
 }
 
 void VideoOutDriver::DrawBlankFrame() {
@@ -350,7 +356,8 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
     Vulkan::Frame* frame;
     // VR: the draws of this frame are complete; record which eye/pose they used (the camera
     // update queued with the flip's ticket at submission).
-    const VR::FrameTag vr_tag = VR::OnGpuFrameBoundary(vr_flip);
+    const VR::FrameTag vr_tag =
+        VR::OnGpuFrameBoundary(vr_flip, [] { presenter->GetRasterizer().Finish(); });
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
         frame->vr_tag = vr_tag;

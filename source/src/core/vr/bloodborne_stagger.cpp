@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <array>
 #include <algorithm>
@@ -17,7 +23,6 @@
 #include "core/vr/bloodborne_visceral_pull.h"
 #include "core/vr/hook_util.h"
 #include "core/vr/stagger_speed.h"
-#include "core/vr/interaction_native_timing.h"
 #include "core/vr/vr_session.h"
 
 namespace VR::Bloodborne {
@@ -67,22 +72,7 @@ u8* g_base = nullptr;
 std::unique_ptr<Xbyak::CodeGenerator> g_code;
 bool g_installed = false;
 bool g_log = false;
-VR::Interactions::NativeStaggerRuntime g_shortener; // Game update owner only.
-VR::Interactions::Module* g_stagger_module{};
-bool g_stagger_fault{};
-void InitStaggerDll() {
-    if (!VR::Interactions::DllRequested() || g_stagger_module)
-        return;
-    g_stagger_module = new VR::Interactions::Module();
-    g_stagger_module->EnableFaultBroadcast();
-    g_shortener.Bind(*g_stagger_module, g_stagger_fault);
-    if (!g_stagger_module->LoadBesideExecutable()) {
-        g_stagger_fault = true;
-        g_stagger_module->ReportFault();
-        LOG_ERROR(Core, "VR stagger: interaction DLL unavailable: {}",
-                  g_stagger_module->Diagnostic());
-    }
-}
+S::Shortener g_shortener; // the hook runs on the game's update thread only
 
 // Counters for the log.
 u64 g_updates = 0;
@@ -184,7 +174,8 @@ void PS4_SYSV_ABI StaggerHook(u8* chr, u8* saved_ymm) {
     in.shorten_s = shorten_s;
     const bool state_ok = ReadState(chr, in);
     // The interactive visceral: his throw's clip and time (read before the request check).
-    const float hold = VisceralPullMain(chr, in.anim_id, in.clip_time, dt);
+    const float hold = VisceralPullMain(chr, state_ok ? in.anim_id : -1, in.clip_time, dt,
+                                        state_ok && in.window);
     if (!state_ok) {
         in.anim_id = -1;
     }
@@ -303,7 +294,6 @@ void InstallStaggerSpeed(VAddr base, u64 size) {
             LOG_ERROR(Core, "VR stagger: could not make {:#x} writable; not installed", SiteRva);
             return;
         }
-        InitStaggerDll();
         Hook::WriteJump(site, SiteLen, entry);
         g_installed = true;
     } catch (const Xbyak::Error& error) {

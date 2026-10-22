@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -18,10 +24,10 @@
 // The VR tile's movie side (header-only, no emulator dependencies; tests/test_vr_tile.cpp).
 // Since 2026-10-05 the icon is a cell of the game's own atlas (Icon::atlas, core/vr/tpf_patch.h),
 // not the embedded bitmap described below (the emulator no longer ships a bitmap icon: since
-// 2026-10-09 the goggles are composited at install over the user's own atlas,
+// 2026-10-09 the goggles are composited at install over the player's own atlas,
 // core/vr/tile_icon_compose.h; the bitmap path stays for the tests).
 //
-// Bloodborne's Options grid is the Scaleform movie game asset (an uncompressed SWF, GFX v11):
+// Bloodborne's Options grid is the Scaleform movie menu/ingametop.gfx (an uncompressed SWF, GFX v11):
 // sprite "Top" (#74) places the row-0 tiles Item_0_0..Item_0_2 (sprite #45: the tile frame #41 at
 // depth 1 and the highlight "Cursor" #44 at depth 3; the suitcase / body / gear icons are the
 // book's background art). The game's C++ drives each cell's instance by name ("Item_%d_%d") and
@@ -385,7 +391,7 @@ inline bool DefinesCharacter(u32 type) {
 } // namespace Detail
 
 // The movie with the 4th row-0 tile, or an error (the movie is not the expected one: anything
-// else than Bloodborne's own game asset layout, or it already has an Item_0_3).
+// else than Bloodborne's own ingametop.gfx layout, or it already has an Item_0_3).
 inline Result AddTile(std::span<const u8> d, const Icon& icon) {
     using namespace Detail;
     Result r;

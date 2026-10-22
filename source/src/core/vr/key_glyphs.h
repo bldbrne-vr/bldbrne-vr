@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -23,12 +29,12 @@
 //
 // Every button icon the game draws (the key guide under each menu, YES / NO dialogs, the quick
 // menu grid, messages, the controls help) is one of the 32 x 32 KG_* textures of
-// game asset (BC7, one mip level, PS4 tile mode 13), asked for by name by the movies
+// menu/common.tpf.dcx (BC7, one mip level, PS4 tile mode 13), asked for by name by the movies
 // (DefineExternalImage2 "KG_OK") and the game's text (<img src="KG_R1">, <?conclusion?>). The
 // icons the VR menu layout presses (openxr_presenter.cpp, the game-menu branch) are redrawn at
 // load, in the same atlas pass as the VR tile's icon (bloodborne_vrtile.cpp PrepareAtlas): our
 // badges in the style of the VR page's (vr_page_draw.h Badge: a dark disc for a face button, a
-// pill for a trigger or grip), their letters in the game's own font from the user's dump. No game
+// pill for a trigger or grip), their letters in the game's own font from the tester's dump. No game
 // pixel is in the source.
 //
 //   ✕ (KG_Cancel) -> A     ○ (KG_OK) -> B       □ (KG_R_L) -> LG     △ (KG_R_U) -> RG
@@ -37,7 +43,7 @@
 // The rest stay the game's: L2 / R2 (nothing in a VR menu), L3 / R3 and the sticks (the sticks'
 // own clicks and pushes), the D-pad and the touchpad.
 //
-// The gameplay HUD (game asset: the action prompts, "Operate Device", "Open Door") draws its own
+// The gameplay HUD (fe.gfx: the action prompts, "Operate Device", "Open Door") draws its own
 // smaller ✕, ○ and △ from two of its atlases (HudGlyphs). Those are shown in gameplay, so they get
 // the gameplay layout's buttons (core/vr/thumb_layout.h): ✕ interacts (B), ○ dodges (A), △ is the
 // Blood Vial (X); with swap_sticks the face buttons trade hands (Y, X, A).
@@ -525,7 +531,7 @@ inline std::vector<u8> EncodeBc7(std::span<const u8> rgba, int width, int height
 
 // ---- Into the atlas -----------------------------------------------------------------------------
 
-// Writes every glyph (Glyphs) into the unpacked game asset in place: `written` counts them; the
+// Writes every glyph (Glyphs) into the unpacked common.tpf in place: `written` counts them; the
 // returned text lists what was refused ("" = all). A texture that is not the retail 32 x 32 BC7
 // one is left as it is.
 inline std::string Apply(std::span<u8> tpf, const GameText::GameFont* font, int& written) {

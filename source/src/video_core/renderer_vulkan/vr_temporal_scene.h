@@ -1,4 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #pragma once
 #include "video_core/renderer_vulkan/vr_camera_motion.h"
 #include "video_core/renderer_vulkan/vr_object_motion.h"
@@ -14,9 +19,12 @@ class VrTemporalScene {
     VrTemporalScene(const Instance &instance, Scheduler &scheduler);
     using CameraPair = std::array<std::array<float, 216>, 2>;
     using Result = VrTemporalPair::Result;
+    // Recovery probes must remain safe to display even if reconstruction fails: zero jitter
+    // and a fresh history for both eyes. This is frame policy, not a provider resource key.
     Result Begin(uint64_t frame, const VR::Graphics::Config &accepted,
-                 const VrTemporalPair::Plan &plan, bool camera_cut = false);
-    // FAST_GPU_S1_ASYM: a frame without Begin while the provider waits, configured, for its retry
+                 const VrTemporalPair::Plan &plan, bool camera_cut = false,
+                 bool recovery_probe = false);
+    // A frame without Begin while the provider waits, configured, for its retry
     // (vr_temporal_failure.h). No objects, jitter, camera or output, as Begin with the provider
     // OFF leaves the frame; the provider and its history are kept (the next Begin is not
     // consecutive, so it restarts the history).
@@ -61,6 +69,6 @@ class VrTemporalScene {
     uint64_t frame{}, last_frame{}, epoch{};
     Result begin_result{Result::Disabled};
     bool begun{}, active{}, have_camera{}, have_previous{}, complete_motion{}, attempted{},
-        published{};
+        published{}, recovery_probe{};
 };
 } // namespace Vulkan

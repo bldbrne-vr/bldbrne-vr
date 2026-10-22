@@ -1,7 +1,9 @@
+#include "common/render_diagnostic.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
+#include "video_core/native_stereo/native_stereo.h"
 #include <cstdlib>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -183,6 +185,9 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     properties = physical_device.getProperties();
     memory_properties = physical_device.getMemoryProperties();
     CollectDeviceParameters();
+    RENDER_DIAGNOSTIC_ONCE("GPU name={} vendor={:#x} device={:#x} driver={} Vulkan={}",
+        properties.deviceName.data(), properties.vendorID, properties.deviceID,
+        GetDriverVersionName(), properties.apiVersion);
     ASSERT_MSG(properties.apiVersion >= TargetVulkanApiVersion,
                "Vulkan {}.{} is required, but only {}.{} is supported by device!",
                VK_VERSION_MAJOR(TargetVulkanApiVersion), VK_VERSION_MINOR(TargetVulkanApiVersion),
@@ -479,6 +484,16 @@ bool Instance::CreateDevice() {
         features.shaderStorageImageExtendedFormats && vk11_features.storageBuffer16BitAccess &&
         vk12_features.storageBuffer8BitAccess && vk12_features.shaderInt8 &&
         vk12_features.shaderFloat16 && vk13_features.shaderIntegerDotProduct;
+    if (NativeStereo::Enabled()) {
+        // Native stereo draws both eyes with multiview; every report then says what the card
+        // offers (a right eye left gray on some AMD cards, 2026-10-21).
+        RENDER_DIAGNOSTIC_ONCE("Native stereo multiview: multiview={} geometry={} tessellation={} "
+                               "vendor={:#x} device={:#x} driver={:#x}",
+                               bool(vk11_features.multiview),
+                               bool(vk11_features.multiviewGeometryShader),
+                               bool(vk11_features.multiviewTessellationShader),
+                               properties.vendorID, properties.deviceID, properties.driverVersion);
+    }
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = 1u,
@@ -758,10 +773,22 @@ void Instance::CreateAllocator() {
         .vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
     };
 
+    // Experiment (2026-10-18, bbport uses 64): VR_VMA_BLOCK_MB=N sets VMA's large-heap block size
+    // (default 0: VMA's own, 256 MiB). A block goes back to the driver only once empty.
+    static const VkDeviceSize block_size = [] {
+        const char* env = std::getenv("VR_VMA_BLOCK_MB");
+        const unsigned long mb = env ? std::strtoul(env, nullptr, 10) : 0;
+        return mb >= 8 && mb <= 1024 ? VkDeviceSize{mb} << 20 : VkDeviceSize{0};
+    }();
+    if (block_size != 0) {
+        LOG_INFO(Render_Vulkan, "VMA large-heap block size {} MiB (VR_VMA_BLOCK_MB)",
+                 block_size >> 20);
+    }
     const VmaAllocatorCreateInfo allocator_info = {
         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
         .physicalDevice = physical_device,
         .device = *device,
+        .preferredLargeHeapBlockSize = block_size,
         .pVulkanFunctions = &functions,
         .instance = *instance,
         .vulkanApiVersion = TargetVulkanApiVersion,
@@ -791,7 +818,7 @@ void Instance::CollectDeviceParameters() {
     const std::string extensions = fmt::format("{}", fmt::join(available_extensions, ", "));
 
     LOG_INFO(Render_Vulkan, "GPU_Vendor: {}", vendor_name);
-    LOG_INFO(Render_Vulkan, "GPU_Model: {}", model_name);
+    LOG_BENCHMARK_INFO(Render_Vulkan, "GPU_Model: {}", model_name);
     LOG_INFO(Render_Vulkan, "GPU_Integrated: {}", IsIntegrated() ? "Yes" : "No");
     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Driver: {}", driver_name);
     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Version: {}", api_version);

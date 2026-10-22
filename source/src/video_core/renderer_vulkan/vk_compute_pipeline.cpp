@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
+#include "video_core/native_stereo/native_stereo.h"
 #include <boost/container/small_vector.hpp>
 
 #include "shader_recompiler/info.h"

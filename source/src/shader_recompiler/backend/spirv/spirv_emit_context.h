@@ -62,6 +62,10 @@ public:
         const Id output_id{DefineVariable(type, builtin, spv::StorageClass::Output)};
         if (location) {
             Decorate(output_id, spv::Decoration::Location, *location);
+            if (l_stage == LogicalStage::Vertex && stage == Stage::Vertex) {
+                ASSERT(*location < 64);
+                info.vertex_output_locations |= u64{1} << *location;
+            }
         }
         return output_id;
     }
@@ -275,6 +279,7 @@ public:
     Id NativeEyeIndex();
     Id NativeBufferPointer(Id type, Id buffer, Id member, Id index);
     Id NativeImagePointer(Id type, Id image, Id lod = {});
+    Id NativeNonUniform(Id resource);
     // VrPushData (Profile::SupportsVrPushData): a native stereo graphics stage declares the whole
     // push block and reads the draw's projection, light tiles, cut and motion buffers from it at
     // run time.

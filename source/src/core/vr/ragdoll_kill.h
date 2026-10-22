@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -59,6 +65,13 @@ struct BlowIn {
     std::int32_t hp{0};   // the target's HP before this hit
     float damage{0.0f}; // the hit's final damage (the game truncates it into the HP store)
 };
+
+// Retail Stake Driver fully charged transformed R2; do not infer explosions from
+// the equipped weapon or treat unrelated bullets / Molotovs as this attack.
+inline bool IsStakeBlast(int behavior, int attack, int bullet, int hand, int category) {
+    return behavior == 101100930 && attack == 1100930 && bullet == NoBullet &&
+           hand == HandRight && category == CategoryRightWeapon;
+}
 
 // The HP the hit takes (the game truncates the final float).
 inline std::int64_t HitDamage(float damage) {
@@ -318,6 +331,19 @@ inline float HitSpeed(float game_hit, float game_tip, float presenter_tip) {
     return std::max(game_hit, presenter_tip * share);
 }
 
+// A conservative heavy-weapon bonus, captured at the killing hit. Transform attacks
+// may strike with the previous form, so they deliberately keep ordinary momentum.
+inline float HeavyTwoHandMomentum(int variation, bool form_b, bool two_handed, bool transform) {
+    if (!form_b || !two_handed || transform) return 1.0f;
+    switch (variation) {
+    case 500: // Hunter Axe
+    case 800: // Kirkhammer
+    case 810: // Ludwig's Holy Blade
+        return 1.5f;
+    default: return 1.0f;
+    }
+}
+
 struct PushConfig {
     float scale{1.0f};           // melee_ragdoll_impulse (0 = no push at all)
     float momentum_kg{31.25f};   // momentum = this x the blade's speed (250 kg m/s at 8 m/s)
@@ -347,6 +373,26 @@ struct PushConfig {
     float close_far_m{1.5f};
     float close_near_m{0.8f};
 };
+
+enum class PushAttack { Normal, HeavyTwoHand, StakeBlast };
+
+// These exceptions raise only the added-velocity caps. Direction, lift, inherited
+// motion limits and the post-push player guard retain the normal rules.
+inline PushConfig AttackPushConfig(float scale, PushAttack attack) {
+    PushConfig cfg{};
+    cfg.scale = scale;
+    float cap = 1.0f;
+    if (attack == PushAttack::HeavyTwoHand) {
+        cfg.momentum_kg *= 1.5f;
+        cap = 1.25f;
+    } else if (attack == PushAttack::StakeBlast) {
+        cfg.momentum_kg *= 1.75f;
+        cap = 1.5f;
+    }
+    cfg.dv_all_max *= cap;
+    cfg.dv_local_max *= cap;
+    return cfg;
+}
 
 struct PushBody {
     Vec3 com{};

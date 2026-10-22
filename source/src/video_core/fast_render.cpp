@@ -1,6 +1,12 @@
 #include "video_core/host_copies.h"
-#include "../../scratchpad/fast-renderer/b_handler_profile.h"
-// SPDX-License-Identifier: GPL-2.0-or-later
+#include "video_core/fast/b_handler_profile.h"
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include "video_core/fast_render.h"
 
@@ -74,8 +80,14 @@ ThreadSample SampleThread(Role role) {
     return {};
 }
 
+const bool g_wait_detail = [] {
+    const char* value = std::getenv("FAST_RECORDER_WAIT_DETAIL");
+    return value && value[0] == '1';
+}();
 struct FlushCount {
     u64 calls{}, drains{}, previous_calls{}, previous_drains{};
+    u64 wait_ns{}, spin_ns{}, stage_b_wait_ns{}, stage_b_spin_ns{};
+    u64 previous_wait_ns{}, previous_spin_ns{}, previous_b_wait_ns{}, previous_b_spin_ns{};
 };
 std::mutex flush_mutex;
 std::map<std::string, FlushCount> flush_counts;
@@ -101,12 +113,28 @@ void ReportRecorderFlushes(double frames) {
     std::scoped_lock lock{flush_mutex};
     if (flush_counts.empty() || frames <= 0)
         return;
-    std::string reasons;
+    std::string reasons, wait_reasons;
     u64 total = 0;
     for (auto& [name, c] : flush_counts) {
         const u64 calls = c.calls - c.previous_calls, drains = c.drains - c.previous_drains;
         c.previous_calls = c.calls;
         c.previous_drains = c.drains;
+        if (g_wait_detail) {
+            const u64 wait = c.wait_ns - c.previous_wait_ns;
+            const u64 spin = c.spin_ns - c.previous_spin_ns;
+            const u64 b_wait = c.stage_b_wait_ns - c.previous_b_wait_ns;
+            const u64 b_spin = c.stage_b_spin_ns - c.previous_b_spin_ns;
+            c.previous_wait_ns = c.wait_ns;
+            c.previous_spin_ns = c.spin_ns;
+            c.previous_b_wait_ns = c.stage_b_wait_ns;
+            c.previous_b_spin_ns = c.stage_b_spin_ns;
+            if (wait || spin) {
+                wait_reasons += fmt::format(
+                    " | {} wait_us/f={:.3f} spin_us/f={:.3f} B_wait_us/f={:.3f} B_spin_us/f={:.3f}",
+                    name, wait / 1000.0 / frames, spin / 1000.0 / frames,
+                    b_wait / 1000.0 / frames, b_spin / 1000.0 / frames);
+            }
+        }
         if (!calls)
             continue;
         total += drains;
@@ -114,6 +142,8 @@ void ReportRecorderFlushes(double frames) {
     }
     LOG_INFO(Render_Vulkan, "FAST recorder: flushes/f={:.3f} reason_calls/drains_per_frame:{}",
              total / frames, reasons);
+    if (!wait_reasons.empty())
+        LOG_INFO(Render_Vulkan, "FAST recorder waits:{}", wait_reasons);
 }
 
 void Run(std::stop_token stop, std::string file) {
@@ -350,6 +380,24 @@ void NoteRecorderReplay(u64 ns) {
 }
 void NoteRecorderWait(u64 ns) {
     g_counters.recorder_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+void NoteRecorderWaitReason(std::string_view reason, std::source_location site, u64 wait_ns,
+                            u64 spin_ns, bool on_stage_b) {
+    if (!g_wait_detail) return;
+    std::string key{reason};
+    if (reason.starts_with("raw")) {
+        std::string_view file{site.file_name()};
+        file.remove_prefix(file.find_last_of("/\\") + 1);
+        key += fmt::format("@{}:{}", file, site.line());
+    }
+    std::scoped_lock lock{flush_mutex};
+    auto& count = flush_counts[key];
+    count.wait_ns += wait_ns;
+    count.spin_ns += spin_ns;
+    if (on_stage_b) {
+        count.stage_b_wait_ns += wait_ns;
+        count.stage_b_spin_ns += spin_ns;
+    }
 }
 void NoteRecorderSpin(u64 ns, bool on_stage_b) {
     g_counters.drain_spin_ns.fetch_add(ns, std::memory_order_relaxed);

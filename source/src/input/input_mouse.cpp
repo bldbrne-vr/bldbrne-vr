@@ -5,6 +5,7 @@
 
 #include "common/assert.h"
 #include "common/types.h"
+#include "input/benchmark_input.h"
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input_mouse.h"
@@ -124,6 +125,7 @@ void ApplyMouseInputBlockers() {
 }
 
 Uint32 MousePolling(void* param, Uint32 id, Uint32 interval) {
+    if (BenchmarkInputLocked()) return interval;
     auto* controller = (GameController*)param;
     switch (mouse_mode) {
     case MouseMode::Joystick:

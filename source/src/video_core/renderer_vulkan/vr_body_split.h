@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -29,7 +35,7 @@ struct Frame {
     bool cut_on{};      // this frame's cutaway code is not 0 (first person, body_cutaway)
     bool cape_hidden{}; // hide_cape applies this frame (first person)
     bool head_hidden{}; // body_head_shadow applies this frame (first person, body_mode=no_head)
-    // body_cutaway_shoulders: the shoulder ranges fade with the cut ones (the user, 2026-10-08:
+    // body_cutaway_shoulders: the shoulder ranges fade with the cut ones (2026-10-08:
     // through the shoulders after a hit or a small head drop); false: they are kept with the arms,
     // exactly the behaviour before 2026-10-09.
     bool shoulder_cut{};

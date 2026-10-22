@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -14,7 +20,7 @@
 // The VR tile's icon in the game's own icon atlas (header-only, no emulator dependencies; zlib is
 // the caller's; tests/test_vr_tile.cpp).
 //
-// The Options grid's row-0 icons are 80 x 80 cells of MENU_Common_00100 (game asset: BC1,
+// The Options grid's row-0 icons are 80 x 80 cells of MENU_Common_00100 (menu/common.tpf.dcx: BC1,
 // 1024 x 1024, one mip level, PS4 tile mode 13), drawn by the movie as an external image. Our
 // goggles go into a cell of its unused (black) area, so the grid draws them exactly like its own
 // icons: the game loads the atlas as always and its Scaleform creates no texture of its own. (An

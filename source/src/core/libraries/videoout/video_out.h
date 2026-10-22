@@ -4,6 +4,7 @@
 #pragma once
 
 #include <core/libraries/system/userservice.h>
+#include "core/libraries/videoout/flip_packet.h"
 #include "core/libraries/kernel/equeue.h"
 #include "core/libraries/videoout/buffer.h"
 
@@ -139,7 +140,8 @@ s32 PS4_SYSV_ABI sceVideoOutColorSettingsSetGamma(SceVideoOutColorSettings* sett
 s32 PS4_SYSV_ABI sceVideoOutAdjustColor(s32 handle, const SceVideoOutColorSettings* settings);
 
 // Internal system functions
-s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, void** unk);
+s32 PrepareEopFlip(s32 handle, u32 buf_id, u64& ticket);
+void ExecuteEopFlip(const FlipPacket& flip);
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 

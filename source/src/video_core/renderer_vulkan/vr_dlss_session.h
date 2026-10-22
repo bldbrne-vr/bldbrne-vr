@@ -1,4 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #pragma once
 #include <array>
 #include <cassert>
@@ -63,12 +68,13 @@ public:
     bool Active() const {
         return requested && supported && initialized && !failed;
     }
-    bool HasFeatures() const {
-        return eyes[0].created && eyes[1].created;
+    bool HasFeatures(unsigned views = 2) const {
+        return (views == 1 || views == 2) && eyes[0].created &&
+               (views == 1 || eyes[1].created);
     }
-    bool CanProduceMotion() const {
-        return Active() && HasFeatures() && completed >= eyes[0].creation &&
-               completed >= eyes[1].creation;
+    bool CanProduceMotion(unsigned views = 2) const {
+        return Active() && HasFeatures(views) && completed >= eyes[0].creation &&
+               (views == 1 || completed >= eyes[1].creation);
     }
     // No feature replacement while commands using it are in flight. Reconfiguration is
     // transactional at the frame owner: retire BOTH eyes, then create both new features.
@@ -116,9 +122,11 @@ public:
     // the eyes, and a bridge built with two views refuses view 2 without recording anything.
     static constexpr unsigned TwinView = 2;
     bool CreateTwin(VkCommandBuffer command, const BbDlssFeature& feature, uint64_t ticket) {
-        twin_valid = twin_synced = false;
-        if (!Active() || twin.created || !command || ticket <= completed)
+        // A failed attempt can still own GPU work. Preserve its ticket until Retire,
+        // and do not disable an existing twin when rejecting a duplicate request.
+        if (!Active() || twin.last_use || !command || ticket <= completed)
             return false;
+        twin_valid = twin_synced = false;
         twin.last_use = ticket; // Creation failures can still record uploads.
         if (!api->CreateFeature(TwinView, command, &feature))
             return false;

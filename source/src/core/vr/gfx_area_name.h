@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -8,14 +14,14 @@
 
 #include "core/vr/gfx_tile.h"
 
-// The area name's dark strip, taken out of the HUD movie (game asset) as it loads. Fe_fla.
+// The area name's dark strip, taken out of the HUD movie (menu/fe.gfx) as it loads. Fe_fla.
 // MapName_162 (the name shown for ~5 s on entering an area) has four children: at depth 1 a
 // 1920 x 240 white-to-black linear gradient across the stage's bottom, MULTIPLY-blended (the dark
 // rectangle behind the name, in the flat game, on the virtual screen and in VR alike), at depth 3
 // the ink smoke (SUBTRACT), at depth 5 the rule (ADD) and at depth 7 the words. Every colour of
 // the gradient is made white: multiplying by white changes nothing, so the strip is gone while the
 // smoke, the rule, the words and their fades stay the game's own. Same length, nothing moved; the
-// layout is checked from the user's own movie and anything unexpected leaves it unchanged.
+// layout is checked from the player's own movie and anything unexpected leaves it unchanged.
 namespace VR::GfxAreaName {
 
 constexpr const char* SpriteClass = "Fe_fla.MapName_162";

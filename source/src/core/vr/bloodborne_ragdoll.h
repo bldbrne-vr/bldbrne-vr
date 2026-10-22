@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -7,7 +13,7 @@
 // Bloodborne (v1.09 eboot): instant ragdoll on a right-hand melee kill (vr.ini melee_kill_ragdoll,
 // melee_ragdoll_impulse; the pure rules are core/vr/ragdoll_kill.h).
 //
-// What the game does (scratchpad overnight/ragdoll/re.md): the death animations of the ordinary
+// What the game does (offline reverse-engineering notes): the death animations of the ordinary
 // enemies (a22xx, a16x0) carry TAE event 228 ("RagdollReviveTime", args 0, 0) over their last part;
 // its handler (0x1A2227B in the TAE event switch 0x1A216B0) writes the chr's ChrCtrl ragdoll request
 // +0x144 = 1 and weight +0x14C = 1.0, and the ChrCtrl ragdoll update (0x1515CC0, every chr every

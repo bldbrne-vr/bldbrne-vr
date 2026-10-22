@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include "common/logging/log.h"
+#include "core/vr/graphics_settings.h"
 #include "core/vr/vr_session.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -14,8 +16,8 @@ namespace VideoCore {
 
 namespace {
 
-// VR picture quality (vr.ini texture_aniso / texture_lod_bias, documents/bloodborne-vr.md
-// "Sharpness"): what the game's sampler gets on top of its own settings.
+// VR picture quality (vr.ini texture_aniso / texture_lod_bias):
+// what the game's sampler gets on top of its own settings.
 struct VrFiltering {
     bool force_aniso{false};
     float aniso{1.0f};
@@ -53,8 +55,11 @@ VrFiltering VrFilteringFor(const AmdGpu::Sampler& sampler) {
         out.force_aniso = true;
         out.aniso = static_cast<float>(s.texture_aniso);
     }
-    if (s.texture_lod_bias != 0.0f && IsTilingMipmapped(sampler)) {
-        out.lod_bias = s.texture_lod_bias;
+    // An upscaler's whole frame (S1) renders below the output size: its mip bias joins the
+    // player's own (0 without an upscaler).
+    const float lod_bias = s.texture_lod_bias + VR::Graphics::S1MipBias();
+    if (lod_bias != 0.0f && IsTilingMipmapped(sampler)) {
+        out.lod_bias = lod_bias;
     }
     return out;
 }
@@ -110,11 +115,12 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
             LOG_INFO(Render_Vulkan,
                      "VR texture filtering: {} samplers made, {} filtered textures ({} with the "
                      "game's own anisotropy), {} raised to {}x anisotropic, {} with the mip bias "
-                     "{:+.2f} (vr.ini texture_aniso={} texture_lod_bias={})",
+                     "{:+.2f} (vr.ini texture_aniso={} texture_lod_bias={}, upscaler {:+.2f})",
                      n, filtered_count.load(), game_aniso_count.load(), forced_count.load(),
                      VR::GetSettings().texture_aniso, biased_count.load(),
-                     VR::GetSettings().texture_lod_bias, VR::GetSettings().texture_aniso,
-                     VR::GetSettings().texture_lod_bias);
+                     VR::GetSettings().texture_lod_bias + VR::Graphics::S1MipBias(),
+                     VR::GetSettings().texture_aniso, VR::GetSettings().texture_lod_bias,
+                     VR::Graphics::S1MipBias());
         }
     }
     auto border_color = LiverpoolToVK::BorderColor(sampler.border_color_type);

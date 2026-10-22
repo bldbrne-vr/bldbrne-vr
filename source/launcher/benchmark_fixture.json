@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "scene": "Central Yharnam fixed-view fixture",
+  "game_versions": [
+    "01.00"
+  ],
+  "files": [
+    {
+      "sha256": "4ebd998b60437752fdb9014321ee3afb0e24e153fcc9633772fc2ce14dff4bf2",
+      "path": "1000/savedata/CUSA00207/SPRJ0005/backup0000"
+    },
+    {
+      "sha256": "653ac2c4686d29c800d27e80b1f84406614cb464be71c8943cddc45bfefd0bb9",
+      "path": "1000/savedata/CUSA00207/SPRJ0005/backup0010"
+    },
+    {
+      "sha256": "9a82ff87e2df6020e50e61d8831db35e329382e4fb36238541f42c0f6881d5ac",
+      "path": "1000/savedata/CUSA00207/SPRJ0005/userdata0000"
+    },
+    {
+      "sha256": "439292e489a0a35e4a3a0fe304ea1a680337243fa53b135aa9310881e1d7e078",
+      "path": "1000/savedata/CUSA00207/SPRJ0005/userdata0001"
+    },
+    {
+      "sha256": "439292e489a0a35e4a3a0fe304ea1a680337243fa53b135aa9310881e1d7e078",
+      "path": "1000/savedata/CUSA00207/SPRJ0005/userdata0002"
+    },
+    {
+      "sha256": "439292e489a0a35e4a3a0fe304ea1a680337243fa53b135aa9310881e1d7e078",
+      "path": "1000/savedata/CUSA00207/SPRJ0005/userdata0003"
+    },
+    {
+      "sha256": "439292e489a0a35e4a3a0fe304ea1a680337243fa53b135aa9310881e1d7e078",
+      "path": "1000/savedata/CUSA00207/SPRJ0005/userdata0004"
+    },
+    {
+      "sha256": "439292e489a0a35e4a3a0fe304ea1a680337243fa53b135aa9310881e1d7e078",
+      "path": "1000/savedata/CUSA00207/SPRJ0005/userdata0005"
+    },
+    {
+      "sha256": "439292e489a0a35e4a3a0fe304ea1a680337243fa53b135aa9310881e1d7e078",
+      "path": "1000/savedata/CUSA00207/SPRJ0005/userdata0006"
+    },
+    {
+      "sha256": "439292e489a0a35e4a3a0fe304ea1a680337243fa53b135aa9310881e1d7e078",
+      "path": "1000/savedata/CUSA00207/SPRJ0005/userdata0007"
+    },
+    {
+      "sha256": "439292e489a0a35e4a3a0fe304ea1a680337243fa53b135aa9310881e1d7e078",
+      "path": "1000/savedata/CUSA00207/SPRJ0005/userdata0008"
+    },
+    {
+      "sha256": "439292e489a0a35e4a3a0fe304ea1a680337243fa53b135aa9310881e1d7e078",
+      "path": "1000/savedata/CUSA00207/SPRJ0005/userdata0009"
+    },
+    {
+      "sha256": "884b45b1c6c0fdcc0196f4a5ea383e4447efcd8039394564889dd9db3b29ee14",
+      "path": "1000/savedata/CUSA00207/SPRJ0005/userdata0010"
+    },
+    {
+      "sha256": "a698d5c449a99be7befa403c8b74b62eb1e0caf1f4d5cb7de7adbc7d769798db",
+      "path": "1000/savedata/CUSA00207/SPRJ0005/sce_sys/icon0.png"
+    },
+    {
+      "sha256": "d879d3e43b698e9ba6bf88c4d937a0008e7a84eabbca5670f1a19c4aa04a502a",
+      "path": "1000/savedata/CUSA00207/SPRJ0005/sce_sys/param.sfo"
+    }
+  ]
+}

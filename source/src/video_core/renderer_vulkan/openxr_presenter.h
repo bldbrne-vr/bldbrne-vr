@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -36,6 +42,15 @@ public:
     // A headset is connected and reports its eye sizes (asleep is fine): a throwaway instance,
     // safe to call before IsRuntimeAvailable and from any thread until then.
     [[nodiscard]] static bool IsHeadsetConnected();
+    struct HeadsetInfo {
+        std::string name;
+        std::array<u32, 2> width{}, height{};
+        u32 max_width{}, max_height{};
+        float refresh_hz{};
+    };
+    // Launcher scan: temporary graphics session for the active rate, no game/settings or rate change.
+    [[nodiscard]] static bool ProbeHeadset(HeadsetInfo& info);
+
 
     // These methods initialize the OpenXR instance on demand and expose the
     // Vulkan requirements before shadPS4 creates its Vulkan instance/device.
@@ -100,6 +115,7 @@ public:
         // The late warp's source (VrStereoWarp::GetLateCapture; invalid without vr.ini
         // late_warp): while the pair is shown, the frame thread warps it again every XR frame.
         VrStereoWarp::LateCapture late{};
+        vk::Format image_format{vk::Format::eUndefined};
     };
     // True while DIBR eyes are submitted with their depth (vr.ini xr_depth, the runtime has
     // XR_KHR_composition_layer_depth and a float depth swapchain format; any thread).

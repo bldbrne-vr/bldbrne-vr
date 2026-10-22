@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -32,7 +38,6 @@
 #include "core/vr/hook_util.h"
 #include "core/vr/pose_gestures.h"
 #include "core/vr/quick_settings.h"
-#include "core/vr/quick_channel.h"
 #include "core/vr/transform_settings.h"
 #include "core/vr/vr_session.h"
 
@@ -185,6 +190,7 @@ bool g_autotest = false;        // VR_HEAL_AUTOTEST: one injection 3 s after the
 bool g_disabled = false;
 bool g_first_logged = false;
 u64 g_main_updates = 0;
+u8* g_arrived_player = nullptr; // the main player last seen (VR::NotePlayerArrival on a new one)
 struct Watch {
     u32 left{};    // updates still watched
     u32 updates{}; // updates since the injection
@@ -198,6 +204,7 @@ struct HealSignal {
     const u8* player{};
     s32 hp{-1};
     s32 max_hp{-1};
+    bool warp_effect{false};
     bool item_seen{false};                           // an item context since this player appeared
     std::chrono::steady_clock::time_point item_at{}; // ... last seen
     bool context{false};                             // VR_HEAL_LOG: the item context last update
@@ -514,6 +521,10 @@ void HealSignalUpdate(const u8* player) {
     }
     auto& h = g_signal;
     if (player != h.player) {
+        if (h.player != nullptr) {
+            VR::RequestTransitionTextureCleanup();
+            LOG_INFO(Core, "Texture transition: replacement player (pressure-only)");
+        }
         h = {};
         h.player = player;
         g_hit.synced = false;
@@ -522,11 +533,20 @@ void HealSignalUpdate(const u8* player) {
     const s32 max_hp = Read<s32>(module + OffsetMaxHp);
     bool item_anim = false;
     bool vial_effect = false;
+    bool warp_effect = false;
     ForEachEffect(player, [&](u8* node, u8*) {
         const s32 id = Read<s32>(node + OffsetNodeId);
         item_anim = item_anim || id == ItemAnimEffectId;
         vial_effect = vial_effect || id == VialEffectId;
+        warp_effect = warp_effect || id == 2101; // native lamp travel / rest
     });
+    const bool died = h.hp > 0 && hp == 0 && max_hp > 0;
+    if (died || (warp_effect && !h.warp_effect)) {
+        VR::RequestTransitionTextureCleanup();
+        LOG_INFO(Core, "Texture transition: {} (pressure-only)",
+                 died ? "player death" : "native warp effect");
+    }
+    h.warp_effect = warp_effect;
     const s32 use_state = Read<s32>(player + OffsetItemUseState);
     const s32 goods = Read<s32>(player + OffsetItemAnimGoods);
     const bool context = use_state != 0 || item_anim || vial_effect;
@@ -702,10 +722,11 @@ void TestHurt(u8* player) {
 }
 
 void OnMainPlayerUpdate(u8* player) {
-    // PlayerUpdateHook validated this main-player pointer. Keep its address/handle in
-    // the host; snapshot consumers see only a generation tied to this actor lifetime.
-    VR::Quick::ObserveInteractionActor(reinterpret_cast<uintptr_t>(player), Read<u32>(player + 0x08));
     VR::NotePlayerUpdate();
+    if (player != g_arrived_player) {
+        g_arrived_player = player; // the game's start or a load: a new main player
+        VR::NotePlayerArrival();
+    }
     ++g_main_updates;
     if (!g_first_logged) {
         g_first_logged = true;
@@ -720,7 +741,7 @@ void OnMainPlayerUpdate(u8* player) {
     if (g_motion) {
         MotionUpdate(player);
     }
-    TuningUpdate(player);     // logs and the HP autotest only
+    TuningUpdate(player);
     IframesSiteA(player);     // the dodge i-frame log's view of the game (VR_IFRAMES_LOG only)
     MenuUpdate(player);       // in-game menu state for the presenter
     LampsSiteA(player);       // lamp requests: native game calls on the player update thread
@@ -807,16 +828,6 @@ void InstallPlayerHook(VAddr base, u64 size) {
                          std::getenv("VR_DODGE_LOG") != nullptr);
     // The in-game menu detection (core/vr/bloodborne_menu.h) samples in this hook too.
     const bool menu = settings.menu_mode;
-    // Quick items in VR (core/vr/bloodborne_quickitems.h) read the slots and use items here.
-    const bool quick = VR::Quick::GetQuickSettings().quick_items;
-    // The weapon-only transform switches the form here (core/vr/bloodborne_transform.h).
-    const bool transform = VR::Transform::GetTransformSettings().native;
-    // Physical gestures (core/vr/bloodborne_pose.h) apply their markers here.
-    const bool pose = VR::PoseGesture::GetPoseSettings().enabled;
-    if (!settings.inject && !settings.cinematic && !motion && !menu && !quick && !transform &&
-        !pose) {
-        return;
-    }
     auto* const module = reinterpret_cast<u8*>(base);
     if (size < MaxVialsRva + sizeof(s32)) {
         LOG_INFO(Core, "VR heal: eboot too small ({:#x}) for Bloodborne 1.09; not installed", size);
@@ -868,11 +879,7 @@ void InstallPlayerHook(VAddr base, u64 size) {
     const bool cinematic_ok = settings.cinematic && InitCinematic(base, size, site_ok, main_ok);
     const bool motion_ok = motion && InitMotion(base, size, site_ok, main_ok);
     const bool menu_ok = menu && hook_ok;
-    const bool quick_ok = quick && hook_ok;
-    const bool transform_ok = transform && hook_ok;
-    const bool pose_ok = pose && hook_ok;
-    if (!heal_ok && !cinematic_ok && !motion_ok && !menu_ok && !quick_ok && !transform_ok &&
-        !pose_ok) {
+    if (!hook_ok) {
         return;
     }
 

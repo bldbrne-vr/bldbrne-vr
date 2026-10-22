@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/arch.h"
@@ -14,7 +15,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#include "../../scratchpad/dual-eye-perf/speculative_read.h"
+#include "video_core/native_stereo/speculative_read.h"
 static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
 #else
 #include <csignal>

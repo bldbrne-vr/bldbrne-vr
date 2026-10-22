@@ -62,6 +62,8 @@ struct UniqueImage {
     }
 
     void Create(const vk::ImageCreateInfo& image_ci);
+    bool TryCreate(const vk::ImageCreateInfo& image_ci);
+    u64 SizeBytes() const;
 
     void Destroy();
 
@@ -85,6 +87,8 @@ class BlitHelper;
 
 struct Image {
     bool native_stereo = false;
+    bool allocation_failed = false;
+    bool RetryAllocation();
     std::shared_ptr<Vulkan::VrSceneProxy> scene_proxy;
     Image(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler, BlitHelper& blit_helper,
           Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info);

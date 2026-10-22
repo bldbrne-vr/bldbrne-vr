@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include "common/alignment.h"
@@ -26,6 +27,10 @@ class PageManager {
     static constexpr size_t PAGES_PER_LOCK = NUM_PAGES_PER_REGION;
 
 public:
+    /// Debug (the draw inspector's `watch`): asked first about every guest access violation; true
+    /// = handled. Null unless a watch was armed.
+    static inline std::atomic<bool (*)(void* context, void* fault_address)> fault_hook{nullptr};
+
     explicit PageManager(Vulkan::Rasterizer* rasterizer);
     ~PageManager();
 

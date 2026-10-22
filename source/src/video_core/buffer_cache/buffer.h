@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
-#include "../../../scratchpad/dual-eye-perf/exact_upload_memo.h"
-#include "../../../scratchpad/dual-eye-perf/upload_batch.h"
+#include "video_core/native_stereo/exact_upload_memo.h"
+#include "video_core/native_stereo/upload_batch.h"
 #include <memory>
 #include <cstddef>
 #include <optional>

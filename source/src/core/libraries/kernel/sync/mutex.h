@@ -10,7 +10,7 @@
 #ifdef _WIN64
 #include <windows.h>
 #include <memory>
-#include "../../../../../scratchpad/dual-eye-perf/fast_mutex.h"
+#include "video_core/native_stereo/fast_mutex.h"
 #else
 #include <mutex>
 #endif

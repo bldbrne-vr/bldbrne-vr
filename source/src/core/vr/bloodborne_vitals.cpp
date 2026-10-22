@@ -1,8 +1,13 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -12,12 +17,11 @@
 #include "common/logging/log.h"
 #include "core/vr/arm_ik.h"
 #include "core/vr/bloodborne_vitals.h"
-#include "core/vr/body_channel.h"
 #include "core/vr/c0000_skeleton.h"
+#include "core/vr/body_channel.h"
 #include "core/vr/combat_channel.h"
 #include "core/vr/hook_util.h"
 #include "core/vr/inframe.h"
-#include "core/vr/interaction_native_vial_visual.h"
 #include "core/vr/live_tune.h"
 #include "core/vr/vitals.h"
 #include "core/vr/vitals_channel.h"
@@ -72,7 +76,7 @@ constexpr u32 GoodsCategory = 0x40000000u;
 constexpr s32 QuicksilverBullets = 900;
 constexpr s32 BloodBullets = 901;
 
-// The hunter's dummies the gauge is placed from (game asset): the palm (L_Hand; its +Z out of
+// The hunter's dummies the gauge is placed from (c0000.flver): the palm (L_Hand; its +Z out of
 // the palm, +Y out on the thumb's side, as the held items use it), the wrist (L_Hand, its frame
 // in L_Hand's: the skeleton read at runtime, core/vr/c0000_skeleton.h Skeleton::left_hand) and
 // near the elbow (L_Forearm, 37 mm from the joint).
@@ -265,12 +269,15 @@ void VitalsSiteA(u8* module, u8* player) {
 namespace {
 
 struct Render {
+    V::GaugeAnim anim{};
+    V::ChangeTracker changes{};
     V::FitFilter fit{};
     V::FitMotionGate fit_motion{};
     u64 motion_rejected{};
     // The straps' sides: (hand strap, elbow strap) x (round +v, round -v), as the probe's lines.
     std::array<V::StrapFilter, V::StrapLines> straps{};
     std::array<float, V::StrapLines> strap_exits{};
+    V::GlanceState glance{};
     s64 last_ns{0};
     u32 probe_id{0};
     u32 result_id{0};
@@ -289,23 +296,6 @@ struct Render {
     u64 fit_seen{0};
 };
 Render g_r{};
-std::atomic_flag g_gauge_busy = ATOMIC_FLAG_INIT;
-VR::Interactions::Module* g_gauge_module{};
-bool g_gauge_fault{};
-VR::Interactions::NativeVialVisualRuntime g_gauge_visual;
-void InitGaugeDll() {
-    if (!VR::Interactions::DllRequested() || g_gauge_module)
-        return;
-    g_gauge_module = new VR::Interactions::Module();
-    g_gauge_module->EnableFaultBroadcast();
-    g_gauge_visual.Bind(*g_gauge_module, g_gauge_fault);
-    if (!g_gauge_module->LoadBesideExecutable()) {
-        g_gauge_fault = true;
-        g_gauge_module->ReportFault();
-        LOG_ERROR(Core, "VR wrist gauge: interaction DLL unavailable: {}",
-                  g_gauge_module->Diagnostic());
-    }
-}
 
 Vec3 Col(const std::array<float, 12>& m, int c) {
     return {m[static_cast<size_t>(c)], m[static_cast<size_t>(4 + c)],
@@ -409,19 +399,7 @@ std::array<float, 4> LinearOf(V::Srgb c, float a = 1.0f) {
 
 } // Anonymous namespace
 
-void InstallVitalsVisual() {
-    InitGaugeDll();
-}
-
 void VitalsRenderTick(u64 record_id, const float* rows, const float* position) {
-    if (g_gauge_busy.test_and_set(std::memory_order_acquire))
-        return;
-    struct Release {
-        ~Release() {
-            g_gauge_busy.clear(std::memory_order_release);
-        }
-    } release;
-
     auto& g = g_site;
     auto& r = g_r;
     const auto& settings = VR::GetSettings();
@@ -588,36 +566,19 @@ void VitalsRenderTick(u64 record_id, const float* rows, const float* position) {
     const Vec3 v_dir = arm.thumb * -1.0f;
     const Vec3 centre = axis_point + n_dir * radius;
 
-    // Copy wrist/beat facts; the physical-visual context owns glance and animation history.
+    // The animation: changes, the glance, the heartbeat (the presenter's clock).
+    const u32 changes = r.changes.Step(st);
     const Vec3 c_view = view.Point(centre);
     const Vec3 n_view = view.Dir(n_dir);
-    PiNativeVialVisualInput gauge{};
-    gauge.operation = PI_VV_VITALS;
-    gauge.now_ns = now;
-    auto& facts = gauge.vitals;
-    facts.status = PhysicalInteractions::VitalsVisual::PackStatus(st);
-    facts.dt = dt;
-    facts.centre[0] = c_view.x;
-    facts.centre[1] = c_view.y;
-    facts.centre[2] = c_view.z;
-    facts.normal[0] = n_view.x;
-    facts.normal[1] = n_view.y;
-    facts.normal[2] = n_view.z;
+    const bool glanced = V::StepGlance(r.glance, {c_view.x, c_view.y, c_view.z},
+                                       {n_view.x, n_view.y, n_view.z}, {0.0f, 0.0f, 0.0f},
+                                       {0.0f, 0.0f, 1.0f}, dt);
+    float pulse = 0.0f;
     V::Beat beat{};
-    facts.have_beat = V::LatestBeat(beat);
-    facts.beat_ns = beat.beat_ns;
-    const auto decision = g_gauge_visual.Call(gauge);
-    if (!decision.applied) {
-        F::List empty{};
-        empty.record = record_id;
-        empty.steady_ns = now;
-        empty.producer = F::Producer::Vitals;
-        F::Submit(empty);
-        V::PublishGauge({});
-        return;
+    if (V::LatestBeat(beat) && beat.beat_ns != 0) {
+        pulse = V::BeatEnvelope(static_cast<float>(now - beat.beat_ns) * 1e-9f);
     }
-    const bool glanced = decision.vitals.glanced != 0;
-    const V::GaugeLook look = PhysicalInteractions::VitalsVisual::Look(decision.vitals);
+    const V::GaugeLook look = r.anim.Step(st, changes, dt, glanced, st.hp > 0, pulse);
     if (look.alpha <= 0.004f) {
         V::PublishGauge(state);
         return;

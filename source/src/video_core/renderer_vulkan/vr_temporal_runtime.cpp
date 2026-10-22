@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
+#include "video_core/renderer_vulkan/vr_temporal_profile.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -38,7 +44,13 @@ VrTemporalRuntime::Result VrTemporalRuntime::BeginPair(const VR::Graphics::Confi
         command, ticket, completed,
         [&]() { return VrDlssRuntime::Get().Activate(accepted, plan.dlss_preset); },
         [&]() -> VrTemporalPair::FsrActivation {
-            if (!fsr) fsr = std::make_unique<VrFsr4Runtime>();
+            // This activator runs only after the old pair retires. Never unload a
+            // provider while its contexts or submitted commands can still be used.
+            if (fsr && fsr->Provider() != accepted.upscaler) {
+                if (!fsr->Shutdown(completed)) return {};
+                fsr.reset();
+            }
+            if (!fsr) fsr = std::make_unique<VrFsr4Runtime>(accepted.upscaler);
             auto* session = fsr->Activate(accepted, instance);
             if (session) fsr_assets = fsr->Assets().wstring();
             return {session, fsr_assets.c_str(), session && fsr->OptimizedPostInstalled(),
@@ -167,12 +179,16 @@ VrTemporalPair::Result VrTemporalRuntime::Resolve(uint64_t frame_id,
     timeline->Refresh();
     pair.RefreshCompletion(timeline->KnownGpuTick());
     if (const auto ticket = pair.ReuseTicket()) {
+        ScratchProfile::Cpu wait_profile(TemporalProfile::SlotWait, "Temporal FSR slot wait");
         scheduler.Wait(ticket);
         timeline->Refresh();
         pair.RefreshCompletion(timeline->KnownGpuTick());
     }
     // The providers record into a raw command buffer (bbport keeps FSR 4/DLSS direct too).
-    const auto cmd = scheduler.CommandBuffer();
+    const auto cmd = [&] {
+        ScratchProfile::Cpu borrow_profile(TemporalProfile::CommandBorrow, "Temporal command borrow");
+        return scheduler.CommandBuffer();
+    }();
     // Bit 37: the borrow ends with this function (no raw handle outlives it), so the merge and
     // the rest of this command buffer return to the recording thread.
     const bool release = UpscalerFastOn(UpscalerFastPart::Recording);
@@ -182,7 +198,11 @@ VrTemporalPair::Result VrTemporalRuntime::Resolve(uint64_t frame_id,
         scheduler.ReleaseCommandBuffer();
         UpscalerFastNote(g_upscaler_fast.raw_released);
     };
-    const auto result = pair.Evaluate(frame_id, cmd, scheduler.CurrentTick(), frame);
+    const auto result = [&] {
+        TemporalProfile::Scope provider_profile(scheduler, TemporalProfile::Provider,
+                                                "Temporal provider evaluation (both eyes)");
+        return pair.Evaluate(frame_id, cmd, scheduler.CurrentTick(), frame);
+    }();
     if (const auto* paired = pair.FsrPairResult()) // FAST bit 45
         Fsr4InterleaveNote(*paired);
     ScratchPush::Invalidate();
@@ -212,7 +232,7 @@ VrTemporalPair::Result VrTemporalRuntime::Resolve(uint64_t frame_id,
                         .subresourceRange = {vk::ImageAspectFlagBits::eColor,0,1,0,1}};
     };
     for (uint32_t eye = 0; eye < 2; ++eye)
-        readable(frame.eyes[eye].output.image);
+        if (frame.eyes[eye].output.image) readable(frame.eyes[eye].output.image);
     if (frame.verify_output.image) // FAST_UPSCALER_VERIFY twin (bit 37), read back later
         readable(frame.verify_output.image);
     cmd.pipelineBarrier2({.imageMemoryBarrierCount = count, .pImageMemoryBarriers = barriers.data()});

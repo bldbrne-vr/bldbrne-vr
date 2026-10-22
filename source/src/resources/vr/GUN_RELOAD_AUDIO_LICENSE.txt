@@ -18,15 +18,3 @@ clipload2 (0-.205 s), clipload1 (0-.250 s), and equipmentclicks (1.03-1.25 s)
 at 0, .18 and .38 seconds. gun_empty.pcm uses the equipmentclicks excerpt.
 Reproduce with scripts/prepare_reload_audio.py (Python + ffmpeg), with the three
 source WAV files in Build/reload-sources. Output duration: .56 s / .22 s.
-
-Provenance verification, 2026-10-16:
-clipload1.wav SHA-256: 1cdc10c50a26834ce7562a5f2925b9aa1118e3bb58a86fea80f34558bf2c5101
-clipload2.wav SHA-256: a5441641e7e9ede24f3ac311642e06265c6f480e3b1ba4b92c19c81c3a5e4d86
-equipmentclicks.wav SHA-256: 42d40e4970fcee45b86088dab9c6a6e7f87b6dc29a6dd9dbbf4d98da7a4e3a47
-The source pages identify all three recordings as CC0. Processing these downloads
-with the retained preparation script produced matching sample lengths and differences
-of at most 2 signed 16-bit PCM units for the reload and 1 for the empty click.
-These close matches corroborate the credited sources; they are not byte-identical
-rebuilds of the bundled files.
-gun_reload.pcm bundled SHA-256: 4d1d62bd0e852166d0d20f998e3b472082e3fafc9cc92ecf22076e8cfe3e0d61
-gun_empty.pcm bundled SHA-256: 247087be8751feb1d2604ab8f739ecba0d5d7e4f8de2be661a0fc3e1835717bd

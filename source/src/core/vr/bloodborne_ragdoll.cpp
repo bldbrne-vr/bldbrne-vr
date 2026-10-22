@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -168,6 +174,8 @@ struct Pending {
     R::Vec3 target_pos{};
     bool blade{false};
     R::Vec3 blade_vel{};
+    bool stake_blast{false}; // exact retail charged blast, frozen at the killing hit
+    R::PushAttack push_attack{R::PushAttack::Normal}; // frozen at the killing hit
     float tip_speed{0.0f};  // the presenter's tip speed for the swing
     float game_tip{0.0f};   // the game blade's tip speed at the last pose tick
     float hit_speed{0.0f};  // the blade's speed at the hit (R::HitSpeed)
@@ -372,8 +380,8 @@ void Push(Pending& p, u8* rag) {
     for (s32 i = 0; i < n; ++i) {
         bodies[i] = read[i].body;
     }
-    R::PushConfig cfg{};
-    cfg.scale = VR::GetSettings().melee_ragdoll_impulse;
+    const R::PushConfig cfg =
+        R::AttackPushConfig(VR::GetSettings().melee_ragdoll_impulse, p.push_attack);
     R::PushIn in{};
     in.hit = p.hit;
     in.hunter = p.hunter_pos;
@@ -382,6 +390,12 @@ void Push(Pending& p, u8* rag) {
     in.blade_vel = p.blade_vel;
     in.hit_speed = p.hit_speed;
     in.fallback_speed = p.tip_speed;
+    if (p.stake_blast) {
+        // Explosive force is independent of a slow trigger-release hand movement.
+        // Use the existing away-from-player direction and modest upward component.
+        in.blade_ok = false;
+        in.fallback_speed = 8.0f;
+    }
     const R::PushPlan plan = R::PlanPush(in, bodies.data(), n, cfg);
     s32 pushed = 0;
     if (g_apply != nullptr) {
@@ -538,7 +552,7 @@ void PS4_SYSV_ABI CtrlRagdollHook(u8* ctrl, u8* saved_ymm) {
         // It would go limp at once. melee_ragdoll_vanilla_pct: with that chance (one roll per kill)
         // it keeps the game's own death instead: nothing written, the death animation plays to its
         // end and the game's own event 228 hands it to the ragdoll there, no push.
-        if (R::RollVanilla(p.roll, VR::GetSettings().melee_ragdoll_vanilla_pct, g_dice)) {
+        if (!p.stake_blast && R::RollVanilla(p.roll, VR::GetSettings().melee_ragdoll_vanilla_pct, g_dice)) {
             LOG_INFO(Core,
                      "VR ragdoll: {} killed by {} -> kept the death animation: the {}% chance "
                      "(melee_ragdoll_vanilla_pct={}): a{} plays to its end, the game's ragdoll "
@@ -622,12 +636,20 @@ void Arm(u8* res, u8* player, u8* target) {
     p.atk = Read<s32>(res + ResAtkParam);
     MeleeHitInfo info{};
     if (MeleeHitInfoOf(res, info)) {
+        if (R::HeavyTwoHandMomentum(info.weapon_variation, info.form_b,
+                                   info.two_handed, info.transform) > 1.0f) {
+            p.push_attack = R::PushAttack::HeavyTwoHand;
+        }
         p.swing = true;
         p.serial = info.serial;
         p.kind = info.kind;
         p.transform = info.transform;
         p.tip_speed = info.tip_speed;
     }
+    p.stake_blast = R::IsStakeBlast(Read<s32>(res + 0x38), p.atk,
+                                   Read<s32>(res + ResBullet), Read<s32>(res + ResHand),
+                                   Read<u8>(res + ResCategory));
+    if (p.stake_blast) p.push_attack = R::PushAttack::StakeBlast;
     p.hit = {Read<float>(res + ResHitPosition), Read<float>(res + ResHitPosition + 4),
              Read<float>(res + ResHitPosition + 8)};
     if (!Position(player, p.hunter_pos)) {

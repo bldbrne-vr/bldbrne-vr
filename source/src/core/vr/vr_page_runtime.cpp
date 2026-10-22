@@ -1,11 +1,16 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
+#include "core/vr/summon_bell.h"
 #include "core/vr/lever_settings.h"
 #include "core/vr/lamp_channel.h"
 #include "core/vr/lamp_page.h"
-#include "core/vr/interaction_lamp_page.h"
-#include <cstdlib>
-#include <cstring>
+#include "core/vr/lamp_presentation.h"
 #include "core/vr/gun_settings.h"
 #include "core/vr/color_settings.h"
 #include "core/vr/graphics_status.h"
@@ -19,8 +24,10 @@
 #include <optional>
 #include <thread>
 #include <SDL3/SDL_events.h>
+#include <SDL3/SDL_filesystem.h>
 
 #include "common/logging/log.h"
+#include "common/memory_patcher.h"
 #include "common/thread.h"
 #include "core/vr/bloodborne_assets.h"
 #include "core/vr/body_settings.h"
@@ -43,6 +50,42 @@ std::string Bool(bool b) {
     return b ? "1" : "0";
 }
 
+// An upscaler's files beside the runtime (its folder there, or the VR_*_DIR override): a release
+// without FSR 4 or DLSS 5 greys their rows instead of offering a choice that cannot start.
+bool ProviderInstalled(const char* env, const char* folder, const char* file);
+
+// The accepted upscaler's files are installed (Off: true). Checked once each.
+bool UpscalerFilesPresent(const Graphics::Config& c) {
+    static const bool dlss = ProviderInstalled("VR_DLSS_DIR", "dlss", "vr_dlss_stereo.dll") &&
+                             ProviderInstalled("VR_DLSS_DIR", "dlss", "nvngx_dlss.dll");
+    static const bool neural = ProviderInstalled("VR_DLSS_DIR", "dlss", "nvngx_dlssnr.dll");
+    static const bool fsr4 = ProviderInstalled("VR_FSR4_DIR", "fsr4", "vr_fsr4_stereo.dll");
+    static const bool fsr31 = ProviderInstalled("VR_FSR31_DIR", "fsr31", "vr_fsr31_stereo.dll");
+    switch (c.upscaler) {
+    case Graphics::Upscaler::Dlss:
+        return dlss && (!c.dlss5 || neural);
+    case Graphics::Upscaler::Fsr4:
+        return fsr4;
+    case Graphics::Upscaler::Fsr31:
+        return fsr31;
+    default:
+        return true;
+    }
+}
+
+bool ProviderInstalled(const char* env, const char* folder, const char* file) {
+    std::filesystem::path dir;
+    if (const char* p = std::getenv(env); p && *p) {
+        dir = p;
+    } else if (const char* base = SDL_GetBasePath(); base) {
+        dir = std::filesystem::path(base) / folder;
+    } else {
+        return false;
+    }
+    std::error_code error;
+    return std::filesystem::is_regular_file(dir / file, error);
+}
+
 // The value of `key` in vr.ini's terms, from a settings struct (the live one, or a default one
 // for the code default).
 std::string ValueIn(const Settings &s, const Body::BodySettings &b, const Quick::QuickSettings &q,
@@ -58,8 +101,12 @@ std::string ValueIn(const Settings &s, const Body::BodySettings &b, const Quick:
         return FormatIni(TwoHand::Settings{}.swing_hum);
     if (key == "lamp_travel")
         return "1";
+    if (key == "physical_summon_bell")
+        return "1";
     if (key == "physical_levers")
         return "1"; // code default; live Get handles the atomic setting separately
+    if (key == "weighted_weapons")
+        return s.weighted_weapons == 2 ? "2" : Bool(s.WeaponWeightStrength() > 0.0f);
     if (key == "weapon_wall")
         return !t.weapon_wall ? "0" : t.weapon_wall_map ? "1" : "2";
     if (key == "blade_sounds")
@@ -141,6 +188,8 @@ std::string ValueIn(const Settings &s, const Body::BodySettings &b, const Quick:
         return Bool(s.hit_vignette);
     } else if (key == "ui_hud_scale_deg") {
         return FormatIni(s.ui_hud_scale_deg);
+    } else if (key == "outgoing_damage_pct") {
+        return std::to_string(s.outgoing_damage_pct);
     } else if (key == "player_hp_bonus_pct") {
         return std::to_string(s.player_hp_bonus_pct);
     } else if (key == "dodge_iframes_extra") {
@@ -150,10 +199,24 @@ std::string ValueIn(const Settings &s, const Body::BodySettings &b, const Quick:
     } else if (key == "melee_ragdoll_impulse") {
         return FormatIni(s.melee_ragdoll_impulse);
     } else if (key == "aa_mode") {
-        return Aa::Name(s.aa_mode);
+        return Aa::Name(GetRequestedAaMode());
+    } else if (key == "lod_bias") {
+        return std::to_string(s.lod_bias);
+    } else if (key == "lod_bias_live") {
+        return MemoryPatcher::LodLiveAvailable() ? "1" : "0";
+    } else if (key == "graphics_fsr4_available") {
+        static const bool installed = ProviderInstalled("VR_FSR4_DIR", "fsr4", "vr_fsr4_stereo.dll");
+        return installed ? "1" : "0";
+    } else if (key == "graphics_fsr31_available") {
+        static const bool installed = ProviderInstalled("VR_FSR31_DIR", "fsr31", "vr_fsr31_stereo.dll");
+        return installed ? "1" : "0";
+    } else if (key == "graphics_neural_available") {
+        // DLSS 5 needs NVIDIA's neural runtime beside the DLSS bridge.
+        static const bool installed = ProviderInstalled("VR_DLSS_DIR", "dlss", "nvngx_dlssnr.dll");
+        return installed ? "1" : "0";
     } else if (key == "ui_enemy_hp_bars") {
         return Bool(s.ui_enemy_hp_bars);
-    } else if (key == "ui_boss_hp_bar") {
+    } else if (key == "ui_boss_bar") {
         return Bool(s.ui_boss_hp_bar);
     }
     return {};
@@ -186,12 +249,18 @@ public:
             return FormatIni(TwoHand::GetTwoHandSettings().swing_hum);
         if (key == "lamp_travel")
             return Bool(Lamps::Enabled());
+        if (key == "physical_summon_bell")
+            return Bool(SummonBell::enabled.load());
         if (key == "physical_levers")
             return Bool(Lever::Enabled());
         if (key == "graphics_config")
             return Graphics::Serialize(Graphics::Accepted());
+        if (key == "graphics_native_stereo")
+            return std::getenv("VR_NATIVE_STEREO") ? "1" : "0";
+        if (key == "graphics_status" && !std::getenv("VR_NATIVE_STEREO"))
+            return "DIBR | Scale applies after restart. DLSS/FSR unavailable; saved settings kept.";
         if (key == "graphics_status")
-            return Graphics::RuntimeStatusText();
+            return Graphics::RuntimeStatusText(UpscalerFilesPresent(Graphics::Accepted()));
         if (key == "graphics_resolution")
             return Graphics::ResolutionText();
         return ValueIn(GetSettings(), Body::GetBodySettings(), Quick::GetQuickSettings(),
@@ -203,6 +272,10 @@ public:
         }
     }
     void Remove(const std::string& key) override {
+        if (key == "weighted_weapons") {
+            Set(key, "1"); // the default: on
+            return;
+        }
         static const Settings defaults{};
         static const Body::BodySettings body_defaults{};
         const std::string value = ValueIn(defaults, body_defaults, Quick::QuickSettings{},
@@ -229,27 +302,9 @@ constexpr std::array<const char*, 4> TextureNames{"MENU_Common_00003", "MENU_Com
 } // Anonymous namespace
 
 struct Runtime::Impl {
-    Interactions::LampPageRuntime lamp_runtime;
-    std::optional<Interactions::LampPageModel> lamp;
+    std::optional<Lamps::Model> lamp;
     Hover lamp_hover{};
-    Interactions::LampPagePresentation lamp_presentation{lamp_runtime};
-    Interactions::Module* lamp_module{}; // installed lifetime; the XR owner never hot-reloads it
-    bool lamp_initialized{};
-    void InitializeLampRuntime() {
-        if (lamp_initialized)
-            return;
-        lamp_initialized = true;
-        if (!VR::Interactions::DllRequested())
-            return;
-        lamp_module = new Interactions::Module();
-        lamp_module->EnableFaultBroadcast();
-        if (!lamp_module->LoadBesideExecutable()) {
-            lamp_runtime.ReportFault();
-            LOG_ERROR(Core, "VR lamp page: DLL unavailable: {}", lamp_module->Diagnostic());
-            return;
-        }
-        lamp_runtime.Bind(*lamp_module);
-    }
+    Lamps::Presentation lamp_presentation;
     SettingsStore store;
     Model model{store, [](const std::string& line) { LOG_INFO(Core, "{}", line); }};
     std::atomic<u32> requests{0};
@@ -683,19 +738,13 @@ double Runtime::SecondsSinceRequest() const {
 }
 
 bool Runtime::PollOpen() {
-    impl->InitializeLampRuntime();
     if (auto offer = Lamps::Mailbox().TakeOffer()) {
         if (impl->open) {
             Lamps::Mailbox().Cancel(offer->serial);
             return false;
         }
         impl->lamp_presentation.Reset();
-        impl->lamp.emplace(impl->lamp_runtime, std::move(*offer));
-        if (impl->lamp_runtime.Faulted()) {
-            Lamps::Mailbox().Cancel(impl->lamp->offer.serial);
-            impl->lamp.reset();
-            return false;
-        }
+        impl->lamp.emplace(std::move(*offer));
         impl->lamp_hover = {};
         RequestOpen();
     }
@@ -775,7 +824,7 @@ Event Runtime::HandleInput(const Input& in) {
     }
     if (impl->lamp) {
         auto& m = *impl->lamp;
-        if (!impl->lamp_runtime.Active(m.offer.serial) || !Lamps::Mailbox().Active(m.offer.serial)) {
+        if (!Lamps::Mailbox().Active(m.offer.serial)) {
             Close("lamp context ended");
             return Event::Closed;
         }
@@ -930,12 +979,10 @@ void Runtime::SetNotice(const std::string& text) {
 
 void Runtime::Tick(float dt) {
     if (impl->lamp) {
-        if (!impl->lamp_runtime.Active(impl->lamp->offer.serial) ||
-            !Lamps::Mailbox().Active(impl->lamp->offer.serial))
+        if (!Lamps::Mailbox().Active(impl->lamp->offer.serial))
             Close("lamp context ended");
     }
-    if (const char* failure =
-            Graphics::restart_failure.exchange(nullptr, std::memory_order_acquire))
+    if (const char* failure = Graphics::restart_failure.exchange(nullptr, std::memory_order_acquire))
         SetNotice(failure);
     bool fresh = false;
     {

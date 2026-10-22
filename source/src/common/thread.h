@@ -49,4 +49,7 @@ public:
 
 std::string GetCurrentThreadName();
 
+/// The OS thread id (a freeze hunt matches it to a stack dump of the process); 0 where unknown.
+u32 CurrentThreadId();
+
 } // namespace Common

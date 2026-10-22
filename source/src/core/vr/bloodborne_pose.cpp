@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <array>
 #include <chrono>
@@ -12,8 +18,6 @@
 #include "core/vr/bloodborne_layout.h"
 #include "core/vr/bloodborne_pose.h"
 #include "core/vr/hook_util.h"
-#include "core/vr/interaction_fault.h"
-#include "core/vr/interaction_pose.h"
 #include "core/vr/live_tune.h"
 #include "core/vr/pose_channel.h"
 #include "core/vr/pose_gestures.h"
@@ -87,9 +91,6 @@ using GetEventFlagFn = u32(PS4_SYSV_ABI*)(void* manager, u32 flag);
 
 u8* g_base = nullptr;
 bool g_ready = false;
-// Game-thread-owned context retained while the installed hook may call it.
-VR::Interactions::Module* g_pose_module{};
-bool g_pose_fault{};
 bool g_disabled = false;
 bool g_test_brain = false; // VR_POSE_TEST=brain: the Brain's flag and region forced (tests only)
 AddSpEffectFn g_add = nullptr;
@@ -104,7 +105,7 @@ struct SiteState {
     bool learned_ok{false};
     const char* block{nullptr};
     bool block_logged{false};
-    VR::Interactions::PoseTrigger trigger{};
+    P::Trigger trigger{};
     u32 fired{0};
     s32 fired_marker{-1};
     u32 wait_serial{0};
@@ -319,17 +320,6 @@ void InstallPose(VAddr base, u64 size) {
     if (const char* test = std::getenv("VR_POSE_TEST"); test != nullptr) {
         g_test_brain = std::string{test} == "brain";
     }
-    if(VR::Interactions::DllRequested() && !g_pose_module) {
-        g_pose_module=new VR::Interactions::Module();
-        g_pose_module->EnableFaultBroadcast();
-        if(!g_pose_module->LoadBesideExecutable()) {
-            g_pose_fault=true;g_disabled=true;
-            LOG_ERROR(Core,"VR pose: DLL marker policy unavailable: {}",g_pose_module->Diagnostic());
-            return;
-        }
-        g_site.trigger.Bind(*g_pose_module,g_pose_fault);
-    }
-    if(g_pose_fault)return;
     g_ready = true;
     LOG_INFO(Core,
              "VR pose: installed (AddSpEffect, GetEventFlag, EventFlagMan ok): the Brain of "
@@ -339,8 +329,7 @@ void InstallPose(VAddr base, u64 size) {
 }
 
 void PoseSiteA(u8* player) {
-    if (!g_ready || g_disabled || player == nullptr ||
-        VR::Interactions::ProcessFaultLatch().Tripped()) {
+    if (!g_ready || g_disabled || player == nullptr) {
         return;
     }
     auto& s = g_site;
@@ -436,7 +425,6 @@ void PoseSiteA(u8* player) {
     in.contact_hold_s = VR::Tune::Get("pose.hold_s", st.contact_hold_s);
     in.now_s = static_cast<double>(now) * 1e-9;
     const P::TriggerOutput out = s.trigger.Step(in);
-    if(g_pose_fault || VR::Interactions::ProcessFaultLatch().Tripped())return;
     if (out.count > 0) {
         std::string applied;
         bool first_added = false;

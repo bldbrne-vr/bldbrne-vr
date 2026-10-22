@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -109,8 +115,13 @@ struct MeleeSettings {
     bool budget{true};
     int budget_charges{2};
     float budget_scale{1.0f};
-    // The user's -20 (2026-10-05), -50 (10-06), then 60 ms shorter than -20: -80 (10-07).
+    // The tester's -20 (2026-10-05), -50 (10-06), then 60 ms shorter than -20: -80 (10-07).
     float budget_offset_ms{-80.0f};
+    // Quick weapons (a light recovery of budget_quick_s or less in the form): this many charges,
+    // the third a moment later and slower back (core/vr/melee_window.h BudgetConfig; the tester,
+    // 2026-10-15). 2: off.
+    int budget_quick_charges{3};
+    float budget_quick_s{0.64f};
     // The physical plunge (core/vr/plunge.h; 2026-10-12, not yet tried in the game): a swing
     // while the hunter falls keeps its attack until he lands (+0.15 s), so the blade you hold out
     // hits what you land on; after a fall at least melee_plunge_min_drop_m deep its hits deal
@@ -118,7 +129,7 @@ struct MeleeSettings {
     // landed byte and height are read with its signals).
     bool plunge{true};
     float plunge_min_drop_m{1.2f};
-    float plunge_damage{1.5f};
+    float plunge_damage{1.35f}; // (1.5 until 2026-10-16: the tester)
     float plunge_hold_s{2.5f}; // the attack never held longer than this after it opened
 };
 

@@ -45,6 +45,13 @@ void AddPatchToQueue(const patchInfo& patchToAdd);
 
 void PatchMemory(const patchInfo& patch);
 
+// vr.ini lod_bias changed in game (the VR page's Display > Distant detail): the Model LOD
+// patch's bias stored to its data slot (no code is rewritten). False when there is no slot
+// (the patch off, or no near memory): the change applies at the next start.
+bool SetLodBiasLive(int bias);
+// The Model LOD patch reads its bias from a slot (SetLodBiasLive applies at once).
+bool LodLiveAvailable();
+
 static std::vector<int32_t> PatternToByte(const std::string& pattern);
 uintptr_t PatternScan(const std::string& signature);
 

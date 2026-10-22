@@ -6,10 +6,6 @@
 #include <vector>
 #include "common/types.h"
 
-namespace Shader {
-struct FragmentRuntimeInfo;
-}
-
 namespace Shader::Backend::SPIRV {
 
 enum class AuxShaderType : u32 {
@@ -18,7 +14,6 @@ enum class AuxShaderType : u32 {
     PassthroughTES,
 };
 
-[[nodiscard]] std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type,
-                                                      const FragmentRuntimeInfo& fs_info);
+[[nodiscard]] std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type, u64 location_mask);
 
 } // namespace Shader::Backend::SPIRV

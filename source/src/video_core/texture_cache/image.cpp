@@ -1,10 +1,13 @@
-#include "../../../scratchpad/dual-eye-perf/profile_scopes.h"
+#include "video_core/native_stereo/profile_scopes.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdlib>
 #include <ranges>
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
+#include "video_core/native_stereo/native_stereo.h"
 #include "common/assert.h"
+#include "common/slow_scope.h"
 #include "video_core/fast_render.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -14,6 +17,7 @@
 #include "video_core/renderer_vulkan/vr_scene_proxy.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/vma_fallback.h"
 
 #include <vk_mem_alloc.h>
 
@@ -103,7 +107,24 @@ void UniqueImage::Destroy() {
     }
 }
 
+u64 UniqueImage::SizeBytes() const {
+    if (!allocation) {
+        return 0;
+    }
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(allocator, allocation, &info);
+    return info.size;
+}
+
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
+    const bool created = TryCreate(image_ci);
+    if (!created) {
+        Common::CrashRecord::Note("out of memory: a texture could not be allocated");
+    }
+    ASSERT_MSG(created, "Failed allocating image: out of device memory");
+}
+
+bool UniqueImage::TryCreate(const vk::ImageCreateInfo& image_ci) {
     this->image_ci = image_ci;
     ASSERT(!image);
     const VmaAllocationCreateInfo alloc_info = {
@@ -117,11 +138,23 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
 
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     VkImage unsafe_image{};
-    VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_info, &unsafe_image,
-                                     &allocation, nullptr);
+    Common::Slow::Scope slow{Common::Slow::ImageAlloc,
+                             u64{image_ci.extent.width} * image_ci.extent.height * image_ci.arrayLayers * 4};
+    const VkResult result = VideoCore::CreateWithFallback(
+        "a texture", alloc_info,
+        [&](const VmaAllocationCreateInfo& ci) {
+            return vmaCreateImage(allocator, &image_ci_unsafe, &ci, &unsafe_image, &allocation,
+                                  nullptr);
+        },
+        false); // The cache may still recover; record a crash note only on final failure.
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+        allocation = {};
+        return false;
+    }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
+    return true;
 }
 
 Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -201,13 +234,31 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
     backing = &backing_images.emplace_back();
     backing->num_samples = info.num_samples;
     backing->image = UniqueImage{instance->GetDevice(), instance->GetAllocator()};
-    backing->image.Create(image_ci);
+    backing->image.image_ci = image_ci;
+    // Failure injection is cache-only and happens once per image, never on its retry.
+    static const u32 fail_every = [] {
+        const char* value = std::getenv("VR_TEST_IMAGE_OOM_EVERY");
+        return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0u;
+    }();
+    static std::atomic<u32> created{0};
+    if (fail_every && (created.fetch_add(1, std::memory_order_relaxed) + 1) % fail_every == 0) {
+        allocation_failed = true;
+        return;
+    }
+    RetryAllocation();
+}
 
+bool Image::RetryAllocation() {
+    allocation_failed = !backing->image.TryCreate(backing->image.image_ci);
+    if (allocation_failed) {
+        return false;
+    }
     Vulkan::SetObjectName(instance->GetDevice(), GetImage(),
                           "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{}", info.size.width,
                           info.size.height, info.size.depth, AmdGpu::NameOf(info.tile_mode),
                           vk::to_string(info.pixel_format), info.guest_address, info.guest_size,
                           info.resources.layers, info.resources.levels, info.num_samples);
+    return true;
 }
 
 Image::~Image() = default;

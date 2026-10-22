@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -14,7 +20,7 @@
 // default). Pure: no emulator state, unit tested in tests/test_ui_conditions.cpp; the resolve
 // (vr_ui_resolve.comp FLAG_CONDITIONS) mirrors the strip's geometry.
 //
-// The game draws the meter (game asset ConditionGaugeList at stage (978, 132), the top centre) as up
+// The game draws the meter (fe.gfx ConditionGaugeList at stage (978, 132), the top centre) as up
 // to five rows, compacted from the top, each an icon (stage x 840..884) and a bar from x 885 whose
 // length depends on the character's resistance (L % of the full bar: 885 + 1.9 L + 9). Each frame
 // it fills the rows into a static block (icon -1 = row off; L at +0x18). In VR the icon and the

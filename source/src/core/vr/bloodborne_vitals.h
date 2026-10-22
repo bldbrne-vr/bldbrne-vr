@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -17,9 +23,6 @@ namespace VR::Bloodborne {
 
 // Site A: the main player's update. `module` = the eboot base.
 void VitalsSiteA(u8* module, u8* player);
-
-// Camera hook installation, before any gauge callback; retains the private visual context.
-void InstallVitalsVisual();
 
 // Render-camera hook (loop thread), every driven frame: the gauge's list for this camera.
 void VitalsRenderTick(u64 record_id, const float* rows, const float* position);

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <filesystem>
 #include <span>
 
 #include "common/types.h"
@@ -18,6 +19,19 @@ enum class WindowsGuestRedZoneProtectionMode : u32 {
 
 namespace Core::WindowsGuestRedZoneProtection {
 
+// Required for every Windows user of this Bloodborne build, including profiles saved with
+// Disabled. Keep the legacy enum/config key readable; it cannot disable the runtime protection.
+constexpr WindowsGuestRedZoneProtectionMode EffectiveMode(
+    WindowsGuestRedZoneProtectionMode configured) noexcept {
+#ifdef _WIN32
+    return WindowsGuestRedZoneProtectionMode::StaticPatching;
+#else
+    return configured;
+#endif
+}
+
+inline constexpr auto DefaultMode = EffectiveMode(WindowsGuestRedZoneProtectionMode::Disabled);
+
 void SetActiveMode(WindowsGuestRedZoneProtectionMode mode) noexcept;
 WindowsGuestRedZoneProtectionMode GetActiveMode() noexcept;
 bool IsStaticPatchingEnabled() noexcept;
@@ -32,6 +46,9 @@ namespace Core {
 
 // Windows static guest red-zone protection
 struct RedZonePatchResult {
+    bool analysis_cache_hit{};
+    bool analysis_cache_written{};
+    u64 decoded_function_count{};
     u64 function_count{};
     u64 instruction_count{};
     u64 red_zone_function_count{};
@@ -61,7 +78,8 @@ bool RetryAtPatchedSite(void* code_address);
 
 // Windows static guest red-zone protection
 /// Keeps Windows exception dispatch outside live guest red zones at faultable memory accesses.
-RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
-                                                  std::span<const uintptr_t> function_starts);
+RedZonePatchResult PatchRedZoneMemoryInstructions(
+    u64 segment_addr, u64 segment_size, std::span<const uintptr_t> function_starts,
+    const std::filesystem::path& cache_directory = {});
 
 } // namespace Core

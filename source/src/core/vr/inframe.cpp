@@ -1,5 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -11,7 +18,10 @@ namespace VR::InFrame {
 
 namespace {
 
-constexpr std::size_t RingSize = 16; // up to 8 camera records x the producers
+// Up to 32 camera records x the producers (quick items, vitals): ~350 ms at 90 Hz. 16 (8 records,
+// ~90 ms) could drop a frame's list before a frame that was late to draw took it: the chest's
+// items gone for that frame (2026-10-18). Matched by record id (ids only grow), ~2 MB in all.
+constexpr std::size_t RingSize = 64;
 // Available(): this many lists in a row submitted and none drawn means the renderer cannot draw
 // into this game's frame; it is tried again after RetryNs.
 constexpr std::uint64_t RefusedStreak = 30;
@@ -183,6 +193,16 @@ bool Has(std::uint64_t record) {
         }
     }
     return false;
+}
+
+std::uint64_t NewestRecord() {
+    auto& r = R();
+    std::scoped_lock lock{r.mutex};
+    std::uint64_t newest = 0;
+    for (const auto& list : r.lists) {
+        newest = std::max(newest, list.record);
+    }
+    return newest;
 }
 
 Stats GetStats() {

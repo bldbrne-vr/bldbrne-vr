@@ -1,4 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #pragma once
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vr_temporal_pair.h"
@@ -42,8 +47,8 @@ class VrTemporalImages {
     uint32_t UncopiedBytesPerPixel() const {
         if (!ready || !direct)
             return 0u;
-        return 16u * uint32_t(2 - std::popcount(copied_color)) +
-               8u * uint32_t(2 - std::popcount(copied_depth));
+        return 16u * uint32_t(allocated.views - std::popcount(copied_color)) +
+               8u * uint32_t(allocated.views - std::popcount(copied_depth));
     }
     std::array<BbDlssEvaluate, 2> Images() const;
     // Plan flags Fsr4VerifyTwin (FAST_UPSCALER_VERIFY, bit 37), Fsr4VerifyInterleave

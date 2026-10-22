@@ -1,4 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #include <cstdlib>
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -16,12 +21,18 @@ VrFsr4Runtime::~VrFsr4Runtime() {
 #endif
 }
 bool VrFsr4Runtime::Load() {
+    // Reconstruction currently consumes paired native images, never the DIBR centre frame.
+    if (!std::getenv("VR_NATIVE_STEREO")) {
+        problem = "Disabled in DIBR mode; native-stereo preference preserved";
+        return false;
+    }
     if (attempted)
         return api != nullptr;
     attempted = true;
 #ifdef _WIN32
+    const bool fsr31_provider = provider == VR::Graphics::Upscaler::Fsr31;
     std::filesystem::path directory;
-    if (const char* p = std::getenv("VR_FSR4_DIR"); p && *p)
+    if (const char* p = std::getenv(fsr31_provider ? "VR_FSR31_DIR" : "VR_FSR4_DIR"); p && *p)
         directory = std::filesystem::absolute(p);
     else {
         std::wstring path(32768, L'\0');
@@ -31,16 +42,22 @@ bool VrFsr4Runtime::Load() {
             return false;
         }
         path.resize(n);
-        directory = std::filesystem::path(path).parent_path() / "fsr4";
+        directory = std::filesystem::path(path).parent_path() / (fsr31_provider ? "fsr31" : "fsr4");
     }
-    assets = directory / "fsr4_shaders";
+    // Explicit diagnostic override: never packaged or selected by the launcher.
+    const char* fsr31 = std::getenv("VR_FSR31_PROBE_DLL");
+    const bool probe31 = !fsr31_provider && fsr31 && *fsr31;
+    const auto library = probe31 ? std::filesystem::absolute(fsr31)
+                                 : directory / (fsr31_provider ? "vr_fsr31_stereo.dll" : "vr_fsr4_stereo.dll");
+    assets = fsr31_provider ? directory : directory / "fsr4_shaders";
     std::error_code error;
-    if (!std::filesystem::is_regular_file(directory / "vr_fsr4_stereo.dll", error) ||
-        !std::filesystem::is_regular_file(assets / "LICENSE-FSR4-v07.txt", error)) {
-        problem = "FSR bridge/assets missing (fsr4 folder or VR_FSR4_DIR)";
+    if (!std::filesystem::is_regular_file(library, error) ||
+        (!fsr31_provider && !probe31 && !std::filesystem::is_regular_file(assets / "LICENSE-FSR4-v07.txt", error))) {
+        problem = fsr31_provider ? "FSR 3.1.5 bridge missing (fsr31 folder or VR_FSR31_DIR)"
+                                 : "FSR 4 bridge/assets missing (fsr4 folder or VR_FSR4_DIR)";
         return false;
     }
-    module = LoadLibraryExW((directory / "vr_fsr4_stereo.dll").c_str(), nullptr,
+    module = LoadLibraryExW(library.c_str(), nullptr,
                             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     const auto get = module ? reinterpret_cast<VrFsr4GetApiFn>(GetProcAddress(
                                   static_cast<HMODULE>(module), "VrFsr4GetStereoApi"))
@@ -53,6 +70,7 @@ bool VrFsr4Runtime::Load() {
         problem = "FSR stereo bridge ABI mismatch/incomplete API";
         return false;
     }
+    if (probe31) LOG_INFO(Render_Vulkan, "FSR diagnostic override: FSR 3.1.5 provider (no frame generation); FSR4 settings select its input ratio");
     api = candidate;
     // ABI 2 bridges accept the optimized post; newer ones list further flags in an export.
     uint32_t bridge_flags = api->abi >= 2 ? VR_FSR4_FLAG_OPTIMIZED_POST : 0u;
@@ -71,12 +89,12 @@ bool VrFsr4Runtime::Load() {
     // FAST bit 37 uses bbport's post passes only when their manifest was packaged, and the
     // fenced SPD auto-exposure pass (packaged with that manifest) only when the bridge takes
     // its flag. The bridge loads either only for a context whose flags request it.
-    optimized_post = api->abi >= 2 &&
+    optimized_post = !fsr31_provider && !probe31 && api->abi >= 2 &&
                      std::filesystem::is_regular_file(assets / "opt" / "post-lds.json", error);
     fenced_spd = optimized_post && (bridge_flags & VR_FSR4_FLAG_FENCED_SPD) != 0 &&
                  std::filesystem::is_regular_file(assets / "opt" / "spd_auto_exposure.spv", error);
-    LOG_INFO(Render_Vulkan, "FSR4 runtime: bridge flags {:#x}, optimized post {}, fenced SPD {}",
-             bridge_flags, optimized_post ? "installed" : "absent",
+    LOG_INFO(Render_Vulkan, "{} runtime: bridge flags {:#x}, optimized post {}, fenced SPD {}",
+             VR::Graphics::UpscalerName(provider), bridge_flags, optimized_post ? "installed" : "absent",
              fenced_spd ? "installed" : "absent");
     return true;
 #else
@@ -86,13 +104,15 @@ bool VrFsr4Runtime::Load() {
 }
 VrFsr4Session* VrFsr4Runtime::Activate(const VR::Graphics::Config& accepted,
                                        const Instance& instance) {
-    if (accepted.upscaler != VR::Graphics::Upscaler::Fsr4) {
+    if (accepted.upscaler != provider) {
         if (session)
             session->Disable();
         return nullptr;
     }
-    if (!instance.IsVrFsr4Supported()) {
-        problem = "FSR 4 required device features are unavailable";
+    if (provider == VR::Graphics::Upscaler::Fsr31 ? !instance.IsVrFsr31Supported()
+                                                : !instance.IsVrFsr4Supported()) {
+        problem = std::string(VR::Graphics::UpscalerName(provider)) +
+                  " required device features are unavailable";
         return nullptr;
     }
     if (!Load())

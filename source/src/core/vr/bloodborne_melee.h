@@ -1,11 +1,16 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
 #include "common/types.h"
 #include "core/vr/anim_classes.h"
 #include "core/vr/body_frame.h"
-#include "core/vr/body_target_facts.h"
 
 namespace VR::Bow { struct NativeGeometry; }
 
@@ -100,6 +105,9 @@ bool MeleeDamage(u8* res, u8* target, float* damage);
 // not (with melee_kill_ragdoll; R1 / R2's canned swings too): its hit capsule's two ends
 // (MeleeBladeSegment, the grip side first) and their velocities from that tick and the one before.
 struct MeleeHitInfo {
+    s32 weapon_variation{-1}; // captured when the killing swing opened
+    bool form_b{false};
+    bool two_handed{false};
     bool swing{false};      // a physical swing's hit (else swing's fields below are not set)
     u32 serial{0};          // its window
     const char* kind{""};   // "light", "heavy", "charged" ...
@@ -117,7 +125,7 @@ bool MeleeHitInfoOf(u8* res, MeleeHitInfo& out);
 
 // SolveBody (loop thread): the blade's bite on the right arm's target, model space (melee_bite;
 // none without a recent hit).
-VR::Body::BiteFacts MeleeTargetFacts();
+void MeleeBite(VR::Body::ModelTarget& right_target, s64 now_ns);
 
 // quick_use_wipe: the right weapon's blade (its hit capsule's axis, base -> tip, world) for the
 // paper wiped along it; false (`how`: why) when not known. `grip`: the weapon's grip (dummy 300)

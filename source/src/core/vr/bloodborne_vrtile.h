@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -9,7 +15,7 @@
 // builds use for their "Debug" tile: the game's own cursor, highlight, sound, D-pad navigation and
 // row label ("VR"), our handler on A. Code side: core/vr/vr_tile_patch.h (signature-checked sites);
 // movie side: core/vr/gfx_tile.h (Item_0_3 with our icon, served by the emulator in place of
-// game asset, core/file_sys/file_override.h). Any failed check leaves the grid untouched.
+// menu/ingametop.gfx, core/file_sys/file_override.h). Any failed check leaves the grid untouched.
 // Also with vr_menu=1: a read-only probe of the grid's cursor (the log's `VR tile probe:` lines).
 namespace VR::Bloodborne {
 

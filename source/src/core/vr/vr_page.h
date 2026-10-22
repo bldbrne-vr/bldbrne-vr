@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -87,12 +93,12 @@ struct Tab {
     Button right;
 };
 
-// ---- The rows (design.md section 3, with the user's choices of 2026-10-05) ----------------------
+// ---- The rows (design.md section 3, with the design choices of 2026-10-05) ----------------------
 
 inline const std::vector<Row>& Rows() {
     static const std::vector<Row> rows = [] {
         std::vector<Row> r;
-        // General > Body (core/vr/player_body.h, the user's design of 2026-10-09: "2 settings.
+        // General > Body (core/vr/player_body.h, the tester's design of 2026-10-09: "2 settings.
         // First option has 2 options 'As the player -- As the hunter' toggling between the two sets
         // the base height. The rest is adjustment, that goes -10+10"). Both live.
         r.push_back({"height", "Height",
@@ -138,6 +144,10 @@ inline const std::vector<Row>& Rows() {
                      Widget::Choice,
                      {"lamp_travel", nullptr},
                      {{"Off", {"0", nullptr}}, {"On", {"1", nullptr}}}});
+        r.push_back({"physical_summon_bell", "Physical summon bell",
+                     "First person: B draws the bell; shake to summon. B again cancels.",
+                     Widget::Choice, {"physical_summon_bell", nullptr},
+                     {{"On", {"1", nullptr}}, {"Off", {"0", nullptr}}}});
         r.push_back({"physical_levers", "Physical levers",
                      "Grip a lever with either hand and pull. Off: original interaction.",
                      Widget::Choice, {"physical_levers", nullptr},
@@ -213,24 +223,29 @@ inline const std::vector<Row>& Rows() {
                      Widget::Choice, {"melee_stamina_pct", nullptr},
                      {{"Original", {"100", nullptr}}, {"80%", {"80", nullptr}},
                       {"50%", {"50", nullptr}}, {"10%", {"10", nullptr}}}});
+        r.push_back({"outgoing_damage", "Damage dealt",
+                     "Your attack damage: -30% to +30%. 0% is normal. Applies immediately.",
+                     Widget::Number, {"outgoing_damage_pct", nullptr}, {},
+                     -30, 30, 5, nullptr, "%"});
+        r.back().signed_value = true;
         r.push_back({"hp_bonus", "Extra health",
-                     "More maximum health for the hunter. Takes effect after a restart.",
+                     "More maximum health for the hunter. Applies while playing.",
                      Widget::Choice, {"player_hp_bonus_pct", nullptr},
                      {{"Off", {"0", nullptr}},
                       {"+10 %", {"10", nullptr}},
                       {"+20 %", {"20", nullptr}},
                       {"+30 %", {"30", nullptr}},
                       {"+50 %", {"50", nullptr}}},
-                     0, 10, 1, nullptr, "", 0, 1.0f, true});
+                     0, 10, 1, nullptr, "", 0, 1.0f, false});
         r.push_back({"iframes", "Longer dodge invincibility",
-                     "Extra frames of invincibility in a dodge. Takes effect after a restart.",
+                     "Extra frames of invincibility in a dodge. Changes apply to your next dodge.",
                      Widget::Choice, {"dodge_iframes_extra", nullptr},
                      {{"Off", {"0", nullptr}},
                       {"+1 frame", {"1", nullptr}},
                       {"+2 frames", {"2", nullptr}},
                       {"+3 frames", {"3", nullptr}},
                       {"+4 frames", {"4", nullptr}}},
-                     0, 10, 1, nullptr, "", 0, 1.0f, true});
+                     0, 10, 1, nullptr, "", 0, 1.0f, false});
         // Blade kills (core/vr/bloodborne_ragdoll.h, 2026-10-08): the instant ragdoll on a
         // right-hand melee kill and its push, live: the damage detour reads melee_kill_ragdoll at
         // every hit and the push reads melee_ragdoll_impulse when it is applied. On, a kill still
@@ -263,11 +278,19 @@ inline const std::vector<Row>& Rows() {
         r.push_back({"aa", "Anti-aliasing",
                      // About 870 of the frame's 900 stage px at 24 px (the menu font; a line of
                      // 69 characters measured 844). A wider line shrinks to fit.
-                     "Game FXAA, dual-eye SMAA, or None. Bypassed while DLSS or FSR 4 is on.",
+                     "Game FXAA, dual-eye SMAA, or None. Bypassed while DLSS or FSR is on.",
                      Widget::Choice, {"aa_mode", nullptr},
                      {{"Game FXAA", {"fxaa", nullptr}},
                       {"SMAA", {"smaa", nullptr}},
                       {"None", {"off", nullptr}}}});
+        // Graphics > Display (vr.ini lod_bias, 2026-10-17): the Model LOD patch's bias, read as
+        // the game starts.
+        r.push_back({"lod", "Distant detail",
+                     "Performance: the game's simpler distant models, fastest. {lod_apply}",
+                     Widget::Choice, {"lod_bias", nullptr},
+                     {{"Performance", {"0", nullptr}},
+                      {"Balanced", {"-1", nullptr}},
+                      {"Quality", {"-2", nullptr}}}});
         // Graphics > Display (core/vr/bloodborne_enemy_bars.h, 2026-10-08): the bars over the
         // enemies you hit or lock on to, with their damage numbers, live (the EnemyTag visibility
         // hook reads ui_enemy_hp_bars at every tag update). The HUD tab's five slots are taken.
@@ -275,12 +298,12 @@ inline const std::vector<Row>& Rows() {
                      "The bars over enemies you hit or lock on to.",
                      Widget::Choice, {"ui_enemy_hp_bars", nullptr},
                      {{"On", {"1", nullptr}}, {"Off", {"0", nullptr}}}});
-        // Graphics > Display (2026-10-15): the boss's bar, hidden by default; shown, it moves near
-        // the top of the view (bloodborne_enemy_bars.h), live.
+        // Graphics > Display (2026-10-15): the boss's bar, shown by default (2026-10-18); shown,
+        // it moves near the top of the view (bloodborne_enemy_bars.h), live.
         r.push_back({"boss_bar", "Show boss health bar",
                      "The boss's bar, shown near the top of the view.",
-                     Widget::Choice, {"ui_boss_hp_bar", nullptr},
-                     {{"Off", {"0", nullptr}}, {"On", {"1", nullptr}}}});
+                     Widget::Choice, {"ui_boss_bar", nullptr},
+                     {{"On", {"1", nullptr}}, {"Off", {"0", nullptr}}}});
         r.push_back({"graphics_resolution",
                      "Headset resolution",
                      "Recommended per-eye resolution reported by OpenXR.",
@@ -301,27 +324,27 @@ inline const std::vector<Row>& Rows() {
         r.push_back(scale);
         r.push_back({"graphics_dlss",
                      "DLSS",
-                     "Render smaller and reconstruct both eyes. DLSS turns FSR 4 and DLSS 5 off.",
+                     "Render smaller and reconstruct both eyes. DLSS turns FSR and DLSS 5 off.",
                      Widget::Choice,
                      {"graphics_dlss"},
                      {{"Off", {"0"}}, {"On", {"1"}}}});
         r.push_back({"graphics_fsr4",
-                     "FSR 4",
-                     "Render smaller and reconstruct both eyes. FSR 4 turns DLSS and DLSS 5 off.",
+                     "FSR",
+                     "Choose FSR 4 or FSR 3.1.5 to reconstruct both eyes. Turns DLSS off.",
                      Widget::Choice,
                      {"graphics_fsr4"},
-                     {{"Off", {"0"}}, {"On", {"1"}}}});
+                     {{"Off", {"0"}}, {"FSR 4", {"1"}}, {"FSR 3.1.5", {"2"}}}});
         const std::vector<Option> profiles{
             {"Performance", {"0"}}, {"Balanced", {"1"}}, {"Quality", {"2"}}};
         r.push_back({"graphics_mode",
                      "Profile",
-                     "Requires DLSS or FSR 4. Each remembers its own profile.",
+                     "Requires DLSS or FSR. DLSS and FSR remember their profiles.",
                      Widget::Choice,
                      {"graphics_mode"},
                      profiles});
         r.push_back({"graphics_neural",
                      "DLSS 5",
-                     "Neural lighting and detail. Turns regular DLSS and FSR 4 off; ACCEPT applies.",
+                     "Neural lighting and detail. Turns regular DLSS and FSR off; ACCEPT applies.",
                      Widget::Choice,
                      {"graphics_neural"},
                      {{"Off", {"0"}}, {"On", {"1"}}}});
@@ -416,7 +439,7 @@ inline const std::vector<Row>& Rows() {
                      {{"On", {"1", nullptr}}, {"Off", {"0", nullptr}}}});
         r.push_back({"shoulder_switch",
                      "Shoulder weapon switch",
-                     "B at right shoulder / Y at left: tap to switch, hold 1.2 seconds for unarmed. Tap unarmed to restore the remembered weapon.",
+                     "B at right shoulder / Y at left: tap to switch, hold about 0.7 seconds for unarmed. Tap unarmed to restore the remembered weapon.",
                      Widget::Choice,
                      {"shoulder_switch", nullptr},
                      {{"Off", {"0", nullptr}}, {"On", {"1", nullptr}}}});
@@ -460,10 +483,15 @@ inline const std::vector<Row>& Rows() {
                      "%",
                      0,
                      .01f});
-        r.push_back({"gun_wrist_reload", "Wrist-flick reload",
-                     "Release the trigger, steady your wrist briefly, then flick it in any direction to reload.",
+        r.push_back({"gun_wrist_reload", "Flick to reload",
+                     "Wrist flick: release the trigger and flick firmly after each shot. Off/Original: fire again without a flick.",
                      Widget::Choice, {"gun_wrist_reload", nullptr},
-                     {{"Off", {"0", nullptr}}, {"On", {"1", nullptr}}}});
+                     {{"Wrist flick", {"1", nullptr}}, {"Off/Original", {"0", nullptr}}}});
+        r.push_back({"weighted_weapons", "Weighted weapons",
+                     "Weight, gravity and air resistance for rigid weapons. Light softens these effects. Whip forms are excluded.",
+                     Widget::Choice, {"weighted_weapons", nullptr},
+                     {{"Off", {"0", nullptr}}, {"On (Light)", {"2", nullptr}},
+                      {"On (Regular)", {"1", nullptr}}}}); // regular by default
         // vr.ini weapon_wall: defaults to 2, weapons solid against each other but
         // passing through walls. 0 disables solid weapons; 1 also enables walls.
         r.push_back({"weapon_wall", "Solid weapons",
@@ -542,7 +570,8 @@ inline const std::vector<Tab>& Tabs() {
         // Existing display controls keep their immediate-apply behavior.
         t.push_back({"Display",
                      {"Image", "Display"},
-                     {RowIndex("aa"), -1, RowIndex("enemy_bars"), RowIndex("boss_bar"), -1},
+                     {RowIndex("aa"), RowIndex("lod"), RowIndex("enemy_bars"), RowIndex("boss_bar"),
+                      -1},
                      {},
                      defaults});
         const Button accept{"ACCEPT", "Save all pending Graphics and DLSS 5 choices together.",
@@ -590,12 +619,16 @@ inline const std::vector<Tab>& Tabs() {
         t.push_back({"Interactions",
                      {"Hands", "Enemy attacks"},
                      {RowIndex("physical_levers"), RowIndex("lamp_travel"),
-                      RowIndex("vr_grab_attacks"), -1, -1},
+                      RowIndex("vr_grab_attacks"), RowIndex("physical_summon_bell"), -1},
                      {},
                      defaults});
         t.push_back({"Color", {"Color", "Brightness"},
                      {RowIndex("color_contrast"), RowIndex("color_saturation"),
                       RowIndex("color_gamma"), -1, -1}, {}, defaults});
+        t.push_back({"Weapon weight", {"Handling", nullptr},
+                     {RowIndex("weighted_weapons"), -1, -1, -1, -1}, {}, defaults});
+        t.push_back({"Damage", {"Attacks", nullptr},
+                     {RowIndex("outgoing_damage"), -1, -1, -1, -1}, {}, defaults});
         return t;
     }();
     return tabs;
@@ -648,7 +681,9 @@ public:
     }
     std::string Get(const std::string& key) override {
         if (!key.starts_with("graphics_") || key == "graphics_resolution" ||
-            key == "graphics_config" || key == "graphics_status")
+            key == "graphics_config" || key == "graphics_status" ||
+            key == "graphics_fsr4_available" || key == "graphics_fsr31_available" || key == "graphics_neural_available" ||
+            key == "graphics_native_stereo")
             return source.Get(key);
         const auto c = Current();
         if (key == "graphics_scale")
@@ -656,9 +691,12 @@ public:
         if (key == "graphics_dlss")
             return c.upscaler == Graphics::Upscaler::Dlss && !c.dlss5 ? "1" : "0";
         if (key == "graphics_fsr4")
-            return c.upscaler == Graphics::Upscaler::Fsr4 ? "1" : "0";
+            return c.upscaler == Graphics::Upscaler::Fsr4 ? "1" :
+                   c.upscaler == Graphics::Upscaler::Fsr31 ? "2" : "0";
+        if (key == "graphics_fsr31")
+            return c.upscaler == Graphics::Upscaler::Fsr31 ? "1" : "0";
         if (key == "graphics_mode")
-            return std::to_string(int(c.upscaler == Graphics::Upscaler::Fsr4 ? c.fsr4 : c.dlss));
+            return std::to_string(int(Graphics::IsFsr(c.upscaler) ? c.fsr4 : c.dlss));
         if (key == "graphics_neural")
             return c.upscaler == Graphics::Upscaler::Dlss && c.dlss5 ? "1" : "0";
         if (key == "graphics_neural_mode")
@@ -687,10 +725,18 @@ public:
             } else if (c.upscaler == Graphics::Upscaler::Dlss && !c.dlss5)
                 c.upscaler = Graphics::Upscaler::Off;
         } else if (key == "graphics_fsr4") {
+            if ((n == 1 && source.Get("graphics_fsr4_available") == "0") ||
+                (n == 2 && source.Get("graphics_fsr31_available") == "0")) return;
             if (n) {
-                c.upscaler = Graphics::Upscaler::Fsr4;
+                c.upscaler = n == 2 ? Graphics::Upscaler::Fsr31 : Graphics::Upscaler::Fsr4;
                 c.dlss5 = false;
-            } else if (c.upscaler == Graphics::Upscaler::Fsr4)
+            } else if (Graphics::IsFsr(c.upscaler))
+                c.upscaler = Graphics::Upscaler::Off;
+        } else if (key == "graphics_fsr31") {
+            if (n) {
+                c.upscaler = Graphics::Upscaler::Fsr31;
+                c.dlss5 = false;
+            } else if (c.upscaler == Graphics::Upscaler::Fsr31)
                 c.upscaler = Graphics::Upscaler::Off;
         } else if (key == "graphics_mode") {
             if (c.upscaler == Graphics::Upscaler::Off || c.dlss5)
@@ -742,12 +788,26 @@ inline bool Enabled(const Row& row, Store& store) {
     const std::string_view id = row.id;
     if (row.widget == Widget::ReadOnly)
         return false;
+    // The current reconstruction path needs native stereo's paired images and motion.
+    // Preserve the saved preference, but keep DIBR's working spatial AA accessible.
+    if (store.Get("graphics_native_stereo") == "0") {
+        if (id == "aa" || id == "graphics_scale") return true;
+        if (id.starts_with("graphics_")) return false;
+    }
     if (id == "aa") {
         const auto accepted = Graphics::Parse(store.Get("graphics_config"));
         return !accepted || accepted->upscaler == Graphics::Upscaler::Off;
     }
+    // A release without FSR 4 or DLSS 5 (their files absent): those choices are greyed. A store
+    // that does not know (empty) leaves them on.
+    if (id == "graphics_fsr31")
+        return store.Get("graphics_fsr31_available") != "0";
+    if (id == "graphics_fsr4")
+        return store.Get("graphics_fsr4_available") != "0" || store.Get("graphics_fsr31_available") == "1";
+    if (id == "graphics_neural")
+        return store.Get("graphics_neural_available") != "0";
     if (id == "graphics_mode")
-        return store.Get("graphics_dlss") == "1" || store.Get("graphics_fsr4") == "1";
+        return store.Get("graphics_dlss") == "1" || store.Get("graphics_fsr4") == "1" || store.Get("graphics_fsr31") == "1";
     if (id == "graphics_neural_mode" || id == "graphics_intensity" || id == "graphics_detail" ||
         id == "graphics_lighting")
         return store.Get("graphics_neural") == "1";
@@ -837,7 +897,14 @@ inline std::string RowLabel(const Row& row, Store& store) {
                               });
 }
 inline std::string RowHelp(const Row& row, Store& store) {
-    return VR::Thumbs::Expand(ExpandEntries(row.help != nullptr ? row.help : "", store),
+    std::string help = row.help != nullptr ? row.help : "";
+    // Distant detail: live when the LOD patch reads its bias from a slot (memory_patcher), else
+    // saved for the next start (store key lod_bias_live: "0" only when it cannot be live).
+    if (const auto at = help.find("{lod_apply}"); at != std::string::npos) {
+        help.replace(at, 11, store.Get("lod_bias_live") == "0" ? "Applies at the next start."
+                                                                : "Applies at once.");
+    }
+    return VR::Thumbs::Expand(ExpandEntries(help, store),
                               SticksSwapped(store), [&](Thumbs::Control physical) {
                                   return store.ControlName(physical);
                               });
@@ -939,7 +1006,11 @@ inline Change Step(const Row& row, Store& store, int delta) {
     case Widget::Choice: {
         std::vector<int> offered;
         for (size_t i = 0; i < row.options.size(); ++i) {
-            if (!row.options[i].ini_only) {
+            const auto& option = row.options[i];
+            const bool missing_fsr = std::string_view(row.id) == "graphics_fsr4" &&
+                ((SameValue("1", option.values[0]) && store.Get("graphics_fsr4_available") == "0") ||
+                 (SameValue("2", option.values[0]) && store.Get("graphics_fsr31_available") == "0"));
+            if (!option.ini_only && !missing_fsr) {
                 offered.push_back(static_cast<int>(i));
             }
         }
@@ -1015,16 +1086,18 @@ inline Change SetFraction(const Row& row, Store& store, float fraction) {
     return c;
 }
 
-// Defaults: every key of the tab's rows goes back to its code default (removed from vr.ini;
+// Defaults: every key of the tab's enabled rows goes back to its code default (removed from vr.ini;
 // General: As the hunter, 0 cm).
 inline Change Defaults(const Tab& tab, Store& store) {
     Change c{std::string{"defaults:"} + tab.name, "Defaults", {}, {}, false, false};
+    // Snapshot enabled rows first: resetting a provider changes the enabled state
+    // of dependent profile rows. Defaults must not depend on row order.
+    std::vector<int> enabled;
     for (const int r : tab.rows) {
-        if (r < 0) {
-            continue;
-        }
+        if (r >= 0 && Enabled(Rows()[static_cast<size_t>(r)], store)) enabled.push_back(r);
+    }
+    for (const int r : enabled) {
         const Row& row = Rows()[static_cast<size_t>(r)];
-        if (std::string_view(row.id) == "aa" && !Enabled(row, store)) continue;
         for (const char* key : row.keys) {
             if (key != nullptr) {
                 store.Remove(key);

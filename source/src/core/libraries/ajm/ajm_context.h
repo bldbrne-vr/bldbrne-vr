@@ -50,8 +50,9 @@ private:
     std::shared_mutex batches_mutex;
     Common::SlotArray<u32, std::shared_ptr<AjmBatch>, MaxBatches, 1> batches;
 
-    std::jthread worker_thread{};
     Common::MPSCQueue<std::shared_ptr<AjmBatch>> batch_queue;
+    // Stop and join the worker before destroying the queue it waits on.
+    std::jthread worker_thread{};
 };
 
 } // namespace Libraries::Ajm

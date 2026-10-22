@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // vr.ini aa_mode (core/vr/aa_mode.h; the VR page's Graphics > Anti-aliasing): the game's FXAA
@@ -21,7 +22,7 @@
 #include "common/logging/log.h"
 #include "core/vr/aa_mode.h"
 #include "core/vr/graphics_settings.h"
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
+#include "video_core/native_stereo/native_stereo.h"
 #include "core/vr/live_tune.h"
 #include "core/vr/vr_session.h"
 #include "video_core/fast_render.h"
@@ -31,6 +32,7 @@
 #include "video_core/renderer_vulkan/vk_recorder.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vr_render_taa.h"
+#include "video_core/renderer_vulkan/vr_dibr_dlss.h"
 #include "video_core/renderer_vulkan/vr_smaa.h"
 #include "video_core/renderer_vulkan/vr_temporal_capture.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -142,17 +144,22 @@ u8 Rasterizer::VrAaDecide(const GraphicsPipeline* pipeline, bool indirect) {
         return static_cast<u8>(VR::Aa::Action::Draw);
     }
     // VR_TUNE_FILE aa_mode=0 / 1 / 2 / 3 (tests: fxaa / smaa / taa / off): the setting changed
-    // while the game runs, through the same parser the VR page's store uses (VR::ApplySetting).
+    // while the game runs, queued like the VR page (VR::ApplySetting) for the next boundary.
     if (VR::Tune::Active()) {
         const float t = VR::Tune::Get("aa_mode", -1.0f);
         if (t >= 0.0f) {
             const auto want = static_cast<VR::Aa::Mode>(std::clamp(static_cast<int>(t), 0, 3));
-            if (want != s.aa_mode) {
+            if (want != VR::GetRequestedAaMode()) {
                 LOG_INFO(Render_Vulkan, "VR aa: aa_mode={} (VR_TUNE_FILE, while running)",
                          VR::Aa::Name(want));
                 VR::ApplySetting("aa_mode", VR::Aa::Name(want));
             }
         }
+    }
+    if (VR::DibrFrameActive() && vr_ui_layer && VR::UiLayerFrameMode() == 1 &&
+        vr_dibr_dlss && vr_dibr_dlss->Ready()) {
+        VrAaNote(Skipped, "experimental DIBR DLSS center reconstruction; saved AA unchanged");
+        return static_cast<u8>(VR::Aa::Action::Skip);
     }
     const VR::Aa::DrawFacts facts{
         .fs_hash = fs,
@@ -163,7 +170,7 @@ u8 Rasterizer::VrAaDecide(const GraphicsPipeline* pipeline, bool indirect) {
         .upscaler = vr_temporal && vr_temporal->frame == vr_temporal_frame &&
                     (vr_temporal->reconstructed || vr_temporal->s1.pending),
     };
-    const VR::Aa::Action action = VR::Aa::Decide(s.aa_mode, facts);
+    const VR::Aa::Action action = VR::Aa::Decide(VR::GetActiveAaMode(), facts);
     if (action == VR::Aa::Action::Draw) {
         VrAaNote(Drawn, facts.immersive ? std::string{"aa_mode=fxaa"}
                                         : std::string{"not an immersive frame"});
@@ -191,7 +198,7 @@ void Rasterizer::VrAaNote(u8 outcome, const std::string& detail) {
     // Every change while it is rare (a switch on the VR page, a cinematic screen), then every
     // 50th (frames that keep flipping between immersive and not).
     if (++vr_aa_log.lines <= 24 || vr_aa_log.lines % 50 == 0) {
-        LOG_INFO(Render_Vulkan,
+        LOG_BENCHMARK_INFO(Render_Vulkan,
                  "VR aa: {} ({}; FXAA draws so far: {} drawn, {} skipped, {} SMAA, {} TAA, {} "
                  "refused)",
                  OutcomeText(outcome), detail, vr_aa_log.counts[Drawn], vr_aa_log.counts[Skipped],
@@ -379,11 +386,6 @@ bool Rasterizer::VrTaaReplace(VideoCore::Image& b, VideoCore::Image& a, std::str
         return no("the scene depth is not the render's size");
     }
     if (!vr_render_taa) {
-        static bool created = false;
-        if (created) {
-            return no("the resolve is unavailable");
-        }
-        created = true;
         vr_render_taa = std::make_unique<VrRenderTaa>(instance, scheduler);
     }
     if (!vr_render_taa->Ready()) {

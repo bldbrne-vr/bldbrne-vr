@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -11,6 +17,8 @@
 // and written with the other defaults when vr.ini is created. Read-only after loading.
 namespace VR::Quick {
 
+inline constexpr int MolotovBurstBullet = 701;
+
 struct QuickSettings {
     // Game side: the quick-item slots are read every update, and selecting, using and throwing
     // them goes through the game's own functions. 0 = nothing installed (Y is Square).
@@ -20,7 +28,7 @@ struct QuickSettings {
     bool quick_arc{true};
     // A tap of the left stick click (not sprinting, no combo) opens and closes the arc exactly
     // like Y, so an item can be picked with the thumb still on the stick, walking and dodging on
-    // (the user's request, 2026-10-05). Sprinting it still jumps and every hold combo stays.
+    // (by request, 2026-10-05). Sprinting it still jumps and every hold combo stays.
     // 0 = the tap is L3 to the game as before. A release later than l3_tap_ms is no tap (L3).
     bool arc_l3{true};
     float l3_tap_ms{500.0f};
@@ -47,7 +55,7 @@ struct QuickSettings {
     int holster_mode{2};
     bool holster_haptics{true};
     float holster_height_cm{0.0f}, holster_width_cm{0.0f}, holster_forward_cm{0.0f};
-    float holster_reach_cm{12.0f}; // (10 until 2026-10-14: the user, "+2 cm")
+    float holster_reach_cm{12.0f}; // (10 until 2026-10-14: the tester, "+2 cm")
     bool belt_vial{true};
     float belt_vial_zone{1.0f};
     float radius_m{0.18f};    // arc radius around the hand (seated: x0.875)
@@ -58,7 +66,7 @@ struct QuickSettings {
     // 10 cm along the line of sight (6.7 / 11.2 cm). It widens where a card is reached for (out,
     // up, in front, behind); between two neighbours the nearer one is lit and the other takes
     // over 1.5 cm nearer whatever this is (quick_items.h PickHover), so switching stays as easy.
-    // A little easier to pick (the user's 2026-10-08 "a tiny bit bigger area of selection" and
+    // A little easier to pick (the tester's 2026-10-08 "a tiny bit bigger area of selection" and
     // "a tiny tiny bit bigger icons"): card_m 0.060 -> 0.064, hover_scale 1.0 -> 1.12.
     float hover_scale{1.12f};
     // How the hand picks a card: hovering it with the fist (0), or pointing the hand from where
@@ -86,7 +94,7 @@ struct QuickSettings {
     float use_commit_ms{100.0f};
     float use_cooldown_ms{500.0f}; // between two uses
     // Opt-in: the left trigger with a throwable in hand (a deliberate pull), or a tap of it with a
-    // usable, puts the item away and fires the gun (L2), a reflex parry. 0 (the user's rule): the
+    // usable, puts the item away and fires the gun (L2), a reflex parry. 0 (the tester's rule): the
     // trigger never fires the gun while an item is in the hand.
     bool trigger_parry{false};
     bool hide_gun{true};           // the left weapon is hidden while an item is in the hand
@@ -121,7 +129,7 @@ struct QuickSettings {
     float mouth_ahead_m{0.08f};
     float mouth_dwell_ms{150.0f};
     bool mouth_sound{true};
-    // Use sounds (the user's 2026-10-06 "and they should play a sound when activated"): an item
+    // Use sounds (the tester's 2026-10-06 "and they should play a sound when activated"): an item
     // used at once, without the game's use animation (eaten, drunk, wiped, crushed, held to use,
     // stabbed, the Blood Vial), plays the game's own sound of that use from its use clip, or the
     // closest one where the clip has none (core/vr/quick_items.h UseSoundsOf). Items used with
@@ -129,7 +137,7 @@ struct QuickSettings {
     // mouth (mouth_sound), as before.
     bool use_sounds{true};
     float use_whoosh{1.0f}; // quiet rising air during hold/crush; 0 = off, 2 = twice as loud
-    // Wipe to apply (the user's 2026-10-06 request: "having to apply the firepaper on the weapon
+    // Wipe to apply (the tester's 2026-10-06 request: "having to apply the firepaper on the weapon
     // itself"): Fire Paper, Bolt Paper and the Empty Phantasm Shell (core/vr/quick_items.h WipeOf)
     // stay in the hunter's left hand when taken from the arc (the trigger held; left_scheme=1: the
     // grip) and are applied when you wipe them along your weapon's blade: the paper within
@@ -137,7 +145,7 @@ struct QuickSettings {
     // wipe_window_ms (either way; not a tap, not a cut across it): the game's own buff at once, no
     // animation. A rasp on both hands while it touches, rising with the stroke, and a thump when
     // it takes. Let go away from the blade: back, nothing used. 0 = used at the pull.
-    // Easier (the user's 2026-10-08 "make applying the fire paper a little easier (like easier to
+    // Easier (the tester's 2026-10-08 "make applying the fire paper a little easier (like easier to
     // find the spot where we need to rub)"): a wider zone (12 cm of the blade's axis), a shorter
     // stroke (30% of the blade, at least wipe_min_cm, within 1 s), the paper's own move at least
     // wipe_own of the stroke (a thrust or a swing of the blade past a still paper is no wipe), and
@@ -145,7 +153,7 @@ struct QuickSettings {
     // nears the blade from wipe_cue_cm away (wipe_cue; on/off: the older values 2 and 3 read as
     // on). The first version: wipe_reach_cm=7 wipe_share=0.4
     // wipe_window_ms=800 wipe_min_cm=8 wipe_own=0 wipe_cue=0. The merge's skeptic: a stroke at
-    // most wipe_max_cm (the long forms asked 25 cm; the user's strokes were 20-21) and the blade
+    // most wipe_max_cm (the long forms asked 25 cm; the tester's strokes were 20-21) and the blade
     // turning at most wipe_turn_deg over it (a forehand with the paper by the hilt went through:
     // a swing turns the blade, a wipe holds it); the first version: wipe_max_cm=25
     // wipe_turn_deg=0.
@@ -159,7 +167,7 @@ struct QuickSettings {
     float wipe_turn_deg{35.0f};
     bool wipe_cue{true};
     float wipe_cue_cm{30.0f};
-    // The rub (the user's 2026-10-08 "I don't want it to trigger when I am not rubbing the actual
+    // The rub (the tester's 2026-10-08 "I don't want it to trigger when I am not rubbing the actual
     // blade -- I want it to trigger when I RUB the blade"; core/vr/quick_items.h WipeConfig): the
     // paper you see (its card in the fingers) within wipe_touch_cm of the blade's surface (its
     // axis with wipe_blade_cm round it), rubbed along it back and forth: strokes of at least
@@ -174,7 +182,7 @@ struct QuickSettings {
     float wipe_rub_ms{1500.0f};
     float wipe_stroke_cm{4.0f};
     float wipe_blade_mps{0.8f};
-    // Hold to use (the user's 2026-10-06 request): the misc items whose use cannot be taken back
+    // Hold to use (the tester's 2026-10-06 request): the misc items whose use cannot be taken back
     // (the coldbloods, Madman's Knowledge, the Blood Dreg, the NPC bloods, the Hunter's Marks, the
     // bells, the Tiny Music Box, ...; core/vr/quick_items.h HoldOf) stay in the hunter's hand when
     // taken from the arc while you keep the trigger (left_scheme=1: the grip) held: a thin ring
@@ -184,7 +192,7 @@ struct QuickSettings {
     // pull, as before.
     bool hold_use{true};
     float hold_use_s{1.5f};
-    // Natural gestures, the faster way for some held items (the user's 2026-10-06 "yes and yes";
+    // Natural gestures, the faster way for some held items (the tester's 2026-10-06 "yes and yes";
     // the hold above stays their fallback; core/vr/quick_items.h GestureOf, StabOf):
     //  - crush: the coldbloods, Madman's Knowledge, Great One's Wisdom, the Blood Dreg and Vermin
     //    are crushed in the fist: squeeze the other button hard (left_scheme=2: the grip, which
@@ -209,7 +217,7 @@ struct QuickSettings {
     float shake_wrist{5.0f};
     float shake_arm{0.9f};
     bool use_stab{true};
-    // The Tiny Music Box played by hand (the user's 2026-10-06 request; core/vr/music_box.h): taken
+    // The Tiny Music Box played by hand (the tester's 2026-10-06 request; core/vr/music_box.h): taken
     // from the arc it stays in the left hand while the trigger (left_scheme=1: the grip) is held
     // and the RIGHT hand is free: the right weapon is put away (no animation), swings and the
     // right grip's transform are off. Squeeze the right grip on the box's little crank (within
@@ -228,7 +236,7 @@ struct QuickSettings {
     float throw_min_speed{1.5f}; // m/s hand speed at release to throw (slower = put back)
     // Real ballistics (your direction, real gravity) with a VR boost: launch speed per hand speed
     // (small class factors on top, no minimum: a weak flick drops short). A throw in the headset
-    // moves the hand far slower than a real one (no weight to drive; the user's first real
+    // moves the hand far slower than a real one (no weight to drive; the tester's first real
     // throw, 2026-10-04: 2.5 m/s with a full wind-up and wrist snap, where a real overhand leaves
     // at 10-15 m/s): at 1.2 it fell 1.7 m away, at 4 it leaves at ~10 m/s ...
     float throw_gain{4.0f};
@@ -237,7 +245,7 @@ struct QuickSettings {
     float throw_gain_curve{0.8f};
     // ... read from the grip located at each input frame's own time (the runtime's freshest
     // estimate; 0 = the poses predicted for the display time, 41-50 ms ahead over Link, which
-    // read the user's real throws about 30% slow) ...
+    // read the tester's real throws about 30% slow) ...
     bool throw_fresh_pose{true};
     // ... and when the grip opens while the hand still speeds up, the throw waits up to this long
     // (ms, the item still in the hand) for its peak (Valve's rule; 0 = at the release) ...
@@ -271,7 +279,7 @@ struct QuickSettings {
     float throw_cap_knee{0.7f};
     // Locked on: the throw's yaw (only) is turned this share toward the target when it points
     // within throw_assist_deg of it (knives throw_assist_knife_deg), fading out toward the edge.
-    // (The user's 30%, 2026-10-07 morning; 0.26 the night before, 0.27 on 10-06, 0.22 before.)
+    // (The tester's 30%, 2026-10-07 morning; 0.26 the night before, 0.27 on 10-06, 0.22 before.)
     float throw_assist{0.30f};
     float throw_assist_deg{9.0f};
     float throw_assist_knife_deg{15.0f};
@@ -306,9 +314,10 @@ struct QuickSettings {
     float molotov_burst_deg{12.0f};
     // The air burst's bullet: 701 = the Cannon shell's explosion (its effect, sound and damage;
     // BehaviorParam 101500800 -> bullet 700 -> HitBulletID 701), <= 0 = the Molotov's own burst.
-    int molotov_burst_bullet{701};
-    // ... and its hit radius (m; the Cannon's own is 1.8; the effect keeps its size), 0 = its own.
-    float molotov_burst_radius_m{2.0f};
+    int molotov_burst_bullet{MolotovBurstBullet};
+    // ... and its hit radius (m; the Cannon's own is 1.8; the effect keeps its size), 0 = its own
+    // (4 m: 2 until 2026-10-16, the tester: +2 m) ...
+    float molotov_burst_radius_m{4.0f};
     bool molotov_burst_ground{true};
     // The release pulse on the left hand scales with the launch speed (a lob a light tick, a hard
     // throw a long strong one); 0 = the same pulse for every throw.

@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <array>
 #include <atomic>
@@ -11,13 +17,11 @@
 
 #include "common/logging/log.h"
 #include "core/vr/bloodborne_levers.h"
+#include "core/vr/summon_bell.h"
 #include "core/vr/body_frame.h"
 // Before hook_util.h: its xbyak brings <windows.h>, whose `near` macro would eat members here.
 #include "core/vr/lever_acquisition.h"
-#include "core/vr/interaction_fault.h"
-#include "core/vr/interaction_lever.h"
-#include "core/vr/interaction_native_lever_prompt.h"
-#include "core/vr/interaction_native_lever_rig.h"
+#include "core/vr/lever_audio.h"
 #include "core/vr/hook_util.h"
 #include "core/vr/lever_channel.h"
 #include "core/vr/lever_models.h"
@@ -258,59 +262,21 @@ struct Offer {
     bool parked{};  // a parked capstan (`parked` below): the hold resumes its bone
 };
 Offer offer;
-L::BasicPoseEdit<VR::Interactions::NativeLeverPoseGeometry> edit;
+L::PoseEdit edit;
 // The capstan the hand let go before its stop (lever_models.h Parked): written by Update and
 // Unpark, read by Bind and Classify, all under the busy guard. Never set by motion-only rehearsal
 // (its levers return to rest), whose Bind never reads it.
 L::Parked parked;
-static_assert(uint32_t(L::CommandKind::Hold) == PI_NLC_HOLD &&
-              uint32_t(L::CommandKind::Release) == PI_NLC_RELEASE &&
-              uint32_t(L::CommandKind::Complete) == PI_NLC_COMPLETE &&
-              uint32_t(L::CommandKind::Settle) == PI_NLC_SETTLE);
+// Below this a let-go capstan is at rest for every purpose: it is restored, not parked.
+constexpr float ParkMinAngle = 0.5f * Body::Deg;
+bool IsCapstan(const L::Model *model) { return model && model->motion == L::Motion::Capstan; }
 u64 generation{}, attempted_completion{}, reported_completion{};
 float logged_hold_angle{};
 float applied_angle{};
-VR::Interactions::LeverSettle settling;
-VR::Interactions::Module* settle_module{};
-bool settle_fault{};
-PiNativeLeverGeometryResult ModelGeometry(const L::Model* model,float sweep = 0.f) {
-    PiNativeLeverGeometryFacts p{};
-    p.model_index = PhysicalInteractions::NativeLeverRigPackets::ModelIndex(model);
-    p.binding.sweep = sweep;p.motion_test = g_motion_test;
-    PiNativeLeverGeometryResult out{};
-    VR::Interactions::NativeLeverGeometry(settle_module,PI_NLR_MODEL,p,out);
-    return out;
-}
-VR::Interactions::NativeLeverPromptRuntime prompt_policy;
-// These queries run before the busy guard and touch only copied facts and the
-// immutable API table. They never share the stateful runtime's sequence fields.
-bool NeedsPromptClassify(L::PromptVerdict& verdict, u64 row, u32 handle,
-                         u64 fallback, u64 serial) {
-    if (VR::Interactions::ProcessFaultLatch().Tripped()) {
-        verdict.bound = 0; // Selection-thread cleanup restores the native prompt.
-        return false;
-    }
-    PiNativeLeverQueryInput p{};
-    p.operation = PI_NLQ_NEEDS_CLASSIFY;
-    p.same_row = verdict.row == row;
-    p.same_handle = verdict.handle == handle;
-    p.recheck = verdict.recheck;
-    p.fallback = fallback;p.serial = serial;
-    p.previous_fallback = verdict.fallback;p.previous_serial = verdict.serial;
-    PiNativeLeverQueryOutput out{};
-    if (!VR::Interactions::NativeLeverQuery(settle_module,p,out)) {
-        verdict.bound = 0;
-        return false;
-    }
-    return out.value;
-}
-bool PromptReady(s64 stamp, s64 now) {
-    if (VR::Interactions::ProcessFaultLatch().Tripped()) return false;
-    PiNativeLeverQueryInput p{};
-    p.operation = PI_NLQ_READY;p.stamp_ns = stamp;p.now_ns = now;
-    PiNativeLeverQueryOutput out{};
-    return VR::Interactions::NativeLeverQuery(settle_module,p,out) && out.value;
-}
+L::Settle settling;
+u64 settling_serial{};
+s64 settling_ns{};
+bool settling_commit{};
 struct Dispatch {
     u64 block{};
     s32 index{-1};
@@ -351,7 +317,6 @@ bool InteractionBlocked(u32 mask) {
     return (reinterpret_cast<Query>(g_base + BlockedRva)() & mask) != 0;
 }
 bool Complete(const L::Command &command) {
-    if(VR::Interactions::ProcessFaultLatch().Tripped())return false;
     attempted_completion = command.serial; // never retry an irreversible dispatch
     if (g_motion_test) {
         ReportCompletion(command, false); // motion rehearsal never dispatches a game event
@@ -381,6 +346,9 @@ bool Complete(const L::Command &command) {
         reinterpret_cast<Accept>(g_base + AcceptRva)(offer.block, index, actor_handle);
     const bool matched = dispatch.seen;
     ReportCompletion(command, accepted && matched);
+    if (accepted && matched) {
+        VR::LeverAudio::PublishPull(NowNs()); // its clunk (core/vr/lever_audio.h)
+    }
     LOG_INFO(
         Core,
         "VR lever development: complete handle={:#x} generation={} event_matched={} accepted={}",
@@ -523,42 +491,49 @@ bool Bind(const Pose &pose, L::BoneBinding &binding, L::Rig &rig, const L::Model
             return false;
     }
     const auto local = pose.Buffers().locals;
-    PiNativeLeverBindFacts facts{};
-    facts.count = pose.count;facts.mesh_count = pose.map_count;facts.motion_test = g_motion_test;
-    facts.action = action;facts.parked_model = -1;
-    std::memcpy(facts.names,skeleton.names.data(),sizeof(facts.names));
-    std::memcpy(facts.parents,skeleton.parents.data(),sizeof(facts.parents));
-    std::memcpy(facts.mesh_map,skeleton.mesh_map.data(),sizeof(facts.mesh_map));
-    std::copy(pose.frame.begin(),pose.frame.end(),facts.rows);
-    std::memcpy(facts.locals,local.data(),pose.count * sizeof(Body::HkQsTransform));
-    // Motion-only rehearsal never reads the parked record (it runs outside the busy guard).
-    if (!g_motion_test) {
-        facts.parked_model = PhysicalInteractions::NativeLeverRigPackets::ModelIndex(parked.model);
-        facts.parked_object_present = parked.object != 0;
-        facts.same_object = parked.object == pose.object;
-        facts.same_entry = parked.entry == pose.entry;
-        facts.same_handle = parked.handle == pose.handle;
-        facts.parked_angle = parked.angle;
-        std::memcpy(facts.original,&parked.original,sizeof(facts.original));
-        std::memcpy(facts.last,&parked.last,sizeof(facts.last));
-    }
-    PiNativeLeverRigInput packet{};packet.operation = PI_NLR_BIND;packet.data.bind = facts;
-    PiNativeLeverRigOutput reply{};
-    if (!VR::Interactions::NativeLeverRig(settle_module,packet,reply)) return false;
-    const auto& out = reply.data.bind;
-    if (!out.valid) {
-        if (out.reason == PI_NLR_UNMATCHED) {
-            std::array<Body::QsTransform,L::MaxBones> locals{};
-            for (u32 i = 0; i < pose.count; ++i) locals[i] = Body::FromHavok(local[i]);
-            LogUnmatched(skeleton,pose,locals,action);
-        }
+    std::array<Body::QsTransform, L::MaxBones> locals{};
+    for (u32 i = 0; i < pose.count; ++i)
+        locals[i] = Body::FromHavok(local[i]);
+    // The model's original rest pivot, orientation and scale; don't bind a clip's intermediate
+    // pose. With the row's action, only a model measured and listed for that row.
+    const std::span<const Body::QsTransform> live{locals.data(), pose.count};
+    const L::Model *matched = nullptr;
+    Body::QsTransform lever{};
+    float at = 0.0f;
+    // A capstan left turned by the hand first: bound at its true rest, standing at its angle. Its
+    // record (the very bar, byte for byte, as the hand left it) wins over the rest match, whose 1.6
+    // degrees would take a bar parked just off rest for a rest of its own.
+    if (!g_motion_test &&
+        (matched = L::StillParked(parked, skeleton, {local.data(), local.size()}, pose.object,
+                                  pose.entry, pose.handle, action))) {
+        lever = Body::FromHavok(parked.original);
+        at = parked.angle;
+    } else if ((matched = L::Match(skeleton, live, action))) {
+        lever = locals[matched->lever];
+    } else {
+        LogUnmatched(skeleton, pose, locals, action);
         return false;
     }
-    binding = PhysicalInteractions::NativeLeverRigPackets::Unpack(out.binding);
-    rig = PhysicalInteractions::NativeLeverRigPackets::Unpack(out.rig);
-    if (model) *model = &L::Models[out.model_index];
-    if (angle) *angle = out.angle;
-    if (is_parked) *is_parked = out.is_parked != 0;
+    Body::ChrFrame world{};
+    if (!Body::ChrFrameFromRows(pose.frame, world))
+        return false;
+    // Rigid FLVER (dynamic=0): the handle and shaft points are already in the lever bone's
+    // local space (before its own scale, which the rig applies as the renderer does). The renderer
+    // applies the mapped bone matrix directly. Subtracting the rest pivot here displaced both the
+    // grab zone and the latched hand. The lever bone's parent: the object composed with every
+    // ancestor (the root; o353010's root and column).
+    binding = L::Binding(*matched, L::ParentWorld(*matched, live, {world.t, world.q, {1, 1, 1}}),
+                         lever);
+    const auto bound = L::BindRig(binding);
+    if (!bound)
+        return false;
+    rig = *bound;
+    if (model)
+        *model = matched;
+    if (angle)
+        *angle = at;
+    if (is_parked)
+        *is_parked = at > 0.0f;
     return true;
 }
 bool SamePose(const Pose &a, const Pose &b) {
@@ -611,7 +586,7 @@ void ClearOffer() {
 }
 
 // Per-instance prompt replacement (core/vr/lever_prompt.h), host side of the native gate: the
-// demotions live in the DLL; copied equality facts and native slot handles use the busy guard.
+// demotions live in the channel (L::Channel().prompt_state), read and written under the guard.
 // The armed lever: the bound lever the game selected last. A squeeze may reach for it while the
 // player stays near it (the XR side's proximity rule, lever_prompt.h ArmMargin), after the hunter
 // has left the game's prompt zone (the handle lies outside it); served from the scheduler hook.
@@ -655,13 +630,13 @@ bool Selectable(s32 state) { return state != 3 && state != 4; } // 13AE09A skips
 // thread, so the change reaches it through the prompt serial the native gate compares.
 void Demote(u64 row, u32 handle, s64 until) {
     auto &channel = L::Channel();
-    prompt_policy.Demote(row, handle, until);
+    channel.prompt_state.Demote(row, handle, until);
     channel.PromptChanged(); // next selection pass reclassifies (and keeps the prompt)
 }
 
-// Native gate's host classifier: called on a different selected row/object, a B fallback, a
-// prompt change or a due recheck. Hides the prompt only when this exact instance's rig binds, a
-// hand can pull it now and the game's tables hold it (or while it is held).
+// Native gate's host classifier: called on a different selected row/object, a legacy serial
+// change, a prompt change or a due recheck. Hides the prompt only when this exact instance's
+// rig binds, a hand can pull it now and the game's tables hold it (or while it is held).
 void Classify(u64 row, u64 actor, u64 block) {
     auto &channel = L::Channel();
     auto &verdict = channel.verdict;
@@ -669,7 +644,7 @@ void Classify(u64 row, u64 actor, u64 block) {
     ReadAt(row + 0x58, handle);
     const auto fallback = channel.prompt_fallback.load(std::memory_order_acquire);
     const auto serial = channel.prompt_serial.load(std::memory_order_acquire);
-    if (!NeedsPromptClassify(verdict, row, handle, fallback, serial))
+    if (!L::NeedsClassify(verdict, row, handle, fallback, serial))
         return;
     Guard guard;
     if (!guard.acquired) {
@@ -703,26 +678,21 @@ void Classify(u64 row, u64 actor, u64 block) {
     // "does not bind" line is logged for a hand's own pull.)
     else if (!held && !Bind(pose, binding, rig, &model, action, &angle))
         why = "no rig measured for this model and row, or not at rest";
-    else if (!PromptReady(ready, now))
+    else if (!L::Recent(ready, now, L::ReadyNs))
         why = "no hand can pull it now: virtual screen, third person, or body or hands untracked";
     else if (!LiveIdentity(row, block, actor, seen))
         why = "not found in the game's action tables, so it cannot be armed";
     const bool binds = why == nullptr;
-    PiNativeLeverPromptInput prompt{};
-    prompt.operation = PI_NLP_DECIDE;prompt.now_ns = now;prompt.handle = handle;
-    prompt.enabled = L::Enabled();prompt.binds = binds;prompt.held = held;
-    prompt.fallback = fallback;prompt.serial = serial;prompt.previous_fallback = verdict.fallback;
-    prompt.ready_present = ready != 0;prompt.motion_test = g_motion_test;
-    prompt.parked_match = parked.model && parked.handle == handle;
-    const auto next = prompt_policy.Call(prompt,row);
-    if (prompt_policy.Faulted()) { verdict.bound = 0;return; }
-    // The capstan the hand parked, whose hand pull is over for now: its prompt given back (B, a
+    const auto next = L::Decide(verdict, channel.prompt_state, row, handle, L::Enabled(), binds,
+                                held, fallback, serial, now);
+    // The capstan the hand parked, whose hand pull is over for now: its prompt given back (a
     // refused pull), a display mode no hand pulls in (the virtual screen, third person: the XR
     // side cleared its word, not merely late; it asks itself as it clears it) or physical levers
     // off. The game holds it unturned and its own button plays its clip from rest: its scheduler
     // puts the bar back at rest first (Unpark), so flat play sees it as the game does. A word
     // merely late (a tracking gap, the headset off) keeps it parked for the hand to carry on.
-    if (next.request_unpark)
+    if (!next.bound && !held && !g_motion_test && parked.model && parked.handle == handle &&
+        (!L::Enabled() || ready == 0 || channel.prompt_state.Demoted(row, handle, now)))
         channel.RequestUnpark(now);
     if (next.bound && !held) {
         // binds: LiveIdentity filled `seen`. A hidden prompt always has an armed lever behind it.
@@ -738,7 +708,7 @@ void Classify(u64 row, u64 actor, u64 block) {
         // Where its handle is: arming, the reach tick and log (refreshed with each recheck).
         channel.PublishNearby({now, object, rig, true, angle});
     }
-    if (next.bound != verdict.bound || row != verdict.row || handle != verdict.handle) {
+    if (next.bound != verdict.bound || next.row != verdict.row || next.handle != verdict.handle) {
         // Once per change of the selected lever or its verdict, never per frame.
         if (next.bound)
             LOG_INFO(Core, "VR lever: handle={:#x} row {} ({}): pulled by hand, prompt hidden",
@@ -746,16 +716,16 @@ void Classify(u64 row, u64 actor, u64 block) {
         else
             LOG_INFO(Core, "VR lever: handle={:#x} row {}: normal prompt kept ({})", handle, action,
                      why ? why
-                     : next.demoted
-                         ? "B or a refused pull: for now"
+                     : channel.prompt_state.Demoted(row, handle, now)
+                         ? "a refused pull: for now"
                          : "off");
     }
-    verdict.handle = handle;
-    verdict.recheck = static_cast<uint16_t>(next.recheck);
-    verdict.bound = static_cast<uint8_t>(next.bound);
-    verdict.fallback = fallback;
-    verdict.serial = serial;
-    verdict.row = row;
+    verdict.handle = next.handle;
+    verdict.recheck = next.recheck;
+    verdict.bound = next.bound;
+    verdict.fallback = next.fallback;
+    verdict.serial = next.serial;
+    verdict.row = next.row;
 }
 
 void Selected(u64 row, u64 actor, u64 block, const char *path = "selected") {
@@ -768,95 +738,54 @@ void Selected(u64 row, u64 actor, u64 block, const char *path = "selected") {
     if (!request)
         return;
     const auto now = NowNs();
-    PiNativeLeverServiceFacts service{};
-    service.kind = PI_NLS_SELECTED;
-    service.requested = 1;
-    service.request_ns = request;
-    service.now_ns = now;
-    PiNativeLeverServiceResult intent{};
-    if (!VR::Interactions::NativeLeverService(settle_module, service, intent) ||
-        !intent.allowed)
-      return;
+    if (!L::Fresh(request, now))
+        return;
     offer_request = request;
     Offer next{};
     next.row = row;
     next.actor = actor;
     next.block = block;
+    const char *rejected = nullptr;
+    // A refusal brings the prompt back for a while, except where the game offers no prompt
+    // either (used or running) or where it is back already (B, an earlier refusal: not extended).
+    bool demote = true;
     s32 action{};
     u32 instance = 0xFFFFFFFF;
     ReadAt(row + 0x58, instance);
-    PiNativeLeverOfferFacts facts{};
-    facts.now_ns = now;
-    facts.phase = PI_NLO_BEGIN;
-    facts.motion_test = g_motion_test;
-    facts.have_instance = instance != 0xFFFFFFFF;
-    PiNativeLeverOfferResult resolution{};
-    bool resolved = false;
-    // At most six read-only native queries; no unbounded retry or guest wait.
-    for (int step = 0; step < 8; ++step) {
-        if (!VR::Interactions::NativeLeverOffer(settle_module, facts, resolution))
-            break;
-        if (resolution.reason || resolution.accepted) {
-            resolved = true;
-            break;
-        }
-        facts.phase = resolution.next;
-        switch (resolution.next) {
-        case PI_NLO_DEMOTION:
-            facts.success = !prompt_policy.Demoted(row, instance, now);
-            if (prompt_policy.Faulted()) break;
-            continue;
-        case PI_NLO_ROW:
-            facts.success = Row(row, block, next.param, next.handle, next.state, &action);
-            facts.state = next.state;
-            continue;
-        case PI_NLO_POSE:
-            facts.success = ReadPose(next.handle, next.pose);
-            continue;
-        case PI_NLO_RIG:
-            facts.success = Bind(next.pose, next.binding, next.rig, &next.model, action,
-                                 &next.angle, &next.parked);
-            continue;
-        case PI_NLO_PERMISSION:
-            facts.success = Permitted(row, actor);
-            continue;
-        case PI_NLO_ACTOR:
-            facts.success = ReadAt(actor + 8, next.actor_handle) &&
-                            next.actor_handle != 0xFFFFFFFF;
-            facts.same_offer = offer.row == row && offer.actor == actor &&
-                offer.param == next.param && offer.handle == next.handle &&
-                offer.actor_handle == next.actor_handle && offer.state == next.state &&
-                SamePose(offer.pose, next.pose);
-            continue;
-        default: break;
-        }
-        break;
-    }
-    if (!resolved) {
-        resolution = {};
-        resolution.reason = PI_NLO_MODULE;
-        if (settle_module) settle_module->ReportFault();
-    }
-    static constexpr const char* Rejected[] = {
-        nullptr,
-        "its normal prompt and button are back for now (B or a refused pull)",
-        "unsupported or stale action row", "action already running or used",
-        "object pose unavailable or animating", "unsupported rig or non-rest pose",
-        "game permission denied", "actor unavailable", "interaction module unavailable"
-    };
-    const char* rejected = Rejected[resolution.reason];
+    if (!g_motion_test && L::Channel().prompt_state.Demoted(row, instance, now)) {
+        rejected = "its normal prompt and button are back for now (a refused pull)";
+        demote = false;
+    } else if (!Row(row, block, next.param, next.handle, next.state, &action))
+        rejected = "unsupported or stale action row";
+    else if (!g_motion_test && !Selectable(next.state)) { // rehearsal pulls used levers by design
+        rejected = "action already running or used";
+        demote = false;
+    } else if (!ReadPose(next.handle, next.pose))
+        rejected = "object pose unavailable or animating";
+    else if (!Bind(next.pose, next.binding, next.rig, &next.model, action, &next.angle,
+                   &next.parked))
+        rejected = "unsupported rig or non-rest pose";
+    else if (!g_motion_test && !Permitted(row, actor))
+        rejected = "game permission denied";
+    else if (!ReadAt(actor + 8, next.actor_handle) || next.actor_handle == 0xFFFFFFFF)
+        rejected = "actor unavailable";
     next.action = action;
     if (rejected) {
         // One message per requested squeeze, never an idle scan or frame log.
         LOG_INFO(Core, "VR lever development: request={} ({}) rejected: {} handle={:#x} state={}",
                  request, path, rejected, instance, next.state);
-        if (resolution.demote)
-            Demote(row, instance, resolution.until_ns);
+        if (demote && !g_motion_test && instance != 0xFFFFFFFF)
+            Demote(row, instance, now + L::RejectedNs);
         ClearOffer();
         L::Channel().PublishOffer({now, {}, request});
         return;
     }
-    next.generation = resolution.reuse_generation ? offer.generation : ++generation;
+    next.generation = offer.row == row && offer.actor == actor && offer.param == next.param &&
+                              offer.handle == next.handle &&
+                              offer.actor_handle == next.actor_handle &&
+                              offer.state == next.state && SamePose(offer.pose, next.pose)
+                          ? offer.generation
+                          : ++generation;
     offer = next;
     PublishOffer(now);
     // One line per squeeze: the XR side's matching "resolution" line says whether the hand
@@ -919,25 +848,11 @@ void Disarm(const RecentLever &seen, const char *why) {
 void ServiceArmed() {
     auto &channel = L::Channel();
     const auto request = channel.acquire.load(std::memory_order_acquire);
-    if (!request)
-      return;
-    PiNativeLeverServiceFacts service{};
-    service.kind = PI_NLS_ARMED_GATE;
-    service.requested = 1;
-    service.request_ns = request;
-    service.motion_test = g_motion_test;
-    service.enabled = L::Enabled();
-    PiNativeLeverServiceResult intent{};
-    if (!VR::Interactions::NativeLeverService(settle_module, service, intent) ||
-        !intent.allowed)
-      return;
+    if (!request || g_motion_test || !L::Enabled())
+        return;
     const auto seen = ArmedLever();
-    service.kind = PI_NLS_ARMED_READY;
-    service.have_row = seen.row != 0;
-    service.now_ns = NowNs();
-    if (!VR::Interactions::NativeLeverService(settle_module, service, intent) ||
-        !intent.allowed)
-      return;
+    if (!seen.row || !L::Fresh(request, NowNs()))
+        return;
     if (!StillInPlace(seen)) {
         Disarm(seen, "its area or the player changed");
         Unserved(request, "its area or the player changed");
@@ -971,39 +886,29 @@ u64 SelectionActor() {
 // reach; a lever must not need the game to have selected it before a hand can take it. Every
 // listed lever row in the game's own action tables whose object lies near is classified as the
 // selection's classifier does: a listed row with an Operate Device param, unused, its normal
-// prompt not given back for now (B or a refused pull), its object's pose readable and not
+// prompt not given back for now (a refused pull), its object's pose readable and not
 // animating, and a measured rig that binds at rest for this model and row. The nearest such lever
 // the head or a hand is within its arm radius of becomes the armed lever, as a selected one does.
 // No permission call and no write: a squeeze for it still goes through ServiceArmed (identity,
 // the game's interaction gate, then the resolver's row, state, rig and the game's permission).
 // A bound lever near but not yet within reach gets a note at most every ScanNoteNs: how far the
 // head or a hand is from its hinge (a log then says why a lever did not arm).
+constexpr float ScanObjectReach = 8.0f; // metres from its object: the levers worth binding
 constexpr u32 ScanMaxRows = 8192;       // a bound on one scan's work, whatever the tables say
 constexpr s64 ScanNoteNs = 2'000'000'000;
 s64 scan_noted_ns{};
 void Scan() {
     auto &channel = L::Channel();
     const auto request = channel.scan.exchange(0, std::memory_order_acq_rel);
-    if (!request) return; // No transport request to service.
+    if (!request || g_motion_test || !L::Enabled())
+        return;
     const auto now = NowNs();
-    PiNativeLeverGeometryFacts geometry{};
-    geometry.request_ns = request;geometry.now_ns = now;
-    geometry.enabled = L::Enabled();geometry.motion_test = g_motion_test;
-    PiNativeLeverGeometryResult decision{};
-    if (!VR::Interactions::NativeLeverGeometry(settle_module,PI_NLR_SCAN_GATE,geometry,decision) ||
-        !decision.allowed) return;
     L::ScanRequest where{};
-    geometry.requested = channel.RequestedScan(where);geometry.where_ns = where.ns;
-    geometry.ready_ns = channel.hand_pull_ready.load(std::memory_order_acquire);
-    geometry.scale = where.scale;
-    geometry.head[0] = where.head.x;geometry.head[1] = where.head.y;geometry.head[2] = where.head.z;
-    for (int h = 0; h < 2; ++h) {
-        geometry.tracked[h] = where.tracked[h];
-        geometry.hands[h][0] = where.hands[h].x;geometry.hands[h][1] = where.hands[h].y;
-        geometry.hands[h][2] = where.hands[h].z;
-    }
-    if (!VR::Interactions::NativeLeverGeometry(settle_module,PI_NLR_SCAN_BEGIN,geometry,decision) ||
-        !decision.allowed) return;
+    if (!L::Fresh(request, now) || !channel.RequestedScan(where) || where.ns != request ||
+        !std::isfinite(where.scale) || where.scale < 0.01f || where.scale > 100.0f ||
+        !Body::IsFinite(where.head) ||
+        !L::Recent(channel.hand_pull_ready.load(std::memory_order_acquire), now, L::ReadyNs))
+        return;
     Guard guard;
     if (!guard.acquired || edit.Owned() || channel.work.load(std::memory_order_acquire))
         return; // busy, or a hold or its cleanup owns the lever state: the next scan decides
@@ -1014,6 +919,9 @@ void Scan() {
         !ReadAt(manager + 0x20, block_count) || block_count <= 0 || block_count > 256 ||
         !ReadAt(manager + 0x28, blocks))
         return;
+    const float to_m = 1.0f / where.scale;
+    const L::Vec3 head = where.head * to_m;
+    const std::array<L::Vec3, 2> hands{where.hands[0] * to_m, where.hands[1] * to_m};
     struct Found {
         u64 row{}, block{};
         u32 handle{};
@@ -1022,7 +930,6 @@ void Scan() {
         L::Rig rig{}; // game units
         const L::Model *model{};
         float angle{}; // where its handle stands (a parked capstan's bar)
-        float radius{}; // approved diagnostic snapshot, metres
     } best, nearest; // the nearest within its arm radius; the nearest at all (the note)
     u32 inspected = 0;
     constexpr s32 Chunk = 32; // rows read per copy: a block's table in a few reads
@@ -1049,18 +956,19 @@ void Scan() {
                 u32 handle{};
                 s32 state{}, action{};
                 if (!Row(row, block, param, handle, state, &action) || !Selectable(state) ||
-                    prompt_policy.Demoted(row, handle, now))
+                    channel.prompt_state.Demoted(row, handle, now))
                     continue;
                 Pose pose{};
                 std::array<u8, 0x2E0> object{};
                 if (!Object(handle, pose.object, object))
                     continue;
                 // Far objects are skipped before their skeleton is read.
-                geometry.object[0] = Field<float>(object,0x24C);
-                geometry.object[1] = Field<float>(object,0x25C);
-                geometry.object[2] = Field<float>(object,0x26C);
-                if (!VR::Interactions::NativeLeverGeometry(settle_module,PI_NLR_SCAN_OBJECT,geometry,decision)) return;
-                if (!decision.allowed) continue;
+                const L::Vec3 at = L::Vec3{Field<float>(object, 0x24C), Field<float>(object, 0x25C),
+                                           Field<float>(object, 0x26C)} * to_m;
+                L::Rig origin{};
+                origin.pivot = at;
+                if (!(L::ArmDistance(origin, head, true, hands, where.tracked) <= ScanObjectReach))
+                    continue;
                 L::BoneBinding binding{};
                 L::Rig rig{};
                 const L::Model *model = nullptr;
@@ -1069,15 +977,13 @@ void Scan() {
                 if (!ReadPoseStorage(object, pose) ||
                     !Bind(pose, binding, rig, &model, action, &angle))
                     continue;
-                geometry.rig = PhysicalInteractions::NativeLeverRigPackets::Pack(rig);
-                geometry.best_valid = best.row != 0;geometry.nearest_valid = nearest.row != 0;
-                geometry.best_distance = geometry.best_valid ? best.distance : 0.f;
-                geometry.nearest_distance = geometry.nearest_valid ? nearest.distance : 0.f;
-                if (!VR::Interactions::NativeLeverGeometry(settle_module,PI_NLR_SCAN_CANDIDATE,geometry,decision)) return;
-                if (decision.replace_best)
-                    best = {row,block,handle,action,decision.reach,rig,model,angle,decision.radius};
-                if (decision.replace_nearest)
-                    nearest = {row,block,handle,action,decision.distance,rig,model,angle,decision.radius};
+                const auto metres = L::Scaled(rig, to_m);
+                const float reach = L::ScanReach(metres, head, hands, where.tracked);
+                if (reach < best.distance)
+                    best = {row, block, handle, action, reach, rig, model, angle};
+                const float away = L::ArmDistance(metres, head, true, hands, where.tracked);
+                if (away < nearest.distance)
+                    nearest = {row, block, handle, action, away, rig, model, angle};
             }
         }
     }
@@ -1087,7 +993,7 @@ void Scan() {
                  "VR lever scan: handle={:#x} row {} ({}) is the nearest hand-pulled lever, {:.2f} m "
                  "from the head or a hand (arms within {:.2f}) | head game ({:.2f},{:.2f},{:.2f})",
                  nearest.handle, nearest.action, nearest.model ? nearest.model->name : "?",
-                 nearest.distance, nearest.radius, where.head.x,
+                 nearest.distance, L::ArmRadius(L::Scaled(nearest.rig, to_m)), where.head.x,
                  where.head.y, where.head.z);
     }
     RecentLever seen{};
@@ -1102,7 +1008,7 @@ void Scan() {
                  "VR lever: handle={:#x} row {} ({}): armed by proximity, {:.2f} m from its "
                  "hinge, without the game selecting it: grabbable while you stay within {:.1f} m",
                  seen.handle, best.action, best.model ? best.model->name : "?", best.distance,
-                 best.radius);
+                 L::ArmRadius(L::Scaled(best.rig, to_m)));
     recent = seen;
     channel.PublishNearby({now, seen.handle, seen.rig, true, seen.angle});
 }
@@ -1113,24 +1019,11 @@ void Scan() {
 // a hold's cleanup writes (a busy guard skips this check; the XR side asks again).
 void CheckArmed() {
     auto &channel = L::Channel();
-    const bool requested =
-        channel.nearby_check.exchange(0, std::memory_order_acq_rel) != 0;
-    if (!requested)
-      return;
+    if (!channel.nearby_check.exchange(0, std::memory_order_acq_rel) || g_motion_test)
+        return;
     Guard guard;
-    if (!guard.acquired)
-      return;
-    PiNativeLeverServiceFacts service{};
-    service.kind = PI_NLS_NEARBY;
-    service.requested = requested;
-    service.motion_test = g_motion_test;
-    service.owned = edit.Owned();
-    service.work = channel.work.load(std::memory_order_acquire) != 0;
-    service.enabled = L::Enabled();
-    PiNativeLeverServiceResult intent{};
-    if (!VR::Interactions::NativeLeverService(settle_module, service, intent) ||
-        !intent.allowed)
-      return;
+    if (!guard.acquired || edit.Owned() || channel.work.load(std::memory_order_acquire))
+        return; // busy, or a hold owns it and re-validates every tick
     const auto seen = recent;
     if (!seen.row) {
         channel.PublishNearby({});
@@ -1148,8 +1041,8 @@ void CheckArmed() {
     L::Rig rig{};
     float angle{};
     const char *why = nullptr;
-    if (intent.disabled)
-      why = "physical levers off";
+    if (!L::Enabled())
+        why = "physical levers off";
     else if (!Row(seen.row, seen.block, param, handle, state, &action))
         why = "no longer a lever row";
     else if (!Selectable(state))
@@ -1159,9 +1052,9 @@ void CheckArmed() {
     else if (!Bind(pose, binding, rig, nullptr, action, &angle))
         why = "not at rest";
     const auto now = NowNs();
-    // B or a refused pull gave it back to the game's button: no hand pull meanwhile, so the
+    // a refused pull gave it back to the game's button: no hand pull meanwhile, so the
     // game's own pull never meets a held lever.
-    if (!why && prompt_policy.Demoted(seen.row, seen.handle, now))
+    if (!why && channel.prompt_state.Demoted(seen.row, seen.handle, now))
         why = "its normal prompt and button are back for now";
     const bool armed = why == nullptr;
     if (recent.armed != armed)
@@ -1179,18 +1072,8 @@ void CheckArmed() {
 void MotionRequest() {
     auto &channel = L::Channel();
     const auto request = channel.acquire.load(std::memory_order_acquire);
-    if (!request)
-      return;
-    PiNativeLeverServiceFacts service{};
-    service.kind = PI_NLS_MOTION_GATE;
-    service.requested = 1;
-    service.request_ns = request;
-    service.motion_test = g_motion_test;
-    service.work = channel.work.load(std::memory_order_acquire) != 0;
-    PiNativeLeverServiceResult intent{};
-    if (!VR::Interactions::NativeLeverService(settle_module, service, intent) ||
-        !intent.allowed)
-      return;
+    if (!g_motion_test || !request || channel.work.load(std::memory_order_acquire))
+        return;
     L::ProbeHands hands{};
     u64 manager{}, blocks{}, world{}, actor{};
     s32 count{};
@@ -1198,75 +1081,52 @@ void MotionRequest() {
     float best = std::numeric_limits<float>::max();
     float nearest = best;
     u32 matching{}, posed{}, bound{};
-    bool probe_failed{};
-    service.kind = PI_NLS_MOTION_DATA;
-    service.now_ns = NowNs();
-    service.have_snapshot = channel.RequestedHands(hands);
-    service.sample_ns = hands.ns;
-    service.radius = hands.radius;
-    const bool accepted =
-        VR::Interactions::NativeLeverService(settle_module, service, intent) &&
-        intent.allowed;
-    if (accepted &&
+    if (L::Fresh(request, NowNs()) && channel.RequestedHands(hands) && hands.ns == request &&
+        std::isfinite(hands.radius) && hands.radius > 0 && hands.radius <= 12 &&
         ReadAt(reinterpret_cast<u64>(g_base) + WorldChrManRva, world) &&
         ReadAt(world + 0x60, actor) &&
         ReadAt(reinterpret_cast<u64>(g_base) + ObjActManRva, manager) &&
         ReadAt(manager + 0x20, count) && count > 0 && count <= 256 &&
         ReadAt(manager + 0x28, blocks)) {
-      u32 inspected{};
-      for (s32 b = 0; b < count && !probe_failed; ++b) {
-        const u64 block = blocks + static_cast<u64>(b) * 0xD8;
-        u64 rows{};
-        s32 rows_count{};
-        if (!ReadAt(block + 0x90, rows) || !ReadAt(block + 0x98, rows_count) ||
-            rows_count < 0 || rows_count > 65536)
-          continue;
-        for (s32 r = 0; r < rows_count && inspected < 65536 && !probe_failed;
-             ++r, ++inspected) {
-          const u64 row = rows + static_cast<u64>(r) * 0x140;
-          s32 type{};
-          if (!ReadAt(row + 0x80, type) || !PhysicalLeverAction(type))
-            continue;
-          u64 param{};
-          u32 handle{};
-          s32 state{};
-          Pose pose{};
-          L::BoneBinding binding{};
-          L::Rig rig{};
-          ++matching;
-          if (!Row(row, block, param, handle, state) || !ReadPose(handle, pose))
-            continue;
-          ++posed;
-          if (!Bind(pose, binding, rig, nullptr, type))
-            continue;
-          ++bound;
-          PiNativeLeverProbeFacts probe{};
-          probe.rig = PhysicalInteractions::NativeLeverRigPackets::Pack(rig);
-          probe.radius = hands.radius;
-          probe.best_distance = best;
-          probe.nearest_distance = nearest;
-          for (int h = 0; h < 2; ++h) {
-            probe.enabled[h] = hands.enabled[h];
-            probe.hands[h][0] = hands.world[h].x;
-            probe.hands[h][1] = hands.world[h].y;
-            probe.hands[h][2] = hands.world[h].z;
-          }
-          PiNativeLeverProbeResult choice{};
-          if (!VR::Interactions::NativeLeverProbe(settle_module, probe,
-                                                  choice)) {
-            best_row = 0;
-            probe_failed = true;
-            break;
-          }
-          if (choice.replace_nearest)
-            nearest = choice.nearest_distance;
-          if (choice.replace_best) {
-            best = choice.best_distance;
-            best_row = row;
-            best_block = block;
-          }
+        u32 inspected{};
+        for (s32 b = 0; b < count; ++b) {
+            const u64 block = blocks + static_cast<u64>(b) * 0xD8;
+            u64 rows{};
+            s32 rows_count{};
+            if (!ReadAt(block + 0x90, rows) || !ReadAt(block + 0x98, rows_count) ||
+                rows_count < 0 || rows_count > 65536)
+                continue;
+            for (s32 r = 0; r < rows_count && inspected < 65536; ++r, ++inspected) {
+                const u64 row = rows + static_cast<u64>(r) * 0x140;
+                s32 type{};
+                if (!ReadAt(row + 0x80, type) || !PhysicalLeverAction(type))
+                    continue;
+                u64 param{};
+                u32 handle{};
+                s32 state{};
+                Pose pose{};
+                L::BoneBinding binding{};
+                L::Rig rig{};
+                ++matching;
+                if (!Row(row, block, param, handle, state) || !ReadPose(handle, pose))
+                    continue;
+                ++posed;
+                if (!Bind(pose, binding, rig, nullptr, type))
+                    continue;
+                ++bound;
+                for (int h = 0; h < 2; ++h) {
+                    if (!hands.enabled[h] || !Body::IsFinite(hands.world[h]))
+                        continue;
+                    const float distance = Body::Length(L::ClosestGrip(rig, 0, hands.world[h]) - hands.world[h]);
+                    nearest = std::min(nearest, distance);
+                    if (distance <= hands.radius && distance < best) {
+                        best = distance;
+                        best_row = row;
+                        best_block = block;
+                    }
+                }
+            }
         }
-      }
     }
     auto expected = request;
     if (best_row) {
@@ -1286,7 +1146,7 @@ void Retire(const L::Command &command) {
     if (command.kind == L::CommandKind::Complete && reported_completion != command.serial)
         ReportCompletion(command, false);
     edit.Forget();
-    settling.Clear();
+    settling_serial = 0;
     ClearOffer();
     L::Channel().Retire(command.serial);
 }
@@ -1318,6 +1178,12 @@ void Park(const L::Command &command, s64 now, const char *why) {
         L::Channel().PublishNearby({now, recent.handle, recent.rig, recent.armed, recent.angle});
     }
     Retire(command);
+}
+// Where an accepted pull settles to: rest for a reusable lever, partway back for one whose own
+// clip ends there (o321110, lever_models.h end_deg), within the offer's stops.
+float SettledEnd() {
+    const float end = offer.model ? L::EndAngle(*offer.model) : 0.0f;
+    return std::clamp(end, 0.0f, std::max(0.0f, offer.binding.sweep));
 }
 // The game ended a hold the hand still had: why, once per hold (the XR side's end line follows).
 u64 dropped_generation{};
@@ -1419,33 +1285,28 @@ void Update(u64 queue, u64 objects) {
     u32 handle{};
     s32 state{};
     u32 actor_handle{};
-    // Resolve model behavior before pose writes or the irreversible dispatch.
-    // A later accepted completion needs no fresh metadata query to stay accepted.
-    const auto model_geometry = ModelGeometry(offer.model,offer.binding.sweep);
-    bool fault=VR::Interactions::ProcessFaultLatch().Tripped();
-    const bool capstan=model_geometry.capstan;
-    PiNativeLeverCommandFacts command_facts{};
-    command_facts.now_ns = now;command_facts.command_ns = command.ns;command_facts.offer_ns = offer.ns;
-    command_facts.serial = command.serial;command_facts.attempted_serial = attempted_completion;
-    command_facts.settle_serial = settling.Serial();command_facts.kind = uint32_t(command.kind);
-    command_facts.fault = fault;command_facts.owned = edit.Owned();command_facts.parked = offer.parked;
-    command_facts.model_present = offer.model != nullptr;command_facts.capstan = capstan;
-    command_facts.same_parked_model = parked.model == offer.model;
-    command_facts.same_parked_object = parked.object == offer.pose.object;
-    command_facts.same_parked_handle = parked.handle == offer.handle;
-    command_facts.angle = command.angle;command_facts.sweep = offer.binding.sweep;
-    command_facts.applied_angle = applied_angle;command_facts.offer_angle = offer.angle;
-    PiNativeLeverCommandResult intent{};
-    const bool planned = VR::Interactions::NativeLeverCommand(settle_module,command_facts,intent);
-    const bool angle_valid = intent.angle_valid;
+    const bool angle_valid = command.angle >= 0 && command.angle <= offer.binding.sweep;
+    // A capstan never moves on its own (lever_models.h Parked): let go short of its stop, refused
+    // or cancelled, its bar stays where the hand left it. Motion-only rehearsal returns it to rest,
+    // as every rehearsed lever.
+    const bool capstan = IsCapstan(offer.model) && !g_motion_test;
+    const bool wants_hold = command.kind == L::CommandKind::Hold;
+    // A capstan parked at its stop (the game refused its completion) completes on the hand's very
+    // first step: the release (Settle) can be the first command to reach the game, before any
+    // hold. It takes the bone then, so that completion is not lost.
+    const bool resume_settle =
+        !edit.Owned() && offer.parked && command.kind == L::CommandKind::Settle;
+    const bool wants_complete = command.kind == L::CommandKind::Complete && edit.Owned() &&
+                                attempted_completion != command.serial &&
+                                std::abs(command.angle - offer.binding.sweep) <= 0.001f;
     // Release/stale-input cleanup never needs another permission call or a live actor.
     const char *refused = nullptr;
-    if (intent.refused == PI_NLC_STALE)
-        refused = "the hand's command went stale (no XR update within 150 ms)";
-    else if (intent.refused == PI_NLC_ANGLE)
-        refused = "its angle left the lever's stops";
-    if (intent.needs_checks && !refused) {
-        if (!Row(offer.row, offer.block, param, handle, state) || param != offer.param ||
+    if (wants_hold || wants_complete || resume_settle) {
+        if (!L::Fresh(command.ns, now))
+            refused = "the hand's command went stale (no XR update within 150 ms)";
+        else if (!angle_valid)
+            refused = "its angle left the lever's stops";
+        else if (!Row(offer.row, offer.block, param, handle, state) || param != offer.param ||
                  handle != offer.handle)
             refused = "its action row changed";
         else if (state != offer.state)
@@ -1455,19 +1316,23 @@ void Update(u64 queue, u64 objects) {
         else if (!g_motion_test && !Permitted(offer.row, offer.actor))
             refused = "the game's permission refused it";
     }
-    command_facts.native_allowed = refused == nullptr;
-    command_facts.fault = VR::Interactions::ProcessFaultLatch().Tripped();
-    PiNativeLeverCommandResult decision{};
-    if (planned) VR::Interactions::NativeLeverCommand(settle_module,command_facts,decision);
-    const bool hold = decision.hold, complete = decision.complete;
+    const bool allowed = (wants_hold || wants_complete || resume_settle) && !refused;
+    const bool hold = wants_hold && allowed;
+    const bool complete = wants_complete && allowed;
     if (!edit.Owned()) {
-        // Pose storage and ownership writes stay guarded in the native adapter.
-        const bool owned = decision.acquire &&
-            (offer.parked ? edit.Resume(offer.binding,pose.Buffers(),offer.model->lever,parked.original,parked.last)
-                          : edit.Begin(offer.binding,pose.Buffers(),offer.model->lever));
+        // A parked capstan's bone is taken as the hand left it (its record's bytes), with its
+        // true rest kept for a later restore; any other lever's at its rest.
+        const bool take = hold || (resume_settle && allowed);
+        const bool owned =
+            take && L::Fresh(offer.ns, now) && offer.model &&
+            (offer.parked ? parked.model == offer.model && parked.object == offer.pose.object &&
+                                parked.handle == offer.handle &&
+                                edit.Resume(offer.binding, pose.Buffers(), offer.model->lever,
+                                            parked.original, parked.last)
+                          : edit.Begin(offer.binding, pose.Buffers(), offer.model->lever));
         if (!owned) {
             LOG_INFO(Core, "VR lever hold rejected: hold={} fresh={} pose ownership unavailable",
-                     decision.take, decision.fresh_offer);
+                     take, L::Fresh(offer.ns, now));
             Retire(command);
             return;
         }
@@ -1486,18 +1351,32 @@ void Update(u64 queue, u64 objects) {
                  offer.parked ? fmt::format(" (resumed at {:.1f} degrees)", offer.angle / Body::Deg)
                               : std::string{});
     }
-    bool wants_settle = decision.wants_settle;
-    if (decision.begin_settle) {
-        settling.Begin(command.serial,now,applied_angle,offer.binding.sweep,
-            intent.fresh_command,angle_valid,command.angle,
-            capstan ? L::Motion::Capstan : L::Motion::Pull);
-        fault=VR::Interactions::ProcessFaultLatch().Tripped();
-        if(fault)wants_settle=false;
-        else if(settling.Park()) {Park(command,now,"let go before its stop");return;}
+    const bool wants_settle = edit.Owned() &&
+        (command.kind == L::CommandKind::Settle ||
+         (command.kind == L::CommandKind::Complete && settling_serial == command.serial));
+    if (wants_settle && settling_serial != command.serial) {
+        // Where the hand let go: the last hold the game applied, or the release's own angle when
+        // it is fresh and within the stops. The XR side's one command slot lets a release replace
+        // holds the game has not read yet (a capstan turned to its stop sends its release at the
+        // stop, after a last applied hold that may be degrees short); the XR side decided the
+        // completion from that same angle. The settle still starts from what the game shows.
+        const bool fresh = L::Fresh(command.ns, now) && angle_valid;
+        const float released = fresh ? std::max(applied_angle, command.angle) : applied_angle;
+        const bool commit =
+            fresh && released / offer.binding.sweep >= L::CommitFor(offer.binding.motion);
+        if (capstan && !commit && applied_angle > ParkMinAngle) {
+            Park(command, now, "let go before its stop");
+            return;
+        }
+        settling_serial = command.serial;
+        settling_ns = now;
+        settling_commit = commit;
+        settling.Begin(applied_angle, offer.binding.sweep, settling_commit);
     }
     // A capstan's hold ended any other way (refused, stale, cancelled; or the game refused its
     // completion): parked where it is, never restored.
-    if (!wants_settle && decision.park_if_not_settling) {
+    if (capstan && edit.Owned() && !wants_settle && !hold && !complete &&
+        applied_angle > ParkMinAngle) {
         if (refused)
             Dropped(command, refused);
         Park(command, now,
@@ -1508,8 +1387,8 @@ void Update(u64 queue, u64 objects) {
     }
     float settle_angle{};
     if (wants_settle) {
-        settle_angle = settling.Tick(now);
-        fault=VR::Interactions::ProcessFaultLatch().Tripped();if(fault)wants_settle=false;
+        settle_angle = settling.Step(static_cast<float>(now - settling_ns) * 1e-9f);
+        settling_ns = now;
     }
     const bool changed = wants_settle ? edit.Apply(settle_angle, pose.Buffers(), refresh)
                          : (hold || complete) ? edit.Apply(command.angle, pose.Buffers(), refresh)
@@ -1526,7 +1405,7 @@ void Update(u64 queue, u64 objects) {
     if (wants_settle) {
         applied_angle = settle_angle;
         if (!settling.Done()) return;
-        if (settling.Commit()) {
+        if (settling_commit) {
             // Revalidate immediately before the one irreversible dispatch. Permission
             // at grab time is not authority to activate a changed action later.
             const bool permitted = L::Enabled() && Row(offer.row, offer.block, param, handle, state) &&
@@ -1535,7 +1414,7 @@ void Update(u64 queue, u64 objects) {
                 (g_motion_test || Permitted(offer.row, offer.actor));
             const bool accepted = permitted && Complete(command);
             if (reported_completion != command.serial) ReportCompletion(command, false);
-            if (accepted && model_geometry.stays_at_stop) {
+            if (accepted && offer.model && L::StaysAtStop(*offer.model)) {
                 StayPulled(command);
                 return;
             }
@@ -1547,7 +1426,8 @@ void Update(u64 queue, u64 objects) {
             // stops partway back: end_deg). Return procedurally as well, without dispatching
             // twice or replaying a clip. A refused activation returns to rest.
             // PoseEdit relinquishes ownership if the game changes the pose meanwhile.
-            settling.Return(accepted ? model_geometry.end_target : 0.f);
+            settling_commit = false;
+            settling.BeginTo(settle_angle, accepted ? SettledEnd() : 0.0f);
             return;
         }
         // The endpoint is rest (or where the model's own clip leaves it after an accepted pull):
@@ -1571,11 +1451,14 @@ void Update(u64 queue, u64 objects) {
     } else if (complete) {
         applied_angle = command.angle;
         if (Complete(command)) {
-            if (model_geometry.stays_at_stop) {
+            if (offer.model && L::StaysAtStop(*offer.model)) {
                 StayPulled(command);
                 return;
             }
-            settling.BeginTo(command.serial,now,command.angle,model_geometry.end_target);
+            settling_serial = command.serial;
+            settling_ns = now;
+            settling_commit = false;
+            settling.BeginTo(command.angle, SettledEnd());
         }
         // A rejected attempt remains awake for cleanup next tick, without redispatch (a capstan's
         // cleanup parks it at its stop).
@@ -1585,60 +1468,35 @@ void Update(u64 queue, u64 objects) {
         Retire(command);
     }
 }
-// The parked capstan whose hand pull is over for now (the XR side asks as
-// physical levers are switched off or no display mode a hand pulls in is left;
-// Classify as its prompt is given back by B or a refused pull): the game holds
-// it unturned, and its own button plays its clip from rest. Its own scheduler
-// puts the bar back at its true rest once, as a cancelled hold of any other
-// lever would have, so flat play sees the capstan as the game holds it. Only
-// the very bar as the hand left it (StillParked and Resume compare every byte);
-// a record that no longer is (the game animating the bar, its object gone or
-// reloaded) is dropped, writing nothing. A request its own scheduler does not
-// serve within its restore window (its map not running, its queue full) lapses
-// and the record stays: the hand can still carry on, and the next request tries
-// again.
+// The parked capstan whose hand pull is over for now (the XR side asks as physical levers are
+// switched off or no display mode a hand pulls in is left; Classify as its prompt is given back by
+// a refused pull): the game holds it unturned, and its own button plays its clip from rest.
+// Its own scheduler puts the bar back at its true rest once, as a cancelled hold of any other lever
+// would have, so flat play sees the capstan as the game holds it. Only the very bar as the hand
+// left it (StillParked and Resume compare every byte); a record that no longer is (the game
+// animating the bar, its object gone or reloaded) is dropped, writing nothing. A request its own
+// scheduler does not serve within UnparkNs (its map not running, its queue full) lapses and the
+// record stays: the hand can still carry on, and the next request tries again.
+constexpr s64 UnparkNs = 2'000'000'000;
 void Unpark(u64 queue, u64 objects) {
     auto &channel = L::Channel();
     auto request = channel.unpark.load(std::memory_order_acquire);
     if (!request)
         return;
-    PiNativeLeverServiceFacts service{};
-    service.kind = PI_NLS_UNPARK_GATE;
-    service.requested = 1;
-    service.request_ns = request;
-    service.runtime_enabled = g_runtime_enabled;
-    service.motion_test = g_motion_test;
-    PiNativeLeverServiceResult intent{};
-    if (!VR::Interactions::NativeLeverService(settle_module, service, intent) ||
-        intent.clear_request) {
-      channel.unpark.compare_exchange_strong(request, 0,
-                                             std::memory_order_acq_rel);
-      return;
+    if (!g_runtime_enabled || g_motion_test) { // nothing parks: nothing to restore
+        channel.unpark.compare_exchange_strong(request, 0, std::memory_order_acq_rel);
+        return;
     }
-    if (!intent.allowed)
-      return;
     Guard guard;
     if (!guard.acquired)
         return; // busy: the next tick
     const auto now = NowNs();
-    service.kind = PI_NLS_UNPARK_READY;
-    service.now_ns = now;
-    service.owned = edit.Owned();
-    service.work = channel.work.load(std::memory_order_acquire) != 0;
-    service.parked_present = parked.model != nullptr;
-    if (!VR::Interactions::NativeLeverService(settle_module, service, intent) ||
-        intent.clear_request) {
-      channel.unpark.compare_exchange_strong(request, 0,
-                                             std::memory_order_acq_rel);
-      return;
+    if (edit.Owned() || channel.work.load(std::memory_order_acquire)) {
+        // A hold or its settle owns a lever: the request waits for it to end, its window starting
+        // then (a capstan's hold that ends so parks the bar, and this then restores it).
+        channel.unpark.compare_exchange_strong(request, now, std::memory_order_acq_rel);
+        return;
     }
-    if (intent.defer_request) {
-      channel.unpark.compare_exchange_strong(request, now,
-                                             std::memory_order_acq_rel);
-      return;
-    }
-    if (!intent.allowed)
-      return;
     const auto served = [&] {
         auto expected = request;
         channel.unpark.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
@@ -1651,13 +1509,16 @@ void Unpark(u64 queue, u64 objects) {
         served();
     };
     const auto lapse = [&](const char *why) {
-      if (!intent.expired)
-        return; // the DLL-approved window permits another attempt
-      LOG_INFO(Core,
-               "VR lever: handle={:#x} ({}) parked bar left parked for now: {}",
-               parked.handle, parked.model->name, why);
-      served();
+        if (now - request <= UnparkNs)
+            return; // the next tick tries again
+        LOG_INFO(Core, "VR lever: handle={:#x} ({}) parked bar left parked for now: {}",
+                 parked.handle, parked.model->name, why);
+        served();
     };
+    if (!parked.model) {
+        served();
+        return;
+    }
     Pose pose{};
     std::array<u8, 0x2E0> object{};
     if (!Object(parked.handle, pose.object, object) || pose.object != parked.object ||
@@ -1940,6 +1801,7 @@ void PS4_SYSV_ABI Event(u64 block, u64 record, u32 remote) noexcept {
 } // namespace
 
 void InstallLeverProbe(VAddr base, u64 size) {
+    InstallSummonBell(base,size);
     const char *enabled = std::getenv("VR_LEVER_PROBE");
     const char *physical = std::getenv("VR_LEVER_PHYSICAL_TEST");
     const char *motion = std::getenv("VR_LEVER_MOTION_TEST");
@@ -2047,8 +1909,8 @@ void InstallLeverProbe(VAddr base, u64 size) {
             });
         // No per-frame host call: recognize the already-selected action's parameter, then
         // reuse the host's verdict for this row and object. The host classifies a different
-        // row/object, a B fallback, a prompt change (prompt_serial) or a due recheck (about once
-        // a second), and resolves
+        // row/object, a legacy serial change, a prompt change (prompt_serial) or a due recheck
+        // (about once a second), and resolves
         // bones/permission for a grip request. Only a bound lever advances the cheap hint.
         code->align(16);
         void *selected = const_cast<u8 *>(code->getCurr());
@@ -2298,18 +2160,6 @@ void InstallLeverProbe(VAddr base, u64 size) {
             !Hook::MakeWritable(module + PoseRva, PoseBytes.size())) {
             LOG_WARNING(Core, "VR lever probe: cannot patch code; probe not installed");
             return;
-        }
-        if(runtime_enabled && VR::Interactions::DllRequested()){
-            LiveLever::settle_module=new VR::Interactions::Module();
-            LiveLever::settle_module->EnableFaultBroadcast();
-            if(!LiveLever::settle_module->LoadBesideExecutable()){
-                LiveLever::settle_fault=true;
-                LOG_ERROR(Core,"VR lever: DLL native settling unavailable: {}",LiveLever::settle_module->Diagnostic());
-                return;
-            }
-            LiveLever::settling.Bind(*LiveLever::settle_module,LiveLever::settle_fault);
-            LiveLever::prompt_policy.Bind(*LiveLever::settle_module,LiveLever::settle_fault);
-            LiveLever::edit.Policy().Bind(*LiveLever::settle_module);
         }
         g_base = module;
         g_runtime_enabled = runtime_enabled;

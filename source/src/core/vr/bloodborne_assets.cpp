@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <atomic>
@@ -113,7 +119,7 @@ std::optional<std::vector<u8>> Bnd4File(const std::vector<u8>& bnd, s32 id) {
     return std::nullopt;
 }
 
-// BND4 with UTF-16 names (sfx archives can contain full Windows-style entry names):
+// BND4 with UTF-16 names (the sfx archive: "N:\SPRJ\data\INTERROOT_ps4\sfx\...\s10010.flver"):
 // every file whose name ends with one of `wanted` (ASCII, case-insensitive), by that suffix.
 std::unordered_map<std::string, std::vector<u8>> Bnd4FilesNamed(
     const std::vector<u8>& bnd, const std::vector<std::string>& wanted) {
@@ -834,7 +840,7 @@ struct Loader {
     std::unordered_map<s32, std::shared_ptr<const Model>> models;
     std::unordered_map<s32, bool> model_failed;
     std::deque<s32> model_queue;
-    // game asset textures (the VR settings page): decoded ones, the names asked for and
+    // menu/common.tpf.dcx textures (the VR settings page): decoded ones, the names asked for and
     // not yet loaded, and the names the file lacks.
     std::unordered_map<std::string, std::shared_ptr<const MenuTexture>> menu_textures;
     std::vector<std::string> menu_queue;
@@ -1086,7 +1092,7 @@ void LoadModels(Loader& l, s32 wanted) {
              micros / 1000, why.empty() ? "" : " (" + why + ")");
 }
 
-// The asked-for textures of game asset (PS4 TPF: BC7, micro-tiled), decoded to RGBA8 from
+// The asked-for textures of menu/common.tpf.dcx (PS4 TPF: BC7, micro-tiled), decoded to RGBA8 from
 // one read of the file (9 MB, 31 MB unpacked, dropped afterwards).
 void LoadMenuTextures(Loader& l, std::vector<std::string> names) {
     const auto start = std::chrono::steady_clock::now();
@@ -1167,12 +1173,27 @@ void LoadMenuTextures(Loader& l, std::vector<std::string> names) {
              names.size(), ms);
 }
 
+// One job of this thread. One that runs out of memory (std::bad_alloc on a PC short of RAM and page
+// file) or meets an unreadable file is skipped: the VR UI does without that asset, and the thread,
+// and the game, keep going. Before 2026-10-17 such a throw ended the game (exit 0xe06d7363).
+template <class Job> bool Guarded(const char* what, Job&& job) {
+    try {
+        job();
+        return true;
+    } catch (const std::exception& e) {
+        LOG_ERROR(Core, "VR assets: {} skipped ({})", what, e.what());
+    } catch (...) {
+        LOG_ERROR(Core, "VR assets: {} skipped", what);
+    }
+    return false;
+}
+
 void Run() {
     Common::SetCurrentThreadName("VR:Assets");
     auto& l = L();
-    LoadNames(l);
-    BuildFont(l);
-    LoadGameFont(l);
+    Guarded("goods names", [&] { LoadNames(l); });
+    Guarded("the VR font", [&] { BuildFont(l); });
+    Guarded("the game font", [&] { LoadGameFont(l); });
     for (;;) {
         s32 id = -1;
         s32 model = -1;
@@ -1193,15 +1214,27 @@ void Run() {
             }
         }
         if (!menu.empty()) {
-            LoadMenuTextures(l, menu);
+            const bool ok = Guarded("menu textures", [&] { LoadMenuTextures(l, menu); });
             std::scoped_lock lock{l.mutex};
             std::erase_if(l.menu_queue, [&menu](const std::string& name) {
                 return std::find(menu.begin(), menu.end(), name) != menu.end();
             });
+            if (!ok) {
+                for (const std::string& name : menu) {
+                    if (!l.menu_textures.contains(name)) {
+                        l.menu_failed[name] = true; // not asked for again
+                    }
+                }
+            }
             continue;
         }
         if (model >= 0) {
-            LoadModels(l, model);
+            if (!Guarded("a model", [&] { LoadModels(l, model); })) {
+                std::scoped_lock lock{l.mutex};
+                if (!l.models.contains(model)) {
+                    l.model_failed[model] = true; // not asked for again
+                }
+            }
             continue;
         }
         const auto start = std::chrono::steady_clock::now();
@@ -1209,12 +1242,17 @@ void Run() {
             fmt::format("/app0/dvdroot_ps4/menu/menu_knowledge_{:05}.tpf.dcx", id);
         std::shared_ptr<Icon> icon;
         std::string why = "missing";
-        if (auto file = ReadGameFile(path)) {
-            if (auto tpf = Dcx(*file)) {
-                icon = DecodeIcon(*tpf, why);
-            } else {
-                why = "not a DCX";
-            }
+        if (!Guarded("an icon", [&] {
+                if (auto file = ReadGameFile(path)) {
+                    if (auto tpf = Dcx(*file)) {
+                        icon = DecodeIcon(*tpf, why);
+                    } else {
+                        why = "not a DCX";
+                    }
+                }
+            })) {
+            icon.reset();
+            why = "out of memory or unreadable";
         }
         const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - start)

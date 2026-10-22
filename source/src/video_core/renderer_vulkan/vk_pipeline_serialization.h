@@ -26,7 +26,8 @@ u64 PermutationId(u64 pgm_hash, const Shader::StageSpecialization& spec);
 // list (where this session has it).
 void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
-                        const Shader::StageSpecialization& spec, u64 perm_id, size_t perm_idx);
+                        const Shader::StageSpecialization& spec, u64 perm_id, size_t perm_idx,
+                        u64 vertex_output_locations);
 void RegisterShaderBinary(std::vector<u32>&& spv, u64 perm_id, u64 pgm_hash, size_t perm_idx);
 
 } // namespace Vulkan

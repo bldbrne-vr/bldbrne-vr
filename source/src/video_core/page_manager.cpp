@@ -210,6 +210,10 @@ struct PageManager::Impl {
     }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
+        if (const auto hook = fault_hook.load(std::memory_order_acquire);
+            hook != nullptr && hook(context, fault_address)) [[unlikely]] {
+            return true;
+        }
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         if (Common::IsWriteError(context)) {
             FastRender::NoteFault();

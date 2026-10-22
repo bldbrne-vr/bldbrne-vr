@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
@@ -19,9 +20,14 @@
 #include "core/vr/game_sounds.h"
 #include "core/vr/grind_audio.h"
 #include "core/vr/audio_settings.h"
+#include <array>
+#include <cstring>
+#include <vector>
 #include "core/vr/whip_audio.h"
 #include "core/vr/gun_reload_audio.h"
+#include "core/vr/lever_audio.h"
 #include "core/vr/quick_use_audio.h"
+#include "core/vr/bell_audio.h"
 #include "core/vr/vr_session.h"
 
 namespace Libraries::AudioOut {
@@ -180,8 +186,43 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
                                           0.48f, VR::Whip::CutterReelGain);
     bool whip_close = false;
     VR::Quick::UseAudioMixer use_audio;
+    VR::Quick::BellAudioMixer bell_audio;
     VR::Gun::ReloadAudioMixer reload_audio(VR::Gun::ReloadPcm(), VR::Gun::EmptyPcm());
     VR::Grind::GrindMixer grind_audio; // the blades' grind (its loop decoded at startup)
+    VR::LeverAudio::Mixer lever_audio; // a lever pulled by hand: its clunk (decoded at startup)
+    // Audio hunt (2026-10-18, logs-on builds): which of our mixers added sound to each buffer; one
+    // that keeps adding for 3 s is logged (a stuck loop: "gr gr gr" after poison), and its end.
+    std::vector<u8> before;
+    std::array<s64, 5> active_since{}, logged_since{};
+    static constexpr std::array<const char*, 5> MixerNames{"whip reel/clink", "gun reload",
+                                                           "item use", "blade grind", "lever"};
+    const auto track = [&](u32 index, s64 now, auto&& mix) {
+        if constexpr (!Common::Log::Enabled) {
+            mix();
+            return;
+        }
+        const u32 bytes = port->BufferSize();
+        before.resize(bytes);
+        std::memcpy(before.data(), port->output_buffer, bytes);
+        mix();
+        const bool added = std::memcmp(before.data(), port->output_buffer, bytes) != 0;
+        if (added) {
+            if (active_since[index] == 0) {
+                active_since[index] = now;
+            }
+            if (now - active_since[index] > 3'000'000'000 && logged_since[index] != active_since[index]) {
+                logged_since[index] = active_since[index];
+                LOG_WARNING(Lib_AudioOut, "VR audio: our {} sound has played for 3 s without a break",
+                            MixerNames[index]);
+            }
+        } else if (active_since[index] != 0) {
+            if (logged_since[index] == active_since[index]) {
+                LOG_WARNING(Lib_AudioOut, "VR audio: our {} sound stopped after {:.1f} s",
+                            MixerNames[index], static_cast<double>(now - active_since[index]) * 1e-9);
+            }
+            active_since[index] = 0;
+        }
+    };
 
     while (true) {
         timer.Start();
@@ -200,21 +241,42 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
                         whip_close = whip_audio.SetClink(VR::GameSounds::CutterClose(),
                                                          VR::Whip::CutterCloseGain);
                     }
-                    whip_audio.Mix(port->output_buffer, port->buffer_frames,
-                                   port->format_info.num_channels, port->sample_rate,
-                                   port->format_info.is_float, VR::Whip::LatestRecallAudio(), now);
-                    reload_audio.Mix(port->output_buffer, port->buffer_frames,
-                                     port->format_info.num_channels, port->sample_rate,
-                                     port->format_info.is_float, VR::Gun::LatestReloadAudio(), now);
-                    use_audio.Mix(port->output_buffer, port->buffer_frames,
-                                  port->format_info.num_channels, port->sample_rate,
-                                  port->format_info.is_float, VR::Quick::LatestUseAudio(), now);
+                    track(0, now, [&] {
+                        whip_audio.Mix(port->output_buffer, port->buffer_frames,
+                                       port->format_info.num_channels, port->sample_rate,
+                                       port->format_info.is_float, VR::Whip::LatestRecallAudio(),
+                                       now);
+                    });
+                    track(1, now, [&] {
+                        reload_audio.Mix(port->output_buffer, port->buffer_frames,
+                                         port->format_info.num_channels, port->sample_rate,
+                                         port->format_info.is_float, VR::Gun::LatestReloadAudio(),
+                                         now);
+                    });
+                    track(2, now, [&] {
+                        use_audio.Mix(port->output_buffer, port->buffer_frames,
+                                      port->format_info.num_channels, port->sample_rate,
+                                      port->format_info.is_float, VR::Quick::LatestUseAudio(), now);
+                        bell_audio.Mix(port->output_buffer, port->BufferSize(), port->buffer_frames,
+                                       port->format_info.num_channels, port->sample_rate,
+                                       port->format_info.is_float, VR::Quick::LatestBellAudio(), now);
+                    });
                     if (!grind_audio.HasPcm()) {
                         grind_audio.SetPcm(VR::Grind::GrindPcm());
                     }
-                    grind_audio.Mix(port->output_buffer, port->buffer_frames,
-                                    port->format_info.num_channels, port->sample_rate,
-                                    port->format_info.is_float, VR::Grind::LatestGrind(), now);
+                    track(3, now, [&] {
+                        grind_audio.Mix(port->output_buffer, port->buffer_frames,
+                                        port->format_info.num_channels, port->sample_rate,
+                                        port->format_info.is_float, VR::Grind::LatestGrind(), now);
+                    });
+                    if (!lever_audio.HasPcm()) {
+                        lever_audio.SetPcm(VR::GameSounds::LeverClunk());
+                    }
+                    track(4, now, [&] {
+                        lever_audio.Mix(port->output_buffer, port->buffer_frames,
+                                        port->format_info.num_channels, port->sample_rate,
+                                        port->format_info.is_float, VR::LeverAudio::Latest(), now);
+                    });
                 }
                 port->impl->Output(port->output_buffer);
                 port->output_ready = false;

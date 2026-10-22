@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 //
 // Fast bit 40: async graphics pipeline creation, ported from bbport's BB_ASYNC_PIPELINES
 // (BBV = bbport gpu/shadps4/video_core: renderer_vulkan/vk_pipeline_cache.cpp:370-418 compiler
@@ -69,9 +75,9 @@
 #include <utility>
 #include <vector>
 
-#include "../../../scratchpad/dual-eye-perf/draw_inputs.h"
-#include "../../../scratchpad/dual-eye-perf/draw_registers.h"
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
+#include "video_core/native_stereo/draw_inputs.h"
+#include "video_core/native_stereo/draw_registers.h"
+#include "video_core/native_stereo/native_stereo.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
@@ -151,6 +157,7 @@ struct Job {
     enum : u32 { Queued = 0, Running = 1, Done = 2 };
     GraphicsPipelineKey key{};
     u64 hash{};
+    u64 vertex_output_locations{};
     std::array<const Shader::Info*, MaxShaderStages> infos{}; // the programs' shared Info
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
@@ -392,6 +399,7 @@ struct PipelineCache::AsyncPipelines {
         job->hash = std::hash<GraphicsPipelineKey>{}(job->key);
         job->infos = selection.infos;
         job->runtime_infos = selection.runtime_infos;
+        job->vertex_output_locations = selection.vertex_output_locations;
         job->fetch_shader = selection.fetch_shader;
         job->modules = selection.modules;
         for (u32 stage = 0; stage < MaxShaderStages; ++stage) {
@@ -867,7 +875,7 @@ struct PipelineCache::AsyncPipelines {
         auto pipeline = std::make_unique<GraphicsPipeline>(
             cache.instance, cache.scheduler, cache.desc_heap, cache.profile, job.key,
             *cache.pipeline_cache, job.infos, job.runtime_infos, job.fetch_shader, job.modules,
-            job.sdata, false);
+            job.sdata, false, job.vertex_output_locations);
         job.compile_ns = AsyncDetail::NowNs() - start;
         g_tolerate_pipeline_rejection = tolerate;
         compile_ns.fetch_add(job.compile_ns, std::memory_order_relaxed);
@@ -1238,6 +1246,7 @@ void PipelineCache::KickPreparedPipeline(const PrepGraphicsContext& context, u64
     job->key = selected.graphics_key;
     job->hash = key_hash;
     job->runtime_infos = selected.runtime_infos;
+    job->vertex_output_locations = selected.vertex_output_locations;
     job->fetch_shader = selected.fetch_shader;
     job->generation = context.generation;
     job->speculative = true;

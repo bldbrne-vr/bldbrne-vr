@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <map>
 #include "common/alignment.h"
 #include "common/arch.h"
@@ -58,7 +59,17 @@ static constexpr u64 SystemReservedSize = SYSTEM_RESERVED_MAX - SYSTEM_RESERVED_
 static constexpr u64 UserSize = USER_MAX - USER_MIN + 1;
 
 // Required backing file size for mapping physical address space.
-static u64 BackingSize = ORBIS_KERNEL_TOTAL_MEM_DEV_PRO + ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE;
+static u64 BackingSize = 0;
+
+u64 InitialDirectMemorySize() {
+    // Retail titles cannot request the larger devkit memory layout.
+    // Keep both retail PS4 modes available until the guest selects its exact layout.
+    // VR_COMPACT_MEMORY_BACKING=0 restores the legacy backing for troubleshooting.
+    const char* compact = std::getenv("VR_COMPACT_MEMORY_BACKING");
+    return (!compact || compact[0] != '0') && !EmulatorSettings.IsDevKit()
+               ? ORBIS_KERNEL_TOTAL_MEM_PRO
+               : ORBIS_KERNEL_TOTAL_MEM_DEV_PRO;
+}
 
 #ifdef _WIN32
 
@@ -190,8 +201,9 @@ struct AddressSpace::Impl {
         user_size = supported_user_max - USER_MIN - 1;
 
         // Increase BackingSize to account for config options.
-        BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB +
-                       EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
+        BackingSize = InitialDirectMemorySize() + ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE +
+                      EmulatorSettings.GetExtraDmemInMBytes() * 1_MB +
+                      EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
 
         // Allocate backing file that represents the total physical memory.
         backing_handle = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
@@ -630,8 +642,9 @@ enum PosixPageProtection {
 
 struct AddressSpace::Impl {
     Impl() {
-        BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB +
-                       EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
+        BackingSize = InitialDirectMemorySize() + ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE +
+                      EmulatorSettings.GetExtraDmemInMBytes() * 1_MB +
+                      EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
         // Allocate virtual address placeholder for our address space.
         system_managed_size = SystemManagedSize;
         system_reserved_size = SystemReservedSize;

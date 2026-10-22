@@ -3,6 +3,7 @@
 
 #include "common/arch.h"
 #include "common/assert.h"
+#include "common/crash_record.h"
 #include "core/signals.h"
 
 #if defined(ARCH_X86_64)
@@ -21,6 +22,16 @@ void assert_fail_impl() {
 [[noreturn]] void unreachable_impl() {
     assert_fail_impl();
     throw std::runtime_error("Unreachable code");
+}
+
+void assert_fail_at(const char* file, int line) {
+    Common::CrashRecord::NoteFailedCheck(file, line, false);
+    assert_fail_impl();
+}
+
+[[noreturn]] void unreachable_at(const char* file, int line) {
+    Common::CrashRecord::NoteFailedCheck(file, line, true);
+    unreachable_impl();
 }
 
 void assert_fail_debug_msg(const char* msg) {

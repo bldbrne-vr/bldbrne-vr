@@ -1,5 +1,11 @@
 #include "video_core/flip_order_trace.h"
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -543,6 +549,7 @@ void CommandRecorder::Drain(std::string_view reason, std::source_location site) 
     }
     Publish();
     const auto start = std::chrono::steady_clock::now();
+    [[maybe_unused]] u64 spin_ns = 0;
 #ifdef _MSC_VER
     if (g_drain_spin_pauses != 0) {
         for (u32 spin = 0; spin < g_drain_spin_pauses && done < end; ++spin) {
@@ -550,10 +557,9 @@ void CommandRecorder::Drain(std::string_view reason, std::source_location site) 
             done = completed.load(std::memory_order_acquire);
         }
         if constexpr (Common::Log::Enabled) {
-            FastRender::NoteRecorderSpin(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                             std::chrono::steady_clock::now() - start)
-                                             .count(),
-                                         FastRender::IsStageB());
+            spin_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - start).count();
+            FastRender::NoteRecorderSpin(spin_ns, FastRender::IsStageB());
         }
     }
 #endif
@@ -561,9 +567,12 @@ void CommandRecorder::Drain(std::string_view reason, std::source_location site) 
         completed.wait(done, std::memory_order_acquire);
         done = completed.load(std::memory_order_acquire);
     }
-    FastRender::NoteRecorderWait(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                     std::chrono::steady_clock::now() - start)
-                                     .count());
+    const u64 wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - start).count();
+    FastRender::NoteRecorderWait(wait_ns);
+    if constexpr (Common::Log::Enabled) {
+        FastRender::NoteRecorderWaitReason(reason, site, wait_ns, spin_ns, FastRender::IsStageB());
+    }
 }
 void CommandRecorder::ReplayUntil(u64 end) {
     const auto start = std::chrono::steady_clock::now();

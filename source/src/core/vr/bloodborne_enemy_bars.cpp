@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <array>
 #include <atomic>
@@ -85,7 +91,7 @@ u64 Load(u64& counter) {
     return std::atomic_ref<u64>(counter).load(std::memory_order_relaxed);
 }
 
-// ---- The boss bar near the top (ui_boss_hp_bar = 1, OnBossTag) ----
+// ---- The boss bar near the top (ui_boss_bar = 1, OnBossTag) ----
 // The flat game draws the boss bars at the stage's bottom (y ~940 of 1080). Shown, each boss tag's
 // clip is set BossRaisePx higher, from the y it had when first seen (the game lays the list out
 // once; set from that original every update, so it never drifts). Through the clip's Scaleform
@@ -93,10 +99,25 @@ u64 Load(u64& counter) {
 // (+0xE8), Scaleform 4's DisplayInfo (X +0x00, Y +0x08, XScale +0x18, VarsSet +0xD4, V_y = 0x02).
 // The read is checked first (a finite y on the stage and a scale of a real clip); anything else
 // leaves the bar where the game puts it, logged once.
-constexpr double BossRaisePx = 780.0;
+// 690 (to stage y ~250; 780 until 2026-10-18, then 700, 620, 680, 700 and 10 px down: the tester).
+constexpr double BossRaisePx = 690.0;
+// Half its size (2026-10-18: the bar did not fit the view), kept centred. Its x is in its
+// parent's coordinates, and the BossTop list's origin is the stage's middle (the bars sit at a
+// negative x, about half their width): scaled about that origin, x' = x * scale keeps the bar's
+// middle there. (Taking 960 as its middle, a first try put the halved bar's middle ~3/4 of the way
+// right, its parent's offset times 1 - scale.)
+constexpr double BossScale = 0.5;
+constexpr double BossCentreX = 0.0; // the stage's middle in the BossTop list's coordinates
+// No horizontal shift (120 px from 11:57 to 2026-10-18 13:20): the game centres the bar; what put
+// it right was the VR HUD's HP-cluster cut over its rows (BossBarUp, ui_layout.h
+// StatusLeftBossCutX).
+constexpr double BossShiftLeftPx = 0.0;
 struct BossClip {
     u64 tag{0};
+    double x{0.0};
     double y{0.0};
+    double xscale{100.0};
+    double yscale{100.0};
 };
 std::array<BossClip, BossTagCount> g_boss_clips{};
 std::atomic<u64> g_boss_moved{0};
@@ -104,6 +125,7 @@ bool g_boss_refused_logged{false};
 bool g_boss_moved_logged{false};
 u64 g_boss_hidden_logged{0};
 alignas(8) u64 g_boss_hidden = 0;
+std::atomic<s64> g_boss_seen_ns{0}; // the last update of a raised boss bar (BossBarUp)
 
 // ---- The enemy tags' scale (SetEnemyTagScale) ----
 // The game places a tag with 0x1ACB8C0 (element, x, y: HUD stage px), which takes the element's
@@ -186,7 +208,7 @@ void PS4_SYSV_ABI OnSetPosition(u8* element, u64 x_arg, u64 y_arg) {
     g_scaled.fetch_add(1, std::memory_order_relaxed);
 }
 
-// The tag update's stub, for a boss tag the game shows while ui_boss_hp_bar is 1 (rdi: the tag).
+// The tag update's stub, for a boss tag the game shows while ui_boss_bar is 1 (rdi: the tag).
 void PS4_SYSV_ABI OnBossTag(u8* tag) {
     if (tag == nullptr) {
         return;
@@ -216,11 +238,15 @@ void PS4_SYSV_ABI OnBossTag(u8* tag) {
         alignas(16) u8 info[0xE0]{};
         const auto read = Hook::Read<DisplayInfoFn>(Hook::Read<u8*>(iface) + 0xE0);
         read(iface, data, info);
-        double y{}, xscale{};
+        double x{}, y{}, xscale{}, yscale{};
+        std::memcpy(&x, info + 0x00, sizeof(x));
         std::memcpy(&y, info + 0x08, sizeof(y));
         std::memcpy(&xscale, info + 0x18, sizeof(xscale));
-        const bool plausible = std::isfinite(y) && std::abs(y) < 4000.0 &&
-                               std::isfinite(xscale) && xscale > 1.0 && xscale < 1000.0;
+        std::memcpy(&yscale, info + 0x20, sizeof(yscale));
+        const bool plausible = std::isfinite(x) && std::abs(x) < 4000.0 &&
+                               std::isfinite(y) && std::abs(y) < 4000.0 &&
+                               std::isfinite(xscale) && xscale > 1.0 && xscale < 1000.0 &&
+                               std::isfinite(yscale) && yscale > 1.0 && yscale < 1000.0;
         if (!plausible) {
             if (!g_boss_refused_logged) {
                 g_boss_refused_logged = true;
@@ -233,7 +259,7 @@ void PS4_SYSV_ABI OnBossTag(u8* tag) {
         }
         for (auto& c : g_boss_clips) {
             if (c.tag == 0) {
-                c = {reinterpret_cast<u64>(tag), y};
+                c = {reinterpret_cast<u64>(tag), x, y, xscale, yscale};
                 clip = &c;
                 break;
             }
@@ -244,17 +270,27 @@ void PS4_SYSV_ABI OnBossTag(u8* tag) {
         }
     }
     alignas(16) u8 info[0xE0]{};
+    const double x = BossCentreX - (BossCentreX - (clip->x - BossShiftLeftPx)) * BossScale;
     const double y = clip->y - BossRaisePx;
-    const u16 vars = 0x02; // V_y
+    const double xscale = clip->xscale * BossScale;
+    const double yscale = clip->yscale * BossScale;
+    const u16 vars = 0x1B; // V_x | V_y | V_xscale | V_yscale
+    std::memcpy(info + 0x00, &x, sizeof(x));
     std::memcpy(info + 0x08, &y, sizeof(y));
+    std::memcpy(info + 0x18, &xscale, sizeof(xscale));
+    std::memcpy(info + 0x20, &yscale, sizeof(yscale));
     std::memcpy(info + 0xD4, &vars, sizeof(vars));
     const auto set = Hook::Read<DisplayInfoFn>(Hook::Read<u8*>(iface) + 0xE8);
     set(iface, data, info);
     release();
+    g_boss_seen_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count(),
+                         std::memory_order_relaxed);
     if (g_boss_moved.fetch_add(1, std::memory_order_relaxed) == 0 && !g_boss_moved_logged) {
         g_boss_moved_logged = true;
         LOG_INFO(Core, "VR ui: boss bar shown near the top (its clip y {:.0f} -> {:.0f}, "
-                       "ui_boss_hp_bar=1)",
+                       "ui_boss_bar=1)",
                  clip->y, y);
     }
 }
@@ -296,6 +332,14 @@ void InstallTagScale(u8* module, u64 size) {
 }
 
 } // Anonymous namespace
+
+bool BossBarUp() {
+    const s64 seen = g_boss_seen_ns.load(std::memory_order_relaxed);
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    return seen != 0 && now - seen < 500'000'000;
+}
 
 void SetEnemyTagScale(bool on, float half_w, float half_h) {
     g_scale_half_w.store(half_w, std::memory_order_relaxed);
@@ -362,7 +406,7 @@ void InstallEnemyBars(VAddr base, u64 size) {
         }
         // A RemotePCTag: as the game shows it.
         c.jmp(keep, Xbyak::CodeGenerator::T_NEAR);
-        // A boss bar: hidden (ui_boss_hp_bar 0), else shown as the game shows it, moved up
+        // A boss bar: hidden (ui_boss_bar 0), else shown as the game shows it, moved up
         // (OnBossTag). The call keeps every register the code after the stub uses (al the
         // visibility, rdi the root, r14 the tag); 8 pushes keep the game's 16-byte alignment here
         // (a call follows in its own code).
@@ -475,7 +519,7 @@ void EnemyBarsUpdate() {
     const u64 boss_hidden = Load(g_boss_hidden);
     if (boss_hidden != g_boss_hidden_logged) {
         if (g_boss_hidden_logged == 0) {
-            LOG_INFO(Core, "VR ui: boss bar hidden (ui_boss_hp_bar=0)");
+            LOG_INFO(Core, "VR ui: boss bar hidden (ui_boss_bar=0)");
         }
         g_boss_hidden_logged = boss_hidden;
     }

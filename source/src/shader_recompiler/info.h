@@ -1,4 +1,4 @@
-#include "../../scratchpad/dual-eye-perf/draw_memory.h"
+#include "video_core/native_stereo/draw_memory.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -7,7 +7,7 @@
 #include <span>
 #include <vector>
 #include <boost/container/static_vector.hpp>
-#include "../../scratchpad/dual-eye-perf/draw_inputs.h"
+#include "video_core/native_stereo/draw_inputs.h"
 #include "common/assert.h"
 #include "common/types.h"
 #include "shader_recompiler/backend/bindings.h"
@@ -75,6 +75,7 @@ struct InfoPersistent {
     Stage stage;
     LogicalStage l_stage;
 
+    u64 vertex_output_locations{};
     u8 mrt_mask{};
     bool has_fetch_shader{};
     bool has_bitwise_xor{};

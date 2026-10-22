@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
+#include "video_core/renderer_vulkan/vr_temporal_profile.h"
 #include <cmath>
 #include "common/logging/log.h"
 #include "video_core/host_shaders/vr_temporal_motion_comp.h"
@@ -57,11 +63,13 @@ bool VrCameraMotion::Init() {
     return true;
 }
 bool VrCameraMotion::Record(const VR::Graphics::Config& accepted, bool provider_ready,
-                            const std::array<Eye, 2>& eyes, const Eye* twin) {
+                            const std::array<Eye, 2>& eyes, const Eye* twin, uint32_t views) {
     if (accepted.upscaler == VR::Graphics::Upscaler::Off || !provider_ready || failed)
         return false;
-    const std::array<const Eye*, 3> passes{&eyes[0], &eyes[1], twin};
-    const uint32_t count = twin ? 3u : 2u;
+    if (views != 1 && views != 2) return false;
+    std::array<const Eye*, 3> passes{&eyes[0], &eyes[1], nullptr};
+    if (twin) passes[views] = twin;
+    const uint32_t count = views + (twin ? 1u : 0u);
     for (uint32_t pass = 0; pass < count; ++pass) {
         const auto& eye = *passes[pass];
         if (!eye.depth || !eye.motion_view || !eye.motion ||
@@ -92,7 +100,7 @@ bool VrCameraMotion::Record(const VR::Graphics::Config& accepted, bool provider_
             std::abs(eye.camera.projection[1]) < 1e-6f)
             return false;
     }
-    if (eyes[0].motion == eyes[1].motion ||
+    if ((views == 2 && eyes[0].motion == eyes[1].motion) ||
         (twin && (twin->motion == eyes[0].motion || twin->motion == eyes[1].motion)))
         return false; // Own single-layer output per eye (and for the twin).
     if (!pipeline && !Init()) {
@@ -101,6 +109,8 @@ bool VrCameraMotion::Record(const VR::Graphics::Config& accepted, bool provider_
         return false;
     }
     scheduler.EndRendering();
+    TemporalProfile::Scope motion_profile(scheduler, TemporalProfile::Motion,
+                                          "Temporal camera/object motion composition");
     // Bit 37: recorded through the scheduler like bbport's motion pass; a raw borrow here
     // drained the recorder and kept the rest of the command buffer on this thread.
     const auto record = [&](auto cmd) {

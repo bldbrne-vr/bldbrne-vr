@@ -1,6 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
-// GPU work between and inside render passes (documents/vr-gpu-guide.md 2.5 D and 2.8 d): the
+// GPU work between and inside render passes: the
 // runtime switches and counters. perf_resync_memo is off by default, perf_depth_one_layout on;
 // off, each gives the GPU exactly the work it got before 2026-10-09.
 //  - vr.ini perf_resync_memo / VR_TUNE_FILE perf.resync_memo: an image read through a texel buffer

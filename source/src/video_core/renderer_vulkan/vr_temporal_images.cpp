@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
+#include "video_core/renderer_vulkan/vr_temporal_profile.h"
 #include "video_core/renderer_vulkan/vr_temporal_images.h"
 #include "video_core/host_shaders/vr_temporal_prepare_comp.h"
 #include "video_core/host_shaders/vr_temporal_merge_comp.h"
@@ -146,7 +152,7 @@ bool VrTemporalImages::Allocate(const VrTemporalPair::Plan &plan) {
         if ((f & need) != need)
             return false;
     }
-    for (uint32_t eye = 0; eye < 2; ++eye)
+    for (uint32_t eye = 0; eye < plan.views; ++eye)
         for (uint32_t kind = 0; kind < 4; ++kind) {
             const auto &s = plan.eyes[eye];
             if (!Create(eyes[eye][kind], formats[kind], kind == 3 ? s.output_width : s.input_width,
@@ -219,7 +225,7 @@ bool VrTemporalImages::Init() {
     return true;
 }
 bool VrTemporalImages::Merge(const std::array<vk::ImageView, 2>& scene) {
-    if (!ready || !merge_pipeline || !scene[0] || !scene[1]) return false;
+    if (!ready || !merge_pipeline || !scene[0] || (allocated.views == 2 && !scene[1])) return false;
     RecordPass(scheduler, [&] { return scheduler.CommandBuffer(); }, [&](auto cmd) {
     // Includes the provider output and the native scene populated from its reduced proxy.
     const vk::MemoryBarrier2 before{.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -229,7 +235,7 @@ bool VrTemporalImages::Merge(const std::array<vk::ImageView, 2>& scene) {
     cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1, .pMemoryBarriers=&before});
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *merge_pipeline);
     ScratchPush::Invalidate();
-    for (uint32_t eye=0; eye<2; ++eye) {
+    for (uint32_t eye=0; eye<allocated.views; ++eye) {
         // Bit 46 left this eye's canonical colour uncopied: the game's alpha comes from the source.
         // Reduced raster reads the proxy (the copy's own source, same nearest texel). Natively the
         // source is the scene being merged into: the shader reads it in place (imageLoad at the
@@ -276,8 +282,10 @@ bool VrTemporalImages::Prepare(const VR::Graphics::Config &accepted, bool provid
     }
     if (failed)
         return false;
+    if (plan.views != 1 && plan.views != 2) return false;
+    const uint32_t active_mask = (1u << plan.views) - 1u;
     // Reject both eyes up front; no partial-eye allocation or GPU commands for bad inputs.
-    for (uint32_t eye = 0; eye < 2; ++eye) {
+    for (uint32_t eye = 0; eye < plan.views; ++eye) {
         const auto &s = plan.eyes[eye];
         const auto &in = sources[eye];
         if (!in.color || !in.depth || !s.input_width || !s.input_height ||
@@ -286,12 +294,12 @@ bool VrTemporalImages::Prepare(const VR::Graphics::Config &accepted, bool provid
             in.height != s.input_height)
             return false;
     }
-    if (sources[0].color == sources[1].color || sources[0].depth == sources[1].depth)
+    if (plan.views == 2 && (sources[0].color == sources[1].color || sources[0].depth == sources[1].depth))
         return false;
     // Bit 46: the provider reads each eye's own layer of the source, only in formats whose
     // values the copy kept exactly (RGBA16F colour, f32 depth aspect); otherwise copy as before.
     if (direct_request) {
-        for (uint32_t eye = 0; eye < 2; ++eye) {
+        for (uint32_t eye = 0; eye < plan.views; ++eye) {
             const auto &in = sources[eye];
             direct_request = direct_request && in.color_image && in.depth_image &&
                              in.layer == eye &&
@@ -300,36 +308,38 @@ bool VrTemporalImages::Prepare(const VR::Graphics::Config &accepted, bool provid
                               in.depth_format == vk::Format::eD32SfloatS8Uint);
         }
     }
-    copies &= 3;
+    copies &= active_mask;
     // Bit 46: what the provider reads in place. A layer-1 input FAST_DLSS_DIRECT_LAYER_COPY names
     // (default: depth) is copied and read from its canonical image, since NGX reads it from
     // layer 0 (vr_dlss_direct.h); the eye's other input stays in place.
     uint32_t in_place_color = 0, in_place_depth = 0;
     if (direct_request) {
         uint32_t layered = 0;
-        for (uint32_t eye = 0; eye < 2; ++eye)
+        for (uint32_t eye = 0; eye < plan.views; ++eye)
             if (sources[eye].layer != 0)
                 layered |= 1u << eye;
         const u32 layer_copy = DlssDirectLayerCopy();
-        in_place_color = 3u & ~((layer_copy & DlssDirectColor) ? layered : 0u);
-        in_place_depth = 3u & ~((layer_copy & DlssDirectDepth) ? layered : 0u);
+        in_place_color = active_mask & ~((layer_copy & DlssDirectColor) ? layered : 0u);
+        in_place_depth = active_mask & ~((layer_copy & DlssDirectDepth) ? layered : 0u);
         direct_request = (in_place_color | in_place_depth) != 0;
     }
     // Per eye: copied for the provider (not read in place) or for the verify twin (`copies`).
-    const uint32_t copy_color = direct_request ? (copies | (3u & ~in_place_color)) : 3u;
-    const uint32_t copy_depth = direct_request ? (copies | (3u & ~in_place_depth)) : 3u;
+    const uint32_t copy_color = direct_request ? (copies | (active_mask & ~in_place_color)) : active_mask;
+    const uint32_t copy_depth = direct_request ? (copies | (active_mask & ~in_place_depth)) : active_mask;
     if ((!pipeline && !Init()) || !Allocate(plan)) {
         failed = true;
         Release();
         return false;
     }
     scheduler.EndRendering();
+    TemporalProfile::Scope prepare_profile(scheduler, TemporalProfile::Prepare,
+                                           "Temporal input preparation (both eyes)");
     RecordPass(scheduler, [&] { return scheduler.CommandBuffer(); }, [&](auto cmd) {
     std::array<vk::ImageMemoryBarrier2, 10> barriers{};
     uint32_t n = 0;
     std::array<Surface *, 10> surfaces{};
-    for (auto &eye : eyes)
-        for (auto &s : eye)
+    for (uint32_t eye = 0; eye < plan.views; ++eye)
+        for (auto &s : eyes[eye])
             surfaces[n++] = &s;
     if (verify.image) // FAST_UPSCALER_VERIFY/FAST_DLSS_DIRECT_VERIFY twin output
         surfaces[n++] = &verify;
@@ -370,7 +380,7 @@ bool VrTemporalImages::Prepare(const VR::Graphics::Config &accepted, bool provid
         return;
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
     ScratchPush::Invalidate();
-    for (uint32_t eye = 0; eye < 2; ++eye) {
+    for (uint32_t eye = 0; eye < plan.views; ++eye) {
         // Bit 46: an input read in place is not copied (1 colour, 2 depth; 3 without the bit).
         const uint32_t mask = ((copy_color >> eye) & 1u) | (((copy_depth >> eye) & 1u) << 1);
         if (!mask)
@@ -597,7 +607,7 @@ std::array<BbDlssEvaluate, 2> VrTemporalImages::Images() const {
     std::array<BbDlssEvaluate, 2> out{};
     if (!ready)
         return out;
-    for (uint32_t eye = 0; eye < 2; ++eye) {
+    for (uint32_t eye = 0; eye < allocated.views; ++eye) {
         out[eye].color = Canonical(eyes[eye][0]);
         out[eye].depth = Canonical(eyes[eye][1]);
         out[eye].motion = Canonical(eyes[eye][2]);
@@ -663,7 +673,7 @@ void VrTemporalImages::DebugCapture(uint64_t frame, std::string_view metadata) {
     std::array<Copy,8> copies{};
     uint64_t total{};
     unsigned n{};
-    for (unsigned eye=0; eye<2; ++eye) for (unsigned kind=0; kind<4; ++kind) {
+    for (unsigned eye=0; eye<allocated.views; ++eye) for (unsigned kind=0; kind<4; ++kind) {
         auto& surface=eyes[eye][kind];
         const uint64_t bytes=uint64_t(surface.width)*surface.height*(kind==0 || kind==3 ? 8:4);
         copies[n++]={&surface,total,bytes,eye,kind};

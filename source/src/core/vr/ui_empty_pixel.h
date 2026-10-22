@@ -1,9 +1,15 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
-// The UI layer's pixels without UI (vr.ini ui_empty_snap, documents/bloodborne-vr.md "The game's
-// UI on its own layers"). The rasterizer draws every UI draw into K (cleared to black) and W
+// The UI layer's pixels without UI (vr.ini ui_empty_snap).
+// The rasterizer draws every UI draw into K (cleared to black) and W
 // (cleared to the grey g, vr.ini ui_grey 0.5); the resolve (vr_ui_resolve.comp) reads the UI alone
 // from them: transmittance T = (W - K) / g, alpha from a two-point fit (exact over a black and a
 // white world). K and W are 8-bit: a GPU stores the grey 0.5 as 127 or 128 of 255, and where no UI

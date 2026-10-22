@@ -1,16 +1,21 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <new>
+#include <string>
+#include <string_view>
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/libs.h"
+#include "core/vr/vr_session.h"
 #include "ime_dialog.h"
 #include "ime_dialog_ui.h"
 
@@ -987,6 +992,21 @@ OrbisImeDialogStatus PS4_SYSV_ABI sceImeDialogGetStatus() {
     return g_ime_dlg_status;
 }
 
+// VR (vr.ini auto_name): the names a new hunter's name box is answered with, one at random.
+constexpr std::array<std::string_view, 40> AutoNames = {
+    "Edgar",   "Ada",     "Victor",   "Eleanor",  "Ambrose", "Cordelia", "Silas",   "Mina",
+    "Ezra",    "Lenore",  "Ignatius", "Helena",   "Thaddeus", "Rowena",  "Abel",    "Isolde",
+    "Caspian", "Vesper",  "Morgan",   "Elias",    "Augustin", "Beatrix", "Cyril",   "Delphine",
+    "Edmund",  "Florian", "Greta",    "Horatio",  "Imogen",  "Jasper",   "Lucian",  "Margot",
+    "Octavia", "Percival", "Quentin", "Rosalind", "Sebastian", "Theodora", "Ulrich", "Winifred"};
+
+// A name box in VR: text (not a number), longer than a Chalice glyph (8 characters). Anything else
+// opens the keyboard as before. Each opening gets a random name other than the one in the box.
+static bool AutoNameBox(const OrbisImeDialogParam& p) {
+    return VR::IsEnabled() && VR::GetSettings().auto_name && p.type != OrbisImeType::Number &&
+           p.max_text_length > 8 && p.input_text_buffer != nullptr;
+}
+
 static Error SetupDialogState(OrbisImeDialogParam* param, OrbisImeParamExtended* extended,
                               bool internal) {
     if (!param) {
@@ -1032,10 +1052,52 @@ static Error SetupDialogState(OrbisImeDialogParam* param, OrbisImeParamExtended*
         g_ime_dlg_has_extended = false;
     }
 
+    // VR: the name box answered at once (2026-10-16: the keyboard cannot be seen in the
+    // headset, a new game could not get past its name): the name written as the box's text and
+    // the dialog finished with OK, as if typed and confirmed; its UI never opens.
+    const bool auto_name = AutoNameBox(local_param);
+    LOG_INFO(Lib_ImeDialog, "text box: type {} max {} characters, {}, auto_name {}",
+             static_cast<u32>(local_param.type), local_param.max_text_length,
+             local_param.input_text_buffer != nullptr && local_param.input_text_buffer[0] != u'\0'
+                 ? "prefilled"
+                 : "empty",
+             auto_name);
+    std::string_view name;
+    if (auto_name) {
+        // A random name, never the one already in the box: opening the box again (clicking the
+        // name) gives another (2026-10-16).
+        std::u16string current;
+        for (u32 i = 0; i < local_param.max_text_length && local_param.input_text_buffer[i]; ++i) {
+            current.push_back(local_param.input_text_buffer[i]);
+        }
+        static u32 seed = static_cast<u32>(
+            std::chrono::steady_clock::now().time_since_epoch().count() & 0xFFFFFFFFu);
+        for (int tries = 0; tries < 8; ++tries) {
+            seed = seed * 1664525u + 1013904223u;
+            name = AutoNames[(seed >> 8) % AutoNames.size()];
+            if (std::u16string(name.begin(), name.end()) != current) {
+                break;
+            }
+        }
+        const std::size_t n = std::min<std::size_t>(name.size(), local_param.max_text_length);
+        for (std::size_t i = 0; i < n; ++i) {
+            local_param.input_text_buffer[i] = static_cast<char16_t>(name[i]);
+        }
+        local_param.input_text_buffer[n] = u'\0';
+    }
+
     g_ime_dlg_state = ImeDialogState(&g_ime_dlg_param, ext_ptr);
     g_ime_dlg_status = OrbisImeDialogStatus::Running;
     if (g_ime_dlg_client) {
         g_ime_dlg_client->dialog_state = 4;
+    }
+    if (auto_name) {
+        g_ime_dlg_result.endstatus = OrbisImeDialogEndStatus::Ok;
+        g_ime_dlg_status = OrbisImeDialogStatus::Finished;
+        if (g_ime_dlg_client) {
+            g_ime_dlg_client->dialog_state = 5;
+        }
+        LOG_INFO(Lib_ImeDialog, "VR: the name box answered with \"{}\" (auto_name)", name);
     }
     g_ime_dlg_ui = ImeDialogUi(&g_ime_dlg_state, &g_ime_dlg_status, &g_ime_dlg_result);
 

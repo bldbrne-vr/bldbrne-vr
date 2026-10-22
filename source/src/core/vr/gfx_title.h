@@ -1,6 +1,14 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
+
+#include <string>
 
 #include "core/vr/gfx_tile.h"
 
@@ -9,7 +17,7 @@
 // game's title fades and disappears with the title, including when loading a save.
 namespace VR::GfxTitle {
 
-inline std::vector<GfxTile::u8> AddLabel(std::span<const GfxTile::u8> movie) {
+inline std::vector<GfxTile::u8> AddLabel(std::span<const GfxTile::u8> movie, bool low_res = false) {
     using namespace GfxTile;
     using namespace GfxTile::Detail;
     const auto hash = Fnv1a64(movie);
@@ -42,14 +50,15 @@ inline std::vector<GfxTile::u8> AddLabel(std::span<const GfxTile::u8> movie) {
         return {};
     }
 
-    // DefineEditText: 160 x 84 stage pixels, 64 px MenuFont_01, the title's pale grey.
+    // Keep the 64 px VR label; allow room for a smaller, inline DIBR status.
     std::vector<u8> text;
     PutU16(text, LabelId);
     BitWriter rect;
-    const int bits = SignedBits({0, 3200, 1680});
+    const int width = (low_res ? 720 : 160) * 20;
+    const int bits = SignedBits({0, width, 1680});
     rect.Ub(bits, 5);
     rect.Sb(0, bits);
-    rect.Sb(3200, bits);
+    rect.Sb(width, bits);
     rect.Sb(0, bits);
     rect.Sb(1680, bits);
     const auto bounds = rect.Bytes();
@@ -67,9 +76,15 @@ inline std::vector<GfxTile::u8> AddLabel(std::span<const GfxTile::u8> movie) {
     PutU16(text, 0);   // indent
     PutU16(text, 40);  // leading, as the retail text
     text.push_back(0); // no variable binding
-    constexpr char html[] = "<p align=\"left\"><font size=\"64\" color=\"#cccccc\" "
-                            "letterSpacing=\"0.000000\" kerning=\"1\"><b>VR</b></font></p>";
-    text.insert(text.end(), html, html + sizeof(html));
+    std::string html = "<p align=\"left\"><font size=\"64\" color=\"#cccccc\" "
+                       "letterSpacing=\"0.000000\" kerning=\"1\"><b>VR</b></font>";
+    if (low_res) {
+        html += "<font size=\"48\" color=\"#cccccc\" "
+                "letterSpacing=\"0.000000\" kerning=\"1\"> (LOW RES MODE)</font>";
+    }
+    html += "</p>";
+    text.insert(text.end(), html.begin(), html.end());
+    text.push_back(0);
 
     std::vector<u8> place{0x26}; // character, matrix, instance name
     PutU16(place, LabelDepth);

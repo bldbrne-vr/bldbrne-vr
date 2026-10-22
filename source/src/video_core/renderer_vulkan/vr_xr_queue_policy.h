@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -43,7 +49,7 @@ constexpr Runtime Classify(std::string_view runtime_name) {
     if (runtime_name.find("SteamVR") != std::string_view::npos) {
         return Runtime::SteamVr;
     }
-    // MockXR (the test harness, the test harness) stands in for a Quest 3 on Link: classed as
+    // MockXR (the test runtime) stands in for a Quest 3 on Link: classed as
     // Meta's, the mock runs Link's path (the shared queue, mip chains) so its timings stay
     // comparable with the headset's. VR_XR_OWN_QUEUE=1 with VR_UI_NO_MIPS=1 runs SteamVR's there.
     if (runtime_name.find("Oculus") != std::string_view::npos ||

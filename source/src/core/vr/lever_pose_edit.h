@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #pragma once
 
 #include "core/vr/lever_update_queue.h"
@@ -25,17 +31,10 @@ struct UpdateQueue {
 // Own exactly one existing bone during a physical hold. An external animation write
 // revokes ownership; cancellation must never put an obsolete rest pose over that write.
 // The game adapter must synchronize the invalidated model pose before publishing it.
-struct LegacyPoseGeometry {
-    bool Valid(const BoneBinding& binding) const { return BindRig(binding).has_value(); }
-    std::optional<Body::QsTransform> Target(const BoneBinding& binding,float angle) const {
-        return BoneTarget(binding,angle);
-    }
-};
-template <class GeometryPolicy> class BasicPoseEdit {
+class PoseEdit {
 public:
-    GeometryPolicy& Policy() { return geometry_; }
     bool Begin(const BoneBinding &binding, PoseBuffers pose, std::size_t bone) {
-        if (owned_ || !geometry_.Valid(binding) || !ValidBuffers(pose) || bone >= pose.locals.size()) {
+        if (owned_ || !BindRig(binding) || !ValidBuffers(pose) || bone >= pose.locals.size()) {
             return false;
         }
         auto expected = pose.locals[bone];
@@ -59,7 +58,7 @@ public:
     // edit then carries on from there as if it had never let go.
     bool Resume(const BoneBinding &binding, PoseBuffers pose, std::size_t bone,
                 const Body::HkQsTransform &original, const Body::HkQsTransform &last) {
-        if (owned_ || !geometry_.Valid(binding) || !ValidBuffers(pose) || bone >= pose.locals.size() ||
+        if (owned_ || !BindRig(binding) || !ValidBuffers(pose) || bone >= pose.locals.size() ||
             !Same(pose.locals[bone], last)) {
             return false;
         }
@@ -80,7 +79,7 @@ public:
     }
 
     bool Apply(float angle, PoseBuffers pose, UpdateQueue queue) {
-        const auto target = geometry_.Target(binding_, angle);
+        const auto target = BoneTarget(binding_, angle);
         if (!target || !Matches(pose)) {
             return false;
         }
@@ -144,7 +143,6 @@ private:
         pose.sync = 0x0100;
         return true;
     }
-    GeometryPolicy geometry_{};
     BoneBinding binding_{};
     Body::HkQsTransform original_{}, last_{};
     Body::HkQsTransform *locals_{};
@@ -152,5 +150,4 @@ private:
     std::size_t bone_{}, count_{};
     bool owned_{};
 };
-using PoseEdit = BasicPoseEdit<LegacyPoseGeometry>;
 } // namespace VR::Lever

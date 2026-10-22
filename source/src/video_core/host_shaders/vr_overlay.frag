@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #version 450
 
@@ -205,7 +211,11 @@ vec4 Glow(vec3 N, vec3 V) {
         const float level = (dd.model * vec4(0.0, dd.params.w, 0.0, 1.0)).y;
         g *= 1.0 - smoothstep(level - 0.004, level + 0.004, in_world.y);
     }
-    return vec4(dd.emissive.rgb * g, 0.0);
+    // Its alpha: the light's own brightness. Meta's runtime adds the light (the additive pass
+    // keeps the layer's alpha there), SteamVR drops alpha-0 pixels (the grip guide, the laser's
+    // dot and the vial's halo never showed there, 2026-10-15): with it they show.
+    const vec3 rgb = dd.emissive.rgb * g;
+    return vec4(rgb, clamp(max(rgb.r, max(rgb.g, rgb.b)), 0.0, 1.0));
 }
 
 vec4 Beam(vec3 N, vec3 V) {

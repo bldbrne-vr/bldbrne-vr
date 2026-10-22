@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
-#include "../../../scratchpad/dual-eye-perf/asymmetric_projection.h"
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
-#include "../../../scratchpad/fast-renderer/constant_write_guard.h"
+#include "video_core/native_stereo/asymmetric_projection.h"
+#include "video_core/native_stereo/native_stereo.h"
+#include "video_core/fast/constant_write_guard.h"
 #include <array>
 #include <optional>
 #include <span>
@@ -54,6 +55,7 @@ class VrInFrame;
 class VrUiLayer;
 class VrSmaa;
 class VrRenderTaa;
+class VrDibrDlss;
 struct ForegroundProbe;
 struct NativeAudit;
 struct VrTemporalCapture;
@@ -148,7 +150,11 @@ public:
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
-    bool InvalidateMemory(VAddr addr, u64 size);
+    /// `emulator_write`: the emulator's own write of exactly these bytes (MemoryManager::
+    /// InvalidateMemory: a file read, a video frame, a protection change), not a guest fault.
+    /// `protection_only`: a protection change (sceKernelMprotect), which writes no byte.
+    bool InvalidateMemory(VAddr addr, u64 size, bool emulator_write = false,
+                          bool protection_only = false);
     /// Fast renderer (FastRender::FaultWindow): after a guest write fault at `addr`.
     void UnprotectFaultWindow(VAddr addr);
     /// InvalidateMemory(addr, 8) for a guest write fault there (FAST_GPU_PAGE_KEEP).
@@ -192,6 +198,7 @@ public:
     }
     // PrepareFrame / PrepareBlankFrame: the frame is over, nothing of it is captured any more.
     void VrEndFrame();
+    bool VrDibrDlssFrame() const { return vr_dibr.dlss; }
 
     // VR UI layer (vk_rasterizer_vr.cpp, renderer_vulkan/vr_ui_layer.h): in a UI-layer frame every
     // UI colour draw into the composite target X is also drawn into the presenter's K and W.
@@ -506,7 +513,7 @@ private:
     // view direction its vertex shader's constants hold (the frame's first draw can come after the
     // game thread already placed the next camera). Tags the frame with it (VR::SetFrameRecord).
     void VrMatchCamera(const GraphicsPipeline* pipeline, const RenderState& state);
-    bool VrCaptureDepth(vk::Extent2D scene);
+    bool VrCaptureDepth(vk::Extent2D scene, bool allow_dlss_resize = true);
     // In-frame items (renderer_vulkan/vr_inframe.h, core/vr/inframe.h): drawn into the scene
     // colour with a private depth copy right after the composite, before the DIBR capture (which
     // then reads that copy). True: drawn this frame.
@@ -554,6 +561,8 @@ private:
     bool VrFilterDraw(const GraphicsPipeline* pipeline, bool is_indexed, bool indirect,
                       u32 index_offset);
     bool VrCapeSkip(const GraphicsPipeline* pipeline, u32 index_offset);
+    // The inspector's log of a compute dispatch (vk_rasterizer_vr_draws.cpp).
+    bool VrLogDispatch(const ComputePipeline* pipeline, bool indirect);
     // Fast bit 40's skip rule in native stereo (vk_pipeline_skip.h), Stage A, asked only for a
     // draw the rule would leave out (`vs`: its vertex program, may be null): Frame outside an
     // immersive frame, Ui after this frame's composite or without one in the frame before
@@ -870,6 +879,8 @@ private:
         u32 last_draw{};
     };
     struct VrDibrFrame {
+        bool dlss{};
+        vk::Extent2D depth_output_extent{};
         bool captured{};   // the composite was seen (captured or refused)
         bool depth_done{}; // depth captured before a composite that writes depth
         u32 draws{};
@@ -928,6 +939,7 @@ private:
     // aa_mode=taa (vk_rasterizer_vr_aa.cpp): the resolve, the last resolved frame (its camera,
     // depth map and reset facts), the viewport scale of the jittered draws (its signs turn the
     // NDC jitter into window pixels) and the `VR taa:` line's counts.
+    std::unique_ptr<VrDibrDlss> vr_dibr_dlss;
     std::unique_ptr<VrRenderTaa> vr_render_taa;
     struct VrTaaState {
         VR::RenderTaa::FrameFacts facts{};

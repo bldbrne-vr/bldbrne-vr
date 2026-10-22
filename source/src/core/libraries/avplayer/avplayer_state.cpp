@@ -175,22 +175,39 @@ bool AvPlayerState::GetStreamInfo(u32 stream_index, AvPlayerStreamInfo& info) {
 
 // Called inside GAME thread
 bool AvPlayerState::Start() {
-    std::unique_lock lock(m_source_mutex);
-    if (m_current_state == AvState::Ready || m_current_state == AvState::Stop || Stop()) {
+    // A start while playing, paused, buffering or at the end stops first. That used to call
+    // Stop(), which locks m_source_mutex again on this thread: held exclusively here (upstream
+    // #4775), a self-deadlock, the whole game frozen (skipping Bloodborne's looping title movie,
+    // 2026-10-18). The events go out after the unlock, as Stop() sends its own: a game callback
+    // calling back into the player cannot deadlock on this lock either.
+    bool stopped = false;
+    {
+        std::unique_lock lock(m_source_mutex);
+        if (m_current_state != AvState::Ready && m_current_state != AvState::Stop) {
+            stopped = StopSourceLocked();
+            if (!stopped) {
+                LOG_ERROR(Lib_AvPlayer, "Could not start playback.");
+                return false;
+            }
+        }
         m_eof_stop_event_sent = false;
         SetState(AvState::Starting);
         if (!m_up_source->Start()) {
             LOG_ERROR(Lib_AvPlayer, "Could not start playback.");
             SetState(AvState::Error);
+            lock.unlock();
+            if (stopped) {
+                OnPlaybackStateChanged(AvState::Stop);
+            }
             return false;
         }
         SetState(AvState::Play);
-        OnPlaybackStateChanged(AvState::Play);
-        return true;
     }
-
-    LOG_ERROR(Lib_AvPlayer, "Could not start playback.");
-    return false;
+    if (stopped) {
+        OnPlaybackStateChanged(AvState::Stop);
+    }
+    OnPlaybackStateChanged(AvState::Play);
+    return true;
 }
 
 // Called inside GAME thread
@@ -209,6 +226,7 @@ bool AvPlayerState::Pause() {
     if (!SetState(AvState::Pause)) {
         return false;
     }
+    lock.unlock(); // Game callbacks may re-enter the player.
     OnPlaybackStateChanged(AvState::Pause);
     return true;
 }
@@ -223,6 +241,7 @@ bool AvPlayerState::Resume() {
     m_up_source->Resume();
     const auto state = m_previous_state.load();
     SetState(state);
+    lock.unlock(); // Game callbacks may re-enter the player.
     OnPlaybackStateChanged(state);
     return true;
 }
@@ -280,6 +299,16 @@ bool AvPlayerState::EnableStream(u32 stream_index) {
 // Called inside GAME thread
 bool AvPlayerState::Stop() {
     std::shared_lock lock(m_source_mutex);
+    if (!StopSourceLocked()) {
+        return false;
+    }
+    lock.unlock(); // A stop callback may start playback again.
+    OnPlaybackStateChanged(AvState::Stop);
+    return true;
+}
+
+// m_source_mutex held (shared or exclusive).
+bool AvPlayerState::StopSourceLocked() {
     if (m_up_source == nullptr || m_current_state == AvState::Stop) {
         return false;
     }
@@ -290,7 +319,6 @@ bool AvPlayerState::Stop() {
         return false;
     }
     m_eof_stop_event_sent = true;
-    OnPlaybackStateChanged(AvState::Stop);
     return true;
 }
 

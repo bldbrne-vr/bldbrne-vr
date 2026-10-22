@@ -1,15 +1,20 @@
+#include <chrono>
+#include <cstdio>
 #include "video_core/host_copies.h"
 #include <utility>
-#include "../../../scratchpad/dual-eye-perf/draw_registers.h"
-#include "../../../scratchpad/dual-eye-perf/profile_scopes.h"
-#include "../../../scratchpad/fast-renderer/b_handler_profile.h"
+#include "video_core/native_stereo/draw_registers.h"
+#include "video_core/native_stereo/profile_scopes.h"
+#include "video_core/fast/b_handler_profile.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
+#include "video_core/native_stereo/native_stereo.h"
 #include <algorithm>
 #include <magic_enum/magic_enum.hpp>
 #include "common/alignment.h"
+#include "common/slow_scope.h"
+#include "common/memory_write_trace.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
 #include "core/memory.h"
@@ -195,11 +200,31 @@ BufferCache::~BufferCache() {
     }
 }
 
-void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
+void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool emulator_write,
+                                   bool protection_only) {
     if (!IsRegionRegistered(device_addr, size)) {
         return;
     }
-    // The emulator's own write there (or an unmap): no GPU byte of it is kept.
+    if (emulator_write && MemoryTracker::KeepGpuPages()) {
+        // The emulator writes exactly these bytes (a protection change none): the GPU's beside
+        // them on their pages stay.
+        memory_tracker->InvalidateRegion(
+            device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); },
+            false, true, protection_only ? 0 : size);
+        return;
+    }
+    // An unmap (or a Linux uffd guest fault): no GPU byte of it is kept.
+    // The catch-all log (off for performance):
+    // if (MemoryTracker::KeepGpuPages() && gpu_modified_ranges.Intersects(device_addr, size)) {
+    //     static std::atomic<u64> logs{0};
+    //     const u64 n = logs.fetch_add(1, std::memory_order_relaxed);
+    //     if (n < 64 || (n & 255) == 0) {
+    //         LOG_INFO(Render_Vulkan,
+    //                  "FAST_GPU_PAGE_KEEP: unmap of {:#x}..{:#x} drops GPU-written bytes ({} "
+    //                  "so far)",
+    //                  device_addr, device_addr + size, n + 1);
+    //     }
+    // }
     memory_tracker->ForgetKept(device_addr, size);
     memory_tracker->InvalidateRegion(
         device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); });
@@ -223,6 +248,7 @@ void BufferCache::MarkFaultWindow(VAddr device_addr, u64 size, FaultWindowCounts
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
+    Common::MemoryWriteTrace::Event("buffer.read.request", device_addr, size, is_write);
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         // GPU-modified ranges come as many small scattered islands, so the download
@@ -241,8 +267,91 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     });
 }
 
+std::span<const u8> BufferCache::ReadForMotion(VAddr address, u32 size) {
+    FastRender::AssertRecordingAccess();
+    if (!size || size > 16_MB) return {};
+    if (!HasGpuWrites(address, size)) {
+        return {reinterpret_cast<const u8*>(address), size};
+    }
+    Buffer& buffer = slot_buffers[FindBuffer(address, size)];
+    // This is the same upload the upcoming indexed draw needs. It retires only
+    // CPU-owned bytes; it never downloads old GPU contents into guest memory.
+    SynchronizeBuffer(buffer, address, size, false, false, true);
+    if (!HasGpuWrites(address, size)) {
+        Common::MemoryWriteTrace::Event("motion.index.cpu_reclaimed", address, size);
+        return {reinterpret_cast<const u8*>(address), size};
+    }
+    const u64 use = ++motion_snapshot_use;
+    for (auto& entry : motion_snapshots) {
+        if (entry.address == address && entry.bytes.size() == size &&
+            entry.serial == buffer.perf_serial && entry.write_seq == buffer.perf_write_seq) {
+            entry.last_use = use;
+            return entry.bytes;
+        }
+    }
+    // A stale version of this exact request cannot be reused. Remove it before
+    // allocating its replacement so repeated writes cannot consume all cache slots.
+    std::erase_if(motion_snapshots, [&](const MotionSnapshot& entry) {
+        if (entry.address != address || entry.bytes.size() != size) return false;
+        motion_snapshot_bytes -= entry.bytes.size();
+        return true;
+    });
+    // Bound both allocations and entry count. A snapshot is valid only until the next
+    // ReadForMotion call; the temporal caller consumes it during this same draw.
+    while (!motion_snapshots.empty() &&
+           (motion_snapshots.size() >= 16 || motion_snapshot_bytes + size > 16_MB)) {
+        const auto oldest = std::min_element(motion_snapshots.begin(), motion_snapshots.end(),
+            [](const auto& a, const auto& b) { return a.last_use < b.last_use; });
+        motion_snapshot_bytes -= oldest->bytes.size();
+        motion_snapshots.erase(oldest);
+    }
+    // Vulkan buffer copies are dword-aligned, including 16-bit indices starting at +2.
+    const u64 begin = Common::AlignDown(static_cast<u64>(buffer.Offset(address)), u64{4});
+    const u64 prefix = buffer.Offset(address) - begin;
+    const u64 transfer_size = Common::AlignUp(prefix + size, u64{4});
+    ASSERT(begin + transfer_size <= buffer.SizeBytes());
+    const auto [download, staging_offset] = download_buffer.Map(transfer_size);
+    download_buffer.Commit();
+    scheduler.EndRendering();
+    const auto commands = scheduler.Commands();
+    const vk::BufferMemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        .buffer = buffer.Handle(), .offset = begin, .size = transfer_size,
+    };
+    commands.pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &barrier});
+    commands.copyBuffer(buffer.Handle(), download_buffer.Handle(),
+                        vk::BufferCopy{begin, staging_offset, transfer_size});
+    // Completion alone does not replace the device-to-host visibility dependency.
+    const vk::BufferMemoryBarrier2 host_barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        .buffer = download_buffer.Handle(), .offset = staging_offset, .size = transfer_size,
+    };
+    commands.pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &host_barrier});
+    scheduler.Finish();
+    if (!download_buffer.is_coherent) {
+        vmaInvalidateAllocation(instance.GetAllocator(), download_buffer.buffer.allocation,
+                                staging_offset, transfer_size);
+    }
+    MotionSnapshot entry{address, buffer.perf_serial, buffer.perf_write_seq, use,
+                         std::vector<u8>(size)};
+    std::memcpy(entry.bytes.data(), download + prefix, size);
+    motion_snapshot_bytes += size;
+    motion_snapshots.push_back(std::move(entry));
+    Common::MemoryWriteTrace::Event("motion.index.private_snapshot", address, size, transfer_size);
+    return motion_snapshots.back().bytes;
+}
+
 template <bool async>
 void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size) {
+    Common::MemoryWriteTrace::Event("buffer.download.request", device_addr, size, async, scheduler.CurrentTick());
     ScratchProfile::Cpu scratch_cpu(3,"BufferCache::DownloadBufferMemory");
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
@@ -294,18 +403,25 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         .pBufferMemoryBarriers = &pre_barrier,
     });
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
-    const auto write_data = [&]() {
+    // By value, and moved into the deferred operation: the async path runs it after this
+    // function has returned. UniqueFunction made from a named (lvalue) lambda keeps a reference
+    // to it, so before 2026-10-16 the deferred write read this dead stack frame (the crashes at
+    // the first FAST_GPU_SETTLE: a garbage pointer, then a garbage guest address).
+    auto write_data = [copies, buffer_addr = buffer.CpuAddr(), download, offset,
+                             device_addr, size, tracker = memory_tracker.get()]() {
         auto* memory = Core::Memory::Instance();
         for (const auto& copy : copies) {
-            const VAddr copy_device_addr = buffer.CpuAddr() + copy.srcOffset;
+            const VAddr copy_device_addr = buffer_addr + copy.srcOffset;
             const u64 dst_offset = copy.dstOffset - offset;
+            Common::MemoryWriteTrace::Event("buffer.download.write", copy_device_addr, copy.size,
+                Common::MemoryWriteTrace::SourceWord(download + dst_offset, copy.size));
             memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + dst_offset,
                                     copy.size);
         }
-        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+        tracker->UnmarkRegionAsGpuModified(device_addr, size);
     };
     if constexpr (async) {
-        scheduler.DeferOperation(write_data);
+        scheduler.DeferOperation(std::move(write_data));
     } else {
         scheduler.Finish();
         write_data();
@@ -725,6 +841,7 @@ bool BufferCache::VerifyIndexHit(IndexBindMemo& memo, BufferId buffer_id, VAddr 
 }
 
 void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+    Common::MemoryWriteTrace::Event("dma.fill", address, num_bytes, value, is_gds);
     ASSERT_MSG(address % 4 == 0, "GDS offset must be dword aligned");
     if (!is_gds) {
         texture_cache.ClearMeta(address);
@@ -745,6 +862,7 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
 }
 
 void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    Common::MemoryWriteTrace::Event("dma.copy", dst, num_bytes, src);
     ScratchProfile::Cpu scratch_cpu(0,"BufferCache::CopyBuffer");
     if (!dst_gds && !IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !IsRegionGpuModified(src, num_bytes) &&
@@ -774,6 +892,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         auto& buffer = slot_buffers[buffer_id];
         SynchronizeBuffer(buffer, dst, num_bytes, true, true);
         gpu_modified_ranges.Add(dst, num_bytes);
+        NoteGpuWrite(dst, num_bytes);
         return buffer;
     }();
     const vk::BufferCopy region = {
@@ -867,6 +986,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        NoteGpuWrite(device_addr, size);
     }
     return {&buffer, buffer.Offset(device_addr)};
 }
@@ -1233,6 +1353,42 @@ BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size) {
     return CreateBuffer(device_addr, size);
 }
 
+namespace {
+// Experiment switch (logs-on builds): VR_BUFFER_GROW_FILE names a file read once a second; "1" in
+// it turns geometric growth on, anything else (or no file) off. Release builds: off.
+std::atomic<bool> g_buffer_grow{false};
+} // namespace
+
+bool BufferCache::BufferGrowGeometric() {
+    return g_buffer_grow.load(std::memory_order_relaxed);
+}
+
+void BufferCache::PollBufferGrowSwitch() {
+    if constexpr (Common::Log::Enabled) {
+        static const char* const file = std::getenv("VR_BUFFER_GROW_FILE");
+        static s64 checked_second = 0;
+        if (file == nullptr) {
+            return;
+        }
+        const s64 second = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+        if (second == checked_second) {
+            return;
+        }
+        checked_second = second;
+        bool on = false;
+        if (FILE* f = std::fopen(file, "r")) {
+            on = std::fgetc(f) == '1';
+            std::fclose(f);
+        }
+        if (g_buffer_grow.exchange(on, std::memory_order_relaxed) != on) {
+            LOG_WARNING(Render_Vulkan, "Buffer growth: {} (VR_BUFFER_GROW_FILE)",
+                        on ? "GEOMETRIC" : "2 MiB steps");
+        }
+    }
+}
+
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 wanted_size) {
     static constexpr int STREAM_LEAP_THRESHOLD = 16;
     boost::container::small_vector<BufferId, 16> overlap_ids;
@@ -1293,11 +1449,17 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
             // When this memory region has been joined a bunch of times, we assume it's being used
             // as a stream buffer. Increase the size to skip constantly recreating buffers.
             has_stream_leap = true;
+            // Experiment (2026-10-18): grow by the region's own size (at most 128 MiB) instead of
+            // 2 MiB. Streaming in an area re-created one region in 2 MiB steps: 2.7 GB allocated
+            // in one frame for 589 MB asked, a 100 ms frame (the sewers).
+            const VAddr leap = BufferGrowGeometric()
+                                   ? std::clamp<VAddr>(end - begin, CACHING_PAGESIZE * 128, 128_MB)
+                                   : CACHING_PAGESIZE * 128;
             if (expands_right) {
-                expand_end(CACHING_PAGESIZE * 128);
+                expand_end(leap);
             }
             if (expands_left) {
-                expand_begin(CACHING_PAGESIZE * 128);
+                expand_begin(leap);
             }
         }
     }
@@ -1371,6 +1533,7 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
 }
 
 BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
+    Common::Slow::Scope slow{Common::Slow::CreateBuffer, wanted_size};
     const VAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
@@ -1521,7 +1684,7 @@ static void VerifyTransferEyeCopies(const Vulkan::Instance& instance, Vulkan::Sc
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
-                                    bool is_texel_buffer) {
+                                    bool is_texel_buffer, bool retire_cpu_uploads) {
     ScratchProfile::Cpu scratch_cpu(1,"BufferCache::SynchronizeBuffer");
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes = 0;
@@ -1537,11 +1700,18 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             memory_tracker->ForUpload(
                 device_addr_out, range_size,
                 [&](VAddr address, u64 bytes) {
+                    Common::MemoryWriteTrace::Event("buffer.upload.range", address, bytes, scheduler.CurrentTick());
                     copies.emplace_back(total_size_bytes, address - buffer_start, bytes);
                     total_size_bytes += bytes;
                 },
                 [this](VAddr page, u64 bytes, auto&& range) {
                     gpu_modified_ranges.ForEachInRange(page, bytes, range);
+                },
+                [](VAddr start, VAddr stop, MemoryTracker::LostWhy why) {
+                    if (start < stop) {
+                        Common::MemoryWriteTrace::Event("gpu.keep.replaced", start,
+                                                       stop - start, static_cast<u8>(why));
+                    }
                 });
         },
         [&](bool safe_async) { src_buffer = UploadCopies(buffer, copies, total_size_bytes, safe_async); },
@@ -1630,6 +1800,15 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                 VerifyTransferEyeCopies(instance, scheduler, buffer.Handle(), outer_right,
                                         copies);
             }
+        }
+        // Motion snapshots need byte ownership, not the historical GPU-dirty page bit.
+        // Only ranges the normal upload path actually emitted become CPU-authoritative;
+        // untouched GPU bytes on mixed pages were excluded by ForUpload and stay owned.
+        if (retire_cpu_uploads) {
+            for (const auto& copy : copies) {
+                gpu_modified_ranges.Subtract(buffer_start + copy.dstOffset, copy.size);
+            }
+            copy_memo_epoch.fetch_add(1, std::memory_order_acq_rel);
         }
         TouchBuffer(buffer);
         buffer.PerfNoteWrite(); // the resync memo: guest data uploaded into it
@@ -1991,10 +2170,144 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
     buffer.PerfNoteWrite();
 }
 
+// The catch-all log of GPU-written bytes an upload replaced with the guest's (MemoryTracker::
+// ForUpload `lost`): each 4 KB page once (and every 64th time after), with why and when, so the
+// path that lost the ghost triangles' data shows in the log. A page the CPU really rewrote (memory
+// reused) shows here too; the face's pages are the ones replaced right before the triangles.
+void BufferCache::NoteGpuBytesReplaced(VAddr start, VAddr stop, u8 why_code) {
+    if (start >= stop) {
+        return;
+    }
+    const auto why = static_cast<MemoryTracker::LostWhy>(why_code);
+    const VAddr page = Common::AlignDown(start, 4096);
+    const u64 total = replaced_total.fetch_add(1, std::memory_order_relaxed) + 1;
+    // The page's slot (linear probing, 8 tries): its count of replacements.
+    u64 seen = 0;
+    size_t slot = static_cast<size_t>((page >> 12) * 0x9E3779B97F4A7C15ull >> 48) &
+                  (ReplacedSlots - 1);
+    for (int probe = 0; probe < 8; ++probe, slot = (slot + 1) & (ReplacedSlots - 1)) {
+        auto& key = (*replaced_pages)[slot];
+        u64 current = key.load(std::memory_order_relaxed);
+        if (current == 0 &&
+            key.compare_exchange_strong(current, page, std::memory_order_relaxed)) {
+            current = page;
+        }
+        if (current == page) {
+            seen = (*replaced_counts)[slot].fetch_add(1, std::memory_order_relaxed) + 1;
+            break;
+        }
+    }
+    if (seen == 0 ? (total & 63) != 0 : (seen != 1 && (seen & 63) != 0)) {
+        return;
+    }
+    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                   replaced_t0)
+                         .count();
+    LOG_INFO(Render_Vulkan,
+             "FAST_GPU_PAGE_KEEP: REPLACED {} GPU-written bytes at {:#x}..{:#x} with the guest's "
+             "({}) | page {:#x} x{} | t={:.1f} s, {} replacements, pool evictions {}",
+             stop - start, start, stop, MemoryTracker::LostName(why), page, seen, t, total,
+             memory_tracker->KeptPoolFull());
+}
+
+namespace {
+// Off unless FAST_GPU_SETTLE=1 (2026-10-16: faceless faces broke without any upload replacing
+// GPU bytes, so this did not fix them, and the one device loss of the night came in its run).
+const bool g_gpu_settle = [] {
+    const char* env = std::getenv("FAST_GPU_SETTLE");
+    return env != nullptr && env[0] == '1';
+}();
+constexpr u64 SettleFrames = 45;               // about half a second without a GPU write
+constexpr u64 SettleScanEvery = 8;             // frames between scans
+constexpr u64 SettleBudget = 8ull << 20;       // bytes copied back per scan at most
+constexpr u64 SettleMaxRange = 8ull << 20;     // larger ranges stay GPU-only (32 MB staging)
+constexpr size_t SettleMaxEntries = 1u << 16;  // a runaway table is dropped, never grown
+} // namespace
+
+void BufferCache::NoteGpuWrite(VAddr addr, u64 size) {
+    Common::MemoryWriteTrace::Event("gpu.write.range", addr, size, scheduler.CurrentTick());
+    if (!g_gpu_settle || size == 0) {
+        return;
+    }
+    std::scoped_lock lock{settle_mutex};
+    auto& write = settle_writes[addr];
+    write.size = std::max(write.size, size);
+    write.tick = gc_tick;
+}
+
+void BufferCache::RequestReadback(VAddr addr, u64 size) {
+    std::scoped_lock lock{settle_mutex};
+    readback_requests.emplace_back(addr, size);
+}
+
+void BufferCache::SettleGpuWrites() {
+    {
+        std::vector<std::pair<VAddr, u64>> requests;
+        {
+            std::scoped_lock lock{settle_mutex};
+            requests.swap(readback_requests);
+        }
+        for (const auto& [addr, size] : requests) {
+            const bool gpu = IsRegionRegistered(addr, size) && IsRegionGpuModified(addr, size);
+            LOG_INFO(Render_Vulkan, "VR draws: gpumem {:#x}+{}: {}", addr, size,
+                     gpu ? "GPU-written, copied back" : "not GPU-written (guest memory as is)");
+            if (gpu) {
+                Buffer& buffer = slot_buffers[FindBuffer(addr, static_cast<u32>(size))];
+                DownloadBufferMemory<true>(buffer, addr, size);
+            }
+        }
+    }
+    if (!g_gpu_settle || gc_tick % SettleScanEvery != 0) {
+        return;
+    }
+    boost::container::small_vector<std::pair<VAddr, u64>, 16> ready;
+    {
+        std::scoped_lock lock{settle_mutex};
+        u64 bytes = 0;
+        for (auto it = settle_writes.begin(); it != settle_writes.end();) {
+            if (it->second.size > SettleMaxRange) {
+                it = settle_writes.erase(it); // render targets and big scratch: not ours
+            } else if (gc_tick - it->second.tick >= SettleFrames &&
+                       bytes + it->second.size <= SettleBudget) {
+                ready.emplace_back(it->first, it->second.size);
+                bytes += it->second.size;
+                it = settle_writes.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (settle_writes.size() > SettleMaxEntries) {
+            settle_writes.clear();
+        }
+    }
+    u64 copied = 0;
+    u32 ranges = 0;
+    for (const auto& [addr, size] : ready) {
+        if (!IsRegionRegistered(addr, size) || !IsRegionGpuModified(addr, size)) {
+            continue; // unmapped since, or already back (a readback, the GC)
+        }
+        Buffer& buffer = slot_buffers[FindBuffer(addr, static_cast<u32>(size))];
+        DownloadBufferMemory<true>(buffer, addr, size);
+        copied += size;
+        ++ranges;
+    }
+    if (ranges != 0) {
+        const u64 n = settle_logs++;
+        if (n < 32 || (n & 63) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "FAST_GPU_SETTLE: {} GPU-written ranges ({} KB) untouched for {} frames "
+                     "copied back to guest memory ({} scans so far)",
+                     ranges, copied >> 10, SettleFrames, n + 1);
+        }
+    }
+}
+
 void BufferCache::RunGarbageCollector() {
     SCOPE_EXIT {
         ++gc_tick;
     };
+    PollBufferGrowSwitch();
+    SettleGpuWrites();
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
     }
@@ -2010,6 +2323,17 @@ void BufferCache::RunGarbageCollector() {
         }
         --max_deletions;
         Buffer& buffer = slot_buffers[buffer_id];
+        // The catch-all log (off for performance):
+        // if (gpu_modified_ranges.Intersects(buffer.CpuAddr(), buffer.SizeBytes())) {
+        //     static std::atomic<u64> logs{0};
+        //     const u64 n = logs.fetch_add(1, std::memory_order_relaxed);
+        //     if (n < 64 || (n & 255) == 0) {
+        //         LOG_INFO(Render_Vulkan,
+        //                  "FAST_GPU_PAGE_KEEP: GC evicts a buffer with GPU-written bytes at "
+        //                  "{:#x}..{:#x} (downloaded, written back later; {} so far)",
+        //                  buffer.CpuAddr(), buffer.CpuAddr() + buffer.SizeBytes(), n + 1);
+        //     }
+        // }
         // InvalidateMemory(buffer.CpuAddr(), buffer.SizeBytes());
         DownloadBufferMemory<true>(buffer, buffer.CpuAddr(), buffer.SizeBytes());
         memory_tracker->MarkRegionAsCpuModified(buffer.CpuAddr(), buffer.SizeBytes());

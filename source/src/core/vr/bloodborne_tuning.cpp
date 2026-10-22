@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -13,13 +19,17 @@
 
 #include "common/logging/log.h"
 #include "core/vr/bloodborne_melee.h"
+#include "core/vr/bloodborne_headshot.h"
 #include "core/vr/bloodborne_ragdoll.h"
 #include "core/vr/bloodborne_tuning.h"
 #include "core/vr/bloodborne_visceral_pull.h"
 #include "core/vr/visceral_pull.h"
 #include "core/vr/body_channel.h"
+#include "core/vr/health_bonus.h"
+#include "core/vr/outgoing_damage.h"
 #include "core/vr/hit_direction.h"
 #include "core/vr/hook_util.h"
+#include "core/vr/molotov_burst_damage.h"
 #include "core/vr/vr_session.h"
 
 namespace VR::Bloodborne {
@@ -344,6 +354,10 @@ void PS4_SYSV_ABI OffhandDamageHook(u8* res, u8* saved_ymm, u8* attacker) {
                                .count(),
                            std::memory_order_relaxed);
     // A physical swing's hit (core/vr/bloodborne_melee.h): scaled by the blade's speed there.
+    // Apply before melee feedback and lethal-hit classification; never scale self damage.
+    *damage = OutgoingDamage::Scale(*damage,
+        OutgoingDamage::live_percent.load(std::memory_order_relaxed),
+        attacker == player, Plausible(target) && target != player);
     const float raw = *damage;
     const bool swing = MeleeDamage(res, target, damage);
     // melee_kill_ragdoll (core/vr/bloodborne_ragdoll.h): a lethal right-hand weapon attack arms
@@ -366,13 +380,26 @@ void PS4_SYSV_ABI OffhandDamageHook(u8* res, u8* saved_ymm, u8* attacker) {
     } else {
         g_skipped_target.fetch_add(1, std::memory_order_relaxed);
     }
+    const float burst_damage = Quick::BurstDamage::Scale(
+        after, {Read<s32>(res + ResBullet), Read<s32>(res + ResBehaviorId), hand,
+                attacker == player, target == player},
+        Quick::GetQuickSettings());
+    const bool burst = std::isfinite(after) && burst_damage != after;
+    after = burst_damage;
+    if (burst && !g_offhand_dry) {
+        *damage = after;
+    }
+    if (other && !g_offhand_dry) {
+        *damage = GunHeadshotDamage(res, target, *damage);
+        after = *damage;
+    }
     if (g_offhand_log == 0) {
         return;
     }
     std::scoped_lock lock{g_hit_mutex};
     const s32 target_hp = ChrHp(target);
     const s32 applied = static_cast<s32>(g_offhand_dry ? before : after);
-    if (boost) {
+    if (boost || burst) {
         g_hit_check = {target, target_hp, applied, 0};
     }
     if (!HitLineAllowed()) {
@@ -386,7 +413,8 @@ void PS4_SYSV_ABI OffhandDamageHook(u8* res, u8* saved_ymm, u8* attacker) {
              Read<s32>(res + ResBullet), Read<s32>(res + ResWeapon), fmt::ptr(target), target_hp,
              raw, after, static_cast<s32>(raw), static_cast<s32>(after),
              boost ? g_offhand_mult : (raw > 0.0f ? after / raw : 1.0f),
-             boost   ? (g_offhand_dry ? "BOOST(dry)" : "BOOST")
+             burst   ? (g_offhand_dry ? "AIRBURST(dry)" : "AIRBURST")
+             : boost ? (g_offhand_dry ? "BOOST(dry)" : "BOOST")
              : swing ? "SWING"
              : !left ? "skip(hand)"
                      : "skip(target)");
@@ -412,10 +440,6 @@ void EmitAbsoluteJump(Xbyak::CodeGenerator& c, u64 target) {
 }
 
 bool InstallHpBonus(u8* module, u64 size, int pct, bool wcm_ok) {
-    if (pct <= 0) {
-        LOG_INFO(Core, "VR hp: player_hp_bonus_pct=0, vanilla max HP (not installed)");
-        return false;
-    }
     u8* const site = module + MaxHpRateRva;
     const bool sig_ok = size > OneConstRva + sizeof(u32) &&
                         std::memcmp(site, MaxHpRateSig.data(), MaxHpRateSig.size()) == 0;
@@ -489,10 +513,9 @@ bool InstallOffhandDamage(u8* module, u64 size, int pct, bool wcm_ok) {
     const bool melee = MeleePhysicalWanted();
     // The kill ragdoll classifies every hit here too (core/vr/bloodborne_ragdoll.h).
     const bool ragdoll = RagdollWanted();
-    if (pct <= 0 && !melee && !ragdoll) {
-        LOG_INFO(Core, "VR dmg: offhand_damage_pct=0, vanilla damage (not installed)");
-        return false;
-    }
+    const bool burst = Quick::BurstDamage::Enabled(Quick::GetQuickSettings());
+    // Keep the signature-checked damage hook available for live outgoing-damage changes,
+    // including when all other damage assists start disabled.
     pct = std::max(pct, 0);
     if (size <= WorldChrManRva + 8) {
         LOG_WARNING(Core, "VR dmg: eboot too small ({:#x}); off-hand bonus not installed", size);
@@ -540,9 +563,10 @@ bool InstallOffhandDamage(u8* module, u64 size, int pct, bool wcm_ok) {
     Hook::WriteJump(site, DamageFinalLen, entry);
     LOG_INFO(Core,
              "VR dmg: offhand +{}% installed at {:#x} (sig ok, prologue ok, attacker slot ok, "
-             "jump-in ok, WorldChrMan ok) mult={:.3f}{}{}{}",
+             "jump-in ok, WorldChrMan ok) mult={:.3f}{}{}{}{}",
              pct, DamageFinalRva, g_offhand_mult, melee ? ", physical melee's hits too" : "",
-             ragdoll ? ", the kill ragdoll's blows too" : "", g_offhand_dry ? " DRYRUN" : "");
+             ragdoll ? ", the kill ragdoll's blows too" : "",
+             burst ? ", shot Molotov airburst damage too" : "", g_offhand_dry ? " DRYRUN" : "");
     return true;
 }
 
@@ -718,6 +742,7 @@ void InstallTuning(VAddr base, u64 size) {
     auto* const module = reinterpret_cast<u8*>(base);
     const bool wcm_ok = size > WorldChrManRva + 8 && ProvesWorldChrMan(module);
     g_base = module;
+    InitHeadshots(base, size);
     g_hp_log = std::getenv("VR_HP_LOG") != nullptr;
     g_hp_autotest = std::getenv("VR_HP_AUTOTEST") != nullptr;
     if (const char* level = std::getenv("VR_OFFHAND_LOG")) {
@@ -742,8 +767,32 @@ void TuningUpdate(u8* player) {
     if (player == nullptr) {
         return;
     }
-    if (g_hp_installed && (g_hp_log || g_hp_autotest)) {
-        HpUpdate(player);
+    if (g_hp_installed) {
+        if (!g_hp_autotest) {
+            const float multiplier = Assists::live.HpMultiplier();
+            if (g_hp_mult != multiplier) {
+                u8* const data = DataModule(player);
+                u8* const manager = Read<u8*>(player + OffsetSpEffects);
+                if (data != nullptr && Plausible(manager)) {
+                    const s32 current_hp = Read<s32>(data + OffsetHp);
+                    const auto change = Assists::PlanHealthChange(
+                        Read<s32>(data + OffsetBaseMaxHp), g_max_hp_rate(manager, false),
+                        g_hp_mult, multiplier, current_hp,
+                        Read<s32>(data + OffsetTrackMaxHp));
+                    if (change) {
+                        if (change->current < current_hp) {
+                            std::memcpy(data + OffsetHp, &change->current, sizeof(s32));
+                        }
+                        std::memcpy(data + OffsetTrackMaxHp, &change->tracked_max, sizeof(s32));
+                        g_hp_mult = multiplier;
+                        LOG_INFO(Core, "VR hp: live multiplier {:.3f}", multiplier);
+                    }
+                }
+            }
+        }
+        if (g_hp_log || g_hp_autotest) {
+            HpUpdate(player);
+        }
     }
     if (g_offhand_installed && g_offhand_log > 0) {
         OffhandUpdate();

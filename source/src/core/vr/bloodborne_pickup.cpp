@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -18,7 +24,6 @@
 #include "core/vr/bloodborne_pickup.h"
 #include "core/vr/hook_util.h"
 #include "core/vr/pickup_gate.h"
-#include "core/vr/interaction_world.h"
 #include "core/vr/vr_session.h"
 
 namespace VR::Bloodborne {
@@ -174,10 +179,6 @@ std::unique_ptr<Xbyak::CodeGenerator> g_code;
 bool g_installed = false;
 int g_env_setting = -1; // VR_PICKUP_INSTANT: -1 = vr.ini
 std::atomic<u32> g_instant{0};
-VR::Interactions::Module* g_policy_module{};
-bool g_policy_fault{};
-VR::Interactions::WorldRuntime g_policy_runtime;
-VR::Interactions::PickupGate g_pickup_gate{g_policy_runtime};
 u32 g_pickups = 0; // the checker's thread only
 
 bool SettingOn() {
@@ -316,8 +317,7 @@ bool PS4_SYSV_ABI AfterPickUp(s32 kind) {
         .first_person = VR::IsFirstPerson(),
         .flat = VR::CinematicFlat(),
     };
-    if(VR::Interactions::ProcessFaultLatch().Tripped())g_policy_fault=true;
-    const P::Reason reason = g_policy_fault?P::Reason::ModuleFault:g_pickup_gate.Decide(in);
+    const P::Reason reason = P::Decide(in);
     const bool instant = reason == P::Reason::Instant;
     ++g_pickups;
     if (instant) {
@@ -567,11 +567,6 @@ void InstallPickup(VAddr base, u64 size) {
                     "animation",
                     bad.substr(1));
         return;
-    }
-    if(VR::Interactions::DllRequested() && !g_policy_module){
-        g_policy_module=new VR::Interactions::Module();g_policy_module->EnableFaultBroadcast();
-        if(!g_policy_module->LoadBesideExecutable()){g_policy_fault=true;LOG_ERROR(Core,"VR pickup: DLL policy unavailable: {}",g_policy_module->Diagnostic());return;}
-        g_policy_runtime.Bind(*g_policy_module,g_policy_fault);
     }
     g_find = reinterpret_cast<FindFn>(module + FindRva);
     const bool scan = std::getenv("VR_PICKUP_SCAN") != nullptr;

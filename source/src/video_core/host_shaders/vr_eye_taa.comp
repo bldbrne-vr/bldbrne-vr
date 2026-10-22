@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 // VR eye temporal anti-aliasing (vr.ini eye_taa; renderer_vulkan/vr_late_warp.cpp). Every headset
 // refresh the late warp makes each eye again from the game frame on display, at a new sub-pixel
@@ -9,7 +15,7 @@
 //     surface (its 1/z, written by the warp) seen from the previous refresh's eye. With
 //     eye_taa_follow (renderer_vulkan/vr_eye_taa_math.h Choose) that is the displayed eye in the
 //     game world, so the history also follows walking and smooth turns; else the head's own
-//     motion while the world stands still (the baseline filter).
+//     motion while the world stands still (the original eye TAA).
 //   - Ghosts are kept out by clamping the history to the 3x3 neighbourhood of this refresh's eye
 //     (whatever moved on its own, an enemy, the hunter's arms, fire, is rejected within a refresh).
 //   - The history is sampled with Catmull-Rom (anti-ringing clamped), so moving it does not blur.

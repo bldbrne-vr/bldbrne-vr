@@ -1,4 +1,5 @@
 # SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+# SPDX-FileCopyrightText: 2026 BB-VR contributors
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 # Version 3.24 needed for FetchContent OVERRIDE_FIND_PACKAGE
@@ -18,14 +19,6 @@ if (NOT CMAKE_BUILD_TYPE)
 endif()
 
 project(shadPS4 CXX C ASM ${ADDITIONAL_LANGUAGES})
-
-if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/physical_interactions/CMakeLists.txt")
-    message(FATAL_ERROR
-        "This source snapshot cannot build the emulator until private interaction-header "
-        "dependencies are removed. "
-        "The launcher can be built independently with cmake -S source/launcher.")
-endif()
-
 
 include(FetchContent)
 
@@ -50,6 +43,7 @@ option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
 option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
 option(ENABLE_OPENXR "Enable experimental OpenXR headset presentation" ON)
 option(BBVR_NO_LOGS "Play build: compile out all logging and write no log file" OFF)
+option(BBVR_MEMORY_WRITE_TRACE "Private memory write attribution diagnostics" OFF)
 
 # First, determine whether to use CMAKE_OSX_ARCHITECTURES or CMAKE_SYSTEM_PROCESSOR.
 if (APPLE AND CMAKE_OSX_ARCHITECTURES)
@@ -73,6 +67,20 @@ if (ARCHITECTURE STREQUAL "x86_64")
     # Target x86-64-v3 CPU architecture as this is a good balance between supporting performance critical
     # instructions like AVX2 and maintaining support for older CPUs.
     add_compile_options(-march=x86-64-v3)
+endif()
+
+# Source paths in the binary (__FILE__ in asserts and logs) relative to the checkout: never the
+# builder's own folders (a user name) in a published executable.
+if (CMAKE_C_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    string(REPLACE "/" "\\" BBVR_SOURCE_DIR_NATIVE "${CMAKE_SOURCE_DIR}")
+    if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        set(BBVR_CLANG_FLAG "/clang:")
+    else()
+        set(BBVR_CLANG_FLAG "")
+    endif()
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:C,CXX>:${BBVR_CLANG_FLAG}-fmacro-prefix-map=${CMAKE_SOURCE_DIR}=.>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:${BBVR_CLANG_FLAG}-fmacro-prefix-map=${BBVR_SOURCE_DIR_NATIVE}=.>")
 endif()
 
 cmake_host_system_information(RESULT PROC_INFO QUERY PROCESSOR_DESCRIPTION)
@@ -231,6 +239,16 @@ set_source_files_properties(src/dist/shadps4.rc PROPERTIES COMPILE_DEFINITIONS "
 set(APP_VERSION_NUM "${EMULATOR_VERSION_MAJOR}.${EMULATOR_VERSION_MINOR}.${EMULATOR_VERSION_PATCH}")
 set(APP_VERSION "${APP_VERSION_NUM} WIP")
 set(APP_IS_RELEASE false)
+# A public release (launcher/make_release.ps1): the public repository and a neutral branch in the
+# window title and the log, instead of the remote and branch the build came from.
+set(BBVR_RELEASE_VERSION "" CACHE STRING "Public release version (empty: a development build)")
+if (NOT "${BBVR_RELEASE_VERSION}" STREQUAL "")
+  set(GIT_BRANCH "release")
+  set(GIT_DESC "v${BBVR_RELEASE_VERSION}")
+  set(GIT_REMOTE_NAME "origin")
+  set(GIT_REMOTE_URL "https://github.com/bldbrne-vr/bldbrne-vr")
+  set(APP_IS_RELEASE true)
+endif()
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/common/scm_rev.cpp.in" "${CMAKE_CURRENT_BINARY_DIR}/src/common/scm_rev.cpp" @ONLY)
 
 message("-- end git things, remote: ${GIT_REMOTE_NAME}, branch: ${GIT_BRANCH}, link: ${GIT_REMOTE_URL}")
@@ -782,6 +800,10 @@ set(COMMON src/common/logging/classes.h
            src/common/alignment.h
            src/common/arch.h
            src/common/assert.cpp
+           src/common/render_diagnostic.cpp
+           src/common/render_diagnostic.h
+           src/common/crash_record.cpp
+           src/common/crash_record.h
            src/common/assert.h
            src/common/bit_array.h
            src/common/bit_field.h
@@ -831,6 +853,8 @@ set(COMMON src/common/logging/classes.h
            src/common/string_util.h
            src/common/thread.cpp
            src/common/thread.h
+           src/common/slow_scope.cpp
+           src/common/slow_scope.h
            src/common/types.h
            src/common/uint128.h
            src/common/unique_function.h
@@ -982,6 +1006,9 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/ragdoll_kill.h
          src/core/vr/bloodborne_stagger.cpp
          src/core/vr/bloodborne_stagger.h
+         src/core/vr/bloodborne_visceral_stage.cpp
+         src/core/vr/bloodborne_visceral_stage.h
+         src/core/vr/visceral_stage.h
          src/core/vr/bloodborne_visceral_pull.cpp
          src/core/vr/bloodborne_visceral_pull.h
          src/core/vr/plunge.h
@@ -1002,14 +1029,18 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/bloodborne_menu.h
          src/core/vr/bloodborne_enemy_bars.cpp
          src/core/vr/bloodborne_enemy_bars.h
+         src/core/vr/bloodborne_lights.cpp
+         src/core/vr/bloodborne_lights.h
          src/core/vr/bloodborne_status.cpp
          src/core/vr/bloodborne_status.h
+         src/core/vr/bloodborne_summon_bell.cpp
          src/core/vr/bloodborne_levers.cpp
          src/core/vr/bloodborne_levers.h
          src/core/vr/bloodborne_pickup.cpp
          src/core/vr/bloodborne_pickup.h
          src/core/vr/bloodborne_lamps.cpp
          src/core/vr/bloodborne_lamps.h
+         src/core/vr/vial_refill.h
          src/core/vr/lamp_channel.h
          src/core/vr/lamp_sequence.h
          src/core/vr/lamp_presentation.h
@@ -1025,6 +1056,9 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/bloodborne_quickitems.h
          src/core/vr/bloodborne_transform.cpp
          src/core/vr/bloodborne_transform.h
+         src/core/vr/bloodborne_headshot.cpp
+         src/core/vr/bloodborne_headshot.h
+         src/core/vr/headshot.h
          src/core/vr/bloodborne_tuning.cpp
          src/core/vr/bloodborne_tuning.h
          src/core/vr/bloodborne_vitals.cpp
@@ -1070,6 +1104,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/gun_reload.h
          src/core/vr/gun_reload_audio.h
          src/core/vr/gun_reload_audio.cpp
+         src/core/vr/lever_audio.cpp
+         src/core/vr/lever_audio.h
          src/core/vr/hand_grip.h
          src/core/vr/held_item.h
          src/core/vr/hook_util.cpp
@@ -1119,6 +1155,7 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/vr_ini.h
          src/core/vr/vr_page.h
          src/core/vr/aa_mode.h
+         src/core/vr/aa_transition.h
          src/core/vr/vr_page_art.h
          src/core/vr/vr_page_draw.h
          src/core/vr/vr_page_render.cpp
@@ -1342,7 +1379,7 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_platform.h
                src/video_core/renderer_vulkan/vk_presenter.cpp
                src/video_core/renderer_vulkan/vk_presenter.h
-               scratchpad/dual-eye-perf/native_stereo.cpp
+               src/video_core/native_stereo/native_stereo.cpp
                src/video_core/renderer_vulkan/vk_rasterizer.cpp
                src/video_core/renderer_vulkan/vk_rasterizer.h
                src/video_core/renderer_vulkan/vk_resource_pool.cpp
@@ -1381,6 +1418,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vr_temporal_runtime.h
                src/video_core/renderer_vulkan/vr_temporal_runtime.cpp
                src/video_core/renderer_vulkan/vr_temporal_images.h
+               src/video_core/renderer_vulkan/vr_dibr_dlss.cpp
+               src/video_core/renderer_vulkan/vr_dibr_dlss.h
                src/video_core/renderer_vulkan/vr_temporal_images.cpp
                src/video_core/renderer_vulkan/vr_temporal_scene.h
                src/video_core/renderer_vulkan/vr_temporal_scene.cpp
@@ -1414,6 +1453,9 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vr_stereo_warp.cpp
                src/video_core/renderer_vulkan/vr_stereo_warp.h
                src/video_core/renderer_vulkan/vr_stereo_warp_math.h
+               src/video_core/renderer_vulkan/vr_ui_compose.cpp
+               src/video_core/renderer_vulkan/vr_ui_compose.h
+               src/video_core/renderer_vulkan/vr_ui_geometry.h
                src/video_core/renderer_vulkan/vr_ui_layer.cpp
                src/video_core/renderer_vulkan/vr_ui_layer.h
                src/video_core/renderer_vulkan/vk_rasterizer_vr.cpp
@@ -1533,9 +1575,20 @@ if (APPLE)
     list(APPEND EMULATOR src/sdl_window_apple.mm)
 endif()
 
-if(WIN32 AND ENABLE_OPENXR)
-    add_subdirectory(src/physical_interactions)
-endif()
+# Invalidate the disposable red-zone analysis cache even for uncommitted patcher edits.
+# Limit this definition to its translation unit so it does not rebuild the entire emulator.
+set(red_zone_cache_sources
+    src/core/cpu_patches.cpp src/core/cpu_patches.h src/core/red_zone_cache.h
+    src/common/decoder.cpp src/common/decoder.h src/core/tls.h src/common/types.h)
+set(red_zone_cache_fingerprint "")
+foreach(source IN LISTS red_zone_cache_sources)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
+    file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/${source}" source_hash)
+    string(APPEND red_zone_cache_fingerprint "${source_hash}")
+endforeach()
+string(SHA256 red_zone_cache_fingerprint "${red_zone_cache_fingerprint}")
+set_property(SOURCE src/core/cpu_patches.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+    "RED_ZONE_CACHE_BUILD_ID=\"${red_zone_cache_fingerprint}\"")
 
 if(NOT ENABLE_TESTS)
 
@@ -1556,45 +1609,45 @@ add_executable(shadps4
     src/sdl_window.cpp
 )
 
-# Isolated compiler experiment: apply ThinLTO to the emulator, not all dependencies.
-option(CODEX_SCRATCH_THINLTO "Scratchpad emulator ThinLTO experiment" OFF)
-if(CODEX_SCRATCH_THINLTO)
+# ThinLTO for the emulator target only, not its dependencies.
+option(BBVR_THINLTO "Emulator ThinLTO" OFF)
+if(BBVR_THINLTO)
     include(CheckIPOSupported)
-    check_ipo_supported(RESULT scratch_ipo_ok OUTPUT scratch_ipo_error LANGUAGES CXX)
-    if(NOT scratch_ipo_ok)
-        message(FATAL_ERROR "Scratch ThinLTO unavailable: ${scratch_ipo_error}")
+    check_ipo_supported(RESULT bbvr_ipo_ok OUTPUT bbvr_ipo_error LANGUAGES CXX)
+    if(NOT bbvr_ipo_ok)
+        message(FATAL_ERROR "ThinLTO unavailable: ${bbvr_ipo_error}")
     endif()
     set_property(TARGET shadps4 PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 endif()
 
-# Scratch PGO applies only to the emulator target; dependency libraries stay unchanged.
-set(CODEX_SCRATCH_PGO "OFF" CACHE STRING "Scratch PGO: OFF, GENERATE, USE")
-set_property(CACHE CODEX_SCRATCH_PGO PROPERTY STRINGS OFF GENERATE USE)
-set(CODEX_SCRATCH_PGO_PROFILE "" CACHE FILEPATH "Indexed LLVM profile for scratch PGO")
-if(NOT CODEX_SCRATCH_PGO STREQUAL "OFF")
+# PGO applies only to the emulator target; dependency libraries stay unchanged.
+set(BBVR_PGO "OFF" CACHE STRING "Profile-guided optimisation: OFF, GENERATE, USE")
+set_property(CACHE BBVR_PGO PROPERTY STRINGS OFF GENERATE USE)
+set(BBVR_PGO_PROFILE "" CACHE FILEPATH "Indexed LLVM profile for PGO")
+if(NOT BBVR_PGO STREQUAL "OFF")
     if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR NOT MSVC)
-        message(FATAL_ERROR "Scratch PGO requires the tested clang-cl toolchain")
+        message(FATAL_ERROR "PGO requires the tested clang-cl toolchain")
     endif()
-    if(CODEX_SCRATCH_PGO STREQUAL "GENERATE")
+    if(BBVR_PGO STREQUAL "GENERATE")
         target_compile_options(shadps4 PRIVATE -fprofile-generate -fprofile-update=atomic)
-        target_compile_definitions(shadps4 PRIVATE CODEX_SCRATCH_PGO_GENERATE=1)
+        target_compile_definitions(shadps4 PRIVATE BBVR_PGO_GENERATE=1)
         execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /clang:-print-resource-dir
-            OUTPUT_VARIABLE scratch_clang_resource OUTPUT_STRIP_TRAILING_WHITESPACE
+            OUTPUT_VARIABLE bbvr_clang_resource OUTPUT_STRIP_TRAILING_WHITESPACE
             COMMAND_ERROR_IS_FATAL ANY)
-        target_link_directories(shadps4 PRIVATE "${scratch_clang_resource}/lib/windows")
+        target_link_directories(shadps4 PRIVATE "${bbvr_clang_resource}/lib/windows")
         target_link_options(shadps4 PRIVATE /NODEFAULTLIB:libcmt.lib)
-    elseif(CODEX_SCRATCH_PGO STREQUAL "USE")
-        if(NOT EXISTS "${CODEX_SCRATCH_PGO_PROFILE}")
+    elseif(BBVR_PGO STREQUAL "USE")
+        if(NOT EXISTS "${BBVR_PGO_PROFILE}")
             message(FATAL_ERROR "Missing indexed PGO profile")
         endif()
         # The filename stays fixed when retraining. Include its contents in every
         # compile command so Ninja cannot link objects from two profile summaries.
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CODEX_SCRATCH_PGO_PROFILE}")
-        file(SHA256 "${CODEX_SCRATCH_PGO_PROFILE}" CODEX_SCRATCH_PGO_SHA256)
-        target_compile_definitions(shadps4 PRIVATE "CODEX_SCRATCH_PGO_SHA256=\"${CODEX_SCRATCH_PGO_SHA256}\"")
-        target_compile_options(shadps4 PRIVATE "-fprofile-use=${CODEX_SCRATCH_PGO_PROFILE}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${BBVR_PGO_PROFILE}")
+        file(SHA256 "${BBVR_PGO_PROFILE}" BBVR_PGO_SHA256)
+        target_compile_definitions(shadps4 PRIVATE "BBVR_PGO_SHA256=\"${BBVR_PGO_SHA256}\"")
+        target_compile_options(shadps4 PRIVATE "-fprofile-use=${BBVR_PGO_PROFILE}")
     else()
-        message(FATAL_ERROR "Unknown scratch PGO mode")
+        message(FATAL_ERROR "Unknown PGO mode")
     endif()
 endif()
 
@@ -1626,6 +1679,16 @@ target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${PROJECT_SOURC
 
 if (ENABLE_DISCORD_RPC)
     target_compile_definitions(shadps4 PRIVATE ENABLE_DISCORD_RPC)
+endif()
+
+if (BBVR_MEMORY_WRITE_TRACE)
+    set_property(SOURCE
+        src/core/memory.cpp
+        src/core/libraries/kernel/file_system.cpp
+        src/video_core/buffer_cache/buffer_cache.cpp
+        src/video_core/renderer_vulkan/vk_rasterizer.cpp
+        src/video_core/renderer_vulkan/vk_rasterizer_temporal.cpp
+        APPEND PROPERTY COMPILE_DEFINITIONS BBVR_MEMORY_WRITE_TRACE=1)
 endif()
 
 if (BBVR_NO_LOGS)
@@ -1722,6 +1785,9 @@ if (WIN32)
     # Change base image address
     if (MSVC)
         target_link_options(shadps4 PRIVATE /BASE:0x700000000000)
+        # shadps4.map beside the executable: a crash.txt offset (common/crash_record.h) names its
+        # function. The fixed base above keeps offsets stable.
+        target_link_options(shadps4 PRIVATE /MAP)
     else()
         target_link_options(shadps4 PRIVATE -Wl,--image-base=0x700000000000)
     endif()
@@ -1743,22 +1809,6 @@ target_include_directories(shadps4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 set(HOST_SHADERS_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/src/video_core/host_shaders)
 
 add_subdirectory(${HOST_SHADERS_INCLUDE})
-target_sources(shadps4 PRIVATE src/core/vr/interaction_module.cpp)
-if(TARGET physical_interactions)
-    # Packaged Windows/OpenXR builds use the DLL; explicit legacy mode is for comparison.
-    target_compile_definitions(shadps4 PRIVATE VR_INTERACTION_DLL_DEFAULT=1)
-    # Runtime dependency only: shadps4 never links the DLL's import library.
-    # Always check the copy, even when only DLL sources changed and the host
-    # executable did not relink. CMP0112 avoids a dependency cycle for TARGET_FILE_DIR.
-    add_custom_target(copy_physical_interactions
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:physical_interactions> $<TARGET_FILE_DIR:shadps4>
-        DEPENDS physical_interactions
-        VERBATIM)
-    add_dependencies(shadps4 copy_physical_interactions)
-    install(TARGETS physical_interactions RUNTIME DESTINATION .)
-endif()
-
 add_dependencies(shadps4 host_shaders)
 target_include_directories(shadps4 PRIVATE ${HOST_SHADERS_INCLUDE})
 
@@ -1803,7 +1853,9 @@ endif()
 # Install rules
 install(TARGETS shadps4 BUNDLE DESTINATION .)
 
-else()
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     enable_testing()
     add_subdirectory(tests)
+else()
+    message(FATAL_ERROR "ENABLE_TESTS needs the tests folder, which this source tree does not include")
 endif()

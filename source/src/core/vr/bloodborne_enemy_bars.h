@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -43,5 +49,9 @@ void EnemyBarsUpdate();
 // squeeze where it is (1 + t^2 across, more for high tags), so it has the same size and shape
 // anywhere in the view and no longer looks turned. Off: the game's own scale (100 %).
 void SetEnemyTagScale(bool on, float half_w, float half_h);
+
+// A boss bar raised near the top (ui_boss_bar = 1) was updated in the last 0.5 s: while it is,
+// the HP cluster's cut stops at ui_layout.h StatusLeftBossCutX (any thread).
+[[nodiscard]] bool BossBarUp();
 
 } // namespace VR::Bloodborne

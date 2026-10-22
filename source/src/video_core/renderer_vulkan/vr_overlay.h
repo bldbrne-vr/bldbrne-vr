@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -85,6 +91,7 @@ public:
 
     struct Settings {
         bool enabled{true};
+        bool offscreen{false}; // private sampled target, no XR swapchain
         float scale{0.70f}; // eye size relative to the recommended size, 0.5 .. 1
         u32 msaa{4};        // 1, 2, 4 or 8 (lowered to what the device supports)
         float exposure{1.0f};
@@ -129,7 +136,7 @@ public:
     // frame thread) and uploads the meshes. Takes queue_mutex briefly (mesh upload, first
     // acquire): do not hold it when calling. False (logged) leaves the overlay disabled.
     bool Init(const DeviceContext& device, const SessionContext& session,
-              const Settings& settings);
+              const Settings& settings, const VrOverlayRenderer* reuse = nullptr);
     // Waits for the overlay's own GPU work (not the queue), destroys everything including the
     // swapchain. Call before xrDestroySession.
     void Shutdown();
@@ -176,6 +183,13 @@ public:
     }
 
     void EndFrame();
+    // External frame-thread command stream; caller fences uniform slot reuse and teardown.
+    bool RecordOffscreen(vk::CommandBuffer cmd, u32 slot, const EyeViews& eyes,
+                         std::span<const VrOverlay::DrawItem> draw_items);
+    vk::Image OffscreenImage() const { return offscreen.image; }
+    vk::ImageView OffscreenView() const { return offscreen.view; }
+    vk::Extent2D OffscreenExtent() const { return {2 * eye_extent.width, eye_extent.height}; }
+
     // Queue lock held. `layer_next` is chained into the layer (e.g. the base layer's
     // XrCompositionLayerColorScaleBiasKHR during cinematic fades). The returned pointer stays
     // valid until the next BeginFrame.
@@ -206,7 +220,7 @@ private:
 
     bool Fail(std::string_view what);
     bool CreateSwapchain();
-    bool CreateTargets();
+    bool CreateTargets(const VrOverlayRenderer* reuse);
     bool CreateImage(ImageResource& out, vk::Format format, vk::ImageUsageFlags usage,
                      vk::ImageAspectFlags aspect, vk::SampleCountFlagBits samples,
                      std::string_view name);
@@ -220,7 +234,8 @@ private:
     bool AcquireImage();
     bool CanReuse() const;
     void ReadTimestamps(u32 slot);
-    void Record(Slot& slot, u32 slot_index);
+    void PrepareDraw(u32 slot_index);
+    void Record(Slot& slot, u32 slot_index, vk::CommandBuffer external = {});
 
     DeviceContext dev{};
     SessionContext xr{};
@@ -243,6 +258,13 @@ private:
     u64 shown_frame{0};
     EyeViews shown{};
 
+    // Borrowed immutable meshes may cross queues in the same family. Transient targets
+    // are shared only on the same queue, where Record barriers serialize their reuse.
+    // The owner must outlive this renderer and all externally submitted commands.
+    bool borrowed_targets{false};
+    bool borrowed_meshes{false};
+    u64 shared_memory_bytes{0};
+    ImageResource offscreen{};
     ImageResource msaa_color{};
     ImageResource depth{};
     BufferResource vertices{};

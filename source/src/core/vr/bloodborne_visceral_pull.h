@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -35,7 +41,7 @@ void InitVisceralPull(VAddr base, u64 size);
 
 // The frame-time detour (the game's update thread). The main player's update: `clip` / `clip_time`
 // his newest TimeAct entry (clip -1: not read). Returns the factor for his frame time.
-[[nodiscard]] float VisceralPullMain(u8* player, s32 clip, float clip_time, float dt);
+[[nodiscard]] float VisceralPullMain(u8* player, s32 clip, float clip_time, float dt, bool control);
 // Only the visual arm blend returns early; combat stays gated by the game's throw.
 [[nodiscard]] bool VisceralPullRecoverArms(const u8* player);
 // Only the outgoing throw gate uses this; enemy grabs keep their existing policy.

@@ -3,7 +3,6 @@
 
 #include <sirit/sirit.h>
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
-#include "shader_recompiler/runtime_info.h"
 
 namespace Shader::Backend::SPIRV {
 
@@ -12,8 +11,8 @@ using Sirit::Id;
 constexpr u32 SPIRV_VERSION_1_5 = 0x00010500;
 
 struct QuadRectListEmitter : public Sirit::Module {
-    explicit QuadRectListEmitter(const FragmentRuntimeInfo& fs_info_)
-        : Sirit::Module{SPIRV_VERSION_1_5}, fs_info{fs_info_} {
+    explicit QuadRectListEmitter(u64 location_mask_)
+        : Sirit::Module{SPIRV_VERSION_1_5}, location_mask{location_mask_} {
         void_id = TypeVoid();
         bool_id = TypeBool();
         float_id = TypeFloat(32);
@@ -252,16 +251,15 @@ private:
         } else {
             gl_per_vertex = AddOutput(gl_per_vertex_type);
         }
-        outputs.reserve(fs_info.num_inputs);
-        for (int i = 0; i < fs_info.num_inputs; i++) {
-            const auto& input = fs_info.inputs[i];
-            if (input.IsDefault()) {
+        outputs.reserve(33);
+        for (u32 i = 0; i < 33; i++) {
+            if ((location_mask & (u64{1} << i)) == 0) {
                 continue;
             }
             outputs.emplace_back(AddOutput(model == spv::ExecutionModel::TessellationControl
                                                ? TypeArray(vec4_id, Int(4))
                                                : vec4_id));
-            Decorate(outputs.back(), spv::Decoration::Location, input.param_index);
+            Decorate(outputs.back(), spv::Decoration::Location, i);
         }
     }
 
@@ -276,19 +274,18 @@ private:
         const Id gl_per_vertex_array{TypeArray(gl_per_vertex_type, Constant(uint_id, 32U))};
         gl_in = AddInput(gl_per_vertex_array);
         const Id float_arr{TypeArray(vec4_id, Int(32))};
-        inputs.reserve(fs_info.num_inputs);
-        for (int i = 0; i < fs_info.num_inputs; i++) {
-            const auto& input = fs_info.inputs[i];
-            if (input.IsDefault()) {
+        inputs.reserve(33);
+        for (u32 i = 0; i < 33; i++) {
+            if ((location_mask & (u64{1} << i)) == 0) {
                 continue;
             }
             inputs.emplace_back(AddInput(float_arr));
-            Decorate(inputs.back(), spv::Decoration::Location, input.param_index);
+            Decorate(inputs.back(), spv::Decoration::Location, i);
         }
     }
 
 private:
-    FragmentRuntimeInfo fs_info;
+    u64 location_mask;
     Id main;
     Id void_id;
     Id bool_id;
@@ -319,8 +316,8 @@ private:
     std::vector<Id> interfaces;
 };
 
-std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type, const FragmentRuntimeInfo& fs_info) {
-    QuadRectListEmitter ctx{fs_info};
+std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type, u64 location_mask) {
+    QuadRectListEmitter ctx{location_mask};
     switch (type) {
     case AuxShaderType::RectListTCS:
         ctx.EmitRectListTCS();

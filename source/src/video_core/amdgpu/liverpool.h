@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -14,7 +15,7 @@
 #include <vector>
 #include <queue>
 
-#include "../../../scratchpad/dual-eye-perf/register_delta.h"
+#include "video_core/native_stereo/register_delta.h"
 #include "common/assert.h"
 #include "common/slot_vector.h"
 #include "common/types.h"

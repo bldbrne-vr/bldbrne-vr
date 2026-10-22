@@ -1,5 +1,11 @@
-#include "../../../scratchpad/dual-eye-perf/push_state_memo.h"
-// SPDX-License-Identifier: GPL-2.0-or-later
+#include "video_core/native_stereo/push_state_memo.h"
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include "video_core/renderer_vulkan/vr_overlay.h"
 
@@ -102,7 +108,7 @@ void VrOverlayRenderer::Disable(std::string_view reason) {
 }
 
 bool VrOverlayRenderer::Init(const DeviceContext& device, const SessionContext& session,
-                             const Settings& s) {
+                             const Settings& s, const VrOverlayRenderer* reuse) {
     Shutdown();
     dev = device;
     xr = session;
@@ -120,9 +126,26 @@ bool VrOverlayRenderer::Init(const DeviceContext& device, const SessionContext& 
         xr.space == XR_NULL_HANDLE) {
         return Fail("missing device or session handles");
     }
-    bool ok = CreateSwapchain() && CreateTargets() && CreateFrameResources() && UploadMeshes() &&
-              CreatePipelines();
-    if (ok) {
+    if (reuse && (!reuse->IsActive() || reuse->dev.device != dev.device ||
+                  reuse->dev.queue_family != dev.queue_family)) {
+        reuse = nullptr;
+    }
+    bool ok = CreateSwapchain() && CreateTargets(reuse) && CreateFrameResources();
+    if (ok && reuse) {
+        vertices = reuse->vertices;
+        indices = reuse->indices;
+        ranges = reuse->ranges;
+        borrowed_meshes = true;
+        for (const auto* buffer : {&vertices, &indices}) {
+            VmaAllocationInfo info{};
+            vmaGetAllocationInfo(dev.allocator, buffer->allocation, &info);
+            shared_memory_bytes += info.size;
+        }
+    } else if (ok) {
+        ok = UploadMeshes();
+    }
+    ok = ok && CreatePipelines();
+    if (ok && !settings.offscreen) {
         const Common::Log::DeferScope log_defer; // its log lines: once the lock is released
         const LockTrace::Start lock_start;
         std::scoped_lock lk{*dev.queue_mutex};
@@ -181,6 +204,15 @@ bool VrOverlayRenderer::CreateSwapchain() {
         h = std::max<u32>(static_cast<u32>(h * fit), 64);
     }
     eye_extent = {w, h};
+    if (settings.offscreen) {
+        if (!CreateImage(offscreen, color_format,
+                         vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
+                         vk::ImageAspectFlagBits::eColor, vk::SampleCountFlagBits::e1,
+                         "VR overlay in eyes")) return false;
+        swapchain_images.push_back(offscreen.image);
+        swapchain_views.push_back(offscreen.view);
+        return true;
+    }
 
     XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
@@ -319,6 +351,7 @@ bool VrOverlayRenderer::CreateBuffer(BufferResource& out, vk::DeviceSize size,
     out.buffer = vk::Buffer{buffer};
     out.allocation = allocation;
     out.mapped = alloc_info.pMappedData;
+    memory_bytes += alloc_info.size;
     if (host_visible && out.mapped == nullptr) {
         return Fail("host buffer is not mapped");
     }
@@ -327,12 +360,15 @@ bool VrOverlayRenderer::CreateBuffer(BufferResource& out, vk::DeviceSize size,
 
 void VrOverlayRenderer::DestroyBuffer(BufferResource& buffer) {
     if (buffer.buffer) {
+        VmaAllocationInfo info{};
+        vmaGetAllocationInfo(dev.allocator, buffer.allocation, &info);
+        memory_bytes -= info.size;
         vmaDestroyBuffer(dev.allocator, static_cast<VkBuffer>(buffer.buffer), buffer.allocation);
     }
     buffer = {};
 }
 
-bool VrOverlayRenderer::CreateTargets() {
+bool VrOverlayRenderer::CreateTargets(const VrOverlayRenderer* reuse) {
     const auto limits = dev.physical_device.getProperties().limits;
     // Depth: D32 float (reversed Z) when it is a depth attachment format, else D16.
     for (const vk::Format f : {vk::Format::eD32Sfloat, vk::Format::eD16Unorm}) {
@@ -359,6 +395,20 @@ bool VrOverlayRenderer::CreateTargets() {
         image_samples(depth_format, vk::ImageUsageFlagBits::eDepthStencilAttachment |
                                         vk::ImageUsageFlagBits::eTransientAttachment);
     samples = PickSamples(supported, settings.msaa);
+    if (reuse && reuse->dev.queue == dev.queue && reuse->eye_extent == eye_extent &&
+        reuse->color_format == color_format && reuse->depth_format == depth_format &&
+        reuse->samples == samples) {
+        msaa_color = reuse->msaa_color;
+        depth = reuse->depth;
+        borrowed_targets = true;
+        for (const auto* image : {&msaa_color, &depth}) {
+            if (!image->allocation) continue;
+            VmaAllocationInfo info{};
+            vmaGetAllocationInfo(dev.allocator, image->allocation, &info);
+            shared_memory_bytes += info.size;
+        }
+        return true;
+    }
     if (samples != vk::SampleCountFlagBits::e1 &&
         !CreateImage(msaa_color, color_format,
                      vk::ImageUsageFlagBits::eColorAttachment |
@@ -812,13 +862,22 @@ void VrOverlayRenderer::Shutdown() {
             dev.device.destroyCommandPool(command_pool);
         }
         DestroyBuffer(uniforms);
-        DestroyBuffer(vertices);
-        DestroyBuffer(indices);
-        DestroyImage(msaa_color);
-        DestroyImage(depth);
-        for (const vk::ImageView view : swapchain_views) {
-            dev.device.destroyImageView(view);
+        if (!borrowed_meshes) {
+            DestroyBuffer(vertices);
+            DestroyBuffer(indices);
         }
+        if (!borrowed_targets) {
+            DestroyImage(msaa_color);
+            DestroyImage(depth);
+        }
+        vertices = {};
+        indices = {};
+        msaa_color = {};
+        depth = {};
+        for (const vk::ImageView view : swapchain_views) {
+            if (view != offscreen.view) dev.device.destroyImageView(view);
+        }
+        DestroyImage(offscreen);
     }
     if (swapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(swapchain);
@@ -838,6 +897,8 @@ void VrOverlayRenderer::Shutdown() {
     recorded = want_layer = frame_open = false;
     initialized = false;
     memory_bytes = 0;
+    shared_memory_bytes = 0;
+    borrowed_meshes = borrowed_targets = false;
     items.clear();
 }
 
@@ -1022,6 +1083,17 @@ void VrOverlayRenderer::EndFrame() {
         waited = true;
     }
 
+    PrepareDraw(slot_index);
+
+    Record(slot, slot_index);
+    if (failed) {
+        return;
+    }
+    recorded = true;
+    want_layer = true;
+}
+
+void VrOverlayRenderer::PrepareDraw(u32 slot_index) {
     O::SortDrawItems(items);
     std::array<O::Mat4, 2> view_proj;
     std::array<O::Vec3, 2> eye_pos;
@@ -1055,23 +1127,29 @@ void VrOverlayRenderer::EndFrame() {
     vmaFlushAllocation(dev.allocator, uniforms.allocation, slot_index * uniform_stride,
                        sizeof(constants));
 
-    Record(slot, slot_index);
-    if (failed) {
-        return;
-    }
-    recorded = true;
-    want_layer = true;
 }
 
-void VrOverlayRenderer::Record(Slot& slot, u32 index) {
-    const vk::CommandBuffer cmd = slot.cmd;
-    if (cmd.reset() != vk::Result::eSuccess ||
+bool VrOverlayRenderer::RecordOffscreen(vk::CommandBuffer cmd, u32 index, const EyeViews& eyes,
+                                       std::span<const O::DrawItem> draw_items) {
+    if (!IsActive() || !settings.offscreen || index >= slots.size()) return false;
+    pending = eyes;
+    items.assign(draw_items.begin(), draw_items.end());
+    lighting_set = false;
+    knee_active = false;
+    PrepareDraw(index);
+    Record(slots[index], index, cmd);
+    return !failed;
+}
+
+void VrOverlayRenderer::Record(Slot& slot, u32 index, vk::CommandBuffer external) {
+    const vk::CommandBuffer cmd = external ? external : slot.cmd;
+    if (!external && (cmd.reset() != vk::Result::eSuccess ||
         cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}) !=
-            vk::Result::eSuccess) {
+            vk::Result::eSuccess)) {
         Disable("command buffer begin");
         return;
     }
-    if (query_pool) {
+    if (query_pool && !external) {
         cmd.resetQueryPool(query_pool, index * 2, 2);
         cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, query_pool, index * 2);
     }
@@ -1206,10 +1284,10 @@ void VrOverlayRenderer::Record(Slot& slot, u32 index) {
     cmd.endRendering();
     // The resolve (or the direct render) leaves the swapchain image in COLOR_ATTACHMENT_OPTIMAL,
     // the layout XR_KHR_vulkan_enable expects at release.
-    if (query_pool) {
+    if (query_pool && !external) {
         cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, query_pool, index * 2 + 1);
     }
-    if (cmd.end() != vk::Result::eSuccess) {
+    if (!external && cmd.end() != vk::Result::eSuccess) {
         Disable("command buffer end");
     }
 }
@@ -1287,9 +1365,10 @@ VrOverlayRenderer::Stats VrOverlayRenderer::TakeStats() {
 }
 
 std::string VrOverlayRenderer::Describe() const {
-    return fmt::format("{}x{} x2, {}, {}x MSAA, depth {}, {} MB", eye_extent.width,
+    return fmt::format("{}x{} x2, {}, {}x MSAA, depth {}, {} MiB owned, {} MiB shared", eye_extent.width,
                        eye_extent.height, vk::to_string(color_format), static_cast<u32>(samples),
-                       vk::to_string(depth_format), memory_bytes / (1024 * 1024));
+                       vk::to_string(depth_format), memory_bytes / (1024 * 1024),
+                       shared_memory_bytes / (1024 * 1024));
 }
 
 } // namespace Vulkan

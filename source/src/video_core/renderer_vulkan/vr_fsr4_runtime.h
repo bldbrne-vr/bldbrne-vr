@@ -1,4 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #pragma once
 #include <filesystem>
 #include <memory>
@@ -9,7 +14,9 @@ namespace Vulkan {
 class Instance;
 class VrFsr4Runtime {
 public:
-    VrFsr4Runtime() = default;
+    explicit VrFsr4Runtime(VR::Graphics::Upscaler provider = VR::Graphics::Upscaler::Fsr4)
+        : provider(provider) {}
+    VR::Graphics::Upscaler Provider() const { return provider; }
     ~VrFsr4Runtime();
     VrFsr4Runtime(const VrFsr4Runtime&) = delete;
     VrFsr4Runtime& operator=(const VrFsr4Runtime&) = delete;
@@ -34,6 +41,7 @@ public:
 
 private:
     bool Load();
+    const VR::Graphics::Upscaler provider;
     void* module{};
     const VrFsr4Api* api{};
     std::unique_ptr<VrFsr4Session> session;

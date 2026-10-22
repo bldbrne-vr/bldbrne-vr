@@ -1,6 +1,15 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+#include "common/render_diagnostic.h"
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include "core/vr/graphics_settings.h"
+#include "core/vr/eye_distance.h"
+#include "core/vr/eye_history.h"
 #include "video_core/renderer_vulkan/openxr_presenter.h"
 
 #include <algorithm>
@@ -28,35 +37,35 @@
 #include <SDL3/SDL_stdinc.h>
 #include <vk_mem_alloc.h>
 #include "common/logging/log.h"
-#include "common/rdtsc.h"
+#include "common/slow_scope.h"
+#include "common/sync_log.h"
 #include "common/singleton.h"
+#include "common/rdtsc.h"
 #include "common/thread.h"
 #include "core/libraries/pad/pad.h"
 #include "core/vr/bb_weapons.h"
 #include "core/vr/belt_vial.h"
-#include "core/vr/bloodborne_enemy_bars.h"
 #include "core/vr/bloodborne_facing.h"
 #include "core/vr/bloodborne_heal.h"
+#include "core/vr/bloodborne_iframes.h"
 #include "core/vr/bloodborne_motion.h"
 #include "core/vr/bloodborne_tuning.h"
 #include "core/vr/body_channel.h"
+#include "core/vr/weapon_hand_filter.h"
+#include "core/vr/weapon_handling.h"
 #include "core/vr/body_feedback.h"
 #include "core/vr/body_settings.h"
 #include "core/vr/body_solver.h"
-#include "core/vr/bow.h"
-#include "core/vr/bow_channel.h"
-#include "core/vr/bow_pose.h"
 #include "core/vr/combat_channel.h"
 #include "core/vr/daze.h"
 #include "core/vr/exit_sequence.h"
 #include "core/vr/eye_fov_cache.h"
 #include "core/vr/feature_cost.h"
 #include "core/vr/grip_adjust.h"
-#include "core/vr/grip_preview.h"
 #include "core/vr/gun_aim.h"
+#include "core/vr/gun_settings.h"
 #include "core/vr/gun_reload.h"
 #include "core/vr/gun_reload_audio.h"
-#include "core/vr/gun_settings.h"
 #include "core/vr/haptic_output.h"
 #include "core/vr/held_item.h"
 #include "core/vr/hit_direction.h"
@@ -64,91 +73,71 @@
 #include "core/vr/hit_vignette.h"
 #include "core/vr/inframe.h"
 #include "core/vr/inject_hold.h"
-#include "core/vr/interaction_module.h"
-#include "core/vr/interaction_body_feedback.h"
-#include "core/vr/interaction_quick.h"
-#include "core/vr/interaction_ranged.h"
-#include "core/vr/interaction_fire.h"
-#include "core/vr/interaction_gun.h"
-#include "core/vr/interaction_gun_delivery.h"
-#include "core/vr/interaction_saw.h"
-#include "core/vr/interaction_blade.h"
-#include "core/vr/interaction_melee.h"
-#include "core/vr/interaction_melee_feedback.h"
-#include "core/vr/interaction_visceral.h"
-#include "core/vr/interaction_pose.h"
-#include "core/vr/interaction_shoulder.h"
-#include "core/vr/interaction_grip.h"
-#include "core/vr/interaction_weapon_input.h"
-#include "core/vr/interaction_roll.h"
-#include "core/vr/interaction_loco.h"
-#include "core/vr/interaction_lean.h"
-#include "core/vr/interaction_lever.h"
-#include "core/vr/interaction_holster.h"
-#include "core/vr/interaction_packets.h"
-#include "core/vr/interaction_requests.h"
-#include "core/vr/interaction_two_hand.h"
-#include "core/vr/lamp_channel.h"
 #include "core/vr/lean_dodge.h"
 #include "core/vr/left_locomotion.h"
-#include "core/vr/lever_acquisition.h"
-#include "core/vr/lever_channel.h"
-#include "core/vr/lever_settings.h"
-#include "core/vr/lever_space.h"
 #include "core/vr/live_tune.h"
+#include "core/vr/grip_preview.h"
 #include "core/vr/melee_settings.h"
 #include "core/vr/melee_window.h"
-#include "core/vr/menu_exit_input.h"
 #include "core/vr/music_box.h"
-#include "physical_interactions/music_feedback_policy.h"
 #include "core/vr/player_body.h"
 #include "core/vr/pose_channel.h"
 #include "core/vr/pose_gestures.h"
 #include "core/vr/quick_channel.h"
 #include "core/vr/quick_items.h"
+#include "core/vr/summon_bell.h"
 #include "core/vr/quick_settings.h"
 #include "core/vr/quick_use_audio.h"
+#include "core/vr/bell_audio.h"
 #include "core/vr/render_steady.h"
 #include "core/vr/render_tilt.h"
 #include "core/vr/roll_chord.h"
+#include "core/vr/quick_turn.h"
 #include "core/vr/session_exit.h"
 #include "core/vr/session_pause.h"
 #include "core/vr/shoulder_switch.h"
 #include "core/vr/bloodborne_shoulder.h"
-#include "core/vr/sparks.h"
 #include "core/vr/stick_click.h"
 #include "core/vr/y_menu.h"
 #include "core/vr/swing_detector.h"
 #include "core/vr/thumb_layout.h"
 #include "core/vr/transform.h"
 #include "core/vr/transform_settings.h"
-#include "core/vr/trick_weapons.h"
+#include "core/vr/lever_channel.h"
+#include "core/vr/lever_settings.h"
+#include "core/vr/lever_acquisition.h"
+#include "core/vr/lever_space.h"
 #include "core/vr/two_hand_channel.h"
-#include "core/vr/two_hand_motion.h"
 #include "core/vr/two_hand_settings.h"
+#include "core/vr/two_hand_motion.h"
 #include "core/vr/ui_conditions.h"
 #include "core/vr/ui_layout.h"
 #include "core/vr/ui_rest_curve.h"
+#include "core/vr/bloodborne_enemy_bars.h"
 #include "core/vr/vial_drain.h"
 #include "core/vr/vial_zones.h"
 #include "core/vr/visceral_channel.h"
-#include "core/vr/visceral_pull.h"
 #include "core/vr/visceral_thrust.h"
+#include "core/vr/visceral_pull.h"
+#include "core/vr/bow.h"
+#include "core/vr/bow_channel.h"
+#include "core/vr/bow_pose.h"
+#include "core/vr/trick_weapons.h"
+#include "core/vr/sparks.h"
+#include "core/vr/weapon_wall.h"
 #include "core/vr/vital_color.h"
 #include "core/vr/vitals.h"
 #include "core/vr/vitals_channel.h"
 #include "core/vr/vr_page_art.h"
 #include "core/vr/vr_page_geom.h"
 #include "core/vr/vr_page_runtime.h"
-#include "core/vr/weapon_wall.h"
+#include "core/vr/menu_exit_input.h"
+#include "core/vr/lamp_channel.h"
 #include "core/vr/whip_moves.h"
 #include "core/vr/whip_settings.h"
 #include "core/vr/whip_spin.h"
 #include "core/vr/xr_bindings.h"
-#include "imgui/notifications_layer.h"
 #include "input/controller.h"
-#include "physical_interactions/music_packets.h"
-#include "physical_interactions/pose_packet.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -159,6 +148,7 @@
 #include "video_core/renderer_vulkan/vr_eye_upscale.h"
 #include "video_core/renderer_vulkan/vr_late_warp.h"
 #include "video_core/renderer_vulkan/vr_overlay.h"
+#include "video_core/renderer_vulkan/vr_ui_compose.h"
 #include "video_core/renderer_vulkan/vr_page_layer.h"
 #include "video_core/renderer_vulkan/vr_perf.h"
 #include "video_core/renderer_vulkan/vr_stereo_queue.h"
@@ -176,6 +166,7 @@
 #ifdef ENABLE_OPENXR
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+#include "video_core/renderer_vulkan/vr_benchmark_refresh.h"
 #endif
 
 namespace Vulkan {
@@ -191,7 +182,7 @@ std::atomic_bool g_openxr_requested{false};
 // RTX 5080 (424 regions at 1696 px, 500 at 2000 px: 0.72-0.86 ms of its 0.79-1.0 ms per frame); the
 // draw ~0.02 ms. The draw samples the atlas as that driver's blit does (the corners' texcoords =
 // texel * 1 / size rounded on the host, interpolated, linear, clamp to edge) and wrote the same
-// bytes as the blits for random atlases at 14 sizes (scratchpad uibench); here it is used once a
+// bytes as the blits for random atlases at 14 sizes (offline analysis); here it is used once a
 // self-test on this GPU found the same for this atlas (UiWarpCheck), else the blits stay.
 // FAST_GPU_UI_COPY_VERIFY=1: every few frames the drawn frame's blits too, compared (LOG_ERROR).
 const bool g_ui_warp_draw = [] {
@@ -1031,21 +1022,6 @@ struct HapticPattern {
     }
 };
 
-// Translate an already validated neutral intent to the OpenXR playback backend.
-HapticPattern PlaybackPattern(const PiHapticPatternIntent& intent) {
-    HapticPattern pattern{};
-    pattern.priority = intent.priority;
-    pattern.test = (intent.flags & PI_HAPTIC_TEST) != 0;
-    pattern.own = (intent.flags & PI_HAPTIC_OWN) != 0;
-    pattern.impact = (intent.flags & PI_HAPTIC_IMPACT) != 0;
-    pattern.count = std::min<u32>(intent.count, static_cast<u32>(pattern.segments.size()));
-    for (u32 i = 0; i < pattern.count; ++i) {
-        const auto s = intent.segment[i];
-        pattern.segments[i] = {s.from, s.to, s.seconds};
-    }
-    return pattern;
-}
-
 HapticPattern Tick(float amplitude, float ms, s32 priority = 1) {
     HapticPattern pattern{};
     pattern.priority = priority;
@@ -1064,6 +1040,24 @@ HapticPattern Repeat(u32 times, float amplitude, float ms, float gap_ms, s32 pri
     return pattern;
 }
 
+// A combat shape (core/vr/haptic_output.h Haptics::Combat: the hierarchy) as a pattern.
+// `guard_ms` (a landed melee hit's impact: Combat::ImpactGuardMs): padded with silence to that
+// length, an impact (only another impact replaces it) that owns the hand all along.
+HapticPattern CombatPattern(const VR::Haptics::Combat::Shape& shape, s32 priority, bool own,
+                            float guard_ms = 0.0f) {
+    namespace HC = VR::Haptics::Combat;
+    HapticPattern pattern{};
+    pattern.priority = priority;
+    pattern.own = own || guard_ms > 0.0f;
+    pattern.impact = guard_ms > 0.0f;
+    std::array<HC::Segment, 8> segments{};
+    const int count = HC::ShapeSegments(shape, guard_ms, segments.data());
+    for (int i = 0; i < count; ++i) {
+        pattern.Ramp(segments[i].from, segments[i].to, segments[i].ms);
+    }
+    return pattern;
+}
+
 // Heavy attack: a hard hit that decays, clearly different from the light tick.
 HapticPattern HeavyThunk() {
     HapticPattern pattern{};
@@ -1071,7 +1065,7 @@ HapticPattern HeavyThunk() {
     return pattern.Pulse(0.85f, 35.0f).Ramp(0.45f, 0.0f, 90.0f);
 }
 
-// Blood Vial injected: one strong THUMP on both hands the moment the game takes it (the user's
+// Blood Vial injected: one strong THUMP on both hands the moment the game takes it (the tester's
 // 2026-10-06 test: "a strong vibration", as Half-Life: Alyx's syringe; it replaced a soft double
 // pulse). 70 ms flat, then nothing: InjectThumpStab on the stabbing (left) hand, 1.0;
 // InjectThumpOther on the other, 0.85 (about 0.9 after haptic_floor). Single and short, so it
@@ -1092,6 +1086,7 @@ HapticPattern InjectThump(float amplitude) {
 // going in is a stab are core/vr/vial_zones.h's (UpdateVialGeometry, UpdateVial, UpdateQuickStab).
 // The swings wait while the armed vial reaches for the weapon arm (VialReaching): for this long
 // after the gate last said so (s).
+constexpr float VialApproachAge = 0.25f;
 // Near misses (an entry into a zone that was no stab) in the log: at most one line this often, and
 // this many in a session.
 constexpr s64 VialNearLogNs = 250'000'000;
@@ -1103,23 +1098,83 @@ constexpr float HeldGunTrigger = 0.2f;
 constexpr float HeldGunHold = 1.0f;
 constexpr s64 HeldStatusMaxAgeNs = 250'000'000;
 
+// Motion controls without the grip clutch (right_grip=transform, SwingGate): swings stay off this
+// long after a context switch, and once a reason to keep them off is gone the weapon hand must be
+// slower than SwingQuietSpeed (relative to the head) for SwingQuietTime. The hand counts as at the
+// face within FaceEnter of the eyes (out again past FaceExit) unless it is behind them, once it is
+// slower there than swing_face_enter_speed (VR::Melee::HandAtFace: a swing passing the face is no
+// hand at the headset).
+constexpr float SwingContextHold = 0.3f;
+constexpr float SwingQuietSpeed = 1.0f; // m/s
+constexpr float SwingQuietTime = 0.1f;
+constexpr float FaceEnter = 0.20f; // m
+constexpr float FaceExit = 0.26f;
+constexpr float FaceBehind = -0.05f; // m along the view: further back is a wind-up, not the face
+// The weapon hand leaving the face at least this fast away from the head is a strike from an
+// overhead wind-up (lowering it from the headset is slower): swings are on at once.
+constexpr float FaceStrikeSpeed = 2.0f; // m/s
 // right_grip=transform: a right-grip squeeze that starts with the weapon hand faster than this
 // (relative to the head), a swing being decided or open, or within GripAfterAttack of an attack is
 // a flick (transform_flick: the weapon-only transform snaps the weapon into its new form
 // mid-stroke, and physical melee makes that stroke the transform attack). A weapon on L1 (or
 // transform_flick=0) ignores such a squeeze until released: a reflex clench at the hit never plays
 // the game's whole-body transform.
+constexpr float GripSwingSpeed = 1.5f; // m/s
 constexpr float GripAfterAttack = 0.4f;
 // weapon_wall: a strike's thud and a swing's own wall clank this close together are one feel.
+constexpr s64 WallThudMergeNs = 120'000'000;
 // melee=physical (UpdatePhysicalMelee): the blade's far end is this far along the blade from the
 // grip, and the game gets its fastest speed of the last MeleeTipWindowS (the damage by speed).
 constexpr float MeleeBladeM = 0.8f;
+// A plunge with the blade held down (UpdatePhysicalMelee): fallen this far, the blade this close to
+// straight down (cos of 45 degrees), the fist no lower than this below the eyes (held up to drive
+// it down: an arm hanging relaxed is no plunge).
+constexpr float PlungeDownM = 0.5f;
+constexpr float PlungeDownCos = 0.7f;
+constexpr float PlungeDownFistM = 0.45f;
+constexpr float MeleeTipWindowS = 0.06f;
 // Right stick click (motion): released within this long, the stick never pushed from the centre
 // past the switch threshold, it is a lock-on (R3); held longer, or with a push, it only selects
 // weapons with the stick (left / right, once held R3SwitchSeconds), and a release that does
 // neither gets the deny double tick.
 constexpr float R3TapSeconds = 0.5f;
 constexpr float R3SwitchSeconds = 0.15f;
+
+// Heal vignette (heal_vignette): in over HealFadeIn, held HealHold, out over HealFadeOut.
+constexpr float HealFadeIn = 0.15f;
+constexpr float HealHold = 0.2f;
+constexpr float HealFadeOut = 1.2f;
+
+// Hit vignette (hit_vignette): in over HitFadeIn, held HitHold, out over hit_vignette_fade_ms, at
+// HitPeakMin .. 1 of hit_vignette_strength by the share of max HP the hit took (1 from
+// HitFullFraction); the ring (its clear inside hit_vignette_inner, its profile's power: only the
+// very edges) is core/vr/hit_vignette.h's, the same for the flash, its wedge and the hit-stun hold.
+constexpr float HitFadeIn = 0.06f;
+constexpr float HitHold = 0.04f;
+constexpr float HitPeakMin = 0.7f;
+constexpr float HitFullFraction = 0.25f;
+// Directional hit feedback (hit_vignette_directional, core/vr/hit_direction.h): the flash is a
+// wedge of the ring toward the blow (its profile squared instead of cubed, VR::HitVig); the
+// view's heading is taken from first-person frames at most HitDirViewAgeNs old.
+// hit_vignette_fit: the ring fitted to what the headset shows (VignetteVisual::fit_inner), so the
+// flash reaches its full strength at the visible edge in every direction (the old degree ring
+// ended 12 degrees beyond a Quest 3's top edge: 7% of it there, 18% directional, and a blow from
+// ahead points the wedge up).
+constexpr s64 HitDirViewAgeNs = 250'000'000;
+
+// The low-HP heartbeat (hud_vitals=wrist, vitals_heartbeat; core/vr/vitals.h): a lub (0.35, 40 ms)
+// and 150 ms after it a dub (0.28, 35 ms) in the left controller, the heart's side; the lowest
+// priority (every combat pattern overrides it) and gentle: with haptic_floor 0.3 it plays at
+// 0.55 / 0.50, under the gun's recoil at 1.0.
+HapticPattern HeartbeatPulse(float gain) {
+    const VR::Vitals::BeatShape shape{};
+    HapticPattern pattern{};
+    pattern.priority = 0;
+    const float g = std::clamp(gain, 0.0f, 2.0f);
+    return pattern.Pulse(std::min(shape.lub * g, 1.0f), shape.lub_s * 1e3f)
+        .Gap((shape.dub_at_s - shape.lub_s) * 1e3f)
+        .Pulse(std::min(shape.dub * g, 1.0f), shape.dub_s * 1e3f);
+}
 
 // One event slot per hand: a newer event wins unless a higher-priority one is playing.
 struct HandHaptics {
@@ -1277,6 +1332,7 @@ struct OpenXRPresenter::Impl {
         XrSwapchain handle{XR_NULL_HANDLE};
         std::vector<XrSwapchainImageVulkanKHR> images;
         std::vector<bool> initialized;
+        std::vector<vk::UniqueImageView> compose_views;
         bool acquired{false}; // acquired (and possibly waited) but not yet released
         bool waited{false};   // ... and waited: never wait twice (a pair's other eye may time out)
         u32 index{0};
@@ -1461,6 +1517,14 @@ struct OpenXRPresenter::Impl {
         InitOverlay();
         InitLateWarp();
         InitUiWarpDraw();
+        if (VR::GetSettings().ui_compose_eyes || VR::GetSettings().overlay_compose_eyes) {
+            const auto format = SrgbVariant(frame_format);
+            if (std::ranges::find(supported_formats, static_cast<s64>(format)) != supported_formats.end()) {
+                compose_failed = !ui_compose.Init(instance.GetDevice(),
+                    instance.GetGraphicsQueueFamilyIndex(),format,instance.GetPhysicalDevice());
+                if (compose_failed) LOG_WARNING(Render_Vulkan,"VR compose unavailable; using layers");
+            }
+        }
         ready = true;
         VR::SetUiLayerAvailable(VR::GetSettings().ui_layer == 1);
         frame_thread = std::jthread([this](std::stop_token token) { FrameLoop(token); });
@@ -1472,7 +1536,7 @@ struct OpenXRPresenter::Impl {
 
     // The process is ending (core/vr/exit_sequence.h; emulator.cpp EndAfterClose, on the exit's
     // own thread with a time limit): OpenXR ended in order so the runtime is told the application
-    // left before the process ends (the user's 2026-10-09 log: Quit in the Meta Link menu,
+    // left before the process ends (the tester's 2026-10-09 log: Quit in the Meta Link menu,
     // EXITING, the play time and the shader cache written - then the process never ended: the
     // runtime's client DLL never let go of a session nobody destroyed). The frame thread stops (it
     // polls the runtime, waits and submits frames); Scheduler::submit_mutex and xr_mutex are then
@@ -1491,15 +1555,7 @@ struct OpenXRPresenter::Impl {
             frame_thread.request_stop();
             SetSessionPause(false);
             frame_thread.join();
-            quick_runtime.Withdraw();
-            fire_runtime.Withdraw();
-            gun_delivery.Withdraw();
         }
-        if (native_transport_serial)
-            VR::Combat::CancelTransformPull(native_transport_serial);
-        // The sole interaction producer has stopped. Untaken guest work can be
-        // withdrawn; already-taken work owns only host data and may finish safely.
-        if (dll_inject_request.Id() != 0) VR::CancelPendingInject();
         const auto t1 = Clock::now();
         // never unlocked: the process ends (the runtime's own queue's lock too: no acquire,
         // release or wait reaches it again)
@@ -1550,17 +1606,12 @@ struct OpenXRPresenter::Impl {
             frame_thread.request_stop();
             SetSessionPause(false);
             frame_thread.join();
-            quick_runtime.Withdraw();
-            fire_runtime.Withdraw();
-            gun_delivery.Withdraw();
         }
-        if (native_transport_serial)
-            VR::Combat::CancelTransformPull(native_transport_serial);
-        // The sole interaction producer has stopped. Untaken guest work can be
-        // withdrawn; already-taken work owns only host data and may finish safely.
-        if (dll_inject_request.Id() != 0) VR::CancelPendingInject();
         if (trace_file != nullptr) {
             std::fclose(trace_file);
+        }
+        if (hand_filter_trace_file != nullptr) {
+            std::fclose(hand_filter_trace_file);
         }
         if (session != XR_NULL_HANDLE) {
             // vkDeviceWaitIdle needs every queue's lock: the present queue's too.
@@ -1574,6 +1625,8 @@ struct OpenXRPresenter::Impl {
                             vk::to_string(idle_result));
             }
         }
+        ui_compose.Shutdown(); // retire external commands before borrowed overlay resources
+        overlay_in_eye.Shutdown();
         overlay.Shutdown(); // its swapchain before the session (the member's destructor is later)
         page_layer.Shutdown();
         VR::Graphics::SetHeadset(0, 0, 0);
@@ -1596,6 +1649,7 @@ struct OpenXRPresenter::Impl {
         }
         for (auto& chain : ui_chains) {
             if (chain.handle != XR_NULL_HANDLE) {
+                chain.compose_views.clear();
                 xrDestroySwapchain(chain.handle);
             }
             chain = {};
@@ -1620,234 +1674,7 @@ struct OpenXRPresenter::Impl {
         }
     }
 
-    bool PhysicalVialEnabled() const {
-        return !interaction_dll_requested || InteractionReady();
-    }
-
-    void InitInteractions() {
-        interaction_dll_requested = VR::Interactions::DllRequested();
-        if (!interaction_dll_requested) return;
-        interaction_module.EnableFaultBroadcast();
-        const bool valid = VR::Interactions::SelectedBackend() == VR::Interactions::Backend::Dll;
-        const bool loaded = valid && interaction_module.LoadBesideExecutable();
-        if(!loaded)VR::Interactions::ProcessFaultLatch().Trip();
-        const std::string message = valid ? interaction_module.Diagnostic()
-            : "VR_PHYSICAL_INTERACTIONS must be legacy or dll";
-        // Selection is by requested mode, never by successful loading. Binding a failed
-        // module makes every facade fail closed instead of entering a legacy controller.
-        interaction_dll_fault = !loaded || interaction_module.Faulted();
-        {
-            quick_runtime.Bind(interaction_module, interaction_dll_fault);
-            ranged_runtime.Bind(interaction_module, interaction_dll_fault, recenter_serial);
-            fire_runtime.Bind(interaction_module, interaction_dll_fault);
-            gun_runtime.Bind(interaction_module, interaction_dll_fault);
-            gun_delivery.Bind(interaction_module, interaction_dll_fault);
-            saw_runtime.Bind(interaction_module, interaction_dll_fault);
-            blade_runtime.Bind(interaction_module, interaction_dll_fault);
-            melee_runtime.Bind(interaction_module, interaction_dll_fault);
-            melee_feedback_runtime.Bind(interaction_module, interaction_dll_fault);
-            visceral_runtime.Bind(interaction_module,interaction_dll_fault);
-            pose_recognizer.Bind(interaction_module,interaction_dll_fault);
-            shoulder_runtime.Bind(interaction_module,interaction_dll_fault);
-            grip_adjust.Bind(interaction_module,interaction_dll_fault);
-            roll_chord.Bind(interaction_module,interaction_dll_fault);
-            loco_runtime.Bind(interaction_module,interaction_dll_fault);
-            whip_transform_hold.Bind(interaction_module,interaction_dll_fault);
-            lean.Bind(interaction_module,interaction_dll_fault);
-            physical_lever_runtime.Bind(interaction_module,interaction_dll_fault);
-            holster_runtime.Bind(interaction_module,interaction_dll_fault);
-            body_feedback_runtime.Bind(interaction_module,interaction_dll_fault);
-            two_hand_runtime.Bind(interaction_module, interaction_dll_fault, reset_requested, recenter_serial);
-        }
-        if (loaded) {
-            LOG_INFO(Render_Vulkan, "{}", message);
-        } else {
-            LOG_ERROR(Render_Vulkan, "{}; physical interactions disabled, basic controls remain available; X uses the game's vial", message);
-            shadNotifications::QueueNotification(message + "; X uses the game's vial",
-                15.0f, shadNotifications::position::TopLeft);
-        }
-    }
-
-    void ResetInteractionContext() {
-        if (!interaction_module.Available()) {
-            CancelNativeTransform();
-            return;
-        }
-        interaction_module.Reset(VR::Body::SteadyNowNs());
-        quick_runtime.Service();
-        fire_runtime.Service();
-        gun_delivery.Service();
-        CancelNativeTransform();
-        inject_hold = 0.0f;
-        VR::PublishVialDrain(0);
-        if (inject_waiting) VR::CancelPendingInject();
-    }
-
-    bool UsingInteractionDll() const {
-        return interaction_dll_requested;
-    }
-    bool InteractionReady() const {
-        return interaction_module.Available() && !interaction_dll_fault && !interaction_module.Faulted();
-    }
-    bool StopFailedInteraction() {
-        if (InteractionReady()) return false;
-        if (!interaction_dll_fault) reset_requested = true;
-        interaction_dll_fault = true;
-        interaction_module.ReportFault();
-        return true;
-    }
-
-    PiVialFeedbackInput VialFeedbackPacket(uint32_t operation, s64 now) const {
-        PiVialFeedbackInput in{};
-        in.size = sizeof(in);
-        in.operation = operation;
-        in.session = interaction_module.Session();
-        in.now_ns = now;
-        in.space = recenter_serial;
-        return in;
-    }
-
-    bool CallVialFeedback(const PiVialFeedbackInput& in, PiVialFeedbackOutput& out) {
-        out = {};
-        out.size = sizeof(out);
-        if (StopFailedInteraction()) {
-            dll_vial_feedback = {};
-            inject_hold = 0;
-            VR::PublishVialDrain(0);
-            return false;
-        }
-        const auto status = interaction_module.VialFeedback(in, out);
-        if (status != PI_OK) {
-            interaction_dll_fault = true;
-            reset_requested = true;
-            ResetInteractionContext();
-            DisarmVial();
-            LOG_ERROR(Render_Vulkan, "Physical vial feedback rejected operation {} ({}); disabled",
-                      in.operation, status);
-            shadNotifications::QueueNotification("Physical vial feedback failed; X uses the game's vial",
-                15.0f, shadNotifications::position::TopLeft);
-            return false;
-        }
-        if (out.haptic_count > 2 || out.confirmation_event > PI_VIAL_CONFIRM_DENIED ||
-            ((out.haptic_count || out.confirmation_event) &&
-             (in.operation != PI_FEEDBACK_FINISH || out.acknowledgement != PI_ACK_CURRENT))) {
-            interaction_module.ReportFault();
-            StopFailedInteraction();
-            return false;
-        }
-        for (uint32_t i = 0; i < out.haptic_count; ++i) {
-            if (!PhysicalInteractions::ValidHapticIntent(out.haptics[i])) {
-                interaction_module.ReportFault();
-                StopFailedInteraction();
-                return false;
-            }
-        }
-        dll_vial_feedback = out;
-        inject_hold = out.visible_s; // render/arbitration snapshot; the DLL owns its countdown
-        return true;
-    }
-
-    void PublishDllVialDrain() {
-        const auto& state = dll_vial_feedback;
-        VR::PublishVialDrain(state.drain_on
-            ? VR::Held::PackDrain({state.drain_start_ns / 1'000'000, state.drain_ms}) : 0);
-    }
-
-    bool BlendInjectPose(VR::Body::Vec3& p, VR::Body::Quat& q, u32 space, s64 now) {
-        if (!UsingInteractionDll()) return inject_hands[0].Blend(p, q, space, now);
-        auto in = VialFeedbackPacket(PI_FEEDBACK_BLEND, now);
-        in.space = space;
-        VR::Body::TrackedHand h{};
-        h.p = p; h.q = q; h.position_valid = h.orientation_valid = true;
-        in.hands[0] = PhysicalInteractions::PackHand(h);
-        PiVialFeedbackOutput out{};
-        if (!CallVialFeedback(in, out) || !(out.blend_mask & 1u)) return false;
-        const auto pose = PhysicalInteractions::UnpackHand(out.hands[0]);
-        p = pose.p; q = pose.q;
-        return true;
-    }
-
-    PiTrickInput TrickPacket(uint32_t operation) const {
-        PiTrickInput p{};
-        p.size = sizeof(p); p.operation = operation;
-        p.session = interaction_module.Session(); p.space = recenter_serial;
-        p.now_ns = VR::Body::SteadyNowNs(); p.family = RightFamily(); p.form_b = RightFormB();
-        const auto& settings = VR::Tricks::GetTrickSettings();
-        p.enabled = settings.hand_transform;
-        p.haptics = settings.haptics;
-        p.pull_m = settings.pull_m; p.cooldown_s = settings.charge_cooldown_s;
-        return p;
-    }
-
-    static void CopyTrickFrame(PiTrickInput& p, const VR::Tricks::Frame& f) {
-        const auto v = [](VR::Body::Vec3 a) { return PiVec3{a.x, a.y, a.z}; };
-        const auto hand = [&v](const VR::Tricks::Hand& h) {
-            PiHand a{};
-            a.p = v(h.p); a.v = v(h.v); a.grip = h.grip;
-            a.flags = (h.valid ? PI_POSITION_VALID : 0u) |
-                      (h.tracked ? PI_POSITION_TRACKED | PI_VELOCITY_VALID : 0u);
-            return a;
-        };
-        p.dt = f.dt; p.hands[0] = hand(f.left); p.hands[1] = hand(f.right);
-        p.head = v(f.head); p.forward = v(f.forward);
-        p.axis = v(f.axis); p.left_axis = v(f.left_axis);
-    }
-
-    bool CallTrick(const PiTrickInput& p, PiTrickOutput& out) {
-        out = {}; out.size = sizeof(out);
-        if (StopFailedInteraction()) return false;
-        const auto status = interaction_module.Trick(p, out);
-        bool valid_feedback = out.block_reason <= 6 && out.haptic_count <= 3 && std::isfinite(out.sustain_right) &&
-            out.sustain_right >= 0 && out.sustain_right <= 1 &&
-            std::isfinite(out.sustain_left) && out.sustain_left >= 0 && out.sustain_left <= 1;
-        for (u32 i = 0; valid_feedback && i < out.haptic_count; ++i)
-            valid_feedback = PhysicalInteractions::ValidHapticIntent(out.haptics[i]);
-        const bool recognized = status == PI_OK && valid_feedback && (!out.request_id ||
-            dll_trick_request.Begin(out.session, out.request_id, interaction_module.Session()));
-        if (!recognized) {
-            interaction_dll_fault = true;
-            reset_requested = true;
-            ResetInteractionContext();
-            LOG_ERROR(Render_Vulkan, "Physical trick interaction rejected operation {} ({}); reset requested",
-                      p.operation, status);
-            shadNotifications::QueueNotification("Physical weapon interaction failed; controls reset",
-                15.0f, shadNotifications::position::TopLeft);
-        }
-        return recognized;
-    }
-
-    void FinishTrick(bool accepted, bool blocked = false) {
-        if (!dll_trick_request.Id()) return;
-        auto p = TrickPacket(PI_TRICK_FINISH);
-        p.session = dll_trick_request.Session(); p.request_id = dll_trick_request.Id();
-        p.confirmed = accepted; p.submit_blocked = blocked;
-        PiTrickOutput out{};
-        if (CallTrick(p, out) && out.acknowledgement == PI_ACK_CURRENT) {
-            right_grip_ready = out.ready;
-            PlayInteractionHaptics(out);
-        }
-        dll_trick_request.Complete();
-    }
-
-    void ConsumeRightGrip() {
-        if (!UsingInteractionDll()) { right_grip.Consume(); return; }
-        auto p = TrickPacket(PI_TRICK_CONSUME);
-        PiTrickOutput out{};
-        CallTrick(p, out);
-        right_grip_ready = false;
-    }
-
-    void CancelRightCharge() {
-        if (!UsingInteractionDll()) { right_grip.CancelCooldown(); return; }
-        auto p = TrickPacket(PI_TRICK_CANCEL_CHARGE);
-        p.request_id = dll_charge_request;
-        PiTrickOutput out{};
-        CallTrick(p, out);
-    }
-
     bool CreateSession() {
-        InitInteractions();
-        BaselineDamageFeedback(feedback_initial_hits, feedback_initial_ranged);
         auto& runtime = Runtime();
         if (!runtime.Initialize() || !runtime.available) {
             LOG_ERROR(Render_Vulkan, "OpenXR session: runtime not available");
@@ -2031,7 +1858,7 @@ struct OpenXRPresenter::Impl {
               runtime.LoadFunction("xrRequestDisplayRefreshRateFB", request_refresh_rate))) {
             enumerate_refresh_rates = nullptr;
         }
-        LOG_INFO(
+        LOG_BENCHMARK_INFO(
             Render_Vulkan,
             "OpenXR session created (fovMutable {}; eye sizes recommended {}x{} / {}x{}, max "
             "{}x{} / {}x{}; largest swapchain {}x{}; formats:{})",
@@ -2399,6 +2226,12 @@ struct OpenXRPresenter::Impl {
                          ? "; the glow pass writes its alpha (SteamVR drops alpha-0 light)"
                          : "");
         }
+        if (s.overlay_compose_eyes && s.overlay) {
+            os.offscreen = true;
+            overlay_in_eye.Init(VrOverlayRenderer::FromInstance(instance, Scheduler::submit_mutex),
+                {Runtime().instance, Runtime().system_id, session, local_space,
+                 view_config, supported_formats, false}, os, &overlay);
+        }
     }
 
     // The late warp (vr.ini late_warp, renderer_vulkan/vr_late_warp.h): its pipelines compiled
@@ -2552,6 +2385,24 @@ struct OpenXRPresenter::Impl {
                         vk::to_string(frame_format));
         }
 
+        if (const char* forced = std::getenv("VR_XR_FORMAT")) {
+            const std::string_view requested{forced};
+            const s64 forced_format = requested == "rgba"
+                ? static_cast<s64>(VK_FORMAT_R8G8B8A8_SRGB)
+                : requested == "bgra" ? static_cast<s64>(VK_FORMAT_B8G8R8A8_SRGB) : 0;
+            if (forced_format && std::ranges::find(supported_formats, forced_format) !=
+                                     supported_formats.end()) {
+                swapchain_format = forced_format;
+                copy_compatible = swapchain_format == exact;
+                LOG_WARNING(Render_Vulkan, "OpenXR diagnostic VR_XR_FORMAT={}: using {}",
+                            requested, vk::to_string(static_cast<vk::Format>(swapchain_format)));
+            } else {
+                LOG_WARNING(Render_Vulkan,
+                            "OpenXR diagnostic VR_XR_FORMAT={} is invalid or unsupported; "
+                            "keeping the negotiated format", requested);
+            }
+        }
+
         for (u32 s = 0; s < PresentSwapchains; ++s) {
             auto& eye = swapchains[s];
             XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
@@ -2637,6 +2488,7 @@ struct OpenXRPresenter::Impl {
         }
         for (auto& eye : swapchains) {
             if (eye.handle != XR_NULL_HANDLE) {
+                eye.compose_views.clear();
                 xrDestroySwapchain(eye.handle);
             }
             eye = {};
@@ -3000,7 +2852,8 @@ struct OpenXRPresenter::Impl {
             overlay_grip_ok = {}; // drawn again once tracked
         }
         // The quick items' spin is the left grip's turn between two XR frames: none across this.
-        quick_motion_legacy.InvalidateOrientations();
+        quick_prev_q_valid = false;
+        quick_fresh_q_valid = false;
         // The camera tick's panel aim until Submit re-places the panel in the new space.
         VR::SetMenuPanelAim(false);
         screen_pose_valid = false; // placed in front again
@@ -3010,7 +2863,6 @@ struct OpenXRPresenter::Impl {
         hud_anchor.valid = false;
         reset_requested = true;
         recenter_serial = VR::ShiftTrackingSpace(shift);
-        ResetInteractionContext();
         ShownToCurrentSpace();
     }
 
@@ -3086,7 +2938,7 @@ struct OpenXRPresenter::Impl {
         pad.ReleaseAll();
         ResetMachines();
         input_was_reset = true; // the next focused frame is a context switch (UpdateInput)
-        whip_transform_hold.Thumb(PI_WEAPON_INPUT_THUMB_ARM);
+        stick_armed = true;
         for (auto& hand : haptics) {
             hand.playing = false;
             hand.out.vibrating = false; // no calls without the focus; the last one runs out
@@ -3094,9 +2946,9 @@ struct OpenXRPresenter::Impl {
         // Hits that land without the focus (the headset off, the dashboard: the game goes on)
         // are felt never, not as a stale knock or tick when it comes back (UpdateHitHaptics,
         // UpdateRangedHits).
-        const u32 feedback_hits = VR::HitTakenCount();
-        const auto feedback_ranged = VR::Bloodborne::PlayerRangedHits();
-        BaselineDamageFeedback(feedback_hits, feedback_ranged);
+        hit_haptic_seen = VR::HitTakenCount();
+        ranged_seen = VR::Bloodborne::PlayerRangedHits();
+        gun_hit_pending_ns = 0;
     }
 
     void LogInteractionProfiles() {
@@ -3110,7 +2962,7 @@ struct OpenXRPresenter::Impl {
             if (state.interactionProfile != XR_NULL_PATH &&
                 XR_SUCCEEDED(xrPathToString(Runtime().instance, state.interactionProfile,
                                             sizeof(name), &length, name))) {
-                // The button map in use (documents/bloodborne-vr.md, Other headsets).
+                // The button map in use.
                 const bool dpad = std::ranges::find(actions.dpad_profiles, std::string_view{name}) !=
                                   actions.dpad_profiles.end();
                 const char* layout = VR::XrBindings::LayoutOf(name, dpad);
@@ -3365,6 +3217,8 @@ struct OpenXRPresenter::Impl {
             // A recenter's change of space comes before this frame's head.
             StepRecenter(dt, frame_state.predictedDisplayTime);
             UpdateHead(frame_state.predictedDisplayTime);
+            quick_turn_input = false;
+            quick_turn_dt = dt;
             UpdateInput(frame_state.predictedDisplayTime, dt, input_dt);
             DebugModeCycle(dt);
             DrawOverlay(frame_state, dt); // records the overlay; Submit submits it (queue lock)
@@ -3401,7 +3255,7 @@ struct OpenXRPresenter::Impl {
                     overlay_text += fmt::format("; {} XR frames without a layer",
                                                std::exchange(empty_frames, 0));
                 }
-                LOG_INFO(Render_Vulkan,
+                LOG_BENCHMARK_INFO(Render_Vulkan,
                          "VR perf: game frames {:.1f}/s, XR frames {:.1f}/s ({:.1f}/s with the "
                          "eyes' depth), copy {:.2f} ms, release lock {:.2f} ms, end frame {:.2f} "
                          "ms (avg), XR submit lock {:.2f}/{:.2f} ms (avg/max per frame); {}{}",
@@ -3632,7 +3486,11 @@ struct OpenXRPresenter::Impl {
             time = runtime_change.changeTime - 1;
         }
 
+        XrSpaceVelocity weight_head_velocity{XR_TYPE_SPACE_VELOCITY};
         XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
+        if (settings.WeaponWeightStrength() > 0.0f) {
+            head.next = &weight_head_velocity;
+        }
         if (XR_FAILED(xrLocateSpace(view_space, local_space, time, &head))) {
             VR::PublishHead({});
             return;
@@ -3687,7 +3545,9 @@ struct OpenXRPresenter::Impl {
         const auto& b = views[1].pose.position;
         const float ipd = std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) +
                                     (a.z - b.z) * (a.z - b.z));
-        state.ipd = ipd > 0.04f && ipd < 0.09f ? ipd : 0.064f;
+        // Invalid poses do not supply a new eye distance. Keep the last tracked distance,
+        // with 64 mm as the fallback before the first valid sample.
+        state.ipd = VR::EyeDistance::Headset(views_valid ? ipd : last_head.ipd);
         state.fov_mutable = fov_mutable == 1;
         if (views_valid) {
             LogViews(state);
@@ -3702,7 +3562,7 @@ struct OpenXRPresenter::Impl {
             state.floor_valid = LocateFloor(time, y);
             state.floor_y = y;
         }
-        PublishHands(time, head);
+        PublishHands(time, head, weight_head_velocity);
         last_head = state;
         VR::PublishHead(state);
     }
@@ -3710,7 +3570,8 @@ struct OpenXRPresenter::Impl {
     // VR body: both grips located for the head's target time, so the runtime's own prediction puts
     // hands and head at one instant (the game side adds no extrapolation). Every XR frame; this
     // thread is the hands channel's only writer.
-    void PublishHands(XrTime time, const XrSpaceLocation& head) {
+    void PublishHands(XrTime time, const XrSpaceLocation& head,
+                      const XrSpaceVelocity& head_velocity) {
         if (!actions.ready) {
             return;
         }
@@ -3726,10 +3587,40 @@ struct OpenXRPresenter::Impl {
         sample.head_q = {head.pose.orientation.x, head.pose.orientation.y, head.pose.orientation.z,
                          head.pose.orientation.w};
         const std::array<XrSpace, 2> spaces{actions.grip_space_left, actions.grip_space_right};
+        static const bool trace_filter = std::getenv("VR_HAND_FILTER_TRACE") != nullptr;
+        // Process-local A/B trial override; zero reproduces the previous directional stage.
+        static const VR::Body::Tremor::Config filter_config = [] {
+            VR::Body::Tremor::Config config;
+            if (const char* text = std::getenv("VR_HAND_SETTLE_HZ")) {
+                char* end = nullptr;
+                const float hz = std::strtof(text,&end);
+                if (end != text && *end == '\0' && std::isfinite(hz) && hz >= 0 && hz <= 20)
+                    config.settle_hz = hz;
+            }
+            return config;
+        }();
+        // Preserve the release filter for the flexible chain. The new directional
+        // settling stage is for rigid weapons, not a second layer on whip dynamics.
+        VR::Combat::MeleeStatus filter_weapon{};
+        const bool whip_filter = VR::Combat::LatestMeleeStatus(filter_weapon) &&
+            filter_weapon.ok && filter_weapon.physical &&
+            sample.steady_ns >= filter_weapon.ns &&
+            sample.steady_ns - filter_weapon.ns < 250'000'000 &&
+            VR::Body::Tremor::FlexibleWhip(filter_weapon.variation / 10, filter_weapon.form_b);
+        std::array<VR::Body::TrackedHand,2> raw_hands{}, filtered_hands{};
         for (size_t i = 0; i < spaces.size(); ++i) {
             LocateGrip(spaces[i], time, sample.hand[i]);
+            if (trace_filter) raw_hands[i] = sample.hand[i];
             sample.hand[i].trigger = body_analog[i]; // the previous XR frame's input sync
             sample.hand[i].grip = body_analog[2 + i];
+            // hand_tremor_filter: the hand's tremor damped while nearly still, with less lag on fast turns.
+            if (VR::GetSettings().hand_tremor_filter && VR::Body::IsTracked(sample.hand[i])) {
+                hand_tremor[i].Step(time, sample.hand[i], sample.space_serial, filter_config,
+                                    i == 1 && whip_filter);
+            } else {
+                hand_tremor[i].Clear();
+            }
+            if (trace_filter) filtered_hands[i] = sample.hand[i];
         }
         // Grip adjust: the weapon stays where it was frozen (the right grip of that moment) while
         // you line the controller up with it.
@@ -3758,9 +3649,36 @@ struct OpenXRPresenter::Impl {
         ApplyBowString(sample);
         ApplyMusicBoxHand(sample);
         ApplyPhysicalLever(sample);
-        RecordTwoHandMotion(sample);
+        const auto intent_hand = sample.hand[1];
+        ApplyWeaponWeight(sample);
+        if (weapon_weight_active) {
+            // Combat must subtract a head sampled at the same predicted time as the hand.
+            // Reuse this frame's locate; no extra OpenXR call or head smoothing.
+            weapon_weight_gesture.time = time;
+            weapon_weight_gesture.head_ok = sample.head_valid;
+            weapon_weight_gesture.head_position = {sample.head_p.x, sample.head_p.y,
+                                                   sample.head_p.z};
+            weapon_weight_gesture.head_orientation = head.pose.orientation;
+            const auto forward = VR::Body::Rotate(sample.head_q, {0, 0, -1});
+            weapon_weight_gesture.forward = {forward.x, forward.y, forward.z};
+            weapon_weight_gesture.head_velocity_ok = sample.head_valid &&
+                (head_velocity.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) != 0;
+            const auto& v = head_velocity.linearVelocity;
+            weapon_weight_gesture.head_velocity = weapon_weight_gesture.head_velocity_ok
+                ? VR::Vec3{v.x, v.y, v.z} : VR::Vec3{};
+        }
+        // Keep the guide attached to the same final grip sent to the game's weapon.
+        // Frame stamp prevents reusing it after an interrupted locate or tracking loss.
+        guide_weapon_hand = sample.hand[1];
+        guide_weapon_frame = xr_frames;
+        RecordTwoHandMotion(sample, intent_hand);
         NoteLateHands(sample);
         VR::Body::PublishHands(sample);
+        if (trace_filter) TraceHandFilter(sample,raw_hands,filtered_hands);
+        Common::SyncLog::Line("pub seq=%llu t=%lld ry=%.5f rx=%.5f",
+                              static_cast<unsigned long long>(sample.seq),
+                              static_cast<long long>(time), sample.hand[1].p.y,
+                              sample.hand[1].p.x);
         if (!hands_logged &&
             (VR::Body::IsTracked(sample.hand[0]) || VR::Body::IsTracked(sample.hand[1]))) {
             hands_logged = true;
@@ -3773,6 +3691,60 @@ struct OpenXRPresenter::Impl {
                      VR::GetSettings().pose_prediction_ms, l.x, l.y, l.z, r.x, r.y, r.z,
                      sample.head_p.x, sample.head_p.y, sample.head_p.z);
         }
+    }
+
+    // Explicit local diagnostics only, including in a NoLOG trial. Raw, smoothed and final
+    // published poses share one clock. Capture at most 180 seconds of immersive gameplay.
+    void TraceHandFilter(const VR::Body::HandsSample& sample,
+                         const std::array<VR::Body::TrackedHand,2>& raw,
+                         const std::array<VR::Body::TrackedHand,2>& filtered) {
+        namespace B = VR::Body;
+        if (hand_filter_trace_done || !VR::IsImmersive() || !sample.head_valid) return;
+        if (!hand_filter_trace_file) {
+            const char* path = std::getenv("VR_HAND_FILTER_TRACE");
+            if (!path) return;
+            hand_filter_trace_file = std::fopen(path,"w");
+            if (!hand_filter_trace_file) { hand_filter_trace_done=true; return; }
+            hand_filter_trace_start=sample.steady_ns;
+            std::fprintf(hand_filter_trace_file,
+                "time,space,hand,enabled,tracked,body_fresh,body_driven,arm_weight,family,"
+                "raw_px,raw_py,raw_pz,raw_qx,raw_qy,raw_qz,raw_qw,"
+                "filtered_px,filtered_py,filtered_pz,filtered_qx,filtered_qy,filtered_qz,filtered_qw,"
+                "published_px,published_py,published_pz,published_qx,published_qy,published_qz,published_qw,"
+                "head_px,head_py,head_pz,head_qx,head_qy,head_qz,head_qw,"
+                "linear_valid,angular_valid,raw_vx,raw_vy,raw_vz,raw_wx,raw_wy,raw_wz,weight_active,weight_limit_deg,gravity_sag_deg,mesh_weight,two_hand\n");
+        }
+        if (sample.steady_ns-hand_filter_trace_start > 180'000'000'000LL) {
+            std::fclose(hand_filter_trace_file);
+            hand_filter_trace_file=nullptr;
+            hand_filter_trace_done=true;
+            return;
+        }
+        B::BodyStatus body{};
+        const bool fresh=B::LatestBodyStatus(body) && sample.steady_ns>=body.steady_ns &&
+            sample.steady_ns-body.steady_ns<250'000'000;
+        for(size_t i=0;i<2;i++) {
+            std::fprintf(hand_filter_trace_file,"%.9f,%u,%zu,%d,%d,%d,%d,%.6f,%d",
+                double(sample.xr_time)*1e-9,sample.space_serial,i,
+                VR::GetSettings().hand_tremor_filter,B::IsTracked(raw[i]),fresh,
+                body.driven,body.arm_weight[i],
+                i==1?body.weapon_family:body.left_weapon_family);
+            const auto pose=[&](B::Vec3 p,B::Quat q) {
+                std::fprintf(hand_filter_trace_file,",%.7f,%.7f,%.7f,%.8f,%.8f,%.8f,%.8f",
+                    p.x,p.y,p.z,q.x,q.y,q.z,q.w);
+            };
+            pose(raw[i].p,raw[i].q);
+            pose(filtered[i].p,filtered[i].q);
+            pose(sample.hand[i].p,sample.hand[i].q);
+            pose(sample.head_p,sample.head_q);
+            std::fprintf(hand_filter_trace_file,",%d,%d,%.7f,%.7f,%.7f,%.7f,%.7f,%.7f,%d,%.5f,%.5f,%d,%.5f\n",
+                raw[i].velocity_valid,raw[i].angular_valid,
+                raw[i].v.x,raw[i].v.y,raw[i].v.z,raw[i].w.x,raw[i].w.y,raw[i].w.z,
+                weapon_weight_active && weapon_weight_frame == xr_frames,
+                weapon_weight_active ? weapon_weight.Limit()/B::Deg : 0.0f,
+                weapon_weight_active ? weapon_weight.GravitySag()/B::Deg : 0.0f, weapon_weight_mesh, sample.two_hand);
+        }
+        if (++hand_filter_trace_frames%90==0) std::fflush(hand_filter_trace_file);
     }
 
     void LocateGrip(XrSpace space, XrTime time, VR::Body::TrackedHand& hand) {
@@ -4159,7 +4131,7 @@ struct OpenXRPresenter::Impl {
         // SteamVR's dashboard takes the left Menu button (none of Menu's jobs reach us there).
         const bool menu_runtime = xr_runtime == VrXrQueuePolicy::Runtime::SteamVr;
         const VR::Thumbs::Layout layout{settings.left_scheme, settings.controls_classic, swap,
-                                        settings.inject && PhysicalVialEnabled(), y_menu, menu_runtime};
+                                        settings.inject, y_menu, menu_runtime};
         VR::SetYMenu(y_menu, menu_runtime); // the VR page's controls view
         if (!thumbs_logged || !(*thumbs_logged == layout)) {
             thumbs_logged = layout;
@@ -4187,68 +4159,73 @@ struct OpenXRPresenter::Impl {
     }
 
     void ResetMachines() {
-        if (const auto failure = two_hand_runtime.TakeFailure(); failure != PI_OK) {
-            LOG_ERROR(Render_Vulkan, "Physical two-hand packet failed ({}); controls reset", failure);
-            shadNotifications::QueueNotification("Physical two-hand input failed; controls reset",
-                15.0f, shadNotifications::position::TopLeft);
-        }
         melee.Reset();
-        melee_window.Reset("a context switch");
-        melee_runtime.ResetRight(VR::Body::SteadyNowNs());CopyRightMelee();
-        // A module generation may already have closed the copied window. Publish the
-        // terminal identity even then so the native side never waits on an old open copy.
-        PublishMeleeWindowNow();
-        melee_window_left.Reset("a context switch");
-        melee_left_close_ns = melee_close_ns;
-        PublishLeftWindow(melee_left_close_ns);
+        if (melee_window.Current().open) {
+            melee_window.Reset("a context switch");
+            PublishMeleeWindowNow();
+        } else {
+            melee_window.Reset("a context switch");
+        }
         melee_telegraph.Reset();
-        melee_runtime.ResetClassifierFeedback();
-        ResetWeaponMotion();
+        melee_charge_sustain = false;
+        melee_whip_sustain = false;
+        arc_sustain = false;
+        since_attack = 10.0f;
+        heavy = Heavy::Idle;
         haptics[0].sustain = haptics[1].sustain = 0.0f;
         // The bow: a nocked arrow is put back, and a trigger still held after the switch is no
         // squeeze (UpdateBow arms it again as the bow comes up). The visceral pull re-arms on
         // the next frame of a hold still running.
-        ranged_runtime.Reset();
+        bow.Arm(true);
         bow_up = false;
         VR::Combat::BowVisualChannel().Store({});
         bow_string_w = 0.0f;
+        bow_sustain = false;
         bow_trigger_wait = false; // a held trigger is blocked by the switch until released
         // The hand transforms: a grab let go (a grip held through the switch is no squeeze; one
         // a gesture owned stays its own until released); the shield down.
-        if (!UsingInteractionDll()) hand_transform.Arm(true);
+        hand_transform.Arm(true);
         hand_sustain_l = hand_sustain_r = 0.0f;
-        if (!UsingInteractionDll()) right_grip.Reset(true); // (a cooldown runs on)
+        right_grip.Reset(true); // (a cooldown runs on)
         right_grip_ready = false;
         grip_sustain_r = 0.0f;
         // A grab-group form B held (or let go of) through the switch turns back once the left
         // hand opens; one the hands never held stays.
-        if (!two_hand_runtime.Active()) {
-            revert_on_open = VR::Tricks::GrabFamily(RightFamily()) &&
-                             (revert_on_open || hold_form.pending || two_hand_runtime.Engaged() ||
-                              grab_transform_ns != 0);
-            hold_form = {};
-            revert_tries = 0;
-            grab_transform_ns = 0;
-            near_hold_ns = slip_ns = 0;
-        }
-        two_hand_runtime.SupportReset();
-        two_hand_runtime.MotionReset();
+        revert_on_open = VR::Tricks::GrabFamily(RightFamily()) &&
+                         (revert_on_open || hold_form.pending || two_hand.Engaged() ||
+                          grab_transform_ns != 0);
+        hold_form = {};
+        revert_tries = 0;
+        grab_transform_ns = 0;
+        near_hold_ns = slip_ns = 0;
+        two_hand_support.Reset();
+        two_hand_blade_motion.Reset();
+        two_hand_physical_motion.Reset();
+        two_hand_intent_blade = {};
         two_hand_blade = {};
-        two_hand_runtime.HumReset();
+        two_hand_combat = false;
+        two_hand_hum = {};
         two_hand_hum_level = 0.0f;
         two_hand_out.weight = 0.0f;
         two_hand_turn_ok = false;
         zone_was = false;
-        grip_quarter = split_quarter = 0;
+        grip_quarter = blast_quarter = split_quarter = 0;
         arm_beat_s = 0.0f;
-        blade_runtime.Reset();
-        saw_runtime.Reset();
+        blast.Reset(true);
+        blast_sustain = 0.0f;
+        saw_spin.Reset();
         VR::Combat::PublishSawRequest({});
+        saw_sustain_l = saw_sustain_r = 0.0f;
+        saw_trigger_r = false;
         melee_left.Reset();
-        melee_runtime.ResetLeft(melee_close_ns);CopyLeftMelee();
+        left_dropped_stroke = 0;
+        shield.Reset();
         shield_up = false;
-        visceral_runtime.ResetTear(); // haptic levels are already zeroed above
-        whip_transform_hold.Thumb(PI_WEAPON_INPUT_THUMB_RESET);
+        pull_detector.Disarm();
+        pull_sustain = 0.0f; // (the sustains are zeroed above)
+        pull_beat = 0.0f;
+        l3_click.Reset();
+        y_click.Reset();
         y_gesture.Reset();
         y_x_combo = false;
         loco.Reset();
@@ -4256,18 +4233,25 @@ struct OpenXRPresenter::Impl {
         loco_combat = nullptr;
         holster_tracker.Reset();
         belt_torso.Reset(); // a recenter turns LOCAL: the torso's heading starts again
+        b_down = b_to_touch = touch_fired = false;
+        r3_down = r3_used = r3_switched = false;
+        swing_ready = hand_at_face = left_at_face = left_face_hold = false;
         melee_shadow.Reset();
-        whip_transform_hold.Transform(PI_WEAPON_INPUT_TRANSFORM_RESET);
+        grip_r_block = nullptr;
         whip_transform_hold.Reset();
-        ResetTwoHandGuide();
+        two_hand_guide_gesture.Reset();
+        swing_quiet = 0.0f;
+        trigger_r_down = false;
+        trigger_route = Route::R1;
         menu_time = 0.0f;
         menu_long_fired = false;
         menu_hold_cancelled = menu_l_centred = menu_r_centred = false;
-
+        stick_armed = false;
+        up_hold = 0.0f;
+        quick_turn_gesture.Reset();
         menu_armed = false;
         menu_dir = PadButton{};
-        grip_r_down = false;
-        ResetInteractionContext(); // withdraw untaken work; late taken results are acknowledged without feedback
+        drawn = sticky_drawn = grip_r_down = false;
         vial_armed = false; // a pending injection request is still answered
         vial_grip_hold.Reset();
         vial_grip_release = -1.0f;
@@ -4279,14 +4263,21 @@ struct OpenXRPresenter::Impl {
         QuickCancel("controls reset");
         (void)VR::RoomscaleWalkInput(false);
         lean.Reset();
+        lean_stick_left = lean_circle_in = 0.0f;
         if (grip_adjust.Cancel()) {
             LOG_INFO(Render_Vulkan, "VR grip: adjust cancelled (controls reset), nothing saved");
         }
         roll_chord.Reset();
-        shoulder_runtime.Reset();
+        for (auto& gate : shoulder_switch) gate.Reset();
+        for (auto& confirmation : shoulder_confirmation) confirmation.Reset();
         VR::Bloodborne::CancelShoulderEquipmentRequests();
         roll_adjust = false;
-        VR::Bloodborne::HoldGameFacing(0);
+        roll_seq = false;
+        roll_stick_left = 0.0f;
+        if (roll_active) {
+            roll_active = false;
+            VR::Bloodborne::HoldGameFacing(0);
+        }
         ReleaseTouch();
     }
 
@@ -4306,13 +4297,17 @@ struct OpenXRPresenter::Impl {
         pad.Suppress(game_menu ? pad.MinRelease() : 0.4f);
         blocked = raw;
         context_age = 0.0f;
+        const bool sticky = sticky_drawn;
         ResetMachines();
-        PiWeaponSwingFacts restore{};
-        restore.game_menu=game_menu;restore.classic=classic;restore.clutch=settings.right_grip_draw;
-        restore.menu_context=menu_context;restore.screen_context=screen_context;restore.grip=raw[PhysGripR];
-        const auto restored=WeaponSwing(PI_WEAPON_INPUT_SWING_RESTORE,restore);
-        if(restored.restore_grip)blocked[PhysGripR]=false;
-        grip_r_down=whip_transform_hold.SwingState().grip_down;
+        if (game_menu) {
+            sticky_drawn = sticky;
+            if (!classic && settings.right_grip_draw && !menu_context && !screen_context &&
+                raw[PhysGripR]) {
+                blocked[PhysGripR] = false;
+                grip_r_down = true;     // held, not a new tap (sticky_grip)
+                grip_press_time = 1.0f; // drawn again with its tick (UpdateMotionWeapon)
+            }
+        }
         haptics[0].Play(Tick(0.15f, 15.0f, 0));
         haptics[1].Play(Tick(0.15f, 15.0f, 0));
     }
@@ -4355,10 +4350,21 @@ struct OpenXRPresenter::Impl {
         config.min_on_ns = static_cast<s64>(settings.haptic_min_ms * 1e6f);
         config.period_ns = std::clamp<s64>(display_period, 1'000'000, 50'000'000);
         const s64 now = VR::Body::SteadyNowNs();
-        std::array<float, 2> rumble{};
+        std::array<float, 2> rumble{small_motor * 0.8f, large_motor * 0.8f};
+        // Directional hit feedback (hit_haptics_directional): the hit's thump, and the game's
+        // rumble for the blow on the side it came from (UpdateHitHaptics, RumbleWeighting).
         {
             VR::FeatureCost::Scope cost{VR::FeatureCost::HitHaptics};
-            rumble = UpdateDamageFeedback(now, small_motor, large_motor);
+            UpdateHitHaptics(now);
+            UpdateRangedHits(now);
+            const bool weighted =
+                hit_rumble.Step(now, std::max(rumble[0], rumble[1]));
+            const VR::HitDir::Hands r =
+                VR::HitDir::WeightRumble(rumble[0], rumble[1], weighted, hit_rumble.gain);
+            // The game's rumble for a blow on the hunter (0.8 for up to 1.6 s) x haptic_hit_rumble:
+            // the hit stays a small vibration and never masks the weapon hand's own feedback.
+            const float k = weighted ? std::clamp(settings.haptic_hit_rumble, 0.0f, 1.0f) : 1.0f;
+            rumble = {r.left * k, r.right * k};
         }
         for (u32 hand = 0; hand < 2; ++hand) {
             auto& h = haptics[hand];
@@ -4580,7 +4586,7 @@ struct OpenXRPresenter::Impl {
 
     // VR_SWING_LOG: commit-gate verdicts (ignored, rejected, or a commit that goes to the
     // trigger machine) with the blade chord that decided wind-ups.
-    void GateLog(const char* what, const char* reason, const VR::Melee::Output& out, int display_heavy = -1) {
+    void GateLog(const char* what, const char* reason, const VR::Melee::Output& out) {
         if (!SwingLogEnabled()) {
             return;
         }
@@ -4590,12 +4596,12 @@ struct OpenXRPresenter::Impl {
                  "arc {:.0f} deg a0 {:.0f} cocked={} chord {:+.2f},{:+.2f},{:+.2f} | drawn={} "
                  "heavy={}",
                  what, reason, s.hand_peak, s.hand_travel, s.hand_ms, s.id, s.theta, s.alpha0,
-                 s.cocked ? 1 : 0, s.chord.x, s.chord.y, s.chord.z, drawn, display_heavy < 0 ? static_cast<int>(heavy) : display_heavy);
+                 s.cocked ? 1 : 0, s.chord.x, s.chord.y, s.chord.z, drawn, static_cast<int>(heavy));
     }
 
     // VR_SWING_LOG: one line per attack with the measurements that decided it. "near" marks a
     // light that came close to the heavy arc, "dropped" a press the pad mapper refused.
-    void AttackLog(PadButton button, const VR::Melee::Output& out, const char* reason, bool ok, u32 display_heavy) {
+    void AttackLog(PadButton button, const VR::Melee::Output& out, const char* reason, bool ok) {
         if (!SwingLogEnabled()) {
             return;
         }
@@ -4609,7 +4615,7 @@ struct OpenXRPresenter::Impl {
                  button == PadButton::R2 ? "R2 heavy" : "R1 light", reason, s.theta, s.theta_eff,
                  s.H, s.peak, s.w, s.decel, s.vpeak, s.travel, s.travel_est ? "~" : "", s.planar,
                  s.alpha0, s.amin, s.cocked ? 1 : 0, s.ms_commit, s.ms_onset,
-                 near_heavy ? " near" : "", ok ? "" : " dropped", drawn, display_heavy);
+                 near_heavy ? " near" : "", ok ? "" : " dropped", drawn, static_cast<int>(heavy));
     }
 
     // Logged once per session: how big swings are classified.
@@ -4692,8 +4698,6 @@ struct OpenXRPresenter::Impl {
     }
 
     void UpdateInput(XrTime time, float dt, float input_dt) {
-        VR::Interactions::FrameFaultPublisher fault_scope{
-            VR::Interactions::ProcessFaultLatch(),interaction_dll_requested,interaction_dll_fault};
         two_hand_hum_level = 0.0f; // menus/early exits cannot leave a swing buzz running
         overlay_in.valid = false;
         if (!actions.ready || session_state != XR_SESSION_STATE_FOCUSED) {
@@ -4937,8 +4941,10 @@ struct OpenXRPresenter::Impl {
             // keep other buttons visible so they cancel its tap/recenter gesture.
             // The closing tail still blocks every control until it is released.
             const auto back = thumbs_swapped ? PhysY : PhysB;
-            VR::MenuInput::GuardExit(raw, in, blocked, menu_open,
-                                    y_menu_now ? back : PhysB, y_menu_now ? back : PhysY);
+            menu_exit_guard.Update(raw, in, blocked, menu_open,
+                                   y_menu_now ? back : PhysB, y_menu_now ? back : PhysY, dt);
+        } else {
+            menu_exit_guard.Reset();
         }
         // Y's own gesture (core/vr/y_menu.h, UpdateYGesture after Menu's block): where it runs
         // this frame and on which logical slot. y_menu does Menu's jobs wherever Menu does them
@@ -5071,7 +5077,7 @@ struct OpenXRPresenter::Impl {
             if (in[PhysStickL]) {
                 blocked[PhysStickL] = true;
                 in[PhysStickL] = false;
-                whip_transform_hold.NoteThumb(0); // a modifier held before Menu ends without an L3 or tap
+                l3_click.NoteCombo(); // a modifier held before Menu ends without an L3 or tap
                 menu_long_fired = true;
                 ++marks;
                 LOG_INFO(Render_Vulkan, "VR MARK {}", marks);
@@ -5238,10 +5244,9 @@ struct OpenXRPresenter::Impl {
         }
         if (screen_context || menu_context) {
             whip_transform_hold.Reset(raw[classic || settings.right_grip_draw ? PhysGripL : PhysGripR]);
-            ResetTwoHandGuide(raw[PhysGripR]);
+            two_hand_guide_gesture.Reset(raw[PhysGripR]);
             QuickCancel(menu_context ? "game menu" : "virtual screen");
         }
-        PollNativeTransform(); // retained outcomes are drained even in menus/screens
         PollInject(dt);
         UpdateHeldRequest(in, analog[0], dt, !screen_context && !menu_context);
 
@@ -5267,8 +5272,8 @@ struct OpenXRPresenter::Impl {
             std::hypot(move.x, move.y) < 0.15f && std::hypot(look.x, look.y) < 0.15f &&
             std::abs(axes[0] - 128) <= 19 && std::abs(axes[1] - 128) <= 19 &&
             !in[PhysA] && !in[PhysB] && !in[PhysTriggerL] && !in[PhysTriggerR] &&
-            !loco.Latched() && !loco_seq.Active() && !roll_chord.Active() &&
-            lean.StickLeft() <= 0.0f && !melee.Pending() && since_attack >= 0.35f && walk_body_ok;
+            !loco.Latched() && !loco_seq.Active() && !roll_active &&
+            lean_stick_left <= 0.0f && !melee.Pending() && since_attack >= 0.35f && walk_body_ok;
         // (Why not, for the room-scale walk's log: the first condition that fails.)
         const char* walk_why =
             walk_allowed                                     ? ""
@@ -5290,8 +5295,8 @@ struct OpenXRPresenter::Impl {
                 ? "the game stick is already pushed"
             : in[PhysA] || in[PhysB] || in[PhysTriggerL] || in[PhysTriggerR]
                 ? "A, B or a trigger"
-            : loco.Latched() || loco_seq.Active() || roll_chord.Active() ? "sprint, dodge or roll"
-            : lean.StickLeft() > 0.0f                         ? "a lean dodge"
+            : loco.Latched() || loco_seq.Active() || roll_active ? "sprint, dodge or roll"
+            : lean_stick_left > 0.0f                         ? "a lean dodge"
             : melee.Pending()                                ? "a swing pending"
             : since_attack < 0.35f                           ? "just attacked"
             : !walk_body_ok                                  ? "the body"
@@ -5325,81 +5330,96 @@ struct OpenXRPresenter::Impl {
                               const HandState& left, const HandState& right,
                               const GestureFrame& g, float dt) {
         const auto& settings = VR::GetSettings();
+        const bool enabled = settings.shoulder_switch && !settings.controls_classic;
         VR::Body::BodyStatus body{};
         const s64 now = VR::Body::SteadyNowNs();
-        const bool have_body = VR::Body::LatestBodyStatus(body);
-        const u32 common = (settings.shoulder_switch ? PI_SF_ENABLED : 0) |
-            (settings.controls_classic ? PI_SF_CLASSIC : 0) | (screen_context ? PI_SF_SCREEN : 0) |
-            (menu_context ? PI_SF_MENU : 0) | (VR::IsImmersive() ? PI_SF_IMMERSIVE : 0) |
-            (VR::CinematicActive() ? PI_SF_CINEMATIC : 0) | (VR::MenuPanelActive() ? PI_SF_PANEL : 0) |
-            (VR::Page::Runtime::Get().IsOpen() ? PI_SF_PAGE : 0) | (have_body ? PI_SF_HAVE_BODY : 0) |
-            (g.head_ok ? PI_SF_HEAD : 0) | (g.head_velocity_ok ? PI_SF_HEAD_VELOCITY : 0) |
-            (grip_adjust.Frozen() ? PI_SF_FROZEN : 0) | (body.driven ? PI_SF_DRIVEN : 0) |
-            (body.facing_block != nullptr ? PI_SF_FACING : 0);
+        const bool fresh = enabled && VR::Body::LatestBodyStatus(body) &&
+                           now >= body.steady_ns && now - body.steady_ns < 250'000'000;
+        const bool gameplay = !screen_context && !menu_context && VR::IsImmersive() &&
+                              !VR::CinematicActive() && !VR::MenuPanelActive() &&
+                              !VR::Page::Runtime::Get().IsOpen();
+        if (!gameplay) VR::Bloodborne::CancelShoulderEquipmentRequests();
         for (int side = 0; side < 2; ++side) {
             const bool is_left = side == 0;
             const auto physical_key = is_left ? PhysY : PhysB;
             const auto key = thumbs_swapped ? (is_left ? PhysB : PhysY) : physical_key;
+            auto& gate = shoulder_switch[side];
+            auto& confirmation = shoulder_confirmation[side];
+            if (!enabled) {
+                VR::ShoulderSwitch::Input disabled{};
+                disabled.b = physical[physical_key];
+                if (gate.Update(disabled, dt).consume) in[key] = false;
+                confirmation.Reset();
+                continue;
+            }
             const auto& hand = is_left ? left : right;
-            PiShoulderMotion raw{};
-            raw.button = physical[physical_key];
-            raw.head[0] = g.head_position.x; raw.head[1] = g.head_position.y; raw.head[2] = g.head_position.z;
-            raw.forward[0] = g.forward.x; raw.forward[1] = g.forward.y; raw.forward[2] = g.forward.z;
-            raw.hand[0] = hand.position.x; raw.hand[1] = hand.position.y; raw.hand[2] = hand.position.z;
-            raw.velocity[0] = hand.velocity.x; raw.velocity[1] = hand.velocity.y; raw.velocity[2] = hand.velocity.z;
-            PiShoulderPresenterFacts facts{};
-            facts.body_ns = body.steady_ns;
-            facts.weapon_slot = is_left ? body.left_weapon_slot : body.weapon_slot;
-            facts.weapon_family = is_left ? body.left_weapon_family : body.weapon_family;
-            facts.arm_weight = body.arm_weight[side]; facts.daze = body.daze;
-            facts.head_velocity[0] = g.head_velocity.x; facts.head_velocity[1] = g.head_velocity.y;
-            facts.head_velocity[2] = g.head_velocity.z;
-            facts.angular[0] = hand.angular.x; facts.angular[1] = hand.angular.y; facts.angular[2] = hand.angular.z;
-            facts.eye_offset_m = VR::HeightBodyOffsetM();
-            facts.flags = common | (hand.valid ? PI_SF_HAND : 0) |
-                (hand.orientation_valid ? PI_SF_ORIENTATION : 0) | (hand.angular_valid ? PI_SF_ANGULAR : 0) |
-                (physical[is_left ? PhysTriggerL : PhysTriggerR] ? PI_SF_TRIGGER : 0) |
-                (melee_window.Current().open ? PI_SF_WINDOW : 0) | (blocked[key] ? PI_SF_BLOCKED : 0) |
-                (VR::Bloodborne::ShoulderUnarmed(side) ? PI_SF_UNARMED : 0);
-            facts.chord_buttons = (physical[PhysA] ? 1u : 0) | (physical[PhysX] ? 2u : 0) |
-                (physical[is_left ? PhysB : PhysY] ? 4u : 0) | (physical[PhysMenu] ? 8u : 0) |
-                (physical[PhysStickL] ? 16u : 0) | (physical[PhysStickR] ? 32u : 0);
-            const auto out = shoulder_runtime.Presenter(side, raw, facts, now, dt);
-            if (side == 0 && out.cancel_requests) VR::Bloodborne::CancelShoulderEquipmentRequests();
-            PlayInteractionHaptics(out);
-            const bool unarmed = out.unarmed != 0;
+            const auto physical_slot = is_left ? body.left_weapon_slot : body.weapon_slot;
+            const bool unarmed = VR::Bloodborne::ShoulderUnarmed(side) &&
+                (is_left ? body.left_weapon_family : body.weapon_family) == 10;
+            const auto slot = unarmed ? 2 : physical_slot; // confirmation token, never a game slot
             const char* name = is_left ? "left" : "right";
-            switch (static_cast<VR::ShoulderSwitch::Result>(out.result)) {
+            switch (confirmation.Update(gameplay, fresh, slot, now)) {
             case VR::ShoulderSwitch::Result::Changed:
+                haptics[side].Play(shoulder_unarm_request[side] ? Tick(.8f, 220.f) : Tick(.35f, 35.f));
                 LOG_INFO(Render_Vulkan, "VR shoulder: {} hand change confirmed ({})", name,
                          unarmed ? "unarmed" : "armed");
                 break;
             case VR::ShoulderSwitch::Result::TimedOut:
+                haptics[side].Play(Repeat(2, .15f, 12.f, 55.f));
                 break;
             case VR::ShoulderSwitch::Result::None:
                 break;
             }
-
+            VR::ShoulderSwitch::Input q{};
+            q.enabled = true;
+            q.left = is_left;
+            q.gameplay = gameplay;
+            q.tracked = g.head_ok && g.head_velocity_ok && hand.valid &&
+                        hand.orientation_valid && hand.angular_valid;
+            q.b = physical[physical_key];
+            q.available = fresh && body.driven && body.arm_weight[side] > .9f && slot >= 0 &&
+                          !confirmation.Pending() && !blocked[key];
+            q.attacking = physical[is_left ? PhysTriggerL : PhysTriggerR] ||
+                          (!is_left && melee_window.Current().open) || grip_adjust.Frozen() ||
+                          body.daze != 0 || body.facing_block != nullptr;
+            q.chord = physical[PhysA] || physical[PhysX] ||
+                      physical[is_left ? PhysB : PhysY] || physical[PhysMenu] ||
+                      physical[PhysStickL] || physical[PhysStickR];
+            q.head = {g.head_position.x, g.head_position.y, g.head_position.z};
+            q.forward = {g.forward.x, g.forward.y, g.forward.z};
+            q.hand = {hand.position.x, hand.position.y, hand.position.z};
+            q.velocity = {hand.velocity.x - g.head_velocity.x,
+                          hand.velocity.y - g.head_velocity.y,
+                          hand.velocity.z - g.head_velocity.z};
+            q.angular_speed = std::sqrt(hand.angular.x * hand.angular.x +
+                                        hand.angular.y * hand.angular.y +
+                                        hand.angular.z * hand.angular.z);
+            q.scale = VR::PlayerBody::BodyScaleFor(VR::HeightBodyOffsetM());
+            const auto out = gate.Update(q, dt);
             if (out.consume) in[key] = false;
-            if (out.command) {
+            if (out.request) {
+                // Holding while already sheathed is a no-op. Only a tap restores the remembered weapon.
+                if (out.unarm && unarmed) continue;
                 // A cycle selects the other slot natively (RequestShoulderCycle): the game's
                 // switch clip took the hunter's arms and his control for a moment (12001/12011,
                 // 2026-10-15). The D-pad only where that cannot (the other slot empty, as the
                 // game's own switch handles it).
-                const bool native_cycle = out.command != PI_SHOULDER_EQUIPMENT &&
-                                          VR::Bloodborne::RequestShoulderCycle(side);
-                const bool accepted = out.command == PI_SHOULDER_EQUIPMENT
-                    ? VR::Bloodborne::RequestShoulderEquipment(side, out.unarm != 0)
+                const bool equipment = out.unarm || unarmed;
+                const bool native_cycle =
+                    !equipment && VR::Bloodborne::RequestShoulderCycle(side);
+                const bool accepted = equipment
+                    ? VR::Bloodborne::RequestShoulderEquipment(side, out.unarm)
                     : native_cycle || pad.Press(is_left ? PadButton::Left : PadButton::Right);
                 if (accepted) {
-                    shoulder_unarm_request[side] = out.unarm != 0;
+                    shoulder_unarm_request[side] = out.unarm;
                     // A restore may select the other slot if the remembered item was moved or sold.
+                    confirmation.Begin(slot, now, out.unarm ? 2 : -1);
                 }
-                PlayInteractionHaptics(shoulder_runtime.Receipt(side, out.request_id, accepted, now));
+                else haptics[side].Play(Repeat(2, .15f, 12.f, 55.f));
                 LOG_INFO(Render_Vulkan, "VR shoulder: equipped {}-hand cycle {}{}",
                          name, accepted ? "requested" : "busy",
                          native_cycle ? " (native, no switch clip)" : "");
-            }
+            } else if (out.rejected) haptics[side].Play(Tick(.12f, 12.f));
         }
     }
 
@@ -5450,7 +5470,7 @@ struct OpenXRPresenter::Impl {
         // A held-back press is shown long enough for the game to sample it (once a game frame).
         const float frame = std::clamp(VR::GameFrameSeconds(), 1.0f / 60.0f, 1.0f / 15.0f);
         config.min_press_s = 1.25f * frame;
-        const R::Output o = roll_chord.Update(config, ri, thumbs_swapped);
+        const R::Output o = roll_chord.Update(config, ri);
         roll_adjust = o.adjust;
         in[PhysA] = o.a;
         in[PhysB] = o.b;
@@ -5459,7 +5479,7 @@ struct OpenXRPresenter::Impl {
             return;
         }
         if (o.chord) {
-            PlayInteractionHaptic(roll_chord.Feedback());
+            ThumbHaptics(VR::Thumbs::Control::A).Play(Tick(0.2f, 12.0f));
             LOG_INFO(Render_Vulkan, "VR input: A+B chord ({:.0f} ms apart, {})", o.gap_s * 1000.0f,
                      o.event == R::Event::Roll
                          ? std::string{"moving: the roll now"}
@@ -5496,12 +5516,15 @@ struct OpenXRPresenter::Impl {
     // (SpEffect 390), so it is a roll, never a leap. The stick stays until the sequence ends.
     // Locked on, the game only quicksteps.
     void StartRoll(const VR::Roll::Output& o) {
-        roll_chord.Start(o.roll_x,o.roll_y);
-        if(interaction_dll_fault)return;
+        roll_dir = {o.roll_x, o.roll_y};
+        roll_active = true;
+        roll_t = roll_after = 0.0f;
+        roll_dodge_seen = roll_pressed = false;
         VR::Bloodborne::HoldGameFacing(VR::Body::SteadyNowNs() + RollHoldNs);
         const bool down = (pad.Mask() & static_cast<u32>(PadButton::Circle)) != 0;
         loco_seq.Start(VR::Loco::Action::Dodge, down,
                        down ? 0.0f : pad.ReleasedFor(PadButton::Circle));
+        roll_seq = true;
         const bool locked = VR::IsLockedOn();
         LOG_INFO(Render_Vulkan, "VR input: ROLL ({}): toward {:+.0f} deg{} | {}",
                  o.moved ? (o.held_s > 0.0f
@@ -5519,22 +5542,52 @@ struct OpenXRPresenter::Impl {
     // time limit; then the VR heading drives him again and the game turns him back to it (the
     // heading was kept: his own turn toward it, no jump).
     void UpdateRollRun(float dt) {
-        const s64 now=VR::Body::SteadyNowNs();
-        const auto d=VR::Bloodborne::LatestDashEffects();
-        const bool fresh=d.valid && SteadyNs()-d.steady_ns<150'000'000;
-        const auto out=roll_chord.Run(dt,fresh,d.dodge);
-        if(out.end){
+        if (!roll_active) {
+            return;
+        }
+        roll_t += dt;
+        roll_after = roll_seq ? 0.0f : roll_after + dt;
+        const s64 now = VR::Body::SteadyNowNs();
+        const VR::Bloodborne::DashEffects d = VR::Bloodborne::LatestDashEffects();
+        const bool fresh = d.valid && SteadyNs() - d.steady_ns < 150'000'000;
+        if (fresh && d.dodge && roll_pressed) {
+            roll_dodge_seen = true;
+        }
+        const char* end = nullptr;
+        if (roll_dodge_seen && fresh && !d.dodge) {
+            end = "the game's dodge ended";
+        } else if (!roll_dodge_seen && !roll_seq && roll_after > 0.45f) {
+            end = fresh ? "no dodge started (refused: stamina, an action)" : "no dodge reading";
+        } else if (roll_t > 2.2f) {
+            end = "the most it waits";
+        }
+        if (end != nullptr) {
+            roll_active = false;
             VR::Bloodborne::HoldGameFacing(0);
-            LOG_INFO(Render_Vulkan,"VR input: ROLL over after {:.0f} ms ({}): the VR heading again",out.time*1000.f,PhysicalInteractions::RollPackets::Ends[out.end]);
-        }else if(out.active)VR::Bloodborne::HoldGameFacing(now+RollHoldNs);
+            LOG_INFO(Render_Vulkan,
+                     "VR input: ROLL over after {:.0f} ms ({}): the VR heading again",
+                     roll_t * 1000.0f, end);
+        } else {
+            VR::Bloodborne::HoldGameFacing(now + RollHoldNs);
+        }
     }
 
     // UpdateGameplay, after UpdateLocomotion: the roll's stick while its Circle sequence runs, and
     // one game frame after it.
     void ApplyRoll(std::array<s32, 6>& axes, float dt) {
-        const bool active=loco_seq.Active() && loco_seq.Current()==VR::Loco::Action::Dodge;
-        const auto out=roll_chord.Stick(dt,active,VR::GameFrameSeconds());
-        if(out.apply){axes[0]=out.axis_x;axes[1]=out.axis_y;}
+        if (roll_seq && !(loco_seq.Active() && loco_seq.Current() == VR::Loco::Action::Dodge)) {
+            roll_seq = false;
+            roll_stick_left = std::clamp(VR::GameFrameSeconds(), 1.0f / 60.0f, 1.0f / 15.0f);
+        }
+        if (!roll_seq && roll_stick_left <= 0.0f) {
+            return;
+        }
+        roll_stick_left = std::max(0.0f, roll_stick_left - (roll_seq ? 0.0f : dt));
+        const auto axis = [](float v) {
+            return std::clamp(static_cast<s32>(std::lround(128.0f + v * 127.0f)), 0, 255);
+        };
+        axes[0] = axis(roll_dir.x);
+        axes[1] = axis(-roll_dir.y);
     }
 
     // The live weapon grip adjust (core/vr/grip_adjust.h, grip_adjust=1): hold A+B for 1.2 s
@@ -5553,26 +5606,21 @@ struct OpenXRPresenter::Impl {
         }
         namespace B = VR::Body;
         B::BodyStatus status{};
-        PiGripEligibility eligibility{};eligibility.mode=PI_GRIP_READY_RAW;
-        eligibility.have_body=B::LatestBodyStatus(status);eligibility.now_ns=B::SteadyNowNs();
-        eligibility.body_ns=status.steady_ns;eligibility.driven=status.driven;
-        eligibility.right_arm_weight=status.arm_weight[1];eligibility.family=status.weapon_family;
-        eligibility.body_enabled=body.body;eligibility.adjust_enabled=body.grip_adjust;
-        eligibility.right_grip_draw=VR::GetSettings().right_grip_draw;
+        const bool fresh =
+            B::LatestBodyStatus(status) && B::SteadyNowNs() - status.steady_ns < 250'000'000;
+        const bool arm = fresh && status.driven && status.arm_weight[1] >= 0.9f;
         B::AdjustInput input{};
         input.dt = dt;
         // A+B as the chord sees it (UpdateRollChord): held, with the stick never pushed.
         input.a = input.b = roll_adjust;
         input.trigger = in[PhysTriggerR];
-        input.ready = false; // raw readiness is decided by the owning DLL frame
+        input.ready = arm && status.weapon_family >= 0;
         input.tracked = B::IsTracked(grip_right_located);
         input.p = grip_right_located.p;
         input.q = grip_right_located.q;
         const bool dry = GripDryRun() || GripAutotest();
         if (GripAutotest() && !adjust_autotest_done) {
-            // Dry-run fixture only; normal gameplay does not compose readiness here.
-            if ((PhysicalInteractions::GripEligibility::Readiness(eligibility)&PI_GRIP_READY) ||
-                grip_adjust.Phase() != B::AdjustPhase::Idle) {
+            if (input.ready || grip_adjust.Phase() != B::AdjustPhase::Idle) {
                 adjust_autotest_time += dt;
             }
             if (adjust_autotest_time >= 20.0f) {
@@ -5580,10 +5628,11 @@ struct OpenXRPresenter::Impl {
                 adjust_autotest_done = !input.a;
             }
         }
-        const B::AdjustOutput out = grip_adjust.Update(input,&eligibility);
-        const bool fresh=(grip_adjust.Readiness()&PI_GRIP_FRESH)!=0;
-        const auto controls=grip_adjust.Controls();
-        const auto feedback = grip_adjust.Feedback();
+        const B::AdjustOutput out = grip_adjust.Update(input);
+        const auto both = [this](const HapticPattern& pattern) {
+            haptics[0].Play(pattern);
+            haptics[1].Play(pattern);
+        };
         const auto trim_text = [](const B::GripTrim& t) {
             return fmt::format("pitch {:.1f} yaw {:.1f} roll {:.1f} deg offset "
                                "({:.1f},{:.1f},{:.1f}) cm",
@@ -5596,7 +5645,7 @@ struct OpenXRPresenter::Impl {
             adjust_family = status.weapon_family;
             bool custom = false;
             adjust_from = B::WeaponGrip(adjust_family, &custom);
-            PlayInteractionHaptic(feedback);
+            both(Tick(0.3f, 15.0f, 2));
             LOG_INFO(Render_Vulkan,
                      "VR grip: adjusting {} ({}, now {} from {}): the weapon is frozen; line the "
                      "controller up with it and release A or B (right trigger = the default "
@@ -5607,12 +5656,12 @@ struct OpenXRPresenter::Impl {
             break;
         }
         case B::AdjustEvent::Save: {
-            const B::AdjustResult r = grip_adjust.Trim(B::C0000::Right, adjust_from,out.p1,out.q1);
-            if(grip_adjust.Faulted())break;
+            const B::AdjustResult r = B::AdjustTrim(B::C0000::Right, adjust_from, grip_adjust.p0,
+                                                    grip_adjust.q0, out.p1, out.q1);
             if (!dry) {
                 B::SetWeaponGrip(adjust_family, &r.trim);
             }
-            PlayInteractionHaptic(feedback);
+            both(Repeat(2, 0.3f, 15.0f, 60.0f, 2));
             LOG_INFO(Render_Vulkan,
                      "VR grip: {} {} after {:.1f} s: the controller turned {:.1f} deg and moved "
                      "{:.1f} cm against the weapon -> {} (was {}){}",
@@ -5625,12 +5674,12 @@ struct OpenXRPresenter::Impl {
             if (!dry) {
                 B::SetWeaponGrip(adjust_family, nullptr);
             }
-            PlayInteractionHaptic(feedback);
+            both(Repeat(3, 0.3f, 15.0f, 60.0f, 2));
             LOG_INFO(Render_Vulkan, "VR grip: {} back on the default grip ({}){}",
                      B::WeaponName(adjust_family), trim_text(B::DefaultWeaponGrip()), dry_text);
             break;
         case B::AdjustEvent::Cancel:
-            PlayInteractionHaptic(feedback);
+            both(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
             LOG_INFO(Render_Vulkan, "VR grip: adjust cancelled ({}), nothing saved", out.why);
             break;
         case B::AdjustEvent::Deny: {
@@ -5645,17 +5694,27 @@ struct OpenXRPresenter::Impl {
             } else if (status.weapon_family < 0) {
                 why = "the weapon in the right hand is unknown";
             }
-            PlayInteractionHaptic(feedback);
+            both(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
             LOG_INFO(Render_Vulkan, "VR grip: A+B held, no adjust: {}", why);
             break;
         }
         case B::AdjustEvent::None:
             break;
         }
-        if(controls&PI_GRIP_SUPPRESS_TRIGGER)in[PhysTriggerR]=false;
-        if(controls&PI_GRIP_SUPPRESS_GRIP)in[PhysGripR]=false;
-        if(controls&PI_GRIP_BLOCK_TRIGGER)blocked[PhysTriggerR]=true;
-        if(controls&PI_GRIP_BLOCK_GRIP)blocked[PhysGripR]=true;
+        if (grip_adjust.Frozen()) {
+            in[PhysTriggerR] = false;
+            in[PhysGripR] = false;
+        } else if (out.event != B::AdjustEvent::None && out.event != B::AdjustEvent::Deny) {
+            // A trigger still held (the reset) only attacks again once released; a held grip
+            // draws the weapon again at once (right_grip=draw) or waits for its release (it would
+            // transform the weapon).
+            blocked[PhysTriggerR] = true;
+            in[PhysTriggerR] = false;
+            if (!VR::GetSettings().right_grip_draw) {
+                blocked[PhysGripR] = true;
+                in[PhysGripR] = false;
+            }
+        }
     }
 
     // VR body feedback (core/vr/body_feedback.h, body_haptics=1): the pose hook's events (a hand
@@ -5667,38 +5726,25 @@ struct OpenXRPresenter::Impl {
         const auto& body = B::GetBodySettings();
         std::array<B::BodyEvent, 16> events{};
         const u32 count = B::PollBodyEvents(events.data(), static_cast<u32>(events.size()));
-        B::GhostFrame frame{};
-        frame.dt = dt;
-        frame.alpha = body.ghost_alpha;
-        frame.body = body.body;
-        frame.ghosts = body.ghost_hands;
-        frame.haptics = body.body_haptics;
-        frame.event_count = count;
-        for (u32 i = 0; i < count; ++i)
-            frame.events[i] = {static_cast<u32>(events[i].kind), events[i].side};
-        B::BodyStatus status{};
-        frame.status_valid = body.body && body.ghost_hands && B::LatestBodyStatus(status);
-        frame.now_ns = B::SteadyNowNs();
-        frame.status_ns = status.steady_ns;
-        frame.driven = status.driven;
-        frame.weight = status.drawn_weight;
-        frame.tracked = status.tracked;
-        frame.detached = status.detached;
-        if (!body_feedback_runtime.Frame(frame)) {
-            ghost_alpha = {};
-            return;
-        }
-        const auto& out = body_feedback_runtime.Output();
-        ghost_alpha = out.alpha;
-        for (u32 i = 0; i < out.command_count; ++i) {
-            const auto& command = out.commands[i];
-            PlayInteractionHaptic(body_feedback_runtime.CommandHaptic(i));
-            if (command.kind == 0) continue;
-            if (grip_adjust.Cancel())
+        for (u32 i = 0; i < count; ++i) {
+            const B::BodyEvent& e = events[i];
+            if (e.kind == B::BodyEventKind::Detached) {
+                if (body.body_haptics && (e.side == 0 || e.side == 1)) {
+                    haptics[static_cast<size_t>(e.side)].Play(Tick(0.1f, 10.0f, 0));
+                }
+                continue;
+            }
+            if (body.body_haptics) {
+                haptics[0].Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
+                haptics[1].Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
+            }
+            if (grip_adjust.Cancel()) {
                 LOG_INFO(Render_Vulkan, "VR grip: adjust cancelled (the body turned off)");
+            }
         }
-        if (!out.ghost_updated)
+        if (!body.body || !body.ghost_hands) {
             return;
+        }
         if (!ghost_logged) {
             ghost_logged = true;
             LOG_INFO(Render_Vulkan,
@@ -5708,11 +5754,22 @@ struct OpenXRPresenter::Impl {
                      overlay.IsActive() ? "drawn by the VR overlay"
                                         : "not drawn (the VR overlay is off)");
         }
+        B::BodyStatus status{};
+        const bool fresh =
+            B::LatestBodyStatus(status) && B::SteadyNowNs() - status.steady_ns < 250'000'000;
         for (size_t side = 0; side < 2; ++side) {
-            if (out.changed[side] && BodyLogEnabled()) {
-                LOG_INFO(Render_Vulkan, "VR ghost: {} hand {} (arm weight {:.2f}{})",
-                         side == 1 ? "R" : "L", out.shown[side] ? "shown" : "hidden",
-                         status.drawn_weight[side], status.detached[side] ? ", detached" : "");
+            const float target =
+                B::GhostTarget(fresh && status.driven, status.tracked[side],
+                               status.drawn_weight[side], status.detached[side], body.ghost_alpha);
+            ghost_alpha[side] = B::GhostFade(ghost_alpha[side], target, body.ghost_alpha, dt);
+            const bool shown = ghost_alpha[side] > 0.01f;
+            if (shown != ghost_shown[side]) {
+                ghost_shown[side] = shown;
+                if (BodyLogEnabled()) {
+                    LOG_INFO(Render_Vulkan, "VR ghost: {} hand {} (arm weight {:.2f}{})",
+                             side == 1 ? "R" : "L", shown ? "shown" : "hidden",
+                             status.drawn_weight[side], status.detached[side] ? ", detached" : "");
+                }
             }
         }
     }
@@ -6316,22 +6373,26 @@ struct OpenXRPresenter::Impl {
     // The gun's recoil on the controller (gun_haptics, x gun_recoil_gain; the presenter's
     // haptic_gain on top): a sharp thump that dies away, longer and heavier for the long guns and
     // the cannons.
-    PiMeleeFeedbackInput GunFeedbackPacket(u32 phase, u32 flags = 0, u32 family = 0,
-                                           bool submitted = true) {
-        const auto& gs = VR::Gun::GetGunSettings();
-        PiMeleeFeedbackInput p{}; p.operation = PI_MF_GUN_FEEDBACK;
-        auto& f = p.gun; f.phase = phase; f.flags = flags; f.family = family;
-        f.gun_haptics = gs.haptics; f.trick_haptics = VR::Tricks::GetTrickSettings().haptics;
-        f.submitted = submitted; f.recoil_gain = gs.recoil_gain; f.variation = melee_variation;
-        f.two_engaged = two_hand_runtime.Engaged(); f.bow_serial = bow_direct_serial;
-        f.bow_up = bow_up; f.bow_phase = static_cast<u32>(ranged_runtime.Phase());
-        f.bow_haptics = VR::Bow::GetBowSettings().haptics; f.bow_hand = bow_hand_i;
-        return p;
-    }
-
-    void PlayGunFeedback(u32 phase, u32 flags, u32 family, bool submitted = true) {
-        const auto out = melee_feedback_runtime.Step(GunFeedbackPacket(phase, flags, family, submitted));
-        PlayInteractionHaptics(out);
+    static HapticPattern GunThump(VR::Gun::Family family, float gain) {
+        using F = VR::Gun::Family;
+        HapticPattern p{};
+        p.priority = 2;
+        p.own = true; // the gunshot owns the gun hand while it plays (no rumble, no hum under it)
+        const float k = std::clamp(gain, 0.0f, 1.5f);
+        switch (family) {
+        case F::Blunderbuss:
+        case F::Rifle:
+        case F::Piercing:
+            return p.Pulse(std::min(1.0f * k, 1.0f), 40.0f).Ramp(0.6f * k, 0.0f, 140.0f);
+        case F::Cannon:
+            return p.Pulse(std::min(1.0f * k, 1.0f), 90.0f).Ramp(0.8f * k, 0.0f, 300.0f);
+        case F::ChurchCannon:
+            return p.Pulse(std::min(0.9f * k, 1.0f), 60.0f).Ramp(0.6f * k, 0.0f, 180.0f);
+        case F::Gatling:
+            return p.Pulse(0.7f * k, 18.0f);
+        default:
+            return p.Pulse(std::min(1.0f * k, 1.0f), 25.0f).Ramp(0.55f * k, 0.0f, 90.0f);
+        }
     }
 
     // One line per wrist-reload attempt (a flick from a still wrist with the chamber empty) and
@@ -6368,141 +6429,282 @@ struct OpenXRPresenter::Impl {
     // game's L2 as before, with only the break tick at the pull; the thump comes with the game's
     // own (late) shot. Every pull is published either way: the barrel-ray hook aims the game's own
     // shot with the grip of its pull. Exactly one route per pull: never a shot and an L2 press.
-    void UpdateGun(const PhysicalState& in, const PhysicalInteractions::QuickOutput& quick, u32& held) {
+    void UpdateGun(const PhysicalState& in, const VR::Quick::Output& quick, u32& held) {
         namespace Cb = VR::Combat;
         namespace Gn = VR::Gun;
         const auto& gs = Gn::GetGunSettings();
+        auto& gun_hand = haptics[0];
         const s64 now = VR::Body::SteadyNowNs();
+        // Simon's Bowblade with its bow in the right hand: the left trigger is the string's
+        // (UpdateBow, which runs later in the frame: hence bow_up, not only the wait); in the left
+        // hand, the bow hand's trigger is the bow's while it is up: never the game's L2 (its
+        // canned bow animation), nor a shot as the bow goes down with it still squeezed (until
+        // let go).
+        bow_l_wait = in[PhysTriggerL] && (bow_l_wait || (bow_hand_i == 0 && bow_up));
+        const bool bow_string = (bow_hand_i == 1 && (bow_up || bow_trigger_wait)) ||
+                                (bow_hand_i == 0 && bow_up) || bow_l_wait;
+        // In the right weapon's two-handed form the left trigger is its special (L2): the game's
+        // canned one only for the weapons in l2_canned; nothing for the others (no animation).
         const s32 right_family = RightFamily();
-        const auto& ts = VR::Tricks::GetTrickSettings();
-        gun_runtime.Configure(ts.l2_canned);
-        Cb::GunStatus st{};
-        const bool have_status = Cb::LatestGunStatus(st);
-        // The endpoint reads only event_count entries. Ordinary frames do not initialize
-        // or copy the unused event storage.
-        PiGunInput packet;
-        packet.facts = {};
-        auto& f = packet.facts;
-        f.now_ns = now; f.status_ns = st.ns; f.player_since_ns = st.player_since_ns;
-        f.confirmed_shot_ns = Cb::LatestGunShotNs(); f.space = grip_located_space;
-        f.player_epoch = st.player_epoch; f.family = st.family;
-        f.in_hand = st.in_hand; f.direct_ok = st.direct_ok; f.ready = st.ready;
-        f.can_fire = st.can_fire; f.aim = st.aim; f.cadence_s = st.cadence_s;
-        f.fire_direct = gs.fire_direct; f.wrist_reload = gs.wrist_reload; f.haptics = gs.haptics;
-        f.trigger = in[PhysTriggerL]; f.quick_block = quick.block_l2; f.quick_press = quick.l2_press;
-        f.bow_up = bow_up; f.bow_trigger_wait = bow_trigger_wait; f.bow_hand = bow_hand_i;
-        f.admission.enabled = 1; f.admission.have_status = have_status;
-        f.admission.two_status_ok = two_hand_status_ok; f.admission.style = two_hand_status.style;
-        f.admission.right_family = right_family; f.admission.right_grip_ready = right_grip_ready;
-        f.admission.right_form_b = RightFormB(); f.admission.saw_spin = ts.saw_spin;
-        f.two_engaged = two_hand_runtime.Engaged();
-        f.reload_pose_valid = grip_left_located.orientation_valid && grip_left_located.orientation_tracked;
-        f.reload_raw.mode = PI_RELOAD_NEAR_RAW;
-        f.reload_raw.head_valid = grip_head_tracked;
-        f.reload_raw.head = {grip_head_p.x,grip_head_p.y,grip_head_p.z};
-        f.reload_raw.head_q = {grip_head_q.x,grip_head_q.y,grip_head_q.z,grip_head_q.w};
-        f.reload_raw.height_offset_m = VR::HeightBodyOffsetM();
-        f.grip = PhysicalInteractions::PackHand(grip_left_located);
-        if (!f.reload_pose_valid) f.grip.q = {0,0,0,1};
-        std::array<Cb::GunEvent,64> events{};
-        PiGunDeliveryResult delivered{};
-        bool reconcile_only = false;
-        const bool have_delivered = gun_delivery.Poll(delivered,&reconcile_only);
-        packet.event_count = gun_runtime.PollRefusal(events[0]) ? 1 : 0;
-        const u32 delivered_index = packet.event_count;
-        if (have_delivered) {
-            events[packet.event_count] = {static_cast<Cb::GunEventKind>(delivered.kind),delivered.controller_serial,
-                static_cast<u8>(delivered.family),delivered.value,delivered.now_ns,delivered.reason};
-            ++packet.event_count;
-        }
-        packet.event_count += Cb::PollGunEvents(events.data()+packet.event_count,
-            static_cast<u32>(events.size())-packet.event_count);
-        if(gun_delivery.Pending()) {
-            f.force_wait = 1;
-            if(interaction_dll_fault) f.quick_block = 1;
-        }
-        for(u32 i=0;i<packet.event_count;++i) packet.events[i] = VR::Interactions::GunRuntime::Event(events[i]);
-        if(have_delivered && reconcile_only)
-            packet.events[delivered_index].flags = PI_GUN_RECONCILE_ONLY;
-        const auto& result = gun_runtime.Update(packet);
-        if (const auto& a = result.reload_attempt; a.valid) {
-            LogReloadAttempt({static_cast<Gn::ReloadEnd>(a.end), a.near_body != 0, a.peak,
-                a.turn, a.ms, a.need, a.near_inferred != 0, a.near_close != 0, a.closest}, now);
-        }
-        gun_shot_ns = result.shot_ns;
-        Gn::PublishReloadAudio(Gn::ReloadCue::None,gs.wrist_reload,now);
-        for(u32 i=0;i<result.event_count;++i) {
-            const auto& e = events[i]; const auto& decision = result.events[i];
-            const auto family = static_cast<Gn::Family>(e.family);
-            if (decision.flags) PlayGunFeedback(PI_GF_EVENT, decision.flags, e.family);
-            if(decision.flags & PI_GUN_HANDOFF_PRESS) {
-                const bool identified = have_delivered && i == delivered_index && delivered.kind == 3;
-                const bool can_issue = !identified || gun_delivery.BeginHandoff();
-                const bool accepted = can_issue && pad.Press(PadButton::L2);
-                if(identified && can_issue) gun_delivery.AckHandoff(accepted);
-                if(!accepted) LOG_INFO(Render_Vulkan,"VR gun: L2 press for pull {} dropped (input suppressed or cancelled)",e.serial);
+        const bool special = two_hand_status_ok &&
+                             two_hand_status.style == VR::TwoHand::StyleTwoHanded &&
+                             right_family >= 0;
+        const auto* weapon = special ? VR::Body::Weapons::FindFamily(right_family) : nullptr;
+        const bool canned =
+            right_family != VR::Tricks::SawFamily && weapon != nullptr &&
+            VR::Tricks::InKeyList(VR::Tricks::GetTrickSettings().l2_canned, weapon->key);
+        const bool no_special = special && !canned && !bow_string;
+        // A pull of it: a soft no in the hand, never silence (the saw's spin is its own).
+        const bool l_press = in[PhysTriggerL] && !l2_trigger_prev;
+        l2_trigger_prev = in[PhysTriggerL];
+        if (no_special && l_press && !quick.block_l2 &&
+            !(right_family == VR::Tricks::SawFamily && VR::Tricks::GetTrickSettings().saw_spin)) {
+            if (VR::Tricks::GetTrickSettings().haptics) {
+                haptics[0].Play(Tick(0.12f, 10.0f, 0));
             }
-            if(have_delivered && i == delivered_index && delivered.kind == 3 &&
-               !(decision.flags & PI_GUN_HANDOFF_PRESS)) gun_delivery.RejectHandoff();
-            if(decision.flags & PI_GUN_HANDOFF_OLD)
-                LOG_INFO(Render_Vulkan,"VR gun: L2 for pull {} dropped ({} ms old)",e.serial,(now-e.ns)/1'000'000);
-            if(decision.flags & PI_GUN_MISMATCH)
-                LOG_INFO(Render_Vulkan,"VR gun: predicted recoil for pull {}, game result {} ({}) ({} mismatches)",
-                         e.serial,static_cast<int>(e.kind),e.why?e.why:"",decision.mismatches);
+            LOG_INFO(Render_Vulkan,
+                     "VR gun: the left trigger in {}'s two-handed form: nothing (its special is "
+                     "the game's canned L2; add it to l2_canned to play it)",
+                     VR::Body::WeaponName(right_family));
         }
-        if (result.feedback_plan & 1u) PlayGunFeedback(PI_GF_BEFORE_SUBMIT, result.flags, st.family);
-        if(result.flags & PI_GUN_NO_SPECIAL) {
-            LOG_INFO(Render_Vulkan,"VR gun: the left trigger in {}'s two-handed form has no configured special",VR::Body::WeaponName(right_family));
+        // The left hand the right grip freed (for the handle, the hilt) holds no gun meanwhile.
+        const bool freed = right_grip_ready && VR::Tricks::GripUseOf(right_family, RightFormB()) ==
+                                                   VR::Tricks::GripUse::Free;
+        const bool freed_pull = freed && in[PhysTriggerL] && !freed_trigger_down && !bow_string;
+        freed_trigger_down = freed && in[PhysTriggerL];
+        if (freed_pull) {
+            if (VR::Tricks::GetTrickSettings().haptics) {
+                haptics[0].Play(Tick(0.12f, 10.0f, 0)); // a soft no: the hand is free
+            }
+            LOG_INFO(Render_Vulkan, "VR gun: no shot: the left hand is free for the weapon "
+                                    "(squeeze the right grip again to take the gun back)");
         }
-        if(result.flags & PI_GUN_FREED_NO) {
-            LOG_INFO(Render_Vulkan,"VR gun: no shot: the left hand is free for the weapon");
+        // A trigger held while the left hand had no gun (freed, on the weapon's handle, a
+        // two-handed form's special) stays none until let go: a full-hand grab presses the trigger
+        // too, and the hand taking the gun back mid-squeeze must never fire it.
+        // An empty left hand punches through motion only. Keep two-handed weapon specials
+        // on their existing route; the unused left equipment slot can be empty in that form.
+        VR::Body::BodyStatus body{};
+        const bool unarmed = !special && VR::Body::LatestBodyStatus(body) &&
+                             now - body.steady_ns < 250'000'000 &&
+                             body.left_weapon_family == 10; // Bare Fists
+        const bool no_gun = unarmed || freed || no_special || (two_hand.Engaged() && !canned);
+        gun_trigger_wait = in[PhysTriggerL] && (gun_trigger_wait || no_gun);
+        const bool gun = in[PhysTriggerL] && !quick.block_l2 && !bow_string && !gun_trigger_wait;
+        const bool pulled = gun && !trigger_l_down;
+        Cb::GunStatus st{};
+        const bool fresh = Cb::LatestGunStatus(st) && now - st.ns < 200'000'000;
+        const auto family = static_cast<Gn::Family>(st.family);
+        reload_mode.Observe(fresh, family);
+        const bool reload_chamber = reload_mode.UsesChamber();
+        const bool reload_enabled = Gn::WristReloadEnabled(gs.wrist_reload, VR::IsFirstPerson());
+        if (fresh && st.player_epoch != reload_player_epoch) {
+            wrist_reload.Reset();
+            reload_player_epoch = st.player_epoch;
+            reload_seen_shot_ns = 0;
         }
-        if(result.flags & PI_GUN_RELOADED) {
-            Gn::PublishReloadAudio(Gn::ReloadCue::Reload,true,now);
+        wrist_reload.SetEnabled(reload_enabled);
+        Gn::PublishReloadAudio(Gn::ReloadCue::None, reload_enabled, now);
+        // Gameplay state cannot depend on the lossy haptic/log queue. Observe the latest
+        // confirmed shot before accepting input, including after menus and queue overflow.
+        const s64 confirmed_shot_ns = Cb::LatestReloadShotNs();
+        if (confirmed_shot_ns > reload_seen_shot_ns && confirmed_shot_ns <= now) {
+            reload_seen_shot_ns = confirmed_shot_ns;
+            if (reload_enabled && confirmed_shot_ns >= st.player_since_ns) {
+                wrist_reload.Shot(confirmed_shot_ns);
+            }
         }
-        if(result.flags & PI_GUN_EMPTY_REJECT) {
-            Gn::PublishReloadAudio(Gn::ReloadCue::Empty,true,now);
+        // The game's answers.
+        std::array<Cb::GunEvent, 64> events{};
+        const u32 count = Cb::PollGunEvents(events.data(), static_cast<u32>(events.size()));
+        for (u32 i = 0; i < count; ++i) {
+            const Cb::GunEvent& e = events[i];
+            const auto f = static_cast<Gn::Family>(e.family);
+            const bool predicted = e.serial != 0 && e.serial == gun_predicted;
+            if (reload_enabled && e.ns >= st.player_since_ns && now >= e.ns) {
+                if (e.kind == Cb::GunEventKind::Denied || e.kind == Cb::GunEventKind::Dry ||
+                           (e.kind == Cb::GunEventKind::Fired && e.a <= 0)) {
+                    wrist_reload.Denied(e.serial);
+                }
+            }
+            switch (e.kind) {
+            case Cb::GunEventKind::Fired:
+                gun_next_ready_ns = std::max(
+                    gun_next_ready_ns, e.ns + static_cast<s64>(st.cadence_s * 1e9f) - 20'000'000);
+                if (!predicted && gs.haptics) {
+                    gun_hand.Play(GunThump(f, gs.recoil_gain)); // a buffered shot: thump now
+                }
+                if (!predicted) {
+                    gun_shot_ns = now;
+                }
+                break;
+            case Cb::GunEventKind::Dry:
+                if (gs.haptics && e.serial != gun_dry_clicked) {
+                    gun_hand.Play(
+                        HapticPattern{}.Pulse(0.25f, 8.0f).Gap(50.0f).Pulse(0.25f, 8.0f));
+                }
+                break;
+            case Cb::GunEventKind::Denied:
+                if (gs.haptics && !predicted) {
+                    gun_hand.Play(Tick(0.12f, 10.0f));
+                }
+                break;
+            case Cb::GunEventKind::Vanilla:
+                // A delayed direct-fire fallback must obey the current hand's trigger gate too.
+                if (no_gun || gun_trigger_wait) {
+                    break;
+                }
+                if (now - e.ns > 500'000'000) {
+                    LOG_INFO(Render_Vulkan, "VR gun: L2 for pull {} dropped ({} ms old)", e.serial,
+                             (now - e.ns) / 1'000'000);
+                } else if (!wrist_reload.Empty() && !pad.Press(PadButton::L2)) {
+                    LOG_INFO(Render_Vulkan, "VR gun: L2 press for pull {} dropped (input "
+                                            "suppressed)",
+                             e.serial);
+                }
+                break;
+            case Cb::GunEventKind::GameShot:
+                if (gs.haptics) {
+                    gun_hand.Play(GunThump(f, gs.recoil_gain));
+                }
+                gun_shot_ns = now;
+                break;
+            case Cb::GunEventKind::ToolBurst:
+                // The Augur's burst leaves the left hand (tool_aim): a heavy push out of the palm.
+                if (VR::Tricks::GetTrickSettings().haptics) {
+                    HapticPattern p{};
+                    p.priority = 2;
+                    haptics[0].Play(p.Pulse(0.8f, 30.0f).Ramp(0.5f, 0.0f, 220.0f));
+                }
+                break;
+            }
+            if (predicted && e.kind != Cb::GunEventKind::Fired) {
+                ++gun_mismatches;
+                gun_predicted = 0;
+                gun_next_ready_ns = 0;
+                LOG_INFO(Render_Vulkan,
+                         "VR gun: haptic mismatch: pull {} thumped at the pull, the game said {} "
+                         "({}) ({} so far)",
+                         e.serial,
+                         e.kind == Cb::GunEventKind::Dry      ? "empty"
+                         : e.kind == Cb::GunEventKind::Denied ? "denied"
+                                                              : "the game's L2",
+                         e.why != nullptr ? e.why : "", gun_mismatches);
+            } else if (predicted) {
+                gun_predicted = 0;
+            }
         }
-        bool feedback_submitted = true;
-        if(result.flags & PI_GUN_SEND) {
+        const bool reload_weapon = reload_chamber && fresh && st.family != 0 &&
+                                   !special && !no_gun && !bow_string;
+        const bool same_space = reload_space_serial == grip_located_space;
+        reload_space_serial = grip_located_space;
+        // The flick is the wrist's: only the orientation must be tracked (a position the runtime
+        // only infers, a controller held low or against the torso, no longer cancels it: until
+        // 2026-10-15 it did, through IsTracked, so a reload near the body rarely got through).
+        // Near the body (or the position inferred) the flick needs a faster peak (NearBody).
+        const bool orientation_ok =
+            grip_left_located.orientation_valid && grip_left_located.orientation_tracked;
+        const bool reload_ok = reload_enabled && reload_weapon && st.in_hand &&
+                               !quick.block_l2 && same_space;
+        reload_near.Update(grip_left_located.position_valid && grip_left_located.position_tracked,
+                           grip_left_located.p, grip_head_tracked, grip_head_p, grip_head_q,
+                           VR::PlayerBody::BodyScaleFor(VR::HeightBodyOffsetM()));
+        if (wrist_reload.Step(now, grip_left_located.q, reload_ok && orientation_ok,
+                              in[PhysTriggerL], reload_near.Sample(),
+                              reload_ok ? VR::Gun::ReloadEnd::OrientationLost
+                                        : VR::Gun::ReloadEnd::Blocked)) {
+            Gn::PublishReloadAudio(Gn::ReloadCue::Reload, true, now);
+            if (gs.haptics) gun_hand.Play(Tick(0.3f, 20.0f));
+        }
+        if (VR::Gun::ReloadAttempt attempt{}; wrist_reload.TakeAttempt(attempt)) {
+            LogReloadAttempt(attempt, now);
+        }
+        const bool reload_scope = reload_enabled && reload_chamber && !special && !bow_string && !no_gun &&
+                                  (!fresh || st.family != 0);
+        const bool requested = pulled || (quick.l2_press && !no_gun);
+        const bool reload_block = requested && reload_scope && wrist_reload.RejectPull();
+        if (requested && reload_block && wrist_reload.Empty()) {
+            Gn::PublishReloadAudio(Gn::ReloadCue::Empty, true, now);
+            if (gs.haptics) gun_hand.Play(Tick(0.2f, 8.0f));
+        }
+        if (requested && !reload_block) {
+            const bool direct = gs.fire_direct && fresh && st.direct_ok;
+            if (pulled) {
+                gun_route_direct = direct; // a held pull keeps its route until released
+            }
             Cb::GunPull pull{};
-            pull.serial = result.request_serial; pull.direct = result.direct;
-            pull.press_ns = now; pull.grip_valid = VR::Body::IsTracked(grip_left_located);
-            pull.grip_q = grip_left_located.q; pull.grip_p = grip_left_located.p;
+            pull.serial = ++gun_serial;
+            pull.direct = direct;
+            pull.press_ns = now;
+            pull.grip_valid = VR::Body::IsTracked(grip_left_located);
+            pull.grip_q = grip_left_located.q;
+            pull.grip_p = grip_left_located.p;
             pull.space_serial = grip_located_space;
-            bool submitted = true;
-            if (pull.direct && gun_delivery.Bound()) {
-                VR::Quick::Snapshot actor{};
-                PiGunDeliveryRequest request{};
-                if (!VR::Quick::LatestSnapshot(actor) || !actor.valid || !actor.character_generation ||
-                    now < actor.steady_ns || now - actor.steady_ns > 300'000'000) {
-                    submitted = false;
-                } else {
-                    request.session = interaction_module.Session();
-                    request.request_id = VR::Quick::NextInteractionRequestId();
-                    request.character_generation = actor.character_generation;
-                    request.controller_serial = pull.serial; request.family = st.family;
-                    request.attach = st.attach; request.press_ns = pull.press_ns;
-                    request.space = pull.space_serial; request.grip_valid = pull.grip_valid;
-                    const auto q = pull.grip_valid ? pull.grip_q : VR::Body::Quat{};
-                    const auto p = pull.grip_valid ? pull.grip_p : VR::Body::Vec3{};
-                    request.grip_q[0]=q.x;request.grip_q[1]=q.y;request.grip_q[2]=q.z;request.grip_q[3]=q.w;
-                    request.grip_p[0]=p.x;request.grip_p[1]=p.y;request.grip_p[2]=p.z;
-                    submitted = gun_delivery.Submit(request);
+            Cb::PublishGunPull(pull);
+            // Vanilla dry fire does not send a shot/denial event. Do not reserve the
+            // chamber for it (or for a vanilla path whose shot observer is unavailable).
+            if (reload_enabled && reload_weapon && (direct || (st.aim && st.can_fire))) {
+                wrist_reload.Request(pull.serial, now);
+            }
+            const bool feel = gs.haptics;
+            if (direct) {
+                const bool predict = st.ready && now >= gun_next_ready_ns;
+                if (predict) {
+                    gun_predicted = pull.serial;
+                    gun_next_ready_ns = now + static_cast<s64>(st.cadence_s * 1e9f);
+                    gun_shot_ns = now; // its hit tick (UpdateRangedHits)
+                    if (feel) {
+                        gun_hand.Play(GunThump(family, gs.recoil_gain));
+                        if (family == Gn::Family::Cannon) {
+                            haptics[1].Play(Tick(0.5f * gs.recoil_gain, 60.0f, 2));
+                        }
+                    }
+                } else if (!st.can_fire) {
+                    gun_dry_clicked = pull.serial; // the empty click now, not again on the answer
+                    if (feel) {
+                        gun_hand.Play(
+                            HapticPattern{}.Pulse(0.25f, 8.0f).Gap(50.0f).Pulse(0.25f, 8.0f));
+                    }
+                } else if (feel) {
+                    gun_hand.Play(Tick(0.15f, 8.0f)); // the trigger break; the shot answers
                 }
-                if(!submitted) {
-                    if(!gun_delivery.HasReadyFor(pull.serial)) gun_runtime.Refuse(pull.serial,st.family,now);
-                    LOG_INFO(Render_Vulkan,"VR gun: pull {} not queued (busy or stale actor)",pull.serial);
+                LOG_INFO(Render_Vulkan,
+                         "VR gun: pull {} direct ({}{}, status {} ms old: ready {} cooldown "
+                         "{:.3f} s bullets {}){}",
+                         pull.serial, Gn::FamilyName(family),
+                         pulled ? "" : ", a tap the quick items gave back",
+                         (now - st.ns) / 1'000'000, st.ready ? 1 : 0, st.cooldown_left_s,
+                         st.can_fire ? "yes" : "no", predict ? " thump now" : "");
+            } else {
+                if (quick.l2_press && !pad.Press(PadButton::L2)) {
+                    LOG_INFO(Render_Vulkan, "VR quick: L2 press dropped (input suppressed)");
                 }
-            } else Cb::PublishGunPull(pull);
-            feedback_submitted = submitted;
-            LOG_INFO(Render_Vulkan,"VR gun: pull {} -> {} (status {} ms old)",pull.serial,
-                     pull.direct?"direct":"L2",(now-st.ns)/1'000'000);
+                if (feel && fresh && st.aim) {
+                    gun_hand.Play(Tick(0.15f, 8.0f)); // the bang's thump comes with the shot
+                } else if (feel) {
+                    // No barrel-ray hook to report the game's shot: the old press pattern.
+                    HapticPattern p{};
+                    p.priority = 2;
+                    p.own = true;
+                    gun_hand.Play(p.Pulse(1.0f, 45.0f).Ramp(0.4f, 0.0f, 120.0f));
+                    gun_shot_ns = now;
+                }
+                if (gs.fire_direct) {
+                    LOG_INFO(Render_Vulkan, "VR gun: pull {} -> L2 ({})", pull.serial,
+                             !fresh             ? "no game status"
+                             : st.family == 0   ? "no gun in the left hand"
+                                                : "not a direct-fire gun, or held two-handed");
+                }
+            }
         }
-        if (result.feedback_plan & 2u) PlayGunFeedback(PI_GF_AFTER_SUBMIT, result.flags, st.family, feedback_submitted);
-        if((result.flags & PI_GUN_VANILLA_PRESS) && !pad.Press(PadButton::L2))
-            LOG_INFO(Render_Vulkan,"VR quick: L2 press dropped (input suppressed)");
-        if(result.flags & PI_GUN_L2_HELD) held |= static_cast<u32>(PadButton::L2);
+        if (!gun) {
+            gun_route_direct = false;
+        }
+        trigger_l_down = gun;
+        if (gun && !gun_route_direct &&
+            !(reload_scope && wrist_reload.BlocksHeldTrigger())) {
+            held |= static_cast<u32>(PadButton::L2);
+        }
 
     }
 
@@ -6615,42 +6817,92 @@ struct OpenXRPresenter::Impl {
         // arc; 2 = the click latches the sprint and A leaps or dodges while sprinting
         // (core/vr/left_locomotion.h, UpdateLocomotion), Y held is the modifier and its tap the
         // arc's Y press (y_menu: Options, UpdateYGesture).
-        // Sample logical inputs once; the DLL owns click, modifier and Y+X histories.
-        const bool inject = !classic && settings.inject && PhysicalVialEnabled();
+        const bool scheme2 = !classic && settings.left_scheme == 2;
+        // Motion controls: X arms a Blood Vial for self-injection (X again disarms; held, nothing
+        // more: never Triangle); classic or inject=0: X is the game's vial button (Triangle).
+        // y_menu, where the arc cannot answer: X pressed with Y held is the game's Square
+        // instead (y_x_combo, below).
+        const bool inject = !classic && settings.inject;
         const auto& quick_settings = VR::Quick::GetQuickSettings();
-        PiThumbFacts thumb_facts{};
-        thumb_facts.classic=classic;thumb_facts.left_scheme=settings.left_scheme;
-        thumb_facts.arc_l3=quick_settings.arc_l3;thumb_facts.tap_ms=quick_settings.l3_tap_ms;
-        thumb_facts.left_y_bound=left_y_bound;thumb_facts.y_menu_now=y_menu_now;
-        thumb_facts.y_spent=y_gesture.Spent();thumb_facts.quick_arc_ready=quick_arc_ready;
-        thumb_facts.stick_l=in[PhysStickL];thumb_facts.a=in[PhysA];thumb_facts.y=in[PhysY];
-        thumb_facts.x=in[PhysX];thumb_facts.x_press=in_press[PhysX];
-        thumb_facts.move[0]=move.x;thumb_facts.move[1]=move.y;thumb_facts.dt=dt;
-        const auto side=[this](TC control){return VR::Thumbs::HandFor(control,thumbs_swapped)==VR::Thumbs::Hand::Right?2u:1u;};
-        thumb_facts.left_side=side(TC::ClickL);thumb_facts.y_side=side(TC::Y);
-        const auto thumb=whip_transform_hold.Thumb(PI_WEAPON_INPUT_THUMB_LEFT,thumb_facts);
-        const bool scheme2=(thumb.flags&PI_THUMB_SCHEME2)!=0;
-        const bool y_menu=(thumb.flags&PI_THUMB_Y_MENU)!=0;
-        const bool modifier=(thumb.flags&PI_THUMB_MODIFIER)!=0;
-        const auto& l3=thumb.l3;const auto& ymod=thumb.ymod;
-        if(l3.l3 && !l3.jump){
-            const bool sent=pad.Press(PadButton::L3);
-            LOG_INFO(Render_Vulkan,"VR input: {} released after {:.0f} ms with no combo: L3{}",
-                ThumbName(TC::ClickL),l3.held_s*1000.f,sent?"":" dropped (input suppressed)");
+        const float tap_max_s = quick_settings.l3_tap_ms * 0.001f;
+        // Left stick click, left_scheme=1 (core/vr/stick_click.h): pressed while sprinting (A
+        // held, the stick past half way) it leaps at once (UpdateLocomotion: the game's jump is a
+        // Circle tap, it has no L3 jump); held it is the modifier for the right stick, B and Y; a
+        // tap (released with no combo) toggles the quick-item arc like Y (quick_arc_l3, below: the
+        // thumb stays on the stick, so the hunter keeps walking), or is L3 to the game where the
+        // arc cannot answer it (quick_arc_l3=0, a hold past quick_arc_l3_tap_ms, the classic
+        // layout, third person, a cinematic). Decided before the quick items so the tap reaches
+        // them this frame.
+        const VR::StickClick::Config click_config{quick_settings.arc_l3 && !scheme2, tap_max_s};
+        VR::StickClick::Out l3{};
+        if (!scheme2) {
+            l3 = l3_click.Update(click_config, {in[PhysStickL],
+                                                in[PhysA] && std::hypot(move.x, move.y) > 0.5f,
+                                                dt});
+            if (l3.l3 && !l3.jump) {
+                const bool sent = pad.Press(PadButton::L3);
+                LOG_INFO(Render_Vulkan,
+                         "VR input: {} released after {:.0f} ms with no combo: L3{}",
+                         ThumbName(TC::ClickL), l3.held_s * 1000.0f,
+                         sent ? "" : " dropped (input suppressed)");
+            }
+        } else if (l3_click.Down()) {
+            l3_click.Reset();
         }
-        const char* const modifier_name=ThumbName(scheme2?TC::Y:TC::ClickL);
-        auto& modifier_hand=ThumbHaptics(scheme2?TC::Y:TC::ClickL);
-        const auto note_combo=[this,scheme2]{
-            whip_transform_hold.NoteThumb(scheme2?1:0);
-            if(scheme2)y_gesture.NoteCombo();
+        // Y, left_scheme=2: held it is the modifier of the gestures (+ B); a tap (released within
+        // quick_arc_l3_tap_ms with no combo) is the arc's Y press (open, close, put an item away,
+        // disarm a vial), or the game's Square where the arc cannot answer it (as Y was there).
+        // y_menu (SteamVR by default: its dashboard owns Menu): the tap is Options, the hold the
+        // recenter and the long hold the flat screen's escape instead (UpdateYGesture in
+        // UpdateInput, every context). Hold Y + right stick (the D-pad) and hold Y + X (the
+        // game's Square) are gone since 2026-10-15 (feedback: the arc reaches every item, the
+        // shoulders and the right stick click + right stick the weapons, the right stick and its
+        // click + right stick the items and the bullets): Y held, X and the right stick do their
+        // own jobs and only make the hold a combo (no arc, no menu); y_menu keeps Y + X as Square
+        // where the arc cannot answer (y_x_combo, below).
+        const bool y_menu = scheme2 && y_menu_now;
+        VR::StickClick::Out ymod{};
+        if (scheme2) {
+            // A controller without Y (the WMR trackpad clicks): the left stick click held with
+            // the stick centred is the modifier (no tap there: the click arms the sprint latch).
+            const bool click_mod = !left_y_bound && in[PhysStickL] &&
+                                   std::hypot(move.x, move.y) < 0.25f;
+            ymod = y_click.Update({left_y_bound && !y_menu, tap_max_s},
+                                  {in[PhysY] || click_mod, false, dt});
+            // A combo, the recenter or the escape spent the held Y (UpdateYGesture, earlier this
+            // frame): its release is no arc tap (noted after the click's update, whose press
+            // would forget it).
+            if (y_gesture.Spent()) {
+                y_click.NoteCombo();
+            }
+        } else if (y_click.Down()) {
+            y_click.Reset();
+        }
+        const bool modifier = scheme2 ? ymod.modifier : l3.modifier;
+        const char* const modifier_name = ThumbName(scheme2 ? TC::Y : TC::ClickL);
+        auto& modifier_hand = ThumbHaptics(scheme2 ? TC::Y : TC::ClickL);
+        const auto note_combo = [this, scheme2] {
+            (scheme2 ? y_click : l3_click).NoteCombo();
+            if (scheme2) {
+                y_gesture.NoteCombo();
+            }
         };
-        y_x_combo=(thumb.flags&PI_THUMB_Y_X)!=0; // copied frame output, no host recognizer
-        if(thumb.flags&PI_THUMB_NOTE_Y)y_gesture.NoteCombo();
-        PlayInteractionHaptics(thumb);
-        if(thumb.flags&PI_THUMB_Y_X_STARTED){
+        // y_menu, where the arc cannot answer (third person, body=0, quick_arc=0, no quick-item
+        // state): X pressed with Y held is the game's Square until X is let go (through the
+        // quick items as L3 + Y was: it arms no vial, even when Y is let go first), as Y's tap
+        // was there before Y became the menu. Only X's press counts (in_press, UpdateInput's
+        // edges): X held first (a vial armed), then Y, is no Square on top of it. Everywhere
+        // else (and without y_menu, Meta Link by default) X is X.
+        const bool y_x_was = y_x_combo;
+        y_x_combo = y_menu && in[PhysX] &&
+                    (y_x_combo || (ymod.modifier && in_press[PhysX] && !quick_arc_ready));
+        if (y_x_combo && !y_x_was) {
+            note_combo();
+            modifier_hand.Play(Tick(0.2f, 12.0f, 0));
             LOG_INFO(Render_Vulkan,
-                "VR input: {} + {}: the game's Square (y_menu: the quick-item arc cannot answer here)",
-                ThumbName(TC::Y),ThumbName(TC::X));
+                     "VR input: {} + {}: the game's Square (y_menu: the quick-item arc cannot "
+                     "answer here)",
+                     ThumbName(TC::Y), ThumbName(TC::X));
         }
         // Circle: the sprint, the dodge, A's leap and the second click.
         UpdateLocomotion(in, move, scheme2, l3.jump, held, axes, dt);
@@ -6678,7 +6930,7 @@ struct OpenXRPresenter::Impl {
             UpdateTwoHand(in, left, right, gesture, dt);
         }
         UpdateHandTransform(in, left, right, gesture, dt);
-        const PhysicalInteractions::QuickOutput& quick = UpdateQuickItems(qin, left, gesture, dt, arc_tap);
+        const VR::Quick::Output& quick = UpdateQuickItems(qin, left, gesture, dt, arc_tap);
         // The Tiny Music Box in the left hand frees the right one (quick_music_box_crank): this
         // frame's transform and swings below already see it, and its putting away.
         UpdateMusicBox(left, right, dt);
@@ -6725,8 +6977,8 @@ struct OpenXRPresenter::Impl {
         } else if (vial_armed) {
             DisarmVial();
         }
-        if (!scheme2 && modifier && quick.square_hold && !whip_transform_hold.ThumbSnapshot().click[0].used) {
-            whip_transform_hold.NoteThumb(0); // L3 + Y was the game's Square: no L3 or tap on the release
+        if (!scheme2 && modifier && quick.square_hold && !l3_click.Used()) {
+            l3_click.NoteCombo(); // L3 + Y was the game's Square: no L3 or tap on the release
             LOG_INFO(Render_Vulkan, "VR input: {} + {}: the game's Square", ThumbName(TC::ClickL),
                      ThumbName(TC::Y));
         }
@@ -6738,30 +6990,75 @@ struct OpenXRPresenter::Impl {
         // (the left stick click) is held so L3 + R3 can be a chord. left_scheme=2: Y held has no
         // right stick combo since 2026-10-15, so the click does its own job (lock-on, + the stick:
         // the D-pad) and only spends Y's tap / hold.
-        PiThumbFacts right_facts{};right_facts.classic=classic;right_facts.scheme2=scheme2;
-        right_facts.modifier=modifier;right_facts.arc_l3=(thumb.flags&PI_THUMB_ARC_CONFIG)!=0;
-        right_facts.click_r=in[PhysStickR];right_facts.look[0]=look.x;right_facts.look[1]=look.y;
-        right_facts.dt=dt;right_facts.right_side=side(TC::ClickR);
-        const auto r3=whip_transform_hold.Thumb(PI_WEAPON_INPUT_THUMB_RIGHT_OWNED,right_facts);
-        if(r3.flags&PI_THUMB_NOTE_Y)y_gesture.NoteCombo();
-        hold(PadButton::R3,(r3.flags&PI_THUMB_HOLD_R3)!=0);
-        if(r3.flags&PI_THUMB_TAP_R3){
-            if(!pad.Press(PadButton::R3))LOG_INFO(Render_Vulkan,"VR input: R3 tap dropped (input suppressed)");
-            else LOG_INFO(Render_Vulkan,"VR input: {} tap ({:.0f} ms): R3 (lock on)",ThumbName(TC::ClickR),r3.r3_time*1000.f);
+        const bool click = in[PhysStickR];
+        const float look_push = std::max(std::abs(look.x), std::abs(look.y));
+        if (click && !r3_down) {
+            r3_to_game = VR::YMenu::RightClickToGame(modifier, scheme2);
+            if (modifier && (scheme2 || click_config.arc)) {
+                // Both stick clicks (the start of the layout switch chord, or a slip), or Y with
+                // the right stick click (left_scheme=2): the modifier's release is no tap.
+                note_combo();
+            }
+            r3_time = 0.0f;
+            r3_used = r3_switched = false;
+            if (!classic && look_push >= 0.35f) {
+                // A click during a flick or a smooth turn (the thumb pressing down on the way):
+                // the stick must centre before a push selects a weapon, so it never switches one.
+                // Pressed at a flick's peak (past the switch threshold) it is no lock-on either.
+                stick_armed = false;
+                r3_used = look_push > 0.7f;
+            }
         }
-        PlayInteractionHaptics(r3);
-        if(r3.flags&PI_THUMB_DENY_R3)LOG_INFO(Render_Vulkan,
-            "VR input: {} released after {:.2f} s{}: no lock-on (a tap is under {:.1f} s with the stick left alone)",
-            ThumbName(TC::ClickR),r3.r3_time,r3.r3_used?" with the stick pushed":"",R3TapSeconds);
+        if (classic) {
+            hold(PadButton::R3, click && r3_to_game);
+        } else if (click) {
+            r3_time += dt;
+            // A push from the centre past the switch threshold after the click: not a tap (the
+            // tail of a flick the click came with, or a slight deflection, does not count).
+            r3_used = r3_used || (stick_armed && look_push > 0.7f);
+        } else if (r3_down && r3_to_game) {
+            stick_armed = false; // a stick still pushed must centre before it turns
+            if (!r3_used && r3_time <= R3TapSeconds) {
+                if (!pad.Press(PadButton::R3)) {
+                    LOG_INFO(Render_Vulkan, "VR input: R3 tap dropped (input suppressed)");
+                } else {
+                    LOG_INFO(Render_Vulkan, "VR input: {} tap ({:.0f} ms): R3 (lock on)",
+                             ThumbName(TC::ClickR), r3_time * 1000.0f);
+                }
+            } else if (!r3_switched) {
+                // Neither a lock-on nor a weapon switch: felt, not silent.
+                ThumbHaptics(TC::ClickR).Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
+                LOG_INFO(Render_Vulkan,
+                         "VR input: {} released after {:.2f} s{}: no lock-on (a tap "
+                         "is under {:.1f} s with the stick left alone)",
+                         ThumbName(TC::ClickR), r3_time, r3_used ? " with the stick pushed" : "",
+                         R3TapSeconds);
+            }
+        }
+        r3_down = click;
+        const bool r3_switch = !classic && click && r3_to_game;
 
         // B = Cross (interact). Modifier + B: tap = touchpad left (gestures), hold 0.6 s =
         // touchpad right.
-        PiThumbFacts b_facts{};b_facts.b=in[PhysB];b_facts.modifier=modifier;
-        b_facts.scheme2=scheme2;b_facts.dt=dt;
-        const auto b=whip_transform_hold.Thumb(PI_WEAPON_INPUT_THUMB_B,b_facts);
-        if(b.flags&PI_THUMB_NOTE_Y)y_gesture.NoteCombo();
-        if(b.touch_x!=0)FireTouch(b.touch_x);
-        hold(PadButton::Cross,(b.flags&PI_THUMB_HOLD_CROSS)!=0);
+        if (in[PhysB] && !b_down) {
+            b_to_touch = modifier;
+            b_time = 0.0f;
+            touch_fired = false;
+            if (b_to_touch) {
+                note_combo();
+            }
+        }
+        if (in[PhysB] && b_to_touch) {
+            b_time += dt;
+            if (!touch_fired && b_time >= 0.6f) {
+                touch_fired = true;
+                FireTouch(0.75f);
+            }
+        } else if (!in[PhysB] && b_down && b_to_touch && !touch_fired) {
+            FireTouch(0.25f);
+        }
+        b_down = in[PhysB];
+        hold(PadButton::Cross, in[PhysB] && !b_to_touch && !summon_bell_block_b);
 
         // A shield held up blocks (shield_raise: UpdateShield, the game's L2).
         UpdateShield(left, gesture, held, dt);
@@ -6775,47 +7072,97 @@ struct OpenXRPresenter::Impl {
         // (StartNativeTransform: no L1, the clack comes with the form's lock); otherwise, and for a
         // weapon without a native clip, L1. Classic and right_grip=draw: the left grip is L1
         // (grabbed next to the right hand of a drawn weapon: "two hands on the hilt" on both).
+        const auto clack = HapticPattern{}.Pulse(0.6f, 25.0f).Gap(50.0f).Pulse(0.4f, 25.0f);
         if (grip_transform) {
+            // The weapon's own use of the right grip (hand_transform: frees the left hand, arms the
+            // stab, held to charge): never a transform or L1 of its own.
             const bool own_use = UpdateRightGrip(in, left, right, gesture, dt);
-            const auto guide_grip = StepTwoHandGuide(in[PhysGripR], own_use,
-                                                    blocked[PhysGripR], RightFamily(), dt);
-            auto facts=GripTransformPacket(in,right,left,gesture,input_dt,true);
-            facts.transform.own_use=own_use;facts.transform.guide_owns=guide_grip.owns;
-            facts.transform.guide_tap=guide_grip.tap;
-            auto result=whip_transform_hold.Transform(PI_WEAPON_INPUT_TRANSFORM_BEGIN,facts);
-            bool guide_l1_sent = false;
-            const bool attempted=(result.flags&PI_TI_ATTEMPT)!=0;
-            if(result.flags&PI_TI_CLEAR_REJECTED)native_transform_rejected=false;
-            if(result.flags&PI_TI_NATIVE_REQUEST){
-                PiWeaponInput receipt{};receipt.transform.token=result.token;
-                receipt.native_sent=StartNativeTransform(PhysicalInteractions::WeaponMotionNames[result.motion]);
-                receipt.native_rejected=native_transform_rejected;
-                result=whip_transform_hold.Transform(PI_WEAPON_INPUT_TRANSFORM_RECEIPT,receipt);
+            const auto guide_grip = two_hand_guide_gesture.Step(
+                in[PhysGripR], two_hand_handle_available && two_hand_status.two_handed &&
+                                   !own_use && !blocked[PhysGripR] && GripTransformBlock() == nullptr,
+                RightFamily(), dt);
+            const auto transform_family = RightFamily();
+            // Missing equipment status must not turn a chain-weapon tap into an immediate L1.
+            const bool hold_required = whip_transform_hold.Required(transform_family);
+            const bool hold_ready = whip_transform_hold.Step(
+                in[PhysGripR], transform_family,
+                transform_family >= 0 && hold_required && right.valid && right.orientation_valid &&
+                    !blocked[PhysGripR] && !own_use && !guide_grip.owns &&
+                    GripTransformBlock() == nullptr,
+                input_dt); // use real sample time: a frame stall cancels the squeeze
+            // Keep a waiting squeeze blocked even if the equipped weapon changes mid-hold.
+            if (hold_required && in[PhysGripR] && !grip_r_down) {
+                grip_r_block = "hold the grip for 0.08 seconds";
+                grip_r_native = false;
             }
-            if(result.flags&PI_TI_DROP_STROKE)melee.DropStroke();
-            PlayInteractionHaptics(result);
-            if(result.flags&PI_TI_STAMP)transform_request_ns=VR::Body::SteadyNowNs();
-            if(result.flags&PI_TI_TAP_L1){
-                guide_l1_sent=pad.Press(PadButton::L1);
-                PiWeaponInput receipt{};receipt.transform.token=result.token;
-                receipt.transform.l1_accepted=guide_l1_sent;
-                result=whip_transform_hold.Transform(PI_WEAPON_INPUT_TRANSFORM_RECEIPT,receipt);
+            if (hold_required ? hold_ready :
+                ((in[PhysGripR] && !grip_r_down) || guide_grip.tap)) {
+                // A squeeze as the vial reaches the wrist (a fist for the needle) is no transform:
+                // ignored until released. One during a swing or with the hand moving is a flick
+                // (transform_flick: the weapon snaps into its new form mid-stroke); a weapon on L1
+                // ignores it (a reflex clench at the hit never plays the whole-body transform).
+                grip_r_block = (own_use || (guide_grip.owns && !guide_grip.tap))
+                                   ? GripUseBlock : GripTransformBlock();
+                grip_r_native = false;
+                const char* motion = GripMotion(right, gesture);
+                if (grip_r_block == nullptr) {
+                    const bool flick_on = VR::Transform::GetTransformSettings().flick;
+                    if (motion == nullptr || flick_on) {
+                        grip_r_native = StartNativeTransform(motion);
+                    }
+                    if (grip_r_native && motion != nullptr && !melee_physical &&
+                        !melee_window.Current().open) {
+                        // A flick in a form whose swings press R1 / R2 (the Threaded Cane's
+                        // whip): the stroke under way never becomes the game's canned attack
+                        // (it would take the arm and stop the transform); the next swing wants
+                        // the hand slowed first.
+                        melee.DropStroke();
+                    }
+                    if (!grip_r_native && motion != nullptr) {
+                        grip_r_block = motion; // L1 or no flick: not mid-swing
+                    } else if (!grip_r_native) {
+                        weapon_hand.Play(clack);
+                    }
+                }
+                if (grip_r_block != nullptr && grip_r_block != GripUseBlock) {
+                    LOG_INFO(Render_Vulkan, "VR input: right grip ignored, no transform ({})",
+                             grip_r_block);
+                } else if (grip_r_block == nullptr) {
+                    transform_request_ns = VR::Body::SteadyNowNs(); // the native one or L1
+                    if (guide_grip.tap && !grip_r_native) {
+                        pad.Press(PadButton::L1); // tap released: no held button to forward
+                    }
+                }
             }
-            if(attempted && result.block && result.block!=8)
-                LOG_INFO(Render_Vulkan,"VR input: right grip ignored, no transform ({})",
-                         PhysicalInteractions::TransformInputBlockNames[result.block]);
-            if(result.flags&PI_TI_FINISH_GUIDE)
-                FinishTwoPolicy((result.flags&PI_TI_GUIDE_SUCCESS)!=0,
-                                result.flags&PI_TI_GUIDE_NATIVE?transform_serial:0);
-            grip_r_down=in[PhysGripR];
-            hold(PadButton::L1,result.hold_l1!=0);
-            HandleTransformEvents();
+            grip_r_down = in[PhysGripR];
+            grip_l_down = in[PhysGripL];
+            hold(PadButton::L1, in[PhysGripR] && grip_r_block == nullptr && !grip_r_native &&
+                 (!hold_required || whip_transform_hold.Accepted()));
+            HandleTransformEvents(clack);
         } else {
-            ResetTwoHandGuide(in[PhysGripR]);
-            const auto facts=GripTransformPacket(in,right,left,gesture,input_dt,false);
-            const auto result=whip_transform_hold.Transform(PI_WEAPON_INPUT_TRANSFORM_BEGIN,facts);
-            PlayInteractionHaptics(result);
-            hold(PadButton::L1,result.hold_l1!=0);
+            two_hand_guide_gesture.Reset(in[PhysGripR]);
+            // Classic and right_grip=draw transform with the left grip. Use the same
+            // hold gate and remember a pending chain-weapon squeeze until release.
+            const auto transform_family = RightFamily();
+            const bool hold_required = whip_transform_hold.Required(transform_family);
+            const bool hold_ready = whip_transform_hold.Step(
+                in[PhysGripL], transform_family,
+                transform_family >= 0 && hold_required && left.valid && left.orientation_valid &&
+                    right.valid && right.orientation_valid && !blocked[PhysGripL] &&
+                    GripTransformBlock() == nullptr,
+                input_dt);
+            if (hold_required ? hold_ready : (in[PhysGripL] && !grip_l_down)) {
+                const XrVector3f d{left.position.x - right.position.x,
+                                   left.position.y - right.position.y,
+                                   left.position.z - right.position.z};
+                gun_hand.Play(clack);
+                if (drawn && left.valid && right.valid && Length(d) < 0.12f) {
+                    weapon_hand.Play(clack); // both hands on the hilt
+                }
+            }
+            grip_l_down = in[PhysGripL];
+            hold(PadButton::L1, in[PhysGripL] &&
+                 (!hold_required || whip_transform_hold.Accepted()));
         }
 
         // The interactive visceral's pull: whatever the controls (the game holds the throw).
@@ -6824,12 +7171,20 @@ struct OpenXRPresenter::Impl {
         if (classic) {
             hold(PadButton::R1, in[PhysTriggerR]);
             hold(PadButton::R2, in[PhysGripR]);
-            WeaponSwing(PI_WEAPON_INPUT_SWING_CLASSIC);
+            drawn = false;
         } else {
             UpdateMotionWeapon(in, right, left, gesture, held, dt);
         }
 
-        // Right stick: X turns; flick down = next quick item; hold up 0.5 s = blood bullets
+        // Lock-on feedback.
+        const bool locked = VR::IsLockedOn();
+        if (locked != was_locked) {
+            was_locked = locked;
+            weapon_hand.Play(locked ? Tick(0.25f, 20.0f) : Repeat(2, 0.15f, 10.0f, 50.0f));
+        }
+
+        // Right stick: X turns; short down flick = item on release; hold down = blink turnaround.
+        // Hold up 0.5 s = blood bullets
         // (it costs HP, so a turn that drifts up must never fire it). With the modifier
         // (left_scheme=1 and classic: the left stick click held) all four directions are instant
         // D-pad presses; left_scheme=2 has no such modifier since 2026-10-15 (Y held, the stick
@@ -6838,28 +7193,111 @@ struct OpenXRPresenter::Impl {
         // up / down, the blood bullets and the next item, locked on too (hold Y + right stick
         // reached them there before). While the game owns the camera (lock-on, cutscenes) the
         // stick goes to the game, e.g. to switch targets.
-        PiThumbFacts stick_facts{};
-        stick_facts.classic=classic;stick_facts.scheme2=scheme2;stick_facts.modifier=modifier;
-        stick_facts.look[0]=look.x;stick_facts.look[1]=look.y;stick_facts.dt=dt;
-        stick_facts.locked=VR::IsLockedOn();
-        stick_facts.game_camera=VR::GameOwnsCamera();
-        stick_facts.snap_deg=settings.snap_turn_deg;stick_facts.smooth_deg_per_s=settings.smooth_turn_deg_per_s;
-        stick_facts.left_side=side(TC::ClickL);stick_facts.right_side=side(TC::StickR);
-        const auto stick=whip_transform_hold.Thumb(PI_WEAPON_INPUT_THUMB_STICK,stick_facts);
-        if(stick.game_axis){axes[2]=stick.axes[0];axes[3]=stick.axes[1];}
-        PlayInteractionHaptics(stick,0,stick.haptic_before);
-        if(stick.turn!=0)VR::AddTurn(stick.turn);
-        if(stick.dpad){
-            const PadButton dpad=stick.dpad==PI_DPAD_UP?PadButton::Up:
-                stick.dpad==PI_DPAD_DOWN?PadButton::Down:stick.dpad==PI_DPAD_RIGHT?PadButton::Right:PadButton::Left;
-            const bool accepted=pad.Press(dpad);
-            if(stick.token){
-                PiThumbFacts receipt{};receipt.token=stick.token;receipt.accepted=accepted;
-                PlayInteractionHaptics(whip_transform_hold.Thumb(PI_WEAPON_INPUT_THUMB_RECEIPT,receipt));
-            }
-            LOG_INFO(Render_Vulkan,"VR input: right stick action {} D-pad {}{}",stick.kind,stick.dpad,accepted?"":" dropped");
+        const float x = look.x;
+        const float y = look.y;
+        const bool dpad_modifier = modifier && !scheme2;
+        const bool game_camera = VR::GameOwnsCamera() && !dpad_modifier && !r3_switch;
+        if (game_camera != right_stick_to_game) {
+            right_stick_to_game = game_camera;
+            stick_armed = false; // a held stick must not snap-turn when control returns
         }
-        PlayInteractionHaptics(stick,stick.haptic_before);
+        if (std::abs(x) < 0.35f && std::abs(y) < 0.35f) {
+            stick_armed = true;
+        }
+        if (y < 0.7f) {
+            up_hold = 0.0f;
+        }
+        const bool vertical = std::abs(y) > 0.7f && std::abs(y) > 1.5f * std::abs(x);
+        const bool horizontal = std::abs(x) > 0.7f && std::abs(x) > 1.5f * std::abs(y);
+        quick_turn_input = !game_camera && !dpad_modifier && !r3_switch &&
+            !click && VR::IsImmersive() && !VR::IsGameMenuOpen() &&
+            !VR::CinematicActive() && recenter_fade.phase == VR::Space::Fade::Phase::Idle;
+        const auto quick_event = quick_turn_gesture.Step(x, y, dt,
+            quick_turn_input && quick_turn_fade.phase == VR::Space::Fade::Phase::Idle);
+        if (quick_event == VR::QuickTurn::Gesture::Event::Turn) {
+            quick_turn_fade.Start();
+            stick_armed = false;
+        }
+        if (game_camera) {
+            axes[2] = axis(x);
+            axes[3] = axis(-y);
+        } else if (dpad_modifier) {
+            if (stick_armed && (vertical || horizontal)) {
+                const PadButton dpad = vertical ? (y > 0 ? PadButton::Up : PadButton::Down)
+                                                : (x > 0 ? PadButton::Right : PadButton::Left);
+                const bool ok = pad.Press(dpad);
+                modifier_hand.Play(Tick(0.25f, 15.0f, 0));
+                stick_armed = false;
+                note_combo();
+                LOG_INFO(Render_Vulkan, "VR input: {} + {}: D-pad {}{}", modifier_name,
+                         ThumbName(TC::StickR),
+                         dpad == PadButton::Up     ? "up"
+                         : dpad == PadButton::Down ? "down"
+                         : dpad == PadButton::Right ? "right"
+                                                    : "left",
+                         ok ? "" : " dropped");
+            }
+        } else if (r3_switch) {
+            if (stick_armed && horizontal && r3_time >= R3SwitchSeconds) {
+                const bool right_hand = x > 0.0f;
+                const bool ok = pad.Press(right_hand ? PadButton::Right : PadButton::Left);
+                (right_hand ? weapon_hand : gun_hand)
+                    .Play(ok ? Tick(0.3f, 15.0f, 0) : Repeat(2, 0.15f, 10.0f, 50.0f, 3));
+                stick_armed = false;
+                r3_used = r3_switched = true;
+                LOG_INFO(Render_Vulkan, "VR input: weapon switch, {} hand (D-pad {}){}",
+                         right_hand ? "right" : "left", right_hand ? "right" : "left",
+                         ok ? "" : " dropped");
+            } else if (scheme2 && stick_armed && vertical && r3_time >= R3SwitchSeconds) {
+                // left_scheme=2: up / down are D-pad up / down (the blood bullets, the next
+                // quick item), the rest of the D-pad hold Y + right stick gave, locked on too.
+                const bool up = y > 0.0f;
+                const bool ok = pad.Press(up ? PadButton::Up : PadButton::Down);
+                ThumbHaptics(TC::StickR)
+                    .Play(ok ? (up ? Tick(0.8f, 60.0f, 2) : Tick(0.25f, 15.0f, 0))
+                             : Repeat(2, 0.15f, 10.0f, 50.0f, 3));
+                stick_armed = false;
+                r3_used = r3_switched = true;
+                LOG_INFO(Render_Vulkan, "VR input: {} + {} {}: D-pad {} ({}){}",
+                         ThumbName(TC::ClickR), ThumbName(TC::StickR), up ? "up" : "down",
+                         up ? "up" : "down", up ? "blood bullets" : "next quick item",
+                         ok ? "" : " dropped");
+            }
+        } else {
+            if (quick_turn_fade.phase != VR::Space::Fade::Phase::Idle) {
+                stick_armed = false; // no extra turns while the blink is in flight
+            } else if (settings.snap_turn_deg > 0.0f) {
+                if (stick_armed && horizontal) {
+                    VR::AddTurn((x > 0 ? 1.0f : -1.0f) * settings.snap_turn_deg *
+                                (3.14159265f / 180.0f));
+                    stick_armed = false;
+                    LOG_INFO(Render_Vulkan, "VR input: snap turn {:+.0f} deg ({})",
+                             (x > 0 ? 1.0f : -1.0f) * settings.snap_turn_deg,
+                             ThumbName(TC::StickR));
+                }
+            } else if (std::abs(x) > 0.2f && std::abs(x) > std::abs(y)) {
+                VR::AddTurn(x * settings.smooth_turn_deg_per_s * (3.14159265f / 180.0f) * dt);
+            }
+            auto& turn_hand = ThumbHaptics(TC::StickR);
+            if (quick_event == VR::QuickTurn::Gesture::Event::Item) {
+                pad.Press(PadButton::Down);
+                turn_hand.Play(Tick(0.25f, 15.0f, 0));
+                stick_armed = false;
+            }
+            if (stick_armed && vertical && y > 0.0f) {
+                const float before = up_hold;
+                up_hold += dt;
+                if (before == 0.0f || (before < 0.25f && up_hold >= 0.25f)) {
+                    turn_hand.Play(Tick(0.5f, 40.0f)); // heartbeat
+                }
+                if (up_hold >= 0.5f) {
+                    pad.Press(PadButton::Up);
+                    turn_hand.Play(Tick(0.8f, 60.0f, 2));
+                    stick_armed = false;
+                    up_hold = 0.0f;
+                }
+            }
+        }
 
         UpdateLeanDodge(in, look, right, gesture, axes, dt);
         ApplyRoll(axes, dt);
@@ -6881,50 +7319,27 @@ struct OpenXRPresenter::Impl {
         namespace L = VR::Loco;
         using TC = VR::Thumbs::Control;
         // The move stick's hand (swap_sticks: the right one); the controls named as pressed.
+        auto& left_hand = ThumbHaptics(TC::ClickL);
         const char* const click_name = ThumbName(TC::ClickL);
         const char* const a_name = ThumbName(TC::A);
-        PiLocoGameplayFacts raw{};
         L::Config c{};
         c.centre_dz = VR::Tune::Get("loco.centre_dz", c.centre_dz);
-        raw.centre_ms = VR::Tune::Get("loco.centre_ms", c.centre_s * 1000.0f);
-        raw.grace_ms = VR::Tune::Get("loco.grace_ms", c.grace_s * 1000.0f);
+        c.centre_s = VR::Tune::Get("loco.centre_ms", c.centre_s * 1000.0f) * 0.001f;
+        c.grace_s = VR::Tune::Get("loco.grace_ms", c.grace_s * 1000.0f) * 0.001f;
         c.leap_cone_deg = VR::Tune::Get("loco.leap_cone_deg", c.leap_cone_deg);
         c.start_push = VR::Tune::Get("loco.start_push", c.start_push);
-        raw.run_delay_ms = VR::Tune::Get("loco.run_delay_ms", c.run_delay_s * 1000.0f);
-        raw.no_dash_ms = VR::Tune::Get("loco.no_dash_ms", c.no_dash_s * 1000.0f);
-        raw.dash_start_ms = VR::Tune::Get("loco.dash_start_ms", c.dash_start_s * 1000.0f);
-        raw.leap_hold_ms = VR::Tune::Get("loco.leap_hold_ms", c.leap_hold_s * 1000.0f);
+        c.run_delay_s = VR::Tune::Get("loco.run_delay_ms", c.run_delay_s * 1000.0f) * 0.001f;
+        c.no_dash_s = VR::Tune::Get("loco.no_dash_ms", c.no_dash_s * 1000.0f) * 0.001f;
+        c.dash_start_s = VR::Tune::Get("loco.dash_start_ms", c.dash_start_s * 1000.0f) * 0.001f;
+        c.leap_hold_s = VR::Tune::Get("loco.leap_hold_ms", c.leap_hold_s * 1000.0f) * 0.001f;
         c.dash_cone_deg = VR::Tune::Get("loco.dash_cone_deg", c.dash_cone_deg);
-        raw.leap_start_ms = VR::Tune::Get("loco.leap_start_ms", c.leap_start_s * 1000.0f);
-        raw.leap_max_ms = VR::Tune::Get("loco.leap_max_ms", c.leap_max_s * 1000.0f);
+        c.leap_start_s = VR::Tune::Get("loco.leap_start_ms", c.leap_start_s * 1000.0f) * 0.001f;
+        c.leap_max_s = VR::Tune::Get("loco.leap_max_ms", c.leap_max_s * 1000.0f) * 0.001f;
         L::SeqConfig sc{};
-        raw.seq_leap_release_ms=VR::Tune::Get("loco.leap_release_ms",sc.leap_release_s*1000.f);
-        raw.seq_dodge_release_ms=VR::Tune::Get("loco.dodge_release_ms",sc.dodge_release_s*1000.f);
-        const double t = static_cast<double>(SteadyNs()) * 1e-9;
-        const auto dash=VR::Bloodborne::LatestDashEffects();
-        raw.now_dash=SteadyNs();raw.dash_valid=dash.valid;raw.dash_ns=dash.steady_ns;
-        raw.dash_on=dash.dash;raw.window_on=dash.window;raw.jump_valid=dash.jump_valid;
-        raw.jump_read_ns=dash.jump_read_ns;raw.jump_ns=dash.jump_ns;
-        raw.game_frame_s=VR::GameFrameSeconds();raw.now_jump=SteadyNs();
-        const auto facing=VR::Bloodborne::LatestFacing();raw.now_facing=SteadyNs();
-        raw.facing_valid=facing.valid;raw.facing_ns=facing.steady_ns;
-        raw.hunter_yaw=facing.hunter_yaw;raw.stick_yaw=facing.stick_yaw;
-        raw.scheme2=scheme2;raw.click=in[PhysStickL];raw.a=in[PhysA];raw.l3_jump=l3_jump;
-        raw.x=move.x;raw.y=move.y;raw.dt=dt;raw.ladder=VR::Bloodborne::LadderActive();
-        raw.circle_down=(pad.Mask()&static_cast<u32>(PadButton::Circle))!=0;
-        raw.since_release_s=pad.ReleasedFor(PadButton::Circle);raw.seq_frame_s=VR::GameFrameSeconds();
-        raw.side_mask=VR::Thumbs::HandFor(TC::ClickL,thumbs_swapped)==VR::Thumbs::Hand::Right?2u:1u;
-        const auto result=loco_runtime.Gameplay(raw,c,sc);
-        const auto& game=result.gameplay;
-        c=VR::Interactions::LP::Unpack(game.config);
-        const auto o=VR::Interactions::LP::Unpack(result.decision);
-        const auto action=static_cast<L::Action>(game.action);
-        const auto dash_now=game.frame.dash,window_now=game.frame.window,jump_now=game.frame.jump;
-        const auto game_frame=game.frame.game_rate>0?(1.f/60.f)/game.frame.game_rate:1.f/60.f;
-        const float facing_off=game.frame.facing_off_deg,facing_yaw=game.facing_yaw;
-        const bool was_latched=game.was_latched!=0;
-        std::string why;
-        PlayInteractionHaptics(game);
+        sc.leap_release_s = VR::Tune::Get("loco.leap_release_ms", sc.leap_release_s * 1000.0f) *
+                            0.001f;
+        sc.dodge_release_s =
+            VR::Tune::Get("loco.dodge_release_ms", sc.dodge_release_s * 1000.0f) * 0.001f;
         if (scheme2 && !loco_logged) {
             loco_logged = true;
             LOG_INFO(Render_Vulkan,
@@ -6940,13 +7355,59 @@ struct OpenXRPresenter::Impl {
                      y_menu_now ? "its tap Options and its 0.7 s hold the recenter (y_menu)"
                                 : "its tap the quick-item arc");
         }
+        const double t = static_cast<double>(SteadyNs()) * 1e-9;
+        bool circle = in[PhysA];
+        L::Action action = L::Action::None;
+        std::string why;
+        // The game's dash (SpEffect 391) and its jump window (390) at its last update, when fresh
+        // (core/vr/bloodborne_motion.h): the Sequencer's timing and the latch's no-dash rule.
+        int dash_now = -1, window_now = -1;
+        const VR::Bloodborne::DashEffects dash = VR::Bloodborne::LatestDashEffects();
+        if (dash.valid && SteadyNs() - dash.steady_ns < 150'000'000) {
+            window_now = dash.window ? 1 : 0;
+            dash_now = dash.dash ? 1 : 0;
+        }
+        // The game's jump (its clip among the pushed TimeAct entries; the game pushes the playing
+        // clip again and again): on while seen within a few game frames of its last update.
+        const float game_frame = std::clamp(VR::GameFrameSeconds(), 1.0f / 60.0f, 1.0f / 15.0f);
+        int jump_now = -1;
+        if (dash.jump_valid && SteadyNs() - dash.jump_read_ns < 150'000'000) {
+            const s64 gap_ns = std::max<s64>(250'000'000, static_cast<s64>(game_frame * 10e9f));
+            jump_now = dash.jump_ns != 0 && dash.jump_read_ns - dash.jump_ns < gap_ns ? 1 : 0;
+        }
+        // The stick against the hunter's facing (core/vr/bloodborne_facing.h): sideways or back
+        // of him the game strafes and never dashes (the latch's no-dash rule waits).
+        float facing_off = -1.0f;
+        float facing_yaw = 0.0f; // logs: his facing against the view (deg)
+        if (const VR::Bloodborne::FacingReading fr = VR::Bloodborne::LatestFacing();
+            fr.valid && SteadyNs() - fr.steady_ns < 150'000'000 &&
+            std::hypot(move.x, move.y) > 1e-3f) {
+            constexpr float Pi = 3.14159265f;
+            const auto wrap = [](float a) {
+                a = std::fmod(a + Pi, 2.0f * Pi);
+                return (a < 0.0f ? a + 2.0f * Pi : a) - Pi;
+            };
+            const float stick = fr.stick_yaw + std::atan2(move.x, move.y);
+            facing_off = std::abs(wrap(stick - fr.hunter_yaw)) * 57.2957795f;
+            facing_yaw = wrap(fr.hunter_yaw - fr.stick_yaw) * 57.2957795f;
+        }
+        L::Frame lf{scheme2, in[PhysStickL], in[PhysA], move.x, move.y, dt};
+        // A leap's Circle sequence lets go of the sprint (the dash lapses): no judgement then.
+        lf.dash = loco_seq.Active() ? -1 : dash_now;
+        lf.window = loco_seq.Active() ? -1 : window_now;
+        lf.facing_off_deg = facing_off;
+        lf.jump = jump_now;
+        lf.game_rate = (1.0f / 60.0f) / game_frame;
+        lf.ladder = VR::Bloodborne::LadderActive();
+        const bool was_latched = loco.Latched();
+        const L::Out o = loco.Update(c, lf);
         if (LocoLogEnabled() && (was_latched || o.started) &&
             (dash_now != loco_log_dash || window_now != loco_log_window)) {
             LOG_INFO(Render_Vulkan,
                      "VR input: latch: the game's dash 391 {} window 390 {} (stick {:.2f}{}) | "
                      "t {:.3f}",
                      dash_now, window_now, std::hypot(move.x, move.y),
-                     game.was_seq_active ? ", a leap's sequence" : "", t);
+                     loco_seq.Active() ? ", a leap's sequence" : "", t);
         }
         loco_log_dash = dash_now;
         loco_log_window = window_now;
@@ -6972,6 +7433,7 @@ struct OpenXRPresenter::Impl {
             loco_log_ahead = true;
         }
         if (scheme2) {
+            circle = o.circle_a || o.sprint;
             if (o.armed) {
                 LOG_INFO(Render_Vulkan,
                          "VR input: {} with the stick at {:.2f}: the sprint latch starts with a "
@@ -6985,6 +7447,7 @@ struct OpenXRPresenter::Impl {
                          click_name, t);
             }
             if (o.started) {
+                left_hand.Play(Tick(0.2f, 12.0f, 0));
                 LOG_INFO(Render_Vulkan,
                          "VR input: sprint latch ON ({}; stick {:.2f} at {:+.0f} deg) "
                          "| t {:.3f}",
@@ -7005,6 +7468,7 @@ struct OpenXRPresenter::Impl {
                          t);
             }
             if (o.ended && o.no_dash) {
+                left_hand.Play(Tick(0.12f, 8.0f, 0));
                 LOG_INFO(Render_Vulkan,
                          "VR input: sprint latch OFF (the game has not dashed for {:.0f} ms with "
                          "the stick at {:.2f}, {}: out of stamina, a swing or a shot; Circle let "
@@ -7015,11 +7479,13 @@ struct OpenXRPresenter::Impl {
                              : std::string{"no facing reading"},
                          t);
             } else if (o.ended && o.action != L::Action::Dodge) {
+                left_hand.Play(Tick(0.12f, 8.0f, 0));
                 LOG_INFO(Render_Vulkan,
                          "VR input: sprint latch OFF (the stick centred {:.0f} ms) | t {:.3f}",
                          c.centre_s * 1000.0f, t);
             }
             if (o.action != L::Action::None) {
+                action = o.action;
                 if (o.cause == L::Cause::Click) {
                     why = o.from_latch ? fmt::format("a second {}", click_name)
                                        : fmt::format("the {} while {} sprints", click_name, a_name);
@@ -7034,14 +7500,17 @@ struct OpenXRPresenter::Impl {
                                        std::atan2(o.dir_x, o.dir_y) * 57.2957795f);
                 }
             }
-        } else if (action != L::Action::None) {
+        } else if (l3_jump) {
+            action = L::Action::Leap;
             why = fmt::format("the {} while {} sprints", click_name, a_name);
         }
         if (action != L::Action::None) {
             // The open quick-item arc closes on it (left_scheme=2: UpdateQuickItems, this frame).
             loco_combat = action == L::Action::Leap ? "a leap" : "a dodge";
-            const bool down=raw.circle_down!=0;
-            const float since=game.start_since_s;
+            const bool down = (pad.Mask() & static_cast<u32>(PadButton::Circle)) != 0;
+            const float since = down ? 0.0f : pad.ReleasedFor(PadButton::Circle);
+            loco_seq.Start(action, down, since);
+            left_hand.Play(action == L::Action::Leap ? Tick(0.3f, 18.0f) : Tick(0.25f, 14.0f));
             LOG_INFO(Render_Vulkan, "VR input: {} ({}) | Circle {} | t {:.3f}",
                      action == L::Action::Leap ? "LEAP" : "DODGE", why,
                      down ? std::string{"let go now"}
@@ -7049,10 +7518,17 @@ struct OpenXRPresenter::Impl {
                      t);
         }
         // The sequence's Circle edges, timed by the game's jump window when it can be read.
-        const auto sf=VR::Interactions::LP::Unpack(game.seq_frame);
-        const auto seq_action=static_cast<L::Action>(game.seq_action);
-        const auto so=VR::Interactions::LP::Unpack(result.seq_decision);
-        roll_chord.Pressed(so.pressed); // copied sequencer-generated Circle edge for the roll
+        L::SeqFrame sf{};
+        sf.dt = dt;
+        sf.frame_s = std::clamp(VR::GameFrameSeconds(), 1.0f / 60.0f, 1.0f / 15.0f);
+        sf.window = window_now;
+        sf.dash = dash_now;
+        const L::Action seq_action = loco_seq.Current();
+        const L::SeqOut so = loco_seq.Update(sc, sf);
+        roll_pressed = roll_pressed || (so.pressed && roll_seq); // the A+B roll's tap (StartRoll)
+        if (so.circle >= 0) {
+            circle = so.circle == 1;
+        }
         if (so.released) {
             LOG_INFO(Render_Vulkan,
                      "VR input: {}: the tap let go {:.0f} ms after the sprint's release ({}) | "
@@ -7065,14 +7541,21 @@ struct OpenXRPresenter::Impl {
                                      : "timed out",
                      t);
         }
-        if (game.circle) {
+        if (circle) {
             held |= static_cast<u32>(PadButton::Circle);
         }
         // A leap with the stick let go (A in the grace after the latch, or the stick passing the
         // centre): the game's jump is a roll request, and a tap with the stick centred is a
         // backstep (measured: A 57 ms after the latch ended backstepped), so the stick is held
         // along the run until the sequence ends.
-        if(game.override_move){axes[0]=game.axes[0];axes[1]=game.axes[1];}
+        if (loco_seq.Active() && loco_seq.Current() == L::Action::Leap &&
+            std::hypot(move.x, move.y) < c.centre_dz) {
+            const auto axis = [](float v) {
+                return std::clamp(static_cast<s32>(std::lround(128.0f + v * 127.0f)), 0, 255);
+            };
+            axes[0] = axis(loco.RunX());
+            axes[1] = axis(-loco.RunY());
+        }
     }
 
     static bool LeanLogEnabled() {
@@ -7094,35 +7577,10 @@ struct OpenXRPresenter::Impl {
     void UpdateLeanDodge(const PhysicalState& in, const XrVector2f& look, const HandState& right,
                          const GestureFrame& gesture, std::array<s32, 6>& axes, float dt) {
         const auto& settings = VR::GetSettings();
-        VR::Lean::Input input{};
-        input.head_ok = gesture.head_ok;
-        input.x = gesture.head_position.x;
-        input.z = gesture.head_position.z;
-        input.velocity_ok = gesture.head_velocity_ok;
-        input.vx = gesture.head_velocity.x;
-        input.vz = gesture.head_velocity.z;
-        input.fwd_x = gesture.forward.x;
-        input.fwd_z = gesture.forward.z;
-        input.look_x = look.x;
-        input.look_y = look.y;
-        VR::Lean::Config config{};
-        config.speed = settings.lean_dodge_speed;
-        config.dist_m = settings.lean_dodge_dist_m;
-        PiLeanInput packet{};packet.motion=PhysicalInteractions::LeanPackets::Pack(input);
-        packet.config=PhysicalInteractions::LeanPackets::Pack(config);packet.dt=dt;
-        packet.frame_s=VR::GameFrameSeconds();packet.min_press=pad.MinPress();
-        auto& raw=packet.gameplay;raw.gesture_ns=gesture.time;
-        raw.lean_on=settings.lean_dodge;raw.seated=settings.seated;raw.classic=settings.controls_classic;
-        raw.immersive=VR::IsImmersive();raw.cinematic=VR::CinematicActive();raw.menu=in[PhysMenu];
-        raw.hand_valid=right.valid;raw.hand_velocity[0]=right.velocity.x;
-        raw.hand_velocity[1]=right.velocity.y;raw.hand_velocity[2]=right.velocity.z;
-        raw.head_velocity_y=gesture.head_velocity.y;raw.swing_pending=melee.Pending();raw.since_attack=since_attack;
-        raw.a=in[PhysA];raw.latched=loco.Latched();raw.seq_active=loco_seq.Active();
-        raw.cooldown_ms=settings.lean_dodge_cooldown_ms;
-        const auto decision=lean.Gameplay(packet);
-        const auto out=PhysicalInteractions::LeanPackets::Unpack(decision);
-        const bool active=decision.gameplay.active!=0;
-        PlayInteractionHaptics(decision.gameplay);
+        const auto axis = [](float v) {
+            return std::clamp(static_cast<s32>(std::lround(128.0f + v * 127.0f)), 0, 255);
+        };
+        const bool active = settings.lean_dodge && !settings.seated && !settings.controls_classic;
         if (settings.lean_dodge && !lean_logged) {
             lean_logged = true;
             LOG_INFO(Render_Vulkan,
@@ -7134,7 +7592,34 @@ struct OpenXRPresenter::Impl {
                      : settings.controls_classic ? " - classic controls"
                                                  : "");
         }
-
+        VR::Lean::Input input{};
+        input.t = static_cast<double>(gesture.time) * 1e-9;
+        input.enabled = active && VR::IsImmersive() && !VR::CinematicActive() && !in[PhysMenu];
+        input.head_ok = gesture.head_ok;
+        input.x = gesture.head_position.x;
+        input.z = gesture.head_position.z;
+        input.velocity_ok = gesture.head_velocity_ok;
+        input.vx = gesture.head_velocity.x;
+        input.vz = gesture.head_velocity.z;
+        input.fwd_x = gesture.forward.x;
+        input.fwd_z = gesture.forward.z;
+        input.look_x = look.x;
+        input.look_y = look.y;
+        // A swing in progress: the classifier measures one, an attack was just sent, or the
+        // weapon hand moves fast relative to the head (the body sways with a hard swing).
+        const float hand_speed = right.valid
+                                     ? std::hypot(right.velocity.x - gesture.head_velocity.x,
+                                                  right.velocity.y - gesture.head_velocity.y,
+                                                  right.velocity.z - gesture.head_velocity.z)
+                                     : 0.0f;
+        input.swing = melee.Pending() || since_attack < 0.35f || hand_speed > 1.5f;
+        // Circle held by hand or by the sprint latch / a leap's sequence (left_scheme=2).
+        input.circle_held = in[PhysA] || loco.Latched() || loco_seq.Active();
+        VR::Lean::Config config{};
+        config.speed = settings.lean_dodge_speed;
+        config.dist_m = settings.lean_dodge_dist_m;
+        config.cooldown_s = settings.lean_dodge_cooldown_ms * 0.001f;
+        const VR::Lean::Output out = lean.Update(input, config);
 
         const auto direction = [](float angle) {
             constexpr std::array<const char*, 8> names{
@@ -7144,6 +7629,12 @@ struct OpenXRPresenter::Impl {
             return names[static_cast<size_t>((sector % 8 + 8) % 8)];
         };
         if (out.fire) {
+            const float frame = std::clamp(VR::GameFrameSeconds(), 1.0f / 60.0f, 1.0f / 15.0f);
+            lean_stick = {out.stick_x, out.stick_y};
+            lean_circle_in = frame;
+            lean_stick_left = std::max(0.15f, frame + pad.MinPress() + 2.0f * frame);
+            haptics[0].Play(Tick(0.3f, 20.0f));
+            haptics[1].Play(Tick(0.3f, 20.0f));
             LOG_INFO(Render_Vulkan,
                      "VR lean: DODGE {} ({:+.0f} deg from the view) stick {:+.2f},{:+.2f} | head "
                      "{:.2f} m/s travel {:.2f} m yaw {:.0f} deg/s{}",
@@ -7156,10 +7647,48 @@ struct OpenXRPresenter::Impl {
                      out.rejected, direction(out.angle_deg), out.angle_deg, out.speed, out.dist,
                      out.yaw_rate * 57.2957795f);
         }
-        if(decision.press && !pad.Press(PadButton::Circle)) {
-            LOG_INFO(Render_Vulkan,"VR lean: Circle press dropped (input suppressed)");
+        if (lean_circle_in > 0.0f) {
+            lean_circle_in -= dt;
+            if (lean_circle_in <= 0.0f) {
+                lean_circle_in = 0.0f;
+                if (!pad.Press(PadButton::Circle)) {
+                    LOG_INFO(Render_Vulkan, "VR lean: Circle press dropped (input suppressed)");
+                }
+            }
         }
-        if(decision.apply){axes[0]=decision.axis_x;axes[1]=decision.axis_y;}
+        if (lean_stick_left > 0.0f) {
+            lean_stick_left -= dt;
+            axes[0] = axis(lean_stick.x);
+            axes[1] = axis(-lean_stick.y);
+        }
+
+        // Lean i-frames (lean_iframes_ms, 200 by default, once per lean_iframes_cooldown_ms):
+        // the same quick lean, without lean_dodge, presses nothing: the hunter is invulnerable
+        // for that many ms of game time (no animation; physical evasion moves his hurtboxes as
+        // before).
+        const bool iframes_active = settings.lean_iframes_ms > 0 && !settings.lean_dodge &&
+                                    !settings.seated && !settings.controls_classic;
+        VR::Lean::Input iframes_input = input;
+        iframes_input.enabled =
+            iframes_active && VR::IsImmersive() && !VR::CinematicActive() && !in[PhysMenu];
+        VR::Lean::Config iframes_config = config;
+        iframes_config.cooldown_s = settings.lean_iframes_cooldown_ms * 0.001f;
+        const VR::Lean::Output iframes_out = lean_iframes.Update(iframes_input, iframes_config);
+        if (iframes_out.fire) {
+            const char* const name = direction(iframes_out.angle_deg);
+            const bool granted =
+                VR::Bloodborne::IframesLeanGrant(static_cast<u32>(settings.lean_iframes_ms), name);
+            LOG_INFO(Render_Vulkan,
+                     "VR lean: I-FRAMES {} ms {} ({:+.0f} deg from the view) | head {:.2f} "
+                     "m/s travel {:.2f} m yaw {:.0f} deg/s{}",
+                     settings.lean_iframes_ms, name, iframes_out.angle_deg, iframes_out.speed,
+                     iframes_out.dist, iframes_out.yaw_rate * 57.2957795f,
+                     granted ? "" : " - NOT GIVEN (the i-frame hook is not installed)");
+        } else if (iframes_out.rejected[0] != '\0' && LeanLogEnabled()) {
+            LOG_INFO(Render_Vulkan, "VR lean: no i-frames ({}) {} | head {:.2f} m/s travel {:.2f} m",
+                     iframes_out.rejected, direction(iframes_out.angle_deg), iframes_out.speed,
+                     iframes_out.dist);
+        }
     }
 
     // Blood Vial self-injection (motion controls). X arms a vial held in the left hand (tick,
@@ -7173,122 +7702,9 @@ struct OpenXRPresenter::Impl {
     // hang at the side never fires; an entry that is refused is logged as a near miss (which rule).
     // X again always disarms (double tick), as does vial_timeout_s (vr.ini, 0 = never).
     // Holding X does nothing more (core/vr/inject_hold.h VialButton): in gameplay X never reaches
-    // the game's own Triangle vial, with its animation and movement lock (the user's 2026-10-06
+    // the game's own Triangle vial, with its animation and movement lock (the tester's 2026-10-06
     // test); the game's menus have their own layout (Triangle on the right grip).
-    PiVialContactFacts GatherVialContactFacts(VR::VialContact::Sample& source) {
-        namespace P=PhysicalInteractions::VialContactPreparation;
-        PiVialContactFacts facts{};facts.mode=PI_VIAL_CONTACT_RAW;
-        VR::Quick::LatestVialContact(source);facts.source=P::Pack(source);
-        VR::Body::BodyStatus body{};facts.body_loaded=VR::Body::LatestBodyStatus(body);
-        facts.body_driven=body.driven;facts.current_body=P::Pack(body.injection_body);
-        P::Put(facts.left_p,grip_left_located.p);P::Put(facts.left_q,grip_left_located.q);
-        facts.geometry_body_ok=vial_geo.body_ok;facts.geometry_seated=vial_geo.params.seated;
-        for(int side=0;side<2;++side){P::Put(facts.hips[side],vial_geo.hips[side]);P::Put(facts.knees[side],vial_geo.knees[side]);}
-        if(facts.body_loaded){
-            VR::Body::HandsSample hands{};facts.hands_loaded=VR::Body::LatestHands(hands);
-            facts.hands_space=hands.space_serial;facts.hands_ns=hands.steady_ns;facts.head_valid=hands.head_valid;
-            const auto& right=hands.hand[1];
-            facts.right_flags=(right.position_valid?PI_POSITION_VALID:0u)|(right.position_tracked?PI_POSITION_TRACKED:0u)|
-                (right.orientation_valid?PI_ORIENTATION_VALID:0u)|(right.orientation_tracked?PI_ORIENTATION_TRACKED:0u)|
-                (right.velocity_valid?PI_VELOCITY_VALID:0u)|(right.angular_valid?PI_ANGULAR_VALID:0u);
-            P::Put(facts.right_p,right.p);P::Put(facts.right_q,right.q);
-            P::Put(facts.head_p,hands.head_p);P::Put(facts.head_q,hands.head_q);
-        }
-        return facts;
-    }
-
-    // Legacy comparison path; active DLL input copies raw facts into the owning vial step below.
-    VR::VialContact::Sample GatherVialContact(s64 now,VR::VialContact::Sample& source) {
-        return PhysicalInteractions::VialContactPreparation::Prepare(GatherVialContactFacts(source),now,recenter_serial);
-    }
-
-    void UpdateDllVial(const PhysicalState& in, const HandState& left, float dt) {
-        if (StopFailedInteraction()) { DisarmVial(); return; }
-        PiVialInput packet{};
-        packet.size = sizeof(packet);
-        packet.session = interaction_module.Session();
-        packet.space = recenter_serial;
-        packet.now_ns = VR::Body::SteadyNowNs();
-        packet.prediction_ns = vial_geo_time;
-        packet.dt = dt;
-        packet.timeout_s = VR::GetSettings().vial_timeout_s;
-        packet.margin_scale = VR::GetSettings().vial_zone_scale;
-        packet.grip = body_analog[2];
-        packet.grip_release = std::exchange(vial_grip_release, -1.0f);
-        packet.x_down = in[PhysX];
-        packet.belt_draw = std::exchange(vial_belt_draw, false);
-        packet.left_valid = left.valid;
-        packet.left_tracked = VR::Body::IsTracked(grip_left_located);
-        packet.weapon_swinging = vial_weapon_swinging;
-        packet.drawn = vial_drawn;
-        // Arming returns before contact recognition. Avoid reading the large body
-        // snapshot on idle/pending frames, just as the legacy path does.
-        if (vial_armed) {
-            VR::VialContact::Sample source{};
-            packet.raw_contact = GatherVialContactFacts(source);
-        }
-        PiVialOutput out{};
-        out.size = sizeof(out);
-        const auto status = interaction_module.Step(packet, out);
-        if (status != PI_OK) {
-            interaction_dll_fault = true;
-            reset_requested = true; // release controls before enabling the fallback layout
-            ResetInteractionContext();
-            DisarmVial();
-            LOG_ERROR(Render_Vulkan, "Physical interaction DLL rejected input ({}); X uses the game's vial", status);
-            shadNotifications::QueueNotification("Physical vial input failed; X uses the game's vial",
-                15.0f, shadNotifications::position::TopLeft);
-            return;
-        }
-        if (out.haptic.count && !PhysicalInteractions::ValidHapticIntent(out.haptic)) {
-            interaction_module.ReportFault();
-            StopFailedInteraction();
-            DisarmVial();
-            return;
-        }
-        // These are render/input-arbitration snapshots, not a second state machine.
-        vial_armed = out.armed != 0;
-        vial_belt = out.belt != 0;
-        vial_time = out.armed_s;
-        vial_reach_age = out.reach_age;
-        haptics[0].sustain = out.sustain;
-        if (out.haptic.count)
-            for (uint32_t side = 0; side < 2; ++side)
-                if (out.haptic.side_mask & (1u << side))
-                    haptics[side].Play(PlaybackPattern(out.haptic));
-        if (out.events & PI_ARMED) {
-            vial_events |= VrOverlay::VialEventArmed;
-            LogVialZones("armed (DLL)");
-        }
-        if (out.events & PI_RETURNED) {
-            vial_events |= VrOverlay::VialEventDisarmed;
-        }
-        if (out.events & (PI_DISARMED | PI_TIMED_OUT)) {
-            vial_events |= (out.events & PI_DISARMED) ? VrOverlay::VialEventDisarmed : VrOverlay::VialEventTimedOut;
-        }
-        if (out.refused) LogVialNearMiss("VR inject DLL", VR::Interactions::Entry(out.miss));
-        if (out.events & PI_INJECT) {
-            LogVialStab("VR inject DLL: STAB", VR::Interactions::Entry(out.hit));
-            if (!dll_inject_request.Begin(out.session, out.request_id, interaction_module.Session())) {
-                interaction_dll_fault = true;
-                reset_requested = true;
-                ResetInteractionContext();
-                DisarmVial();
-                LOG_ERROR(Render_Vulkan, "Physical interaction DLL emitted a duplicate, stale or overlapping request; disabled");
-                shadNotifications::QueueNotification("Physical vial request failed; X uses the game's vial",
-                    15.0f, shadNotifications::position::TopLeft);
-                return;
-            }
-            std::copy(std::begin(out.hit.label), std::end(out.hit.label), dll_inject_zone.begin());
-            InjectVial(dll_inject_zone.data());
-        }
-    }
-
     void UpdateVial(const PhysicalState& in, const HandState& left, float dt) {
-        if (UsingInteractionDll()) {
-            UpdateDllVial(in, left, dt);
-            return; // exactly one recognizer may submit an action
-        }
         auto& vial_hand = haptics[0];
         if (!inject_logged) {
             inject_logged = true;
@@ -7366,11 +7782,33 @@ struct OpenXRPresenter::Impl {
         }
         // Untracked: no zone decisions (the gate drops what was inside).
         const s64 contact_now = VR::Body::SteadyNowNs();
-        VR::VialContact::Sample source{};
-        const auto contact = GatherVialContact(contact_now, source);
+        VR::VialContact::Sample source{}, contact{};
+        VR::Quick::LatestVialContact(source);
+        VR::Body::BodyStatus current_body{};
+        if (VR::Body::LatestBodyStatus(current_body)) {
+            contact = VR::VialContact::AtGrip(source,
+                current_body.driven && current_body.injection_body.valid ?
+                    current_body.injection_body : source.body,
+                grip_left_located.p, grip_left_located.q, contact_now, recenter_serial);
+            VR::VialContact::SeatedLap(contact.body,vial_geo,contact_now);
+            VR::Body::HandsSample hands{};
+            if (VR::Body::LatestHands(hands) &&
+                hands.space_serial==recenter_serial && contact_now>=hands.steady_ns &&
+                contact_now-hands.steady_ns<VR::VialContact::GraceNs) {
+                // Same post-freeze / ApplyTwoHand / music-box pose given to the body.
+                const auto& right=hands.hand[1];
+                if (VR::Body::IsTracked(right))
+                    VR::VialContact::AtRightGrip(contact.body,right.p,right.q,hands.steady_ns);
+                if (hands.head_valid) {
+                    contact.body.p[5]=hands.head_p+VR::Body::Rotate(
+                        VR::Body::Normalize(hands.head_q),VR::Body::Vec3{0,0,.02f});
+                    contact.body.point_ns[5]=hands.steady_ns;
+                }
+            }
+        }
         const auto r = vial_gate.Update(contact, contact_now, recenter_serial,
             VR::Body::IsTracked(grip_left_located),
-            vial_weapon_swinging,
+            vial_geo.arm_ok && vial_geo.weapon_speed > VR::VialZones::SwingGuardSpeed,
             VR::GetSettings().vial_zone_scale);
         // Every rejected entry and each half-second report uses the padded target gap.
         if (r.refused || r.stab || contact_now-vial_contact_log_ns>=500'000'000) {
@@ -7395,7 +7833,19 @@ struct OpenXRPresenter::Impl {
         if (r.refused) {
             LogVialNearMiss("VR inject", r.miss);
         }
-        if (r.stab) {
+        // A vial never injects right after it is armed (2026-10-16: the hand passing the
+        // body as it came out stabbed by itself): 360 ms after a pouch draw, 70 ms after A.
+        constexpr float PouchStabGraceS = 0.36f;
+        constexpr float ButtonStabGraceS = 0.07f;
+        const float stab_grace = vial_belt ? PouchStabGraceS : ButtonStabGraceS;
+        if (r.stab && vial_time < stab_grace) {
+            // The gate fires once per draw: give the stab back, or this vial never injects (the
+            // user, 2026-10-16: a vial held that would not inject). Out of the body, then in.
+            vial_gate.Unfire();
+            LOG_INFO(Render_Vulkan, "VR inject: stab {:.0f} ms after the vial was armed ({}): "
+                                    "ignored (stab again)",
+                     vial_time * 1000.0f, vial_belt ? "pouch" : "button");
+        } else if (r.stab) {
             LogVialStab("VR inject: STAB", r.hit);
             InjectVial(r.hit.label);
         }
@@ -7405,34 +7855,53 @@ struct OpenXRPresenter::Impl {
     // neck pivot under the eyes (a look round or down never moves it), the torso's lazy heading
     // (belt_torso: a glance down at the hip or the vial never turns it), the right arm from the
     // right controller (the hunter's wrist on the grip, the elbow, the shoulder) and your height.
-    void UpdateVialGeometry(const HandState& right,const GestureFrame& gesture,float dt) {
-        PiMeleeFeedbackInput p{};p.operation=PI_MF_ZONE_GEOMETRY;p.dt=dt;
-        auto& f=p.zone;f.prediction_ns=gesture.time;f.head_ok=gesture.head_ok;
-        f.head_velocity_ok=gesture.head_velocity_ok;f.torso_valid=belt_torso.Valid();
-        f.weapon_valid=right.valid;f.weapon_orientation_valid=right.orientation_valid;
-        const auto put=[](float* to,const auto& v){to[0]=v.x;to[1]=v.y;to[2]=v.z;};
-        const auto quat=[](float* to,const auto& q){to[0]=q.x;to[1]=q.y;to[2]=q.z;to[3]=q.w;};
-        put(f.head,gesture.head_position);put(f.head_velocity,gesture.head_velocity);
-        quat(f.head_q,gesture.head_orientation);put(f.forward,gesture.forward);
-        put(f.torso_forward,belt_torso.Forward());put(f.weapon_p,right.position);
-        put(f.weapon_v,right.velocity);quat(f.weapon_q,right.orientation);
-        const auto& settings=VR::GetSettings();const auto trim=VR::Body::DefaultWeaponGrip();
-        f.eye_offset_m=VR::HeightBodyOffsetM();f.zone_scale=settings.vial_zone_scale;
-        f.floor_known=floor_located;f.floor_y=floor_y;f.seated=settings.seated;
-        f.seated_eye_cm=settings.seated_eye_cm;f.natural_arms=VR::Body::GetBodySettings().body_natural_arms;
-        f.blade_pitch_deg=settings.blade_pitch_deg;f.trim[0]=trim.yaw_deg;f.trim[1]=trim.pitch_deg;f.trim[2]=trim.roll_deg;
-        namespace C=VR::Body::C0000;
-        if(const auto* sk=C::Active()) {
-            f.skeleton_valid=1;const auto& m=sk->model;
-            std::copy(m[C::R_Weapon].t.begin(),m[C::R_Weapon].t.end(),f.model_weapon);
-            std::copy(m[C::R_Weapon].q.begin(),m[C::R_Weapon].q.end(),f.model_weapon_q);
-            std::copy(m[C::R_Hand].t.begin(),m[C::R_Hand].t.end(),f.model_hand);
-            std::copy(m[C::R_Forearm].t.begin(),m[C::R_Forearm].t.end(),f.model_forearm);
+    void UpdateVialGeometry(const HandState& right, const GestureFrame& gesture, float dt) {
+        namespace Z = VR::VialZones;
+        // A gap (menus, a cinematic, no gameplay input): the neck's turn rate starts again.
+        if (vial_geo_time == 0 || gesture.time - vial_geo_time > 100'000'000) {
+            vial_neck.Reset();
         }
-        const auto result=melee_feedback_runtime.Step(p).zone;
-        vial_geo=PhysicalInteractions::ZonePackets::Unpack(result.geometry);
-        vial_geo_time=result.prediction_ns;vial_zone_sequence=result.geometry_sequence;
-        vial_weapon_swinging=(result.flags&PI_ZO_SWINGING)!=0;
+        vial_geo_time = gesture.time;
+        const auto& h = gesture.head_position;
+        const auto& hq = gesture.head_orientation;
+        const auto neck = vial_neck.Update(gesture.head_ok, {h.x, h.y, h.z},
+                                           {gesture.head_velocity.x, gesture.head_velocity.y,
+                                            gesture.head_velocity.z},
+                                           gesture.head_velocity_ok, {hq.x, hq.y, hq.z, hq.w}, dt);
+        VR::Body::Vec3 heading{vial_heading.x, 0.0f, vial_heading.z};
+        if (belt_torso.Valid()) {
+            const VR::Belt::P3 f = belt_torso.Forward();
+            heading = {f.x, 0.0f, f.z};
+        } else if (std::hypot(gesture.forward.x, gesture.forward.z) > 0.2f) {
+            heading = {gesture.forward.x, 0.0f, gesture.forward.z}; // looking almost straight up
+                                                                     // or down keeps the last one
+        }
+        vial_heading = {heading.x, 0.0f, heading.z};
+        const auto& vs = VR::GetSettings();
+        Z::Params p{};
+        p.k = VR::PlayerBody::BodyScaleFor(VR::HeightBodyOffsetM());
+        p.scale = vs.vial_zone_scale;
+        p.floor_known = floor_located;
+        p.floor_y = floor_y;
+        p.seated = vs.seated;
+        p.natural_arms = VR::Body::GetBodySettings().body_natural_arms;
+        p.lap_below = Z::LapBelow * p.k;
+        if (vs.seated && vs.seated_eye_cm > 0 && floor_located) {
+            // The lap keeps its height in the room when you lean down to it.
+            p.lap_y_known = true;
+            p.lap_y = floor_y + static_cast<float>(vs.seated_eye_cm) * 0.01f - p.lap_below;
+        }
+        const VR::Body::GripTrim trim = VR::Body::DefaultWeaponGrip();
+        const Z::ArmInGrip arm = Z::HunterArmInGrip(vs.blade_pitch_deg, trim.yaw_deg,
+                                                    trim.pitch_deg, trim.roll_deg);
+        Z::Tracked weapon{};
+        weapon.valid = right.valid;
+        weapon.p = {right.position.x, right.position.y, right.position.z};
+        weapon.v = {right.velocity.x, right.velocity.y, right.velocity.z};
+        weapon.q_valid = right.orientation_valid;
+        weapon.q = {right.orientation.x, right.orientation.y, right.orientation.z,
+                    right.orientation.w};
+        vial_geo = Z::Build(neck, heading, weapon, arm, p);
     }
 
     static VR::VialZones::Tracked VialHand(const HandState& left) {
@@ -7472,7 +7941,7 @@ struct OpenXRPresenter::Impl {
     }
 
     // An entry into a zone that was no stab, with the rule that refused it (at most one line per
-    // VialNearLogNs, VialNearLogMax in a session): the user's next session says what still fails.
+    // VialNearLogNs, VialNearLogMax in a session): the tester's next session says what still fails.
     void LogVialNearMiss(const char* prefix, const VR::VialZones::Entry& e) {
         namespace Z = VR::VialZones;
         ++vial_near_count;
@@ -7538,7 +8007,6 @@ struct OpenXRPresenter::Impl {
     }
 
     void DisarmVial() {
-        interaction_module.Disarm();
         vial_armed = false;
         vial_grip_hold.Reset();
         vial_gate.Reset();
@@ -7553,159 +8021,39 @@ struct OpenXRPresenter::Impl {
     // next (a refused one is not repeated by the hand resting there). The stab reaches the
     // controller with the next UpdateQuickItems (Input::stab). While the hand reaches for the
     // weapon arm, swings and the transform squeeze wait (VialReaching), as for the vial.
-    void UpdateQuickStab(const HandState& left,float dt) {
-        if(!vial_zone_sequence)return;
-        PiMeleeFeedbackInput p{};p.operation=PI_MF_ZONE_STAB;p.dt=dt;
-        auto& f=p.zone_stab;f.geometry_sequence=vial_zone_sequence;
-        f.grabs=quick_out.grabs;f.stab_item=quick_out.stab_item;f.valid=left.valid;f.q_valid=left.orientation_valid;
-        f.p[0]=left.position.x;f.p[1]=left.position.y;f.p[2]=left.position.z;
-        f.v[0]=left.velocity.x;f.v[1]=left.velocity.y;f.v[2]=left.velocity.z;
-        f.q[0]=left.orientation.x;f.q[1]=left.orientation.y;f.q[2]=left.orientation.z;f.q[3]=left.orientation.w;
-        const auto result=melee_feedback_runtime.Step(p).zone;
-        if(result.flags&PI_ZO_REFUSED)LogVialNearMiss("VR quick: stab",PhysicalInteractions::ZonePackets::Unpack(result.miss));
-        if(result.flags&PI_ZO_STAB) {
-            std::copy(std::begin(result.hit.label),std::end(result.hit.label),quick_stab_zone.begin());
-            quick_stab_pending=true;
-            LOG_INFO(Render_Vulkan,"VR quick: STAB zone {}: the hand {:.0f} cm inside it, {:.2f} m/s toward it",
-                     quick_stab_zone.data(),result.hit.inside_m*100.f,result.hit.best);
+    void UpdateQuickStab(const HandState& left, float dt) {
+        QuickStab& z = quick_stab;
+        z.reach_age = std::min(z.reach_age + dt, 10.0f);
+        if (quick_out.grabs != z.grabs) {
+            z.gate.Reset(); // a new take: the zones start again from where it was taken
+            z.gate.StartMoved({left.position.x, left.position.y, left.position.z});
+            z.grabs = quick_out.grabs;
         }
+        const auto r = z.gate.Update(
+            vial_geo, quick_out.stab_item ? VialHand(left) : VR::VialZones::Tracked{}, dt);
+        if (!quick_out.stab_item) {
+            return;
+        }
+        if (r.reaching) {
+            z.reach_age = 0.0f;
+        }
+        if (r.refused) {
+            LogVialNearMiss("VR quick: stab", r.miss);
+        }
+        if (!r.stab) {
+            return;
+        }
+        quick_stab_zone = r.hit.label;
+        LOG_INFO(Render_Vulkan,
+                 "VR quick: STAB zone {}: the hand {:.0f} cm inside it, {:.2f} m/s toward it",
+                 quick_stab_zone, r.hit.inside_m * 100.0f, r.hit.best);
     }
 
     // The armed vial's hand on its way to the weapon arm, or in one of its zones (UpdateVial): an
     // injection is coming. (quick_use_stab: a blood's the same, UpdateQuickStab.)
     bool VialReaching() const {
-        PiMeleeFeedbackInput p{};p.operation=PI_MF_ZONE_REACH;
-        p.zone_stab.inject_waiting=inject_waiting;p.zone_stab.vial_armed=vial_armed;
-        p.zone_stab.vial_reach_age=vial_reach_age;
-        return (melee_feedback_runtime.Step(p).zone.flags&PI_ZO_REACHING)!=0;
-    }
-
-    PiTwoPolicyInput TwoPolicyFacts(s64 now) const {
-        PiTwoPolicyInput f{};
-        f.now_ns = now;
-        f.family = RightFamily();
-        f.form_b = RightFormB();
-        f.status_fresh = two_hand_status_ok;
-        f.trick_enabled = VR::Tricks::GetTrickSettings().hand_transform;
-        f.right_ready = right_grip_ready;
-        VR::Combat::TransformStatus running{};
-        f.transforming = VR::Combat::LatestTransformStatus(running) &&
-                         now - running.ns < 200'000'000 && running.busy;
-        f.combat_busy = melee_window.Current().open || melee.Pending();
-        return f;
-    }
-
-    void FinishTwoPolicy(bool accepted, u32 native_serial) {
-        if (!two_hand_runtime.PolicyRequestId())
-            return;
-        auto f = TwoPolicyFacts(VR::Body::SteadyNowNs());
-        f.request_id = two_hand_runtime.PolicyRequestId();
-        f.action_session = two_hand_runtime.PolicyRequestSession();
-        f.accepted = accepted;
-        const auto result =
-            two_hand_runtime.Policy(PI_TWO_POLICY_ACCEPT, f, VR::TwoHand::GetTwoHandSettings());
-        PlayInteractionHaptics(result);
-        if (accepted && result.acknowledgement == PI_ACK_CURRENT) {
-            dll_two_action_id = f.request_id;
-            dll_two_action_session = f.action_session;
-            dll_two_action_serial = native_serial;
-        }
-        two_hand_runtime.CompletePolicyRequest();
-    }
-
-    void HandleTwoPolicyOutcome(const VR::Combat::TransformEvent& event) {
-        if (!two_hand_runtime.Active() || !dll_two_action_id || !dll_two_action_serial ||
-            event.serial != dll_two_action_serial)
-            return;
-        auto f = TwoPolicyFacts(VR::Body::SteadyNowNs());
-        switch (event.kind) {
-        case VR::Combat::TransformEventKind::Locked: // form committed; animation tail may continue
-        case VR::Combat::TransformEventKind::Done:
-            f.outcome = PI_TWO_DONE;
-            break;
-        case VR::Combat::TransformEventKind::Denied:
-            f.outcome = PI_TWO_DENIED;
-            break;
-        case VR::Combat::TransformEventKind::Aborted:
-            f.outcome = event.a < .5f ? PI_TWO_ABORTED_BEFORE : PI_TWO_ABORTED_AFTER;
-            break;
-        default:
-            return;
-        }
-        f.request_id = dll_two_action_id;
-        f.action_session = dll_two_action_session;
-        const bool engaged = two_hand_runtime.Engaged();
-        two_hand_runtime.Policy(PI_TWO_POLICY_OUTCOME, f, VR::TwoHand::GetTwoHandSettings());
-        if (engaged && !two_hand_runtime.Engaged())
-            two_hand_out = {};
-        dll_two_action_id = 0;
-        dll_two_action_serial = 0;
-    }
-
-    void ResetTwoHandGuide(bool down = false) {
-        if (!two_hand_runtime.Active()) {
-            two_hand_guide_gesture.Reset(down);
-            return;
-        }
-        auto f = TwoPolicyFacts(VR::Body::SteadyNowNs());
-        f.right_down = down;
-        two_hand_runtime.Policy(PI_TWO_GUIDE_RESET, f, VR::TwoHand::GetTwoHandSettings());
-    }
-    VR::TwoHand::GuideGesture::Out StepTwoHandGuide(bool down, bool own_use, bool blocked,
-                                                  int family, float dt) {
-        auto f = TwoPolicyFacts(VR::Body::SteadyNowNs());
-        f.right_down = down;
-        f.family = family;
-        const auto block = GripTransformBlockPacket();
-        auto& raw = f.guide;
-        raw.now_ns = block.now_ns;
-        raw.transform_ns = block.transform_ns;
-        raw.handle_available = two_hand_handle_available;
-        raw.two_handed = two_hand_status.two_handed;
-        raw.own_use = own_use;
-        raw.blocked = blocked;
-        raw.native_pending = block.native_pending;
-        raw.policy_pending = block.policy_pending;
-        raw.vial = block.vial;
-        raw.music = block.music;
-        raw.bow_up = block.bow_up;
-        raw.bow_nocked = block.bow_nocked;
-        raw.at_bow = block.at_bow;
-        raw.bow_holding = block.bow_holding;
-        raw.quiver = block.quiver;
-        if (!two_hand_runtime.Active())
-            return two_hand_guide_gesture.Step(
-                down, PhysicalInteractions::TwoHandGuidePolicy::Eligible(raw), family, dt);
-        const auto o = two_hand_runtime.Policy(PI_TWO_GUIDE_RAW, f,
-                                               VR::TwoHand::GetTwoHandSettings(),
-                                               nullptr, nullptr, dt);
-        return {o.guide_owns != 0, o.guide_tap != 0};
-    }
-
-    void CancelNativeTransform() {
-        if (!native_transport_serial)
-            return;
-        native_cancelled_through = std::max(native_cancelled_through, native_transport_serial);
-        if (VR::Combat::CancelTransformPull(native_transport_serial)) {
-            // ResetInteractionContext already cancelled this module generation. No guest claim
-            // won the CAS, so this is a definitive pre-execution cancellation.
-            HandleTwoPolicyOutcome({VR::Combat::TransformEventKind::Aborted,
-                                    native_transport_serial, 0, 0, VR::Body::SteadyNowNs(),
-                                    "cancelled before game claim"});
-            native_transport_serial = 0;
-        }
-    }
-
-    void PollNativeTransform() {
-        if (!interaction_dll_requested)
-            return;
-        VR::Combat::TransformEvent outcome{};
-        if (!VR::Combat::PollTransformOutcome(outcome))
-            return;
-        HandleTwoPolicyOutcome(outcome);
-        ApplyNativeTransformEvent(outcome,PI_NTI_RETAINED);
-        if (outcome.serial == native_transport_serial)
-            native_transport_serial = 0;
+        return inject_waiting || (vial_armed && vial_reach_age <= VialApproachAge) ||
+               quick_stab.reach_age <= VialApproachAge;
     }
 
     // right_grip=transform with transform=native: a squeeze goes to the game's weapon-only
@@ -7716,50 +8064,39 @@ struct OpenXRPresenter::Impl {
     // did the motion, so the clip starts at its flick start (the form switches at once), no swing
     // joins it, and the gesture's own clunk is its lock (no tick, detents or clack from here).
     bool StartNativeTransform(const char* motion, bool hand = false) {
-        namespace Cb=VR::Combat;
-        const auto& ts=VR::Transform::GetTransformSettings();
-        const s64 now=VR::Body::SteadyNowNs();
+        namespace Cb = VR::Combat;
+        const auto& ts = VR::Transform::GetTransformSettings();
+        const s64 now = VR::Body::SteadyNowNs();
         Cb::TransformStatus st{};
-        PiNativeTransformInputFacts facts{};
-        facts.now_ns=now;facts.dll_mode=interaction_dll_requested;facts.busy=Cb::TransformPullBusy();
-        facts.native_on=ts.native;facts.status_loaded=Cb::LatestTransformStatus(st);
-        facts.status_ns=st.ns;facts.status_ok=st.ok;facts.moving=motion!=nullptr;facts.hand=hand;
-        facts.flick=ts.flick;facts.feel=ts.haptics;facts.character_generation=st.character_generation;
-        facts.weapon_id=st.weapon_id;facts.style=st.style;facts.weapon_slot=st.weapon_slot;
-        const auto& window=melee_window.Current();facts.window_open=window.open;facts.window_serial=window.serial;
-        const auto prepared=whip_transform_hold.NativeTransform(PI_WEAPON_INPUT_NATIVE_TRANSFORM_PREPARE,facts);
-        native_transform_rejected=(prepared.flags&PI_NTI_REJECTED)!=0;
-        if(interaction_dll_requested && (interaction_dll_fault || interaction_module.Faulted())){
-            native_transform_rejected=true;return false;
-        }
-        if(native_transform_rejected)return false;
-        if(!(prepared.flags&PI_NTI_READY)){
-            LOG_INFO(Render_Vulkan,"VR input: {} -> {} ({})",hand?"hand transform":"right grip",
-                motion!=nullptr?"nothing (L1 is no flick)":"L1",
-                prepared.reason==PI_NTI_REASON_VANILLA?"transform=vanilla":
-                prepared.reason==PI_NTI_REASON_STALE?"no game status":(st.why!=nullptr?st.why:"?"));
+        const bool fresh = Cb::LatestTransformStatus(st) && now - st.ns < 200'000'000;
+        if (!ts.native || !fresh || !st.ok) {
+            LOG_INFO(Render_Vulkan, "VR input: {} -> {} ({})",
+                     hand ? "hand transform" : "right grip",
+                     motion != nullptr ? "nothing (L1 is no flick)" : "L1",
+                     !ts.native ? "transform=vanilla"
+                     : !fresh   ? "no game status"
+                                : (st.why != nullptr ? st.why : "?"));
             return false;
         }
-        const auto& command=prepared.command;
-        Cb::TransformPull pull{};pull.serial=Cb::NextTransformSerial();
-        pull.press_ns=command.press_ns;pull.flick=command.flick!=0;pull.no_join=command.no_join!=0;
-        pull.character_generation=command.character_generation;pull.weapon_id=command.weapon_id;
-        pull.style=command.style;pull.weapon_slot=command.weapon_slot;pull.window=command.window;
-        const bool accepted=pull.serial && (!interaction_dll_requested || Cb::SubmitTransformPull(pull));
-        if(accepted){
-            // Keep native ownership before reporting the receipt: a concurrent fault must cancel it.
-            transform_serial=pull.serial;
-            if(interaction_dll_requested)native_transport_serial=pull.serial;
-            else Cb::PublishTransformPull(pull);
+        Cb::TransformPull pull{};
+        pull.serial = ++transform_serial;
+        pull.press_ns = now;
+        pull.flick = (motion != nullptr || hand) && ts.flick;
+        pull.no_join = hand;
+        const VR::Melee::Window& w = melee_window.Current();
+        pull.window = w.open ? w.serial : 0;
+        Cb::PublishTransformPull(pull);
+        if (ts.flick && !hand) {
+            // The swing open now, or the next one within the attach time, joins this transform
+            // (the game's FlickJoins, a plain squeeze's too): the transform's stroke, never
+            // charged by the combo budget (core/vr/melee_window.h NoteFlick).
+            melee_window.NoteFlick(0.35f);
         }
-        PiNativeTransformInputFacts receipt{};receipt.token=prepared.token;
-        receipt.serial=pull.serial;receipt.accepted=accepted;
-        const auto result=whip_transform_hold.NativeTransform(PI_WEAPON_INPUT_NATIVE_TRANSFORM_RECEIPT,receipt);
-        native_transform_rejected=(result.flags&PI_NTI_REJECTED)!=0 || !(result.flags&PI_NTI_SENT);
-        if(!(result.flags&PI_NTI_SENT))return false;
-        if(result.flags&PI_NTI_NOTE_FLICK)melee_window.NoteFlick(result.join_s);
-        if(result.flags&PI_NTI_HAND)hand_transform_serial=result.serial;
-        PlayInteractionHaptics(result);
+        if (hand) {
+            hand_transform_serial = pull.serial;
+        } else if (ts.haptics) {
+            haptics[1].Play(Tick(0.2f, 12.0f));
+        }
         LOG_INFO(Render_Vulkan,
                  "VR input: {} -> native transform #{} (weapon {} style {} clip a000_{}{}){}",
                  hand ? "hand transform" : "right grip", pull.serial, st.weapon_id, st.style,
@@ -7768,50 +8105,66 @@ struct OpenXRPresenter::Impl {
                                           pull.window != 0 ? fmt::format(", swing #{}", pull.window)
                                                            : std::string{})
                             : std::string{});
-        if(result.flags&PI_NTI_STAMP)transform_request_ns=now;
+        transform_request_ns = now;
         return true;
     }
 
     // The game's answers to native transform squeezes: a detent tick per mechanical sound of the
     // clip, the clack as the form locks, a refused squeeze's double tick. Drained every gameplay
     // frame.
-    PiNativeTransformInputFacts NativeTransformEventFacts(const VR::Combat::TransformEvent& event,
-                                                        uint32_t source) const {
-        static_assert(static_cast<u32>(VR::Combat::TransformEventKind::Started)==PI_NTI_STARTED &&
-                      static_cast<u32>(VR::Combat::TransformEventKind::Detent)==PI_NTI_DETENT &&
-                      static_cast<u32>(VR::Combat::TransformEventKind::Locked)==PI_NTI_LOCKED &&
-                      static_cast<u32>(VR::Combat::TransformEventKind::Done)==PI_NTI_DONE &&
-                      static_cast<u32>(VR::Combat::TransformEventKind::Denied)==PI_NTI_DENIED &&
-                      static_cast<u32>(VR::Combat::TransformEventKind::Aborted)==PI_NTI_ABORTED);
-        PiNativeTransformInputFacts f{};f.source=source;f.kind=static_cast<uint32_t>(event.kind);
-        f.serial=event.serial;f.a=event.a;f.hand_serial=hand_transform_serial;
-        f.cancelled_through=native_cancelled_through;f.dll_mode=interaction_dll_requested;
-        f.feel=VR::Transform::GetTransformSettings().haptics;f.policy_active=two_hand_runtime.Active();
-        f.engaged=two_hand_runtime.Engaged();f.status_valid=two_hand_status_ok;
-        f.style=two_hand_status.style;f.family=RightFamily();f.charge_serial=charge_serial;
-        f.revert_tries=revert_tries;return f;
-    }
-
-    void ApplyNativeTransformEvent(const VR::Combat::TransformEvent& event,uint32_t source) {
-        const auto result=whip_transform_hold.NativeTransform(PI_WEAPON_INPUT_NATIVE_TRANSFORM_EVENT,
-                                                             NativeTransformEventFacts(event,source));
-        PlayInteractionHaptics(result);
-        if(result.flags&PI_NTI_CLEAR_GRAB)grab_transform_ns=0;
-        if(result.flags&PI_NTI_CANCEL_CHARGE){CancelRightCharge();charge_serial=0;}
-        if(result.flags&PI_NTI_RETRY_REVERT){
-            revert_tries=result.revert_tries;hold_form.pending=true;hold_form.off_s=0;
+    void HandleTransformEvents(const HapticPattern& clack) {
+        namespace Cb = VR::Combat;
+        auto& weapon_hand = haptics[1];
+        const bool feel = VR::Transform::GetTransformSettings().haptics;
+        std::array<Cb::TransformEvent, 16> events{};
+        const u32 count = Cb::PollTransformEvents(events.data(), static_cast<u32>(events.size()));
+        for (u32 i = 0; i < count; ++i) {
+            const Cb::TransformEvent& e = events[i];
+            // A hand transform's lock is the gesture's own clunk (UpdateHandTransform).
+            const bool by_hand = e.serial != 0 && e.serial == hand_transform_serial;
+            switch (e.kind) {
+            case Cb::TransformEventKind::Detent:
+                if (feel && !by_hand) {
+                    weapon_hand.Play(Tick(0.3f, 8.0f, 0));
+                }
+                break;
+            case Cb::TransformEventKind::Locked:
+                if (feel && !by_hand) {
+                    weapon_hand.Play(clack);
+                }
+                break;
+            case Cb::TransformEventKind::Denied:
+                if (feel) {
+                    weapon_hand.Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
+                }
+                if (by_hand) {
+                    grab_transform_ns = 0;
+                    RetryRefusedHandTransform(e.serial);
+                }
+                if (by_hand && two_hand.Engaged() && !RightFormB() &&
+                    VR::Tricks::GrabFamily(RightFamily())) {
+                    // The grab's transform never came: let go of the one-handed form's handle.
+                    two_hand.Drop();
+                    two_hand_out = {};
+                }
+                LOG_INFO(Render_Vulkan, "VR input: transform #{} refused by the game ({})",
+                         e.serial, e.why != nullptr ? e.why : "");
+                break;
+            case Cb::TransformEventKind::Aborted:
+                if (by_hand) {
+                    grab_transform_ns = 0; // (a grab's hold on form A lets go: UpdateTwoHand)
+                    if (e.a < 0.5f) { // (stopped before the switch)
+                        RetryRefusedHandTransform(e.serial);
+                    }
+                }
+                LOG_INFO(Render_Vulkan, "VR input: transform #{} stopped ({}{})", e.serial,
+                         e.why != nullptr ? e.why : "", e.a > 0.5f ? ", after the switch" : "");
+                break;
+            case Cb::TransformEventKind::Started:
+            case Cb::TransformEventKind::Done:
+                break;
+            }
         }
-        if(result.flags&PI_NTI_DROP){two_hand_runtime.Drop();two_hand_out={};}
-        if(result.flags&PI_NTI_LOG_DENIED)
-            LOG_INFO(Render_Vulkan,"VR input: transform #{} refused by the game ({})",event.serial,event.why!=nullptr?event.why:"");
-        if(result.flags&PI_NTI_LOG_ABORTED)
-            LOG_INFO(Render_Vulkan,"VR input: transform #{} stopped ({}{})",event.serial,event.why!=nullptr?event.why:"",event.a>.5f?", after the switch":"");
-    }
-
-    void HandleTransformEvents() {
-        std::array<VR::Combat::TransformEvent,16> events{};
-        const auto count=VR::Combat::PollTransformEvents(events.data(),static_cast<u32>(events.size()));
-        for(u32 i=0;i<count;++i)ApplyNativeTransformEvent(events[i],PI_NTI_RING);
     }
 
     // right_grip=transform: why a right-grip squeeze starting now is not a transform at all
@@ -7827,92 +8180,7 @@ struct OpenXRPresenter::Impl {
     // any context switch, QuickCancel): everything back on this very frame.
     static constexpr const char* MusicBoxBlock = "the right hand is on the music box";
 
-    PiMusicInput MusicPacket(uint32_t op) const {
-        PiMusicInput p{};
-        p.size = sizeof(p);
-        p.operation = op;
-        p.session = interaction_module.Session();
-        p.space = recenter_serial;
-        p.now_ns = VR::Body::SteadyNowNs();
-        return p;
-    }
-    bool CallMusic(const PiMusicInput& p, PiMusicOutput& o) {
-        o = {};
-        o.size = sizeof(o);
-        if (StopFailedInteraction()) return false;
-        const auto result = interaction_module.Music(p, o);
-        if (result == PI_OK && PhysicalInteractions::ValidMusicFeedback(o))
-            return true;
-        LOG_ERROR(Render_Vulkan, "Physical music-box packet failed ({})", result);
-        interaction_dll_fault = true;
-        reset_requested = true;
-        return false;
-    }
-    void UpdateDllMusicBox(const HandState& left, const HandState& right, float dt) {
-        namespace M = VR::MusicBox;
-        const auto& qs = VR::Quick::GetQuickSettings();
-        auto p = MusicPacket(PI_MUSIC_STEP);
-        p.active = quick_out.crank_box;
-        p.dt = dt;
-        p.grip = body_analog[3];
-        p.tracked = right.valid;
-        p.refused = quick_out.crank_answer < 0;
-        p.hand = {right.position.x, right.position.y, right.position.z};
-        M::Attachment attachment{};
-        p.attached =
-            left.valid && left.orientation_valid && M::LatestAttachment(attachment, p.now_ns);
-        const auto frame = p.attached ? attachment.frame : M::Frame{};
-        const auto geometry = p.attached ? attachment.geometry : M::Geometry{};
-        M::Config cfg{};
-        cfg.grab_m = qs.music_box_grab_cm * .01f;
-        cfg.play_turns = qs.music_box_turns;
-        cfg.replay_s = qs.music_box_replay_s;
-        PhysicalInteractions::MusicPackets::Pack(p, cfg, geometry, frame);
-        VR::Body::BodyStatus status{};
-        p.arm = VR::Body::LatestBodyStatus(status) && p.now_ns - status.steady_ns < 250'000'000 &&
-                status.arm_weight[1] >= .9f;
-        PiMusicOutput o{};
-        if (!CallMusic(p, o)) {
-            music_box_free = false;
-            music_box_play = false;
-            music_box_snap = 0;
-            M::PublishScene({});
-            return;
-        }
-        music_box_free = o.active;
-        music_box_snap = o.snap;
-        music_box_knob = {o.knob.x, o.knob.y, o.knob.z};
-        if (p.attached) {
-            const auto body = [](auto v) { return VR::Body::Vec3{v.x, v.y, v.z}; };
-            music_box_frame = VR::Body::FromBasis(body(frame.u), body(frame.v), body(frame.axis));
-        }
-        music_box_play_ns = o.play_ns;
-        PlayInteractionHaptics(o);
-        if (o.events & PI_MUSIC_PLAY)
-            music_box_play = true; // feeds the identified Quick::Controller request
-        if (o.events)
-            LOG_INFO(Render_Vulkan, "VR music-box DLL: events {}, plays {}, progress {}", o.events,
-                     o.plays, o.progress);
-        M::Scene scene{};
-        scene.steady_ns = p.now_ns;
-        scene.active = o.active;
-        scene.grabbed = o.grabbed;
-        scene.angle = o.angle;
-        scene.progress = o.progress;
-        scene.play_ns = o.play_ns;
-        scene.frame = frame;
-        scene.geometry = geometry;
-        M::PublishScene(scene);
-    }
-
     void UpdateMusicBox(const HandState& left, const HandState& right, float dt) {
-        if (UsingInteractionDll()) {
-            if (quick_out.crank_box)
-                UpdateDllMusicBox(left, right, dt);
-            else
-                MusicBoxOff("the box left the hand");
-            return;
-        }
         namespace MB = VR::MusicBox;
         const auto& qs = VR::Quick::GetQuickSettings();
         const bool active = quick_out.crank_box;
@@ -8079,15 +8347,6 @@ struct OpenXRPresenter::Impl {
         if (!music_box_free) {
             return;
         }
-        if (UsingInteractionDll()) {
-            PiMusicOutput o{};
-            CallMusic(MusicPacket(PI_MUSIC_OFF), o);
-            music_box_free = false;
-            music_box_play = false;
-            music_box_snap = 0;
-            VR::MusicBox::PublishScene({});
-            return;
-        }
         music_box_free = false;
         music_box_play = false;
         music_box_snap = 0.0f;
@@ -8118,25 +8377,41 @@ struct OpenXRPresenter::Impl {
     // the game would queue it and turn the weapon straight back (a reflex clench at the join).
     static constexpr s64 HandTransformLockNs = 1'000'000'000;
 
-    PiWeaponInput GripTransformBlockPacket() const {
-        PiWeaponInput p{};
-        p.native_pending = interaction_dll_requested && VR::Combat::TransformPullBusy();
-        p.policy_pending = two_hand_runtime.PolicyWaiting();
-        p.vial = VialReaching();
-        p.music = music_box_free;
-        p.bow_up = bow_up;
-        p.bow_nocked = ranged_runtime.Phase() == VR::Bow::Phase::Nocked;
-        p.at_bow = bow_at_bow;
-        p.bow_holding = ranged_runtime.Phase() == VR::Bow::Phase::Holding;
-        p.quiver = VR::Bow::GetBowSettings().quiver;
-        p.now_ns = VR::Body::SteadyNowNs();
-        p.transform_ns = hand_transform_ns;
-        return p;
+    const char* GripTransformBlock() const {
+        if (VialReaching()) {
+            return "the vial is at the wrist";
+        }
+        if (music_box_free) {
+            return MusicBoxBlock; // the right grip takes the crank
+        }
+        if (bow_up && (bow.State() == VR::Bow::Phase::Nocked ||
+                       (bow_at_bow && (bow.State() == VR::Bow::Phase::Holding ||
+                                       !VR::Bow::GetBowSettings().quiver)))) {
+            // A clench mid-draw, or a whole-hand squeeze nocking at the bow, never turns it back
+            // (the grip's edge comes before UpdateBow nocks in the same frame).
+            return "an arrow at the string";
+        }
+        if (VR::Body::SteadyNowNs() - hand_transform_ns < HandTransformLockNs) {
+            return "a hand transform just went out";
+        }
+        return nullptr;
     }
 
-    const char* GripTransformBlock() const {
-        const auto reason = whip_transform_hold.Block(GripTransformBlockPacket());
-        return reason == 4 ? MusicBoxBlock : PhysicalInteractions::WeaponBlockNames[reason];
+    static constexpr const char* GripUseBlock = "the weapon's own use of the right grip";
+
+    // A hand transform the game refused or stopped before its switch: a charge's costs no
+    // cooldown; a grab-group form B let go of tries its revert again (at most 3 times).
+    void RetryRefusedHandTransform(u32 serial) {
+        if (serial != 0 && serial == charge_serial) {
+            right_grip.CancelCooldown();
+            charge_serial = 0;
+        }
+        if (VR::Tricks::GrabFamily(RightFamily()) && RightFormB() && !two_hand.Engaged() &&
+            revert_tries < 3) {
+            ++revert_tries;
+            hold_form.pending = true;
+            hold_form.off_s = 0.0f;
+        }
     }
 
     // The right weapon's family and whether it is in form B (the two-handed grip's game status).
@@ -8152,19 +8427,13 @@ struct OpenXRPresenter::Impl {
     // lives in the hunter's animation (Tonitrus, the Chikage, the Bloodletter) or that have no
     // weapon-only clip. True if one went to the game.
     bool HandTransformNow(const char* what) {
-        if (interaction_dll_requested && VR::Combat::TransformPullBusy())
-            return false;
-        native_transform_rejected = false;
         const s32 family = RightFamily();
         bool native = false;
-        PiWeaponInput delivery{};
-        delivery.family = family;
-        if (whip_transform_hold.Delivery(delivery).native_allowed) {
+        if (!VR::Tricks::UsesL1(family)) {
             native = StartNativeTransform(nullptr, true);
         }
-        delivery.native_sent = native;
-        delivery.native_rejected = native_transform_rejected;
-        const bool l1 = whip_transform_hold.Delivery(delivery).l1_allowed && pad.Press(PadButton::L1);
+        // The saw must never fall back to a whole-character transform animation.
+        const bool l1 = !native && family != VR::Tricks::SawFamily && pad.Press(PadButton::L1);
         const s64 now = VR::Body::SteadyNowNs();
         if (native || l1) {
             hand_transform_ns = transform_request_ns = now; // (a reflex grip after: none)
@@ -8192,108 +8461,92 @@ struct OpenXRPresenter::Impl {
         auto& lh = haptics[0];
         auto& rh = haptics[1];
         const s32 family = RightFamily();
+        if (Tr::GripUseOf(family, RightFormB()) == Tr::GripUse::None) {
+            if (family == Tr::FistFamily) {
+                // Switching to fists mid-squeeze must also stop the previous weapon's
+                // held L1 and grip-owned vibration, without cancelling other haptics.
+                grip_r_block = GripUseBlock;
+                if (grip_sustain_r > 0.0f && rh.sustain == grip_sustain_r) {
+                    rh.sustain = 0.0f;
+                }
+                grip_sustain_r = 0.0f;
+                grip_quarter = 0;
+                arm_beat_s = 0.0f;
+            }
+            right_grip.Reset(in[PhysGripR]);
+            right_grip_ready = false;
+            return true; // right grip alone does nothing, in either form
+        }
+        Tr::GripUse use = ts.hand_transform && family >= 0 ? Tr::GripUseOf(family, RightFormB())
+                                                           : Tr::GripUse::Transform;
+        if (use == Tr::GripUse::Free && Tr::GrabFamily(family) &&
+            !VR::TwoHand::GetTwoHandSettings().enabled) {
+            use = Tr::GripUse::Transform; // (no grab without two_hand_grip: the squeeze, as before)
+        }
+        // The grab, the hilt and the stab need your hands on the hunter's (the first-person body
+        // driving his arms); without it (third person, body=0) the squeeze transforms, as before.
         VR::Body::BodyStatus body{};
         const s64 now = VR::Body::SteadyNowNs();
-        const bool have_body = VR::Body::LatestBodyStatus(body);
-        const bool arms = !UsingInteractionDll() && have_body &&
-                          now - body.steady_ns < 1'000'000'000 && body.driven && VR::IsFirstPerson();
+        const bool arms = VR::Body::LatestBodyStatus(body) &&
+                          now - body.steady_ns < 1'000'000'000 && body.driven &&
+                          VR::IsFirstPerson();
+        if ((use == Tr::GripUse::Free || use == Tr::GripUse::Arm) && !arms) {
+            use = Tr::GripUse::Transform;
+        }
         const auto end_sustain = [&] {
-            if (grip_sustain_r > 0.0f && rh.sustain == grip_sustain_r) rh.sustain = 0.0f;
+            if (grip_sustain_r > 0.0f && rh.sustain == grip_sustain_r) {
+                rh.sustain = 0.0f;
+            }
             grip_sustain_r = 0.0f;
         };
-        const bool edge = !UsingInteractionDll() && in[PhysGripR] && !grip_r_down;
-        const char* block = edge ? GripTransformBlock() : nullptr;
+        const bool edge = in[PhysGripR] && !grip_r_down;
+        if (two_hand.Engaged()) {
+            // Either grip can retain the support hand: re-squeezing the right one must not
+            // transform the weapon out from under it.
+            right_grip.Reset(in[PhysGripR]);
+            end_sustain();
+            right_grip_ready = false;
+            return true;
+        }
+        const char* block = edge && use != Tr::GripUse::Transform ? GripTransformBlock() : nullptr;
+        if (block != nullptr) {
+            right_grip.Reset(true); // this squeeze is none (a cooldown runs on)
+            right_grip_ready = false;
+            end_sustain();
+            if (ts.haptics) {
+                rh.Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3)); // not now: the deny
+            }
+            LOG_INFO(Render_Vulkan, "VR right grip: {} ignored ({})", VR::Body::WeaponName(family),
+                     block);
+            return true;
+        }
         Tr::Frame f = TrickFrame(left, right, gesture, false, dt);
         f.right.grip = in[PhysGripR];
-        Tr::GripUse use{};
-        Tr::RightGrip::Out o{};
-        if (UsingInteractionDll()) {
-            auto packet = TrickPacket(PI_TRICK_RIGHT_FRAME);
-            CopyTrickFrame(packet, f);
-            packet.two_hand_enabled = VR::TwoHand::GetTwoHandSettings().enabled;
-            packet.engaged = two_hand_runtime.Engaged();
-            packet.now_ns = now;
-            auto& facts = packet.right_frame;
-            facts.body_ns = body.steady_ns; facts.transform_ns = hand_transform_ns;
-            facts.vial_reach_age = vial_reach_age;
-            facts.flags = (have_body ? PI_TR_BODY : 0u) | (body.driven ? PI_TR_DRIVEN : 0u) |
-                (VR::IsFirstPerson() ? PI_TR_FIRST_PERSON : 0u) | (grip_r_down ? PI_TR_PREVIOUS_GRIP : 0u) |
-                (VR::Combat::TransformPullBusy() ? PI_TR_NATIVE_PENDING : 0u) |
-                (two_hand_runtime.PolicyWaiting() ? PI_TR_POLICY_PENDING : 0u) |
-                (inject_waiting ? PI_TR_INJECT_WAIT : 0u) | (vial_armed ? PI_TR_VIAL_ARMED : 0u) |
-                (music_box_free ? PI_TR_MUSIC : 0u) | (bow_up ? PI_TR_BOW_UP : 0u) |
-                (ranged_runtime.Phase() == VR::Bow::Phase::Nocked ? PI_TR_BOW_NOCKED : 0u) |
-                (bow_at_bow ? PI_TR_AT_BOW : 0u) |
-                (ranged_runtime.Phase() == VR::Bow::Phase::Holding ? PI_TR_BOW_HOLDING : 0u) |
-                (VR::Bow::GetBowSettings().quiver ? PI_TR_QUIVER : 0u);
-            PiTrickOutput result{};
-            if (!CallTrick(packet, result)) { end_sustain(); return true; }
-            PlayInteractionHaptics(result);
-            end_sustain();
-            if (result.sustain_right > 0)
-                rh.sustain = grip_sustain_r = result.sustain_right;
-            use = static_cast<Tr::GripUse>(result.use);
-            if (result.early) {
-                if (family != Tr::SawFamily) end_sustain();
-                right_grip_ready = false;
-                if (result.denied) {
-                    LOG_INFO(Render_Vulkan, "VR right grip: {} ignored ({})",
-                             VR::Body::WeaponName(family), result.block_reason == 4 ? MusicBoxBlock :
-                                 PhysicalInteractions::WeaponBlockNames[result.block_reason]);
-                }
-                return true;
-            }
-            o = {static_cast<E>(result.event), result.ready != 0, result.charging != 0,
-                 result.progress, result.cooldown_s};
-            if (result.request_id) dll_charge_request = result.request_id;
-        } else {
-            if (family == Tr::SawFamily) {
-                right_grip.Reset(in[PhysGripR]); right_grip_ready = false; return true;
-            }
-            use = ts.hand_transform && family >= 0 ? Tr::GripUseOf(family, RightFormB())
-                                                   : Tr::GripUse::Transform;
-            if (use == Tr::GripUse::Free && Tr::GrabFamily(family) &&
-                !VR::TwoHand::GetTwoHandSettings().enabled) use = Tr::GripUse::Transform;
-            if ((use == Tr::GripUse::Free || use == Tr::GripUse::Arm) && !arms)
-                use = Tr::GripUse::Transform;
-            if (two_hand_runtime.Engaged()) {
-                right_grip.Reset(in[PhysGripR]); end_sustain(); right_grip_ready = false; return true;
-            }
-            if (block && use != Tr::GripUse::Transform) {
-                right_grip.Reset(true); right_grip_ready = false; end_sustain();
-                if (ts.haptics) rh.Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
-                LOG_INFO(Render_Vulkan, "VR right grip: {} ignored ({})",
-                         VR::Body::WeaponName(family), block);
-                return true;
-            }
-            o = right_grip.Step(f, use, family, ts);
-        }
+        const Tr::RightGrip::Out o = right_grip.Step(f, use, family, ts);
         right_grip_ready = o.ready;
-        if (!UsingInteractionDll()) {
-            if (o.charging && ts.haptics) {
-                // The build: felt from its start (a steady level gets no haptic floor) and rising
-                // with the charge, a detent at each quarter (Tonitrus' crackle, the furnace, the beast).
-                rh.sustain = grip_sustain_r = 0.12f + 0.30f * o.progress;
-                const int q = std::min(static_cast<int>(o.progress * 4.0f), 3);
-                if (q > grip_quarter) {
-                    rh.Play(Tick(0.15f + 0.1f * static_cast<float>(q), 10.0f, 1));
-                }
-                grip_quarter = q;
-            } else {
-                end_sustain();
-                grip_quarter = 0;
+        if (o.charging && ts.haptics) {
+            // The build: felt from its start (a steady level gets no haptic floor) and rising
+            // with the charge, a detent at each quarter (Tonitrus' crackle, the furnace, the beast).
+            rh.sustain = grip_sustain_r = 0.12f + 0.30f * o.progress;
+            const int q = std::min(static_cast<int>(o.progress * 4.0f), 3);
+            if (q > grip_quarter) {
+                rh.Play(Tick(0.15f + 0.1f * static_cast<float>(q), 10.0f, 1));
             }
-            // Armed, the Bloodletter beats faintly in the hand until the stab (or the arming ends).
-            arm_beat_s = o.ready && use == Tr::GripUse::Arm ? arm_beat_s + dt : 0.0f;
-            if (arm_beat_s >= 0.9f) {
-                arm_beat_s = 0.0f;
-                if (ts.haptics) {
-                    rh.Play(HapticPattern{}.Pulse(0.2f, 20.0f).Gap(110.0f).Pulse(0.12f, 20.0f));
-                }
+            grip_quarter = q;
+        } else {
+            end_sustain();
+            grip_quarter = 0;
+        }
+        // Armed, the Bloodletter beats faintly in the hand until the stab (or the arming ends).
+        arm_beat_s = o.ready && use == Tr::GripUse::Arm ? arm_beat_s + dt : 0.0f;
+        if (arm_beat_s >= 0.9f) {
+            arm_beat_s = 0.0f;
+            if (ts.haptics) {
+                rh.Play(HapticPattern{}.Pulse(0.2f, 20.0f).Gap(110.0f).Pulse(0.12f, 20.0f));
             }
         }
         const std::string weapon = VR::Body::WeaponName(family);
-        const bool feel = ts.haptics && !UsingInteractionDll();
+        const bool feel = ts.haptics;
         HapticPattern big{};
         big.priority = 2;
         switch (o.event) {
@@ -8340,7 +8593,6 @@ struct OpenXRPresenter::Impl {
                 HandTransformNow(use == Tr::GripUse::Lift ? "lifted up: charged"
                                  : family == 320          ? "held: the bow"
                                                           : "held: charged");
-            FinishTrick(sent);
             charge_serial = sent && hand_transform_serial != serial_before ? hand_transform_serial
                                                                             : 0;
             if (sent) {
@@ -8357,7 +8609,7 @@ struct OpenXRPresenter::Impl {
                     rh.Play(big.Pulse(0.8f, 35.0f).Ramp(0.5f, 0.0f, 200.0f));
                 }
             } else {
-                CancelRightCharge(); // the charge never reached the game
+                right_grip.CancelCooldown(); // the charge never reached the game
                 if (feel) {
                     rh.Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
                 }
@@ -8381,24 +8633,27 @@ struct OpenXRPresenter::Impl {
         return use != Tr::GripUse::Transform;
     }
 
-    // Copy native status, sampling and settings; interaction policy owns eligibility and history.
-    PiWeaponInput GripTransformPacket(const PhysicalState& in,const HandState& right,
-                                     const HandState& left,const GestureFrame& gesture,
-                                     float input_dt,bool right_mode) const {
-        auto p=GripTransformBlockPacket();p.family=RightFamily();
-        p.swing_pending=melee.Pending();p.swing_open=melee_window.Current().open;
-        p.since_attack=since_attack;p.tracked=right.valid;
-        p.velocity[0]=right.velocity.x;p.velocity[1]=right.velocity.y;p.velocity[2]=right.velocity.z;
-        p.head_velocity[0]=gesture.head_velocity.x;p.head_velocity[1]=gesture.head_velocity.y;
-        p.head_velocity[2]=gesture.head_velocity.z;
-        auto& f=p.transform;f.right_mode=right_mode;f.right=in[PhysGripR];f.left=in[PhysGripL];
-        f.right_valid=right.valid;f.left_valid=left.valid;f.right_orientation=right.orientation_valid;
-        f.left_orientation=left.orientation_valid;f.blocked_right=blocked[PhysGripR];f.blocked_left=blocked[PhysGripL];
-        f.previous_right=grip_r_down;f.drawn=drawn;f.flick=VR::Transform::GetTransformSettings().flick;
-        f.melee_physical=melee_physical;f.window_open=melee_window.Current().open;f.input_dt=input_dt;
-        f.position[0][0]=left.position.x;f.position[0][1]=left.position.y;f.position[0][2]=left.position.z;
-        f.position[1][0]=right.position.x;f.position[1][1]=right.position.y;f.position[1][2]=right.position.z;
-        return p;
+    // right_grip=transform: why a right-grip squeeze starting now happens mid-swing (a flick for
+    // the weapon-only transform; nothing for L1); nullptr: the hand is still.
+    const char* GripMotion(const HandState& right, const GestureFrame& gesture) const {
+        if (melee.Pending()) {
+            return "a swing is being decided";
+        }
+        if (melee_window.Current().open) {
+            return "a swing is open";
+        }
+        if (since_attack < GripAfterAttack) {
+            return "an attack just went out";
+        }
+        if (right.valid) {
+            const float speed = std::hypot(right.velocity.x - gesture.head_velocity.x,
+                                           right.velocity.y - gesture.head_velocity.y,
+                                           right.velocity.z - gesture.head_velocity.z);
+            if (speed > GripSwingSpeed) {
+                return "the weapon hand is swinging";
+            }
+        }
+        return nullptr;
     }
 
     // Quick items in VR (core/vr/quick_items.h): Y opens a small arc of the quick items equipped
@@ -8412,89 +8667,167 @@ struct OpenXRPresenter::Impl {
     // free there); otherwise, with quick_arc=0, or without the hunter's hand, Y is Square.
     // `l3_tap`: the left stick click was tapped this frame (quick_arc_l3): a Y press for the arc;
     // Output::tap_taken says whether it was one (else the caller sends L3).
-    const PhysicalInteractions::QuickOutput& UpdateQuickItems(const PhysicalState& in, const HandState& left,
+    const VR::Quick::Output& UpdateQuickItems(const PhysicalState& in, const HandState& left,
                                               const GestureFrame& gesture, float dt,
                                               bool l3_tap) {
         namespace Q = VR::Quick;
         const auto& settings = VR::GetSettings();
         const auto& qs = Q::GetQuickSettings();
         const s64 now = Q::NowNs();
+        Q::Config c{};
         if (VR::GripPreview::Enabled()) {
-            if (quick_runtime.Bound()) quick_runtime.Cancel(quick_out, "grip preview");
-            quick_out = PhysicalInteractions::QuickPackets::FromPacket(
-                PhysicalInteractions::QuickPackets::ToPacket(
-                    VR::GripPreview::Display(VR::GripPreview::Goods(), now)));
-            if (quick_runtime.Bound())
-                quick_runtime.PreviewFeedback(PhysicalInteractions::QuickFeedbackState::Facts(
-                    QuickFeedbackPacket(qs), quick_out));
+            quick_out = VR::GripPreview::Display(VR::GripPreview::Goods(), now);
             QuickApply(qs);
             if (vial_armed) DisarmVial();
             return quick_out;
         }
         // The arc needs the in-frame renderer to show it (inframe=0: blind, on purpose); if it
         // turned itself off or cannot draw into this game's frame, Y stays the game's Square.
-        const bool inframe_available = VR::InFrame::Available();
-        const bool shown = !qs.inframe || inframe_available;
+        const bool shown = !qs.inframe || VR::InFrame::Available();
         if (!shown && !quick_inframe_warned) {
             quick_inframe_warned = true;
             LOG_WARNING(Render_Vulkan, "VR quick: the in-frame renderer cannot draw the arc; Y is "
                                        "the game's Square until it can");
         }
+        c.enabled = qs.quick_items && qs.quick_arc && !settings.controls_classic &&
+                    !settings.right_grip_draw && shown;
+        c.use_commit_s = qs.use_commit_ms * 0.001f;
+        c.use_cooldown_s = qs.use_cooldown_ms * 0.001f;
+        c.throw_min_speed = qs.throw_min_speed * (settings.seated ? 0.8f : 1.0f);
+        c.throw_gain = qs.throw_gain;
+        c.throw_gain_curve = qs.throw_gain_curve;
+        c.throw_lift_deg = qs.throw_lift_deg;
+        c.throw_peak_window_s = qs.throw_peak_window_s;
+        c.throw_peak_turn_deg = qs.throw_peak_turn_deg;
+        c.throw_push_factor = qs.throw_push_factor;
+        c.throw_spin = qs.throw_spin;
+        c.throw_fresh = qs.throw_fresh_pose;
+        c.throw_rise_wait_s = qs.throw_rise_wait_ms * 0.001f;
+        // VR_THROW_TRACE (diagnostics): every release of a throwable also logs the last 0.4 s of
+        // hand samples (THROWTRACE / TT lines), with the grip located at the input time as well.
         static const bool throw_trace = std::getenv("VR_THROW_TRACE") != nullptr;
-        PiQuickGameplayFacts gameplay{};
-        auto& raw = gameplay.settings;
-        raw = VR::Interactions::CopyQuickGameplaySettings(qs);
-        raw.classic = settings.controls_classic;
-        raw.right_grip_draw = settings.right_grip_draw;
-        raw.seated = settings.seated;
-        raw.inject = settings.inject;
-        raw.physical_vial = PhysicalVialEnabled();
-        raw.inframe_available = inframe_available;
-        raw.left_scheme = settings.left_scheme;
-        raw.left_y_bound = left_y_bound;
-        raw.y_menu_setting = YMenuSetting();
-        raw.steamvr = xr_runtime == VrXrQueuePolicy::Runtime::SteamVr;
-        raw.music_hide_ready = VR::MusicBox::HideReady().load(std::memory_order_relaxed);
-        raw.throw_trace = throw_trace;
-        gameplay.now_ns = now;
-        gameplay.cinematic = VR::CinematicActive();
-        gameplay.menu = in[PhysMenu];
-        gameplay.frozen = grip_adjust.Frozen();
-        gameplay.immersive = VR::IsImmersive();
-        gameplay.x_down = in[PhysX];
-        gameplay.grip_blocked = blocked[PhysGripL];
-        gameplay.trigger_blocked = blocked[PhysTriggerL];
-        gameplay.lever_owns = physical_lever_out.owns_grip[0];
-        gameplay.two_hand_owns = two_hand_out.owns_grip;
-        gameplay.hand_owns = hand_owns_grip;
-        gameplay.shield_up = shield_up;
-        gameplay.bow_up = bow_up;
-        gameplay.bow_hand = bow_hand_i;
-        gameplay.arrow_in_hand = bow_up && bow_hand_i != 0 ? ArrowInHand() : false;
-        gameplay.grip = body_analog[2];
-        gameplay.trigger = body_analog[0];
-        gameplay.since_attack = since_attack;
-        gameplay.loco_combat = loco_combat != nullptr;
-        PhysicalInteractions::QuickPackets::Copy(gameplay.loco_reason, loco_combat);
-        loco_combat = nullptr;
-        gameplay.inject_waiting = inject_waiting;
-        gameplay.inject_hold = inject_hold;
-        gameplay.two_hand_grabbed = two_hand_out.grabbed;
-        gameplay.hand_weapon_grab = hand_weapon_grab;
+        c.throw_trace = throw_trace;
+        c.stack = qs.stack;
+        c.regrab_s = qs.regrab_s;
+        c.throws = qs.throws;
+        c.instant = qs.instant;
+        c.select = qs.select;
+        c.quick_draw = qs.quick_draw;
+        c.trigger_parry = qs.trigger_parry;
+        c.idle_close_s = qs.idle_close_s;
+        c.late_hover_s = qs.grace_ms * 0.001f;
+        c.nearest_max = qs.nearest;
+        // left_scheme=2: the left grip opens the arc and the trigger takes (core/vr/quick_items.h
+        // Config::left_scheme); the grip at the left hip draws a Blood Vial where the vial is
+        // X's (inject on, motion controls, the left grip free: right_grip=transform).
+        c.left_scheme = settings.left_scheme;
+        c.dwell_s = qs.dwell_ms * 0.001f;
+        c.trigger_release = qs.trigger_release;
+        c.reopen_s = qs.reopen_s;
+        c.holster_mode =
+            !settings.controls_classic && !settings.right_grip_draw ? qs.holster_mode : 0;
+        c.holster_haptics = qs.holster_haptics;
+        // y_menu: Y's tap is the game's menu, so the grip is the arc's only opener, holster_mode=1
+        // included (Q::Config::y_menu).
+        c.y_menu = YMenuActive();
+        c.belt_vial = c.holster_mode == 0 && settings.left_scheme == 2 && qs.belt_vial &&
+                      settings.inject && !settings.controls_classic && !settings.right_grip_draw;
+        // quick_use_mouth: pellets and drinks are held and used at the mouth (Q::MouthGate).
+        c.mouth = qs.use_mouth;
+        c.mouth_cfg.radius_m = qs.mouth_radius_m;
+        c.mouth_cfg.exit_m = qs.mouth_radius_m + 0.04f;
+        c.mouth_cfg.dwell_s = qs.mouth_dwell_ms * 0.001f;
+        // quick_hold_use: the misc items are used by holding them (Q::HoldOf: a ring fills).
+        c.hold_use = qs.hold_use;
+        c.hold_use_s = qs.hold_use_s;
+        // quick_use_wipe: the papers are applied by wiping them along the blade (Q::WipeDetector
+        // on the render-camera hook's paper-against-blade samples).
+        c.wipe = qs.use_wipe;
+        c.wipe_cfg.reach_m = qs.wipe_reach_cm * 0.01f;
+        // Off a third further (the first version's 7 cm: 10; 12 cm: 16) and past the blade's
+        // ends by half the reach (7 cm: 4; 12 cm: 6).
+        c.wipe_cfg.exit_m = c.wipe_cfg.reach_m + std::max(0.03f, c.wipe_cfg.reach_m / 3.0f);
+        c.wipe_cfg.end_margin_m = std::max(0.04f, 0.5f * c.wipe_cfg.reach_m);
+        c.wipe_cfg.share = qs.wipe_share;
+        c.wipe_cfg.window_s = qs.wipe_window_ms * 0.001f;
+        c.wipe_cfg.min_travel_m = qs.wipe_min_cm * 0.01f;
+        c.wipe_cfg.own_share = qs.wipe_own;
+        c.wipe_cfg.max_travel_m = std::max(qs.wipe_max_cm * 0.01f, c.wipe_cfg.min_travel_m);
+        c.wipe_cfg.max_turn_deg = qs.wipe_turn_deg;
+        // The find cue (quick_wipe_cue): the ticks on the paper hand read Output::wipe_near.
+        c.wipe_cfg.cue_m = qs.wipe_cue ? qs.wipe_cue_cm * 0.01f : 0.0f;
+        // quick_wipe_rub: the card on the blade's surface and the rub back and forth (the
+        // one-way stroke's share / min / max / own / turn still hold for its long stroke and its
+        // strokes; the contact off 2.5 cm further than it comes on).
+        c.wipe_cfg.rub = qs.wipe_rub;
+        c.wipe_cfg.blade_m = qs.wipe_blade_cm * 0.01f;
+        c.wipe_cfg.touch_m = qs.wipe_touch_cm * 0.01f;
+        c.wipe_cfg.touch_exit_m = c.wipe_cfg.touch_m + 0.025f;
+        c.wipe_cfg.rub_m = qs.wipe_rub_cm * 0.01f;
+        c.wipe_cfg.rub_window_s = qs.wipe_rub_ms * 0.001f;
+        c.wipe_cfg.stroke_m = qs.wipe_stroke_cm * 0.01f;
+        c.wipe_cfg.blade_max_mps = qs.wipe_blade_mps;
+        if (qs.wipe_rub) {
+            c.wipe_cfg.end_margin_m = 0.06f; // the card's centre past either end
+        }
+        // quick_use_crush / quick_use_shake / quick_use_stab: the gestures (Q::CrushGate,
+        // Q::ShakeGate; the stab's zones: UpdateQuickStab).
+        c.crush = qs.use_crush;
+        c.crush_cfg.press = qs.crush_press;
+        c.crush_cfg.release = std::min(0.75f, qs.crush_press - 0.1f);
+        c.crush_cfg.hold_s = qs.crush_hold_ms * 0.001f;
+        c.shake = qs.use_shake;
+        c.shake_choir = qs.shake_choir_bell;
+        c.shake_cfg.strokes = qs.shake_strokes;
+        c.shake_cfg.window_s = qs.shake_window_ms * 0.001f;
+        c.shake_cfg.ang_hi = qs.shake_wrist;
+        c.shake_cfg.lin_hi = qs.shake_arm;
+        c.stab = qs.use_stab;
+        // quick_music_box_crank: the Tiny Music Box is played by its crank (UpdateMusicBox), only
+        // once the right weapon can be put away (HideReady); before that, the game's way. Read
+        // as the box is taken: a box already in the hand keeps its way.
+        c.crank = qs.music_box_crank && VR::MusicBox::HideReady().load(std::memory_order_relaxed);
         Q::Input q{};
         q.t = static_cast<double>(now) * 1e-9;
         q.dt = dt;
+        q.gameplay = !VR::CinematicActive() && !in[PhysMenu] && !grip_adjust.Frozen() &&
+                     VR::IsImmersive();
         VR::Body::BodyStatus status{};
-        gameplay.body_loaded = VR::Body::LatestBodyStatus(status);
-        gameplay.body_now_ns = VR::Body::SteadyNowNs();
-        gameplay.body_ns = status.steady_ns;
-        gameplay.body_driven = status.driven;
-        gameplay.first_person = VR::IsFirstPerson();
-        gameplay.arm_weight = status.arm_weight[0];
+        const bool fresh = VR::Body::LatestBodyStatus(status) &&
+                           VR::Body::SteadyNowNs() - status.steady_ns < 250'000'000;
+        q.body = fresh && status.driven && VR::IsFirstPerson();
+        q.arm_weight = fresh ? status.arm_weight[0] : 0.0f;
         q.y = in[PhysY];
         q.l3 = in[PhysStickL];
         q.arc_tap = l3_tap;
+        // left_scheme=2: the tap is Y's (UpdateGameplay), for the log.
+        q.arc_tap_by = settings.left_scheme == 2 && !settings.controls_classic ? "Y" : "L3";
+        q.x_edge = in[PhysX] && !quick_x_down;
+        quick_x_down = in[PhysX];
         q.trigger_latch = in[PhysTriggerL];
+        // Held through a context switch (a menu, the screen, the headset off): 0 until let go, as
+        // the gate holds the buttons back (else the first gameplay frame is a squeeze: the arc
+        // opens, a vial is drawn). The raw trigger still says a clench (no arc, no vial).
+        // ... and a squeeze the two-handed grip or a hand transform took (UpdateTwoHand,
+        // UpdateHandTransform), or one bracing the raised shield or holding the bow, or with an
+        // arrow nocked (UpdateShield, UpdateBow), is never the arc's (with left_scheme=2 Y still
+        // opens it).
+        const bool bow_grip = bow_up && (bow_hand_i == 0 || ArrowInHand());
+        q.grip = blocked[PhysGripL] || physical_lever_out.owns_grip[0] ||
+                         two_hand_out.owns_grip || hand_owns_grip || shield_up ||
+                         bow_grip
+                     ? 0.0f
+                     : body_analog[2];
+        q.trigger = blocked[PhysTriggerL] ? 0.0f : body_analog[0];
+        q.trigger_raw = body_analog[0];
+        // left_scheme=2: a swing (an attack went out since the last frame) or a leap / dodge
+        // (UpdateLocomotion, this frame) closes the open arc.
+        const bool attack = since_attack + 1e-4f < quick_since_attack;
+        quick_since_attack = since_attack;
+        q.combat = attack || loco_combat != nullptr;
+        q.combat_why = attack ? "a swing" : (loco_combat != nullptr ? loco_combat : "");
+        q.dodge = loco_combat != nullptr; // (quick_hold_use: cancels the ring filling)
+        loco_combat = nullptr;
         q.hand_valid = left.valid;
         q.hand_p = {left.position.x, left.position.y, left.position.z};
         q.hand_v = {left.velocity.x, left.velocity.y, left.velocity.z};
@@ -8517,18 +8850,36 @@ struct OpenXRPresenter::Impl {
         // change is re-prediction noise, not motion).
         q.hand_q = {left.orientation.x, left.orientation.y, left.orientation.z,
                     left.orientation.w};
-        PiQuickMotionFacts motion{};
-        motion.display_ns = gesture.time;
-        motion.space = recenter_serial;
-        motion.orientation_valid = left.orientation_valid;
-        motion.head_ok = gesture.head_ok;
-        motion.head_velocity_ok = gesture.head_velocity_ok;
-        motion.head = {gesture.head_position.x, gesture.head_position.y, gesture.head_position.z};
-        motion.forward = {gesture.forward.x, gesture.forward.y, gesture.forward.z};
-        motion.head_velocity = {gesture.head_velocity.x, gesture.head_velocity.y,
-                                gesture.head_velocity.z};
-        motion.mouth_down_m = qs.mouth_down_m;
-        motion.mouth_ahead_m = qs.mouth_ahead_m;
+        const float pose_dt = quick_prev_time != 0
+                                  ? static_cast<float>(gesture.time - quick_prev_time) * 1e-9f
+                                  : 0.0f;
+        if (left.orientation_valid && quick_prev_q_valid && pose_dt > 1e-3f) {
+            const auto& a = quick_prev_q;
+            quick_wv = Q::AngularVelocity({a.x, a.y, a.z, a.w}, q.hand_q, std::min(pose_dt, 0.1f));
+        } else if (!left.orientation_valid || !quick_prev_q_valid) {
+            quick_wv = {};
+        }
+        q.hand_wv = quick_wv;
+        q.hand_w = Q::Length(q.hand_wv);
+        if (pose_dt > 1e-3f || !quick_prev_q_valid || quick_prev_time == 0) {
+            quick_prev_q = left.orientation;
+            quick_prev_time = gesture.time;
+        }
+        quick_prev_q_valid = left.orientation_valid;
+        if (gesture.head_ok) {
+            float fx = gesture.forward.x;
+            float fz = gesture.forward.z;
+            const float len = std::hypot(fx, fz);
+            if (len > 1e-3f) {
+                fx /= len;
+                fz /= len;
+                const auto& h = gesture.head_position;
+                // right = (-fz, 0, fx)
+                q.shoulder = {h.x + fz * 0.17f - fx * 0.07f, h.y - 0.24f,
+                              h.z - fx * 0.17f - fz * 0.07f};
+                q.shoulder_valid = true;
+            }
+        }
         if (throw_trace) {
             // The trace compares the orientation-derived angular velocity with the runtime's own.
             q.hand_wv_rt_valid = left.angular_valid;
@@ -8554,89 +8905,123 @@ struct OpenXRPresenter::Impl {
             q.hand_v_now = {fresh.velocity.x, fresh.velocity.y, fresh.velocity.z};
             q.hand_q_now = {fresh.orientation.x, fresh.orientation.y, fresh.orientation.z,
                             fresh.orientation.w};
-            motion.fresh_sampled = true;
-            motion.fresh_ns = fresh_time;
-            motion.fresh_orientation_valid = fresh.orientation_valid;
+            // Its spin from those orientations, as the display-time one above.
+            const float fresh_dt =
+                quick_fresh_time != 0
+                    ? static_cast<float>(fresh_time - quick_fresh_time) * 1e-9f
+                    : 0.0f;
+            if (fresh.orientation_valid && quick_fresh_q_valid && fresh_dt > 1e-3f) {
+                const auto& a = quick_fresh_q;
+                quick_fresh_wv = Q::AngularVelocity({a.x, a.y, a.z, a.w}, q.hand_q_now,
+                                                    std::min(fresh_dt, 0.1f));
+            } else if (!fresh.orientation_valid || !quick_fresh_q_valid) {
+                quick_fresh_wv = {};
+            }
+            q.hand_wv_now = quick_fresh_wv;
+            if (fresh_dt > 1e-3f || !quick_fresh_q_valid || quick_fresh_time == 0) {
+                quick_fresh_q = fresh.orientation;
+                quick_fresh_time = fresh_time;
+            }
+            quick_fresh_q_valid = fresh.orientation_valid;
         }
         q.vial_armed = vial_armed;
         // The belt vial: where the left hand is against the hip's box (the torso's heading
         // follows the view lazily, so a glance down at the hip leaves the box where the hip is).
+        q.vial_busy = vial_armed || inject_waiting || inject_hold > 0.0f;
+        if (gesture.head_ok) {
+            belt_torso.Update({gesture.forward.x, gesture.forward.y, gesture.forward.z}, dt);
+        }
+        belt_place = {};
+        if (c.belt_vial && left.valid && gesture.head_ok && belt_torso.Valid()) {
+            const auto& h = gesture.head_position;
+            belt_place = VR::Belt::Locate(
+                {h.x, h.y, h.z}, {left.position.x, left.position.y, left.position.z},
+                belt_torso.Forward(),
+                VR::Belt::BodyScaled(
+                    VR::Belt::Scaled(settings.seated ? VR::Belt::Seated : VR::Belt::Standing,
+                                     qs.belt_vial_zone),
+                    VR::PlayerBody::BodyScaleFor(VR::HeightBodyOffsetM())));
+        }
+        q.at_hip = belt_place.inside;
         VR::Holsters::Config hc{};
-        hc.scale=VR::PlayerBody::BodyScaleFor(VR::HeightBodyOffsetM());
+        hc.assignment = VR::Holsters::InventoryAssignment;
+        // Vials retain their existing injection enable / input ownership rules.
+        if (!settings.inject)
+            for (int &a : hc.assignment)
+                if (a == 1)
+                    a = 0;
+        hc.scale = VR::PlayerBody::BodyScaleFor(VR::HeightBodyOffsetM());
+        hc.reach = qs.holster_reach_cm * 0.01f;
+        const bool holsters_enabled =
+            c.holster_mode != 0 && c.enabled && q.gameplay && gesture.head_ok && q.body;
         VR::Holsters::Targets mounted{};
-        const bool have_targets=Q::LatestHolsterTargets(mounted);
-        auto& hp = gameplay.holster;
-        hp.operation = PI_HOLSTER_FRAME;
-        hp.mounted = PhysicalInteractions::HolsterPackets::Pack(mounted.layout);
-        hp.now = now; hp.mounted_ns = mounted.ns;
-        hp.space = recenter_serial; hp.mounted_space = mounted.space;
-        hp.have_targets = have_targets;
-        hp.seated = settings.seated; hp.head_ok = gesture.head_ok; hp.hand_ok = left.valid;
-        for (int i = 0; i < 3; ++i) hp.assignment[i] = hc.assignment[i];
-        hp.scale = hc.scale; hp.body_scale = hc.scale; hp.zone_scale = qs.belt_vial_zone;
-        hp.dt = dt;
-        hp.head[0]=gesture.head_position.x;hp.head[1]=gesture.head_position.y;hp.head[2]=gesture.head_position.z;
-        hp.hand[0]=left.position.x;hp.hand[1]=left.position.y;hp.hand[2]=left.position.z;
-        hp.view[0]=gesture.forward.x;hp.view[1]=gesture.forward.y;hp.view[2]=gesture.forward.z;
+        const bool mounted_fresh =
+            Q::LatestHolsterTargets(mounted) && VR::Holsters::Fresh(mounted, now, recenter_serial);
+        // A setting change must not leave yesterday's assignment active for one render frame.
+        const bool assignments_match = mounted.layout.assignment == hc.assignment;
+        const auto& lp = left.position;
+        const auto holsters = holster_tracker.Follow(mounted.layout, {lp.x, lp.y, lp.z},
+                                                     holsters_enabled && left.valid &&
+                                                         mounted_fresh && assignments_match,
+                                                     hc.reach, hc.scale);
+        q.holster_assignment = holsters.hover >= 0 ? hc.assignment[holsters.hover] : 0;
+        q.holster_entered = holsters.entered;
         q.carried_vials = VR::Bloodborne::CarriedBloodVials();
 
-        gameplay.snapshot_loaded = Q::LatestSnapshot(q.snapshot);
-        gameplay.hover_loaded = Q::LatestHover(q.hover);
-        q.have_result = !quick_runtime.Bound() && Q::LatestResult(q.result);
+        q.snapshot_fresh = Q::LatestSnapshot(q.snapshot) && q.snapshot.valid &&
+                           now - q.snapshot.steady_ns < 300'000'000;
+        q.hover_fresh = Q::LatestHover(q.hover) && now - q.hover.steady_ns < 250'000'000;
+        q.have_result = Q::LatestResult(q.result);
         // quick_use_wipe: the newest sample of the paper against the blade, and the two-handed
         // grip on the handle (the left hand is there: no wipe until it lets go).
-        gameplay.wipe_loaded = qs.use_wipe && Q::LatestWipe(q.wipe);
+        q.wipe_fresh = c.wipe && Q::LatestWipe(q.wipe) &&
+                       now - q.wipe.steady_ns < static_cast<s64>(c.wipe_cfg.stale_s * 1e9f);
         q.two_hand = two_hand_out.engaged;
+        q.weapon_grab = two_hand_out.grabbed || hand_weapon_grab;
         // quick_use_stab: the blood in the hand went into a stab zone (UpdateQuickStab, the last
         // input frame).
-        q.stab = std::exchange(quick_stab_pending,false);
-        q.stab_zone = q.stab ? quick_stab_zone.data() : "";
+        q.stab = quick_stab_zone != nullptr;
+        q.stab_zone = q.stab ? quick_stab_zone : "";
+        quick_stab_zone = nullptr;
         // quick_use_mouth: the mouth below and in front of the eyes, in the head's frame (its
         // pitch: a head tilted back to drink brings it forward). The head's velocity whatever
         // quick_use_mouth says: the mouth's speed and the shake's forearm channel (Q::ShakeGate:
         // the hand against the head, so walking or leaning never counts) both read it.
+        if (c.mouth && gesture.head_ok) {
+            const auto& h = gesture.head_position;
+            q.mouth_valid = true;
+            q.mouth = Q::MouthPoint({h.x, h.y, h.z},
+                                    {gesture.forward.x, gesture.forward.y, gesture.forward.z},
+                                    qs.mouth_down_m, qs.mouth_ahead_m);
+        }
+        if (gesture.head_ok && gesture.head_velocity_ok) {
+            q.head_v = {gesture.head_velocity.x, gesture.head_velocity.y,
+                        gesture.head_velocity.z};
+        }
         // quick_music_box_crank: the crank went round last frame (UpdateMusicBox): the box plays.
         q.crank_play = music_box_play;
         music_box_play = false;
-        const Q::Phase phase_before = QuickPhase();
+        const auto bell = VR::SummonBell::Update(
+            q.gameplay && q.body && !settings.controls_classic && !VR::IsGameMenuOpen() &&
+            (!q.snapshot_fresh || q.snapshot.alive) && !q.vial_busy &&
+            quick.GetPhase()==Q::Phase::Idle, in[PhysB], left.valid, q.t,
+            q.hand_wv, q.hand_v-q.head_v);
+        summon_bell_block_b = bell.block_b;
+        if (bell.held) c.enabled=false;
+        const Q::Phase phase_before = quick.GetPhase();
         // What Q::Update's tap needs to open the arc (UpdateGameplay's y_menu Y + X: Square only
         // where the arc cannot answer).
-        PiQuickGameplayOutput prepared{};
+        quick_arc_ready = c.enabled && q.body && q.snapshot_fresh;
         {
             VR::FeatureCost::Scope cost{VR::FeatureCost::QuickUpdate};
-            if (quick_runtime.Bound()) {
-                hp = holster_runtime.Stamp(hp);
-                quick_runtime.Gameplay(q, motion, gameplay, holster_runtime, quick_out, prepared,
-                                       QuickFeedbackPacket(qs));
-            } else {
-                const auto c = PhysicalInteractions::QuickGameplayPreparation::Config(raw);
-                quick_gameplay_legacy.Apply(gameplay, c, q);
-                quick_motion_legacy.Apply(motion, q, c.mouth);
-                const auto geometry = holster_runtime.Call(
-                    PhysicalInteractions::QuickGameplayPreparation::Holster(gameplay, c, q));
-                q.at_hip = geometry.inside != 0;
-                q.holster_assignment = geometry.selected_assignment;
-                q.holster_entered = geometry.layout.entered != 0;
-                prepared.holster = geometry;
-                prepared.arc_ready = c.enabled && q.body && q.snapshot_fresh;
-                prepared.belt_vial = c.belt_vial;
-                prepared.holsters_enabled = PhysicalInteractions::QuickGameplayPreparation::HolstersEnabled(gameplay, c, q);
-                prepared.valid = 1;
-                quick.Update(c, q, quick_out);
-                quick_out.scene.holsters = PhysicalInteractions::HolsterPackets::Unpack(geometry.layout);
-                quick_out.scene.holsters_enabled = prepared.holsters_enabled != 0;
-                quick_out.scene.holsters_ns = now;
-            }
+            quick.Update(c, q, quick_out);
         }
-        quick_arc_ready = prepared.arc_ready != 0;
-        belt_place = {prepared.holster.ahead, prepared.holster.out, prepared.holster.below,
-                      prepared.holster.inside != 0};
         // VR_THROW_MARK (tests): a body-log MARK at every grab and another 1.2 s later, so
         // VR_BODY_LOG=2 logs the throwing arm frame by frame through the wind-up, release and
         // follow-through.
         static const bool throw_mark = std::getenv("VR_THROW_MARK") != nullptr;
         if (throw_mark && phase_before != Q::Phase::Holding &&
-            QuickPhase() == Q::Phase::Holding) {
+            quick.GetPhase() == Q::Phase::Holding) {
             VR::Body::NoteMark();
             quick_mark_t = q.t + 1.2;
         }
@@ -8644,13 +9029,26 @@ struct OpenXRPresenter::Impl {
             VR::Body::NoteMark();
             quick_mark_t = 0.0;
         }
+        if (bell.held) {
+            quick_out.scene.state=Q::SceneState::Holding;
+            quick_out.scene.state_ns=bell.started_ns;
+            quick_out.scene.held_goods=200; // existing bell model/grip; no inventory use
+            quick_out.held_goods=200;
+            quick_out.held_ffx=-1;
+            quick_out.block_l2=true;
+        }
+        if (bell.haptic!=Q::Haptic::None) quick_out.Haptics(bell.haptic);
+        quick_out.BellSound(bell.haptic);
+        quick_out.scene.holsters = holsters;
+        quick_out.scene.holsters_enabled = holsters_enabled;
+        quick_out.scene.holsters_ns = now;
         QuickApply(qs);
         if (quick_out.disarm_vial && vial_armed) {
             DisarmVial();
             vial_events |= VrOverlay::VialEventDisarmed;
             LOG_INFO(Render_Vulkan, "VR quick: Y while the vial was armed: vial disarmed");
         }
-        if (quick_out.grip_edge && prepared.belt_vial) {
+        if (quick_out.grip_edge && c.belt_vial) {
             // Where every left-grip squeeze was against the hip's box (headset tuning).
             LOG_INFO(Render_Vulkan,
                      "VR belt: left grip at ahead {:+.2f} out {:+.2f} below {:.2f} m (torso frame, "
@@ -8670,98 +9068,121 @@ struct OpenXRPresenter::Impl {
     // The controller's output: requests, the scene for the render-camera hook, haptics, the log.
     void QuickApply(const VR::Quick::QuickSettings& qs) {
         namespace Q = VR::Quick;
-        if (quick_out.send && !quick_runtime.Bound()) {
+        if (quick_out.send) {
             Q::PublishRequest(quick_out.request);
         }
         Q::PublishScene(quick_out.scene);
+        if (quick_out.bell_audio != Q::Haptic::None && VR::IsFirstPerson() && VR::IsImmersive())
+            Q::PublishBellAudio(quick_out.bell_audio == Q::Haptic::BellToll, Q::NowNs());
         if (!quick_out.log.empty()) {
-            LOG_INFO(Render_Vulkan, "VR quick: {} | t {:.3f}", quick_out.log.c_str(),
+            LOG_INFO(Render_Vulkan, "VR quick: {} | t {:.3f}", quick_out.log,
                      static_cast<double>(Q::NowNs()) * 1e-9);
         }
         // VR_THROW_TRACE: a release's hand samples, one log line each.
         for (std::size_t at = 0; at < quick_out.trace.size();) {
-            const std::size_t end = std::min(quick_out.trace.find("\n", at), quick_out.trace.size());
+            const std::size_t end = std::min(quick_out.trace.find('\n', at), quick_out.trace.size());
             LOG_INFO(Render_Vulkan, "VR quick: {}",
                      std::string_view{quick_out.trace}.substr(at, end - at));
             at = end + 1;
         }
-        if (quick_runtime.Bound()) ApplyQuickFeedback(quick_runtime.Feedback());
-        else {
-            PiQuickFeedbackOutput effects{};
-            quick_feedback_legacy.Apply(PhysicalInteractions::QuickFeedbackState::Facts(
-                QuickFeedbackPacket(qs), quick_out), effects);
-            effects.sequence = ++quick_feedback_legacy_sequence;
-            ApplyQuickFeedback(effects);
+        const float k = qs.haptics;
+        bool inject = false;
+        for (int i = 0; i < quick_out.haptic_count; ++i) {
+            inject = inject || quick_out.haptics[static_cast<size_t>(i)] == Q::Haptic::Inject;
         }
+        if (inject) {
+            // quick_use_stab: the game took the stabbed blood: the Blood Vial's THUMP on both
+            // hands (the stabbing left the stronger) and its hand hold where it went in.
+            if (k > 0.0f) {
+                haptics[0].Play(InjectThump(InjectThumpStab * std::min(k, 1.0f)));
+                haptics[1].Play(InjectThump(InjectThumpOther * std::min(k, 1.0f)));
+            }
+            StartInjectHold();
+        }
+        for (int i = 0; i < quick_out.haptic_count && k > 0.0f; ++i) {
+            const Q::Haptic h = quick_out.haptics[static_cast<size_t>(i)];
+            if (h == Q::Haptic::Inject) {
+                continue; // (above)
+            }
+            if (h == Q::Haptic::Throw) {
+                throw_ns = VR::Body::SteadyNowNs(); // its hit tick (UpdateRangedHits)
+            }
+            const HapticPattern pattern =
+                QuickHaptic(h, k, qs.throw_haptic_scale ? quick_out.throw_strength : -1.0f);
+            haptics[0].Play(pattern);
+            if (h == Q::Haptic::Ignite) {
+                haptics[1].Play(pattern); // quick_use_wipe: the blade flares in the weapon hand too
+            }
+        }
+        QuickWipeFeel(quick_out.wipe_touch, quick_out.wipe_progress, quick_out.wipe_teeth, k);
+        QuickWipeCue(quick_out.wipe_touch ? 0.0f : quick_out.wipe_near, k);
+        // quick_hold_use: the left hand's hum rises with the ring (Q::HoldHum; the vial, the
+        // other owner of that hand's hum, is never armed with an item in the hand).
+        QuickHoldHum(quick_out.hold_hum * k);
         Q::PublishUseAudio(quick_out.use_whoosh, qs.use_whoosh, Q::NowNs());
     }
 
-    PiQuickFeedbackFacts QuickFeedbackPacket(const VR::Quick::QuickSettings& qs) const {
-        PiQuickFeedbackFacts f{};
-        f.now_ns = VR::Body::SteadyNowNs();
-        f.gain = qs.haptics;
-        f.inject_gain = VR::GetSettings().haptic_inject;
-        f.throw_scaled = qs.throw_haptic_scale;
-        return f;
+    // quick_use_wipe: the rasp while the paper touches the blade, on both hands: a light hum
+    // rising with the stroke (0..1) and a tick for each tooth of it (Q::WipeConfig::tooth_m along
+    // the blade); the paper hand a little stronger. No hum once it is off the blade.
+    void QuickWipeFeel(bool touch, float progress, int teeth, float k) {
+        if (touch && k > 0.0f) {
+            const float p = std::clamp(progress, 0.0f, 1.0f);
+            if (!quick_wipe_sustain) {
+                // The paper meets the steel: a crisp tick on both hands at once (the hum below
+                // starts under haptic_floor, and the first tooth comes 3 cm along: until the
+                // 2026-10-06 feel check nothing said "on the blade" before the stroke moved).
+                haptics[0].Play(Tick(0.30f * k, 14.0f, 0));
+                haptics[1].Play(Tick(0.15f * k, 10.0f, 0));
+            }
+            haptics[0].sustain = (0.07f + 0.23f * p) * k;
+            haptics[1].sustain = (0.05f + 0.15f * p) * k;
+            quick_wipe_sustain = true;
+            for (int i = 0; i < std::min(teeth, 2); ++i) {
+                haptics[0].Play(Tick((0.10f + 0.25f * p) * k, 9.0f, 0));
+                haptics[1].Play(Tick((0.06f + 0.15f * p) * k, 7.0f, 0));
+            }
+        } else if (quick_wipe_sustain) {
+            haptics[0].sustain = haptics[1].sustain = 0.0f;
+            quick_wipe_sustain = false;
+        }
     }
 
-    void ApplyQuickFeedback(const PiQuickFeedbackOutput& effects) {
-        if (quick_runtime.Bound() && (!effects.valid || !InteractionReady() ||
-                                      effects.session != interaction_module.Session())) {
-            // Native device cleanup after module failure cannot depend on a DLL reply.
-            haptics[0].sustain = haptics[1].sustain = 0.f;
+    // quick_use_wipe's find cue (quick_wipe_cue; the tester's 2026-10-08 "easier to find the
+    // spot where we need to rub"): while a paper is in the hand and off the blade, soft ticks on
+    // the paper hand only, quickening and firming as it nears the blade's zone, like a Geiger
+    // counter (Output::wipe_near 0 -> 1: a tick every 0.40 s from quick_wipe_cue_cm out, every
+    // 0.08 s at the zone's edge; 0.06 -> 0.16 before haptic_floor, under the touch-down tick's
+    // 0.30). None far from it, and none once it touches: the rasp takes over.
+    void QuickWipeCue(float closeness, float k) {
+        if (closeness <= 0.0f || k <= 0.0f) {
+            quick_wipe_cue_ns = 0;
             return;
         }
-        for (uint32_t i = 0; i < effects.count; ++i) {
-            const auto& e = effects.effects[i];
-            if (e.operation == PI_QF_PATTERN) {
-                for (int hand = 0; hand < 2; ++hand)
-                    if (e.side_mask & (1u << hand)) haptics[hand].Play(PlaybackPattern(e.pattern));
-            } else if (e.operation == PI_QF_SUSTAIN) {
-                for (int hand = 0; hand < 2; ++hand)
-                    if (e.side_mask & (1u << hand)) haptics[hand].sustain = e.level;
-            } else if (e.operation == PI_QF_THROW_STAMP) {
-                throw_ns = VR::Body::SteadyNowNs();
-            } else if (e.operation == PI_QF_INJECT_HOLD) {
-                if (!quick_runtime.Bound()) StartInjectHold();
-                else if (!StartQuickDllInjectHold(effects.sequence)) return;
-            }
+        const s64 now = VR::Body::SteadyNowNs();
+        if (quick_wipe_cue_ns != 0 && now < quick_wipe_cue_ns) {
+            return;
         }
+        const float n = std::clamp(closeness, 0.0f, 1.0f);
+        haptics[0].Play(Tick((0.06f + 0.10f * n) * k, 10.0f, 0));
+        quick_wipe_cue_ns = now + static_cast<s64>((0.40f - 0.32f * n) * 1e9f);
     }
 
-    bool StartQuickDllInjectHold(uint64_t sequence) {
-        const auto& settings = VR::GetSettings();
-        auto packet = VialFeedbackPacket(PI_FEEDBACK_QUICK_HOLD, VR::Body::SteadyNowNs());
-        packet.request_id = sequence;
-        packet.pose_ns = grip_located_ns;
-        packet.space = grip_located_space;
-        packet.hands[0] = PhysicalInteractions::PackHand(grip_left_located);
-        packet.hands[1] = PhysicalInteractions::PackHand(grip_right_located);
-        packet.hold_ms = settings.vial_inject_hold_ms;
-        packet.hold_frames = settings.vial_inject_hold_frames;
-        packet.release_ms = settings.vial_inject_release_ms;
-        packet.hold_both = settings.vial_inject_hold_both;
-        packet.right_frozen = grip_adjust.Frozen();
-        PiVialFeedbackOutput out{};
-        if (!CallVialFeedback(packet, out)) return false;
-        for (size_t i = 0; i < 2; ++i)
-            inject_hand_phase[i] = static_cast<VR::Body::InjectHold::Phase>(out.phase[i]);
-        if (out.started_mask && std::getenv("VR_INJECT_MARK") != nullptr) VR::Body::NoteMark();
-        return true;
+    void QuickHoldHum(float level) {
+        if (level > 0.0f) {
+            haptics[0].sustain = level;
+            quick_hold_sustain = true;
+        } else if (quick_hold_sustain) {
+            haptics[0].sustain = 0.0f;
+            quick_hold_sustain = false;
+        }
     }
 
     // Closes the arc and puts an item away without a sound (menus, the screen, a context switch).
-    VR::Quick::Phase QuickPhase() const {
-        return quick_runtime.Bound() ? quick_runtime.GetPhase() : quick.GetPhase();
-    }
-
     void QuickCancel(const char* why) {
-        fire_runtime.Cancel();
-        gun_delivery.Cancel();
-        if (quick_runtime.Bound()) quick_runtime.Cancel(quick_out, why);
-        else quick.Cancel(quick_out, why);
+        quick.Cancel(quick_out, why);
         if (!quick_out.log.empty()) {
-            LOG_INFO(Render_Vulkan, "VR quick: {}", quick_out.log.c_str());
+            LOG_INFO(Render_Vulkan, "VR quick: {}", quick_out.log);
             quick_out.log.clear();
         }
         quick_out.scene.holsters = {};
@@ -8775,19 +9196,129 @@ struct OpenXRPresenter::Impl {
         quick_out.hold_hum = 0.0f;
         quick_out.use_whoosh = -1.0f;
         VR::Quick::PublishUseAudio(-1.0f, 0.0f, VR::Quick::NowNs());
-        if (quick_runtime.Bound()) ApplyQuickFeedback(quick_runtime.Feedback());
-        else {
-            PiQuickFeedbackOutput feedback{};
-            quick_feedback_legacy.Clear(feedback);
-            feedback.sequence = ++quick_feedback_legacy_sequence;
-            ApplyQuickFeedback(feedback);
-        }
+        QuickHoldHum(0.0f);
         quick_out.wipe_touch = false;
         quick_out.wipe_near = 0.0f;
+        QuickWipeFeel(false, 0.0f, 0, 0.0f);
+        QuickWipeCue(0.0f, 0.0f);
         quick_out.stab_item = false;
         quick_out.crank_box = false;
         MusicBoxOff(why);
         VR::Quick::PublishScene(quick_out.scene);
+    }
+
+    // `throw_strength` (0..1, Output::throw_strength; < 0: throw_haptic_scale=0): how hard the
+    // throw left the hand.
+    static HapticPattern QuickHaptic(VR::Quick::Haptic h, float k, float throw_strength = -1.0f) {
+        using VR::Quick::Haptic;
+        HapticPattern p{};
+        switch (h) {
+        case Haptic::Unfurl:
+            return Repeat(3, 0.12f * k, 6.0f, 14.0f, 0);
+        case Haptic::Close:
+            p.priority = 0;
+            return p.Ramp(0.2f * k, 0.0f, 50.0f);
+        case Haptic::Detent:
+            return Tick(0.32f * k, 14.0f, 0);
+        case Haptic::FirstDetent:
+            return Tick(0.38f * k, 16.0f, 0);
+        case Haptic::Empty:
+            p.priority = 0;
+            return p.Ramp(0.15f * k, 0.0f, 120.0f);
+        case Haptic::Grab:
+            p.priority = 1;
+            return p.Pulse(0.55f * k, 18.0f).Ramp(0.3f * k, 0.0f, 60.0f);
+        case Haptic::LastOne:
+            return Repeat(2, 0.35f * k, 10.0f, 30.0f, 1);
+        case Haptic::Throw: {
+            p.priority = 2;
+            if (throw_strength < 0.0f) {
+                return p.Pulse(0.9f * k, 20.0f).Ramp(0.5f * k, 0.0f, 80.0f);
+            }
+            // The item leaving the fingers: a lob a light, short snap; a hard throw a full-strength
+            // one that rings out longer (the arm's follow-through).
+            const float s = std::clamp(throw_strength, 0.0f, 1.0f);
+            return p.Pulse((0.55f + 0.45f * s) * k, 14.0f + 10.0f * s)
+                .Ramp((0.25f + 0.35f * s) * k, 0.0f, 50.0f + 70.0f * s);
+        }
+        case Haptic::PutBack:
+            return Repeat(2, 0.2f * k, 15.0f, 40.0f, 1);
+        case Haptic::GunBack:
+            return Tick(0.25f * k, 12.0f, 0);
+        case Haptic::Squeeze:
+            p.priority = 1;
+            return p.Ramp(0.2f * k, 0.5f * k, 100.0f);
+        case Haptic::Use:
+            p.priority = 1;
+            return p.Pulse(0.5f * k, 30.0f).Ramp(0.3f * k, 0.0f, 120.0f);
+        case Haptic::Deny:
+            return Repeat(2, 0.3f * k, 15.0f, 60.0f, 3);
+        case Haptic::Pick:
+            return Tick(0.3f * k, 12.0f, 1);
+        case Haptic::Gulp:
+            // quick_use_mouth, a drink: two soft swallows.
+            p.priority = 1;
+            return p.Ramp(0.15f * k, 0.45f * k, 40.0f)
+                .Ramp(0.45f * k, 0.0f, 70.0f)
+                .Gap(140.0f)
+                .Ramp(0.15f * k, 0.4f * k, 40.0f)
+                .Ramp(0.4f * k, 0.0f, 70.0f);
+        case Haptic::HoldDone:
+            // quick_hold_use, the ring full and the item used: a solid thump (firmer than the
+            // hum it ends, a short full pulse ringing out), with the flash on the item.
+            p.priority = 2;
+            return p.Pulse(0.95f * k, 40.0f).Ramp(0.55f * k, 0.0f, 110.0f);
+        case Haptic::Ignite:
+            // quick_use_wipe, the paper wiped along the blade took (both hands, QuickApply): a
+            // full thump, then the flare rolling off over a quarter second.
+            p.priority = 2;
+            return p.Pulse(1.0f * k, 30.0f).Ramp(0.7f * k, 0.3f * k, 70.0f).Ramp(0.3f * k, 0.0f,
+                                                                                150.0f);
+        case Haptic::Crunch:
+            // quick_use_crush, crushed in the fist: a crack, a crackle, a crumble (~0.25 s). Dips,
+            // not silences: over Link a Touch motor blurs gaps under ~30 ms, while every level
+            // change of 0.05 or more is its own call (core/vr/haptic_output.h). So every step is
+            // at least 30 ms (the review of 2026-10-06: 20 ms dips would smear into one buzz).
+            p.priority = 2;
+            return p.Pulse(1.0f * k, 35.0f)
+                .Pulse(0.3f * k, 30.0f)
+                .Pulse(0.8f * k, 30.0f)
+                .Pulse(0.25f * k, 30.0f)
+                .Pulse(0.55f * k, 30.0f)
+                .Ramp(0.3f * k, 0.0f, 100.0f);
+        case Haptic::BellStrike:
+            // quick_use_shake, a stroke of the bell counted: the clapper's clack, ringing briefly.
+            p.priority = 1;
+            return p.Pulse(0.7f * k, 25.0f).Ramp(0.4f * k, 0.0f, 90.0f);
+        case Haptic::BellToll:
+            // ... rung: a full strike, then a decaying hum with a beat in it (each ramp starts a
+            // little above where the last one ended), about half a second.
+            p.priority = 2;
+            return p.Pulse(1.0f * k, 35.0f)
+                .Ramp(0.75f * k, 0.5f * k, 80.0f)
+                .Ramp(0.6f * k, 0.35f * k, 100.0f)
+                .Ramp(0.45f * k, 0.2f * k, 120.0f)
+                .Ramp(0.3f * k, 0.0f, 160.0f);
+        case Haptic::Inject:
+            // quick_use_stab (QuickApply plays it on both hands, with the hand hold): the vial's.
+            return InjectThump(InjectThumpStab * std::min(k, 1.0f));
+        case Haptic::Bite:
+            // ... a pellet or an antidote eaten: a crunch (two cracks), then a swallow. The feel
+            // review (2026-10-06): the cracks were 12 and 10 ms with a 30 ms silence between,
+            // under haptic_min_ms (25) and the ~30 ms a Touch motor over Link blurs, so they
+            // smeared into one buzz; now every step is at least 30 ms and the gap a dip, as
+            // Crunch's.
+            p.priority = 1;
+            return p.Pulse(0.6f * k, 35.0f)
+                .Pulse(0.12f * k, 35.0f)
+                .Pulse(0.45f * k, 30.0f)
+                .Gap(110.0f)
+                .Ramp(0.15f * k, 0.4f * k, 40.0f)
+                .Ramp(0.4f * k, 0.0f, 70.0f);
+        case Haptic::None:
+            break;
+        }
+        return p;
     }
 
     // vial_in_hand=game (core/vr/bloodborne_held.h): what the hunter's left hand should hold,
@@ -8795,14 +9326,7 @@ struct OpenXRPresenter::Impl {
     // reaches the game before the request that puts the vial away for the gun. The vial: armed,
     // or vial_inject_hold_s after a stab; only in gameplay (a context switch disarms it anyway).
     void UpdateHeldRequest(const PhysicalState& in, float trigger_l, float dt, bool gameplay) {
-        if (UsingInteractionDll()) {
-            auto packet = VialFeedbackPacket(PI_FEEDBACK_TICK, VR::Body::SteadyNowNs());
-            packet.dt = dt;
-            PiVialFeedbackOutput out{};
-            CallVialFeedback(packet, out);
-        } else {
-            inject_hold = std::max(inject_hold - dt, 0.0f);
-        }
+        inject_hold = std::max(inject_hold - dt, 0.0f);
         gun_hold = in[PhysTriggerL] || trigger_l > HeldGunTrigger ? HeldGunHold
                                                                   : std::max(gun_hold - dt, 0.0f);
         if (gun_hold >= HeldGunHold) {
@@ -8839,10 +9363,7 @@ struct OpenXRPresenter::Impl {
         request.flags |= drained ? VR::Held::FlagDrain : 0;
         request.ms = VR::Body::SteadyNowNs() / 1'000'000;
         VR::PublishHeldRequest(VR::Held::PackRequest(request));
-        if (UsingInteractionDll()) {
-            // Preserve publication order: the held-item word precedes a drain clear.
-            PublishDllVialDrain();
-        } else if (inject_drain.On() && (vial_armed || inject_hold <= 0.0f)) {
+        if (inject_drain.On() && (vial_armed || inject_hold <= 0.0f)) {
             EndInjectDrain(vial_armed ? "a new vial armed" : "the vial put away");
         }
     }
@@ -8886,20 +9407,7 @@ struct OpenXRPresenter::Impl {
             FinishInject(VR::InjectResult::Disabled);
             return;
         }
-        if (UsingInteractionDll()) {
-            auto packet = VialFeedbackPacket(PI_FEEDBACK_BEGIN, VR::Body::SteadyNowNs());
-            packet.request_id = dll_inject_request.Id();
-            packet.visible_s = VR::GetSettings().vial_inject_hold_s;
-            PiVialFeedbackOutput out{};
-            if (!CallVialFeedback(packet, out)) {
-                interaction_module.Acknowledge(dll_inject_request.Session(), dll_inject_request.Id());
-                dll_inject_request.Complete();
-                vial_events |= VrOverlay::VialEventInjectDenied;
-                return;
-            }
-        } else {
-            inject_hold = VR::GetSettings().vial_inject_hold_s;
-        }
+        inject_hold = VR::GetSettings().vial_inject_hold_s; // the game's vial stays at the wrist
         if (!VR::RequestInject()) {
             FinishInject(VR::InjectResult::Busy);
             return;
@@ -8915,7 +9423,7 @@ struct OpenXRPresenter::Impl {
         inject_wait += dt;
         VR::InjectResult result = VR::PollInjectResult();
         if (result == VR::InjectResult::Pending) {
-            if (dll_inject_request.Id() != 0 || inject_wait < 2.0f) {
+            if (inject_wait < 2.0f) {
                 return;
             }
             result = VR::InjectResult::Expired; // no answer at all: stop waiting
@@ -8930,60 +9438,22 @@ struct OpenXRPresenter::Impl {
     // double tick on the vial hand and his hands never stop following the controllers. The game
     // thread logs the details of a denial.
     void FinishInject(VR::InjectResult result) {
-        const bool healed = result == VR::InjectResult::Healed || result == VR::InjectResult::DryRun;
-        const bool dll_result = dll_inject_request.Id() != 0;
-        if (dll_result) {
-            const auto& settings = VR::GetSettings();
-            auto packet = VialFeedbackPacket(PI_FEEDBACK_FINISH, VR::Body::SteadyNowNs());
-            packet.session = dll_inject_request.Session();
-            packet.request_id = dll_inject_request.Id();
-            packet.confirmed = healed;
-            packet.inject_gain = settings.haptic_inject;
-            packet.pose_ns = grip_located_ns;
-            packet.space = grip_located_space;
-            packet.hands[0] = PhysicalInteractions::PackHand(grip_left_located);
-            packet.hands[1] = PhysicalInteractions::PackHand(grip_right_located);
-            packet.hold_ms = settings.vial_inject_hold_ms;
-            packet.hold_frames = settings.vial_inject_hold_frames;
-            packet.release_ms = settings.vial_inject_release_ms;
-            packet.hold_both = settings.vial_inject_hold_both;
-            packet.right_frozen = grip_adjust.Frozen();
-            packet.drain_enabled = settings.vial_inject_drain;
-            packet.drain_ms = settings.vial_inject_drain_ms;
-            packet.empty_ms = settings.vial_inject_empty_ms;
-            PiVialFeedbackOutput out{};
-            const bool valid = CallVialFeedback(packet, out);
-            dll_inject_request.Complete();
-            if (!valid || out.acknowledgement != PI_ACK_CURRENT) return;
-            vial_events |= out.confirmation_event == PI_VIAL_CONFIRM_HEALED ? VrOverlay::VialEventInjectHealed
-                                                       : VrOverlay::VialEventInjectDenied;
-            PublishDllVialDrain();
-            for (size_t i = 0; i < 2; ++i)
-                inject_hand_phase[i] = static_cast<VR::Body::InjectHold::Phase>(out.phase[i]);
-            LOG_INFO(Render_Vulkan, "VR inject DLL: confirmed={}, held mask={}, drain={} ms, visible={} ms",
-                healed, out.started_mask, out.drain_on ? out.drain_ms : 0, out.visible_s * 1000.0f);
-            if (out.started_mask && std::getenv("VR_INJECT_MARK") != nullptr) VR::Body::NoteMark();
-            for (uint32_t n = 0; n < out.haptic_count; ++n)
-                for (uint32_t side = 0; side < 2; ++side)
-                    if (out.haptics[n].side_mask & (1u << side))
-                        haptics[side].Play(PlaybackPattern(out.haptics[n]));
-            LOG_INFO(Render_Vulkan, "VR inject: {} -> {} ({:.0f} ms)", inject_zone,
-                     VR::InjectResultName(result), inject_wait * 1000.0f);
-            return;
-        }
+        const bool healed =
+            result == VR::InjectResult::Healed || result == VR::InjectResult::DryRun;
         vial_events |= healed ? VrOverlay::VialEventInjectHealed : VrOverlay::VialEventInjectDenied;
         if (healed) {
-            PiMeleeFeedbackInput glow{};glow.operation=PI_MF_VIGNETTE_HEAL;
-            melee_feedback_runtime.Step(glow);
+            heal_trigger = "injection"; // the heal vignette (DrawOverlay)
             haptics[0].Play(InjectThump(InjectThumpStab));
             haptics[1].Play(InjectThump(InjectThumpOther));
-            if (!dll_result) StartInjectDrain();
+            StartInjectDrain();
         } else {
             haptics[0].Play(Repeat(2, 0.3f, 15.0f, 60.0f, 3));
         }
         LOG_INFO(Render_Vulkan, "VR inject: {} -> {} ({:.0f} ms)", inject_zone,
                  VR::InjectResultName(result), inject_wait * 1000.0f);
-        if (healed && !dll_result) StartInjectHold();
+        if (healed) {
+            StartInjectHold();
+        }
     }
 
     // vial_inject_drain (core/vr/vial_drain.h): the vial in the hunter's hand empties from this
@@ -9014,12 +9484,6 @@ struct OpenXRPresenter::Impl {
     }
 
     void EndInjectDrain(const char* why) {
-        if (UsingInteractionDll()) {
-            const auto packet = VialFeedbackPacket(PI_FEEDBACK_CANCEL_DRAIN, VR::Body::SteadyNowNs());
-            PiVialFeedbackOutput out{};
-            if (CallVialFeedback(packet, out)) PublishDllVialDrain();
-            return;
-        }
         if (!inject_drain.On()) {
             return;
         }
@@ -9085,114 +9549,151 @@ struct OpenXRPresenter::Impl {
                              const HandState& right, float dt) {
         namespace L = VR::Lever;
         auto& channel = L::Channel();
-        const bool installed = channel.installed.load(std::memory_order_acquire);
-        if (!installed && !physical_lever_out.owns_grip[0] && !physical_lever_out.owns_grip[1] &&
-            !physical_lever_runtime.FeedbackPending()) return;
-        PiLeverInput context{};
-        context.now = VR::Body::SteadyNowNs(); context.epoch = recenter_serial;
-        context.frame.dt = dt;
-        auto& outer = context.outer;
-        outer.installed = installed; outer.setting_enabled = L::Enabled();
-        outer.motion_test = channel.motion_test.load(std::memory_order_relaxed);
-        outer.selected_hint = channel.selected_hint.load(std::memory_order_acquire);
-        outer.screen = screen_context; outer.menu = menu_context;
-        outer.page = VR::Page::Runtime::Get().IsOpen(); outer.cinematic = VR::CinematicActive();
-        outer.frozen = grip_adjust.Frozen(); outer.immersive = VR::IsImmersive();
-        outer.first_person = VR::IsFirstPerson(); outer.menu_button = in[PhysMenu]; outer.b = in[PhysB];
-        outer.quick_phase = static_cast<uint32_t>(QuickPhase()); outer.vial = vial_armed;
-        outer.inject_waiting = inject_waiting; outer.inject_hold = inject_hold;
-        outer.two_hand_owns = two_hand_out.owns_grip; outer.hand_owns = hand_owns_grip;
-        outer.shield = shield_up; outer.bow = bow_up; outer.music = music_box_free;
-        const std::array<const HandState*, 2> hands{&left, &right};
-        for (int h = 0; h < 2; ++h) {
-            outer.position_valid[h] = hands[h]->valid;
-            outer.orientation_valid[h] = hands[h]->orientation_valid;
-            auto& hand = context.frame.hands[h];
-            hand.grip = body_analog[2+h]; hand.grip_valid = physical_lever_grip_valid[h];
-            hand.blocked = blocked[h==0 ? PhysGripL : PhysGripR];
-            hand.position[0] = hands[h]->position.x;
-            hand.position[1] = hands[h]->position.y;
-            hand.position[2] = hands[h]->position.z;
+        const bool lever_enabled = channel.installed.load(std::memory_order_acquire) && L::Enabled();
+        if (!lever_enabled && channel.installed.load(std::memory_order_acquire) &&
+            channel.hand_pull_ready.load(std::memory_order_relaxed) != 0) {
+            // Physical levers switched off: no hand pulls a lever now (the word cleared, as for a
+            // display mode that cannot), and a capstan the hand parked goes back to rest (the
+            // game's Unpark): the game holds it unturned, and its own button serves it now.
+            channel.hand_pull_ready.store(0, std::memory_order_release);
+            channel.PromptChanged();
+            channel.RequestUnpark(VR::Body::SteadyNowNs());
+            physical_lever_ready = false;
         }
-        context.prompt.word_present = channel.hand_pull_ready.load(std::memory_order_relaxed) != 0;
-        // Sampling optimization only: the DLL independently decides readiness from raw facts.
-        const bool sample = installed && outer.setting_enabled && !outer.screen &&
-            outer.immersive && outer.first_person &&
-            ((outer.position_valid[0] && outer.orientation_valid[0]) ||
-             (outer.position_valid[1] && outer.orientation_valid[1]));
-        VR::Body::BodyStatus ready_body{};
-        VR::Body::Anchor ready_anchor{};
-        auto& ready = context.preparation;
-        ready.body_available = sample && VR::Body::LatestBodyStatus(ready_body);
-        ready.body_ns = ready_body.steady_ns; ready.body_driven = ready_body.driven;
-        ready.anchor_available = ready.body_available && VR::Body::LatestAnchor(ready_anchor);
-        context.aux.anchor = {ready_anchor.steady_ns, ready_anchor.valid, 0,
-            {ready_anchor.eye_world.x,ready_anchor.eye_world.y,ready_anchor.eye_world.z},
-            {ready_anchor.head_k.x,ready_anchor.head_k.y,ready_anchor.head_k.z},
-            ready_anchor.base_yaw, ready_anchor.world_scale};
-        const auto begin = physical_lever_runtime.OuterContext(context);
-        if (const auto cancelled=physical_lever_runtime.TakeCancelledOffer()) channel.CancelOffer(cancelled);
-        if (begin.prompt.fallback) {
-            channel.prompt_fallback.fetch_add(1,std::memory_order_acq_rel);
-            LOG_INFO(Render_Vulkan,"VR lever: B at a hand-pulled lever: its prompt and button are back for {} s",L::FallbackNs/1'000'000'000);
-        }
-        if (begin.prompt.clear_ready) channel.hand_pull_ready.store(0,std::memory_order_release);
-        if (begin.prompt.write_ready) channel.hand_pull_ready.store(context.now,std::memory_order_release);
-        if (begin.prompt.prompt_changed) channel.PromptChanged();
-        if (begin.prompt.request_unpark) channel.RequestUnpark(context.now);
-        if (!begin.outer.continue_input) {
-            if (physical_lever_runtime.Faulted()) {
-                physical_lever_out = VR::Interactions::LeverP::Unpack(begin.decision);
-                if (begin.command.present) channel.Publish({0,begin.command.ns,begin.command.id,
-                    begin.command.generation,begin.command.angle,begin.command.hand,L::CommandKind::Release});
-                UpdatePhysicalLeverFeel(context.now,false);
-                for (int h=0;h<2;++h) if (physical_lever_out.owns_grip[h]) {
-                    in[h==0?PhysGripL:PhysGripR]=false; in[h==0?PhysTriggerL:PhysTriggerR]=false;
-                }
-            }
+        if (!lever_enabled &&
+            !physical_lever_out.owns_grip[0] && !physical_lever_out.owns_grip[1] &&
+            physical_lever_feedback_pending.ns == 0) {
             return;
         }
-        const auto token = begin.outer.token;
-        physical_lever_armed_near = false; physical_lever_reaching = {};
-        if (begin.outer.reach_wanted) UpdatePhysicalLeverReach(left,right,token);
+        L::Input idle{};
+        for (int h = 0; h < 2; ++h) {
+            idle.hands[h].grip = body_analog[2 + h];
+            idle.hands[h].grip_valid = physical_lever_grip_valid[h];
+        }
+        const bool motion_test = channel.motion_test.load(std::memory_order_relaxed);
+        const bool need_candidate = physical_lever.NeedsCandidate(idle.hands);
+        const bool pending = physical_lever_acquisition.Stamp() != 0;
+        // B still serves ordinary interactions (e.g. nearby loot); it must not restore a
+        // supported lever's button prompt or disable its hand pull.
+        // Whether a hand can pull a lever at all now: the game hides a hand-pulled lever's
+        // prompt and button only while this word is fresh.
+        UpdatePhysicalLeverReady(left, right, lever_enabled);
+        // The armed lever (the hand-pullable one the game selected last): grabbable, with no
+        // timer, while the head or a hand stays near it in gameplay (lever_prompt.h ArmMargin).
+        // Ticks a hand that could grab as it comes within reach of the handle, and logs the
+        // reach (2 Hz). While a squeeze is pending or a lever held, its reach state is kept, so a
+        // hand still on the handle afterwards does not tick again.
+        const bool reach_gameplay = !screen_context && !menu_context &&
+                                    !VR::Page::Runtime::Get().IsOpen() && !VR::CinematicActive() &&
+                                    !grip_adjust.Frozen() && VR::IsImmersive() &&
+                                    VR::IsFirstPerson();
+        const bool busy = quick.GetPhase() != VR::Quick::Phase::Idle || vial_armed ||
+                          inject_waiting || inject_hold > 0.0f || two_hand_out.owns_grip ||
+                          hand_owns_grip || shield_up || bow_up || music_box_free;
+        physical_lever_armed_near = false;
+        physical_lever_reaching = {};
+        if (lever_enabled && !motion_test && !physical_lever_out.holding && !pending) {
+            std::array<bool, 2> free{};
+            for (int h = 0; h < 2; ++h) {
+                free[h] = !busy && !blocked[h == 0 ? PhysGripL : PhysGripR] &&
+                          physical_lever.CanSqueeze(h);
+            }
+            UpdatePhysicalLeverReach(left, right, reach_gameplay, free);
+        } else if (!lever_enabled || motion_test) {
+            physical_lever_arm = {};
+        }
+        // A squeeze is sent for the armed lever only from a hand already reaching for it (within
+        // NearMiss of its grip or stem); every other squeeze keeps its ordinary use at once.
+        const auto squeezes = physical_lever.GrabEdges(idle.hands);
+        const bool reaching = (squeezes[0] && physical_lever_reaching[0]) ||
+                              (squeezes[1] && physical_lever_reaching[1]);
+        const bool try_grab = need_candidate && !physical_lever_out.holding &&
+                              (motion_test || (physical_lever_armed_near && reaching));
         L::Offer offer{};
-        const bool have_offer = begin.outer.read_offer && channel.LatestOffer(offer);
-        const auto routed = physical_lever_runtime.OuterRoute(token,recenter_serial,
-                                                             VR::Body::SteadyNowNs(),have_offer);
-        if (routed.outer.fast_idle) {
-            physical_lever_out = VR::Interactions::LeverP::Unpack(routed.decision);
+        const bool have_offer = (physical_lever_out.holding || pending) &&
+                                channel.LatestOffer(offer);
+        if (!have_offer && !try_grab && !pending && !physical_lever_out.holding &&
+            !physical_lever_out.owns_grip[0] && !physical_lever_out.owns_grip[1] &&
+            physical_lever_feedback_pending.ns == 0) {
+            // Idle or an already-held unowned squeeze: only maintain grip latches.
+            // No offer copy, command lock or input mapping (the readiness word and the armed
+            // lever's reach above are the only per-frame reads).
+            // A changed native prompt hint above is timestamped only for grab detection.
+            physical_lever_out = physical_lever.Step(idle);
+            physical_lever_update_ns = 0;
             return;
         }
         const s64 now = VR::Body::SteadyNowNs();
-        L::Input raw{};
-        raw.candidate = offer.candidate;
-        PiLeverPreparationFacts facts{};
+        L::Input input{};
+        input.dt = dt;
+        input.enabled = lever_enabled &&
+                        (physical_lever_update_ns == 0 ||
+                         L::Fresh(physical_lever_update_ns, now));
+        physical_lever_update_ns = now;
+        input.gameplay = !screen_context && !menu_context && !VR::Page::Runtime::Get().IsOpen() &&
+                         !VR::CinematicActive() && !in[PhysMenu] && !grip_adjust.Frozen() &&
+                         VR::IsImmersive() && VR::IsFirstPerson();
+        input.fallback = in[PhysB];
+        const std::array<const HandState*, 2> hands{&left, &right};
+        for (int h = 0; h < 2; ++h) {
+            input.hands[h].grip = body_analog[2 + h];
+            input.hands[h].grip_valid = physical_lever_grip_valid[h];
+            input.hands[h].tracked = hands[h]->valid && hands[h]->orientation_valid;
+            input.hands[h].busy = busy;
+            input.hands[h].blocked = blocked[h == 0 ? PhysGripL : PhysGripR];
+        }
         VR::Body::Anchor anchor{};
+        const bool offered = have_offer && L::Fresh(offer.ns, now);
+        if (have_offer && !offered) {
+            channel.DismissOffer(offer);
+        }
         VR::Body::BodyStatus body{};
-        facts.body_available=routed.outer.allow_mapping && VR::Body::LatestBodyStatus(body);
-        facts.body_ns=body.steady_ns;facts.body_driven=body.driven;
-        facts.arm_weight[0]=body.arm_weight[0];facts.arm_weight[1]=body.arm_weight[1];
-        facts.anchor_available=facts.body_available && VR::Body::LatestAnchor(anchor);
-        facts.have_offer=have_offer;facts.offer_ns=offer.ns;
-        facts.cleanup_pending=channel.CleanupPending();
-        const auto prepared=physical_lever_runtime.PrepareOuter(raw,facts,anchor,token,recenter_serial,now,offer.request_ns);
-        const auto& preparation=prepared.preparation;
-        L::Input input=VR::Interactions::LeverP::Unpack(preparation.frame);
-        const bool mapped=preparation.mapped;
-        if(preparation.dismiss_offer)channel.DismissOffer(offer);
+        bool mapped = false;
+        if ((try_grab || pending || physical_lever_out.holding) &&
+            VR::Body::LatestBodyStatus(body) && L::Fresh(body.steady_ns, now) &&
+            body.driven && VR::Body::LatestAnchor(anchor)) {
+            for (int h = 0; h < 2; ++h) {
+                input.hands[h].busy = input.hands[h].busy || body.arm_weight[h] < 0.9f;
+            }
+            if (const auto space = L::Space::From(anchor, now)) {
+                mapped = true;
+                for (int h = 0; h < 2; ++h) {
+                    const auto& p = hands[h]->position;
+                    input.hands[h].position = space->HandInMetres({p.x, p.y, p.z});
+                    // Its real motion alone (a capstan walked round: physical_lever.h Jumped).
+                    input.hands[h].tracking = {p.x, p.y, p.z};
+                }
+                if (offered) {
+                    if (const auto rig = space->RigInMetres(offer.candidate.rig)) {
+                        input.candidate = offer.candidate;
+                        input.candidate.rig = *rig;
+                        input.candidate.space_epoch = recenter_serial;
+                        input.candidate.age_s = static_cast<float>(now - offer.ns) * 1e-9f;
+                    }
+                }
+            }
+        }
+        input.enabled = input.enabled && mapped && !channel.CleanupPending();
         // The armed lever, near: its handle is out of reach from the game's prompt zone, so the
         // hand reaches it once the hunter has stepped beside or behind the housing.
-        const auto& request_intent=prepared.request;
-        if (request_intent.kind) {
-            if(request_intent.kind==PI_LEVER_REQUEST_PROBE) {
-                L::ProbeHands request{};request.ns=request_intent.ns;request.radius=request_intent.radius;
-                for(int h=0;h<2;++h) {
-                    const auto& p=request_intent.world[h];request.world[h]={p[0],p[1],p[2]};
-                    request.enabled[h]=request_intent.enabled[h]!=0;
+        const bool lever_near = motion_test || physical_lever_armed_near;
+        if (!pending && try_grab && lever_near &&
+            physical_lever_acquisition.Begin(physical_lever, input, recenter_serial, now)) {
+            if (motion_test) {
+                L::ProbeHands request{};
+                request.ns = now;
+                request.radius = L::GrabRadius * anchor.world_scale;
+                const auto edges = physical_lever.GrabEdges(input.hands);
+                for (int h = 0; h < 2; ++h) {
+                    request.world[h] = input.hands[h].position * anchor.world_scale;
+                    request.enabled[h] = edges[h] && input.hands[h].tracked &&
+                                         !input.hands[h].busy && !input.hands[h].blocked;
                 }
                 channel.RequestMotionOffer(request);
-            } else channel.RequestOffer(request_intent.ns);
-        } else if (prepared.outer.note_refusal &&
+            } else {
+                channel.RequestOffer(now);
+            }
+        } else if (!pending && try_grab && lever_near &&
                    (physical_lever_note_ns == 0 || now - physical_lever_note_ns > 1'000'000'000)) {
             // A squeeze near a hand-pulled lever that never reached the game (one note a second
             // at most): which input gate refused it.
@@ -9207,35 +9708,46 @@ struct OpenXRPresenter::Impl {
                      input.hands[0].grip, input.hands[1].tracked, input.hands[1].busy,
                      input.hands[1].blocked, input.hands[1].grip);
         }
-        const auto executed=physical_lever_runtime.ExecuteOuter(token,recenter_serial,now);
-        physical_lever_out=VR::Interactions::LeverP::Unpack(executed.decision);
-        if (const auto request=executed.outer.resolved_stamp) {
-            channel.CancelOffer(request);
-            const bool replied=executed.outer.replied != 0;
-            const float reach=executed.outer.resolution_distance>=0 ? executed.outer.resolution_distance : std::numeric_limits<float>::infinity();
-            const auto point = L::HandleAt(input.candidate.rig, input.candidate.angle);
-            LOG_INFO(Render_Vulkan,
-                     "VR lever resolution: request={} replied={} eligible={} grabbed={} "
-                     "holding={} kept={} age_ms={} reach_cm={:.0f} (grab within {:.0f}, kept "
-                     "within {:.0f}) handle_cm=({:.0f}, {:.0f}) enabled={} gameplay={} B={} "
-                     "busy=({}, {}) blocked=({}, {})",
-                     request, replied, input.candidate.eligible, physical_lever_out.grabbed,
-                     physical_lever_out.holding,
-                     physical_lever_out.owns_grip[0] || physical_lever_out.owns_grip[1],
-                     (now - request) / 1000000, reach * 100.0f, L::GrabRadius * 100.0f,
-                     L::NearMiss * 100.0f,
-                     VR::Body::Length(input.hands[0].position - point) * 100.0f,
-                     VR::Body::Length(input.hands[1].position - point) * 100.0f, input.enabled,
-                     input.gameplay, input.fallback, input.hands[0].busy, input.hands[1].busy,
-                     input.hands[0].blocked, input.hands[1].blocked);
+        if (const auto request = physical_lever_acquisition.Stamp()) {
+            const bool replied = offered && offer.request_ns == request;
+            // The squeezing hands' distance to the offered grip, before Poll consumes the press.
+            const float reach = physical_lever_acquisition.Distance(input);
+            physical_lever_out = physical_lever_acquisition.Poll(
+                physical_lever, input, recenter_serial, now, replied);
+            if (!physical_lever_acquisition.Stamp()) {
+                channel.CancelOffer(request);
+                // One line per squeeze that reached the game: did the hand get to the grip? The
+                // game's "offer request=..." line carries the same request id.
+                const auto point = L::HandleAt(input.candidate.rig, input.candidate.angle);
+                LOG_INFO(Render_Vulkan,
+                         "VR lever resolution: request={} replied={} eligible={} grabbed={} "
+                         "holding={} kept={} age_ms={} reach_cm={:.0f} (grab within {:.0f}, kept "
+                         "within {:.0f}) handle_cm=({:.0f}, {:.0f}) enabled={} gameplay={} B={} "
+                         "busy=({}, {}) blocked=({}, {})",
+                         request, replied, input.candidate.eligible, physical_lever_out.grabbed,
+                         physical_lever_out.holding,
+                         physical_lever_out.owns_grip[0] || physical_lever_out.owns_grip[1],
+                         (now - request) / 1000000, reach * 100.0f, L::GrabRadius * 100.0f,
+                         L::NearMiss * 100.0f,
+                         VR::Body::Length(input.hands[0].position - point) * 100.0f,
+                         VR::Body::Length(input.hands[1].position - point) * 100.0f, input.enabled,
+                         input.gameplay, input.fallback, input.hands[0].busy, input.hands[1].busy,
+                         input.hands[0].blocked, input.hands[1].blocked);
+            }
+        } else {
+            physical_lever_out = physical_lever.Step(input);
         }
         const auto& out = physical_lever_out;
-        const auto submission=physical_lever_runtime.Command();
         if (out.grabbed) {
+            physical_lever_rig = input.candidate.rig;
+            physical_lever_space = recenter_serial;
             physical_lever_hold_log_ns = 0;
         }
         // The held fist's contact, at rest: frozen at the grab on a lever stick; a capstan's slides
         // along its bar with the hand, so the pinned fist follows it.
+        if (out.grabbed || out.holding) {
+            physical_lever_rig.rest = out.contact_rest;
+        }
         LogPhysicalLeverHold(input, out, now);
         if (out.completed || out.ended != L::End::None) {
             // Once per hold: how it ended (the game's own "hold dropped" line says why it let go).
@@ -9245,19 +9757,21 @@ struct OpenXRPresenter::Impl {
                      static_cast<int>(out.ended), L::EndName(out.ended), out.completed, out.angle,
                      out.progress * 100.0f, out.hand);
         }
-        bool published=false;
-        static_assert(static_cast<u32>(L::CommandKind::Hold)==PI_LEVER_COMMAND_HOLD &&
-                      static_cast<u32>(L::CommandKind::Release)==PI_LEVER_COMMAND_RELEASE &&
-                      static_cast<u32>(L::CommandKind::Settle)==PI_LEVER_COMMAND_SETTLE);
-        if (submission.present) {
-            if (!channel.Publish({0,submission.ns,submission.id,submission.generation,
-                    submission.angle,submission.hand,static_cast<L::CommandKind>(submission.kind)})) {
+        if (out.holding || out.completed || out.ended != L::End::None) {
+            const auto kind = (out.completed || L::SettlesOnEnd(out.ended))
+                                  ? L::CommandKind::Settle
+                                  : out.holding ? L::CommandKind::Hold : L::CommandKind::Release;
+            if (!channel.Publish({0, now, out.id, out.generation, out.angle, out.hand, kind})) {
                 // Preserve the tracker so a rejected squeeze cannot become another action.
-                physical_lever_out = VR::Interactions::LeverP::Unpack(
-                    physical_lever_runtime.ExecuteOuter(token,recenter_serial,now,true).decision);
-            } else published=true;
+                input.enabled = false;
+                physical_lever_out = physical_lever.Step(input);
+            } else if (out.completed ||
+                       (L::SettlesOnEnd(out.ended) &&
+                        out.progress >= L::CommitFor(physical_lever_rig.motion))) {
+                physical_lever_feedback_pending = {now, 0, out.id, out.generation, out.hand, false};
+            }
         }
-        UpdatePhysicalLeverFeel(now,published);
+        UpdatePhysicalLeverFeel(now);
         for (int h = 0; h < 2; ++h) {
             if (physical_lever_out.owns_grip[h]) {
                 in[h == 0 ? PhysGripL : PhysGripR] = false;
@@ -9281,8 +9795,8 @@ struct OpenXRPresenter::Impl {
         const auto hand = input.hands[out.hand].position;
         const bool first = physical_lever_hold_log_ns == 0;
         const auto moved = first ? L::Vec3{} : hand - physical_lever_hold_hand;
-        const auto g = physical_lever_runtime.HoldGeometry(hand, moved);
-        if (!g.valid) return;
+        const auto& rig = physical_lever.HeldRig();
+        const auto g = L::Geometry(rig, hand, physical_lever.Expected(), moved);
         physical_lever_hold_log_ns = now;
         physical_lever_hold_hand = hand;
         LOG_INFO(Render_Vulkan,
@@ -9290,9 +9804,44 @@ struct OpenXRPresenter::Impl {
                  "{:.0f} cm from the hinge axis, {:.0f} cm off the handle's arc (slips past {:.0f}) "
                  "| moved {:+.1f} cm along the pull, {:+.1f} radial, {:+.1f} along the axis",
                  out.id, out.hand, out.angle / VR::Body::Deg, out.progress * 100.0f,
-                 g.sweep / VR::Body::Deg, g.plane * 100.0f, g.off_arc * 100.0f,
+                 rig.sweep / VR::Body::Deg, g.plane * 100.0f, g.off_arc * 100.0f,
                  L::SlipDistance * 100.0f, g.tangential * 100.0f, g.radial * 100.0f,
                  g.axial * 100.0f);
+    }
+
+    // Whether a hand can pull a lever now: immersive first person (not the virtual screen or
+    // third person), the body driven by fresh tracking and a hand tracked. The game hides a
+    // hand-pulled lever's prompt and button only while this word is fresh (lever_prompt.h
+    // ReadyNs): refreshed every frame while ready, cleared at once when the display mode cannot
+    // pull, left to age through a tracking gap (or a stopped XR loop). Each change that matters
+    // reaches the game's next selection pass (prompt_serial). Transient UI (menus, the VR page,
+    // cinematics) only pauses the hand path; the game offers no prompt through most of it.
+    void UpdatePhysicalLeverReady(const HandState& left, const HandState& right, bool enabled) {
+        namespace L = VR::Lever;
+        auto& channel = L::Channel();
+        const s64 now = VR::Body::SteadyNowNs();
+        const bool mode = enabled && !screen_context && VR::IsImmersive() && VR::IsFirstPerson();
+        VR::Body::BodyStatus body{};
+        VR::Body::Anchor anchor{};
+        const bool ready =
+            mode && ((left.valid && left.orientation_valid) ||
+                     (right.valid && right.orientation_valid)) &&
+            VR::Body::LatestBodyStatus(body) && L::Fresh(body.steady_ns, now) && body.driven &&
+            VR::Body::LatestAnchor(anchor) && L::Space::From(anchor, now).has_value();
+        if (ready) {
+            channel.hand_pull_ready.store(now, std::memory_order_release);
+        } else if (!mode && channel.hand_pull_ready.load(std::memory_order_relaxed) != 0) {
+            channel.hand_pull_ready.store(0, std::memory_order_release);
+            channel.PromptChanged(); // the prompts come back at once
+            // A capstan the hand parked goes back to rest (the game's Unpark): the game holds it
+            // unturned, and its own button serves it in this mode. (A word merely late, a tracking
+            // gap or the headset off, keeps it parked.)
+            channel.RequestUnpark(now);
+        }
+        if (ready && !physical_lever_ready) {
+            channel.PromptChanged(); // hand pulls are back: hide the prompts again at once
+        }
+        physical_lever_ready = ready;
     }
 
     // The armed lever (the hand-pullable one the game selected last, its rig as the game bound
@@ -9303,50 +9852,74 @@ struct OpenXRPresenter::Impl {
     // a light tick as a hand that could grab comes within grab reach of its handle or stem, and a
     // reach line twice a second (the hands' distances in metres, and grip and hands in game
     // units to check the mapping).
-    void UpdatePhysicalLeverReach(const HandState& left, const HandState& right, uint64_t token) {
+    void UpdatePhysicalLeverReach(const HandState& left, const HandState& right, bool gameplay,
+                                  const std::array<bool, 2>& free) {
         namespace L = VR::Lever;
         auto& channel = L::Channel();
         const s64 now = VR::Body::SteadyNowNs();
         L::Nearby lever{};
         VR::Body::Anchor anchor{};
-        const bool have_anchor=VR::Body::LatestAnchor(anchor);
-        if(!have_anchor)anchor.valid=false;
-        L::ArmInput raw{};
-        raw.now=now;
-        raw.published=have_anchor && channel.LatestNearby(lever);
-        raw.published_ns=lever.ns;raw.armed=lever.armed;
-        raw.rig=lever.rig;raw.angle=lever.angle;
-        const std::array<const HandState*,2> hands{&left,&right};
-        for(int h=0;h<2;++h) {
-            raw.tracked[h]=hands[h]->valid;
-            const auto& p=hands[h]->position;raw.hands[h]={p.x,p.y,p.z};
+        L::ArmInput arm{};
+        arm.now = now;
+        arm.gameplay = gameplay;
+        arm.free = free;
+        std::optional<L::Space> space;
+        if (VR::Body::LatestAnchor(anchor)) {
+            space = L::Space::From(anchor, now);
         }
-        const auto packet=physical_lever_runtime.ReachOuter(raw,anchor,token,recenter_serial);
-        const auto out=VR::Interactions::LeverRuntime::ArmDecision(packet.arm);
-        if(out.request_check)channel.RequestNearbyCheck(now);
-        if(packet.scan_due) {
-            L::ScanRequest where{};where.ns=now;where.scale=packet.reach.scale;
-            where.head=anchor.eye_world;
-            for(int h=0;h<2;++h) {
-                where.tracked[h]=raw.tracked[h];
-                const auto& p=packet.reach.scan_hands[h];where.hands[h]={p[0],p[1],p[2]};
+        const auto rig =
+            space && channel.LatestNearby(lever) ? space->RigInMetres(lever.rig) : std::nullopt;
+        if (rig) {
+            const std::array<const HandState*, 2> hands{&left, &right};
+            arm.published = true;
+            arm.published_ns = lever.ns;
+            arm.armed = lever.armed;
+            arm.rig = *rig;
+            arm.angle = lever.angle; // a parked capstan's bar stands turned
+            arm.head = anchor.eye_world * (1.0f / anchor.world_scale);
+            for (int h = 0; h < 2; ++h) {
+                arm.tracked[h] = hands[h]->valid;
+                const auto& p = hands[h]->position;
+                arm.hands[h] = space->HandInMetres({p.x, p.y, p.z});
+            }
+        }
+        const auto out = L::Arm(physical_lever_arm, arm);
+        if (out.request_check) {
+            channel.RequestNearbyCheck(now);
+        }
+        // No armed lever near (none yet, walked away, or the near one used): the game looks for a
+        // bound one near the head or a hand a few times a second (lever_prompt.h ScanNs), so a
+        // lever arms by proximity alone, without the hunter first standing in its prompt zone.
+        if (space && L::ScanDue(gameplay && physical_lever_ready && !out.armed_near,
+                                physical_lever_scan_ns, now)) {
+            physical_lever_scan_ns = now;
+            L::ScanRequest where{};
+            where.ns = now;
+            where.scale = anchor.world_scale;
+            where.head = anchor.eye_world;
+            const std::array<const HandState*, 2> hands{&left, &right};
+            for (int h = 0; h < 2; ++h) {
+                const auto& p = hands[h]->position;
+                where.tracked[h] = hands[h]->valid;
+                where.hands[h] = space->HandInMetres({p.x, p.y, p.z}) * anchor.world_scale;
             }
             channel.RequestScan(where);
         }
-        physical_lever_armed_near=out.armed_near;
-        physical_lever_reaching=out.reaching;
-        PlayInteractionHaptics(packet.effects);
+        physical_lever_armed_near = out.armed_near;
+        physical_lever_reaching = out.reaching;
+        for (int h = 0; h < 2; ++h) {
+            if (out.tick[h]) {
+                haptics[h].Play(Tick(0.2f, 12.0f, 0));
+            }
+        }
         if (!out.armed_near ||
             (physical_lever_reach_log_ns != 0 && now - physical_lever_reach_log_ns < 500'000'000)) {
             return;
         }
         physical_lever_reach_log_ns = now;
-        const auto& geometry=packet.reach;
-        const float scale = geometry.scale;
-        const auto mapped_rig=VR::Interactions::LeverP::Unpack(geometry.rig);
-        const VR::Body::Vec3 mapped_head{geometry.head[0],geometry.head[1],geometry.head[2]};
+        const float scale = anchor.world_scale;
         const auto grip = L::HandleAt(lever.rig, lever.angle);
-        const auto& at = geometry.hands;
+        const auto& at = arm.hands;
         LOG_INFO(Render_Vulkan,
                  "VR lever reach: handle={:#x} nearest {:.0f} cm (L {:.0f}, R {:.0f}; grabs within "
                  "{:.0f}, sent within {:.0f}) | head {:.2f} m from the hinge (armed within {:.2f}) "
@@ -9354,29 +9927,88 @@ struct OpenXRPresenter::Impl {
                  "({:.2f},{:.2f},{:.2f}) head game ({:.2f},{:.2f},{:.2f}) scale {:.3f}",
                  lever.id, std::min(out.distance[0], out.distance[1]) * 100.0f,
                  out.distance[0] * 100.0f, out.distance[1] * 100.0f, L::GrabRadius * 100.0f,
-                 L::NearMiss * 100.0f, VR::Body::Length(mapped_head - mapped_rig.pivot),
-                 L::ArmRadius(mapped_rig), grip.x, grip.y, grip.z, at[0][0] * scale, at[0][1] * scale,
-                 at[0][2] * scale, at[1][0] * scale, at[1][1] * scale, at[1][2] * scale,
+                 L::NearMiss * 100.0f, VR::Body::Length(arm.head - arm.rig.pivot),
+                 L::ArmRadius(arm.rig), grip.x, grip.y, grip.z, at[0].x * scale, at[0].y * scale,
+                 at[0].z * scale, at[1].x * scale, at[1].y * scale, at[1].z * scale,
                  anchor.eye_world.x, anchor.eye_world.y, anchor.eye_world.z, scale);
     }
 
-    void UpdatePhysicalLeverFeel(s64 now,bool published) {
-        namespace L=VR::Lever;
-        L::Completion completion{};const bool answered=L::Channel().LatestCompletion(completion);
-        const auto effects=physical_lever_runtime.Feedback(now,{haptics[0].sustain,haptics[1].sustain},published,answered,completion);
-        for(int h=0;h<2;++h)if(effects.write[h])haptics[h].sustain=effects.level[h];
-        PlayInteractionHaptics(effects);
+    void UpdatePhysicalLeverFeel(s64 now) {
+        namespace L = VR::Lever;
+        const auto& out = physical_lever_out;
+        for (int h = 0; h < 2; ++h) {
+            auto& hand = haptics[h];
+            const bool ours = physical_lever_sustain[h] > 0.0f &&
+                              hand.sustain == physical_lever_sustain[h];
+            const float level = out.holding && out.hand == h
+                                    ? 0.035f + 0.15f * out.strain : 0.0f;
+            if (level > 0.0f && (ours || hand.sustain <= level)) {
+                hand.sustain = level;
+                physical_lever_sustain[h] = level;
+            } else {
+                if (ours) hand.sustain = 0.0f;
+                physical_lever_sustain[h] = 0.0f;
+            }
+        }
+        if (out.hand >= 0 && out.hand < 2) {
+            auto& hand = haptics[out.hand];
+            if (out.grabbed) hand.Play(Tick(0.35f, 18.0f, 2));
+            else if (out.ratchet) hand.Play(Tick(0.20f, 12.0f, 1));
+            else if (out.ended == L::End::Slipped) hand.Play(Tick(0.16f, 14.0f, 1));
+            else if (out.ended == L::End::Released) hand.Play(Tick(0.10f, 10.0f, 0));
+        }
+        auto& waiting = physical_lever_feedback_pending;
+        if (waiting.ns == 0) return;
+        L::Completion completion{};
+        const bool answered = L::Channel().LatestCompletion(completion) &&
+                              completion.id == waiting.id &&
+                              completion.generation == waiting.generation &&
+                              completion.hand == waiting.hand && completion.ns >= waiting.ns;
+        if (answered) {
+            if (L::Fresh(completion.ns, now) && now >= waiting.ns && now - waiting.ns <= 1'000'000'000 &&
+                completion.hand >= 0 && completion.hand < 2) {
+                if (completion.accepted) {
+                    HapticPattern clunk{};
+                    clunk.priority = 3;
+                    clunk.Pulse(0.85f, 40.0f).Gap(25.0f).Pulse(0.30f, 25.0f);
+                    haptics[completion.hand].Play(clunk);
+                } else {
+                    haptics[completion.hand].Play(Tick(0.12f, 12.0f, 1));
+                }
+            }
+            waiting = {};
+        } else if (now < waiting.ns || now - waiting.ns > 1'000'000'000) {
+            waiting = {}; // no late clunk after a loading stall or loss of focus
+        }
     }
 
     void ApplyPhysicalLever(VR::Body::HandsSample& sample) {
-        namespace L=VR::Lever;
-        if(!physical_lever_runtime.Holding()){L::Channel().PresentHand({});return;}
-        L::Applied applied{};const bool have_applied=L::Channel().LatestApplied(applied);
-        VR::Body::Anchor anchor{};if(!VR::Body::LatestAnchor(anchor))anchor.valid=false;
-        const auto effects=physical_lever_runtime.Present(sample.steady_ns,sample.space_serial,{VR::Body::IsTracked(sample.hand[0]),VR::Body::IsTracked(sample.hand[1])},have_applied,applied,anchor);
-        L::HandPresentation present{};
-        if(effects.present){auto& hand=sample.hand[effects.pin_hand];hand.p={effects.pin[0],effects.pin[1],effects.pin[2]};hand.v={};hand.grip=1.f;present={sample.steady_ns,sample.space_serial,effects.pin_hand};}
-        L::Channel().PresentHand(present);
+        namespace L = VR::Lever;
+        const auto present = [&]() -> L::HandPresentation {
+            const auto& out = physical_lever_out;
+            if (!out.holding || out.hand < 0 || out.hand > 1 ||
+                sample.space_serial != physical_lever_space) {
+                return {};
+            }
+            L::Applied applied{};
+            VR::Body::Anchor anchor{};
+            if (!L::Channel().LatestApplied(applied) || applied.id != out.id ||
+                applied.generation != out.generation || !L::Fresh(applied.ns, sample.steady_ns) ||
+                !std::isfinite(applied.angle) || !VR::Body::LatestAnchor(anchor)) {
+                return {};
+            }
+            const auto space = L::Space::From(anchor, sample.steady_ns);
+            auto& hand = sample.hand[out.hand];
+            if (!space || !VR::Body::IsTracked(hand)) {
+                return {};
+            }
+            // Pin only to a pose the game has actually applied, never an unacknowledged command.
+            hand.p = space->PinInTracking(L::HandleAt(physical_lever_rig, applied.angle));
+            hand.v = {};
+            hand.grip = 1.0f;
+            return {sample.steady_ns, sample.space_serial, out.hand};
+        };
+        L::Channel().PresentHand(present());
     }
 
     static VR::TwoHand::Pose TwoHandPose(const HandState& h) {
@@ -9389,113 +10021,8 @@ struct OpenXRPresenter::Impl {
     // the grab and never reaches them (no arc, no belt vial); elsewhere the left grip is theirs.
     // The game's side (the form, its own two-handed grip, the hands' grips) comes from the body
     // (core/vr/two_hand_channel.h); ApplyTwoHand puts the grab on the next published hands.
-    void UpdateDllTwoHand(const PhysicalState& in, const HandState& left, const HandState& right,
-                          const GestureFrame& gesture, float dt) {
-        namespace T = VR::TwoHand;
-        const auto& settings = VR::GetSettings();
-        const auto& ts = T::GetTwoHandSettings();
-        const s64 now = VR::Body::SteadyNowNs();
-        T::GameStatus st{};
-        PiTwoFrameFacts raw{};
-        raw.have_status=T::LatestGameStatus(st);raw.status_ns=st.ns;
-        raw.family=st.family;raw.style=st.style;raw.two_handed=st.two_handed;raw.measured=st.measured;
-        raw.target=PhysicalInteractions::TwoPackets::Pack(st.grip);raw.scale=st.scale;
-        raw.bones[0]=PhysicalInteractions::TwoPackets::Pack(st.left);
-        raw.bones[1]=PhysicalInteractions::TwoPackets::Pack(st.right);
-        two_hand_status=st;two_hand_update_ns=now;
-        PiTwoPolicyInput facts{};facts.now_ns=now;
-        facts.trick_enabled=VR::Tricks::GetTrickSettings().hand_transform;
-        facts.right_ready=right_grip_ready;facts.right_down=in[PhysGripR];
-        facts.combat_busy=melee_window.Current().open||melee.Pending();
-        VR::Combat::TransformStatus running{};
-        raw.have_transform=VR::Combat::LatestTransformStatus(running);
-        raw.transform_ns=running.ns;raw.transform_busy=running.busy;
-        VR::Body::BodyStatus status{};
-        raw.have_body=VR::Body::LatestBodyStatus(status);raw.body_ns=status.steady_ns;
-        raw.driven=status.driven;raw.first_person=VR::IsFirstPerson();
-        raw.controls_classic=settings.controls_classic;raw.right_grip_draw=settings.right_grip_draw;
-        raw.cinematic=VR::CinematicActive();raw.menu=in[PhysMenu];
-        raw.adjusting=grip_adjust.Frozen();raw.immersive=VR::IsImmersive();
-        raw.quick_phase=static_cast<uint32_t>(QuickPhase());raw.vial=vial_armed;
-        raw.inject_waiting=inject_waiting;raw.inject_hold=inject_hold;
-        raw.blocked_left=blocked[PhysGripL];raw.lever_left=physical_lever_out.owns_grip[0];
-        raw.left_grip=body_analog[2];raw.right_grip=body_analog[3];
-        raw.right_valid=right.valid;raw.right_q_valid=right.orientation_valid;
-        raw.left_valid=left.valid;raw.left_q_valid=left.orientation_valid;
-        raw.hands[0]=PhysicalInteractions::TwoPackets::Pack(TwoHandPose(left));
-        raw.hands[1]=PhysicalInteractions::TwoPackets::Pack(TwoHandPose(right));
-        raw.left_velocity={left.velocity.x,left.velocity.y,left.velocity.z};
-        raw.head_velocity={gesture.head_velocity.x,gesture.head_velocity.y,gesture.head_velocity.z};
-        raw.blade_valid=two_hand_blade.valid;raw.swing_speed=two_hand_blade.lever_speed;
-        VR::Combat::MeleeStatus native{};
-        raw.have_native=VR::Combat::LatestMeleeStatus(native);raw.native_ns=native.ns;
-        raw.native_tip_valid=native.blade_tip_valid;raw.native_form_b=native.form_b;
-        raw.native_variation=native.variation;raw.strike_near=native.blade_strike_near;
-        const auto frame=two_hand_runtime.FrameTrack(raw,facts,ts,dt,two_hand_out);
-        if(!frame.frame.token)return;
-        two_hand_status_ok=frame.frame.status_fresh!=0;
-        // Render-only copy in DLL mode; recognition/learning lives in its owning context.
-        two_hand_blade_clear.Set(st.family,frame.frame.blade_clear);
-        const auto& tracked=frame.policy;
-        if (tracked.gap_drop)
-            LOG_INFO(Render_Vulkan, "VR two-hand DLL: released after {} ms input gap",
-                     tracked.gap_ns / 1'000'000);
-        const auto event = two_hand_out;
-        PlayInteractionHaptics(tracked);
-        if (event.grabbed) {
-            gun_runtime.WaitForRelease(in[PhysTriggerL]);
-            two_hand_held_s = two_hand_log_s = 0;
-            two_hand_turn_ok = false;
-            LOG_INFO(Render_Vulkan, "VR two-hand DLL: GRAB {} ({} cm along, {} cm off rail)",
-                     VR::Body::WeaponName(st.family), event.zone.along * 100, event.zone.off * 100);
-        }
-        if (tracked.action == PI_TWO_ACTION_GRAB) {
-            ConsumeRightGrip();
-            right_grip_ready = false;
-            const auto before = transform_serial;
-            const bool accepted = HandTransformNow("both hands on the handle (DLL)");
-            FinishTwoPolicy(accepted, transform_serial != before ? transform_serial : 0);
-            if (!accepted) {
-                two_hand_out = {};
-                two_hand_out.owns_grip = true;
-            }
-        }
-        if (event.released != T::Why::None) {
-            LOG_INFO(Render_Vulkan, "VR two-hand DLL: RELEASE ({})", T::WhyName(event.released));
-        }
-        const auto supported=two_hand_runtime.FrameStage(PI_TWO_FRAME_SUPPORT,frame.frame);
-        if(!supported.frame.token)return;
-        const bool seated=supported.result!=0;
-        PlayInteractionHaptics(supported.policy);
-        two_hand_out.weight=supported.support.weight;
-        if (seated) {
-            two_hand_turn_ok = false;
-            LOG_INFO(Render_Vulkan, "VR two-hand DLL: support acquired on {}",
-                     VR::Body::WeaponName(st.family));
-        }
-        const auto posted=two_hand_runtime.FrameStage(PI_TWO_FRAME_POST,frame.frame);
-        if(!posted.frame.token)return;
-        const auto& post=posted.policy;
-        two_hand_handle_available = post.handle_available;
-        two_hand_guide_available = post.guide_available;
-        PlayInteractionHaptics(post);
-        if (post.action == PI_TWO_ACTION_REVERT) {
-            const auto before = transform_serial;
-            const bool accepted = HandTransformNow("let go of the handle: back to one hand (DLL)");
-            FinishTwoPolicy(accepted, transform_serial != before ? transform_serial : 0);
-        }
-        const auto& w=melee_window.Current();
-        two_hand_runtime.FrameStage(PI_TWO_FRAME_SWING,frame.frame,w.serial,w.open);
-        if (two_hand_out.engaged)
-            two_hand_held_s += dt;
-    }
-
     void UpdateTwoHand(const PhysicalState& in, const HandState& left, const HandState& right,
                        const GestureFrame& gesture, float dt) {
-        if (two_hand_runtime.Active()) {
-            UpdateDllTwoHand(in, left, right, gesture, dt);
-            return;
-        }
         namespace T = VR::TwoHand;
         namespace Q = VR::Quick;
         const auto& settings = VR::GetSettings();
@@ -9511,9 +10038,9 @@ struct OpenXRPresenter::Impl {
         const s64 gap_ns = two_hand_update_ns != 0 ? now - two_hand_update_ns : 0;
         two_hand_update_ns = now;
         if (gap_ns > 1'000'000'000) {
-            ResetTwoHandGuide(in[PhysGripR]);
+            two_hand_guide_gesture.Reset(in[PhysGripR]);
         }
-        if (gap_ns > 1'000'000'000 && two_hand_runtime.Drop()) {
+        if (gap_ns > 1'000'000'000 && two_hand.Drop()) {
             two_hand_out = {};
             two_hand_out.owns_grip = true; // (the grip stays the grab's: Drop)
             two_hand_turn_ok = false;
@@ -9553,7 +10080,7 @@ struct OpenXRPresenter::Impl {
         // one-handed form otherwise (it lets go: a re-grab during a revert, a refused transform).
         ti.grab_transforms = grab_family && !st.two_handed &&
                              (st.family == VR::Tricks::SawFamily || right_grip_ready || grab_transform_ns != 0 ||
-                              (in[PhysGripR] && !two_hand_runtime.Engaged()));
+                              (in[PhysGripR] && !two_hand.Engaged()));
         // A squeeze near the handle that cannot grab yet is kept from the quick items (a near miss
         // never opens the arc), and grabs without a new squeeze when it can: the right grip a
         // moment after the left (NearHoldNs), the hand back on the handle after slipping off it
@@ -9561,7 +10088,7 @@ struct OpenXRPresenter::Impl {
         ti.hold_near = (grab_family && !st.two_handed) || st.two_handed;
         ti.grab_held = (near_hold_ns != 0 && now - near_hold_ns < NearHoldNs) ||
                        (slip_ns != 0 && now - slip_ns < SlipRegrabNs);
-        const Q::Phase phase = QuickPhase();
+        const Q::Phase phase = quick.GetPhase();
         ti.busy = !Q::WeaponGrabAvailable(phase) || vial_armed || inject_waiting ||
                   inject_hold > 0.0f;
         ti.blocked = blocked[PhysGripL] || physical_lever_out.owns_grip[0];
@@ -9586,7 +10113,7 @@ struct OpenXRPresenter::Impl {
         ti.left_bone = T::BoneOrigin(TwoHandPose(left), st.left);
         ti.right_q_ok = ti.right_tracked;
         ti.right_q = TwoHandPose(right).q;
-        two_hand_runtime.Update(ts, ti, two_hand_out);
+        two_hand.Update(ts, ti, two_hand_out);
         const T::Output& o = two_hand_out;
         const double t = static_cast<double>(now) * 1e-9;
         if (o.grabbed) {
@@ -9594,7 +10121,7 @@ struct OpenXRPresenter::Impl {
             revert_tries = 0;
             // A trigger held through the grab (a full-hand squeeze presses it) fires nothing: no
             // gun or canned special until let go. The saw accepts held triggers.
-            gun_runtime.WaitForRelease(in[PhysTriggerL]);
+            gun_trigger_wait = gun_trigger_wait || in[PhysTriggerL];
             two_hand_held_s = 0.0f;
             two_hand_log_s = 0.0f;
             two_hand_turn_ok = false;
@@ -9616,7 +10143,7 @@ struct OpenXRPresenter::Impl {
                      t);
             if (ti.grab_transforms) {
                 // Both hands on it: into its two-handed form, a heavy clunk through both hands.
-                ConsumeRightGrip();
+                right_grip.Consume();
                 right_grip_ready = false;
                 if (HandTransformNow("both hands on the handle")) {
                     grab_transform_ns = now;
@@ -9628,7 +10155,7 @@ struct OpenXRPresenter::Impl {
                         haptics[1].Play(clunk);
                     }
                 } else {
-                    two_hand_runtime.Drop(); // not taken: no hold on a one-handed form
+                    two_hand.Drop(); // not taken: no hold on a one-handed form
                     two_hand_out = {};
                     two_hand_out.owns_grip = true; // (the squeeze stays the grab's: Drop)
                     if (ts.haptics) {
@@ -9663,7 +10190,7 @@ struct OpenXRPresenter::Impl {
                      "VR two-hand: RELEASE ({}) after {:.0f} ms (the hands {:.1f} cm apart, the "
                      "grab's {:.1f}; {:.0f} deg off the handle){} | t {:.3f}",
                      T::WhyName(o.released), two_hand_held_s * 1000.0f, o.hands_m * 100.0f,
-                     two_hand_runtime.GrabDistance() * 100.0f, T::TwistDeg(ti.handle, ti.left_bone),
+                     two_hand.GrabDistance() * 100.0f, T::TwistDeg(ti.handle, ti.left_bone),
                      o.owns_grip ? "; the grip stays the grab's until you let go" : "", t);
         }
         // A grab retains the weapon/form, but steering starts only when the actual controller
@@ -9687,8 +10214,8 @@ struct OpenXRPresenter::Impl {
         // The hand that moves along the weapon slides, the still one holds it; the weapon's own
         // speed locks both during a swing.
         support.swing_mps = two_hand_blade.valid ? two_hand_blade.lever_speed : 0.0f;
-        const bool seated = two_hand_runtime.SupportUpdate(ts, support, dt);
-        two_hand_out.weight = two_hand_runtime.Weight();
+        const bool seated = two_hand_support.Update(ts, support, dt);
+        two_hand_out.weight = two_hand_support.Weight();
         if (seated) {
             two_hand_tip_known = false;
             two_hand_turn_ok = false;
@@ -9701,7 +10228,23 @@ struct OpenXRPresenter::Impl {
                                     T::HandleAvailable(ts, ti, two_hand_out.engaged);
         // While reaching, show the continuous grip rail with right grip held.
         two_hand_guide_available = two_hand_status_ok &&
-                                  T::GuideAvailable(ts, ti, two_hand_runtime.Seated());
+                                  T::GuideAvailable(ts, ti, two_hand_support.Seated());
+        // Why not (the guide's log, UpdateGuideLog): the first of GuideAvailable's terms that fails.
+        // The guide log (off for performance):
+        // two_hand_guide_why = !two_hand_status_ok          ? "no fresh weapon status"
+                             // : !ts.guide                  ? "two_hand_guide=0"
+                             // : !ts.enabled                ? "two_hand_grip=0"
+                             // : !ti.enabled                ? "two-hand off (classic, right_grip=draw, "
+                                                            // "no body or not first person)"
+                             // : !ti.gameplay               ? "not gameplay"
+                             // : two_hand_support.Seated()  ? "the left hand already holds it"
+                             // : ti.busy                    ? "busy (quick item, vial)"
+                             // : ti.blocked                 ? "left grip blocked (lever, menu)"
+                             // : !ti.right_tracked          ? "right hand not tracked"
+                             // : !ti.handle.valid           ? "no handle (the weapon's grip unknown)"
+                             // : !(ti.two_handed || ti.grab_transforms)
+                                 // ? "not a two-handed form and no grab transform"
+                                 // : nullptr;
         // A kept near miss that never became a grab: a soft no, once.
         if (near_hold_ns != 0 && !o.engaged && now - near_hold_ns >= NearHoldNs) {
             near_hold_ns = 0;
@@ -9731,9 +10274,9 @@ struct OpenXRPresenter::Impl {
                          "hand's share {:.2f}){}",
                          two_hand_held_s, o.hands_m * 100.0f, o.apart_m * 100.0f, o.twist_deg,
                          two_hand_turn_deg, o.weight,
-                         (two_hand_runtime.RightSlide() + two_hand_runtime.Slide()) * 100.0f,
-                         two_hand_runtime.RightSlide() * 100.0f, two_hand_runtime.RightShare(),
-                         two_hand_runtime.Swinging() ? " (swinging: locked)" : "");
+                         (two_hand_support.RightSlide() + two_hand_support.Slide()) * 100.0f,
+                         two_hand_support.RightSlide() * 100.0f, two_hand_support.RightShare(),
+                         two_hand_support.Swinging() ? " (swinging: locked)" : "");
             }
         }
         // The grab group's form B lasts while either grip retains the support hand. Release
@@ -9787,13 +10330,13 @@ struct OpenXRPresenter::Impl {
             left_speed = std::sqrt(vx * vx + vy * vy + vz * vz);
         }
         const VR::Melee::Window& w = melee_window.Current();
-        two_hand_runtime.SwingUpdate(w.serial, w.open, two_hand_runtime.Seated(), left_speed);
-        if (two_hand_runtime.TwoHanded(ts) && two_hand_bonus_serial != w.serial) {
+        two_hand_swing.Update(w.serial, w.open, two_hand_support.Seated(), left_speed);
+        if (two_hand_swing.TwoHanded(ts) && two_hand_bonus_serial != w.serial) {
             two_hand_bonus_serial = w.serial;
             LOG_INFO(Render_Vulkan,
                      "VR two-hand: swing #{} two-handed (the left hand at {:.1f} m/s): its hits "
                      "x{:.2f} | t {:.3f}",
-                     w.serial, two_hand_runtime.SwingPeak(), two_hand_runtime.Factor(ts), t);
+                     w.serial, two_hand_swing.left_peak, two_hand_swing.Factor(ts), t);
         }
     }
 
@@ -9838,32 +10381,28 @@ struct OpenXRPresenter::Impl {
         const auto& settings = VR::GetSettings();
         hand_weapon_grab = false;
         // The left grip as the quick items latch it (0.75 / 0.45): the same squeeze.
-        if (!UsingInteractionDll()) {
-            const float squeeze = blocked[PhysGripL] || physical_lever_out.owns_grip[0]
-                                      ? 0.0f : body_analog[2];
-            hand_grip_l = hand_grip_l ? squeeze > 0.45f : squeeze >= 0.75f;
-        }
+        const float squeeze = blocked[PhysGripL] || physical_lever_out.owns_grip[0]
+                                  ? 0.0f : body_analog[2];
+        hand_grip_l = hand_grip_l ? squeeze > 0.45f : squeeze >= 0.75f;
         const Tr::Kind kind = Tr::KindOf(RightFamily());
         const bool form_b = RightFormB();
         const s64 now = VR::Body::SteadyNowNs();
         VR::Body::BodyStatus body{};
-        const bool have_body = VR::Body::LatestBodyStatus(body);
+        const bool arms = VR::Body::LatestBodyStatus(body) && now - body.steady_ns < 250'000'000 &&
+                          body.driven && VR::IsFirstPerson() &&
+                          Tr::HandTransformArmsReady(kind, body.drawn_weight[0],
+                                                     body.drawn_weight[1]);
+        // A transform still running: a pull now would wait for it and turn it back.
         VR::Combat::TransformStatus running{};
-        const bool have_running = VR::Combat::LatestTransformStatus(running);
-        bool on = false;
-        if (!UsingInteractionDll()) {
-            const bool arms = have_body && now - body.steady_ns < 250'000'000 &&
-                body.driven && VR::IsFirstPerson() &&
-                Tr::HandTransformArmsReady(kind, body.drawn_weight[0], body.drawn_weight[1]);
-            const bool busy = have_running && now - running.ns < 200'000'000 && running.busy;
-            on = ts.hand_transform && !two_hand_runtime.PolicyWaiting() &&
-                !settings.controls_classic && !settings.right_grip_draw &&
-                kind != Tr::Kind::None && arms && !busy &&
-                now - transform_request_ns >= HandTransformLockNs && gesture.head_ok &&
-                !VR::CinematicActive() && VR::IsImmersive() && !grip_adjust.Frozen() &&
-                VR::Quick::WeaponGrabAvailable(QuickPhase()) && !vial_armed &&
-                !inject_waiting && inject_hold <= 0.0f && !music_box_free;
-        }
+        const bool busy = VR::Combat::LatestTransformStatus(running) &&
+                          now - running.ns < 200'000'000 && running.busy;
+        const bool on = ts.hand_transform && !settings.controls_classic &&
+                        !settings.right_grip_draw && kind != Tr::Kind::None && arms && !busy &&
+                        now - transform_request_ns >= HandTransformLockNs &&
+                        gesture.head_ok && !VR::CinematicActive() && VR::IsImmersive() &&
+                        !grip_adjust.Frozen() &&
+                        VR::Quick::WeaponGrabAvailable(quick.GetPhase()) &&
+                        !vial_armed && !inject_waiting && inject_hold <= 0.0f && !music_box_free;
         auto& lh = haptics[0];
         auto& rh = haptics[1];
         // Only the levels it wrote (an armed vial's buzz, a charge's build stay theirs).
@@ -9876,79 +10415,35 @@ struct OpenXRPresenter::Impl {
             }
             hand_sustain_l = hand_sustain_r = 0.0f;
         };
-        Tr::HandTransform::Out o{};
-        if (UsingInteractionDll()) {
-            auto packet = TrickPacket(PI_TRICK_HAND_FRAME);
-            auto frame = TrickFrame(left, right, gesture, false, dt);
-            frame.right.grip = in[PhysGripR];
-            CopyTrickFrame(packet, frame);
-            packet.now_ns = now;
-            packet.squeeze = body_analog[2];
-            auto& facts = packet.hand_frame;
-            facts.body_ns = body.steady_ns; facts.running_ns = running.ns;
-            facts.transform_request_ns = transform_request_ns;
-            facts.drawn_weight[0] = body.drawn_weight[0]; facts.drawn_weight[1] = body.drawn_weight[1];
-            facts.inject_hold = inject_hold; facts.since_attack = since_attack;
-            facts.quick_phase = static_cast<u32>(QuickPhase());
-            const auto& current_swing = melee_window.Current();
-            facts.flags = (have_body ? PI_TH_BODY : 0u) | (body.driven ? PI_TH_DRIVEN : 0u) |
-                (VR::IsFirstPerson() ? PI_TH_FIRST_PERSON : 0u) | (have_running ? PI_TH_RUNNING : 0u) |
-                (running.busy ? PI_TH_RUNNING_BUSY : 0u) | (two_hand_runtime.PolicyWaiting() ? PI_TH_POLICY_WAIT : 0u) |
-                (settings.controls_classic ? PI_TH_CLASSIC : 0u) | (settings.right_grip_draw ? PI_TH_GRIP_DRAW : 0u) |
-                (gesture.head_ok ? PI_TH_HEAD : 0u) | (VR::CinematicActive() ? PI_TH_CINEMATIC : 0u) |
-                (VR::IsImmersive() ? PI_TH_IMMERSIVE : 0u) | (grip_adjust.Frozen() ? PI_TH_FROZEN : 0u) |
-                (vial_armed ? PI_TH_VIAL : 0u) | (inject_waiting ? PI_TH_INJECT_WAIT : 0u) |
-                (music_box_free ? PI_TH_MUSIC_FREE : 0u) | (current_swing.open ? PI_TH_SWING_OPEN : 0u) |
-                (current_swing.committed ? PI_TH_SWING_COMMITTED : 0u) |
-                (blocked[PhysGripL] ? PI_TH_INPUT_BLOCKED : 0u) |
-                (physical_lever_out.owns_grip[0] ? PI_TH_LEVER_OWNS : 0u);
-            PiTrickOutput result{};
-            if (!CallTrick(packet, result)) { end_sustain(); return; }
-            PlayInteractionHaptics(result);
+        if (!on) {
+            hand_transform.Arm(hand_grip_l);
             end_sustain();
-            if (result.sustain_left > 0) lh.sustain = hand_sustain_l = result.sustain_left;
-            if (result.sustain_right > 0) rh.sustain = hand_sustain_r = result.sustain_right;
-            hand_grip_l = result.left_grip;
-            hand_owns_grip = result.owns_left;
-            if (result.early) {
-                end_sustain();
-                if (result.denied) LOG_INFO(Render_Vulkan, "VR hand transform: stab ignored (a swing is going out)");
-                return;
-            }
-            o = {static_cast<Tr::Gesture>(result.gesture), result.owns_left != 0,
-                 result.holding != 0, result.hand_progress, result.missed != 0};
-        } else {
-            if (!on) {
-                hand_transform.Arm(hand_grip_l);
-                end_sustain();
-                hand_owns_grip = hand_owns_grip && hand_grip_l;
-                return;
-            }
-            Tr::Frame frame = TrickFrame(left, right, gesture, hand_grip_l, dt);
-            frame.right.grip = in[PhysGripR];
-            o = hand_transform.Step(frame, kind, form_b, right_grip_ready, ts);
-            hand_owns_grip = (hand_owns_grip || o.owns_grip) && hand_grip_l;
+            hand_owns_grip = hand_owns_grip && hand_grip_l;
+            return;
         }
+        Tr::Frame frame = TrickFrame(left, right, gesture, hand_grip_l, dt);
+        frame.right.grip = in[PhysGripR];
+        const Tr::HandTransform::Out o =
+            hand_transform.Step(frame, kind, form_b, right_grip_ready, ts);
+        hand_owns_grip = (hand_owns_grip || o.owns_grip) && hand_grip_l;
         hand_weapon_grab = o.gesture == Tr::Gesture::Grab;
         // The hilt held: its pull in both hands, rising as they part.
-        if (!UsingInteractionDll()) {
-            if (o.holding && ts.haptics) {
-                // Felt from its start (a steady level gets no haptic floor), the steel sliding in
-                // detents each quarter of the pull.
-                lh.sustain = hand_sustain_l = 0.12f + 0.25f * o.progress;
-                rh.sustain = hand_sustain_r = 0.10f + 0.15f * o.progress;
-                const int q = std::min(static_cast<int>(o.progress * 4.0f), 3);
-                if (q > split_quarter) {
-                    lh.Play(Tick(0.15f, 8.0f, 0));
-                }
-                split_quarter = q;
-            } else {
-                end_sustain();
-                split_quarter = 0;
+        if (o.holding && ts.haptics) {
+            // Felt from its start (a steady level gets no haptic floor), the steel sliding in
+            // detents each quarter of the pull.
+            lh.sustain = hand_sustain_l = 0.12f + 0.25f * o.progress;
+            rh.sustain = hand_sustain_r = 0.10f + 0.15f * o.progress;
+            const int q = std::min(static_cast<int>(o.progress * 4.0f), 3);
+            if (q > split_quarter) {
+                lh.Play(Tick(0.15f, 8.0f, 0));
             }
+            split_quarter = q;
+        } else {
+            end_sustain();
+            split_quarter = 0;
         }
         if (o.missed) {
-            if (ts.haptics && !UsingInteractionDll()) {
+            if (ts.haptics) {
                 lh.Play(Tick(0.12f, 15.0f, 1)); // a soft no: the hands never met for it
             }
             LOG_INFO(Render_Vulkan, "VR hand transform: a squeeze for the {} that never took",
@@ -9958,7 +10453,7 @@ struct OpenXRPresenter::Impl {
             return;
         }
         const std::string weapon = VR::Body::WeaponName(RightFamily());
-        const bool feel = ts.haptics && !UsingInteractionDll();
+        const bool feel = ts.haptics;
         HapticPattern big{};
         big.priority = 2;
         if (!Tr::Transforms(o.gesture)) {
@@ -9978,8 +10473,7 @@ struct OpenXRPresenter::Impl {
         // gone) that passes the chest is none.
         const bool contact = o.gesture == Tr::Gesture::Stab;
         const VR::Melee::Window& swing = melee_window.Current();
-        if (!UsingInteractionDll() && contact && ((swing.open && swing.committed) || since_attack < GripAfterAttack)) {
-            FinishTrick(false, true);
+        if (contact && ((swing.open && swing.committed) || since_attack < GripAfterAttack)) {
             if (feel) {
                 rh.Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3)); // not now: the deny
             }
@@ -9995,10 +10489,9 @@ struct OpenXRPresenter::Impl {
             }
         }
         const bool taken = HandTransformNow(Tr::GestureName(o.gesture));
-        FinishTrick(taken);
         if (taken) {
             hand_weapon_grab = o.gesture == Tr::Gesture::Split || o.gesture == Tr::Gesture::Join;
-            ConsumeRightGrip(); // the freed hand, the armed stab: used
+            right_grip.Consume(); // the freed hand, the armed stab: used
             right_grip_ready = false;
         } else if (feel) {
             lh.Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3)); // not taken: the deny double tick
@@ -10040,47 +10533,68 @@ struct OpenXRPresenter::Impl {
         const auto& ts = Tr::GetTrickSettings();
         const s64 now = VR::Body::SteadyNowNs();
         VR::Body::BodyStatus body{};
-        const bool have_body = VR::Body::LatestBodyStatus(body);
-        PiRangedInput packet{};
-        packet.operation = PI_SHIELD_PRESENTER; packet.now_ns = now; packet.dt = dt;
-        packet.guard_serial = body.guard_serial; packet.guard_clip = body.guard_clip;
-        packet.shield_m = ts.shield_m;
-        packet.head = {gesture.head_position.x, gesture.head_position.y, gesture.head_position.z};
-        packet.forward = {gesture.forward.x, gesture.forward.y, gesture.forward.z};
-        packet.hands[0].p = {left.position.x, left.position.y, left.position.z};
-        packet.hands[0].flags = left.pose_valid ? PI_POSITION_VALID : 0;
-        auto& facts = packet.shield_presenter;
-        facts.body_ns = body.steady_ns; facts.family = body.left_weapon_family;
-        facts.drawn_weight = body.drawn_weight[0]; facts.style = two_hand_status.style;
-        facts.quick_phase = static_cast<u32>(QuickPhase()); facts.inject_hold = inject_hold;
-        facts.flags = (have_body ? PI_SHP_HAVE_BODY : 0) | (ts.shield_raise ? PI_SHP_ENABLED : 0) |
-            (VR::GetSettings().controls_classic ? PI_SHP_CLASSIC : 0) | (body.driven ? PI_SHP_DRIVEN : 0) |
-            (gesture.head_ok ? PI_SHP_HEAD : 0) | (VR::CinematicActive() ? PI_SHP_CINEMATIC : 0) |
-            (two_hand_status_ok ? PI_SHP_TWO_OK : 0) | (vial_armed ? PI_SHP_VIAL : 0) |
-            (inject_waiting ? PI_SHP_INJECT_WAIT : 0) | (ts.haptics ? PI_SHP_HAPTICS : 0);
-        facts.torso_valid = belt_torso.Valid();
-        if (facts.torso_valid) {
-            const auto torso = belt_torso.Forward(); facts.torso = {torso.x, torso.y, torso.z};
-        }
-        const auto& decision = ranged_runtime.Update(packet);
-        PlayInteractionHaptics(decision.presenter);
-        const bool up = decision.shield.up;
-        if (decision.shield.blow) {
-            const int size = decision.shield.blow_size;
+        const bool fresh = VR::Body::LatestBodyStatus(body) && now - body.steady_ns < 250'000'000;
+        const bool in_hand = fresh && Tr::IsShieldFamily(body.left_weapon_family);
+        if (ts.shield_raise && in_hand && shield_guard_seen &&
+            body.guard_serial != shield_guard_serial) {
+            // As big as the blow: the guard reaction the game played (small .. the guard
+            // broken: a long shudder through the arm).
+            const int size = Tr::GuardBlowSize(body.guard_clip);
+            if (ts.haptics) {
+                HapticPattern blow{};
+                blow.priority = 2;
+                blow.own = true; // the blow owns the shield hand while it plays
+                blow.Pulse(0.55f + 0.15f * static_cast<float>(size),
+                           25.0f + 10.0f * static_cast<float>(size))
+                    .Ramp(0.35f + 0.15f * static_cast<float>(size), 0.0f,
+                          120.0f + 60.0f * static_cast<float>(size));
+                if (size >= 3) {
+                    blow.Gap(30.0f).Pulse(0.7f, 40.0f).Ramp(0.5f, 0.0f, 300.0f);
+                }
+                haptics[0].Play(blow);
+                haptics[1].Play(Tick(0.15f + 0.1f * static_cast<float>(size), 20.0f, 2));
+            }
             static constexpr const char* Sizes[] = {"small", "medium", "large", "guard-breaking"};
             LOG_INFO(Render_Vulkan, "VR shield: a {} blow on the shield (clip {}){}", Sizes[size],
                      body.guard_clip, shield_up ? " (held up)" : "");
         }
-        if (decision.shield.changed) {
-            const auto& l = decision.shield.local;
+        if (fresh) {
+            shield_guard_serial = body.guard_serial;
+            shield_guard_seen = true;
+        }
+        const bool free = ts.shield_raise && !VR::GetSettings().controls_classic && in_hand &&
+                          body.driven && body.drawn_weight[0] >= 0.5f && gesture.head_ok &&
+                          !VR::CinematicActive() &&
+                          !(two_hand_status_ok && two_hand_status.style == VR::TwoHand::StyleTwoHanded) &&
+                          quick.GetPhase() == VR::Quick::Phase::Idle && !vial_armed &&
+                          !inject_waiting && inject_hold <= 0.0f;
+        bool up = false;
+        Tr::Frame f = TrickFrame(left, left, gesture, false, dt);
+        if (belt_torso.Valid()) {
+            // In front of the body: a glance aside never lowers it.
+            const VR::Belt::P3 t = belt_torso.Forward();
+            f.forward = {t.x, t.y, t.z};
+        }
+        if (free) {
+            up = shield.Step(f, ts);
+        } else {
+            shield.Reset();
+        }
+        if (up != shield_up) {
+            shield_up = up;
+            if (ts.haptics) {
+                haptics[0].Play(up ? Tick(0.4f, 25.0f, 1) : Tick(0.12f, 10.0f, 0));
+            }
+            const Tr::HeadLocal l = Tr::InHead(f.head, f.forward, f.left.p);
             LOG_INFO(Render_Vulkan,
                      "VR shield: {} (the left hand {:.0f} cm in front of the eyes, {:.0f} cm "
                      "above them, {:.0f} cm to the side)",
-                     up ? "UP: the game's guard (L2 held)" : "down", l.x * 100.0f,
-                     l.y * 100.0f, l.z * 100.0f);
+                     up ? "UP: the game's guard (L2 held)" : "down", l.fwd * 100.0f,
+                     l.up * 100.0f, l.side * 100.0f);
         }
-        shield_up = up;
-        if (up) held |= static_cast<u32>(PadButton::L2);
+        if (up) {
+            held |= static_cast<u32>(PadButton::L2);
+        }
     }
 
     // PublishHands (frame thread, before the input): while an arrow is nocked (UpdateBow, the
@@ -10089,8 +10603,100 @@ struct OpenXRPresenter::Impl {
     // NockPoint: the controller may go past full draw, the hand on the string cannot), eased in at
     // the nock and out after release. The native arrow uses these same paired endpoints.
     void ApplyBowString(VR::Body::HandsSample& sample) {
-        ranged_runtime.Apply(sample, VR::IsGameMenuOpen() || VR::CinematicActive(),
-                             VR::Bow::GetBowSettings());
+        if (bow_up && !VR::IsGameMenuOpen() && !VR::CinematicActive()) {
+            sample.bow_hand = static_cast<s8>(bow_hand_i);
+            sample.bow_arrow = ArrowInHand();
+            sample.bow_nocked = bow.State() == VR::Bow::Phase::Nocked;
+        }
+        bow_tracking.Apply(sample);
+        if (sample.bow_hand < 0 || bow_string_w <= 0.0f) {
+            return;
+        }
+        auto& string = sample.hand[bow_hand_i == 0 ? 1 : 0];
+        const auto& bow_hand = sample.hand[bow_hand_i == 0 ? 0 : 1];
+        if (!VR::Body::IsTracked(string) || !VR::Body::IsTracked(bow_hand)) {
+            return;
+        }
+        // The string hand on the arrow's line through its rest beside the bow fist, on the string
+        // hand's side of the bow (the head's right for a bow in the left hand).
+        VR::Body::Vec3 side = VR::Body::Rotate(VR::Body::Normalize(sample.head_q), {1, 0, 0});
+        side = VR::Body::Vec3{side.x, 0.0f, side.z} * (bow_hand_i == 0 ? 1.0f : -1.0f);
+        const VR::Body::Vec3 rest = VR::Bow::ArrowRest(
+            bow_hand.p, VR::Body::Rotate(VR::Body::Normalize(bow_hand.q), {0, 1, 0}), side);
+        const VR::Bow::V3 n =
+            VR::Bow::NockPoint({rest.x, rest.y, rest.z}, {string.p.x, string.p.y, string.p.z},
+                               bow_rest_m, VR::Bow::GetBowSettings().draw_m);
+        const float w = bow_string_w;
+        string.p = {string.p.x + (n.x - string.p.x) * w, string.p.y + (n.y - string.p.y) * w,
+                    string.p.z + (n.z - string.p.z) * w};
+        string.v = string.v * (1.0f - w); // the string's motion now, not the controller's
+    }
+
+    // Frame thread: final weapon orientation for rendering, physical speed and contact.
+    // Attack classification and grab/transform gestures retain their pre-inertia intent.
+    void ApplyWeaponWeight(VR::Body::HandsSample& sample) {
+        namespace B = VR::Body;
+        weapon_weight_active = false; weapon_weight_mesh = false;
+        const auto& settings = VR::GetSettings();
+        const bool preset = settings.WeightedWeaponsPreset();
+        const float strength = settings.WeaponWeightStrength();
+        if (strength <= 0.0f) {
+            weapon_weight.Clear();
+            return;
+        }
+        VR::TwoHand::GameStatus st{};
+        VR::Combat::MeleeStatus melee_status{};
+        B::BodyStatus body{};
+        const auto fresh = [&](s64 stamp) {
+            return sample.steady_ns >= stamp && sample.steady_ns-stamp < 250'000'000;
+        };
+        const bool eligible = sample.head_valid && VR::IsImmersive() && !menu_context &&
+            !VR::IsGameMenuOpen() && !VR::CinematicActive() && !grip_adjust.Frozen() &&
+            !inject_freeze.On() && !inject_waiting && inject_hold <= 0.0f &&
+            !music_box_free && !physical_lever_out.owns_grip[1] && !hold_form.pending &&
+            VR::TwoHand::LatestGameStatus(st) && fresh(st.ns) &&
+            VR::Combat::LatestMeleeStatus(melee_status) && fresh(melee_status.ns) &&
+            melee_status.ok && melee_status.physical &&
+            melee_status.variation/10 == st.family &&
+            melee_status.form_b == (st.style >= 3 && st.style <= 5) &&
+            B::LatestBodyStatus(body) && fresh(body.steady_ns) && body.driven &&
+            body.arm_weight[1] >= .99f;
+        // Flexible chains own their dynamics. Clear all residual rigid-weapon state
+        // on transformation, before profiling, support correction or motor output.
+        if (!eligible || VR::Body::Tremor::FlexibleWhip(st.family, melee_status.form_b)) {
+            weapon_weight.Clear();
+            return;
+        }
+        const B::Quat target = sample.hand[1].q;
+        const B::Vec3 local_axis = B::Normalize(
+            VR::TwoHand::BoneToGripLocal(st.right, {0,-1,0}, 1.0f)-st.right.offset,
+            {0,0,-1});
+        B::Weight::Input input{st.family, melee_status.form_b, eligible, strength,
+            sample.two_hand, B::Length(grip_left_located.p-grip_right_located.p),
+            B::Rotate(target,local_axis), sample.head_p, sample.head_valid};
+        input.gravity = preset ? 1.0f : settings.weapon_gravity;
+        input.load_response = preset ? 1.0f : settings.weapon_load_response;
+        input.lift_response = preset ? 1.0f : settings.weapon_lift_response;
+        input.measured_shape = preset || settings.weapon_mesh_weight;
+        input.model_to_metres = st.scale > 1e-6f ? 1.0f/st.scale : 1.0f;
+        if (input.measured_shape) {
+            const auto& shape = weapon_weight.ProfileFor(input);
+            if (shape.measured) {
+                weapon_weight_mesh = true;
+                input.gravity_arm = B::Rotate(target,
+                    VR::TwoHand::BoneToGripLocal(st.right,
+                        weapon_weight.NativeCenter()+sample.two_hand_weapon_shift,st.scale));
+            }
+        }
+        weapon_weight.ConfigureMotor(preset || settings.weapon_pose_motor,st.right,
+                                     sample.two_hand_weapon_shift,st.scale);
+        weapon_weight_active = weapon_weight.Step(sample.xr_time,sample.space_serial,
+                                                   sample.hand[1],input);
+        if (weapon_weight_active) {
+            B::Weight::CarrySupport(sample,target,weapon_weight.PositionOffset());
+            weapon_weight_hand = sample.hand[1];
+            weapon_weight_frame = xr_frames;
+        }
     }
 
     // PublishHands (frame thread, before the input): while the left grip holds the handle
@@ -10101,25 +10707,12 @@ struct OpenXRPresenter::Impl {
     // its wrist follows tracking. The rail calibration stays fixed for this hold.
     // With the left controller occluded the weapon keeps its last turn and the
     // hunter's left hand stays on the handle. Combat samples this same steered pose.
-    void RecordTwoHandMotion(const VR::Body::HandsSample& sample) {
+    void RecordTwoHandMotion(const VR::Body::HandsSample& sample,
+                             const VR::Body::TrackedHand& intent_hand) {
         namespace T = VR::TwoHand;
-        if(two_hand_runtime.Active()) {
-            PiTwoMotionFacts facts{};facts.steady_ns=sample.steady_ns;
-            facts.head_valid=sample.head_valid;facts.right_tracked=VR::Body::IsTracked(grip_right_located);
-            facts.two_hand=sample.two_hand;facts.weapon=PhysicalInteractions::TwoPackets::Pack(T::Pose{sample.hand[1].p,sample.hand[1].q});
-            facts.head=PhysicalInteractions::TwoPackets::Pack(sample.head_p);facts.head_q=PhysicalInteractions::TwoPackets::Pack(sample.head_q);
-            if(two_hand_runtime.MotionNativeWanted()&&sample.two_hand>0) {
-                VR::Combat::MeleeStatus native{};facts.have_native=VR::Combat::LatestMeleeStatus(native);
-                facts.native_ns=native.ns;facts.native_tip_valid=native.blade_tip_valid;
-                facts.native_form_b=native.form_b;facts.native_variation=native.variation;
-                facts.native_tip=PhysicalInteractions::TwoPackets::Pack(native.blade_tip);
-            }
-            two_hand_blade=two_hand_runtime.MotionRaw(facts,sample.xr_time,sample.space_serial);
-            two_hand_blade_frame=xr_frames;return;
-        }
         const auto& st = two_hand_status;
         const bool active = two_hand_status_ok && sample.two_hand > 0.0f &&
-                            T::SharedMotion(st.family, st.style, two_hand_runtime.Seated());
+                            T::SharedMotion(st.family, st.style, two_hand_support.Seated());
         // Require complete attachment (never differentiate a snap-in) and the right controller:
         // the steered weapon hangs on it. The left one is often behind the right hand mid-swing;
         // the weapon then keeps its last turn on the right hand (ApplyTwoHand), so the swing
@@ -10145,31 +10738,39 @@ struct OpenXRPresenter::Impl {
         const VR::Body::Vec3 native = two_hand_tip_known ? two_hand_native_tip :
             VR::Body::Vec3{0, -MeleeBladeM * st.scale, 0};
         // The weapon's grip, moved in the right fist when the right hand slid on it.
-        const VR::Body::Vec3 origin = st.right.offset + two_hand_runtime.WeaponShiftGrip();
+        const VR::Body::Vec3 origin = st.right.offset + two_hand_support.WeaponShiftGrip();
         VR::Body::Vec3 dir = T::BoneToGripLocal(st.right, native, st.scale) - origin;
         dir = VR::Body::Length(dir) > 1e-4f
                   ? VR::Body::Normalize(dir)
                   : VR::Body::Normalize(T::BoneToGripLocal(st.right, {0, -1, 0}, 1.0f) - origin);
         const auto& hand = sample.hand[1];
-        two_hand_blade = two_hand_runtime.MotionStep(active, tracked, sample.xr_time,
-            sample.space_serial, st.family, st.style, {hand.p, hand.q},
-            T::AlongBlade(origin, dir, T::BladeTipM), T::AlongBlade(origin, dir, T::BladeLeverM),
-            sample.head_p);
-        two_hand_blade.head_forward = VR::Body::Rotate(sample.head_q, {0, 0, -1});
+        const auto tip = T::AlongBlade(origin, dir, T::BladeTipM);
+        const auto lever = T::AlongBlade(origin, dir, T::BladeLeverM);
+        // Attack classification keeps its pre-inertia motion and thresholds. Physical speed
+        // and contact use the final displayed blade, so weight cannot turn a heavy into a stab.
+        two_hand_intent_blade = two_hand_blade_motion.Step(active, tracked, sample.xr_time,
+            sample.space_serial, st.family, st.style, {intent_hand.p, intent_hand.q},
+            tip, lever, sample.head_p);
+        two_hand_intent_blade.head_forward = VR::Body::Rotate(sample.head_q, {0, 0, -1});
+        // Excluded forms and inactive frames must use the original motion history.
+        if (weapon_weight_active && weapon_weight_frame == xr_frames) {
+            two_hand_blade = two_hand_physical_motion.Step(active, tracked, sample.xr_time,
+                sample.space_serial, st.family, st.style, {hand.p, hand.q},
+                tip, lever, sample.head_p);
+            two_hand_blade.head_forward = two_hand_intent_blade.head_forward;
+        } else {
+            two_hand_physical_motion.Reset();
+            two_hand_blade = two_hand_intent_blade;
+        }
         two_hand_blade_frame = xr_frames;
     }
 
     void ApplyTwoHand(VR::Body::HandsSample& sample) {
         namespace T = VR::TwoHand;
-        if (two_hand_runtime.Active()) {
-            two_hand_runtime.ApplyHands(sample, false, two_hand_status.right, two_hand_status.left,
-                                        two_hand_turn_deg,true,VR::Body::SteadyNowNs());
-            return;
-        }
         // The weapon's place in the right fist goes out every frame, whatever else holds below
         // (a frame without the right controller must not snap the weapon back for a moment);
         // zero once the hold has eased out.
-        sample.two_hand_weapon_shift = two_hand_runtime.WeaponShift();
+        sample.two_hand_weapon_shift = two_hand_support.WeaponShift();
         if (two_hand_out.weight <= 0.0f) {
             two_hand_turn_ok = false;
             return;
@@ -10200,12 +10801,12 @@ struct OpenXRPresenter::Impl {
                 ? static_cast<float>(static_cast<double>(sample.xr_time - two_hand_apply_time) * 1e-9)
                 : 0.0f;
             two_hand_apply_time = sample.xr_time;
-            a = two_hand_runtime.ApplyTracked(rp, lp, st.right, st.left, apply_dt);
+            a = two_hand_support.ApplyTracked(rp, lp, st.right, st.left, apply_dt);
             two_hand_turn = a.turn_local;
             two_hand_turn_ok = true;
         } else if (two_hand_turn_ok) {
-            a = T::Place(rp, lp, st.right, st.left, two_hand_runtime.Grip(),
-                         two_hand_runtime.Scale(), 1.0f,
+            a = T::Place(rp, lp, st.right, st.left, two_hand_support.Grip(),
+                         two_hand_support.Scale(), 1.0f,
                          VR::Body::ScaleRotation(two_hand_turn, w));
             l.position_valid = l.position_tracked = true;
             l.orientation_valid = l.orientation_tracked = true;
@@ -10226,14 +10827,6 @@ struct OpenXRPresenter::Impl {
     // cinematic, a dodge, death, a controls reset): the hands still held ease back from `at` (the
     // deadline, or now). Nothing when no freeze runs.
     void EndInjectFreeze(const char* why, s64 at) {
-        if (UsingInteractionDll()) {
-            auto packet = VialFeedbackPacket(PI_FEEDBACK_RELEASE, at);
-            packet.release_reason = why && std::strcmp(why, "the gun") == 0
-                ? PI_RELEASE_GUN : why ? PI_RELEASE_CONTEXT : PI_RELEASE_DEADLINE;
-            PiVialFeedbackOutput out{};
-            CallVialFeedback(packet, out);
-            return;
-        }
         if (!inject_freeze.On()) {
             return;
         }
@@ -10297,34 +10890,6 @@ struct OpenXRPresenter::Impl {
     // PublishHands (frame thread): the injection's freeze on the published grips, with a log line
     // as each hand lets go and when it is the controller's again.
     void ApplyInjectHold(VR::Body::HandsSample& sample) {
-        if (UsingInteractionDll()) {
-            if (!dll_vial_feedback.freeze_on && dll_vial_feedback.phase[0] == PI_HOLD_OFF &&
-                dll_vial_feedback.phase[1] == PI_HOLD_OFF) return;
-            auto packet = VialFeedbackPacket(PI_FEEDBACK_APPLY, sample.steady_ns);
-            packet.space = sample.space_serial;
-            packet.hands[0] = PhysicalInteractions::PackHand(sample.hand[0]);
-            packet.hands[1] = PhysicalInteractions::PackHand(sample.hand[1]);
-            VR::Body::BodyStatus status{};
-            const bool fresh = dll_vial_feedback.freeze_on && VR::Body::LatestBodyStatus(status) &&
-                sample.steady_ns - status.steady_ns < 250'000'000;
-            packet.release_reason = menu_context || VR::IsGameMenuOpen() ? PI_RELEASE_MENU
-                : VR::CinematicActive() ? PI_RELEASE_CINEMATIC
-                : fresh && InjectFreezeBlocked(status.evade_block) ? PI_RELEASE_BODY_BLOCK
-                : PI_RELEASE_NONE;
-            PiVialFeedbackOutput out{};
-            if (CallVialFeedback(packet, out)) {
-                for (size_t i = 0; i < 2; ++i) {
-                    sample.hand[i] = PhysicalInteractions::UnpackHand(out.hands[i]);
-                    const auto phase = static_cast<VR::Body::InjectHold::Phase>(out.phase[i]);
-                    if (phase != inject_hand_phase[i]) {
-                        LOG_INFO(Render_Vulkan, "VR inject DLL: hand {} phase {} -> {}, reason {}",
-                            i, static_cast<int>(inject_hand_phase[i]), out.phase[i], out.release_reason[i]);
-                        inject_hand_phase[i] = phase;
-                    }
-                }
-            }
-            return;
-        }
         if (inject_freeze.On()) {
             UpdateInjectFreeze(sample);
         }
@@ -10374,55 +10939,91 @@ struct OpenXRPresenter::Impl {
     // weapon's with the two-handed grip. Steel throws sparks (core/vr/sparks.h; DrawOverlay steps
     // and draws them): a little spray at a strike, a trickle along a fast scrape. A level of its
     // own that any stronger feel keeps (the hum gives way to it).
-    void PlayInteractionHaptic(const PiHapticPatternIntent& intent) {
-        if (!intent.count) return;
-        const auto pattern = PlaybackPattern(intent);
-        for (u32 hand = 0; hand < 2; ++hand)
-            if (intent.side_mask & (1u << hand)) haptics[hand].Play(pattern);
-    }
-    template <typename Feedback>
-    void PlayInteractionHaptics(const Feedback& out, u32 first=0, u32 end=~0u) {
-        for (u32 i = first; i < std::min(end,out.haptic_count); ++i) {
-            const auto& intent = out.haptics[i];
-            const auto pattern = PlaybackPattern(intent);
-            for (u32 hand = 0; hand < 2; ++hand)
-                if (intent.side_mask & (1u << hand)) haptics[hand].Play(pattern);
-        }
-    }
-
     void UpdateWeaponWall(float dt) {
         namespace WW = VR::WeaponWall;
+        constexpr float Other = 0.6f; // the left hand's share of the right weapon's, two-handed
         const auto& ts = VR::Tricks::GetTrickSettings();
-        WW::State st{};
-        const bool loaded = ts.weapon_wall && WW::Channel().Load(st);
-        PiMeleeFeedbackInput facts{};
-        facts.operation = PI_MF_WALL_FRAME;
-        facts.now_ns = VR::Body::SteadyNowNs();
-        facts.wall_ns = st.ns;
-        facts.dt = dt;
-        facts.flags = (ts.weapon_wall ? PI_MFF_WALL_ON : 0) |
-                      (ts.haptics ? PI_MFF_FEEL : 0) | (loaded ? PI_MFF_LOADED : 0) |
-                      (two_hand_out.engaged ? PI_MFF_TWO_ENGAGED : 0);
-        const std::array<const WW::Touching*, 3> touch{&st.hand[0], &st.hand[1], &st.clash};
-        for (u32 k = 0; k < touch.size(); ++k) {
-            const auto& t = *touch[k];
-            facts.touch[k] = {t.strike_serial, static_cast<u32>(t.steel),
-                              static_cast<u32>(t.scraping), 0, t.strike_speed, t.scrape_speed};
+        if (!ts.weapon_wall) {
+            // Off: nothing runs. Turned off, a scrape's buzz it held lets go and its sparks go.
+            if (wall_on) {
+                wall_on = false;
+                for (size_t h = 0; h < 2; ++h) {
+                    if (wall_sustain[h] > 0.0f && haptics[h].sustain == wall_sustain[h]) {
+                        haptics[h].sustain = 0.0f;
+                    }
+                    wall_sustain[h] = 0.0f;
+                    wall_grain_s[h] = 0.0f;
+                }
+                wall_spark_carry = {};
+                wall_sparks.Clear();
+            }
+            return;
         }
-        for (u32 h = 0; h < 2; ++h) facts.sustain[h] = haptics[h].sustain;
-        const auto out = melee_feedback_runtime.Step(facts);
-        PlayInteractionHaptics(out);
-        for (u32 h = 0; h < 2; ++h)
-            if (out.sustain_mask & (1u << h)) haptics[h].sustain = out.sustain[h];
-        if (out.clear_sparks) wall_sparks.Clear();
+        wall_on = true;
+        const s64 now = VR::Body::SteadyNowNs();
+        WW::State st{};
+        const bool loaded = WW::Channel().Load(st); // (a torn read: as if nothing came)
+        const bool fresh = loaded && now - st.ns < 150'000'000;
+        const bool feel = fresh && ts.haptics;
+        // The left weapon's, the right one's and the clash's: each one's share in each hand.
+        const std::array<const WW::Touching*, 3> touch{&st.hand[0], &st.hand[1], &st.clash};
+        const float two = two_hand_out.engaged ? Other : 0.0f;
+        const float share[3][2] = {{1.0f, 0.0f}, {two, 1.0f}, {1.0f, 1.0f}};
         const auto v3 = [](const float (&a)[3]) { return VR::Body::Vec3{a[0], a[1], a[2]}; };
-        for (u32 k = 0; k < touch.size(); ++k) {
-            const auto& t = *touch[k];
-            if (out.spark_strike_mask & (1u << k))
+        std::array<float, 2> level{};
+        for (size_t k = 0; k < touch.size(); ++k) {
+            const WW::Touching& t = *touch[k];
+            const bool strike = loaded && t.strike_serial != wall_strike_seen[k];
+            if (loaded) {
+                wall_strike_seen[k] = t.strike_serial; // (seen even when stale: never a late thud)
+            }
+            if (fresh && t.steel && strike) {
                 wall_sparks.Strike(v3(t.point), v3(t.normal), v3(t.slide), t.strike_speed);
-            if (out.spark_scrape_mask & (1u << k))
-                wall_sparks.Scrape(wall_spark_carry[k], v3(t.point), v3(t.normal), v3(t.slide), dt);
-            if (out.spark_clear_mask & (1u << k)) wall_spark_carry[k] = 0;
+            }
+            if (fresh && t.steel && t.scraping) {
+                wall_sparks.Scrape(wall_spark_carry[k], v3(t.point), v3(t.normal), v3(t.slide),
+                                   dt);
+            } else {
+                wall_spark_carry[k] = 0.0f;
+            }
+            const bool thud = feel && strike && (k != 1 || now - wall_thud_ns >= WallThudMergeNs);
+            const float hard = std::clamp((t.strike_speed - WW::StrikeSpeed) / 3.0f, 0.0f, 1.0f);
+            const float scrape =
+                feel && t.scraping ? 0.12f + 0.2f * WW::ScrapeLevel(t.scrape_speed) : 0.0f;
+            for (size_t h = 0; h < 2; ++h) {
+                const float part = share[k][h];
+                if (thud && part > 0.0f) {
+                    HapticPattern p{};
+                    p.priority = 2;
+                    haptics[h].Play(p.Pulse(part * (0.55f + 0.4f * hard), 30.0f + 20.0f * hard)
+                                        .Ramp(part * (0.35f + 0.3f * hard), 0.0f,
+                                              120.0f + 80.0f * hard));
+                }
+                level[h] = std::max(level[h], part * scrape);
+            }
+            if (thud && k == 1) {
+                wall_thud_ns = now;
+            }
+        }
+        const auto sustain = [&](HandHaptics& h, float& mine, float want) {
+            const bool ours = mine > 0.0f && h.sustain == mine;
+            if (want > 0.0f && (ours || h.sustain <= want)) {
+                h.sustain = mine = want;
+            } else {
+                if (ours) {
+                    h.sustain = 0.0f;
+                }
+                mine = 0.0f;
+            }
+        };
+        for (size_t h = 0; h < 2; ++h) {
+            sustain(haptics[h], wall_sustain[h], level[h]);
+            // The grit: a short tick every 45 ms over the buzz while it scrapes.
+            wall_grain_s[h] = level[h] > 0.0f ? wall_grain_s[h] + dt : 0.0f;
+            if (level[h] > 0.0f && wall_grain_s[h] >= 0.045f) {
+                wall_grain_s[h] = 0.0f;
+                haptics[h].Play(Tick(std::min(level[h] + 0.15f, 0.6f), 6.0f, 0));
+            }
         }
     }
 
@@ -10437,6 +11038,22 @@ struct OpenXRPresenter::Impl {
     void UpdateMotionWeapon(const PhysicalState& in, const HandState& right,
                             const HandState& left, const GestureFrame& gesture, u32& held,
                             float dt) {
+        // Controller intent selects the attack as before. Inertia only changes the physical
+        // weapon: its displayed pose, speed, contact and haptics. A bounded visual lag must
+        // not cross the classifier's early-heavy / thrust thresholds or reset a pending attack.
+        HandState physical_right = right;
+        GestureFrame physical_gesture = gesture;
+        const bool weighted = weapon_weight_active && weapon_weight_frame == xr_frames;
+        if (weighted) {
+            physical_gesture = weapon_weight_gesture;
+            physical_gesture.grip_pose = gesture.grip_pose;
+            const auto& h = weapon_weight_hand;
+            physical_right.position = {h.p.x,h.p.y,h.p.z};
+            physical_right.orientation = {h.q.x,h.q.y,h.q.z,h.q.w};
+            physical_right.velocity = {h.v.x,h.v.y,h.v.z};
+            physical_right.angular = {h.w.x,h.w.y,h.w.z};
+            physical_right.angular_valid = h.angular_valid;
+        }
         const auto& settings = VR::GetSettings();
         auto& weapon_hand = haptics[1];
         LogMeleeConfig(settings, gesture.grip_pose);
@@ -10445,15 +11062,57 @@ struct OpenXRPresenter::Impl {
             HandleMeleeEvents();
         }
 
-        const auto swing_frame=WeaponSwing(PI_WEAPON_INPUT_SWING_BEGIN,WeaponSwingFacts(right,gesture,dt,in));
-        const bool talking=swing_frame.talking!=0;
-        const bool heavy_trigger=swing_frame.heavy_trigger!=0;
-        const bool swings=swing_frame.swings!=0;
-        grip_r_down=whip_transform_hold.SwingState().grip_down;
-        if(swing_frame.events&PI_WS_TALK_CHANGE)
-            LOG_INFO(Render_Vulkan,"VR input: swings {} (an NPC {})",talking?"paused":"back",talking?"is talking":"stopped talking");
-        ApplyWeaponMotion(swing_frame.feedback);
-        LogWeaponSwing(swing_frame);
+        // talk_guard: while an NPC is talking a swing never attacks (a friendly NPC hit turns
+        // hostile for good); the trigger and the buttons still do. A hand still moving when it
+        // ends must slow down first, as when the weapon is drawn (SwingGate does the same).
+        const bool talking = settings.talk_guard && VR::IsNpcTalking();
+        if (talking != talk_paused) {
+            talk_paused = talking;
+            if (!talking && clutch) {
+                melee.OnDraw();
+            }
+            LOG_INFO(Render_Vulkan, "VR input: swings {} (an NPC {})", talking ? "paused" : "back",
+                     talking ? "is talking" : "stopped talking");
+        }
+
+        bool heavy_trigger = settings.gestures; // the trigger is the heavy button, not R1
+        bool swings = false;                    // a swing may attack this frame
+        if (clutch) {
+            const bool grip = in[PhysGripR];
+            if (grip && !grip_r_down) {
+                grip_press_time = 0.0f;
+            }
+            if (grip) {
+                grip_press_time += dt;
+            }
+            if (!grip && grip_r_down && settings.sticky_grip && grip_press_time < 0.25f) {
+                sticky_drawn = !sticky_drawn;
+            }
+            grip_r_down = grip;
+            const bool now_drawn = grip || sticky_drawn;
+            if (now_drawn && !drawn) {
+                weapon_hand.Play(Tick(0.2f, 10.0f, 0));
+                melee.OnDraw(); // a hand already moving must slow down first
+            }
+            drawn = now_drawn;
+            heavy_trigger = drawn;
+            swings = settings.gestures && drawn && !talking;
+        } else {
+            swings = SwingGate(in, right, gesture, talking, dt);
+            drawn = swings; // logs and the trace: swings armed
+        }
+
+        // Holding grip reserves the Bloodletter's inward motion for its transform. Otherwise
+        // that same thrust can commit a melee swing before the chest gesture recognizes it.
+        if (VR::Tricks::GetTrickSettings().hand_transform && RightFamily() == 290 &&
+            !RightFormB() && right_grip_ready) {
+            swings = false;
+        }
+
+        // Grinding has its own hit cadence, never an ordinary swing/charged attack as well.
+        if (saw_spin.Spinning()) {
+            swings = false;
+        }
 
         // Simon's Bowblade's bow form (vr.ini bow, core/vr/bow.h): your hands are the bow and its
         // string; no swing or trigger attack while it is up (UpdateBow presses the game's shots).
@@ -10463,165 +11122,343 @@ struct OpenXRPresenter::Impl {
 
         // melee=physical (UpdatePhysicalMelee): the swing is the attack, the trigger charges it;
         // no R1 / R2 at all while the game says the weapon in hand has physical moves.
-        const auto route=PhysicalMeleeRoute();
-        const bool physical=route.physical!=0;
-        const bool motion_valid=route.motion_valid!=0;
-        if(route.flags&PI_WEAPON_ROUTE_SHARED_CHANGED){melee.DropStroke();melee_shadow.DropStroke();}
-        if(route.flags&PI_WEAPON_ROUTE_CLOSE_DISCONTINUITY){
-            melee_window.Reset("two-hand motion discontinuity");PublishMeleeWindowNow();
-        }else if(route.flags&PI_WEAPON_ROUTE_CLOSE_ROUTE){
-            melee_window.Reset("the route went back to R1 / R2");PublishMeleeWindowNow();
+        const bool physical = PhysicalMeleeRoute();
+        const bool shared = physical && two_hand_blade.active && two_hand_status_ok &&
+            VR::TwoHand::SharedMotion(two_hand_status.family, two_hand_status.style,
+                                      two_hand_support.Seated()) &&
+            melee_variation / 10 == two_hand_status.family && melee_form_b;
+        const bool motion_valid = shared && two_hand_blade.valid &&
+                                  two_hand_blade_frame == xr_frames;
+        // Changing the sampled point (controller <-> steered blade) must not become a stroke.
+        // A frame without blade motion (attaching, a hitch, the right controller lost) is a
+        // tracking gap like the controller's own: the classifier rides it out (its gap rules),
+        // the swing in progress and its window stay. Single-hand and dual-wield paths are
+        // untouched.
+        if (shared != two_hand_combat) {
+            melee.DropStroke();
+            melee_shadow.DropStroke();
+            if (melee_window.Current().open) {
+                melee_window.Reset("two-hand motion discontinuity");
+                PublishMeleeWindowNow();
+            }
         }
-        if(route.flags&PI_WEAPON_ROUTE_RESET_TELEGRAPH)melee_telegraph.Reset();
+        two_hand_combat = shared;
+        if (physical) {
+            if (heavy != Heavy::Idle) {
+                heavy = Heavy::Idle;
+                weapon_hand.sustain = 0.0f;
+            }
+        } else {
+            if (melee_window.Current().open) {
+                melee_window.Reset("the route went back to R1 / R2");
+                PublishMeleeWindowNow();
+            }
+            melee_telegraph.Reset(); // R1 / R2: the game's own attacks notify its AIs
+        }
 
-        const PiBladeConfig blade_config = physical ? BladeConfigurationNow() : PiBladeConfig{};
-        const auto blade_shot = static_cast<VR::Tricks::Shot>(blade_config.shot);
+        // Right trigger: the route is fixed when it is pressed. (Not while the music box frees
+        // the right hand: its weapon is put away.)
+        // A trigger squeezed with the fist on the crank and still held as the box is put away is
+        // no attack (R1, or a heavy tap on its release): only a new pull is.
+        if (music_box_free) {
+            music_box_trigger_wait = in[PhysTriggerR];
+        } else if (!in[PhysTriggerR]) {
+            music_box_trigger_wait = false;
+        }
+        const bool bow_string = bow_trigger_wait && bow_hand_i == 0; // UpdateBow
+        const bool trigger =
+            in[PhysTriggerR] && !music_box_free && !music_box_trigger_wait && !bow_string;
+        // The right hand's shots (UpdateBladeShots): a gun-blade's trigger fires it, a blast's
+        // charges it, and neither charges a swing there.
+        const VR::Tricks::Shot blade_shot = physical ? BladeShotNow() : VR::Tricks::Shot::None;
         const bool gun_blade = blade_shot == VR::Tricks::Shot::GunBlade ||
                                blade_shot == VR::Tricks::Shot::StakeBlast;
-        PiWeaponMotionFacts trigger_facts{};
-        trigger_facts.dt=dt;trigger_facts.current_sustain=weapon_hand.sustain;
-        trigger_facts.physical=physical;trigger_facts.trigger=in[PhysTriggerR];
-        trigger_facts.music=music_box_free;trigger_facts.bow_wait=bow_trigger_wait;
-        trigger_facts.bow_hand=bow_hand_i;trigger_facts.heavy_trigger=heavy_trigger;
-        trigger_facts.heavy_button=settings.heavy_button;trigger_facts.swing_pending=melee.Pending();
-        const auto trigger_state=WeaponMotion(PI_WEAPON_INPUT_TRIGGER_ROUTE,trigger_facts);
-        const bool trigger=trigger_state.trigger!=0;
-        ApplyWeaponMotion(trigger_state,nullptr,&held);
+        since_attack += dt;
+        const bool trigger_edge = trigger && !trigger_r_down && !physical;
+        if (trigger_edge) {
+            trigger_route = !heavy_trigger          ? Route::R1
+                            : settings.heavy_button ? Route::R2
+                                                    : Route::Heavy;
+            if (trigger_route == Route::Heavy) {
+                heavy = Heavy::Pending;
+                heavy_time = 0.0f;
+                // A reflex squeeze during a swing never adds a second attack on release.
+                heavy_tap_suppressed = since_attack < 0.25f || melee.Pending();
+            }
+        }
+        trigger_r_down = trigger;
+        if (trigger && trigger_route == Route::R1 && !physical) {
+            held |= static_cast<u32>(PadButton::R1);
+        }
+        if (trigger && trigger_route == Route::R2 && !physical) {
+            held |= static_cast<u32>(PadButton::R2);
+        }
 
         // Swing classification (head-relative, so leaning and stepping never attack). Runs
         // every frame, swings on or not, so the blade's rest pose is known when they come on.
         // Without the clutch every motion of the hand is judged: a commit also needs the blade
         // turning with it or a stab's speed (Config::clutchless).
-        PiMeleeSettingsFacts classifier_settings{};
-        classifier_settings.enabled=1;
-        classifier_settings.heavy_arc=settings.heavy_arc;
-        classifier_settings.grip_pose=gesture.grip_pose;
-        classifier_settings.ready_tick=settings.heavy_ready_tick;
-        classifier_settings.heavy_arc_deg=settings.heavy_arc_deg;
-        classifier_settings.heavy_windup_deg=settings.heavy_windup_deg;
-        classifier_settings.seated=settings.seated;
-        classifier_settings.blade_pitch_deg=settings.blade_pitch_deg;
-        classifier_settings.clutch=clutch;
-        classifier_settings.windup_turn_deg=settings.swing_windup_turn_deg;
-        classifier_settings.toward_front_deg=settings.swing_toward_front_deg;
-        classifier_settings.rejudge=settings.swing_windup_rejudge;
+        auto config = VR::Melee::Config::Make(settings.heavy_arc && gesture.grip_pose,
+                                              settings.heavy_ready_tick, settings.heavy_arc_deg,
+                                              settings.heavy_windup_deg, settings.seated,
+                                              settings.blade_pitch_deg);
+        config.clutchless = !clutch;
+        // Overhead swings (QA 2026-10-07): a wind-up looped into its chop, a chop whose blade lags.
+        config.windup_turn = settings.swing_windup_turn_deg * VR::Melee::Deg;
+        config.toward_front = settings.swing_toward_front_deg * VR::Melee::Deg;
+        config.rejudge = settings.swing_windup_rejudge;
         VR::Melee::Input input{};
         input.t = static_cast<double>(gesture.time) * 1e-9;
         input.active = swings;
         // Drops for single frames (hitches). Swings keep working during a cinematic, e.g. to
         // cancel the end of an animation with an attack like R1 would.
         input.immersive = VR::IsImmersive() || VR::CinematicActive();
-        input.heavy_idle = trigger_state.heavy_idle;
-        input.trigger_heavy_edge = trigger_state.trigger_heavy_edge;
+        input.heavy_idle = physical || heavy == Heavy::Idle;
+        input.trigger_heavy_edge = !physical && trigger_edge && trigger_route == Route::Heavy;
         input.ori_valid = right.orientation_valid;
         input.q = {right.orientation.x, right.orientation.y, right.orientation.z,
                    right.orientation.w};
         input.pos_valid = right.valid;
         input.p = {right.position.x, right.position.y, right.position.z};
         input.v = {right.velocity.x, right.velocity.y, right.velocity.z};
+        if (two_hand_combat) {
+            const auto& blade = two_hand_intent_blade;
+            input.pos_valid = input.ori_valid = two_hand_intent_blade.valid &&
+                two_hand_blade_frame == xr_frames;
+            input.q = {blade.weapon.q.x, blade.weapon.q.y, blade.weapon.q.z, blade.weapon.q.w};
+            // The lever point (BladeLeverM) as the classifier's hand: runtime wrist velocity
+            // alone misses a push-pull swing with the right hand still, and the tip would pass
+            // the hand-tuned thresholds on a wrist flick. The wound-up pose stays the hand's.
+            input.p = {blade.lever.x, blade.lever.y, blade.lever.z};
+            input.v = {blade.lever_velocity.x, blade.lever_velocity.y, blade.lever_velocity.z};
+            input.pose_valid = true;
+            input.pose_p = {blade.weapon.p.x, blade.weapon.p.y, blade.weapon.p.z};
+        }
         input.head_ok = gesture.head_ok;
         input.head_p = {gesture.head_position.x, gesture.head_position.y, gesture.head_position.z};
         input.head_v = {gesture.head_velocity.x, gesture.head_velocity.y, gesture.head_velocity.z};
         input.head_fwd = {gesture.forward.x, gesture.forward.y, gesture.forward.z};
-        PiMeleeSelectionFacts selection{};selection.enabled=1;
-        selection.shared=route.shared;selection.motion_valid=route.motion_valid;
-        const auto& selected=two_hand_blade;selection.ns=selected.ns;
-        const auto put=[](float* out,const auto& v){out[0]=v.x;out[1]=v.y;out[2]=v.z;};
-        const auto quat=[](float* out,const auto& q){out[0]=q.x;out[1]=q.y;out[2]=q.z;out[3]=q.w;};
-        quat(selection.weapon_q,selected.weapon.q);put(selection.weapon_p,selected.weapon.p);
-        put(selection.lever,selected.lever);put(selection.lever_velocity,selected.lever_velocity);
-        put(selection.relative_velocity,selected.lever_relative_velocity);put(selection.head,selected.head);
-        put(selection.head_forward,selected.head_forward);
-        quat(selection.bone_q,two_hand_status.right.grip);put(selection.bone_offset,two_hand_status.right.offset);
-        PiMeleeClassifierFacts classifier{};
-        classifier.clutch=clutch;classifier.gestures=settings.gestures;
-        classifier.menu_context=menu_context;classifier.menu=VR::IsGameMenuOpen();
-        classifier.cinematic=VR::CinematicActive();classifier.menu_held=in[PhysMenu];
-        classifier.frozen=grip_adjust.Frozen();classifier.music=music_box_free;
-        classifier.saw_spinning=saw_runtime.Spinning();classifier.current_sustain=weapon_hand.sustain;
-        const auto& classified=melee.UpdatePair(input,classifier_settings,selection,classifier,MeleeRightFacts(right,trigger && !gun_blade && !saw_runtime.OwnsRight()));
-        const auto config=VR::Interactions::MP::Unpack(classified.base_config);
-        const VR::Melee::Output out=VR::Interactions::MP::Unpack(classified.decision);
-        // Copy diagnostics before dispatch: a generic command may call the runtime again.
-        const auto feedback=classified.classifier_feedback;
-        ApplyWeaponMotion(feedback.commands);
-        if(feedback.flags&PI_CLASS_SHADOW_DENIED)
-            LOG_INFO(Render_Vulkan,"VR swing: a swing not taken ({})",
-                     swing_block!=nullptr?swing_block:"the hand not still yet");
-        if(feedback.flags&PI_CLASS_GATE_IGNORED)GateLog("ignored",out.gate_reason,out);
-        if(feedback.flags&PI_CLASS_GATE_REJECTED)GateLog("rejected",out.gate_reason,out);
+        auto swing_config = config;
+        if (two_hand_combat) {
+            const auto& blade = two_hand_intent_blade;
+            // PublishHands includes pose_prediction_ms; input uses display time. Match by
+            // XR frame, and keep the blade/head poses and derivatives on the predicted clock.
+            input.t = static_cast<double>(blade.ns) * 1e-9;
+            input.head_p = {blade.head.x, blade.head.y, blade.head.z};
+            const auto head_v = blade.lever_velocity - blade.lever_relative_velocity;
+            input.head_v = {head_v.x, head_v.y, head_v.z};
+            input.head_fwd = {blade.head_forward.x, blade.head_forward.y, blade.head_forward.z};
+            const auto axis = VR::Body::Normalize(VR::TwoHand::BoneToGripLocal(
+                two_hand_status.right, {0, -1, 0}, 1.0f) - two_hand_status.right.offset);
+            swing_config.blade_local = {axis.x, axis.y, axis.z};
+        }
+        const VR::Melee::Output out = melee.Update(input, swing_config);
+        if (!clutch) {
+            // Swings held back by SwingGate for a reason the player may not see (the vial at the
+            // wrist, an NPC talking, a context switch, the hand at the face, the hand not still
+            // yet): a second classifier judges the same motion as if they were on, and a swing
+            // that would have attacked gets the deny double tick and a log line, never a press.
+            // Menus, cinematics, Menu held and the grip adjust are plain to see: no tick.
+            // (The music box: the weapon is visibly put away, and the crank's ticks are its own.)
+            const bool plain = !settings.gestures || menu_context || VR::IsGameMenuOpen() ||
+                               VR::CinematicActive() || in[PhysMenu] || grip_adjust.Frozen() ||
+                               music_box_free || saw_spin.Spinning();
+            VR::Melee::Input shadow = input;
+            shadow.active = !plain;
+            shadow.trigger_heavy_edge = false;
+            const VR::Melee::Output would = melee_shadow.Update(shadow, swing_config);
+            const bool attack = would.kind == VR::Melee::Kind::Light ||
+                                would.kind == VR::Melee::Kind::Heavy ||
+                                would.kind == VR::Melee::Kind::Commit;
+            if (attack && !swings && !plain) {
+                weapon_hand.Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
+                LOG_INFO(Render_Vulkan, "VR swing: a swing not taken ({})",
+                         swing_block != nullptr ? swing_block : "the hand not still yet");
+            }
+        }
+
+        if (out.ready_click) {
+            weapon_hand.Play(Tick(0.12f, 12.0f, 0)); // wound up: a big swing from here is heavy
+        }
+        if (out.sustain > 0.0f) {
+            weapon_hand.sustain = out.sustain; // rising buzz while a big swing builds its arc
+            arc_sustain = true;
+        } else if (arc_sustain) {
+            weapon_hand.sustain = 0.0f;
+            arc_sustain = false;
+        }
+        // A frame can carry a gate verdict on a new swing and the decision of a pending one.
+        switch (out.gate) {
+        case VR::Melee::Kind::Ignored:
+            GateLog("ignored", out.gate_reason, out);
+            break;
+        case VR::Melee::Kind::Rejected:
+            GateLog("rejected", out.gate_reason, out);
+            if (out.kind == VR::Melee::Kind::None) { // an attack's own haptic wins
+                weapon_hand.Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
+            }
+            break;
+        default:
+            break;
+        }
         const auto& two_settings = VR::TwoHand::GetTwoHandSettings();
-        two_hand_hum_level = two_hand_runtime.HumStep(
+        two_hand_hum_level = two_hand_hum.Step(
             swings && two_hand_combat && motion_valid && two_settings.haptics &&
                 VR::Melee::GetMeleeSettings().haptics,
             two_hand_blade.speed, dt, two_settings.swing_hum);
-        UpdateWeaponHum(physical, melee_runtime.RightState().tip_speed, dt);
+        UpdateWeaponHum(physical, RightTipSpeed(physical_right, physical_gesture, config), dt);
         UpdateLeftMelee(left, gesture, config,
                         physical && swings && !physical_lever_out.owns_grip[0], dt);
         if (!physical) {
-            UpdateBladeShots(right, gesture, trigger, blade_config, swings, dt); // (its end)
+            UpdateBladeShots(physical_right, physical_gesture, trigger, blade_shot, swings, dt); // (its end)
         }
         if (physical) {
-            // Resolve the stake's release before publishing this frame's melee window.
+            // Resolve the stake's punch/release before publishing this frame's melee window.
             // The moonlight still reads the physical swing after it has been updated.
-            const bool stake_melee = blade_config.stake_melee != 0;
+            const bool stake_melee = blade_shot == VR::Tricks::Shot::StakeBlast &&
+                VR::Tricks::StakePunch(melee_variation, melee_form_b, melee_charged_row);
+            const VR::Body::Vec3 punch_velocity{
+                physical_right.velocity.x - physical_gesture.head_velocity.x,
+                physical_right.velocity.y - physical_gesture.head_velocity.y,
+                physical_right.velocity.z - physical_gesture.head_velocity.z};
+            const bool punch = stake_melee && VR::Tricks::StakePunchMotion(
+                out.fired, punch_velocity, {physical_gesture.forward.x,
+                                          physical_gesture.forward.y, physical_gesture.forward.z});
             const bool discharge = stake_melee &&
-                UpdateBladeShots(right, gesture, trigger, blade_config, swings, dt);
-            UpdatePhysicalMelee(right, gesture, out, config, swings,
-                                trigger && !gun_blade && !saw_runtime.OwnsRight(), dt, discharge);
+                UpdateBladeShots(physical_right, physical_gesture, trigger, blade_shot, swings, dt,
+                                 punch);
+            // A charged punch owns this stroke: don't spend an ordinary light attack first.
+            UpdatePhysicalMelee(physical_right, physical_gesture, out, config,
+                                swings && !(stake_melee && trigger && !discharge &&
+                                            !(melee_window.Current().open &&
+                                              melee_window.Current().powered)),
+                                trigger && !gun_blade && !saw_trigger_r, dt, discharge);
             if (!stake_melee) {
-                UpdateBladeShots(right, gesture, trigger, blade_config, swings, dt);
+                UpdateBladeShots(physical_right, physical_gesture, trigger, blade_shot, swings, dt);
             }
             {
                 VR::FeatureCost::Scope cost{VR::FeatureCost::ThrustUpdate};
-                UpdateVisceralThrust(right, gesture, config, swings, dt);
+                UpdateVisceralThrust(physical_right, physical_gesture, config, swings, dt);
             }
             return;
         }
         // R1 / R2: no shots; a trigger held as the physical route comes back is no shot.
-        blade_runtime.ObserveTrigger(trigger);
-        PiWeaponMotionFacts resolved{};
-        resolved.dt=dt;resolved.trigger=trigger;resolved.kind=static_cast<u32>(out.kind);
-        resolved.consume_trigger=out.consume_trigger;resolved.current_sustain=weapon_hand.sustain;
-        const int prior_heavy=static_cast<int>(heavy);
-        const auto result=WeaponMotion(PI_WEAPON_INPUT_TRIGGER_RESULT,resolved);
-        if(result.flags&PI_WM_COMMIT_LOG)GateLog("commit",out.reason,out,prior_heavy);
-        if((result.flags&PI_WM_RELEASE_LOG)&&SwingLogEnabled())
-            LOG_INFO(Render_Vulkan,"VR swing: charge released by the swing");
-        ApplyWeaponMotion(result,&out,&held);
+        blade_trigger_down = trigger;
+        bool swung = false; // a swing committed while the trigger machine is busy
+        switch (out.kind) {
+        case VR::Melee::Kind::Commit:
+            GateLog("commit", out.reason, out);
+            swung = true;
+            break;
+        case VR::Melee::Kind::Light:
+            Attack(PadButton::R1, out);
+            break;
+        case VR::Melee::Kind::Heavy:
+            if (out.consume_trigger) {
+                heavy = Heavy::Consumed; // the squeeze decided it: no tap or charge on release
+            }
+            Attack(PadButton::R2, out);
+            break;
+        default:
+            break;
+        }
+
+        switch (heavy) {
+        case Heavy::Pending:
+            heavy_time += dt;
+            if (swung) {
+                swung = false;
+                Attack(PadButton::R2, out, "trigger + swing");
+                heavy = Heavy::Consumed;
+            } else if (!trigger) {
+                if (!heavy_tap_suppressed) {
+                    Attack(PadButton::R2, out, "trigger tap");
+                }
+                heavy = Heavy::Idle;
+            } else if (heavy_time >= 0.35f) {
+                heavy = Heavy::Charging;
+                heavy_time = 0.0f;
+            }
+            break;
+        case Heavy::Charging: {
+            heavy_time += dt;
+            const bool release = swung || !trigger || heavy_time >= 2.5f;
+            if (release) {
+                if (swung && SwingLogEnabled()) {
+                    LOG_INFO(Render_Vulkan, "VR swing: charge released by the swing");
+                }
+                swung = false;
+                weapon_hand.sustain = 0.0f;
+                weapon_hand.Play(Tick(0.7f, 50.0f));
+                heavy = trigger ? Heavy::Consumed : Heavy::Idle;
+                break;
+            }
+            held |= static_cast<u32>(PadButton::R2);
+            const float build = std::min(heavy_time / 1.0f, 1.0f);
+            weapon_hand.sustain = 0.10f + 0.40f * build;
+            if (heavy_time >= 1.0f && heavy_time - dt < 1.0f) {
+                weapon_hand.Play(Repeat(3, 0.6f, 20.0f, 40.0f, 2)); // fully charged
+            }
+            break;
+        }
+        case Heavy::Consumed:
+            if (!trigger) {
+                heavy = Heavy::Idle;
+            } else if (swung) {
+                // Trigger still held: every swing is another heavy attack.
+                swung = false;
+                Attack(PadButton::R2, out, "trigger held");
+            }
+            break;
+        case Heavy::Idle:
+            break;
+        }
+
+        if (swung) {
+            Attack(PadButton::R1, out, "after trigger release");
+        }
     }
 
     // melee=physical (core/vr/melee_window.h, core/vr/bloodborne_melee.h): whether swings go to the
     // game as attack windows now, the game's update saying the right weapon has physical moves in
     // its current form; otherwise R1 / R2 as before. Every change is logged.
-    PiWeaponRouteOutput PhysicalMeleeRoute() {
-        namespace Cb=VR::Combat;
-        PiWeaponRouteFacts p{};p.enabled=VR::Melee::GetMeleeSettings().physical;
-        Cb::MeleeStatus st{};
-        if(p.enabled){p.now_ns=VR::Body::SteadyNowNs();p.have_status=Cb::LatestMeleeStatus(st);}
-        p.status_ns=st.ns;p.status_physical=st.physical;p.status_ok=st.ok;p.variation=st.variation;
-        p.form_b=st.form_b;p.charged_row=st.charged_melee;
-        p.blade_active=two_hand_blade.active;p.two_status_ok=two_hand_status_ok;
-        p.two_family=two_hand_status.family;p.two_style=two_hand_status.style;
-        p.seated=two_hand_runtime.Seated();p.blade_valid=two_hand_blade.valid;
-        p.blade_frame=two_hand_blade_frame;p.frame=xr_frames;p.window_open=melee_window.Current().open;
-        const auto out=whip_transform_hold.Route(p);
-        if(out.flags&PI_WEAPON_ROUTE_DROP_ROUTE)melee.DropStroke();
-        if(p.enabled){
-            const char* why=out.why==PI_WEAPON_ROUTE_READY?"":out.why==PI_WEAPON_ROUTE_STALE?"no game status":
-                out.why==PI_WEAPON_ROUTE_NOT_PHYSICAL?"not installed":out.why==PI_WEAPON_ROUTE_FAULT?"a module fault":st.why;
-            // Native diagnostic string identity stays host; it never crosses the ABI.
-            if(out.changed || (!out.physical && why!=melee_route_why))
-                LOG_INFO(Render_Vulkan,"VR melee: swings {}{}",out.physical?"are the attack (physical, no R1 / R2)":"press R1 / R2",
-                    out.physical?fmt::format(" (variation {} form {})",st.variation,st.form_b?"B":"A"):fmt::format(" ({})",why));
-            melee_route_why=why;
+    bool PhysicalMeleeRoute() {
+        namespace Cb = VR::Combat;
+        if (!VR::Melee::GetMeleeSettings().physical) {
+            return false;
         }
-        CopyWeaponRoute();return out;
-    }
-    void CopyWeaponRoute() {
-        const auto& state=whip_transform_hold.RouteState();
-        melee_physical=state.physical!=0;melee_variation=state.variation;melee_form_b=state.form_b!=0;
-        melee_charged_row=state.charged_row!=0;two_hand_combat=state.shared!=0;
+        Cb::MeleeStatus st{};
+        const s64 now = VR::Body::SteadyNowNs();
+        const bool have = Cb::LatestMeleeStatus(st);
+        // A game update that stalls (a hit's hitch, a load) keeps the route for a while: a swing
+        // must never become a canned R1 because the status was a moment late.
+        const bool fresh = have && now - st.ns < 250'000'000;
+        const bool held = melee_physical && have && now - st.ns < 2'000'000'000;
+        const bool physical = fresh ? st.physical && st.ok : held;
+        if (fresh && st.variation >= 0) {
+            melee_variation = st.variation; // the combo budget's pace (UpdatePhysicalMelee)
+            melee_form_b = st.form_b;
+            melee_charged_row = st.charged_melee;
+        }
+        const char* why = physical      ? ""
+                          : !fresh      ? "no game status"
+                          : !st.physical ? "not installed"
+                                         : st.why;
+        if (melee_physical && !physical) {
+            // A stroke under way (a flick into a form without physical moves, say) never becomes
+            // a canned R1 / R2 when its window closes: the hand slows down first.
+            melee.DropStroke();
+        }
+        if (physical != melee_physical || (!physical && why != melee_route_why)) {
+            LOG_INFO(Render_Vulkan, "VR melee: swings {}{}",
+                     physical ? "are the attack (physical, no R1 / R2)" : "press R1 / R2",
+                     physical ? fmt::format(" (variation {} form {})", st.variation,
+                                            st.form_b ? "B" : "A")
+                              : fmt::format(" ({})", why));
+        }
+        melee_physical = physical;
+        melee_route_why = why;
+        return physical;
     }
 
     // weapon_hum (core/vr/trick_weapons.h HumOf): the transformed Whirligig Saw's spinning blade
@@ -10629,14 +11466,28 @@ struct OpenXRPresenter::Impl {
     // up as you swing (the blade's far end, HumRev; quick to rise, slower to wind down), under any
     // stronger feel the hand has (a charge's build, the arc's buzz take over and hand it back).
     void UpdateWeaponHum(bool physical, float tip_speed, float dt) {
-        const auto& ts = VR::Tricks::GetTrickSettings();
-        PiMeleeFeedbackInput p{}; p.operation = PI_MF_HUM;
-        p.dt = dt; p.tip_speed = tip_speed; p.variation = melee_variation;
-        p.sustain[1] = haptics[1].sustain;
-        p.flags = (ts.weapon_hum ? PI_MFF_HUM_ENABLED : 0) | (ts.haptics ? PI_MFF_FEEL : 0) |
-                  (physical ? PI_MFF_PHYSICAL : 0) | (melee_form_b ? PI_MFF_FORM_B : 0);
-        const auto out = melee_feedback_runtime.Step(p);
-        if (out.sustain_mask & 2u) haptics[1].sustain = out.sustain[1];
+        namespace Tr = VR::Tricks;
+        const auto& ts = Tr::GetTrickSettings();
+        const Tr::Hum hum = ts.weapon_hum && ts.haptics && physical && melee_form_b
+                                ? Tr::HumOf(melee_variation)
+                                : Tr::Hum{};
+        // The hum is the background: any other feel's level in the hand (a heavy's arc building,
+        // a charge) takes over whatever its strength, and hands it back when it ends.
+        const float rev = Tr::HumRev(tip_speed);
+        const float tau = rev > hum_rev ? 0.03f : 0.25f;
+        hum_rev += (rev - hum_rev) * (1.0f - std::exp(-std::max(dt, 0.0f) / tau));
+        const float level = hum.idle > 0.0f ? hum.idle + hum.rev * hum_rev : 0.0f;
+        auto& hand = haptics[1];
+        const bool ours = hum_level > 0.0f && hand.sustain == hum_level;
+        if (level > 0.0f && (ours || hand.sustain <= 0.0f)) {
+            hand.sustain = level;
+            hum_level = level;
+        } else {
+            if (ours) {
+                hand.sustain = 0.0f; // the hum ended (another feel's level is left alone)
+            }
+            hum_level = 0.0f;
+        }
     }
 
     // melee_left (core/vr/trick_weapons.h; the game's side: bloodborne_melee.cpp LeftMeleeTick):
@@ -10651,28 +11502,57 @@ struct OpenXRPresenter::Impl {
     // (the dull buzz with no charge left), the impact on a hit, the deny tick for a refusal, in
     // the left hand. `allowed`: physical melee and the swings armed (SwingGate). Off: the window
     // closes.
-    void CopyLeftMelee() {
-        const auto& state=melee_runtime.LeftState();
-        melee_left_open_ns=state.open_ns;melee_left_close_ns=state.close_ns;
-        melee_left_prev_serial=state.prev_serial;melee_left_prev_aborted=state.prev_aborted!=0;
-    }
-    void UpdateLeftMelee(const HandState& left,const GestureFrame& gesture,
-                         const VR::Melee::Config& config,bool allowed,float dt) {
-        namespace M=VR::Melee;namespace Cb=VR::Combat;
-        const auto& ms=M::GetMeleeSettings();const s64 now=VR::Body::SteadyNowNs();
-        Cb::MeleeStatus st{};const bool have_status=Cb::LatestMeleeStatus(st);
-        const auto face=WeaponSwing(PI_WEAPON_INPUT_SWING_LEFT_FACE,WeaponSwingFacts(left,gesture,dt));
-        ApplyWeaponMotion(face.feedback);
-        PiMeleeLeftFacts f{};f.now_ns=now;f.have_status=have_status;f.status_ns=st.ns;
-        f.dual=st.left_dual;f.ok=st.left_ok;f.learning=st.left_learning;f.gun=st.left_gun;
-        f.allowed=allowed;f.face_hold=whip_transform_hold.SwingState().left_hold;
-        f.quick_idle=QuickPhase()==VR::Quick::Phase::Idle;f.vial=vial_armed;f.inject_waiting=inject_waiting;
-        f.inject_hold=inject_hold;f.music=music_box_free;f.shield=shield_up;f.haptics=ms.haptics;
-        f.shot_ns=gun_shot_ns;f.right_open_ns=melee_open_ns;f.analog=body_analog[0];
-        f.angular_valid=left.angular_valid;f.angular[0]=left.angular.x;f.angular[1]=left.angular.y;f.angular[2]=left.angular.z;
-        f.variation=melee_variation;f.form_b=melee_form_b;f.hit_serial=melee_feedback_runtime.HitSerial(0);
+    void UpdateLeftMelee(const HandState& left, const GestureFrame& gesture,
+                         const VR::Melee::Config& config, bool allowed, float dt) {
+        namespace M = VR::Melee;
+        namespace Cb = VR::Combat;
+        namespace Tr = VR::Tricks;
+        const auto& ms = M::GetMeleeSettings();
+        const s64 now = VR::Body::SteadyNowNs();
+        melee_window_left.PayFrom(&melee_window); // one pace for both hands
+        Cb::MeleeStatus st{};
+        const bool fresh = Cb::LatestMeleeStatus(st) && now - st.ns < 250'000'000;
+        left_single = fresh && !st.left_dual;
+        const s64 counter_ns = static_cast<s64>(Tr::CounterSwingS * 1e9f);
+        // The left hand at the face (the strap, the headset): no left swings until it is away and
+        // slow again (lowered from there it would look like a chop), as the right hand's.
+        if (HandAtFace(left, gesture, left_at_face)) {
+            left_face_hold = true;
+            left_face_quiet = 0.0f;
+        } else if (left_face_hold) {
+            const float speed = left.valid ? std::hypot(left.velocity.x - gesture.head_velocity.x,
+                                                        left.velocity.y - gesture.head_velocity.y,
+                                                        left.velocity.z - gesture.head_velocity.z)
+                                           : SwingQuietSpeed;
+            left_face_quiet = speed < SwingQuietSpeed ? left_face_quiet + dt : 0.0f;
+            if (left_face_quiet >= SwingQuietTime) {
+                left_face_hold = false;
+                melee_left.OnDraw(); // the detector re-arms with the hand slow
+            }
+        }
+        const bool free = allowed && fresh && !left_face_hold &&
+                          quick.GetPhase() == VR::Quick::Phase::Idle && !vial_armed &&
+                          !inject_waiting && inject_hold <= 0.0f && !music_box_free;
+        const bool on = free && st.left_ok;
+        // A left part or weapon whose attack the game has not shown yet: its swings are still
+        // told apart, each one refused with the deny double tick (never silence).
+        const bool learning = free && !st.left_ok && st.left_learning;
+        if (on != melee_left_on) {
+            melee_left_on = on;
+            LOG_INFO(Render_Vulkan, "VR melee left: left swings {}",
+                     on ? "attack"
+                        : fmt::format("off ({})", !allowed ? "no physical swings now"
+                                                  : !fresh ? "no game status"
+                                                  : !st.left_ok ? (st.left_why != nullptr
+                                                                       ? st.left_why
+                                                                       : "?")
+                                                  : left_face_hold ? "the hand at the face"
+                                                                   : "the left hand is busy"));
+        }
+        // The stroke classifier runs every frame (its rest pose known when swings come on).
         M::Input input{};
         input.t = static_cast<double>(gesture.time) * 1e-9;
+        input.active = on || learning;
         input.immersive = VR::IsImmersive() || VR::CinematicActive();
         input.ori_valid = left.orientation_valid;
         input.q = {left.orientation.x, left.orientation.y, left.orientation.z,
@@ -10686,32 +11566,127 @@ struct OpenXRPresenter::Impl {
         input.head_v = {gesture.head_velocity.x, gesture.head_velocity.y,
                         gesture.head_velocity.z};
         input.head_fwd = {gesture.forward.x, gesture.forward.y, gesture.forward.z};
-        M::TrackerConfig tc{};tc.onset=ms.open_onset;tc.charge_full_s=ms.charge_s;
-        tc.budget.enabled=ms.budget;tc.budget.charges=ms.budget_charges;tc.budget.scale=ms.budget_scale;
-        tc.budget.offset_s=ms.budget_offset_ms*.001f;
-        const auto result=melee_runtime.LeftFrame(f,input,config,tc,dt);CopyLeftMelee();
-        const auto& decision=result.left;const auto& w=melee_window_left.Current();
-        if(decision.flags&PI_ML_CHANGED)
-            LOG_INFO(Render_Vulkan,"VR melee left: left swings {}",decision.state.on?"attack":fmt::format("off ({})",
-                decision.why==PI_ML_NO_PHYSICAL?"no physical swings now":decision.why==PI_ML_NO_STATUS?"no game status":
-                decision.why==PI_ML_NO_ROW?(st.left_why?st.left_why:"?"):decision.why==PI_ML_FACE?"the hand at the face":"the left hand is busy"));
-        if(decision.flags&PI_ML_LEARNING_DENIED)
-            LOG_INFO(Render_Vulkan,"VR melee left: a swing, no attack ({})",st.left_why?st.left_why:"?");
-        if(decision.flags&PI_ML_GUN_AIM)
-            LOG_INFO(Render_Vulkan,"VR melee left: a swing with the gun at {:.1f} m/s: an aim, no punch (one needs {:.1f})",
-                decision.hand_peak,VR::Tricks::GunPunchSpeed);
-        if(decision.flags&PI_ML_AIM_DROPPED)
-            LOG_INFO(Render_Vulkan,"VR melee left: #{} dropped: an aim (the trigger {:.0f} ms after it)",
-                decision.aim_serial,static_cast<double>(now-melee_left_open_ns)*1e-6);
-        if(result.coordination.flags&PI_MCO_COUNTER_DROPPED){
-            LogCounterMotion(result.coordination);
-            if(melee_window.Current().late)PublishMeleeWindowNow();
+        // A gun's punch is a stab (the barrel hardly turns): the left hand's detector takes it at
+        // GunPunchSpeed, a little under the right hand's stab speed (2026-10-18).
+        M::Config left_config = config;
+        if (st.left_gun) {
+            left_config.stab_speed = Tr::GunPunchSpeed;
         }
-        if(decision.flags&PI_ML_COMBO_LOG)
-            LOG_INFO(Render_Vulkan,"VR melee left: #{} opened {:.0f} ms after right swing #{}: {}",w.serial,
-                static_cast<double>(melee_left_open_ns-melee_open_ns)*1e-6,melee_window.Current().serial,
-                st.left_dual?"both hands' blades":"a combo, counted");
-        ApplyWeaponMotion(result.coordination.commands);PublishLeftWindow(now);
+        const M::Output out = melee_left.Update(input, left_config);
+        // (Not for the off hand's counter-motion to a right swing: that one is never a request.)
+        const bool counter_like = left_single && melee_window.Current().serial != 0 &&
+                                  now - melee_open_ns < counter_ns;
+        if (learning && out.fired && !counter_like) {
+            if (ms.haptics) {
+                haptics[0].Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
+            }
+            LOG_INFO(Render_Vulkan, "VR melee left: a swing, no attack ({})",
+                     st.left_why != nullptr ? st.left_why : "?");
+        }
+        // A gun's punch: only a real strike (opened at its commit, never at a stroke's start: a
+        // quick aim starts like one), never with the trigger pulled nor just after a shot.
+        bool fired = out.fired;
+        if (st.left_gun && fired && out.stats.hand_peak < Tr::GunPunchSpeed) {
+            fired = false;
+            melee_left.DropStroke(); // nor later in this motion
+            LOG_INFO(Render_Vulkan, "VR melee left: a swing with the gun at {:.1f} m/s: an aim, no "
+                                    "punch (one needs {:.1f})",
+                     out.stats.hand_peak, Tr::GunPunchSpeed);
+        }
+        const bool shot = gun_shot_ns != 0 &&
+                          now - gun_shot_ns < static_cast<s64>(Tr::GunPunchAfterShotS * 1e9f);
+        // A deliberate shield strike may start in auto-guard. Trigger-held guarding still
+        // blocks it. Guns retain their trigger and post-shot suppression unchanged.
+        const bool aiming = st.left_gun && Tr::PunchAimBlocks(st.left_shield, body_analog[0], shot);
+        if (st.left_gun && aiming && melee_window_left.Current().open &&
+            !melee_window_left.Current().hit && now - melee_left_open_ns < counter_ns) {
+            // A punch the trigger follows this soon was the start of an aim (a snap at a target
+            // to shoot it): dropped, silently and free, as the off hand's counter-motion is.
+            LOG_INFO(Render_Vulkan, "VR melee left: #{} dropped: an aim (the trigger {:.0f} ms "
+                                    "after it)",
+                     melee_window_left.Current().serial,
+                     static_cast<double>(now - melee_left_open_ns) * 1e-6);
+            melee_window_left.Drop("an aim: the trigger pulled");
+            melee_left_close_ns = now;
+            melee_left.DropStroke();
+            left_dropped_stroke = melee_left.CurrentStroke();
+        }
+        // The rest of a stroke dropped as the off hand's counter-motion (below) opens nothing.
+        const bool dropped =
+            melee_left.StrokeLive() && melee_left.CurrentStroke() == left_dropped_stroke;
+        M::TrackerInput ti{};
+        ti.dt = dt;
+        ti.swings = on && !dropped && !aiming;
+        ti.stroke_live = melee_left.StrokeLive();
+        ti.stroke = melee_left.CurrentStroke();
+        ti.cocked = melee_left.CurrentCocked();
+        ti.recovery = melee_left.Recovery();
+        ti.blade_rate = melee_left.Rate();
+        ti.stroke_peak = melee_left.StrokePeak();
+        ti.fired = fired;
+        ti.fired_stroke = out.fired_stroke;
+        ti.kind = out.kind;
+        ti.kind_stroke = out.stats.id;
+        ti.gate = out.gate;
+        if (left.valid) {
+            ti.hand_v = {left.velocity.x - gesture.head_velocity.x,
+                         left.velocity.y - gesture.head_velocity.y,
+                         left.velocity.z - gesture.head_velocity.z};
+            ti.hand_speed = M::Length(ti.hand_v);
+        }
+        ti.fwd_flat = M::Normalize({gesture.forward.x, 0.0f, gesture.forward.z});
+        ti.tip_speed = TipSpeed(left, gesture, config);
+        ti.hit_serial = melee_left_hit_serial;
+        ti.top = M::MoveKind::Light; // one row: every left swing is a light one
+        const float recover =
+            M::PaceRecover(M::FindPace(melee_variation), melee_form_b, M::MoveKind::Light);
+        ti.recover.fill(recover);
+        M::TrackerConfig tc{};
+        tc.onset = ms.open_onset && !st.left_gun;
+        tc.charge_full_s = ms.charge_s;
+        tc.budget.enabled = ms.budget; // the right hand's charges (PayFrom)
+        tc.budget.charges = ms.budget_charges;
+        tc.budget.scale = ms.budget_scale;
+        tc.budget.offset_s = ms.budget_offset_ms * 0.001f;
+        tc.budget.quick_charges = ms.budget_quick_charges;
+        tc.budget.quick_s = ms.budget_quick_s;
+        const M::Window before = melee_window_left.Current();
+        const M::TrackerOutput to = melee_window_left.Step(ti, tc);
+        const M::Window& w = melee_window_left.Current();
+        if (to.opened) {
+            melee_left_open_ns = now;
+            // (The game finishes the window this one replaced by these: its stamina back.)
+            melee_left_prev_serial = before.serial;
+            melee_left_prev_aborted = before.open ? !before.committed : before.aborted;
+        }
+        if (to.closed) {
+            melee_left_close_ns = now;
+        }
+        const bool counter = DropCounterMotion(tc, now);
+        if (counter && melee_window.Current().late) {
+            PublishMeleeWindowNow(); // the right swing it starved is paid now
+        }
+        if (!counter) {
+            // (Tuning the counter-motion window: a left swing kept soon after a right one.)
+            const M::Window& rw = melee_window.Current();
+            const s64 after_right = melee_left_open_ns - melee_open_ns;
+            if (to.opened && rw.committed && melee_open_ns != 0 && after_right < 400'000'000) {
+                LOG_INFO(Render_Vulkan,
+                         "VR melee left: #{} opened {:.0f} ms after right swing #{}: {}", w.serial,
+                         static_cast<double>(after_right) * 1e-6, rw.serial,
+                         st.left_dual ? "both hands' blades" : "a combo, counted");
+            }
+            if (ms.haptics && to.empty) {
+                // No charge left for it (the right hand's swings used them): a dull buzz, as the
+                // right hand's, not the swing's tick.
+                HapticPattern p{};
+                p.priority = 3;
+                haptics[0].Play(p.Pulse(0.10f, 45.0f).Ramp(0.10f, 0.03f, 75.0f));
+            } else if (ms.haptics && to.committed && !w.unpaid) {
+                haptics[0].Play(Tick(0.2f, 10.0f));
+            }
+        }
+        PublishLeftWindow(now);
     }
 
     // melee_left with a left-hand weapon of its own (left_single: a torch, a fist, a gun's punch;
@@ -10721,21 +11696,29 @@ struct OpenXRPresenter::Impl {
     // stamina in the game, unless it hit something), the rest of its stroke too; before the game
     // saw it open it makes no attack at all. The right swing it starved of a charge gets that
     // charge (PayLate). Checked after either hand's step. True when it dropped one.
-    bool DropCounterMotion(const VR::Melee::TrackerConfig& tc,s64 now) {
-        PiMeleeCoordinationFacts f{};f.enabled=1;f.now_ns=now;f.left_single=melee_runtime.LeftState().single;
-        f.right_open_ns=melee_open_ns;f.left_open_ns=melee_left_open_ns;
-        const auto result=melee_runtime.Coordinate(PI_MELEE_COUNTER_MOTION,f,tc);
-        if(!(result.flags&PI_MCO_COUNTER_DROPPED))return false;
-        CopyLeftMelee();LogCounterMotion(result);return true;
-    }
-    void LogCounterMotion(const PiMeleeCoordinationOutput& result) {
+    bool DropCounterMotion(const VR::Melee::TrackerConfig& tc, s64 now) {
+        namespace M = VR::Melee;
+        const M::Window& lw = melee_window_left.Current();
+        const M::Window& rw = melee_window.Current();
+        const s64 counter_ns = static_cast<s64>(VR::Tricks::CounterSwingS * 1e9f);
+        if (!left_single || !lw.open || lw.hit || !rw.committed || melee_open_ns == 0 ||
+            std::abs(melee_open_ns - melee_left_open_ns) >= counter_ns) {
+            return false;
+        }
+        const u32 serial = lw.serial;
+        melee_window_left.Drop("the off hand's counter-motion");
+        melee_left_close_ns = now;
+        melee_left.DropStroke();
+        left_dropped_stroke = melee_left.CurrentStroke();
+        const bool paid = melee_window.PayLate(tc);
         LOG_INFO(Render_Vulkan,
                  "VR melee left: #{} dropped: the off hand's counter-motion (right swing #{} "
                  "{:.0f} ms {} it){}",
-                 result.left_serial,melee_window.Current().serial,
-                 std::abs(static_cast<double>(melee_open_ns-melee_left_open_ns))*1e-6,
-                 melee_open_ns<=melee_left_open_ns?"before":"after",
-                 result.flags&PI_MCO_COUNTER_PAID?"; its charge pays the right swing":"");
+                 serial, rw.serial,
+                 std::abs(static_cast<double>(melee_open_ns - melee_left_open_ns)) * 1e-6,
+                 melee_open_ns <= melee_left_open_ns ? "before" : "after",
+                 paid ? "; its charge pays the right swing" : "");
+        return true;
     }
 
     // The left window for the game (bloodborne_melee.cpp LeftMeleeTick).
@@ -10765,98 +11748,155 @@ struct OpenXRPresenter::Impl {
         Cb::PublishMeleeWindowLeft(p);
     }
 
-    // Copy equipment/settings facts; weapon selection and timing are DLL-owned.
-    PiBladeConfig BladeConfigurationNow() {
-        const auto& ts = VR::Tricks::GetTrickSettings();
-        PiBladeConfigFacts f{};
-        f.variation = melee_variation; f.form_b = melee_form_b;
-        f.gun_blade = ts.gun_blade; f.moon_wave = ts.moon_wave;
-        f.stake_blast = ts.stake_blast; f.charged_row = melee_charged_row;
-        return blade_runtime.Configure(f);
+    // A gun-blade's kick: the Reiterpallasch a pistol's; the Rifle Spear's blast stronger than a
+    // rifle's (a charged shotgun blast through the shaft: a long hard slam, then its body).
+    HapticPattern BladeThump() const {
+        const float k = std::clamp(VR::Gun::GetGunSettings().recoil_gain, 0.0f, 1.5f);
+        if (melee_variation == 1000) {
+            HapticPattern p{};
+            p.priority = 2;
+            p.own = true;
+            return p.Pulse(std::min(1.0f * k, 1.0f), 55.0f).Ramp(0.85f * k, 0.0f, 220.0f);
+        }
+        return GunThump(VR::Gun::Family::Pistol, k);
+    }
+
+    // The right hand's shot of the weapon in hand (core/vr/trick_weapons.h ShotWeaponOf, from the
+    // game's melee status: melee_variation, melee_form_b), when its setting is on.
+    VR::Tricks::Shot BladeShotNow() const {
+        namespace Tr = VR::Tricks;
+        const auto& ts = Tr::GetTrickSettings();
+        const Tr::ShotWeapon* w = Tr::ShotWeaponOf(melee_variation);
+        if (w == nullptr || !melee_form_b) {
+            return Tr::Shot::None;
+        }
+        bool on = false;
+        switch (w->shot) {
+        case Tr::Shot::GunBlade:
+            on = ts.gun_blade;
+            break;
+        case Tr::Shot::MoonWave:
+            on = ts.moon_wave;
+            break;
+        case Tr::Shot::StakeBlast:
+            on = ts.stake_blast;
+            break;
+        case Tr::Shot::Bow: // the bow's own path (UpdateBow)
+        case Tr::Shot::None:
+            break;
+        }
+        return on ? w->shot : Tr::Shot::None;
     }
 
     // The right hand's shots (core/vr/trick_weapons.h; the game fires the weapon's own bullet row
     // in its update, with no animation: bloodborne_gun.cpp BladeShotTick). gun_blade: the
     // Reiterpallasch's trigger squeeze, along the blade. The Rifle Spear's (gun_blade) and the
     // Stake Driver's (stake_blast) blast: the trigger held BlastChargeS charges it (a build, then a
-    // triple buzz), letting go discharges it (BlastCooldownS after it). A verified stake melee
+    // triple buzz), releasing discharges it (BlastCooldownS after it). A verified stake also
+    // accepts a committed forward punch while held. Its melee
     // row returns true to open a powered contact window; projectile rows use BladeShotTick.
     // moon_wave: a charged swing (the trigger held 1 s) of the transformed Holy Moonlight Sword
     // lets its wave go at the stroke's fastest, where you look or out through the blade. The
     // kick comes with the game's answer (HandleMeleeEvents: Shot).
     bool UpdateBladeShots(const HandState& right, const GestureFrame& gesture, bool trigger,
-                          const PiBladeConfig& config, bool swings, float dt) {
+                          VR::Tricks::Shot shot, bool swings, float dt, bool stake_punch = false) {
         namespace Tr = VR::Tricks;
-        PiBladeInput p{};
-        p.now_ns = VR::Body::SteadyNowNs();
-        p.fired_ns = melee_feedback_runtime.BladeHistory().blade_fired_ns;
-        p.dry_ns = melee_feedback_runtime.BladeHistory().blade_dry_ns;
-        p.dt = dt;
-        p.trigger = trigger;
-        const auto shot = static_cast<Tr::Shot>(config.shot);
-        p.shot = config.shot;
-        p.shot_weapon = config.shot_weapon;
-        p.charge_s = config.charge_s;
-        p.cadence_s = config.cadence_s;
-        p.sustain = haptics[1].sustain;
-        p.swings = swings;
-        p.face_block = swing_block == FaceBlock;
-        p.vial = VialReaching();
-        p.haptics = Tr::GetTrickSettings().haptics;
-        p.stake_melee = config.stake_melee;
-        if (shot == Tr::Shot::MoonWave) {
-            const auto& w = melee_window.Current();
-            p.window = w.serial;
-            p.open = w.open;
-            p.committed = w.committed;
-            p.unpaid = w.unpaid;
-            p.flick = w.flick;
-            p.armed = w.armed;
-            p.charged = w.kind == VR::Melee::MoveKind::Charged;
-            p.tip_peak = w.tip_peak;
-            p.tip_speed = w.tip_speed;
-            const auto f = TrickFrame(right, right, gesture, false, 0);
-            const auto put = [](float* out, VR::Body::Vec3 v) {
-                out[0] = v.x;
-                out[1] = v.y;
-                out[2] = v.z;
-            };
-            put(p.head, f.head);
-            put(p.gaze, {gesture.forward.x, gesture.forward.y, gesture.forward.z});
-            put(p.right, f.right.p);
-            put(p.axis, f.axis);
-            put(p.forward, f.forward);
-        }
-        const auto& o = blade_runtime.Update(p);
-        if (o.flags & PI_BLADE_WRITE_SUSTAIN)
-            haptics[1].sustain = o.sustain;
-        PlayInteractionHaptics(o);
-        if (o.blast_event)
-            LOG_INFO(Render_Vulkan, "VR blade charge: shot {} event {} progress {:.2f}", p.shot,
-                     o.blast_event, o.progress);
-        if (o.flags & PI_BLADE_SEND) {
-            VR::Combat::BladeShot req{};
-            req.serial = ++blade_shots;
-            req.shot = static_cast<u8>(shot);
-            req.press_ns = p.now_ns;
-            req.space_serial = recenter_serial;
-            req.charged = o.charged;
-            req.window = o.window;
-            req.dir = {o.direction[0], o.direction[1], o.direction[2]};
-            req.dir_valid = o.dir_valid;
-            const bool submitted = PublishNativeBlade(req);
-            if (o.flags & PI_BLADE_PREDICT) {
-                auto feedback = GunFeedbackPacket(PI_GF_BLADE_PREDICT, 0, 0, submitted);
-                feedback.serial = req.serial; feedback.now_ns = req.press_ns;
-                PlayInteractionHaptics(melee_feedback_runtime.Step(feedback));
+        namespace Bd = VR::Body;
+        const bool edge = trigger && !blade_trigger_down;
+        blade_trigger_down = trigger;
+        const Tr::ShotWeapon* sw = Tr::ShotWeaponOf(melee_variation);
+        const bool blast_weapon = shot != Tr::Shot::None && sw != nullptr && sw->charge_s > 0.0f;
+        if (!blast_weapon) {
+            if (blast_sustain > 0.0f && haptics[1].sustain == blast_sustain) {
+                haptics[1].sustain = 0.0f;
             }
-            LOG_INFO(Render_Vulkan, "VR blade shot: #{} shot {} window {}{}", req.serial, p.shot,
-                     o.window,
-                     (o.flags & PI_BLADE_WAVE)
-                         ? (o.at_gaze ? " where you look" : " along its fastest line")
-                         : "");
+            blast_sustain = 0.0f;
+            blast.Idle(trigger, dt); // (its cooldown runs on)
         }
-        return (o.flags & PI_BLADE_STAKE_MELEE) != 0;
+        if (shot == Tr::Shot::None) {
+            return false;
+        }
+        VR::Combat::BladeShot req{};
+        req.shot = static_cast<u8>(shot);
+        req.press_ns = Bd::SteadyNowNs();
+        req.space_serial = recenter_serial;
+        if (blast_weapon) {
+            return UpdateBlast(trigger, shot, *sw, swings, dt, req, stake_punch);
+        }
+        if (shot == Tr::Shot::GunBlade) {
+            // Not while swings are held back (an NPC talking, Menu held; the hand at the face is
+            // sighting down the blade: that pull shoots) or the vial reaches the wrist (a clench
+            // for the needle): that pull is no shot.
+            if (edge && (swings || swing_block == FaceBlock) && !VialReaching()) {
+                req.serial = ++blade_shots;
+                VR::Combat::PublishBladeShot(req);
+                // The kick at the pull, as the gun's (the game fires within a frame): when its
+                // cadence is over and it has not just clicked empty; else the game's answer.
+                const Tr::ShotWeapon* gw = Tr::ShotWeaponOf(melee_variation);
+                const bool ready =
+                    gw != nullptr &&
+                    req.press_ns - blade_fired_ns >=
+                        static_cast<s64>(gw->cadence_s * 1e9f) + 40'000'000 &&
+                    req.press_ns - blade_dry_ns > 1'000'000'000;
+                if (ready && Tr::GetTrickSettings().haptics) {
+                    haptics[1].Play(BladeThump());
+                    blade_predicted = req.serial;
+                    blade_fired_ns = req.press_ns;
+                }
+                LOG_INFO(Render_Vulkan, "VR blade shot: #{} the gun-blade's trigger{}", req.serial,
+                         ready ? " (the kick now)" : "");
+            } else if (edge) {
+                if (!VialReaching() && Tr::GetTrickSettings().haptics) {
+                    haptics[1].Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3)); // no shot: the deny tick
+                }
+                LOG_INFO(Render_Vulkan, "VR blade shot: the gun-blade's trigger, no shot ({})",
+                         VialReaching() ? "the vial is at the wrist" : "swings are held back");
+            }
+            return false;
+        }
+        const VR::Melee::Window& w = melee_window.Current();
+        const Tr::Frame f = TrickFrame(right, right, gesture, false, 0.0f);
+        const Bd::Vec3 chest = f.head + Bd::Vec3{0.0f, -Tr::ChestDownM, 0.0f};
+        const Bd::Vec3 gaze{gesture.forward.x, gesture.forward.y, gesture.forward.z};
+        if (shot == Tr::Shot::MoonWave) {
+            // The wave's line: where you look if this swing's blade swept through it, else the
+            // blade's at its fastest (WaveSweep, fed every frame of the window).
+            if (w.serial != wave_window) {
+                wave_window = w.serial;
+                wave_sweep = {};
+            }
+            if (w.open) {
+                wave_sweep.Step(f.head, gaze, chest, f.right.p + f.axis * 0.5f, f.forward,
+                                w.tip_speed);
+            }
+        }
+        // The wave: a charged swing only (the trigger held the full charge first: the tester,
+        // 2026-10-12).
+        const bool kind = shot == Tr::Shot::MoonWave && w.armed &&
+                          w.kind == VR::Melee::MoveKind::Charged;
+        const bool wants = w.open && w.committed && !w.unpaid && !w.flick &&
+                           w.serial != blade_shot_window && kind;
+        // At the stroke's fastest: the blade's far end slowing from its peak.
+        if (!wants || w.tip_peak < 1.5f || w.tip_speed > 0.85f * w.tip_peak) {
+            return false;
+        }
+        blade_shot_window = w.serial;
+        req.dir = wave_sweep.Aim(f.head, gaze, f.forward);
+        req.dir_valid = Bd::LengthSq(req.dir) > 0.5f;
+        req.serial = ++blade_shots;
+        req.charged = w.kind == VR::Melee::MoveKind::Charged;
+        req.window = w.serial;
+        VR::Combat::PublishBladeShot(req);
+        LOG_INFO(Render_Vulkan,
+                 "VR blade shot: #{} the moonlight wave of swing #{} at {:.1f} m/s (its peak "
+                 "{:.1f}) along ({:.2f},{:.2f},{:.2f}){}",
+                 req.serial, w.serial, w.tip_speed, w.tip_peak, req.dir.x, req.dir.y, req.dir.z,
+                 wave_sweep.AtGaze()
+                     ? fmt::format(" where you look (the blade {:.0f} deg from it)",
+                                   wave_sweep.gaze_deg)
+                     : fmt::format(" along the swing at its fastest (your view {:.0f} deg off)",
+                                   wave_sweep.gaze_deg));
+        return false;
     }
 
     // saw_spin (core/vr/trick_weapons.h SawSpin): the transformed Whirligig Saw held with both
@@ -10864,72 +11904,205 @@ struct OpenXRPresenter::Impl {
     // catch, then the rumble rising to speed with the teeth's grain in both hands), let go (or the
     // left hand off the handle) it spins down (the whir dying away). The game's L2 never plays
     // (UpdateGun). SawAttackTick runs the weapon-only loop and its native contact attacks.
-    void UpdateSawSpin(const PhysicalState& in, const PhysicalInteractions::QuickOutput& quick,
-                       float dt) {
+    void UpdateSawSpin(const PhysicalState& in, const VR::Quick::Output& quick, float dt) {
         namespace Tr = VR::Tricks;
+        using E = Tr::SawSpin::Event;
         const auto& ts = Tr::GetTrickSettings();
-        PiSawInput p{};
-        p.now_ns = VR::Body::SteadyNowNs();
-        p.dt = dt;
-        p.left_level = haptics[0].sustain;
-        p.right_level = haptics[1].sustain;
-        p.hum_level = melee_feedback_runtime.HumOwned();
-        p.enabled = ts.saw_spin;
-        p.status_ok = two_hand_status_ok;
-        p.admission.enabled = 1;
-        p.admission.status_family = two_hand_status.family;
-        p.form_b = RightFormB();
-        p.admission.right_family = RightFamily();
-        p.engaged = two_hand_runtime.Engaged();
-        p.seated = two_hand_runtime.Seated();
-        p.trigger_left = in[PhysTriggerL];
-        p.trigger_right = in[PhysTriggerR];
-        p.quick_block = quick.block_l2;
-        p.admission.music = music_box_free; p.admission.vial = VialReaching();
-        p.admission.menu = VR::IsGameMenuOpen(); p.admission.cinematic = VR::CinematicActive();
-        p.admission.frozen = grip_adjust.Frozen(); p.admission.menu_held = in[PhysMenu];
-        p.haptics = ts.haptics;
-        const auto& o = saw_runtime.Update(p);
-        VR::Combat::PublishSawRequest({o.request_ns, o.rev, o.held != 0});
-        if (o.flags & PI_SAW_WRITE_LEFT)
-            haptics[0].sustain = o.left_level;
-        if (o.flags & PI_SAW_WRITE_RIGHT)
-            haptics[1].sustain = o.right_level;
-        PlayInteractionHaptics(o);
-        if (o.flags & PI_SAW_LOST_WEAPON)
-            LOG_INFO(Render_Vulkan, "VR saw: stopped (no longer held in transformed form)");
-        switch (static_cast<Tr::SawSpin::Event>(o.event)) {
-        case Tr::SawSpin::Event::Start:
+        auto& lh = haptics[0];
+        auto& rh = haptics[1];
+        const bool saw = ts.saw_spin && two_hand_status_ok &&
+                         two_hand_status.family == Tr::SawFamily && RightFormB();
+        // Only the levels it wrote, or the hum's (the saw's idle hum gives way to its spin and
+        // takes the hand back after: UpdateWeaponHum); a charge's build stays its own.
+        const auto write = [&](float level) {
+            const float l = level * 0.8f; // the left hand on the handle, a little less
+            if (level > 0.0f && ts.haptics) {
+                if (rh.sustain <= 0.0f || rh.sustain == saw_sustain_r ||
+                    (hum_level > 0.0f && rh.sustain == hum_level)) {
+                    rh.sustain = saw_sustain_r = level;
+                }
+                if (lh.sustain <= 0.0f || lh.sustain == saw_sustain_l) {
+                    lh.sustain = saw_sustain_l = l;
+                }
+                return;
+            }
+            if (saw_sustain_r > 0.0f && rh.sustain == saw_sustain_r) {
+                rh.sustain = 0.0f;
+            }
+            if (saw_sustain_l > 0.0f && lh.sustain == saw_sustain_l) {
+                lh.sustain = 0.0f;
+            }
+            saw_sustain_l = saw_sustain_r = 0.0f;
+        };
+        // The left trigger's pull (kept current whatever the weapon: its one-handed soft no).
+        const bool left_pull = in[PhysTriggerL] && !quick.block_l2 && !saw_left_down;
+        saw_left_down = in[PhysTriggerL];
+        if (!saw) {
+            saw_trigger_r = RightFamily() == Tr::SawFamily && two_hand.Engaged();
+            if (saw_spin.Spinning()) {
+                LOG_INFO(Render_Vulkan, "VR saw: stopped (no longer the Whirligig held in its "
+                                        "transformed form)");
+            }
+            saw_spin.Reset();
+            VR::Combat::PublishSawRequest({});
+            write(0.0f);
+            return;
+        }
+        // Either trigger (2026-10-12): with both hands on the saw the right one is the
+        // saw's too, never a swing's charge (UpdateMotionWeapon: saw_trigger_r), and stays so
+        // until let go (a hand off the handle mid-spin never turns it into a held charge).
+        saw_trigger_r = two_hand.Engaged() || (saw_trigger_r && in[PhysTriggerR]);
+        const bool allowed = !quick.block_l2 && !music_box_free && !VialReaching() &&
+                             !VR::IsGameMenuOpen() && !VR::CinematicActive() &&
+                             !grip_adjust.Frozen() && !in[PhysMenu];
+        const bool left_trigger = allowed && in[PhysTriggerL];
+        const bool right_trigger = allowed && in[PhysTriggerR];
+        // A held trigger is a held spin request, including through the off-hand grab.
+        const bool trigger = left_trigger || right_trigger;
+        if (left_pull && !two_hand_support.Seated()) {
+            if (ts.haptics) {
+                lh.Play(Tick(0.12f, 10.0f, 0));
+            }
+            LOG_INFO(Render_Vulkan, "VR saw: no spin: put your left hand on the handle (the left "
+                                    "grip) and pull a trigger");
+        }
+        const Tr::SawSpin::Out o =
+            saw_spin.Step(left_trigger, right_trigger, two_hand_support.Seated(), dt);
+        VR::Combat::PublishSawRequest(
+            {VR::Body::SteadyNowNs(), o.rev, trigger && two_hand_support.Seated()});
+        write(o.level);
+        switch (o.event) {
+        case E::None:
+            break;
+        case E::Start:
+            if (ts.haptics) {
+                rh.Play(Tick(0.4f, 15.0f, 1)); // the pull-start's catch
+            }
             LOG_INFO(Render_Vulkan, "VR saw: spinning up (a trigger, both hands on it)");
             break;
-        case Tr::SawSpin::Event::Full:
+        case E::Full:
+            if (ts.haptics) {
+                rh.Play(Tick(0.3f, 12.0f, 1)); // the motor catching
+            }
             LOG_INFO(Render_Vulkan, "VR saw: at speed (weapon-only loop and grinding contact)");
             break;
-        case Tr::SawSpin::Event::Stop:
+        case E::Stop:
             LOG_INFO(Render_Vulkan, "VR saw: spinning down ({})",
-                     p.seated ? "the trigger let go" : "a hand off the handle");
+                     two_hand_support.Seated() ? "the trigger let go" : "a hand off the handle");
             break;
-        case Tr::SawSpin::Event::Still:
+        case E::Still:
             LOG_INFO(Render_Vulkan, "VR saw: still");
-            break;
-        case Tr::SawSpin::Event::None:
             break;
         }
     }
 
-    PiMeleeRightFacts MeleeRightFacts(const HandState& hand,bool trigger) {
-        PiMeleeRightFacts f{};f.enabled=1;f.class_sequence=melee_runtime.RightState().class_sequence;
-        f.angular_valid=hand.angular_valid;f.angular[0]=hand.angular.x;f.angular[1]=hand.angular.y;f.angular[2]=hand.angular.z;
-        f.shared=two_hand_combat;f.blade_valid=two_hand_blade.valid;f.blade_frame=two_hand_blade_frame;f.frame=xr_frames;
-        f.lever_velocity[0]=two_hand_blade.lever_relative_velocity.x;
-        f.lever_velocity[1]=two_hand_blade.lever_relative_velocity.y;f.lever_velocity[2]=two_hand_blade.lever_relative_velocity.z;
-        f.lever_speed=two_hand_blade.lever_speed;f.blade_speed=two_hand_blade.speed;
-        f.variation=melee_variation;f.form_b=melee_form_b;f.charged_row=melee_charged_row;
-        f.whip_physical=VR::Whip::GetWhipSettings().physical;f.trigger=trigger;return f;
+    // A blast (core/vr/trick_weapons.h Blast): the trigger held builds in the sword hand, a triple
+    // buzz once charged, the blast on release or a verified stake punch (kick on game answer); let go early,
+    // a soft tick; during the cooldown or while swings are held back, the deny.
+    bool UpdateBlast(bool trigger, VR::Tricks::Shot shot, const VR::Tricks::ShotWeapon& sw,
+                     bool swings, float dt, VR::Combat::BladeShot& req, bool stake_punch) {
+        namespace Tr = VR::Tricks;
+        using E = Tr::Blast::Event;
+        auto& rh = haptics[1];
+        const bool feel = Tr::GetTrickSettings().haptics;
+        const bool stake_melee = shot == Tr::Shot::StakeBlast &&
+            Tr::StakePunch(melee_variation, melee_form_b, melee_charged_row);
+        const bool allowed = (swings || (!stake_melee && swing_block == FaceBlock)) &&
+                             !VialReaching();
+        const Tr::Blast::Out o = blast.Step(trigger, allowed, dt, sw.charge_s, sw.cadence_s,
+                                          stake_melee && stake_punch);
+        if (o.charging && feel) {
+            // Felt from its start (no haptic floor for a steady level), a detent each quarter.
+            rh.sustain = blast_sustain = 0.12f + 0.28f * o.progress;
+            const int q = std::min(static_cast<int>(o.progress * 4.0f), 3);
+            if (q > blast_quarter) {
+                rh.Play(Tick(0.15f + 0.1f * static_cast<float>(q), 10.0f, 1));
+            }
+            blast_quarter = q;
+        } else if (blast_sustain > 0.0f) {
+            if (rh.sustain == blast_sustain) {
+                rh.sustain = 0.0f;
+            }
+            blast_sustain = 0.0f;
+        }
+        if (!o.charging) {
+            blast_quarter = 0;
+        }
+        const char* name = shot == Tr::Shot::StakeBlast ? "the stake's blast" : "the spear's blast";
+        switch (o.event) {
+        case E::None:
+            break;
+        case E::Start:
+            if (feel) {
+                rh.Play(Tick(0.2f, 12.0f, 1));
+            }
+            LOG_INFO(Render_Vulkan, "VR blade shot: {}: charging ({:.1f} s, let go to fire)", name,
+                     sw.charge_s);
+            break;
+        case E::Full:
+            if (feel) {
+                rh.Play(Repeat(3, 0.6f, 20.0f, 40.0f, 2));
+            }
+            LOG_INFO(Render_Vulkan, "VR blade shot: {}: charged", name);
+            break;
+        case E::Fire:
+            if (stake_melee) {
+                LOG_INFO(Render_Vulkan, "VR stake: charged melee discharge ({})",
+                         trigger ? "held-trigger punch" : "trigger release");
+                return true;
+            }
+            // Along the weapon's own line (its two dummies, BladeShotTick); a bullet.
+            req.serial = ++blade_shots;
+            req.charged = shot == Tr::Shot::StakeBlast; // (the stake's row is its charged one)
+            VR::Combat::PublishBladeShot(req);
+            LOG_INFO(Render_Vulkan, "VR blade shot: #{} {} at the release", req.serial, name);
+            break;
+        case E::Short:
+            if (feel) {
+                rh.Play(Tick(0.12f, 10.0f, 0));
+            }
+            LOG_INFO(Render_Vulkan, "VR blade shot: {}: let go before it charged", name);
+            break;
+        case E::Cooling:
+        case E::Refused:
+            if (feel && !VialReaching()) {
+                rh.Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
+            }
+            LOG_INFO(Render_Vulkan, "VR blade shot: {}: no ({})", name,
+                     o.event == E::Cooling   ? "cooling down"
+                     : VialReaching()        ? "the vial is at the wrist"
+                                             : "swings are held back");
+            break;
+        }
+        return false;
     }
-    void CopyRightMelee() {
-        const auto& state=melee_runtime.RightState();melee_open_ns=state.open_ns;melee_close_ns=state.close_ns;
-        melee_prev_serial=state.prev_serial;melee_prev_aborted=state.prev_aborted!=0;
+
+    // The blade's far end, relative to the head (m/s): the grip's velocity plus the controller's
+    // turn times the blade (MeleeBladeM along the blade axis of the swing classifier).
+    static float TipSpeed(const HandState& right, const GestureFrame& g,
+                          const VR::Melee::Config& config) {
+        namespace M = VR::Melee;
+        if (!right.valid) {
+            return 0.0f;
+        }
+        M::V3 v{right.velocity.x - g.head_velocity.x, right.velocity.y - g.head_velocity.y,
+                right.velocity.z - g.head_velocity.z};
+        if (right.angular_valid && right.orientation_valid) {
+            const M::Q4 q{right.orientation.x, right.orientation.y, right.orientation.z,
+                          right.orientation.w};
+            const M::V3 blade = M::Normalize(M::Rotate(q, config.blade_local)) * MeleeBladeM;
+            v = v + M::Cross({right.angular.x, right.angular.y, right.angular.z}, blade);
+        }
+        return M::Length(v);
+    }
+
+    float RightTipSpeed(const HandState& right, const GestureFrame& g,
+                        const VR::Melee::Config& config) const {
+        if (two_hand_combat) {
+            return two_hand_blade.valid && two_hand_blade_frame == xr_frames ?
+                       two_hand_blade.speed : 0.0f;
+        }
+        return TipSpeed(right, g, config);
     }
 
     // ", budget 1/2 (used 1, back in 0.55 s)" for a window's log line (empty without the budget).
@@ -10945,7 +12118,10 @@ struct OpenXRPresenter::Impl {
                                w.next_s);
         }
         return fmt::format(", budget {}/{} (used {}{}, back in {:.2f} s)", w.left, w.capacity,
-                           w.charges, w.downgraded ? " as a light: wound up with one left" : "",
+                           w.charges,
+                           w.downgraded ? " as a light: wound up with one left"
+                           : w.flurry   ? " as a light: a flurry's lash"
+                                        : "",
                            w.refill_s);
     }
 
@@ -10957,7 +12133,12 @@ struct OpenXRPresenter::Impl {
         if (w.serial == 0) {
             return;
         }
-        const float tip=melee_runtime.RightState().recent_tip;
+        float tip = 0.0f;
+        for (const auto& [t, speed] : melee_tip_history) {
+            if (melee_clock - t <= MeleeTipWindowS) {
+                tip = std::max(tip, speed);
+            }
+        }
         Cb::MeleeWindow p{};
         p.serial = w.serial;
         p.kind = static_cast<u8>(w.kind);
@@ -10983,8 +12164,8 @@ struct OpenXRPresenter::Impl {
         p.budget_downgraded = w.downgraded;
         p.powered = w.powered;
         // A two-handed swing (UpdateTwoHand's SwingMark): its hits x two_hand_damage.
-        p.two_hand = two_hand_runtime.SwingSerial() == w.serial
-                         ? two_hand_runtime.Factor(VR::TwoHand::GetTwoHandSettings())
+        p.two_hand = two_hand_swing.serial == w.serial
+                         ? two_hand_swing.Factor(VR::TwoHand::GetTwoHandSettings())
                          : 1.0f;
         Cb::PublishMeleeWindow(p);
     }
@@ -10996,191 +12177,299 @@ struct OpenXRPresenter::Impl {
         namespace Cb = VR::Combat;
         std::array<Cb::EvadeEvent, 16> events{};
         const u32 count = Cb::PollEvadeEvents(events.data(), static_cast<u32>(events.size()));
-        if (count == 0) return;
-        PiMeleeFeedbackInput packet{};
-        packet.operation = PI_MF_EVASION;
-        packet.now_ns = VR::Body::SteadyNowNs();
-        packet.evasion.enabled = VR::GetSettings().evasion_feedback;
-        packet.evasion.count = count;
-        for (u32 i = 0; i < count; ++i) {
-            const auto& e = events[i];
-            packet.evasion.events[i] = {e.ns, static_cast<uint32_t>(e.kind), e.side, e.a, 0};
+        if (count == 0 || !VR::GetSettings().evasion_feedback) {
+            return;
         }
-        const auto out = melee_feedback_runtime.Step(packet);
-        PlayInteractionHaptics(out);
+        const s64 now = VR::Body::SteadyNowNs();
         for (u32 i = 0; i < count; ++i) {
-            if (!(out.evade_near_mask & (1u << i))) continue;
-            const auto& e = events[i];
-            LOG_INFO(Render_Vulkan, "VR evade: near miss on the {} (vanilla body {:.0f} cm "
-                                    "inside the blow): whoosh",
-                     e.side == 1 ? "right" : "left", -100.0f * e.a);
+            const Cb::EvadeEvent& e = events[i];
+            if (now - e.ns > 300'000'000) {
+                continue; // queued while the input was elsewhere (a menu): too late to feel right
+            }
+            if (e.kind == Cb::EvadeEventKind::Wall) {
+                haptics[0].Play(Tick(0.12f, 18.0f, 0));
+                haptics[1].Play(Tick(0.12f, 18.0f, 0));
+            } else if (e.side == 0 || e.side == 1) {
+                HapticPattern p{};
+                p.priority = 1;
+                haptics[static_cast<size_t>(e.side)].Play(
+                    p.Ramp(0.0f, 0.30f, 50.0f).Ramp(0.30f, 0.0f, 110.0f));
+                LOG_INFO(Render_Vulkan, "VR evade: near miss on the {} (vanilla body {:.0f} cm "
+                                        "inside the blow): whoosh",
+                         e.side == 1 ? "right" : "left", -100.0f * e.a);
+            }
         }
     }
 
     // The game's answers to the windows (physical melee): the hit thump, the wall clank, a refused
     // swing's double tick, the visceral's thrust. Drained every gameplay frame.
-    void HandleBladeShotFeedback(const VR::Combat::MeleeEvent& e) {
-        auto p = GunFeedbackPacket(PI_GF_BLADE_RECEIPT);
-        p.serial = e.serial; p.now_ns = e.ns; p.a = e.a; p.b = e.b;
-        const auto out = melee_feedback_runtime.Step(p);
-        PlayInteractionHaptics(out);
-        if (out.gun.flags & PI_GFO_REARM_BOW)
-            ranged_runtime.Rearm(bow_trigger_wait, VR::Bow::GetBowSettings().quiver);
-        if (out.gun.flags & PI_GFO_BOW_REFUSAL)
-            LOG_INFO(Render_Vulkan, "VR bow: release refused ({}); no delayed shot", e.why);
-        LOG_INFO(Render_Vulkan, "VR blade shot: #{} {}{}", e.serial,
-                 e.b > 0.5f ? "fired" : e.b > -0.5f ? "no bullets" : "refused",
-                 e.why != nullptr && e.why[0] != 0 ? fmt::format(" ({})", e.why) : std::string{});
-    }
-
-    bool PublishNativeBlade(const VR::Combat::BladeShot& shot) {
-        if (!fire_runtime.Bound()) {
-            VR::Combat::PublishBladeShot(shot);
-            return true;
-        }
-        VR::Quick::Snapshot actor{};
-        VR::Combat::MeleeStatus equipment{};
-        const s64 now = VR::Quick::NowNs();
-        if (!VR::Quick::LatestSnapshot(actor) || !actor.valid || !actor.character_generation ||
-            now < actor.steady_ns || now - actor.steady_ns > 300'000'000 ||
-            !VR::Combat::LatestMeleeStatus(equipment) || now < equipment.ns || now - equipment.ns > 300'000'000 ||
-            !equipment.form_b) {
-            LOG_INFO(Render_Vulkan, "VR blade shot: #{} not queued (no fresh actor/equipment)", shot.serial);
-            const VR::Combat::MeleeEvent denied{VR::Combat::MeleeEventKind::Shot,shot.serial,
-                static_cast<float>(shot.shot),-1.f,now,"no fresh actor/equipment"};
-            HandleBladeShotFeedback(denied);
-            return false;
-        }
-        PiFireRequest request{};
-        request.session = interaction_module.Session();
-        request.request_id = VR::Quick::NextInteractionRequestId();
-        request.character_generation = actor.character_generation;
-        request.controller_serial = shot.serial;
-        request.shot = shot.shot; request.charged = shot.charged;
-        request.press_ns = shot.press_ns; request.space = shot.space_serial;
-        request.window = shot.window; request.dir_valid = shot.dir_valid;
-        request.direction[0] = shot.dir.x; request.direction[1] = shot.dir.y; request.direction[2] = shot.dir.z;
-        request.variation = equipment.variation; request.form_b = equipment.form_b;
-        request.bow_hand = equipment.bow_hand;
-        const bool submitted = fire_runtime.Submit(request);
-        if (!submitted) {
-            LOG_INFO(Render_Vulkan, "VR blade shot: #{} not queued (fire channel busy or unavailable)", shot.serial);
-            const VR::Combat::MeleeEvent denied{VR::Combat::MeleeEventKind::Shot,shot.serial,
-                static_cast<float>(shot.shot),-1.f,now,"fire channel busy or unavailable"};
-            HandleBladeShotFeedback(denied);
-        }
-        return submitted;
-    }
-
     void HandleMeleeEvents() {
         namespace Cb = VR::Combat;
-        static_assert(static_cast<u32>(Cb::MeleeEventKind::Opened) == PI_MFE_OPENED &&
-                      static_cast<u32>(Cb::MeleeEventKind::Denied) == PI_MFE_DENIED &&
-                      static_cast<u32>(Cb::MeleeEventKind::Hit) == PI_MFE_HIT &&
-                      static_cast<u32>(Cb::MeleeEventKind::Wall) == PI_MFE_WALL &&
-                      static_cast<u32>(Cb::MeleeEventKind::Visceral) == PI_MFE_VISCERAL &&
-                      static_cast<u32>(Cb::MeleeEventKind::Refunded) == PI_MFE_REFUNDED &&
-                      static_cast<u32>(Cb::MeleeEventKind::BudgetRefund) == PI_MFE_BUDGET_REFUND &&
-                      static_cast<u32>(Cb::MeleeEventKind::Plunge) == PI_MFE_PLUNGE &&
-                      static_cast<u32>(Cb::MeleeEventKind::Shot) == PI_MFE_SHOT &&
-                      static_cast<u32>(Cb::MeleeEventKind::LeftHit) == PI_MFE_LEFT_HIT &&
-                      static_cast<u32>(Cb::MeleeEventKind::LeftDenied) == PI_MFE_LEFT_DENIED);
         auto& weapon_hand = haptics[1];
-        PiFireResult fire{};
-        if (fire_runtime.Poll(fire)) {
-            const Cb::MeleeEvent event{Cb::MeleeEventKind::Shot,fire.controller_serial,
-                static_cast<float>(fire.shot),fire.outcome == PI_FIRE_FIRED ? 1.f : fire.outcome == PI_FIRE_DRY ? 0.f : -1.f,
-                fire.now_ns,fire.reason};
-            HandleBladeShotFeedback(event);
-        }
+        const bool feel = VR::Melee::GetMeleeSettings().haptics;
         std::array<Cb::MeleeEvent, 16> events{};
         const u32 count = Cb::PollMeleeEvents(events.data(), static_cast<u32>(events.size()));
         for (u32 i = 0; i < count; ++i) {
-            const auto& e = events[i];
-            const auto& ms = VR::Melee::GetMeleeSettings();
-            const auto& vs = VR::GetSettings();
-            PiMeleeFeedbackInput facts{};
-            facts.operation = PI_MF_EVENT;
-            facts.now_ns = VR::Body::SteadyNowNs();
-            facts.kind = static_cast<u32>(e.kind);
-            facts.serial = e.serial;
-            facts.bonus_serial = two_hand_bonus_serial;
-            facts.a = e.a; facts.b = e.b;
-            facts.gain = vs.haptic_melee_hit;
-            facts.hit_ms = vs.haptic_melee_hit_ms;
-            facts.min_drop = ms.plunge_min_drop_m;
-            facts.flags = (ms.haptics ? PI_MFF_FEEL : 0) |
-                          (VR::TwoHand::GetTwoHandSettings().haptics ? PI_MFF_TWO_FEEL : 0) |
-                          (ms.visceral_pull ? PI_MFF_PULL : 0) |
-                          (vs.haptic_melee_crunch ? PI_MFF_CRUNCH : 0) |
-                          (weapon_hand.playing ? PI_MFF_PLAYING : 0) |
-                          (weapon_hand.pattern.impact ? PI_MFF_IMPACT : 0);
-            const auto out = melee_feedback_runtime.Step(facts);
-            PlayInteractionHaptics(out);
+            const Cb::MeleeEvent& e = events[i];
             switch (e.kind) {
-            case Cb::MeleeEventKind::Hit:
-                if (out.flags & PI_MFO_IMPACT_LOG) {
+            case Cb::MeleeEventKind::Hit: {
+                melee_hit_serial = std::max(melee_hit_serial, e.serial);
+                // The hit landing: THE impact on the hand holding the weapon (both with the
+                // two-handed grip), a sharp near-full crack that decays, by the hit's damage
+                // (e.a) and its row's hit stop (e.b, the weapon's weight class); owning the hand
+                // (no arc hum, no rumble under it). No damage (guarded, parried, immune): a dull
+                // knock. One impact per swing: its second target within 60 ms only makes it
+                // stronger (core/vr/haptic_output.h Haptics::Combat).
+                namespace HC = VR::Haptics::Combat;
+                const bool both = e.serial != 0 && e.serial == two_hand_bonus_serial &&
+                                  VR::TwoHand::GetTwoHandSettings().haptics;
+                const float gain = VR::GetSettings().haptic_melee_hit;
+                const bool dealt = std::isfinite(e.a) && e.a >= HC::ImpactMinDamage;
+                const float weight = HC::ImpactWeight(e.a, e.b, both);
+                const s64 at = VR::Body::SteadyNowNs();
+                const bool again = e.serial != 0 && e.serial == melee_impact_serial &&
+                                   at - melee_impact_ns < 60'000'000 &&
+                                   weight <= melee_impact_weight;
+                if (feel && gain > 0.0f && !again) {
+                    // haptic_melee_hit_ms (65): full for 65+ ms, a decay, a heavy hit's crunch,
+                    // and the guard: nothing but another impact cuts it for 200 ms (the same
+                    // swing's wall clank came 1 .. 20 ms after half the tester's hits).
+                    const auto& vs = VR::GetSettings();
+                    const float hit_ms = vs.haptic_melee_hit_ms;
+                    const HC::Shape s = dealt ? HC::MeleeImpact(weight, gain, hit_ms,
+                                                                vs.haptic_melee_crunch)
+                                              : HC::MeleeKnock(gain);
+                    const float guard = dealt && hit_ms > 0.0f ? HC::ImpactGuardMs : 0.0f;
+                    const HapticPattern p = CombatPattern(s, 2, dealt, guard);
+                    weapon_hand.Play(p);
+                    if (both) {
+                        haptics[0].Play(p);
+                    }
+                    melee_impact_serial = e.serial;
+                    melee_impact_ns = at;
+                    melee_impact_weight = weight;
                     LOG_INFO(Render_Vulkan,
                              "VR melee: #{} {} on the {} ({:.0f} damage, hit stop {:.0f} ms, "
-                             "weight {:.2f}): {:.2f} for {:.0f} ms, then from {:.2f} over {:.0f} ms{}{}",
-                             e.serial, out.flags & PI_MFO_DEALT ? "IMPACT" : "knock (no damage)",
-                             out.flags & PI_MFO_BOTH ? "both hands" : "weapon hand", e.a,
-                             e.b * 1000.0f, out.weight, out.peak, out.hold_ms, out.tail_from, out.tail_ms,
-                             out.crunch > 0 ? fmt::format(", a crunch {:.2f} for {:.0f} ms after {:.0f} ms",
-                                                        out.crunch, out.crunch_ms, out.crunch_gap_ms)
-                                            : std::string{},
-                             out.guard_ms > 0 ? fmt::format(" ({:.0f} ms in all, guarded {:.0f} ms)",
-                                                           out.total_ms, out.guard_ms) : std::string{});
+                             "weight {:.2f}): {:.2f} for {:.0f} ms, then from {:.2f} over {:.0f} ms"
+                             "{}{}",
+                             e.serial, dealt ? "IMPACT" : "knock (no damage)",
+                             both ? "both hands" : "weapon hand", e.a, e.b * 1000.0f, weight,
+                             s.peak, s.hold_ms, s.tail_from, s.tail_ms,
+                             s.crunch > 0.0f
+                                 ? fmt::format(", a crunch {:.2f} for {:.0f} ms after {:.0f} ms",
+                                               s.crunch, s.crunch_ms, s.crunch_gap_ms)
+                                 : std::string{},
+                             guard > 0.0f ? fmt::format(" ({:.0f} ms in all, guarded {:.0f} ms)",
+                                                        HC::ShapeMs(s), guard)
+                                          : std::string{});
                 }
                 break;
+            }
             case Cb::MeleeEventKind::Wall:
-                if (out.flags & PI_MFO_WALL_GUARDED)
+                if (feel && weapon_hand.playing && weapon_hand.pattern.impact) {
                     LOG_INFO(Render_Vulkan,
                              "VR melee: #{} wall clank skipped: hit #{}'s impact guards the hand "
-                             "({:.0f} ms into it)", e.serial, out.impact_serial, weapon_hand.time * 1000.0f);
+                             "({:.0f} ms into it)",
+                             e.serial, melee_impact_serial, weapon_hand.time * 1000.0f);
+                } else if (feel && VR::Body::SteadyNowNs() - wall_thud_ns < WallThudMergeNs) {
+                    // weapon_wall's strike thud just played for the same touch: one feel.
+                } else if (feel) {
+                    HapticPattern p{};
+                    p.priority = 2;
+                    weapon_hand.Play(
+                        p.Pulse(0.9f, 25.0f).Gap(15.0f).Pulse(0.35f, 10.0f).Gap(15.0f).Pulse(0.2f,
+                                                                                         10.0f));
+                    wall_thud_ns = VR::Body::SteadyNowNs();
+                }
                 break;
             case Cb::MeleeEventKind::Denied: {
-                const bool back = (out.flags & PI_MFO_REFUND_RIGHT) && melee_window.RefundWindow(e.serial);
+                if (feel) {
+                    weapon_hand.Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
+                }
+                const bool back = melee_window.RefundWindow(e.serial); // the combo budget's
                 LOG_INFO(Render_Vulkan, "VR melee: swing #{} not taken by the game ({}){}",
                          e.serial, e.why != nullptr ? e.why : "",
-                         back ? fmt::format("; its charges back (budget {}/{})", melee_window.BudgetFree(),
-                                            melee_window.Budget().Capacity()) : std::string{});
+                         back ? fmt::format("; its charges back (budget {}/{})",
+                                            melee_window.BudgetFree(),
+                                            melee_window.Budget().Capacity())
+                              : std::string{});
                 break;
             }
-            case Cb::MeleeEventKind::Plunge:
+            case Cb::MeleeEventKind::Plunge: {
+                // A plunge's landing (melee_plunge, core/vr/plunge.h): from a real plunge's depth
+                // (melee_plunge_min_drop_m) that hit nothing, a dull landing through both hands,
+                // deeper falls a little harder. A hit had its impact (the plunge to feel); a step
+                // off a curb is none.
+                const float depth = std::clamp((e.a - 1.0f) / 4.0f, 0.0f, 1.0f);
+                if (feel && e.b < 0.5f && e.a >= VR::Melee::GetMeleeSettings().plunge_min_drop_m) {
+                    HapticPattern p{};
+                    p.priority = 2;
+                    p.Pulse(0.35f + 0.2f * depth, 40.0f + 20.0f * depth).Ramp(0.25f, 0.0f, 120.0f);
+                    weapon_hand.Play(p);
+                    haptics[0].Play(p);
+                }
                 LOG_INFO(Render_Vulkan, "VR melee: #{} plunge landed from {:.2f} m{}", e.serial,
                          e.a, e.b > 0.5f ? " (it hit)" : "");
                 break;
-            case Cb::MeleeEventKind::LeftHit:
+            }
+            case Cb::MeleeEventKind::LeftHit: {
+                // A left swing's hit (melee_left): the impact in the left hand, as the right's.
+                namespace HC = VR::Haptics::Combat;
+                melee_left_hit_serial = std::max(melee_left_hit_serial, e.serial);
+                const auto& vs = VR::GetSettings();
+                const float gain = vs.haptic_melee_hit;
+                const bool dealt = std::isfinite(e.a) && e.a >= HC::ImpactMinDamage;
+                if (feel && gain > 0.0f) {
+                    const HC::Shape shape =
+                        dealt ? HC::MeleeImpact(HC::ImpactWeight(e.a, e.b, false), gain,
+                                                vs.haptic_melee_hit_ms, vs.haptic_melee_crunch)
+                              : HC::MeleeKnock(gain);
+                    haptics[0].Play(CombatPattern(
+                        shape, 2, dealt,
+                        dealt && vs.haptic_melee_hit_ms > 0.0f ? HC::ImpactGuardMs : 0.0f));
+                }
                 LOG_INFO(Render_Vulkan, "VR melee left: #{} HIT ({:.0f} damage)", e.serial, e.a);
                 break;
+            }
             case Cb::MeleeEventKind::LeftDenied: {
-                const bool back = (out.flags & PI_MFO_REFUND_LEFT) && melee_window_left.RefundWindow(e.serial);
+                // A left swing the game would not take (no stamina, the game has the left arm):
+                // the deny tick in the left hand, its charge back to both hands' pace.
+                if (feel) {
+                    haptics[0].Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
+                }
+                const bool back = melee_window_left.RefundWindow(e.serial);
                 LOG_INFO(Render_Vulkan, "VR melee left: #{} not taken by the game ({}){}",
                          e.serial, e.why != nullptr ? e.why : "",
-                         back ? fmt::format("; its charge back (budget {}/{})", melee_window.BudgetFree(),
-                                            melee_window.Budget().Capacity()) : std::string{});
+                         back ? fmt::format("; its charge back (budget {}/{})",
+                                            melee_window.BudgetFree(),
+                                            melee_window.Budget().Capacity())
+                              : std::string{});
                 break;
             }
-            case Cb::MeleeEventKind::Shot:
-                if (!fire_runtime.Bound()) HandleBladeShotFeedback(e);
+            case Cb::MeleeEventKind::Shot: {
+                // A right-hand shot's fate (UpdateBladeShots): fired, no bullets, refused.
+                namespace Tr = VR::Tricks;
+                const auto shot = static_cast<Tr::Shot>(static_cast<int>(e.a));
+                const bool on = Tr::GetTrickSettings().haptics;
+                if (e.b > 0.5f && on) {
+                    HapticPattern p{};
+                    p.priority = 2;
+                    p.own = true;
+                    switch (shot) {
+                    case Tr::Shot::GunBlade: // the gun's own kick, in the sword hand (once)
+                        if (e.serial != blade_predicted) {
+                            weapon_hand.Play(BladeThump());
+                        }
+                        if (melee_variation == 1000 && two_hand.Engaged()) {
+                            // The spear's blast through the hand on its shaft.
+                            const float g = std::clamp(VR::Gun::GetGunSettings().recoil_gain, 0.0f,
+                                                       1.5f);
+                            HapticPattern held{};
+                            held.priority = 2;
+                            haptics[0].Play(held.Pulse(std::min(0.75f * g, 1.0f), 45.0f)
+                                                .Ramp(0.45f * g, 0.0f, 160.0f));
+                        }
+                        blade_fired_ns = e.ns;
+                        break;
+                    case Tr::Shot::MoonWave: // the moonlight let go: a swell out of the blade
+                        weapon_hand.Play(p.Ramp(0.4f, 1.0f, 50.0f).Ramp(1.0f, 0.0f, 260.0f));
+                        haptics[0].Play(Tick(0.25f, 30.0f, 1));
+                        break;
+                    case Tr::Shot::StakeBlast: // the stake fired: the hardest kick there is (an
+                                               // impact over the punch's own hit: never cut by it)
+                        p.priority = 3;
+                        p.impact = true;
+                        weapon_hand.Play(p.Pulse(1.0f, 60.0f).Ramp(0.8f, 0.0f, 300.0f));
+                        haptics[0].Play(Tick(0.4f, 30.0f, 2));
+                        break;
+                    case Tr::Shot::Bow: // the release's snap and kick played at the release
+                    case Tr::Shot::None:
+                        break;
+                    }
+                } else if (e.b > -0.5f && on) {
+                    blade_dry_ns = e.ns; // no kick predicted until it has bullets again
+                    weapon_hand.Play(HapticPattern{}.Pulse(0.25f, 8.0f).Gap(50.0f).Pulse(0.25f, 8.0f));
+                } else if ((shot == Tr::Shot::GunBlade || shot == Tr::Shot::StakeBlast) && on) {
+                    weapon_hand.Play(Tick(0.12f, 10.0f));
+                }
+                if (shot == Tr::Shot::Bow && e.b < -0.5f && e.serial == bow_direct_serial) {
+                    if (bow_up && bow.State() == VR::Bow::Phase::Idle) {
+                        bow.Arm(bow_trigger_wait, VR::Bow::GetBowSettings().quiver);
+                    }
+                    if (VR::Bow::GetBowSettings().haptics) {
+                        haptics[bow_hand_i == 0 ? 1 : 0].Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
+                    }
+                    LOG_INFO(Render_Vulkan, "VR bow: release refused ({}); no delayed shot", e.why);
+                }
+                LOG_INFO(Render_Vulkan, "VR blade shot: #{} {}{}", e.serial,
+                         e.b > 0.5f ? "fired" : e.b > -0.5f ? "no bullets" : "refused",
+                         e.why != nullptr && e.why[0] != 0 ? fmt::format(" ({})", e.why)
+                                                           : std::string{});
                 break;
+            }
             case Cb::MeleeEventKind::BudgetRefund:
-                if ((out.flags & PI_MFO_REFUND_RIGHT) && melee_window.RefundWindow(e.serial))
+                if (melee_window.RefundWindow(e.serial)) {
                     LOG_INFO(Render_Vulkan,
-                             "VR melee: window #{} became the transform attack ({}): its charges back "
-                             "(budget {}/{})", e.serial, e.why != nullptr ? e.why : "",
-                             melee_window.BudgetFree(), melee_window.Budget().Capacity());
-                break;
-            case Cb::MeleeEventKind::Opened:
-                if (out.flags & PI_MFO_RESOLVE_LIGHT) {
-                    VR::Melee::BudgetConfig cfg{};
-                    cfg.enabled = ms.budget; cfg.charges = ms.budget_charges;
-                    cfg.scale = ms.budget_scale; cfg.offset_s = ms.budget_offset_ms * .001f;
-                    melee_window.ResolveLightAttack(e.serial, cfg);
+                             "VR melee: window #{} became the transform attack ({}): its charges "
+                             "back (budget {}/{})",
+                             e.serial, e.why != nullptr ? e.why : "", melee_window.BudgetFree(),
+                             melee_window.Budget().Capacity());
                 }
                 break;
             case Cb::MeleeEventKind::Visceral:
+                if (feel && VR::Melee::GetMeleeSettings().visceral_pull) {
+                    // The blade going in: a hard plunge, driven deeper, settling into the held
+                    // resistance (UpdateVisceralPull's lodged level: "now pull"); the left hand a
+                    // lighter echo. The heartbeat belongs to the catch; the rip's burst to the
+                    // verified damage event.
+                    HapticPattern p{};
+                    p.priority = 3;
+                    p.impact = true;
+                    weapon_hand.Play(p.Pulse(1.0f, 40.0f)
+                                         .Ramp(0.8f, 0.5f, 90.0f)
+                                         .Ramp(0.5f, VR::Melee::Pull::LodgedTension, 110.0f));
+                    HapticPattern echo{};
+                    echo.priority = 3;
+                    echo.impact = true;
+                    haptics[0].Play(echo.Gap(30.0f).Pulse(0.4f, 35.0f).Ramp(0.3f, 0.0f, 150.0f));
+                } else if (feel && e.b > 0.5f) {
+                    // A thrust's visceral (visceral_thrust): the hand plunging in, a hard stop
+                    // and a long heavy pull on the right hand; the left a lighter echo.
+                    HapticPattern p{};
+                    p.priority = 3;
+                    p.impact = true; // a landed hit: a hit's impact guard gives way to it
+                    p.Pulse(1.0f, 45.0f)
+                        .Ramp(0.9f, 0.55f, 140.0f)
+                        .Ramp(0.55f, 0.75f, 120.0f)
+                        .Ramp(0.75f, 0.0f, 380.0f);
+                    weapon_hand.Play(p);
+                    HapticPattern echo{};
+                    echo.priority = 3;
+                    echo.impact = true;
+                    haptics[0].Play(echo.Gap(40.0f).Pulse(0.45f, 40.0f).Ramp(0.35f, 0.0f, 260.0f));
+                } else if (feel) {
+                    HapticPattern p{};
+                    p.priority = 3;
+                    p.impact = true;
+                    p.Pulse(1.0f, 60.0f).Ramp(0.6f, 0.0f, 220.0f);
+                    weapon_hand.Play(p);
+                    haptics[0].Play(p);
+                }
+                break;
+            case Cb::MeleeEventKind::Opened: {
+                if (e.b == static_cast<float>(VR::Melee::MoveKind::Light)) {
+                    const auto& ms = VR::Melee::GetMeleeSettings();
+                    VR::Melee::BudgetConfig cfg{};
+                    cfg.enabled = ms.budget;
+                    cfg.charges = ms.budget_charges;
+                    cfg.scale = ms.budget_scale;
+                    cfg.offset_s = ms.budget_offset_ms * .001f;
+                    cfg.quick_charges = ms.budget_quick_charges;
+                    cfg.quick_s = ms.budget_quick_s;
+                    melee_window.ResolveLightAttack(e.serial, cfg);
+                }
+                break;
+            }
             case Cb::MeleeEventKind::Refunded:
                 break;
             }
@@ -11197,7 +12486,47 @@ struct OpenXRPresenter::Impl {
         namespace P = VR::PoseGesture;
         const s64 now = VR::Body::SteadyNowNs();
         P::ZoneState z{};
-        const bool have_zone = P::ZoneChannel().Load(z);
+        const bool zone_ok = P::ZoneChannel().Load(z) && now - z.ns < 1'500'000'000;
+        const P::Zone zone = zone_ok ? static_cast<P::Zone>(z.zone) : P::Zone::None;
+        if (zone_ok && z.fired != pose_fired_seen) {
+            if (pose_fired_valid && z.fired_marker == P::MarkerContact) {
+                HapticPattern p{};
+                p.priority = 2;
+                p.Pulse(0.85f, 80.0f).Ramp(0.7f, 0.0f, 450.0f);
+                haptics[0].Play(p);
+                haptics[1].Play(p);
+            }
+            pose_fired_seen = z.fired;
+        }
+        pose_fired_valid = pose_fired_valid || zone_ok;
+        const auto release = [this](const char* why) {
+            const P::Output& last = pose_recognizer.Last();
+            if (last.pose != P::Kind::None) {
+                LOG_INFO(Render_Vulkan, "VR pose: {} released after {:.2f} s ({})",
+                         P::KindName(last.pose), last.held_s, why);
+            }
+            pose_recognizer.Reset();
+        };
+        // Not called outside gameplay (a menu, the virtual screen): a hold never runs through a gap.
+        const bool gap = pose_active && now - pose_last_ns > 250'000'000;
+        pose_last_ns = now;
+        if (gap) {
+            release("a pause in gameplay");
+        }
+        const bool off = zone == P::Zone::None || z.blocked || VR::IsGameMenuOpen() ||
+                         VR::CinematicActive();
+        if (off) {
+            if (pose_active) {
+                release(zone == P::Zone::None ? "left the zone" : "a gate");
+                P::PoseState ps{};
+                ps.serial = pose_recognizer.Last().serial;
+                ps.ns = now;
+                P::PoseChannel().Store(ps);
+                pose_active = false;
+            }
+            return;
+        }
+        pose_active = true;
         P::Frame f{};
         f.head_ok = gesture.head_ok;
         f.head = {gesture.head_position.x, gesture.head_position.y, gesture.head_position.z};
@@ -11209,43 +12538,14 @@ struct OpenXRPresenter::Impl {
         f.left_v = {left.velocity.x, left.velocity.y, left.velocity.z};
         f.right_v = {right.velocity.x, right.velocity.y, right.velocity.z};
         const P::Config config{};
-        PiPosePresenterFacts facts{};
-        facts.now_ns = now; facts.zone_ns = z.ns;
-        facts.have_zone = have_zone; facts.zone = z.zone;
-        facts.blocked = z.blocked; facts.menu = VR::IsGameMenuOpen();
-        facts.cinematic = VR::CinematicActive(); facts.module_failure = interaction_dll_fault;
-        facts.available = z.available; facts.fired = z.fired; facts.fired_marker = z.fired_marker;
-        const auto& lifecycle = pose_recognizer.Presenter(f, config, facts, dt);
-        const auto& out = pose_recognizer.Last();
-        const auto zone = static_cast<P::Zone>(lifecycle.zone);
-        for (u32 i = 0; i < lifecycle.haptic_count; ++i) {
-            const auto& intent = lifecycle.haptics[i];
-            const auto pattern = PlaybackPattern(intent);
-            for (u32 hand = 0; hand < 2; ++hand)
-                if (intent.side_mask & (1u << hand)) haptics[hand].Play(pattern);
-        }
-        if (lifecycle.reset_pose != 0) {
-            const char* why = lifecycle.reset_reason == PI_POSE_RELEASE_GAP ? "a pause in gameplay" :
-                              lifecycle.reset_reason == PI_POSE_RELEASE_ZONE ? "left the zone" :
-                              lifecycle.reset_reason == PI_POSE_RELEASE_MODULE ? "a module fault" : "a gate";
-            LOG_INFO(Render_Vulkan, "VR pose: {} released after {:.2f} s ({})",
-                     P::KindName(static_cast<P::Kind>(lifecycle.reset_pose)), lifecycle.reset_held_s, why);
-        }
-        const auto publish = [&] {
-            P::PoseState ps{};
-            ps.pose = static_cast<u8>(out.pose); ps.held_s = out.held_s;
-            ps.serial = out.serial; ps.ns = now;
-            P::PoseChannel().Store(ps);
-        };
-        if (!lifecycle.active) {
-            if (lifecycle.publish) publish();
-            return;
-        }
+        const P::Output& out = pose_recognizer.Update(f, config, zone, z.available, dt);
         if (out.released != P::Kind::None) {
             LOG_INFO(Render_Vulkan, "VR pose: {} released after {:.2f} s",
                      P::KindName(out.released), out.released_held_s);
         }
         if (out.recognized_now) {
+            haptics[0].Play(Tick(0.2f, 14.0f, 1));
+            haptics[1].Play(Tick(0.2f, 14.0f, 1));
             const P::Local l = P::ToHead(f, f.left);
             const P::Local r = P::ToHead(f, f.right);
             LOG_INFO(Render_Vulkan,
@@ -11269,7 +12569,12 @@ struct OpenXRPresenter::Impl {
                      f.left_ok ? "" : " lost", r.up * 100.0f, r.fwd * 100.0f, r.side * 100.0f,
                      P::Len(f.right_v), f.right_ok ? "" : " lost", P::HeadPitchDeg(f));
         }
-        if (lifecycle.publish) publish();
+        P::PoseState ps{};
+        ps.pose = static_cast<u8>(out.pose);
+        ps.held_s = out.held_s;
+        ps.serial = out.serial;
+        ps.ns = now;
+        P::PoseChannel().Store(ps);
     }
 
     // Physical viscerals (visceral_thrust=1): a thrust of the right hand (fast, forward along the
@@ -11279,7 +12584,7 @@ struct OpenXRPresenter::Impl {
     // heartbeat on the right hand when the game says a visceral opened (visceral_cue).
     // An arrow taken from the quiver or on the string (UpdateBow).
     bool ArrowInHand() const {
-        return bow_up && ranged_runtime.Phase() != VR::Bow::Phase::Idle;
+        return bow_up && bow.State() != VR::Bow::Phase::Idle;
     }
 
     // Simon's Bowblade's bow (vr.ini bow, core/vr/bow.h), every gameplay frame. True while its bow
@@ -11295,97 +12600,197 @@ struct OpenXRPresenter::Impl {
         const auto& bs = W::GetBowSettings();
         const s64 now = VR::Body::SteadyNowNs();
         Cb::MeleeStatus st{};
-        const bool have_status = Cb::LatestMeleeStatus(st);
-        PiRangedInput packet{};
-        packet.operation = PI_BOW_PRESENTER;
-        packet.now_ns = now;
-        packet.dt = dt;
-        packet.bow = VR::Interactions::RangedRuntime::Settings(bs);
-        packet.presenter.status_ns = st.ns;
-        packet.presenter.have_status = have_status;
-        packet.presenter.hand = st.bow_hand;
-        packet.presenter.menu = VR::IsGameMenuOpen();
-        packet.presenter.cinematic = VR::CinematicActive();
-        for (u32 h = 0; h < 2; ++h) packet.presenter.current_sustain[h] = haptics[h].sustain;
-        packet.direct_available = st.bow_direct;
-        packet.pinch[0] = in[PhysTriggerL];
-        packet.pinch[1] = in[PhysTriggerR];
-        packet.pinch_valid[0] = bow_trigger_active[0];
-        packet.pinch_valid[1] = bow_trigger_active[1];
-        packet.head_valid = gesture.head_ok;
-        packet.head = {gesture.head_position.x, gesture.head_position.y, gesture.head_position.z};
-        packet.forward = {gesture.forward.x, gesture.forward.y, gesture.forward.z};
-        packet.torso_valid = belt_torso.Valid();
-        if (packet.torso_valid) {
-            const auto t = belt_torso.Forward();
-            packet.torso = {t.x, t.y, t.z};
-        }
-        const auto pack = [](const HandState& h) {
-            PiHand p{};
-            p.p = {h.position.x, h.position.y, h.position.z};
-            p.q = {h.orientation.x, h.orientation.y, h.orientation.z, h.orientation.w};
-            p.flags = h.pose_valid ? PI_POSITION_VALID | PI_ORIENTATION_VALID : 0;
-            return p;
+        const bool up = bs.enabled && Cb::LatestMeleeStatus(st) && now - st.ns < 300'000'000 &&
+                        st.bow_hand >= 0;
+        const auto end = [&](const char* why) {
+            if (bow_up) {
+                LOG_INFO(Render_Vulkan, "VR bow: down ({}){}", why,
+                         bow.State() == W::Phase::Nocked ? ": the arrow put back" : "");
+            }
+            bow.Reset();
+            bow_up = false;
+            VR::Combat::BowVisualChannel().Store({});
+            bow_string_w = 0.0f;
+            if (bow_sustain) {
+                haptics[0].sustain = haptics[1].sustain = 0.0f;
+                bow_sustain = false;
+            }
         };
-        packet.hands[0] = pack(left);
-        packet.hands[1] = pack(right);
-        const auto& result = ranged_runtime.Update(packet);
-        const auto& feedback = result.presenter;
-        const auto& decision = result.bow;
-        bow_up = decision.up;
-        bow_hand_i = decision.hand;
-        bow_trigger_wait = decision.trigger_wait;
-        bow_at_bow = decision.at_bow;
-        bow_string_w = decision.string_weight;
-        bow_rest_m = decision.rest_m;
-        bow_shot_direct = decision.shot_direct;
-        const int bow_i = bow_hand_i;
-        if (feedback.flags & PI_BP_CLEAR_VISUAL)
+        if (!up) {
+            end("the bow form is not in hand");
+            // A string's trigger still held as the bow goes down (a transform mid-draw) is no
+            // attack (the right trigger's route) or shot (UpdateGun): only a new squeeze is.
+            bow_trigger_wait =
+                bow_trigger_wait && (bow_hand_i == 0 ? in[PhysTriggerR] : in[PhysTriggerL]);
+            return false;
+        }
+        const int bow_i = st.bow_hand == 0 ? 0 : 1; // haptics / hands: 0 left, 1 right
+        const int string_i = 1 - bow_i;
+        const bool pinch_now = string_i == 1 ? in[PhysTriggerR] : in[PhysTriggerL];
+        if (bow_up && bow_i != bow_hand_i) {
+            // The game moved the bow to the other hand (just after the transform): start again.
+            LOG_INFO(Render_Vulkan, "VR bow: the bow went to the {} hand{}",
+                     bow_i == 0 ? "left" : "right",
+                     bow.State() == W::Phase::Nocked ? ": the arrow put back" : "");
+            bow.Arm(pinch_now, bs.quiver && bow.State() != W::Phase::Idle);
             Cb::BowVisualChannel().Store({});
-        if (feedback.flags & PI_BP_CLEAR_MELEE) {
-            melee_runtime.ResetClassifierFeedback();
-            CancelWeaponCharge();
+            bow_string_w = 0.0f;
+        }
+        bow_hand_i = bow_i;
+        bow_trigger_wait = pinch_now;
+        if (!bow_up) {
+            bow_up = true;
+            // A trigger held as it comes up is no squeeze; an arrow ready in the string hand
+            // (bow_quiver: the next ones from over the shoulder).
+            bow.Arm(pinch_now, bs.quiver);
+            // Whatever the swing route left humming (a charge, the arc, the whip) stops: the
+            // bow owns the hands' sustain now.
+            haptics[0].sustain = haptics[1].sustain = 0.0f;
+            arc_sustain = melee_charge_sustain = melee_whip_sustain = false;
+            heavy = Heavy::Idle;
             if (melee_window.Current().open) {
                 melee_window.Reset("the bow is up");
                 PublishMeleeWindowNow();
             }
-            LOG_INFO(Render_Vulkan, "VR bow: up in the {} hand", bow_i == 0 ? "left" : "right");
+            LOG_INFO(Render_Vulkan,
+                     "VR bow: up: the {} hand holds the bow{}; squeeze the {} trigger at the bow "
+                     "to nock, pull back to draw, let go to shoot{}",
+                     bow_i == 0 ? "left" : "right",
+                     bs.quiver ? ", an arrow ready in the other" : "",
+                     string_i == 1 ? "right" : "left",
+                     bs.quiver ? "; the next arrow from over your shoulder" : "");
         }
-        if (decision.frame_events & PI_BOW_DOWN)
-            LOG_INFO(Render_Vulkan, "VR bow: down (the bow form is not in hand)");
-        if (decision.frame_events & PI_BOW_HAND_CHANGE)
-            LOG_INFO(Render_Vulkan, "VR bow: moved to the {} hand", bow_i == 0 ? "left" : "right");
-        for (u32 h = 0; h < 2; ++h)
-            if (feedback.sustain_mask & (1u << h)) haptics[h].sustain = feedback.sustain[h];
-        PlayInteractionHaptics(feedback);
-        if (!(feedback.flags & PI_BP_ACTIVE)) return bow_up;
-        W::Output o{};
-        o.phase = static_cast<W::Phase>(decision.phase);
-        o.event = static_cast<W::Event>(decision.event);
-        o.draw = decision.draw; o.aim_draw = decision.aim_draw;
-        o.charged = decision.charged; o.detent = decision.detent; o.wall = decision.wall;
-        o.aim = {decision.aim.x, decision.aim.y, decision.aim.z};
-        if (feedback.flags & PI_BP_PUBLISH_VISUAL)
-            Cb::BowVisualChannel().Store({now, feedback.visual_active != 0});
+        if (VR::IsGameMenuOpen() || VR::CinematicActive()) {
+            if (bow.State() == W::Phase::Nocked) {
+                LOG_INFO(Render_Vulkan, "VR bow: the arrow put back (a menu or a cinematic)");
+            }
+            // An arrow in hand or on the string stays in the fingers (bow_quiver).
+            bow.Arm(pinch_now, bs.quiver && bow.State() != W::Phase::Idle);
+            Cb::BowVisualChannel().Store({});
+            bow_string_w = 0.0f;
+            if (bow_sustain) {
+                haptics[0].sustain = haptics[1].sustain = 0.0f;
+                bow_sustain = false;
+            }
+            return true;
+        }
+        const HandState& bow_hand = bow_i == 0 ? left : right;
+        const HandState& string_hand = bow_i == 0 ? right : left;
+        auto& string_feel = haptics[string_i];
+        auto& bow_feel = haptics[bow_i];
+        W::Input bi{};
+        bi.dt = dt;
+        bi.valid = bow_hand.pose_valid && string_hand.pose_valid; // (the string at the cheek)
+        // The arrow's rest beside the bow fist (bow_pose.h): the nock zone, the draw and the
+        // shot's line all start there, where the arrow shows. The string hand's side of the bow:
+        // the head's right (forward x up) for a bow in the left hand.
+        const VR::Body::Quat bow_q{bow_hand.orientation.x, bow_hand.orientation.y,
+                                   bow_hand.orientation.z, bow_hand.orientation.w};
+        const VR::Body::Vec3 rest = VR::Bow::ArrowRest(
+            {bow_hand.position.x, bow_hand.position.y, bow_hand.position.z},
+            VR::Body::Rotate(VR::Body::Normalize(bow_q), {0, 1, 0}),
+            VR::Body::Vec3{-gesture.forward.z, 0.0f, gesture.forward.x} *
+                (bow_i == 0 ? 1.0f : -1.0f));
+        bi.bow = {rest.x, rest.y, rest.z};
+        bi.string = {string_hand.position.x, string_hand.position.y, string_hand.position.z};
+        bi.pinch = pinch_now;
+        bi.pinch_valid = bow_trigger_active[string_i];
+        if (bs.quiver && string_hand.pose_valid && gesture.head_ok) {
+            // The quiver: over a shoulder, behind the ears (a cheek anchor at full draw is none),
+            // in front of the body's forward (a glance aside never moves it; the cameras'
+            // inferred position behind the head).
+            const VR::Body::Vec3 head{gesture.head_position.x, gesture.head_position.y,
+                                      gesture.head_position.z};
+            const VR::Body::Vec3 flat{gesture.forward.x, 0.0f, gesture.forward.z};
+            VR::Body::Vec3 forward = VR::Body::Normalize(flat, {0.0f, 0.0f, -1.0f});
+            if (belt_torso.Valid()) {
+                const VR::Belt::P3 t = belt_torso.Forward();
+                forward = {t.x, t.y, t.z};
+            }
+            const VR::Tricks::HeadLocal l =
+                VR::Tricks::InHead(head, forward, {bi.string.x, bi.string.y, bi.string.z});
+            bi.at_quiver = W::AtQuiver(l.fwd, l.up, l.side);
+        }
+        // Charge belongs to the physical draw. The nock only selects how to fire on release.
+        const W::Output o = bow.Update(bi, bs);
+        bow_at_bow = bi.valid && W::Length(W::Sub(bi.bow, bi.string)) <= bs.nock_m;
+        Cb::BowVisualChannel().Store({now, o.phase != W::Phase::Idle});
+        // The string hand on the string (ApplyBowString): eased in at the nock, out after the
+        // release or a put-back (the follow-through back to the controller).
+        bow_string_w = o.phase == W::Phase::Nocked ? std::min(bow_string_w + dt / 0.06f, 1.0f)
+                                                   : std::max(bow_string_w - dt / 0.08f, 0.0f);
+        if (o.phase == W::Phase::Nocked) {
+            bow_rest_m = bow.RestM(bs); // (kept after the release: the ease-out's)
+        }
+        if (o.event == W::Event::Nock) {
+            // bow_direct: this arrow leaves at the release (fired by the game's update); else the
+            // game's own shot clips. Decided at the nock, kept for the arrow (never both).
+            bow_shot_direct = bs.direct && st.bow_direct;
+        }
+        // Charging stays local. No attack input reaches the game before release.
+        const bool feel = bs.haptics;
+        // The draw held still (aiming): after 0.3 s the tension eases to a steady pressure.
+        bow_still_s = dt > 0.0f && std::abs(o.draw - bow_last_draw) < 0.15f * dt
+                          ? bow_still_s + dt
+                          : 0.0f;
+        bow_last_draw = o.draw;
+        if (o.phase == W::Phase::Nocked && feel) {
+            // The string's tension: rising with the draw in the string hand, half in the bow hand.
+            const float ease = std::clamp((bow_still_s - 0.3f) / 0.3f, 0.0f, 1.0f);
+            const float k = o.draw * o.draw * (1.0f - 0.7f * ease);
+            string_feel.sustain = 0.06f + 0.30f * k;
+            bow_feel.sustain = 0.03f + 0.15f * k;
+            bow_sustain = true;
+        } else if (bow_sustain) {
+            string_feel.sustain = bow_feel.sustain = 0.0f;
+            bow_sustain = false;
+        }
+        if (o.wall && feel) {
+            // Full draw: the string can go no further, the wall in the string hand, the limbs
+            // loaded in the bow hand.
+            // (Priority 1: the game's charge's triple buzz, started at 0.85, plays on.)
+            HapticPattern wall{};
+            wall.priority = 1;
+            string_feel.Play(wall.Pulse(0.7f, 20.0f).Ramp(0.35f, 0.0f, 60.0f));
+            bow_feel.Play(Tick(0.3f, 15.0f, 1));
+        } else if (o.detent && feel) {
+            string_feel.Play(Tick(0.2f, 18.0f, 1)); // a third of the draw
+        }
         switch (o.event) {
         case W::Event::Take:
+            if (feel) {
+                // Drawn out of the quiver: a short scrape up to the click of the nock in the
+                // fingers.
+                HapticPattern p{};
+                p.priority = 2;
+                string_feel.Play(p.Ramp(0.15f, 0.45f, 70.0f).Pulse(0.55f, 12.0f));
+            }
             LOG_INFO(Render_Vulkan, "VR bow: an arrow from the quiver");
             break;
         case W::Event::Empty:
+            if (feel) {
+                string_feel.Play(Tick(0.12f, 15.0f, 1)); // a soft no: no arrow in hand
+            }
             LOG_INFO(Render_Vulkan, "VR bow: a squeeze at the bow with no arrow: reach over your "
                                     "shoulder for one");
             break;
         case W::Event::Nock:
+            if (feel) {
+                string_feel.Play(Tick(0.5f, 15.0f, 2));
+                bow_feel.Play(Tick(0.3f, 12.0f, 2));
+            }
             LOG_INFO(Render_Vulkan, "VR bow: nocked");
             break;
         case W::Event::Full:
+            if (feel) {
+                string_feel.Play(Repeat(3, 0.6f, 20.0f, 40.0f, 2));
+            }
             LOG_INFO(Render_Vulkan, "VR bow: {}",
                      bow_shot_direct ? "charged (the full draw held)" : "charged (shot queued only on release)");
             break;
         case W::Event::Quick:
         case W::Event::Charged: {
-            if (!(feedback.flags & PI_BP_SHOT)) break;
-            const bool charged = (feedback.flags & PI_BP_CHARGED) != 0;
+            const bool charged = o.event == W::Event::Charged;
             Cb::BowShot shot{};
             shot.serial = ++bow_shots;
             shot.charged = charged;
@@ -11398,7 +12803,7 @@ struct OpenXRPresenter::Impl {
             shot.release_ns = now;
             Cb::BowShotChannel().Store(shot);
             bool pressed = true;
-            if (feedback.flags & PI_BP_DIRECT) {
+            if (bow_shot_direct) {
                 // The arrow now: the game's update fires it (BladeShotTick) along the drawn line.
                 Cb::BladeShot req{};
                 req.serial = ++blade_shots;
@@ -11408,10 +12813,25 @@ struct OpenXRPresenter::Impl {
                 req.dir_valid = true;
                 req.dir = {o.aim.x, o.aim.y, o.aim.z};
                 req.space_serial = recenter_serial;
+                Cb::PublishBladeShot(req);
                 bow_direct_serial = req.serial;
-                PublishNativeBlade(req);
             } else {
                 pressed = pad.Press(charged ? PadButton::R2 : PadButton::R1);
+            }
+            if (feel) {
+                // The string snaps out of the fingers; the bow kicks in the other hand.
+                HapticPattern snap{};
+                snap.priority = 2;
+                string_feel.Play(snap.Pulse(1.0f, 25.0f).Ramp(0.5f, 0.0f, 90.0f));
+                // The kick, then the limbs' buzz dying away in the hand (the hand shock).
+                HapticPattern kick{};
+                kick.priority = 2;
+                bow_feel.Play(kick.Pulse(charged ? 1.0f : 0.8f, charged ? 40.0f : 30.0f)
+                                  .Ramp(0.5f, 0.25f, 40.0f)
+                                  .Gap(12.0f)
+                                  .Pulse(0.3f, 12.0f)
+                                  .Gap(12.0f)
+                                  .Pulse(0.18f, 12.0f));
             }
             LOG_INFO(Render_Vulkan,
                      "VR bow: #{} {} at draw {:.2f} along ({:.2f},{:.2f},{:.2f}){}", shot.serial,
@@ -11422,8 +12842,11 @@ struct OpenXRPresenter::Impl {
             break;
         }
         case W::Event::PutBack:
+            if (feel) {
+                string_feel.Play(Tick(0.15f, 10.0f, 1));
+            }
             LOG_INFO(Render_Vulkan, "VR bow: the arrow put back (draw {:.2f}){}", o.draw,
-                     ranged_runtime.Phase() == W::Phase::Holding ? ": in the fingers again" : "");
+                     bow.State() == W::Phase::Holding ? ": in the fingers again" : "");
             break;
         case W::Event::None:
             break;
@@ -11435,44 +12858,138 @@ struct OpenXRPresenter::Impl {
     // catch on drives the throw to the rip (VisceralPulled every frame: the tension rising in the
     // hand, a fibre giving every fifth of the pull, the heart failing) and the yank tears it out:
     // the tension lets go at once, then the burst at the rip's damage.
-    void UpdateVisceralPull(const HandState& right,const GestureFrame& gesture,float dt) {
-        namespace Cb=VR::Combat;
-        const auto& ms=VR::Melee::GetMeleeSettings();
-        const s64 now=VR::Body::SteadyNowNs();
-        Cb::VisceralRip rip{};Cb::VisceralHold hold{};
-        const bool rip_present=Cb::VisceralRipChannel().Load(rip);
-        const bool hold_present=Cb::VisceralHoldChannel().Load(hold);
-        PiVisceralInput p{};
-        p.pull_config={ms.visceral_pull_cm,ms.visceral_freehand?0.f:ms.visceral_pull_mps,.35f};
-        p.tear.tracking_hand[0]=right.position.x;
-        p.tear.tracking_hand[1]=right.position.y;
-        p.tear.tracking_hand[2]=right.position.z;
-        p.hand[0]=right.position.x-gesture.head_position.x;
-        p.hand[1]=right.position.y-gesture.head_position.y;
-        p.hand[2]=right.position.z-gesture.head_position.z;
-        p.velocity[0]=right.velocity.x-gesture.head_velocity.x;
-        p.velocity[1]=right.velocity.y-gesture.head_velocity.y;
-        p.velocity[2]=right.velocity.z-gesture.head_velocity.z;
-        p.forward[0]=gesture.forward.x;p.forward[1]=gesture.forward.y;p.forward[2]=gesture.forward.z;
-        p.tear.now=now;p.tear.hold_ns=hold.ns;p.tear.held_ns=hold.held_ns;p.tear.rip_ns=rip.ns;
-        p.tear.space=recenter_serial;p.tear.hold_serial=hold.serial;p.tear.rip_serial=rip.serial;
-        p.tear.dt=dt;p.tear.current_sustain=haptics[1].sustain;
-        p.tear.flags=(ms.visceral_pull?PI_TF_ENABLED:0)|(ms.haptics?PI_TF_HAPTICS:0)|
-            (right.valid&&gesture.head_ok&&gesture.head_velocity_ok?PI_TF_POSE_VALID:0)|
-            (hold_present?PI_TF_HOLD_PRESENT:0)|(hold.active?PI_TF_ACTIVE:0)|
-            (hold.held?PI_TF_HELD:0)|(hold.released?PI_TF_RELEASED:0)|(hold.failed?PI_TF_FAILED:0)|
-            (rip_present?PI_TF_RIP_PRESENT:0)|(rip.mistimed?PI_TF_MISTIMED:0);
-        const auto o=visceral_runtime.Tear(p);
-        if(o.flags&PI_TO_WRITE_SUSTAIN)haptics[1].sustain=o.sustain;
-        if(o.flags&PI_TO_PUBLISH) {
-            Cb::VisceralPulledChannel().Store({o.serial,o.progress,(o.flags&PI_TO_YANK)!=0,
-                o.travel,o.peak,o.yanked_ns});
+    void UpdateVisceralPull(const HandState& right, const GestureFrame& gesture, float dt) {
+        namespace Cb = VR::Combat;
+        namespace P = VR::Melee::Pull;
+        const auto& ms = VR::Melee::GetMeleeSettings();
+        const s64 now = VR::Body::SteadyNowNs();
+        Cb::VisceralRip rip{};
+        if (Cb::VisceralRipChannel().Load(rip) && rip.serial != pull_rip_seen) {
+            pull_rip_seen = rip.serial;
+            if (ms.visceral_pull && ms.haptics && now - rip.ns < 500'000'000) {
+                // The actual damage/blood event, never merely the request to resume playback: a
+                // landed heavy hit's burst.
+                HapticPattern p{};
+                p.priority = 3;
+                p.impact = true;
+                const float strength = rip.mistimed ? 0.6f : 1.0f;
+                haptics[1].Play(p.Pulse(strength, 70.0f).Ramp(0.8f * strength, 0.0f, 200.0f));
+                HapticPattern echo{};
+                echo.priority = 3;
+                echo.impact = true;
+                haptics[0].Play(echo.Gap(30.0f).Pulse(0.5f * strength, 35.0f)
+                                   .Ramp(0.35f * strength, 0.0f, 110.0f));
+            }
         }
-        PlayInteractionHaptics(o);
-        if(o.flags&PI_TO_YANK) {
-            LOG_INFO(Render_Vulkan,"VR visceral pull: #{} PULLED {:.0f} ms after the catch: {:.0f} cm at {:.1f} m/s",
-                o.serial,static_cast<double>(now-hold.held_ns)*1e-6,o.travel*100.f,o.peak);
+        const bool pose_ok = right.valid && gesture.head_ok && gesture.head_velocity_ok &&
+                             pull_space == recenter_serial;
+        const P::V3 hand_rel{right.position.x - gesture.head_position.x,
+                             right.position.y - gesture.head_position.y,
+                             right.position.z - gesture.head_position.z};
+        const P::V3 vel_rel{right.velocity.x - gesture.head_velocity.x,
+                            right.velocity.y - gesture.head_velocity.y,
+                            right.velocity.z - gesture.head_velocity.z};
+        // Freehand: the distance alone (pull out as slowly as you like), not a speed too.
+        const P::PullConfig pc{ms.visceral_pull_cm,
+                               ms.visceral_freehand ? 0.0f : ms.visceral_pull_mps, 0.35f};
+        Cb::VisceralHold h{};
+        const bool active = ms.visceral_pull && Cb::VisceralHoldChannel().Load(h) &&
+                            now - h.ns < 250'000'000 && h.active;
+        if (active && h.failed && pull_failed_seen != h.serial && pull_rip_seen != h.serial) {
+            pull_failed_seen = h.serial;
+            if (ms.haptics) {
+                HapticPattern lost{};
+                lost.priority = 3; // interrupt the heartbeat with a soft falling vibration
+                haptics[1].Play(lost.Pulse(0.3f, 25.0f).Ramp(0.25f, 0.0f, 120.0f));
+            }
         }
+        if (!active || h.released || !h.held) {
+            EndTearTension(); // no catch (or it ended): the next one measures afresh
+            pull_detector.Disarm();
+            return;
+        }
+        if (pull_held_serial != h.serial) {
+            // Measured afresh at the catch: the thrust's own recoil never pulls.
+            pull_held_serial = h.serial;
+            pull_sent = false;
+            pull_beat = 1.0f;
+            pull_fibre = 0;
+            pull_detector.Disarm();
+        }
+        if (pull_sent) {
+            return; // torn: the game lets go at its next update
+        }
+        float progress = 0.0f;
+        if (pose_ok) {
+            const P::V3 hand_tracking{right.position.x, right.position.y, right.position.z};
+            if (!pull_detector.Armed()) {
+                pull_detector.Arm(hand_rel,
+                                  {gesture.forward.x, gesture.forward.y, gesture.forward.z},
+                                  hand_tracking);
+            }
+            const bool yank = pull_detector.Step(hand_rel, vel_rel, pc, hand_tracking);
+            progress = pull_detector.Progress(pc);
+            Cb::VisceralPulledChannel().Store({h.serial, progress, yank, pull_detector.Travel(),
+                                               pull_detector.Peak(), yank ? now : 0});
+            if (yank) {
+                pull_sent = true;
+                EndTearTension(); // it gives: silence until the rip's burst
+                LOG_INFO(Render_Vulkan,
+                         "VR visceral pull: #{} PULLED {:.0f} ms after the catch: {:.0f} cm at "
+                         "{:.1f} m/s",
+                         h.serial, static_cast<double>(now - h.held_ns) * 1e-6,
+                         pull_detector.Travel() * 100.0f, pull_detector.Peak());
+                return;
+            }
+        } else {
+            // Untracked (or the space recentred): measured afresh once seen again, the throw
+            // where the last pull left it.
+            pull_detector.Disarm();
+            pull_space = recenter_serial;
+        }
+        if (!ms.haptics) {
+            EndTearTension();
+            return;
+        }
+        // The tear's tension (the right hand's continuous level, unless another feel's is above):
+        // lodged from the catch (the blade stuck in him: pull), rising as you pull.
+        auto& hand = haptics[1];
+        const float tension = std::max(P::LodgedTension, P::TearTension(progress));
+        const bool ours = pull_sustain > 0.0f && hand.sustain == pull_sustain;
+        if (tension > 0.0f && (ours || hand.sustain <= tension)) {
+            hand.sustain = pull_sustain = tension;
+        } else {
+            EndTearTension();
+        }
+        // A fibre giving every fifth of the pull (at most every 50 ms: a fast yank grinds once
+        // or twice); never again for ground already pulled.
+        const int fibre = static_cast<int>(progress * 5.0f);
+        if (fibre > pull_fibre) {
+            pull_fibre = fibre;
+            if (now - pull_fibre_ns >= 50'000'000) {
+                pull_fibre_ns = now;
+                HapticPattern p{};
+                p.priority = 1; // under the heartbeat
+                hand.Play(p.Pulse(0.15f + 0.35f * progress, 20.0f));
+            }
+        }
+        // The enemy's heart: racing as you wait, slower and fainter as you pull.
+        const P::Beat beat = P::HeartbeatAt(static_cast<float>(now - h.held_ns) * 1e-9f, progress);
+        pull_beat += dt / std::max(beat.interval_s, 0.05f);
+        if (pull_beat >= 1.0f) {
+            pull_beat = 0.0f;
+            HapticPattern p{};
+            p.priority = 2;
+            hand.Play(p.Pulse(beat.strength, 22.0f).Gap(65.0f).Pulse(beat.strength * 0.65f, 18.0f));
+        }
+    }
+
+    // The visceral pull's tension off the right hand (another feel's level is left alone).
+    void EndTearTension() {
+        if (pull_sustain > 0.0f && haptics[1].sustain == pull_sustain) {
+            haptics[1].sustain = 0.0f;
+        }
+        pull_sustain = 0.0f;
     }
 
     void UpdateVisceralThrust(const HandState& right, const GestureFrame& gesture,
@@ -11480,67 +12997,64 @@ struct OpenXRPresenter::Impl {
         namespace T = VR::Melee::Thrust;
         namespace M = VR::Melee;
         namespace Cb = VR::Combat;
-        namespace VP = PhysicalInteractions::VisceralPackets;
         const auto& ms = M::GetMeleeSettings();
-        PiVisceralInput p{};
-        p.dt = dt;
-        auto& f = p.thrust;
-        f.now_ns = VR::Body::SteadyNowNs();
-        f.thrust_enabled = ms.visceral_thrust;
-        f.visceral_enabled = ms.visceral;
-        f.haptics = ms.haptics;
-        f.turn_ok = two_hand_turn_ok;
-        f.weight = two_hand_out.weight;
-        f.q[0] = right.orientation.x; f.q[1] = right.orientation.y;
-        f.q[2] = right.orientation.z; f.q[3] = right.orientation.w;
-        f.turn[0] = two_hand_turn.x; f.turn[1] = two_hand_turn.y;
-        f.turn[2] = two_hand_turn.z; f.turn[3] = two_hand_turn.w;
-        f.blade_local[0] = config.blade_local.x;
-        f.blade_local[1] = config.blade_local.y;
-        f.blade_local[2] = config.blade_local.z;
-        f.min_speed = ms.visceral_thrust_speed;
-        f.min_travel_cm = ms.visceral_thrust_cm;
-        f.align_deg = ms.visceral_thrust_align_deg;
-        f.cue_mode = ms.visceral_cue;
-        p.motion.t = static_cast<double>(gesture.time) * 1e-9;
-        p.motion.active = swings;
-        p.motion.valid = right.valid && right.orientation_valid;
-        p.motion.v[0] = right.velocity.x; p.motion.v[1] = right.velocity.y;
-        p.motion.v[2] = right.velocity.z;
-        p.motion.head_ok = gesture.head_ok;
-        p.motion.head_v[0] = gesture.head_velocity.x;
-        p.motion.head_v[1] = gesture.head_velocity.y;
-        p.motion.head_v[2] = gesture.head_velocity.z;
-        p.motion.head_fwd[0] = gesture.forward.x;
-        p.motion.head_fwd[1] = gesture.forward.y;
-        p.motion.head_fwd[2] = gesture.forward.z;
-        const M::Window& w = melee_window.Current();
-        const u32 open_window = w.open ? w.serial : 0;
-        p.window = open_window;
-        const auto classified = visceral_runtime.ThrustFrame(p);
-        const auto publication = [](const PiThrustPublication& v) {
-            Cb::ThrustState st{};
-            st.enabled = v.enabled != 0; st.ns = v.ns;
-            st.thrust_serial = v.thrust_serial; st.thrust_window = v.thrust_window;
-            st.thrust_ns = v.thrust_ns; st.peak = v.peak; st.travel = v.travel;
-            st.verdict_window = v.verdict_window; st.verdict = static_cast<u8>(v.verdict);
-            st.why = VP::Text(v.why);
-            return st;
-        };
-        if (!classified.thrust.publication.enabled) {
-            Cb::ThrustChannel().Store(publication(classified.thrust.publication));
+        const s64 now = VR::Body::SteadyNowNs();
+        auto& st = thrust_state;
+        st.enabled = ms.visceral_thrust && ms.visceral;
+        st.ns = now;
+        if (!st.enabled) {
+            thrust_detector.Reset();
+            Cb::ThrustChannel().Store(st);
             return;
         }
-        // Preserve the native observation between classification/window and heartbeat processing.
         Cb::VisceralOpen vo{};
-        f.have_open = Cb::VisceralOpenChannel().Load(vo);
-        f.visceral_ns = vo.ns; f.game_open = vo.open; f.game_serial = vo.serial;
-        f.frame_sequence = classified.thrust.frame_sequence;
-        const auto feedback = visceral_runtime.ThrustFeedback(p);
-        const auto st = publication(feedback.thrust.publication);
-        const auto out = VP::Unpack(classified.decision);
-        const bool visceral_open = (feedback.thrust.flags & PI_THP_OPEN) != 0;
-        if ((classified.thrust.flags & PI_THP_FIRED) && st.enabled) {
+        const bool vo_ok = Cb::VisceralOpenChannel().Load(vo) && now - vo.ns < 300'000'000;
+        const bool visceral_open = vo_ok && vo.open;
+        const T::Config made =
+            T::Config::Make(ms.visceral_thrust_speed, ms.visceral_thrust_cm,
+                            ms.visceral_thrust_align_deg, 30.0f);
+        // A visceral open: a little easier to start (visceral_thrust.h EasedForOpenVisceral).
+        const T::Config tc = visceral_open ? made.EasedForOpenVisceral() : made;
+        // A visceral opening: the motion under way is judged again from now (Detector::Rejudge).
+        if (visceral_open && vo.serial != thrust_rejudged_serial) {
+            thrust_rejudged_serial = vo.serial;
+            thrust_detector.Rejudge();
+        }
+        T::Input in{};
+        in.t = static_cast<double>(gesture.time) * 1e-9;
+        in.active = swings;
+        in.valid = right.valid && right.orientation_valid;
+        in.v = {right.velocity.x, right.velocity.y, right.velocity.z};
+        M::Q4 q{right.orientation.x, right.orientation.y, right.orientation.z,
+                right.orientation.w};
+        // Two hands on the weapon (two_hand_grip): the blade the game shows is the right hand's
+        // turned onto the hands' line (ApplyTwoHand, the same turn and weight), so a thrust along
+        // it with both hands is judged along that blade, not the right controller's own.
+        // A weighted input already contains ApplyTwoHand's final orientation.
+        if (!(weapon_weight_active && weapon_weight_frame == xr_frames) &&
+            two_hand_turn_ok && two_hand_out.weight > 0.0f) {
+            const VR::Body::Quat turned = VR::Body::Normalize(
+                VR::Body::Normalize(VR::Body::Quat{q.x, q.y, q.z, q.w}) *
+                VR::Body::ScaleRotation(VR::Body::Normalize(two_hand_turn), two_hand_out.weight));
+            if (VR::Body::IsFinite(turned)) {
+                q = {turned.x, turned.y, turned.z, turned.w};
+            }
+        }
+        in.blade = M::Rotate(q, config.blade_local);
+        in.head_ok = gesture.head_ok;
+        in.head_v = {gesture.head_velocity.x, gesture.head_velocity.y, gesture.head_velocity.z};
+        in.head_fwd = {gesture.forward.x, gesture.forward.y, gesture.forward.z};
+        const T::Output out = thrust_detector.Update(in, tc);
+        const M::Window& w = melee_window.Current();
+        const u32 open_window = w.open ? w.serial : 0;
+        thrust_verdict.Step(open_window, out, dt);
+        if (out.fired) {
+            ++st.thrust_serial;
+            st.thrust_window = open_window;
+            st.thrust_ns = now;
+            // (a stab by the hand's path: its travel and peak toward the facing)
+            st.peak = out.by_path ? out.stats.path_peak : out.stats.peak;
+            st.travel = out.by_path ? out.stats.path_travel : out.stats.travel;
             LOG_INFO(Render_Vulkan,
                      "VR melee: THRUST {} (motion {}): {:.0f} cm along the blade at {:.2f} m/s, "
                      "the blade turned {:.0f} deg, {:.0f} cm off its axis, {:.0f} ms; the blade "
@@ -11553,20 +13067,37 @@ struct OpenXRPresenter::Impl {
                      out.stats.path_peak, out.stats.path_bend * RadToDeg, out.why, open_window,
                      visceral_open ? "" : "not ");
         }
+        st.verdict_window = thrust_verdict.window;
+        st.verdict = static_cast<u8>(thrust_verdict.verdict);
+        st.why = thrust_verdict.why;
         Cb::ThrustChannel().Store(st);
-        if (feedback.thrust.flags & PI_THP_LOG_VERDICT) {
+        if (visceral_open && thrust_verdict.window != 0 &&
+            thrust_verdict.window != thrust_logged_window &&
+            thrust_verdict.verdict != T::Verdict::Pending) {
+            thrust_logged_window = thrust_verdict.window;
             LOG_INFO(Render_Vulkan,
                      "VR melee: window #{} at an open visceral: a {} ({}), {:.0f} ms after it "
-                     "opened",
-                     feedback.window, T::VerdictName(static_cast<T::Verdict>(feedback.verdict)),
-                     VP::Text(feedback.why), feedback.age * 1000.0f);
+                     "opened | the motion: {:.0f} cm along the blade at {:.2f} m/s, the blade "
+                     "turned {:.0f} deg, {:.0f} cm off its axis, {:.0f} ms; the blade {:.0f} deg "
+                     "off the facing, {:+.0f} deg up; the hand's path {:.0f} cm ahead at {:.2f} "
+                     "m/s, bent {:.0f} deg",
+                     thrust_verdict.window, T::VerdictName(thrust_verdict.verdict),
+                     thrust_verdict.why, thrust_verdict.age * 1000.0f, out.stats.travel * 100.0f,
+                     out.stats.peak, out.stats.turn * RadToDeg, out.stats.misaligned * 100.0f,
+                     out.stats.time * 1000.0f, out.stats.yaw_off * RadToDeg,
+                     out.stats.elev * RadToDeg, out.stats.path_travel * 100.0f,
+                     out.stats.path_peak, out.stats.path_bend * RadToDeg);
         }
-        if (!(interaction_module.Available() &&
-              (interaction_dll_fault || interaction_module.Faulted())))
-            PlayInteractionHaptics(feedback.thrust);
-        if (feedback.thrust.flags & PI_THP_BEAT) {
+        // The heartbeat: a visceral opened (a target the hunter hit staggers within reach).
+        const bool beat =
+            thrust_cue.Step(ms.visceral_cue, vo_ok ? vo.serial : thrust_cue.serial,
+                            visceral_open, dt);
+        if (beat && ms.haptics) {
+            HapticPattern p{};
+            p.priority = 2;
+            haptics[1].Play(p.Pulse(0.45f, 24.0f).Gap(120.0f).Pulse(0.3f, 20.0f));
             LOG_INFO(Render_Vulkan, "VR melee: visceral heartbeat ({} of the open visceral, {:.1f} m)",
-                     feedback.beats, vo.distance);
+                     thrust_cue.beats, vo.distance);
         }
     }
 
@@ -11583,59 +13114,276 @@ struct OpenXRPresenter::Impl {
         namespace Cb = VR::Combat;
         auto& weapon_hand = haptics[1];
         const auto& ms = M::GetMeleeSettings();
-        M::TrackerConfig settings{};settings.onset=ms.open_onset;settings.charge_full_s=ms.charge_s;
-        settings.budget.enabled=ms.budget;settings.budget.charges=ms.budget_charges;settings.budget.scale=ms.budget_scale;
-        settings.budget.offset_s=ms.budget_offset_ms*.001f;
-        const auto facts=MeleeRightFacts(right,trigger);
-        const auto sample=melee_runtime.RightState();
-        const bool whip_form=sample.whip_form!=0,cutter_compact=sample.compact!=0;
-        VR::Whip::PublishSwingInput({VR::Body::SteadyNowNs(),sample.publish_speed,cutter_compact});
-        const s64 now=VR::Body::SteadyNowNs();
-        const M::Window before=melee_window.Current();
-        const auto whip_facts = [&] {
-            PiMeleeWhipFacts f{};
-            f.now_ns = now;
-            f.last_close_ns = melee_close_ns;
-            const auto feel = whip_form ? VR::Whip::LatestWhipFeel() : VR::Whip::WhipFeel{};
-            f.feel_ns = feel.ns;
-            f.lash = feel.lash;
-            f.locks = feel.locks;
-            f.reels = feel.reels;
-            f.out = feel.out;
-            f.tip_speed = feel.tip_speed;
-            f.payout_speed = VR::Whip::GetWhipSettings().payout_speed;
-            f.flags = (whip_form ? PI_MWF_FORM : 0) | (cutter_compact ? PI_MWF_COMPACT : 0) |
-                      (feel.driving ? PI_MWF_DRIVING : 0) |
-                      (feel.asked_out ? PI_MWF_ASKED_OUT : 0) | (swings ? PI_MWF_SWINGS : 0) |
-                      (ms.haptics ? PI_MWF_HAPTICS : 0) | (trigger ? PI_MWF_TRIGGER : 0) |
-                      (melee_runtime.ArcSustain() ? PI_MWF_ARC : 0) | (discharge ? PI_MWF_DISCHARGE : 0) |
-                      (feel.lifting ? PI_MWF_LIFTING : 0);
-            return f;
-        };
-        PiMeleeCoordinationFacts coordination{};
-        coordination.enabled=1;coordination.haptics=ms.haptics;coordination.now_ns=now;
-        Cb::MeleeStatus air{};coordination.have_air=Cb::LatestMeleeStatus(air);
-        coordination.air_ns=air.ns;coordination.air_falling=air.falling;coordination.fall_m=air.fall_m;
-        coordination.orientation_valid=right.orientation_valid;
-        coordination.hand_y=right.position.y;coordination.head_y=gesture.head_position.y;
-        coordination.q[0]=right.orientation.x;coordination.q[1]=right.orientation.y;
-        coordination.q[2]=right.orientation.z;coordination.q[3]=right.orientation.w;
-        coordination.blade_local[0]=config.blade_local.x;coordination.blade_local[1]=config.blade_local.y;
-        coordination.blade_local[2]=config.blade_local.z;
-        const auto physical_frame=melee_runtime.RightFrame(facts,settings,whip_facts(),coordination,
-            swings,dt,melee_feedback_runtime.HitSerial(1));
-        CopyRightMelee();
-        const auto ti=VR::Interactions::MP::Unpack(physical_frame.right.motion);
-        const auto tc=VR::Interactions::MP::Unpack(physical_frame.right.config);
-        M::TrackerOutput to=VR::Interactions::MP::Unpack(physical_frame.tracker);
-        const bool revolution=(physical_frame.whip.flags&PI_MWD_REVOLUTION)!=0;
-        ApplyWeaponMotion(physical_frame.coordination.commands);
-        if(physical_frame.coordination.flags&PI_MCO_PLUNGE)
-            LOG_INFO(Render_Vulkan,"VR melee: #{} PLUNGE with the blade held down ({:.1f} m fallen)",
-                     melee_window.Current().serial,air.fall_m);
+        melee_clock += dt;
+        M::TrackerInput ti{};
+        ti.dt = dt;
+        ti.swings = swings;
+        ti.stroke_live = melee.StrokeLive();
+        ti.stroke = melee.CurrentStroke();
+        ti.cocked = melee.CurrentCocked();
+        ti.recovery = melee.Recovery(); // bringing the weapon back: no window
+        ti.blade_rate = melee.Rate();
+        ti.stroke_peak = melee.StrokePeak();
+        ti.fired = out.fired;
+        ti.fired_stroke = out.fired_stroke;
+        ti.kind = out.kind;
+        ti.kind_stroke = out.stats.id;
+        ti.gate = out.gate;
+        if (right.valid) {
+            ti.hand_v = {right.velocity.x - gesture.head_velocity.x,
+                         right.velocity.y - gesture.head_velocity.y,
+                         right.velocity.z - gesture.head_velocity.z};
+            ti.hand_speed = M::Length(ti.hand_v);
+        }
+        if (two_hand_combat) {
+            // The lever point, as the classifier: the window's hand thresholds are the hand's.
+            const bool fresh = two_hand_blade.valid && two_hand_blade_frame == xr_frames;
+            const auto& v = two_hand_blade.lever_relative_velocity;
+            ti.hand_v = fresh ? M::V3{v.x, v.y, v.z} : M::V3{};
+            ti.hand_speed = fresh ? two_hand_blade.lever_speed : 0.0f;
+        }
+        ti.fwd_flat = M::Normalize({gesture.forward.x, 0.0f, gesture.forward.z});
+        ti.tip_speed = RightTipSpeed(right, gesture, config);
+        ti.hit_serial = melee_hit_serial;
+        // The physical whip's payout follows this swing speed (core/vr/whip_spin.h, the game's
+        // update: core/vr/bloodborne_whip.h); none while swings may not attack.
+        const bool whip_form = VR::Whip::GetWhipSettings().physical && melee_form_b &&
+                               VR::Whip::FindWhip(melee_variation) != nullptr;
+        const bool cutter_compact = VR::Whip::CompactCutter(
+            melee_variation, melee_form_b, VR::Whip::GetWhipSettings().physical, trigger);
+        // For this form the trigger is a held compact-mode control, not a charge modifier.
+        ti.trigger = trigger && !cutter_compact;
+        VR::Whip::PublishSwingInput({VR::Body::SteadyNowNs(),
+                                    swings && right.valid ? ti.tip_speed : 0.0f,
+                                    cutter_compact});
+        melee_tip_history[melee_tip_next++ % melee_tip_history.size()] = {melee_clock,
+                                                                          ti.tip_speed};
+        M::TrackerConfig tc{};
+        // Give a broad whip sweep another 120 ms to connect on the same attack. A whip's sweep
+        // whose far end got fast enough to fling the chain fully out is never aborted for want of
+        // a commit (the swing detector reads a blade's stroke: side-to-side lashes were aborted
+        // after 150 ms with the chain still paying out, 2026-10-15); the gate still vetoes.
+        if (whip_form && !cutter_compact) {
+            // The Beast Cutter's whip-form windows: 0.80 s (0.72 until 2026-10-15: the tester, a
+            // little more forgiving).
+            tc.max_open = melee_variation == 2400 ? 0.80f : 0.72f;
+            tc.commit_tip = VR::Whip::GetWhipSettings().payout_speed;
+        }
+        tc.onset = ms.open_onset;
+        tc.charge_full_s = ms.charge_s;
+        tc.budget.enabled = ms.budget;
+        tc.budget.charges = ms.budget_charges;
+        tc.budget.scale = ms.budget_scale;
+        tc.budget.offset_s = ms.budget_offset_ms * 0.001f;
+        tc.budget.quick_charges = ms.budget_quick_charges;
+        tc.budget.quick_s = ms.budget_quick_s;
+        // The Beast Cutter's whip: its lash is nearly always heavy: one charge, not two
+        // (melee_window.h BudgetConfig::heavy_cost; 2026-10-17) ... and one wound up within 0.8 s
+        // of a heavy is a light lash (a flurry's backswing is no wind-up; the one after may be
+        // heavy again: melee_window.h TrackerConfig::flurry_s). The Threaded Cane keeps 0.3.0's
+        // rules (2026-10-18, the tester: with these it was too easy).
+        if (whip_form && !cutter_compact && melee_variation == 2400) {
+            tc.budget.heavy_cost = 1;
+            tc.flurry_s = 0.8f;
+        }
+        const M::WeaponPace* pace = M::FindPace(melee_variation);
+        // A quick weapon (melee_budget_quick_charges): its light's own pace in this form, never a
+        // form without one (the generic default) nor a whip form (its registration pace below).
+        ti.light_pace = pace != nullptr && !(melee_form_b && VR::Whip::FindWhip(melee_variation))
+                            ? pace->recover[melee_form_b ? 3u : 0u]
+                            : 0.0f;
+        for (std::size_t k = 0; k < ti.recover.size(); ++k) {
+            ti.recover[k] = M::PaceRecover(pace, melee_form_b, static_cast<M::MoveKind>(k));
+            // A whip form (whip=physical: its swings are physical only then) at its own clips'
+            // pace (core/vr/whip_moves.h): the Beast Cutter's lash 1.23 s, the cane's 0.77 s;
+            // their charges back sooner (whip forms only): 270 ms for light, 150 ms for
+            // heavy/charged. Beast Cutter gets another 100 ms off each move's recovery, and since
+            // 2026-10-15 another 5% off its light, 10% off its heavy / charged (39 / 174 ms:
+            // 0.74 / 1.56 / 1.60 s), and later that day another 50 / 100 ms (feedback: a little
+            // more forgiving, gently: 0.69 / 1.46 / 1.50 s); the
+            // Threaded Cane another 100 ms off its light and 250 ms off its heavy / charged
+            // (2026-10-15, its lashes register about a quarter sooner: 0.32 / 0.85 / 0.79 s).
+            // That is registration only: their damage per second stays the game's (whip_pace,
+            // core/vr/whip_damage.h PaceMeter in bloodborne_melee.cpp MeleeDamage: a whip window
+            // that hurts before the game could have started its move, WhipRecover after the last,
+            // deals less by the share it is early; the generic cadence factor is off with the
+            // combo budget on). 2026-10-17 (feedback: a nice calibration, not much shorter): the
+            // Beast Cutter's x WhipRegisterScale (0.85): 0.58 / 1.23 / 1.27 s; the Threaded Cane
+            // keeps 0.3.0's 0.32 / 0.85 / 0.79 s (2026-10-18, the tester: too easy otherwise).
+            if (const float whip = melee_form_b ? VR::Whip::WhipRecover(melee_variation, k) : 0.0f;
+                whip > 0.0f) {
+                const bool light = k == static_cast<std::size_t>(M::MoveKind::Light);
+                const float sooner = (light ? 0.270f : 0.150f) +
+                                     (melee_variation == 2400   ? (light ? 0.189f : 0.374f)
+                                      : melee_variation == 2200 ? (light ? 0.100f : 0.250f)
+                                                                : 0.0f);
+                constexpr float WhipRegisterScale = 0.85f;
+                ti.recover[k] = (whip - sooner / std::max(ms.budget_scale, 0.1f)) *
+                                (melee_variation == 2400 ? WhipRegisterScale : 1.0f);
+            }
+        }
+        // The heaviest move the weapon has in this form (a heavy swing without a heavy row opens
+        // the light one: Rakuyo's form B; it costs a light's charge).
+        if (const M::WeaponMoves* moves = M::FindMoves(melee_variation); moves != nullptr) {
+            const M::MoveChoice top = M::ChooseMove(*moves, melee_form_b, M::MoveKind::Charged);
+            ti.top = top.row != nullptr ? top.kind : M::MoveKind::Charged;
+        }
+        // StakeMovesFor resolves this row from the running game's params; the generated
+        // table omits it. Preserve the charged punch in the budget as well as the attack.
+        if (VR::Tricks::StakePunch(melee_variation, melee_form_b, melee_charged_row)) {
+            ti.top = M::MoveKind::Charged;
+            tc.charge_full_s = VR::Tricks::BlastChargeS;
+        }
+        // The combo budget and the cadence clock run on real time whatever the route: the time
+        // since the last Step that this frame's dt does not cover (a game menu, the virtual
+        // screen, focus loss, the R1 / R2 route) comes first.
+        const s64 now = VR::Body::SteadyNowNs();
+        if (melee_step_ns != 0) {
+            const double gap = static_cast<double>(now - melee_step_ns) * 1e-9 - dt;
+            if (gap > 0.02) {
+                melee_window.Advance(gap);
+            }
+        }
+        melee_step_ns = now;
+        {
+            // The off hand's stroke that may be this swing's counter-motion holds a charge
+            // (melee_left): a wound-up swing one short waits for it rather than settling for a
+            // light (DropCounterMotion gives it back at this swing's commit, PayLate pays).
+            const M::Window& lw = melee_window_left.Current();
+            ti.hold_ago = left_single && lw.open && !lw.hit && lw.charges > 0
+                              ? static_cast<float>(now - melee_left_open_ns) * 1e-9f
+                              : -1.0f;
+            tc.hold_s = VR::Tricks::CounterSwingS; // (the tracker: against each window's start)
+        }
+        const M::Window before = melee_window.Current();
+        // The release owns this frame; a coincident classified swing cannot spend a second
+        // combo charge before the powered window is opened.
+        if (discharge) {
+            ti.fired = false;
+            ti.stroke_live = false;
+        }
+        M::TrackerOutput to = melee_window.Step(ti, tc);
+        if (discharge) {
+            const M::TrackerOutput r = melee_window.OpenPowered(ti, tc);
+            to.opened = r.opened;
+            to.committed = r.committed;
+            to.closed = to.closed || r.closed;
+            to.aborted = to.aborted || r.aborted;
+            to.refunded = to.refunded || r.refunded;
+            to.empty = r.empty;
+            to.paid_late = r.paid_late;
+        }
+        // A spun whip (core/vr/whip_spin.h): each revolution of the hand is a swing of its own, a
+        // window paid from the combo budget like any other (a stroke's own window restarts the
+        // count: at most one window per revolution).
+        bool revolution = false;
+        if (whip_form && !cutter_compact) {
+            const bool rev =
+                melee_spin.Step(ti.hand_v.x, ti.hand_v.y, ti.hand_v.z, dt, VR::Whip::SpinConfig{});
+            if (to.opened) {
+                melee_spin.Restart();
+            } else if (rev && swings) {
+                const M::TrackerOutput r = melee_window.OpenRevolution(ti, tc);
+                if (r.opened) {
+                    revolution = true;
+                    to.opened = true;
+                    to.closed = to.closed || r.closed;
+                    to.aborted = to.aborted || r.aborted;
+                    to.committed = to.committed || r.committed;
+                    to.refunded = to.refunded || r.refunded;
+                    to.empty = r.empty;
+                    to.paid_late = r.paid_late;
+                }
+            }
+            // A crack (core/vr/whip_spin.h CrackGate): the chain lashed out by a flick of the
+            // wrist alone, which the swing gate does not count, gets a window of its own too (paid
+            // the same way), so a lash you see hurts.
+            const VR::Whip::WhipFeel wf = VR::Whip::LatestWhipFeel();
+            const M::Window& cw = melee_window.Current();
+            const s64 last_close = to.closed ? now : melee_close_ns;
+            VR::Whip::CrackInput ci{};
+            ci.dt = dt;
+            ci.swings = swings && wf.driving && now - wf.ns < 150'000'000;
+            ci.window_open = cw.open;
+            ci.window_committed = cw.committed;
+            ci.since_close_s =
+                last_close != 0 ? static_cast<float>(now - last_close) * 1e-9f : 10.0f;
+            ci.lash = wf.lash;
+            ci.asked_out = wf.asked_out;
+            ci.out = wf.out;
+            ci.tip = wf.tip_speed;
+            ci.swing_speed = ti.tip_speed;
+            ci.v_drive = VR::Whip::GetWhipSettings().payout_speed;
+            ci.recovery = ti.recovery;
+            // The Beast Cutter's flick recall lifting the weapon back (whip_flick_recall=1):
+            // the same wrist snap as a crack, but a recall (core/vr/whip_flick.h).
+            ci.lifting = wf.lifting;
+            if (melee_crack.Step(ci, VR::Whip::CrackConfig{})) {
+                const M::TrackerOutput r = melee_window.OpenRevolution(ti, tc, "a whip crack");
+                if (r.opened) {
+                    melee_spin.Restart();
+                    to.opened = true;
+                    to.closed = to.closed || r.closed;
+                    to.aborted = to.aborted || r.aborted;
+                    to.committed = to.committed || r.committed;
+                    to.refunded = to.refunded || r.refunded;
+                    to.empty = r.empty;
+                    to.paid_late = r.paid_late;
+                }
+            }
+        } else {
+            melee_spin = {};
+            melee_crack = {};
+        }
+        // melee_plunge with the blade held point down (core/vr/plunge.h): falling (the game's air
+        // tracker, PlungeDownM down so far) with the blade within 45 degrees of straight down and
+        // no swing open, a window of its own opens, as a swing's would: the plunge holds its attack
+        // to the landing, so the blade hits what you land on. Once per fall.
+        {
+            Cb::MeleeStatus air{};
+            const bool falling = Cb::LatestMeleeStatus(air) && now - air.ns < 250'000'000 &&
+                                 air.falling && air.fall_m >= PlungeDownM;
+            if (!falling) {
+                plunge_down_armed = true;
+            } else if (plunge_down_armed && swings && right.orientation_valid &&
+                       right.position.y >= gesture.head_position.y - PlungeDownFistM &&
+                       !melee_window.Current().open) {
+                const M::Q4 q{right.orientation.x, right.orientation.y, right.orientation.z,
+                              right.orientation.w};
+                const M::V3 blade = M::Normalize(M::Rotate(q, config.blade_local));
+                if (blade.y <= -PlungeDownCos) {
+                    const M::TrackerOutput r =
+                        melee_window.OpenRevolution(ti, tc, "a plunge: the blade held down");
+                    if (r.opened) {
+                        plunge_down_armed = false;
+                        to.opened = true;
+                        to.closed = to.closed || r.closed;
+                        to.aborted = to.aborted || r.aborted;
+                        to.committed = to.committed || r.committed;
+                        to.refunded = to.refunded || r.refunded;
+                        to.empty = r.empty;
+                        to.paid_late = r.paid_late;
+                        if (ms.haptics && !r.empty) {
+                            weapon_hand.Play(Tick(0.35f, 15.0f, 2)); // the point set
+                        }
+                        LOG_INFO(Render_Vulkan,
+                                 "VR melee: #{} PLUNGE with the blade held down ({:.1f} m fallen)",
+                                 melee_window.Current().serial, air.fall_m);
+                    }
+                }
+            }
+        }
         const M::Window& w = melee_window.Current();
+        if (to.opened) {
+            melee_open_ns = now;
+            melee_prev_serial = before.serial;
+            melee_prev_aborted = before.open ? !before.committed : before.aborted;
+        }
+        if (to.closed) {
+            melee_close_ns = now;
+        }
         if (w.open) {
-            NoteWeaponAttack(); // a squeeze now is a flick (GripMotion)
+            since_attack = 0.0f; // a squeeze now is a flick (GripMotion)
         }
         // The off hand's counter-motion to this swing (melee_left): dropped now, and a charge it
         // held pays this swing if it could not be (no empty buzz: it registers).
@@ -11646,14 +13394,55 @@ struct OpenXRPresenter::Impl {
                 to.paid_late = true;
             }
         }
-        coordination.trigger=trigger;coordination.revolution=revolution;
-        coordination.current_sustain=weapon_hand.sustain;
-        const auto feedback=melee_runtime.Coordinate(PI_MELEE_PHYSICAL_FEEDBACK,coordination,tc,to);
-        ApplyWeaponMotion(feedback.commands);
-        if(ms.haptics){
-            // Preserve the second raw whip-feel observation after charge playback.
-            const auto feel=melee_window.WhipPhysicalFeedback(whip_facts(),weapon_hand.sustain);
-            ApplyWeaponMotion(feel.commands);
+        if (ms.haptics) {
+            if (to.empty && !revolution) {
+                // The combo budget had no charge for it: a dull buzz, not the swing's tick (a
+                // spun whip's revolution: none, it just does not hurt).
+                HapticPattern p{};
+                p.priority = 3;
+                weapon_hand.Play(p.Pulse(0.10f, 45.0f).Ramp(0.10f, 0.03f, 75.0f));
+            } else if (to.committed && !w.unpaid) {
+                weapon_hand.Play(Tick(0.2f, 10.0f));
+            }
+            if (to.charge_full) {
+                weapon_hand.Play(Repeat(3, 0.6f, 20.0f, 40.0f, 2)); // fully charged
+            } else if (to.charge_heavy) {
+                weapon_hand.Play(Tick(0.25f, 15.0f));
+            }
+            if (trigger && !arc_sustain) {
+                const float build = std::clamp(melee_window.ChargeHeld() / tc.charge_full_s, 0.0f,
+                                               1.0f);
+                weapon_hand.sustain = 0.06f + 0.30f * build; // the charge builds
+                melee_charge_sustain = true;
+            } else if (melee_charge_sustain) {
+                weapon_hand.sustain = 0.0f;
+                melee_charge_sustain = false;
+            }
+            // The physical whip: a light hum rising with its payout and speed, a tick as it locks
+            // out at its full length, a soft click as it reels back onto its stick.
+            const VR::Whip::WhipFeel feel =
+                whip_form ? VR::Whip::LatestWhipFeel() : VR::Whip::WhipFeel{};
+            const bool feel_fresh = feel.driving && now - feel.ns < 150'000'000;
+            if (feel_fresh && feel.locks != melee_whip_locks && feel.locks != 0) {
+                weapon_hand.Play(Tick(0.45f, 12.0f));
+            } else if (feel_fresh && feel.reels != melee_whip_reels && feel.reels != 0) {
+                weapon_hand.Play(Tick(0.2f, 8.0f));
+            }
+            melee_whip_locks = feel.locks;
+            melee_whip_reels = feel.reels;
+            const float hum =
+                feel_fresh ? std::clamp(feel.out, 0.0f, 1.5f) *
+                                 (0.03f + 0.09f * std::clamp(feel.tip_speed / 40.0f, 0.0f, 1.0f))
+                           : 0.0f;
+            if (!trigger && !arc_sustain) {
+                if (hum > 0.01f) {
+                    weapon_hand.sustain = std::min(hum, 0.18f);
+                    melee_whip_sustain = true;
+                } else if (melee_whip_sustain) {
+                    weapon_hand.sustain = 0.0f;
+                    melee_whip_sustain = false;
+                }
+            }
         }
         PublishMeleeWindowNow();
         // The telegraph: a swing the enemies may read (melee_telegraph) gets the game's own attack
@@ -11739,81 +13528,134 @@ struct OpenXRPresenter::Impl {
         }
     }
 
+    // right_grip=transform: whether a swing may attack now. Never while a game menu is open, in a
+    // cinematic, while the armed Blood Vial reaches for the weapon hand's wrist or is being
+    // injected (VialReaching; an armed vial alone keeps swings, so a visceral after a parry still
+    // works), while an NPC talks (talk_guard), while Menu is held or the grip adjust holds the
+    // weapon, in the first SwingContextHold after a context switch, or with the weapon hand at the
+    // face (HandAtFace: lowered again from the headset it would look like a chop). Once nothing
+    // holds them back the hand must first be slow (SwingQuietSpeed for SwingQuietTime), so a
+    // motion already under way never attacks; only a strike out of the face zone (fast, away from
+    // the head) is on at once. Changes are logged (`VR swing: swings on / off`); a swing held back
+    // gets the deny double tick (UpdateMotionWeapon's shadow classifier).
     static constexpr const char* FaceBlock = "the hand at the face";
-    void CopyWeaponSwing() {
-        const auto& state=whip_transform_hold.SwingState();drawn=state.drawn!=0;
-        swing_block=state.block==PI_WS_MUSIC?MusicBoxBlock:state.block==PI_WS_FACE?FaceBlock:
-            PhysicalInteractions::SwingBlockNames[state.block];
+
+    bool SwingGate(const PhysicalState& in, const HandState& right, const GestureFrame& gesture,
+                   bool talking, float dt) {
+        const bool at_face = HandAtFace(right, gesture, hand_at_face);
+        const char* why = nullptr;
+        if (physical_lever_out.owns_grip[1]) {
+            why = "the right hand owns a lever grip";
+        } else if (!VR::GetSettings().gestures) {
+            why = "gestures=0";
+        } else if (menu_context || VR::IsGameMenuOpen()) {
+            why = "a game menu is open";
+        } else if (VR::CinematicActive()) {
+            why = "a cinematic";
+        } else if (VialReaching()) {
+            why = "the Blood Vial is at the wrist";
+        } else if (music_box_free) {
+            why = MusicBoxBlock;
+        } else if (talking) {
+            why = "an NPC is talking";
+        } else if (in[PhysMenu]) {
+            why = "Menu held";
+        } else if (grip_adjust.Frozen()) {
+            why = "the grip adjust";
+        } else if (context_age < SwingContextHold) {
+            why = "a context switch";
+        } else if (at_face) {
+            why = FaceBlock;
+        }
+        if (why != nullptr) {
+            if (swing_ready || (why != swing_block && SwingLogEnabled())) {
+                LOG_INFO(Render_Vulkan, "VR swing: swings off ({})", why);
+            }
+            swing_ready = false;
+            swing_block = why;
+            swing_quiet = 0.0f;
+            return false;
+        }
+        if (!swing_ready && swing_block == MusicBoxBlock) {
+            // The music box put away: the weapon is back in the hand this frame, and so are its
+            // swings (a crank is turned slowly: nothing under way to wait for).
+            swing_ready = true;
+            swing_block = nullptr;
+            LOG_INFO(Render_Vulkan, "VR swing: swings on (the music box put away)");
+            return true;
+        }
+        if (!swing_ready) {
+            const float speed = right.valid ? std::hypot(right.velocity.x - gesture.head_velocity.x,
+                                                         right.velocity.y - gesture.head_velocity.y,
+                                                         right.velocity.z - gesture.head_velocity.z)
+                                            : SwingQuietSpeed;
+            if (swing_block == FaceBlock && right.valid && gesture.head_ok) {
+                // Out of the face zone fast and away from the head: a strike from an overhead
+                // wind-up, not the hand lowered from the headset. Swings are on at once and the
+                // stroke under way may still commit (no OnDraw).
+                const VR::Vec3 d{right.position.x - gesture.head_position.x,
+                                 right.position.y - gesture.head_position.y,
+                                 right.position.z - gesture.head_position.z};
+                const float length = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+                const float away = length > 1e-4f
+                                       ? ((right.velocity.x - gesture.head_velocity.x) * d.x +
+                                          (right.velocity.y - gesture.head_velocity.y) * d.y +
+                                          (right.velocity.z - gesture.head_velocity.z) * d.z) /
+                                             length
+                                       : 0.0f;
+                if (away >= FaceStrikeSpeed) {
+                    swing_ready = true;
+                    swing_block = nullptr;
+                    LOG_INFO(Render_Vulkan,
+                             "VR swing: swings on (a strike from the face, {:.1f} m/s away from "
+                             "the head)",
+                             away);
+                    return true;
+                }
+            }
+            swing_quiet = speed < SwingQuietSpeed ? swing_quiet + dt : 0.0f;
+            if (swing_quiet >= SwingQuietTime) {
+                swing_ready = true;
+                swing_block = nullptr;
+                melee.OnDraw(); // the detector re-arms once the hand is slow (it is)
+                LOG_INFO(Render_Vulkan, "VR swing: swings on");
+            }
+        }
+        return swing_ready;
     }
-    PiWeaponSwingOutput WeaponSwing(u32 operation,const PiWeaponSwingFacts& facts={}) {
-        auto out=whip_transform_hold.Swing(operation,facts);CopyWeaponSwing();return out;
-    }
-    PiWeaponSwingFacts WeaponSwingFacts(const HandState& hand,const GestureFrame& gesture,float dt,const PhysicalState& input={}) const {
-        const auto& settings=VR::GetSettings();PiWeaponSwingFacts f{};
-        f.dt=dt;f.context_age=context_age;f.face_enter_speed=settings.swing_face_enter_speed;
-        f.clutch=settings.right_grip_draw;f.grip=input[PhysGripR];
-        f.sticky=settings.sticky_grip;f.gestures=settings.gestures;f.talk_guard=settings.talk_guard;
-        f.npc_talking=VR::IsNpcTalking();f.lever=physical_lever_out.owns_grip[1];
-        f.menu_context=menu_context;f.menu=VR::IsGameMenuOpen();f.cinematic=VR::CinematicActive();
-        f.vial=VialReaching();f.music=music_box_free;f.menu_held=input[PhysMenu];f.frozen=grip_adjust.Frozen();
-        f.hand_valid=hand.valid;f.head_valid=gesture.head_ok;
-        f.hand_p[0]=hand.position.x;f.hand_p[1]=hand.position.y;f.hand_p[2]=hand.position.z;
-        f.head_p[0]=gesture.head_position.x;f.head_p[1]=gesture.head_position.y;f.head_p[2]=gesture.head_position.z;
-        f.hand_v[0]=hand.velocity.x;f.hand_v[1]=hand.velocity.y;f.hand_v[2]=hand.velocity.z;
-        f.head_v[0]=gesture.head_velocity.x;f.head_v[1]=gesture.head_velocity.y;f.head_v[2]=gesture.head_velocity.z;
-        f.forward[0]=gesture.forward.x;f.forward[1]=gesture.forward.y;f.forward[2]=gesture.forward.z;
-        f.right_family=RightFamily();f.form_b=RightFormB();f.grip_ready=right_grip_ready;
-        f.hand_transform=VR::Tricks::GetTrickSettings().hand_transform;f.saw_spinning=saw_runtime.Spinning();
-        f.shared_grip_down=grip_r_down;f.log_enabled=SwingLogEnabled();return f;
-    }
-    void LogWeaponSwing(const PiWeaponSwingOutput& out) {
-        if(out.events&PI_WS_OFF_LOG)LOG_INFO(Render_Vulkan,"VR swing: swings off ({})",swing_block);
-        if(out.events&PI_WS_MUSIC_LOG)LOG_INFO(Render_Vulkan,"VR swing: swings on (the music box put away)");
-        if(out.events&PI_WS_FACE_LOG)LOG_INFO(Render_Vulkan,"VR swing: swings on (a strike from the face, {:.1f} m/s away from the head)",out.away);
-        if(out.events&PI_WS_ON_LOG)LOG_INFO(Render_Vulkan,"VR swing: swings on");
+
+    // A hand at the face (touching or adjusting the headset; `at_face` its own state): within
+    // FaceEnter of the eyes (out again past FaceExit) and not behind them (the over-the-shoulder
+    // and behind-the-head wind-ups are 12-20 cm behind the eyes). Kept through tracking gaps.
+    bool HandAtFace(const HandState& hand, const GestureFrame& g, bool& at_face) {
+        if (!hand.valid || !g.head_ok) {
+            return at_face;
+        }
+        const VR::Vec3 d{hand.position.x - g.head_position.x, hand.position.y - g.head_position.y,
+                         hand.position.z - g.head_position.z};
+        const float distance = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+        const float ahead = d.x * g.forward.x + d.y * g.forward.y + d.z * g.forward.z;
+        // A hand comes to the headset and stops there; a swing passing the face at speed (a chop
+        // from beside or behind the head) never turns swings off (swing_face_enter_speed).
+        const float speed = std::hypot(hand.velocity.x - g.head_velocity.x,
+                                       hand.velocity.y - g.head_velocity.y,
+                                       hand.velocity.z - g.head_velocity.z);
+        VR::Melee::FaceRule rule{FaceBehind, FaceEnter, FaceExit};
+        rule.enter_speed = VR::GetSettings().swing_face_enter_speed;
+        at_face = VR::Melee::HandAtFace(at_face, ahead, distance, speed, rule);
+        return at_face;
     }
 
     // One attack press with its haptic: light tick, heavy thunk, or the rejected double tick
     // when the pad mapper drops the press.
-    PiWeaponMotionOutput WeaponMotion(u32 operation, const PiWeaponMotionFacts& facts = {}) {
-        auto out=whip_transform_hold.Coordinate(operation,facts);
-        const auto& state=whip_transform_hold.CoordinatorState();
-        heavy=static_cast<Heavy>(state.heavy);since_attack=state.since_attack;CopyWeaponSwing();CopyWeaponRoute();
-        return out;
-    }
-    void ResetWeaponMotion() { WeaponMotion(PI_WEAPON_INPUT_TRIGGER_RESET); }
-    void CancelWeaponCharge() { WeaponMotion(PI_WEAPON_INPUT_CANCEL_CHARGE); }
-    void NoteWeaponAttack() { WeaponMotion(PI_WEAPON_INPUT_NOTE_ATTACK); }
-    void ApplyWeaponMotion(const PiWeaponMotionOutput& result, const VR::Melee::Output* swing = nullptr,
-                           u32* held = nullptr) {
-        if(held && !(interaction_module.Available() && (interaction_dll_fault || interaction_module.Faulted()))) {
-            if(result.held_r1)*held|=static_cast<u32>(PadButton::R1);
-            if(result.held_r2)*held|=static_cast<u32>(PadButton::R2);
-        }
-        for(u32 i=0;i<result.command_count;++i) {
-            const auto& c=result.command[i];
-            const bool fault=interaction_module.Available() && (interaction_dll_fault || interaction_module.Faulted());
-            if(c.kind==PI_WM_SUSTAIN) {
-                if(!fault || ((result.flags&PI_WM_FAULT_CLEANUP) && c.sustain==0))haptics[1].sustain=c.sustain;
-            } else if(!fault && c.kind==PI_WM_PATTERN) {
-                const auto pattern=PlaybackPattern(c.pattern);
-                for(u32 hand=0;hand<2;++hand)if(c.pattern.side_mask&(1u<<hand))haptics[hand].Play(pattern);
-            } else if(!fault && c.kind==PI_WM_ON_DRAW) {
-                melee.OnDraw();
-            } else if(!fault && c.kind==PI_WM_LEFT_DRAW) {
-                melee_left.OnDraw();
-            } else if(!fault && c.kind==PI_WM_ATTACK && swing) {
-                Attack(c.button ? PadButton::R2 : PadButton::R1,*swing,
-                       PhysicalInteractions::WeaponAttackReasons[c.reason],c.heavy);
-            }
-        }
-    }
-    void Attack(PadButton button, const VR::Melee::Output& out, const char* reason, u32 display_heavy) {
-        const bool ok=pad.Press(button);
-        PiWeaponMotionFacts receipt{};receipt.button=button==PadButton::R2;receipt.accepted=ok;
-        receipt.current_sustain=haptics[1].sustain;
-        ApplyWeaponMotion(WeaponMotion(PI_WEAPON_INPUT_ATTACK_RECEIPT,receipt));
-        AttackLog(button,out,reason!=nullptr?reason:out.reason,ok,display_heavy);
+    void Attack(PadButton button, const VR::Melee::Output& out, const char* reason = nullptr) {
+        auto& weapon_hand = haptics[1];
+        since_attack = 0.0f;
+        const bool ok = pad.Press(button);
+        weapon_hand.Play(!ok                       ? Repeat(2, 0.15f, 10.0f, 50.0f, 3)
+                         : button == PadButton::R2 ? HeavyThunk()
+                                                   : Tick(0.35f, 15.0f));
+        AttackLog(button, out, reason != nullptr ? reason : out.reason, ok);
     }
 
     // One vignette (VrOverlay::AppendVignette's draw item): to the late warp (vignette_in_warp,
@@ -11883,15 +13725,32 @@ struct OpenXRPresenter::Impl {
             controller_alpha = {};
             laser_alpha = laser_hold = 0.0f;
             laser_raised = false;
-            PiMeleeFeedbackInput reset{};reset.operation=PI_MF_VIGNETTE_INACTIVE;
-            reset.vignette.initial_hits=vignette_initial_hits;
-            reset.vignette.hits=VR::HitTakenCount();reset.vignette.heals=VR::ItemHealCount();
-            melee_feedback_runtime.Step(reset);
+            hit_seen = VR::HitTakenCount(); // no late flash for a hit it could not show
+            hit_level = hit_hold = 0.0f;
+            hit_dir_on = false;
+            heal_seen = VR::ItemHealCount();
+            heal_trigger = nullptr;
+            heal_level = heal_hold = heal_context = 0.0f;
+            heal_rising = false;
+            daze_fader = {};
+            stun_hold = {};
             return;
         }
         const auto& s = VR::GetSettings();
         const auto& body = VR::Body::GetBodySettings();
-        const OverlayInput& in = overlay_in;
+        OverlayInput in = overlay_in;
+        if (s.overlay_compose_eyes) {
+            if (const auto* hands = LateHandsAt(last_head.time);
+                hands && hands->xr_time == last_head.time) {
+                for (u32 i = 0; i < 2; ++i) {
+                    const auto& h = hands->hand[i];
+                    if (h.position_valid && h.orientation_valid) {
+                        in.grip[i].position = {h.p.x, h.p.y, h.p.z};
+                        in.grip[i].orientation = {h.q.x, h.q.y, h.q.z, h.q.w};
+                    }
+                }
+            }
+        }
         auto& items = overlay.Items();
         const auto pose_matrix = [](const HandState& hand) {
             const auto& q = hand.orientation;
@@ -11921,12 +13780,12 @@ struct OpenXRPresenter::Impl {
             // A healed stab's freeze (vial_inject_hold_ms): this vial stays where it went in
             // too, with the hunter's hand, then eases back to the controller.
             O::Mat4 vial_grip = overlay_grip[0];
-            if ((UsingInteractionDll() || inject_hands[0].On()) && in.grip[0].pose_valid) {
+            if (inject_hands[0].On() && in.grip[0].pose_valid) {
                 const auto& g = in.grip[0];
                 VR::Body::Vec3 p{g.position.x, g.position.y, g.position.z};
                 VR::Body::Quat q{g.orientation.x, g.orientation.y, g.orientation.z,
                                  g.orientation.w};
-                if (BlendInjectPose(p, q, recenter_serial, VR::Body::SteadyNowNs())) {
+                if (inject_hands[0].Blend(p, q, recenter_serial, VR::Body::SteadyNowNs())) {
                     vial_grip = O::Mat4::FromPose({{q.x, q.y, q.z, q.w}, {p.x, p.y, p.z}});
                 }
             }
@@ -11960,8 +13819,7 @@ struct OpenXRPresenter::Impl {
         }
 
         // (3) Ghost hands: ghost_alpha is eased by UpdateBodyFeedback.
-        if (gameplay && body.body && body.ghost_hands &&
-            (!interaction_dll_requested || !VR::Interactions::ProcessFaultLatch().Tripped())) {
+        if (gameplay && body.body && body.ghost_hands) {
             for (u32 i = 0; i < 2; ++i) {
                 if (ghost_alpha[i] > 0.01f && in.grip[i].pose_valid) {
                     O::AppendGhostHand(items, i == 0 ? O::Hand::Left : O::Hand::Right,
@@ -11986,15 +13844,16 @@ struct OpenXRPresenter::Impl {
                            {.length_m = 3.0f, .radius_m = 0.002f, .alpha = laser_alpha});
         }
 
-        // The off-hand target uses exactly the same bone transforms as acquisition and placement.
+        // The off-hand target uses the weapon's published grip, including smoothing
+        // and inertia, with the same bone calibration as placement.
         // No lingering cue after a menu, tracking loss, or release of the right grip.
         const auto& two_settings = VR::TwoHand::GetTwoHandSettings();
         const bool guide = two_settings.enabled && two_settings.guide && gameplay &&
                            VR::IsFirstPerson() && colors_visible && in.grip_space &&
                            !s.controls_classic && !s.right_grip_draw && !grip_adjust.Frozen() &&
-                           in.raw[PhysGripR] && !blocked[PhysGripR] && !two_hand_runtime.Seated() &&
+                           in.raw[PhysGripR] && !blocked[PhysGripR] && !two_hand_support.Seated() &&
                            !vial_on && !held_shown &&
-                           VR::Quick::WeaponGrabAvailable(QuickPhase()) &&
+                           VR::Quick::WeaponGrabAvailable(quick.GetPhase()) &&
                            !vial_armed && !inject_waiting && inject_hold <= 0.0f &&
                            in.grip[1].valid && in.grip[1].orientation_valid &&
                            two_hand_guide_available && two_hand_status_ok &&
@@ -12002,10 +13861,61 @@ struct OpenXRPresenter::Impl {
                            (two_hand_status.two_handed ||
                             (VR::Tricks::GetTrickSettings().hand_transform &&
                              VR::Tricks::GrabFamily(two_hand_status.family)));
+        // The guide's log (2026-10-15: not drawn on the clean branch): at each right-grip squeeze
+        // with a weapon the guide is for, what kept it hidden, or that it shows.
+        // The guide log (off for performance):
+        // const bool guide_weapon =
+            // two_hand_status_ok &&
+            // (two_hand_status.two_handed ||
+             // (VR::Tricks::GetTrickSettings().hand_transform &&
+              // VR::Tricks::GrabFamily(two_hand_status.family)));
+        // if (in.raw[PhysGripR] && !guide_grip_was && guide_weapon && guide_logs < 200) {
+            // ++guide_logs;
+            // const char* why = !two_settings.enabled || !two_settings.guide ? "the setting is off"
+                              // : !gameplay                                  ? "not gameplay"
+                              // : !VR::IsFirstPerson()                       ? "not first person"
+                              // : !colors_visible                            ? "colours not visible"
+                              // : !in.grip_space                             ? "no grip space"
+                              // : s.controls_classic || s.right_grip_draw    ? "classic / grip draw"
+                              // : grip_adjust.Frozen()                       ? "grip adjust"
+                              // : blocked[PhysGripR]                         ? "right grip blocked"
+                              // : two_hand_support.Seated()                  ? "already seated"
+                              // : vial_on                                    ? "the vial is shown"
+                              // : held_shown                                 ? "a held item is shown"
+                              // : !VR::Quick::WeaponGrabAvailable(quick.GetPhase())
+                                  // ? "a quick item phase"
+                              // : vial_armed || inject_waiting || inject_hold > 0.0f
+                                  // ? "a vial armed or injecting"
+                              // : !in.grip[1].valid || !in.grip[1].orientation_valid
+                                  // ? "right grip pose invalid"
+                              // : !two_hand_guide_available
+                                  // ? (two_hand_guide_why != nullptr ? two_hand_guide_why
+                                                                   // : "not available")
+                              // : VR::Body::SteadyNowNs() - two_hand_status.ns >= 1'000'000'000
+                                  // ? "weapon status stale"
+                                  // : nullptr;
+            // LOG_INFO(Render_Vulkan, "VR two-hand guide: right grip on {} (family {}{}): {}{}",
+                     // VR::Body::WeaponName(two_hand_status.family), two_hand_status.family,
+                     // two_hand_status.two_handed ? ", two-handed form" : "",
+                     // why == nullptr ? "SHOWN" : "hidden: ", why == nullptr ? "" : why);
+        // }
+        // guide_grip_was = in.raw[PhysGripR];
         if (guide) {
             const auto& st = two_hand_status;
-            auto handle = VR::TwoHand::HandleAt(TwoHandPose(in.grip[1]), st.right,
-                                                 st.grip, st.scale);
+            // A missing fully tracked body sample must not hide an otherwise valid
+            // input-space guide (the runtime can infer controller position). Prefer
+            // the final weapon pose, but retain the original guide's fallback.
+            const auto guide_pose = guide_weapon_frame == xr_frames &&
+                                            VR::Body::IsTracked(guide_weapon_hand)
+                                        ? VR::TwoHand::Pose{guide_weapon_hand.p, guide_weapon_hand.q}
+                                        : TwoHandPose(in.grip[1]);
+            auto handle = VR::TwoHand::HandleAt(guide_pose, st.right, st.grip, st.scale);
+            // The guide log (off for performance):
+            // if (!handle.valid && guide_logs < 200) {
+            //     ++guide_logs;
+            //     LOG_INFO(Render_Vulkan, "VR two-hand guide: not drawn (the handle is not
+            //     valid)");
+            // }
             handle.blade_clear = two_hand_blade_clear.Get(st.family);
             if (handle.valid) {
                 // The grabbable rail: off the right fist itself (ZoneOf), across it only when
@@ -12063,77 +13973,154 @@ struct OpenXRPresenter::Impl {
         // same red held while a blow's on-feet hit reaction refuses swings, gone within
         // VR::HitStun::FadeOutS of the game's attack window; a light stagger shows it alone (the
         // black tunnel steps aside, VR::HitStun::BlackLevel), a heavy one keeps the black with it.
-        const auto visual_frame=UpdateVignettes(dt,gameplay);
-        const auto& vignette=visual_frame.vignette;
-        const float heal=vignette.heal,daze=vignette.daze,stun_level=vignette.stun;
-        const float hit_flash=vignette.flash,hit=vignette.hit,daze_share=vignette.share;
-        const float heal_context=vignette.context;
+        const float heal = UpdateHealVignette(dt);
+        const float daze = UpdateStaggerVignette(dt); // first: the hit flash's fade reads it
+        const float stun_level = UpdateHitStun(dt); // after it (its status), before the flash
+        const float hit_flash = UpdateHitVignette(dt);
+        // The hold at this blow's flash peak (an old blow's: the lowest peak, the plain ring).
+        const bool stun_hit_recent = hit_age_s <= VR::HitStun::HitRecentS;
+        const float hit =
+            VR::HitStun::Red(hit_flash, stun_level, stun_hit_recent ? hit_peak : HitPeakMin,
+                             s.hitstun_vignette_strength);
+        const bool stun_plain = hit > hit_flash && !stun_hit_recent;
+        const float daze_share = VR::Daze::Share(daze, daze_fader.Shown(), s.stagger_vignette_fit,
+                                                 s.stagger_vignette_strength);
+        const bool heal_here = gameplay && !VR::MenuPanelActive();
+        heal_context = Approach(heal_context, heal_here ? 1.0f : 0.0f, dt / 0.15f);
         // VR_HITSTUN_LOG=1 (tests): every XR frame with red or black at the edges, the opacities
         // drawn at the visible edge (before the profile) and the steady clock.
         static const bool stun_trace = std::getenv("VR_HITSTUN_LOG") != nullptr;
-        if (stun_trace && (hit > 0.0f || daze > 0.0f || (vignette.flags & PI_VG_STUN_SHOWN))) {
+        if (stun_trace && (hit > 0.0f || daze > 0.0f || stun_hold.Shown())) {
             LOG_INFO(Render_Vulkan,
                      "VR hit-stun trace: t {:.1f} ms clip {} hold {:.2f} flash {:.2f} red {:.3f} "
                      "black {:.3f}{}",
-                     static_cast<double>(VR::Body::SteadyNowNs()) * 1e-6, vignette.stun_clip,
+                     static_cast<double>(VR::Body::SteadyNowNs()) * 1e-6, stun_clip_now,
                      stun_level, hit_flash,
                      std::min(hit * heal_context * s.hit_vignette_strength *
                                   VR::Daze::RedScale(daze_share, s.stagger_vignette_red),
                               1.0f),
                      daze * heal_context, heal_context < 1.0f ? " (out of gameplay)" : "");
         }
-        O::Pose head{};
-        const bool head_ok=(visual_frame.vignette_visual.flags&PI_VGO_HEAD)&&overlay.HeadPose(head);
-        const auto visuals=VignetteVisualFor(visual_frame,head_ok);
-        const auto append=[&](const PiVignetteShape& v,const O::Vec3& color) {
-            PutVignette(items,head,{.color=color,.alpha=v.alpha,.distance_m=std::max(s.hud_depth_m,.5f),
-                .profile_power=v.power,.inner_deg=v.inner_deg,.full_deg=v.full_deg,
-                .wedge_focus=v.wedge_focus,.wedge_x=v.wedge_x,.wedge_y=v.wedge_y,.wedge_power=v.wedge_power,
-                .fit_inner=v.fit_inner,.fit_full=v.fit_full});
-        };
-        if(visuals.flags&PI_VGO_BLACK)append(visuals.black,O::Vec3{0,0,0});
-        if(visuals.flags&PI_VGO_HEAL) {
-            const auto& c=s.heal_vignette_color;
-            append(visuals.heal,O::Vec3{SrgbToLinear(c[0]),SrgbToLinear(c[1]),SrgbToLinear(c[2])});
+        if (heal > 0.0f && heal_here != heal_here_logged) {
+            heal_here_logged = heal_here;
+            LOG_INFO(Render_Vulkan, "VR heal vignette: {}",
+                     heal_here ? "shown (gameplay)"
+                               : "hidden (a menu, the virtual screen or a cinematic)");
         }
-        if(visuals.flags&PI_VGO_HIT) {
-            const auto& c=s.hit_vignette_color;
-            append(visuals.hit,O::Vec3{SrgbToLinear(c[0]),SrgbToLinear(c[1]),SrgbToLinear(c[2])});
+        O::Pose head{};
+        const bool head_ok =
+            (heal + hit + daze) * heal_context > 0.0f && overlay.HeadPose(head);
+        // (6b) The stagger vignette (stagger_vignette, UpdateStaggerVignette, core/vr/daze.h): the
+        // edges darken while a blow's stagger or a knockdown holds the hunter; under the hit flash
+        // (drawn first) so the blow's direction still reads; gameplay only like it.
+        if (daze * heal_context > 0.0f && head_ok) {
+            const bool down = daze_fader.Shown() == VR::Daze::Level::Knockdown;
+            // stagger_vignette_fit: against what the headset shows (the displayed field), else
+            // the old degrees.
+            const bool fit = s.stagger_vignette_fit;
+            PutVignette(
+                items, head,
+                {.color = {0.0f, 0.0f, 0.0f},
+                 .alpha = daze * heal_context,
+                 .distance_m = std::max(s.hud_depth_m, 0.5f),
+                 .inner_deg = down ? VR::Daze::KnockdownInnerDeg : VR::Daze::StaggerInnerDeg,
+                 .full_deg = down ? VR::Daze::KnockdownFullDeg : VR::Daze::StaggerFullDeg,
+                 .fit_inner = !fit  ? 0.0f
+                              : down ? VR::Daze::FitKnockdownInner
+                                     : VR::Daze::FitStaggerInner,
+                 .fit_full = down ? VR::Daze::FitKnockdownFull : VR::Daze::FitStaggerFull});
+        }
+        if (heal * heal_context > 0.0f && head_ok) {
+            const auto& c = s.heal_vignette_color;
+            // Fitted to what the headset shows, so every edge glows alike (the degree ring was
+            // full only where the view reaches 55 degrees: the bottom and outer edges of a
+            // Quest 3). The ring mesh's smoothstep to the power 2.07, full where that ring was
+            // (VignetteFullDeg ~ the displayed edge): its inner edges 5% softer than the squared
+            // rise (5% less halfway, a little more further in, the edge unchanged; the tester,
+            // 2026-10-14).
+            PutVignette(
+                items, head,
+                {.color = {SrgbToLinear(c[0]), SrgbToLinear(c[1]), SrgbToLinear(c[2])},
+                 .alpha = heal * heal_context * s.heal_vignette_strength,
+                 .distance_m = std::max(s.hud_depth_m, 0.5f),
+                 .profile_power = 2.07f,
+                 .fit_inner = O::VignetteInnerDeg / O::VignetteFullDeg,
+                 .fit_full = 1.0f});
+        }
+        if (hit * heal_context > 0.0f && head_ok) {
+            const auto& c = s.hit_vignette_color;
+            // hit_vignette_directional: a wedge toward the blow (its direction from the head now),
+            // else the plain ring.
+            float az = 0.0f;
+            bool wedge_on = false;
+            if (const auto& ft = VR::FeatureCost::HitFlashTest(); ft.forced) {
+                wedge_on = ft.directional; // VR_HIT_FLASH_TEST
+                az = ft.azimuth_rad;
+                // VR_TUNE_FILE hit.test_az (tests): the forced flash's direction in degrees (0
+                // ahead, + right), 999 the plain ring.
+                if (const float t = VR::Tune::Get("hit.test_az", -1e4f); t > -1e3f) {
+                    wedge_on = t < 900.0f;
+                    az = t * VR::HitDir::Deg;
+                }
+            } else {
+                wedge_on = hit_dir_on && !stun_plain && HitAzimuthNow(hit_dir, az);
+            }
+            const VR::HitDir::Wedge w = wedge_on ? VR::HitDir::WedgeFor(az) : VR::HitDir::Wedge{};
+            // The ring (core/vr/hit_vignette.h): its clear inside hit_vignette_inner, the same for
+            // the flash, the wedge and the hit-stun hold (VR_TUNE_FILE hit.inner: live A/B).
+            const VR::HitVig::Ring ring = VR::HitVig::RingFor(
+                VR::Tune::Get("hit.inner", s.hit_vignette_inner), s.hit_vignette_fit, wedge_on,
+                daze_share, s.stagger_vignette_red);
+            PutVignette(
+                items, head,
+                {.color = {SrgbToLinear(c[0]), SrgbToLinear(c[1]), SrgbToLinear(c[2])},
+                 .alpha = std::min(hit * heal_context * s.hit_vignette_strength *
+                                       VR::Daze::RedScale(daze_share, s.stagger_vignette_red),
+                                   1.0f),
+                 .distance_m = std::max(s.hud_depth_m, 0.5f),
+                 .profile_power = ring.power,
+                 .inner_deg = ring.inner_deg,
+                 .full_deg = ring.full_deg,
+                 .wedge_focus = wedge_on ? w.focus : 0.0f,
+                 .wedge_x = w.x,
+                 .wedge_y = w.y,
+                 .wedge_power = w.power,
+                 .fit_inner = ring.fit_inner,
+                 .fit_full = ring.fit_full});
         }
         // (8) Low HP (hud_vitals=wrist, vitals_edge, UpdateVitalsNet): the edges of the view
         // darken with dried blood below 60% HP, clear inside 30 degrees, swelling and drawing in
         // with the heartbeat below vitals_low_hp; while the game's rally can win HP back a warm
         // amber rim at 54..62 degrees fades as it drains. Combined by max with the flashes over
         // it (the hit and heal vignettes): the edges never go opaque.
-        if (vitals_visual.flags & PI_VF_EDGE) {
+        if (vitals_edge_on) {
             namespace V = VR::Vitals;
-            PiMeleeFeedbackInput p{};p.operation=PI_MF_VITALS_EDGE;
-            p.vitals_edge={heal_context,hit,heal,s.hit_vignette_strength,
-                           s.heal_vignette_strength,s.vitals_low_hp,s.vitals_edge_strength};
-            const auto e=melee_feedback_runtime.Step(p).vitals_edge;
+            const float flash = heal_context * std::max(hit * s.hit_vignette_strength,
+                                                        heal * s.heal_vignette_strength);
+            const V::Edge e = V::EdgeOf(vitals_hp, vitals_heart.Pulse(), vitals_regain,
+                                        vitals_regain_peak, flash, s.vitals_low_hp);
             const float strength = std::max(s.vitals_edge_strength, 0.0f);
             O::Pose edge_head{};
-            if ((e.flags & PI_VE_ELIGIBLE) && (e.alpha > 0.0f || e.rim > 0.0f) &&
-                (head_ok || overlay.HeadPose(edge_head))) {
+            if ((e.alpha > 0.0f || e.rim > 0.0f) && (head_ok || overlay.HeadPose(edge_head))) {
                 const O::Pose& at = head_ok ? head : edge_head;
                 const float d = std::max(s.hud_depth_m, 0.5f);
-                if (e.flags & PI_VE_DARK) {
+                if (e.alpha * strength > 0.002f) {
                     const auto c = V::Linear(V::ColorEdgeDark);
                     // Fitted like the heal glow: its degrees as fractions of VignetteFullDeg (the
                     // displayed edge), the same squared rise, so it is even on every edge.
                     PutVignette(items, at,
                                       {.color = {c[0], c[1], c[2]},
-                                       .alpha = e.draw_alpha,
+                                       .alpha = std::min(e.alpha * strength, 0.9f),
                                        .distance_m = d,
                                        .profile_power = 2.0f,
                                        .fit_inner = e.inner_deg / O::VignetteFullDeg,
                                        .fit_full = e.full_deg / O::VignetteFullDeg});
                 }
-                if (e.flags & PI_VE_RIM) {
+                if (e.rim * strength > 0.002f) {
                     const auto c = V::Linear(V::ColorRally);
                     PutVignette(items, at,
                                       {.color = {c[0], c[1], c[2]},
-                                       .alpha = e.draw_rim,
+                                       .alpha = std::min(e.rim * strength, 0.5f),
                                        .distance_m = d,
                                        .inner_deg = 54.0f,
                                        .full_deg = 62.0f,
@@ -12144,12 +14131,23 @@ struct OpenXRPresenter::Impl {
                     LOG_INFO(Render_Vulkan,
                              "VR vitals: the edges darken ({:.0f}% HP: {:.2f} at the edges, clear "
                              "inside {:.0f} deg){}",
-                             100.0f * e.hp, e.alpha * strength, e.inner_deg,
+                             100.0f * vitals_hp, e.alpha * strength, e.inner_deg,
                              e.rim > 0.0f ? ", the rally's amber rim" : "");
                 }
             }
         }
-        overlay.EndFrame();
+        if (s.overlay_compose_eyes) {
+            auto& snapshot = overlay_history[overlay_history_next++ % overlay_history.size()];
+            snapshot.head_time = last_head.time;
+            snapshot.space = recenter_serial;
+            snapshot.items = items;
+        }
+        // Recorded at Submit only when this frame's eyes can carry it (native stereo, the composer
+        // and the in-eye overlay up): elsewhere (AER, mono, DIBR) it is recorded here, as before.
+        overlay_deferred = s.overlay_compose_eyes && content_immersive && !panel_shown &&
+                           !late_enabled.load() && content[0].native && !compose_failed &&
+                           overlay_in_eye.IsActive();
+        if (!overlay_deferred) overlay.EndFrame();
     }
 
     // The low-HP safety net of the wrist gauge (hud_vitals=wrist, core/vr/vitals.h), on the frame
@@ -12161,77 +14159,89 @@ struct OpenXRPresenter::Impl {
     void UpdateVitalsNet(float dt) {
         namespace V = VR::Vitals;
         const auto& s = VR::GetSettings();
-        PiMeleeFeedbackInput p{};
-        p.operation=PI_MF_VITALS;p.now_ns=VR::Body::SteadyNowNs();p.dt=dt;
-        auto& f=p.vitals;
-        f.hud_mode=s.hud_vitals;
+        const s64 now = VR::Body::SteadyNowNs();
         V::Status st{};
-        // Preserve guarded native reads; their success is a copied fact for DLL policy.
-        if(f.hud_mode==static_cast<u32>(V::Mode::Wrist)) {
-            f.wrist_works=V::WristWorks(p.now_ns);
-            if(f.wrist_works)f.have_wrist=V::LatestStatus(st);
-        }
-        f.status[0]=PhysicalInteractions::PackVitals(st);
+        const bool wrist = s.hud_vitals == static_cast<s32>(V::Mode::Wrist) &&
+                           V::WristWorks(now) && V::LatestStatus(st);
+        const bool gameplay = !screen_context && !menu_context && VR::IsCameraActive() &&
+                              !VR::CinematicActive() && !VR::MenuPanelActive();
         V::Status color_status{};
-        if(s.health_color||s.stamina_color)V::LatestStatus(color_status);
-        f.status[1]=PhysicalInteractions::PackVitals(color_status);
-        f.screen=screen_context;f.menu=menu_context;f.camera=VR::IsCameraActive();
-        f.cinematic=VR::CinematicActive();f.menu_panel=VR::MenuPanelActive();
-        f.page=VR::Page::Runtime::Get().IsOpen();
-        f.heartbeat=s.vitals_heartbeat;f.edge=s.vitals_edge;f.low_hp=s.vitals_low_hp;
-        f.mute_s=s.vitals_heartbeat_mute_s;f.heartbeat_gain=s.vitals_heartbeat_gain;
-        f.health_color=s.health_color;f.stamina_color=s.stamina_color;
-        f.health_gain=s.health_color_strength;f.stamina_gain=s.stamina_color_strength;
-        f.haptic_testing=haptic_test==HapticTest::Playing;f.left_playing=haptics[0].playing;
-        const auto result=melee_feedback_runtime.Step(p);
-        const auto& v=result.vitals;
-        vitals_visual=v;vital_color={v.health,v.desaturation};
-        V::PublishBeat({v.beat_ns,v.bpm});
-        if(v.flags&PI_VF_FELT_LOG) {
-            const bool felt=(v.flags&PI_VF_FELT)!=0;
-            LOG_INFO(Render_Vulkan,
-                     "VR vitals: heartbeat {} ({:.0f} bpm at {:.0f}% HP{})",felt?"on":"off",
-                     v.bpm,100.f*v.hp,felt?"":!(v.flags&PI_VF_BEATING)?"":
-                     !(v.flags&PI_VF_GAMEPLAY)?", out of gameplay":
-                     ", quiet: no HP lost for vitals_heartbeat_mute_s");
+        if (s.health_color || s.stamina_color) {
+            V::LatestStatus(color_status);
         }
-        if (!(interaction_module.Available() &&
-              (interaction_dll_fault || interaction_module.Faulted())))
-            PlayInteractionHaptics(result);
+        vital_color = vital_color_state.Update(
+            color_status,
+            {s.health_color, s.stamina_color, s.health_color_strength, s.stamina_color_strength},
+            gameplay && !VR::Page::Runtime::Get().IsOpen(), now, dt);
+        const bool alive = st.ok && st.hp > 0 && st.max_hp > 0;
+        const u32 changes = vitals_changes.Step(st);
+        if (changes & V::ChangeHit) {
+            vitals_loss_ns = now;
+        }
+        const float hp = alive ? V::Fraction(st.hp, st.max_hp) : 0.0f;
+        // The rally rim: its share of max HP now against its largest since it appeared.
+        const float regain = alive ? V::Fraction(st.rally_hp - st.hp, st.max_hp) : 0.0f;
+        vitals_regain_peak = regain > 0.0f ? std::max(vitals_regain_peak, regain) : 0.0f;
+        vitals_regain = regain;
+        vitals_hp = hp;
+        vitals_edge_on = wrist && s.vitals_edge && gameplay && alive;
+        // The heart keeps its rhythm through a moment out of gameplay (a hit's camera, a grab):
+        // only its haptic and the edges wait for gameplay.
+        const bool active = wrist && alive && (s.vitals_heartbeat || s.vitals_edge);
+        const bool beat = vitals_heart.Step(dt, hp, active, s.vitals_low_hp);
+        V::PublishBeat({vitals_heart.beating ? now - static_cast<s64>(vitals_heart.since_beat_s *
+                                                                       1e9f)
+                                             : 0,
+                        vitals_heart.bpm});
+        const bool felt = active && gameplay && s.vitals_heartbeat && vitals_heart.beating &&
+                          V::HeartbeatFelt(now, vitals_loss_ns, s.vitals_heartbeat_mute_s);
+        static u32 felt_logs = 0;
+        if (felt != vitals_felt && felt_logs < 60) {
+            ++felt_logs;
+            vitals_felt = felt;
+            LOG_INFO(Render_Vulkan,
+                     "VR vitals: heartbeat {} ({:.0f} bpm at {:.0f}% HP{})", felt ? "on" : "off",
+                     vitals_heart.bpm, 100.0f * hp,
+                     felt                    ? ""
+                     : !vitals_heart.beating ? ""
+                     : !gameplay             ? ", out of gameplay"
+                                             : ", quiet: no HP lost for vitals_heartbeat_mute_s");
+        }
+        vitals_felt = felt;
+        if (beat && felt && haptic_test != HapticTest::Playing && !haptics[0].playing) {
+            haptics[0].Play(HeartbeatPulse(s.vitals_heartbeat_gain));
+            ++vitals_beats_felt;
+        }
     }
 
-    PiMeleeFeedbackOutput UpdateVignettes(float dt,bool gameplay) {
-        const auto& s=VR::GetSettings();
-        PiMeleeFeedbackInput p{};p.operation=PI_MF_VIGNETTE_FRAME;p.dt=dt;
-        auto& f=p.vignette;f.initial_hits=vignette_initial_hits;
-        f.heals=VR::ItemHealCount();
+    // Stagger vignette (stagger_vignette, core/vr/daze.h): the body's level (a stagger or a
+    // knockdown before its attack window) through the fader; death or the setting off end it at
+    // once, a stale status (a load, a long stall) fades it out. Returns the edge opacity.
+    float UpdateStaggerVignette(float dt) {
+        const auto& s = VR::GetSettings();
         VR::Body::BodyStatus status{};
-        f.have_body=VR::Body::LatestBodyStatus(status);
-        f.body_now_ns=f.have_body?VR::Body::SteadyNowNs():0;
-        f.body_ns=status.steady_ns;f.body_daze=status.daze;f.stun_clip=status.stun_clip;
-        f.body_dead=status.facing_block!=nullptr&&std::strcmp(status.facing_block,"dead")==0;
-        f.hits=VR::HitTakenCount();f.hit_fraction=VR::LastHitFraction();
-        f.heal_enabled=s.heal_vignette;f.hit_enabled=s.hit_vignette;
-        f.stagger_enabled=s.stagger_vignette;f.stagger_fit=s.stagger_vignette_fit;
-        f.stagger_strength=s.stagger_vignette_strength;f.merge_ms=s.stagger_vignette_merge_ms;
-        f.dip_ms=s.stagger_vignette_dip_ms;f.red=s.stagger_vignette_red;
-        f.hit_fade_ms=s.hit_vignette_fade_ms;f.stun_strength=s.hitstun_vignette_strength;
-        f.hitstun_setting=s.hitstun_vignette;f.directional=s.hit_vignette_directional;
-        f.forced=VR::FeatureCost::HitFlashTest().forced;
-        f.gameplay=gameplay;f.menu_panel=VR::MenuPanelActive();
-        auto frame=[&] {
-            VR::FeatureCost::Scope cost{VR::FeatureCost::HitVignette};
-            return melee_feedback_runtime.Step(p);
-        }();
-        const auto& v=frame.vignette;
-        if(v.flags&PI_VG_HEAL_ON)
-            LOG_INFO(Render_Vulkan,"VR heal vignette: on ({})",v.heal_reason==PI_VG_HEAL_INJECTION?"injection":"item heal");
-        if(v.flags&PI_VG_HEAL_OFF)LOG_INFO(Render_Vulkan,"VR heal vignette: off");
-        const auto level=static_cast<VR::Daze::Level>(v.daze_level);
-        const auto daze_logged=static_cast<VR::Daze::Level>(v.previous_daze);
-        const float before=v.daze_before;
-        const bool fresh=(v.flags&PI_VG_BODY_FRESH)!=0,dead=(v.flags&PI_VG_DEAD)!=0;
-        if (v.flags & PI_VG_DAZE_LOG) {
+        const bool fresh = VR::Body::LatestBodyStatus(status) &&
+                           VR::Body::SteadyNowNs() - status.steady_ns < 250'000'000;
+        const bool dead = fresh && status.facing_block != nullptr &&
+                          std::strcmp(status.facing_block, "dead") == 0;
+        // The hit-stun vignette (UpdateHitStun, next) reads this status too.
+        stun_status_fresh = fresh;
+        stun_status_dead = dead;
+        stun_clip_now = fresh ? status.stun_clip : -1;
+        // hitstun_vignette: a light stagger shows the red alone (the black steps aside).
+        const auto level = VR::HitStun::BlackLevel(
+            fresh && status.daze <= 2 ? static_cast<VR::Daze::Level>(status.daze)
+                                      : VR::Daze::Level::None,
+            HitStunMode(), stun_clip_now);
+        const bool reset = !s.stagger_vignette || dead;
+        // (A stale status, an emulator stall mid-fight, clears into the rest too: run pl1 had a
+        // blow 295 ms after such a clear. A load's screen hides it anyway.)
+        const float merge_s = s.stagger_vignette_merge_ms * 0.001f;
+        const float before = daze_fader.Linear();
+        const float alpha =
+            daze_fader.Step(level, reset, dt, s.stagger_vignette_strength, merge_s,
+                            s.stagger_vignette_fit, s.stagger_vignette_dip_ms * 0.001f);
+        if (level != daze_logged && s.stagger_vignette) {
             LOG_INFO(Render_Vulkan, "VR stagger vignette: {}",
                      level != VR::Daze::Level::None
                          ? fmt::format("{} (edge {:.2f}{}){}", VR::Daze::LevelName(level),
@@ -12253,25 +14263,42 @@ struct OpenXRPresenter::Impl {
                      : dead   ? std::string{"off at once (dead)"}
                      : !fresh ? std::string{"clearing (no body status)"}
                               : std::string{"clearing (you can act)"});
+            daze_logged = level;
         }
-        const auto mode=static_cast<VR::HitStun::Mode>(v.mode);
-        const auto stun_clip_now=v.stun_clip;
-        const float held_s=v.stun_held;
-        const bool stun_status_dead=dead,stun_status_fresh=fresh;
+        return alpha;
+    }
+
+    // hitstun_vignette (core/vr/hit_stun.h), off without the hit flash it holds.
+    static VR::HitStun::Mode HitStunMode() {
+        const auto& s = VR::GetSettings();
+        return s.hit_vignette ? VR::HitStun::ModeOf(s.hitstun_vignette) : VR::HitStun::Mode::Off;
+    }
+
+    // Hit-stun vignette (hitstun_vignette, core/vr/hit_stun.h): the body's stun clip (a blow's
+    // on-feet hit reaction before the game takes R1 again, read by UpdateStaggerVignette this
+    // frame) holds the red; death or the setting off end it at once, the window or a stale status
+    // (a load, a long stall) fade it out over VR::HitStun::FadeOutS. Returns the hold's level.
+    float UpdateHitStun(float dt) {
+        const auto mode = HitStunMode();
+        const bool stun = mode != VR::HitStun::Mode::Off && stun_clip_now >= 0;
+        const bool was = stun_hold.On();
+        const float held_s = stun_hold.Since();
+        const float level =
+            stun_hold.Step(stun, mode == VR::HitStun::Mode::Off || stun_status_dead, dt);
         const auto clip_name = [](std::int32_t id) {
             return fmt::format("a{:03}_{:06}", id / 1'000'000, id % 1'000'000);
         };
-        if (v.flags & PI_VG_STUN_ON) {
+        if (stun && (!was || stun_clip_now != stun_logged)) {
             LOG_INFO(Render_Vulkan,
                      "VR hit-stun vignette: on ({}: swings wait for the game's attack window; "
                      "the red {}, x{:.2f} of the blow's flash peak)",
                      clip_name(stun_clip_now),
-                     (v.flags & PI_VG_RED_ALONE)
+                     VR::HitStun::RedAlone(mode, stun_clip_now)
                          ? "alone"
                          : "over the black stagger tunnel (a heavy stagger: "
                            "hitstun_vignette=2 for the red alone)",
                      VR::GetSettings().hitstun_vignette_strength);
-        } else if (v.flags & PI_VG_STUN_OFF) {
+        } else if (!stun && was) {
             LOG_INFO(Render_Vulkan, "VR hit-stun vignette: {} after {:.0f} ms ({})",
                      stun_status_dead ? "off at once" : "clearing", held_s * 1000.0f,
                      stun_status_dead              ? "dead"
@@ -12279,124 +14306,258 @@ struct OpenXRPresenter::Impl {
                      : mode == VR::HitStun::Mode::Off ? "hitstun_vignette off"
                                                    : "the game takes attacks again");
         }
-        if(v.flags&PI_VG_HIT_ON) {
-            LOG_INFO(Render_Vulkan,
-                     "VR hit vignette: on (the hit took {:.1f}% of max HP: peak {:.0f}% of "
-                     "hit_vignette_strength; clear inside {:.3f} of the view, "
-                     "hit_vignette_inner)",100.f*f.hit_fraction,100.f*v.peak,
-                     VR::Tune::Get("hit.inner",s.hit_vignette_inner));
+        stun_logged = stun ? stun_clip_now : -1;
+        return level;
+    }
+
+    // Hit vignette (hit_vignette): a hit that took HP (VR::HitTakenCount, the player update hook)
+    // brings it in over HitFadeIn to its peak, HitPeakMin .. 1 by the share of max HP the hit
+    // took (1 from HitFullFraction); it holds HitHold and fades out over hit_vignette_fade_ms. Another hit
+    // while it shows brings it back up from where it is (to the larger peak). Returns its opacity
+    // factor, 0 .. 1 (eased).
+    float UpdateHitVignette(float dt) {
+        VR::FeatureCost::Scope cost{VR::FeatureCost::HitVignette};
+        const u32 hits = VR::HitTakenCount();
+        const bool fresh = hits != hit_seen;
+        hit_seen = hits;
+        hit_age_s = fresh ? 0.0f : std::min(hit_age_s + std::clamp(dt, 0.0f, 0.1f), 1e9f);
+        if (!VR::GetSettings().hit_vignette) {
+            hit_level = 0.0f;
+            hit_rising = false;
+            return 0.0f;
         }
-        if(v.flags&PI_VG_NEW_HIT) {
-            PiMeleeFeedbackInput direction{};direction.operation=PI_MF_VIGNETTE_DIRECTION;
-            direction.vignette_visual.frame_sequence=frame.vignette_visual.frame_sequence;
-            if(v.flags&PI_VG_DIRECTION_ALLOWED)direction.damage.observation[0]=DamageObservation(0,false);
-            const auto d=melee_feedback_runtime.Step(direction).vignette_visual;
-            frame.vignette_visual=d;
-            LOG_INFO(Render_Vulkan,"VR hit vignette: {}",
-                     (d.flags&PI_VGO_AZIMUTH)?fmt::format("toward the {} (az {:+.0f} deg, {}; peak {:.0f}%)",
-                         VR::HitDir::SideName(d.azimuth),d.azimuth/VR::HitDir::Deg,
-                         VR::HitDir::SourceName(static_cast<VR::HitDir::Source>(d.source)),100.f*v.peak):
-                     s.hit_vignette_directional?std::string{"no direction for this hit: the plain ring"}:
-                     std::string{"the plain ring (hit_vignette_directional=0)"});
+        if (VR::FeatureCost::HitFlashTest().forced) {
+            return 1.0f; // VR_HIT_FLASH_TEST: the flash held at full strength
         }
-        if(v.flags&PI_VG_HIT_OFF)LOG_INFO(Render_Vulkan,"VR hit vignette: off");
-        if(v.flags&PI_VG_CONTEXT_LOG)
-            LOG_INFO(Render_Vulkan,"VR heal vignette: {}",(v.flags&PI_VG_HEAL_HERE)?
-                "shown (gameplay)":"hidden (a menu, the virtual screen or a cinematic)");
-        return frame;
-    }
-
-    PiVignetteVisualOutput VignetteVisualFor(const PiMeleeFeedbackOutput& frame,bool head_ok) {
-        if(!head_ok||!frame.vignette_visual.frame_sequence)return {};
-        const auto& s=VR::GetSettings();
-        PiMeleeFeedbackInput p{};p.operation=PI_MF_VIGNETTE_VISUAL;
-        auto& f=p.vignette_visual;f.frame_sequence=frame.vignette_visual.frame_sequence;
-        f.stagger_fit=s.stagger_vignette_fit;f.hit_fit=s.hit_vignette_fit;
-        f.red=s.stagger_vignette_red;f.hit_strength=s.hit_vignette_strength;f.heal_strength=s.heal_vignette_strength;
-        f.head_ok=head_ok;f.inner=s.hit_vignette_inner;f.test_azimuth_deg=-1e4f;
-        const auto& ft=VR::FeatureCost::HitFlashTest();
-        f.forced=ft.forced;f.forced_directional=ft.directional;f.forced_azimuth=ft.azimuth_rad;
-        if(head_ok&&(frame.vignette_visual.flags&PI_VGO_HIT)) {
-            f.inner=VR::Tune::Get("hit.inner",s.hit_vignette_inner);
-            if(f.forced)f.test_azimuth_deg=VR::Tune::Get("hit.test_az",-1e4f);
-            else if((frame.vignette_visual.flags&PI_VGO_DIRECTION)&&!(frame.vignette.flags&PI_VG_STUN_PLAIN)) {
-                auto& a=p.damage.observation[0];VR::Body::Anchor anchor{};
-                a.have_anchor=VR::Body::LatestAnchor(anchor);a.anchor_valid=anchor.valid;
-                a.anchor_ns=anchor.steady_ns;a.anchor_yaw=anchor.view_yaw;
-                a.anchor_now_ns=VR::Body::SteadyNowNs();
-            }
-        }
-        return melee_feedback_runtime.Step(p).vignette_visual;
-    }
-
-    void BaselineDamageFeedback(u32 hits, const VR::Bloodborne::RangedHits& ranged) {
-        PiMeleeFeedbackInput p{}; p.operation = PI_MF_DAMAGE_BASELINE;
-        p.damage.hit_count = hits; p.damage.gun_count = ranged.gun; p.damage.throw_count = ranged.thrown;
-        melee_feedback_runtime.Step(p);
-    }
-
-    static PiDamageObservation DamageObservation(s64 frame_now, bool frame_clock) {
-        PiDamageObservation out{};
-        VR::HitDir::Event e{};
-        out.have_event = VR::HitDir::Channel().Load(e);
-        out.event_ns = e.steady_ns; out.event_serial = e.serial; out.source = e.source;
-        out.view_ok = e.view_ok; out.world_yaw = e.world_yaw; out.view_yaw = e.view_yaw;
-        out.azimuth = e.azimuth;
-        out.event_now_ns = frame_clock ? frame_now : VR::Body::SteadyNowNs();
-        VR::Body::Anchor anchor{};
-        out.have_anchor = VR::Body::LatestAnchor(anchor);
-        out.anchor_valid = anchor.valid; out.anchor_ns = anchor.steady_ns;
-        out.anchor_yaw = anchor.view_yaw; out.anchor_now_ns = VR::Body::SteadyNowNs();
-        return out;
-    }
-
-    std::array<float, 2> UpdateDamageFeedback(s64 now, float small_motor, float large_motor) {
-        namespace H = VR::HitDir;
-        const auto& settings = VR::GetSettings();
-        PiMeleeFeedbackInput p{}; p.operation = PI_MF_DAMAGE; p.now_ns = now;
-        auto& facts = p.damage;
-        facts.flags = (settings.hit_haptics_directional ? PI_DF_DIRECTIONAL : 0) |
-                      (VR::Gun::GetGunSettings().haptics ? PI_DF_GUN_HAPTICS : 0);
-        facts.observation[0] = DamageObservation(now, true);
-        facts.hit_count = VR::HitTakenCount();
-        facts.observation[1] = DamageObservation(now, false);
-        facts.hit_fraction = VR::LastHitFraction(); facts.hit_gain = settings.haptic_hit_taken;
-        const auto hits = VR::Bloodborne::PlayerRangedHits();
-        facts.gun_count = hits.gun; facts.throw_count = hits.thrown;
-        facts.gun_shot_ns = gun_shot_ns; facts.throw_ns = throw_ns;
-        facts.gun_gain = settings.haptic_gun_hit; facts.throw_gain = settings.haptic_throw_hit;
-        facts.quick_haptics = VR::Quick::GetQuickSettings().haptics;
-        facts.rumble_gain = settings.haptic_hit_rumble;
-        facts.rumble[0] = small_motor; facts.rumble[1] = large_motor;
-        facts.left_playing = haptics[0].playing; facts.left_priority = haptics[0].pattern.priority;
-        const auto result = melee_feedback_runtime.Step(p);
-        PlayInteractionHaptics(result);
-        const auto& out = result.damage;
-        if (out.flags & PI_DO_KNOCK) {
-            if (out.flags & PI_DO_DIRECTIONAL) {
+        if (fresh) {
+            const float fraction = VR::LastHitFraction();
+            const float peak = HitPeakMin + (1.0f - HitPeakMin) *
+                                                std::clamp(fraction / HitFullFraction, 0.0f, 1.0f);
+            if (hit_level <= 0.0f) {
+                hit_peak = peak;
                 LOG_INFO(Render_Vulkan,
-                         "VR hit haptics: from the {} (az {:+.0f} deg, {}): knock left {:.2f} right "
-                         "{:.2f} ({:.0f}% of max HP), the game's rumble for the blow x{:.2f} left x{:.2f} right",
-                         H::SideName(out.azimuth), out.azimuth / H::Deg,
-                         H::SourceName(static_cast<H::Source>(out.source)), out.knock[0], out.knock[1],
-                         facts.hit_fraction * 100.0f, out.hand_gain[0], out.hand_gain[1]);
+                         "VR hit vignette: on (the hit took {:.1f}% of max HP: peak {:.0f}% of "
+                         "hit_vignette_strength; clear inside {:.3f} of the view, "
+                         "hit_vignette_inner)",
+                         100.0f * fraction, 100.0f * peak,
+                         VR::Tune::Get("hit.inner", VR::GetSettings().hit_vignette_inner));
             } else {
-                LOG_INFO(Render_Vulkan,
-                         "VR hit haptics: knock left {:.2f} right {:.2f} ({:.0f}% of max HP; no "
-                         "direction{}: the game's rumble for the blow even on both hands)",
-                         out.knock[0], out.knock[1], facts.hit_fraction * 100.0f,
-                         settings.hit_haptics_directional ? " for this hit" : ", hit_haptics_directional=0");
+                hit_peak = std::max(hit_peak, peak);
+            }
+            // Directional (hit_vignette_directional): the newest hit's source, or the plain ring.
+            VR::HitDir::Event e{};
+            hit_dir_on = VR::GetSettings().hit_vignette_directional && LatestHitDirection(e);
+            if (hit_dir_on) {
+                hit_dir = e;
+            }
+            float az = 0.0f;
+            LOG_INFO(Render_Vulkan, "VR hit vignette: {}",
+                     hit_dir_on && HitAzimuthNow(hit_dir, az)
+                         ? fmt::format("toward the {} (az {:+.0f} deg, {}; peak {:.0f}%)",
+                                       VR::HitDir::SideName(az), az / VR::HitDir::Deg,
+                                       VR::HitDir::SourceName(
+                                           static_cast<VR::HitDir::Source>(hit_dir.source)),
+                                       100.0f * hit_peak)
+                     : VR::GetSettings().hit_vignette_directional
+                         ? std::string{"no direction for this hit: the plain ring"}
+                         : std::string{"the plain ring (hit_vignette_directional=0)"});
+            hit_rising = true;
+            hit_hold = HitHold;
+        }
+        if (hit_rising) {
+            hit_level = std::min(hit_level + dt / HitFadeIn, 1.0f);
+            hit_rising = hit_level < 1.0f;
+        } else if (hit_hold > 0.0f) {
+            hit_hold -= dt;
+        } else if (hit_level > 0.0f) {
+            float fade_out = std::max(VR::GetSettings().hit_vignette_fade_ms, 50.0f) * 1e-3f;
+            // Over the stagger's black (stagger_vignette_red < 1): gone within RedFadeS, so the
+            // tunnel reads black (UpdateStaggerVignette runs first in the frame).
+            if (daze_fader.Shown() != VR::Daze::Level::None &&
+                VR::GetSettings().stagger_vignette_red < 1.0f) {
+                fade_out = std::min(fade_out, VR::Daze::RedFadeS);
+            }
+            // The hit-stun hold carries the red through the stun and clears it at the window:
+            // the flash does not linger after it (UpdateHitStun runs first in the frame).
+            fade_out = VR::HitStun::FlashFadeS(fade_out, stun_hold.Shown());
+            hit_level = std::max(hit_level - dt / fade_out, 0.0f);
+            if (hit_level <= 0.0f) {
+                LOG_INFO(Render_Vulkan, "VR hit vignette: off");
             }
         }
-        if (out.flags & PI_DO_GUN_LOG)
-            LOG_INFO(Render_Vulkan, "VR gun: hit ({} ms after the shot): the hit tick", (now - gun_shot_ns) / 1'000'000);
-        if (out.flags & PI_DO_THROW_LOG)
-            LOG_INFO(Render_Vulkan, "VR quick: the thrown item hit ({} ms after the throw): the hit tick", (now - throw_ns) / 1'000'000);
-        return {out.rumble[0], out.rumble[1]};
+        return hit_peak * hit_level * hit_level * (3.0f - 2.0f * hit_level);
+    }
+
+    // Directional hit feedback (core/vr/hit_direction.h): the damage hook's newest event when it
+    // belongs to the hit just counted (at most EventMaxAgeNs old) and has a source.
+    static bool LatestHitDirection(VR::HitDir::Event& out) {
+        VR::HitDir::Event e{};
+        if (!VR::HitDir::Channel().Load(e) ||
+            e.source == static_cast<u8>(VR::HitDir::Source::None) ||
+            VR::Body::SteadyNowNs() - e.steady_ns > VR::HitDir::EventMaxAgeNs) {
+            return false;
+        }
+        out = e;
+        return true;
+    }
+
+    // The event's direction relative to the head now: from the view's heading of the newest
+    // first-person frame (turning toward the blow moves the wedge toward the top), else the
+    // heading at the hit. False when neither is known (third person, the virtual screen).
+    static bool HitAzimuthNow(const VR::HitDir::Event& e, float& azimuth) {
+        VR::Body::Anchor a{};
+        const bool now_ok = VR::Body::LatestAnchor(a) && a.valid &&
+                            VR::Body::SteadyNowNs() - a.steady_ns <= HitDirViewAgeNs;
+        if (!now_ok && !e.view_ok) {
+            return false;
+        }
+        azimuth = VR::HitDir::CurrentAzimuth(e, now_ok, a.view_yaw);
+        return true;
+    }
+
+    // hit_haptics_directional (UpdateHaptics, before the hands): a new damage event with a
+    // direction arms the weighting of the game's rumble for that blow with the hands' gains
+    // (VR::HitDir::RumbleWeighting: the hit side keeps the stronger motor's level, the other gets
+    // less the more the blow came from the side); a hit counted (VR::HitTakenCount) plays the
+    // small knock on both hands (haptic_hit_taken), the hand toward the blow a little stronger.
+    // Without a direction the knock is even and the game's rumble as is.
+    void UpdateHitHaptics(s64 now) {
+        namespace H = VR::HitDir;
+        const bool on = VR::GetSettings().hit_haptics_directional;
+        H::Event e{};
+        if (H::Channel().Load(e) && e.serial != hit_haptic_serial) {
+            hit_haptic_serial = e.serial;
+            float az = 0.0f;
+            if (now - e.steady_ns <= H::EventMaxAgeNs) {
+                // Every blow's rumble is weighted (and x haptic_hit_rumble in UpdateHaptics, so
+                // the blow stays a small vibration): toward its side with a direction, else even
+                // on both hands.
+                const bool dir = on && e.source != static_cast<u8>(H::Source::None) &&
+                                 HitAzimuthNow(e, az);
+                hit_rumble.Hit(now, dir ? H::HandGains(az) : H::Hands{});
+            }
+        }
+        const u32 hits = VR::HitTakenCount();
+        if (hits == hit_haptic_seen) {
+            return;
+        }
+        hit_haptic_seen = hits;
+        // The hit's own knock (haptic_hit_taken; core/vr/haptic_output.h Haptics::Combat::HitTaken):
+        // small, on BOTH controllers, a little stronger toward the blow (with a direction and
+        // hit_haptics_directional) and for a big one; priority 1, under the weapon hand's
+        // impact and the gun's recoil (it never cuts them).
+        const float k = VR::GetSettings().haptic_hit_taken;
+        if (k <= 0.0f) {
+            return;
+        }
+        float az = 0.0f;
+        const bool dir = on && LatestHitDirection(e) && HitAzimuthNow(e, az);
+        const H::Hands g = dir ? H::HandGains(az) : H::Hands{};
+        const float fraction = VR::LastHitFraction();
+        const std::array<float, 2> gain{g.left, g.right};
+        std::array<float, 2> knock{};
+        for (u32 hand = 0; hand < 2; ++hand) {
+            const VR::Haptics::Combat::Shape s =
+                VR::Haptics::Combat::HitTaken(fraction, gain[hand], k);
+            knock[hand] = s.peak;
+            haptics[hand].Play(CombatPattern(s, 1, false));
+        }
+        if (dir) {
+            LOG_INFO(Render_Vulkan,
+                     "VR hit haptics: from the {} (az {:+.0f} deg, {}): knock left {:.2f} right "
+                     "{:.2f} ({:.0f}% of max HP), the game's rumble for the blow x{:.2f} left "
+                     "x{:.2f} right",
+                     H::SideName(az), az / H::Deg,
+                     H::SourceName(static_cast<H::Source>(e.source)), knock[0], knock[1],
+                     fraction * 100.0f, g.left, g.right);
+        } else {
+            LOG_INFO(Render_Vulkan,
+                     "VR hit haptics: knock left {:.2f} right {:.2f} ({:.0f}% of max HP; no "
+                     "direction{}: the game's rumble for the blow even on both hands)",
+                     knock[0], knock[1], fraction * 100.0f,
+                     on ? " for this hit" : ", hit_haptics_directional=0");
+        }
+    }
+
+    // The hit ticks (UpdateHaptics, before the hands): one of his bullets hitting a character
+    // (the damage hook's count, within 2 s of a shot) gets one light tick on the gun hand once
+    // the shot's own recoil has played out (waiting at most 0.4 s); a thrown item hitting (within
+    // 5 s of a throw) a lighter tick on the throwing (left) hand, at most one per 150 ms (a
+    // Molotov's burst on two enemies is one). Haptics::Combat::GunHit / ThrowHit.
+    void UpdateRangedHits(s64 now) {
+        namespace HC = VR::Haptics::Combat;
+        const auto& s = VR::GetSettings();
+        const VR::Bloodborne::RangedHits hits = VR::Bloodborne::PlayerRangedHits();
+        auto& left = haptics[0];
+        if (hits.gun != ranged_seen.gun && gun_shot_ns != 0 && now - gun_shot_ns < 2'000'000'000 &&
+            s.haptic_gun_hit > 0.0f && VR::Gun::GetGunSettings().haptics) {
+            if (gun_hit_pending_ns == 0) {
+                LOG_INFO(Render_Vulkan, "VR gun: hit ({} ms after the shot): the hit tick",
+                         (now - gun_shot_ns) / 1'000'000);
+            }
+            gun_hit_pending_ns = now;
+        }
+        if (gun_hit_pending_ns != 0) {
+            const bool busy = left.playing && left.pattern.priority >= 2;
+            if (now - gun_hit_pending_ns > 400'000'000) {
+                gun_hit_pending_ns = 0; // the recoil (or another strong pattern) went on too long
+            } else if (!busy) {
+                left.Play(CombatPattern(HC::GunHit(s.haptic_gun_hit), 2, false));
+                gun_hit_pending_ns = 0;
+            }
+        }
+        if (hits.thrown != ranged_seen.thrown && throw_ns != 0 && now - throw_ns < 5'000'000'000 &&
+            now - throw_tick_ns > 150'000'000 && s.haptic_throw_hit > 0.0f &&
+            VR::Quick::GetQuickSettings().haptics > 0.0f) {
+            throw_tick_ns = now;
+            left.Play(CombatPattern(HC::ThrowHit(s.haptic_throw_hit), 1, false));
+            LOG_INFO(Render_Vulkan, "VR quick: the thrown item hit ({} ms after the throw): the "
+                                    "hit tick",
+                     (now - throw_ns) / 1'000'000);
+        }
+        ranged_seen = hits;
     }
 
     static float SrgbToLinear(float c) {
         return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+    }
+
+    // Heal vignette (heal_vignette): an injection that healed (FinishInject) or a heal the player
+    // update hook saw an item give (VR::ItemHealCount) brings it in over HealFadeIn; it holds
+    // HealHold and fades out over HealFadeOut. Another heal while it shows holds it again from
+    // where it is. Returns its opacity factor, 0 .. 1 (eased).
+    float UpdateHealVignette(float dt) {
+        const char* why = std::exchange(heal_trigger, nullptr);
+        if (const u32 heals = VR::ItemHealCount(); heals != heal_seen) {
+            heal_seen = heals;
+            if (why == nullptr) {
+                why = "item heal";
+            }
+        }
+        if (!VR::GetSettings().heal_vignette) {
+            heal_level = 0.0f;
+            heal_rising = false;
+            return 0.0f;
+        }
+        if (why != nullptr) {
+            if (heal_level <= 0.0f) {
+                LOG_INFO(Render_Vulkan, "VR heal vignette: on ({})", why);
+            }
+            heal_rising = true;
+            heal_hold = HealHold;
+        }
+        if (heal_rising) {
+            heal_level = std::min(heal_level + dt / HealFadeIn, 1.0f);
+            heal_rising = heal_level < 1.0f;
+        } else if (heal_hold > 0.0f) {
+            heal_hold -= dt;
+        } else if (heal_level > 0.0f) {
+            heal_level = std::max(heal_level - dt / HealFadeOut, 0.0f);
+            if (heal_level <= 0.0f) {
+                LOG_INFO(Render_Vulkan, "VR heal vignette: off");
+            }
+        }
+        return heal_level * heal_level * (3.0f - 2.0f * heal_level);
     }
 
     // The vial's visibility changes, with why it went away (lines up with the `VR inject:` lines).
@@ -12705,7 +14866,7 @@ struct OpenXRPresenter::Impl {
             for (const float t : times) {
                 list += fmt::format(" {:.1f}", t);
             }
-            LOG_INFO(Render_Vulkan, "VR frame times: {} intervals (ms):{}", times.size(), list);
+            LOG_BENCHMARK_INFO(Render_Vulkan, "VR frame times: {} intervals (ms):{}", times.size(), list);
         }
         for (const float t : times) {
             ++frame_time_hist[std::min<std::size_t>(static_cast<std::size_t>(t * 10.0f),
@@ -12744,7 +14905,7 @@ struct OpenXRPresenter::Impl {
         auto& l = latency;
         const std::size_t warped = l.pose_to_end_ms.size();
         const auto& c = cadence;
-        LOG_INFO(Render_Vulkan,
+        LOG_BENCHMARK_INFO(Render_Vulkan,
                  "VR latency: game frame times p50 {:.1f} / p99 {:.1f} / p99.9 {:.1f} / max {:.1f} "
                  "ms over {} frames ({} gaps of 250 ms+); since the start {} frames: 1% worst "
                  "{:.1f} ms, 0.1% worst {:.1f} ms, max {:.1f} ms; missed latches: {} XR refreshes "
@@ -13172,13 +15333,36 @@ struct OpenXRPresenter::Impl {
             ExpireStaged();
             AdoptStereo();
         }
+        // Use the existing all-layer recenter fade, independent of stagger settings.
+        // Wait for both displayed eyes to carry the new turn before revealing them.
+        if (!quick_turn_input) {
+            quick_turn_gesture.Reset();
+            quick_turn_fade = {};
+        } else if (quick_turn_fade.phase != VR::Space::Fade::Phase::Idle) {
+            const bool shown = content[0].valid && content[1].valid &&
+                content[0].source.record > quick_turn_record &&
+                content[1].source.record > quick_turn_record &&
+                content[0].source.turn_serial != quick_turn_serial &&
+                content[1].source.turn_serial != quick_turn_serial;
+            if (quick_turn_fade.Step(quick_turn_dt, shown)) {
+                VR::CameraRecord record{};
+                if (VR::NewestCameraRecord(record) && !VR::GameOwnsCamera()) {
+                    quick_turn_record = record.id;
+                    quick_turn_serial = record.turn_serial;
+                    VR::AddTurn(3.14159265f);
+                    LOG_INFO(Render_Vulkan, "VR input: blink turnaround 180 deg");
+                } else {
+                    quick_turn_fade = {};
+                }
+            }
+        }
         ShownToCurrentSpace(); // a frame placed before a recenter goes up in the new space
         // Cinematic fades and the recenter's fade (1 outside them): the layer's colour is scaled
         // down to black. Without XR_KHR_composition_layer_color_scale_bias a dim frame drops its
         // content layers (a cut); on such a runtime the black base layer (VrXrLayers) is what
         // shows, since a frame without layers shows the runtime's own void there.
         const float brightness = VR::CinematicBrightness(content_immersive, layer_switch_ns) *
-                                 recenter_fade.Brightness();
+                                 recenter_fade.Brightness() * quick_turn_fade.Brightness();
         if (brightness < 0.999f && Runtime().has_color_scale) {
             color_scale.colorScale = {brightness, brightness, brightness, 1.0f};
             color_scale.colorBias = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -13322,7 +15506,9 @@ struct OpenXRPresenter::Impl {
                     reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
                 // The game's UI on its own layers over the live world.
                 UpdateUiPlacement(last_head);
-                ui_layers = BuildUiLayers(ui_storage, brightness, layers, layer_count);
+                if (!shown_ui_composed || late_used) {
+                    ui_layers = BuildUiLayers(ui_storage, brightness, layers, layer_count);
+                }
             } else if (screen_valid) {
                 if (!screen_pose_valid && last_head.valid) {
                     float yaw{}, pitch{};
@@ -13378,8 +15564,12 @@ struct OpenXRPresenter::Impl {
         const XrCompositionLayerBaseHeader* overlay_layer = nullptr;
         {
             LockTrace::Phase phase{"overlay submit"};
-            overlay_layer = overlay.SubmitLayer(
-                brightness < 0.999f && Runtime().has_color_scale ? &color_scale : nullptr);
+            const bool composed = shown_overlay_composed && content_immersive && !panel && !late_used;
+            if (!composed) {
+                if (overlay_deferred) overlay.EndFrame();
+                overlay_layer = overlay.SubmitLayer(
+                    brightness < 0.999f && Runtime().has_color_scale ? &color_scale : nullptr);
+            }
         }
         // After a frame with the overlay was rejected, the next one goes without it (a probe).
         const bool probe = overlay_probe;
@@ -13473,6 +15663,10 @@ struct OpenXRPresenter::Impl {
             frame_lock.unlock();
         }
         XrResult end = XR_SUCCESS;
+        Common::SyncLog::Line("end disp=%lld rec=%llu head_t=%lld layers=%u",
+                              static_cast<long long>(frame_state.predictedDisplayTime),
+                              static_cast<unsigned long long>(late_shown_record.id),
+                              static_cast<long long>(late_shown_record.head_time), layer_count);
         {
             LockTrace::Phase phase{"xrEndFrame"};
             end = xrEndFrame(session, &end_info);
@@ -13745,7 +15939,7 @@ struct OpenXRPresenter::Impl {
         // the top to the bottom; the head's roll and motion aside).
         const auto rooms = VR::Tilt::RestRooms(record.eye_fov, record.vfov, aspect,
                                                record.pitch_bias);
-        LOG_INFO(Render_Vulkan,
+        LOG_BENCHMARK_INFO(Render_Vulkan,
                  "VR projection: render vfov {:.2f} deg, hfov {:.2f} deg (aspect {:.4f} from the "
                  "{}), image {}x{}, render pitch bias {:.2f} deg (late-warp room at rest: "
                  "outer-left {:.1f} / outer-right {:.1f} at the eyes' middle, {:.1f} / {:.1f} at "
@@ -14487,6 +16681,8 @@ struct OpenXRPresenter::Impl {
             content[1] = {true, pending.eye_poses[1], pending.projections[1], RightSwapchain,
                           pending.source};
             content[0].dibr = content[1].dibr = true;
+            // A plain copy (the present thread's fallback): nothing composed into these eyes.
+            shown_ui_composed = shown_overlay_composed = false;
             ShowImmersive();
             HidePanel();
             ++pair_stats.dibr;
@@ -14575,6 +16771,7 @@ struct OpenXRPresenter::Impl {
                               left.source};
                 content[1] = {true, pending.eye_poses[1], pending.projections[1], RightSwapchain,
                               pending.source};
+                shown_ui_composed = shown_overlay_composed = false; // AER: never composed
                 ShowImmersive();
             } else {
                 // The right eye alone: shown to both eyes until the next pair (no double images,
@@ -14777,6 +16974,7 @@ struct OpenXRPresenter::Impl {
         }
         for (u32 i = 0; i < 2; ++i) {
             if (swapchains[first + i].handle != XR_NULL_HANDLE) {
+                swapchains[first + i].compose_views.clear();
                 xrDestroySwapchain(swapchains[first + i].handle);
             }
             swapchains[first + i] = {};
@@ -15001,6 +17199,9 @@ struct OpenXRPresenter::Impl {
             if (!eyes.image[i] || eyes.extent[i].width < crop.width ||
                 eyes.extent[i].height < crop.height ||
                 (eyes.depth_buffer && eyes.extent[i] != crop)) {
+                RENDER_DIAGNOSTIC_ONCE("stereo copy invalid eye={} native={} image={} size={}x{} crop={}x{} depth={}",
+                    i, eyes.native, bool(eyes.image[i]), eyes.extent[i].width, eyes.extent[i].height,
+                    crop.width, crop.height, bool(eyes.depth_buffer));
                 return false;
             }
         }
@@ -15014,7 +17215,10 @@ struct OpenXRPresenter::Impl {
             const LockTrace::Start lock_start;
             std::scoped_lock lk{Scheduler::submit_mutex, xr_mutex};
             LockTrace::Hold trace{"dibr copy: acquire", lock_start}; // VR_LOCK_TRACE only
-            if (swapchains[0].handle == XR_NULL_HANDLE || !copy_compatible ||
+            const bool stereo_copy_compatible = eyes.image_format == vk::Format::eUndefined
+                ? copy_compatible
+                : eyes.image_format == static_cast<vk::Format>(swapchain_format);
+            if (swapchains[0].handle == XR_NULL_HANDLE || !stereo_copy_compatible ||
                 dibr_recording.valid) {
                 return false; // the present thread creates the eye swapchains with a first frame
             }
@@ -15050,6 +17254,8 @@ struct OpenXRPresenter::Impl {
                 }
             }
             if (!pairs_ok) {
+                RENDER_DIAGNOSTIC_ONCE("stereo swapchain creation failed native={} size={}x{} format={}",
+                    eyes.native, need.width, need.height, static_cast<int>(eyes.image_format));
                 dibr_swapchains_failed = true;
                 LOG_ERROR(Render_Vulkan, "OpenXR: no DIBR swapchains; DIBR eyes go through the "
                                          "present thread for this session");
@@ -15058,6 +17264,8 @@ struct OpenXRPresenter::Impl {
             for (u32 i = 0; i < 2; ++i) {
                 auto& eye = swapchains[DibrBase + 2 * pair + i];
                 if (!AcquireAndWait(eye)) {
+                    RENDER_DIAGNOSTIC_ONCE("stereo acquire/wait failed eye={} native={} pair={} (can be transient)",
+                        i, eyes.native, pair);
                     ++pair_stats.dibr_fallback;
                     return false; // still acquired: waited for again with the next frame
                 }
@@ -15075,6 +17283,8 @@ struct OpenXRPresenter::Impl {
             dibr_recording.depth = with_depth;
             dibr_recording.ui_set = false;
             dibr_recording.ui = {};
+            dibr_recording.compose = eyes.native && !late_enabled.load() &&
+                (VR::GetSettings().ui_compose_eyes || VR::GetSettings().overlay_compose_eyes);
         }
 
         constexpr vk::ImageSubresourceRange subresource{
@@ -15099,8 +17309,8 @@ struct OpenXRPresenter::Impl {
             // The compositor is done with the image (xrWaitSwapchainImage); only our own earlier
             // copy into it is ordered here. The eye images were written by the warp just before.
             pre[i] = vk::ImageMemoryBarrier2{
-                .srcStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
-                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
                 .dstStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
                 .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
                 .oldLayout = eye.initialized[indices[i]] ? vk::ImageLayout::eColorAttachmentOptimal
@@ -15300,6 +17510,7 @@ struct OpenXRPresenter::Impl {
             return;
         }
         const s64 now = SteadyNs();
+        double diagnostic_frame_ms = 0.0;
         {
             const Common::Log::DeferScope log_defer; // its log lines: once the lock is released
             const LockTrace::Start lock_start;
@@ -15308,7 +17519,7 @@ struct OpenXRPresenter::Impl {
             DibrFrame& frame = dibr_recording;
             const XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             bool released = true;
-            if (xrq.Own()) {
+            if (xrq.Own() || frame.compose) {
                 // The runtime's own queue: nothing is released here (an XR call would wait for
                 // xrEndFrame, which holds the XR queue most of a refresh on SteamVR). The eyes,
                 // their depth and the UI stay acquired until the frame thread puts this pair up
@@ -15324,7 +17535,7 @@ struct OpenXRPresenter::Impl {
             } else if (frame.ui_set && frame.ui.chain >= 0 && !ReleaseUiChain(frame.ui.chain)) {
                 frame.ui_set = false; // the shown UI stays
             }
-            for (u32 i = 0; i < 2 && !xrq.Own(); ++i) {
+            for (u32 i = 0; i < 2 && !xrq.Own() && !frame.compose; ++i) {
                 LockTrace::Phase phase{"xrReleaseSwapchainImage"};
                 auto& eye = swapchains[DibrBase + 2 * frame.pair + i];
                 eye.acquired = false;
@@ -15374,10 +17585,16 @@ struct OpenXRPresenter::Impl {
                     if (p.intervals_ms.size() < 4096) {
                         p.intervals_ms.push_back(static_cast<float>(ms));
                     }
+                    diagnostic_frame_ms = ms;
                 } else if (interval >= 250'000'000) {
                     ++publish_stats.long_gaps;
                 }
             }
+        }
+        // Diagnostics may discover threads or write logs: never keep XR or queue submission
+        // waiting behind that work. The frame interval above still uses the publication timestamp.
+        if (diagnostic_frame_ms > 0.0) {
+            Common::Slow::FrameBoundary(diagnostic_frame_ms);
         }
         // The game's frame interval, for the minimum hold (a hitch restarts it). Stutter frames
         // (shader compiles: 50-100 ms apart) are left out: over 4.5 refreshes.
@@ -15468,12 +17685,44 @@ struct OpenXRPresenter::Impl {
         }
         queue_stats.skipped += static_cast<u32>(pick);
         EraseQueued(0, static_cast<u32>(pick) + 1);
-        if (xrq.Own() && !ReleaseAdopted(adopted.pair, adopted.source, adopted.depth,
-                                         adopted.ui_set ? adopted.ui.chain : -1,
-                                         adopted.ui_set)) {
-            UpdateLateBusy();
-            return; // its eyes could not be handed to the runtime: the shown pair stays up
+        const UiContent previous_ui = ui_shown;
+        const bool previous_ui_composed = shown_ui_composed;
+        const bool previous_overlay_composed = shown_overlay_composed;
+        if (adopted.ui_set) ui_shown = adopted.ui;
+        shown_overlay_composed = false;
+        shown_ui_composed = adopted.compose && ComposeAdoptedUi(adopted);
+        bool released = true;
+        if (xrq.Own()) {
+            released = ReleaseAdopted(adopted.pair, adopted.source, adopted.depth,
+                                     adopted.ui_set ? adopted.ui.chain : -1, adopted.ui_set);
+        } else if (adopted.compose) {
+            const XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            const auto release_one = [&](EyeSwapchain& image) {
+                const bool ok = image.acquired && image.waited &&
+                    CheckXr(xrReleaseSwapchainImage(image.handle, &release), "composed image release");
+                image.acquired = image.waited = false;
+                return ok;
+            };
+            for (u32 i = 0; i < 2; ++i) {
+                released &= release_one(swapchains[DibrBase + 2 * adopted.pair + i]);
+            }
+            if (adopted.depth) {
+                bool depth_ok = true;
+                for (u32 i = 0; i < 2; ++i)
+                    depth_ok &= release_one(depth_swapchains[2 * adopted.pair + i]);
+                adopted.depth = depth_ok;
+            }
+            if (adopted.ui_set && adopted.ui.chain >= 0)
+                adopted.ui_set = release_one(ui_chains[adopted.ui.chain]);
         }
+        if (!released) {
+            ui_shown = previous_ui;
+            shown_ui_composed = previous_ui_composed;
+            shown_overlay_composed = previous_overlay_composed;
+            UpdateLateBusy();
+            return;
+        }
+        if (!adopted.ui_set) ui_shown = previous_ui;
         const EyeSource& source = adopted.source;
         const u32 left = DibrBase + 2 * adopted.pair;
         content[0] = {true, adopted.eye_poses[0], adopted.projections[0], left, source};
@@ -15741,9 +17990,11 @@ struct OpenXRPresenter::Impl {
         const VR::Settings& vrs = VR::GetSettings();
         // aa_mode=taa: the game frame arrives anti-aliased over time already; taa_eye_taa (>= 0)
         // sets the eyes' own weight on top of it (-1: eye_taa's own).
-        const bool render_taa = vrs.aa_mode == VR::Aa::Mode::Taa;
-        src.taa = (render_taa && vrs.taa_eye_taa >= 0.0f) ? vrs.taa_eye_taa : vrs.eye_taa;
-        if (render_taa && VR::Tune::Active()) {
+        const bool render_taa = late_shown.render_taa;
+        const bool native_stereo = std::getenv("VR_NATIVE_STEREO") != nullptr;
+        src.taa = VR::EyeHistory::Weight(native_stereo, render_taa, vrs.eye_taa,
+                                         vrs.taa_eye_taa, vrs.dibr_eye_taa);
+        if (render_taa && VR::Tune::Active() && (native_stereo || vrs.dibr_eye_taa < 0.0f)) {
             // VR_TUNE_FILE taa.eye_taa (tests; < 0 = keep).
             const float t = VR::Tune::Get("taa.eye_taa", -1.0f);
             if (t >= 0.0f) {
@@ -16015,7 +18266,7 @@ struct OpenXRPresenter::Impl {
                  "reprojection pass {:.3f} ms avg; eyes {}x{} / {}x{}, {} upscaled or sharpened "
                  "(GPU {:.3f} ms avg); {} through the eye TAA, {} of them with a history ({} "
                  "the world moving, {} the head only) (GPU {:.3f} ms avg; eye_taa={:.2f} "
-                 "eye_taa_follow={} eye_taa_gate_px={:.2f} eye_taa_edge_cap={:.2f} "
+                 "dibr_eye_taa={:.2f} eye_taa_follow={} eye_taa_gate_px={:.2f} eye_taa_edge_cap={:.2f} "
                  "eye_taa_jitter={:.2f}; aa_mode={} taa_jitter={:.2f} taa_phases={} "
                  "taa_alpha_min={:.3f} taa_clip_gamma={:.2f} taa_depth_reject={:.3f} "
                  "taa_stable_depth={} taa_sharpen={:.2f} taa_eye_taa={:.2f} "
@@ -16029,8 +18280,8 @@ struct OpenXRPresenter::Impl {
                  t.out[0].height, t.out[1].width, t.out[1].height, t.upscaled,
                  t.upscale_samples ? t.upscale_ms / t.upscale_samples : 0.0, t.taa, t.taa_history,
                  t.taa_moving, t.taa_head, t.taa_samples ? t.taa_ms / t.taa_samples : 0.0,
-                 vrs.eye_taa, vrs.eye_taa_follow ? 1 : 0, vrs.eye_taa_gate_px,
-                 vrs.eye_taa_edge_cap, vrs.eye_taa_jitter, VR::Aa::Name(vrs.aa_mode),
+                 vrs.eye_taa, vrs.dibr_eye_taa, vrs.eye_taa_follow ? 1 : 0, vrs.eye_taa_gate_px,
+                 vrs.eye_taa_edge_cap, vrs.eye_taa_jitter, VR::Aa::Name(VR::GetActiveAaMode()),
                  vrs.taa_jitter, vrs.taa_phases, vrs.taa_alpha_min, vrs.taa_clip_gamma,
                  vrs.taa_depth_reject, vrs.taa_stable_depth ? 1 : 0, vrs.taa_sharpen,
                  vrs.taa_eye_taa, vrs.taa_luma_weight, vrs.taa_occluder ? 1 : 0,
@@ -16642,6 +18893,7 @@ struct OpenXRPresenter::Impl {
             }
             for (auto& chain : ui_chains) {
                 if (chain.handle != XR_NULL_HANDLE) {
+                    chain.compose_views.clear();
                     xrDestroySwapchain(chain.handle);
                 }
                 chain = {};
@@ -16654,13 +18906,15 @@ struct OpenXRPresenter::Impl {
         }
         u32 mips = UiMipLevels(extent);
         u32 images = 0;
-        for (u32 attempt = 0; attempt < 2; ++attempt) {
+        for (u32 attempt = 0; attempt < 3; ++attempt) {
             bool ok = true;
             images = 0;
             for (auto& chain : ui_chains) {
                 XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
                 info.usageFlags =
                     XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+                if (VR::GetSettings().ui_compose_eyes && ui_compose_sampled)
+                    info.usageFlags |= XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
                 if (mips > 1) {
                     info.usageFlags |= XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT; // the mip blits
                 }
@@ -16699,9 +18953,16 @@ struct OpenXRPresenter::Impl {
             }
             for (auto& c : ui_chains) {
                 if (c.handle != XR_NULL_HANDLE) {
+                    c.compose_views.clear();
                     xrDestroySwapchain(c.handle);
                 }
                 c = {};
+            }
+            if (mips == 1 && VR::GetSettings().ui_compose_eyes && ui_compose_sampled) {
+                ui_compose_sampled = false;
+                LOG_WARNING(Render_Vulkan,
+                            "VR compose: runtime refused sampled UI images; using UI layers");
+                continue;
             }
             if (mips == 1) {
                 ui_chains_failed = true;
@@ -17992,7 +20253,8 @@ struct OpenXRPresenter::Impl {
 
     // The lower group's distance: further away while an area name is on it (easier to read).
     float UiLowerDistance() const {
-        const float d = VR::GetSettings().ui_hud_distance_m;
+        const auto& s = VR::GetSettings();
+        const float d = s.ui_hud_distance_m + s.ui_lower_push_m;
         return ui_area_on ? std::max(d, VR::Ui::AreaNameDistanceM) : d;
     }
 
@@ -18368,6 +20630,7 @@ struct OpenXRPresenter::Impl {
             // would dip and jump to where you look then).
             if (now - ui_tick_ns >= 1'500'000'000) {
                 ui_title.state = {};
+                ui_title.unknown = {}; // no pre-load guess may confirm against the next fade
             }
             if (!same_menu) {
                 ui_canvas.valid = false;
@@ -18664,8 +20927,21 @@ struct OpenXRPresenter::Impl {
             const VR::BannerEvent banner = VR::LatestBanner();
             const bool fresh = banner.serial != ui_title.banner_serial;
             ui_title.banner_serial = banner.serial;
-            const bool new_banner =
+            const bool played =
                 s.ui_banner_title && fresh && banner.serial != 0 && now - banner.ns < 1'000'000'000;
+            // One of unknown type waits for a banner's screen-wide dim (VR::Ui::UnknownBannerGate);
+            // while dead it is the death screen at once, as before. A known one supersedes it.
+            const bool unknown = played && banner.type == 0 && !dead;
+            bool dropped = false;
+            const bool confirmed = ui_title.unknown.Step(unknown, screen, now, dropped);
+            if (played && !unknown) {
+                ui_title.unknown = {};
+            }
+            if (dropped) {
+                LOG_INFO(Render_Vulkan, "VR ui: a text effect of unknown type without a banner's "
+                                        "screen-wide dim: no title");
+            }
+            const bool new_banner = (played && !unknown) || confirmed;
             const bool was_on = ui_title.state.on;
             if (VR::Ui::StepDeathTitle(ui_title.state, s.ui_death_distance_m > 0.0f, screen, dead,
                                        head.valid, new_banner, dt)) {
@@ -19414,6 +21690,169 @@ struct OpenXRPresenter::Impl {
         return layer_count - before;
     }
 
+    vk::ImageView ComposeView(EyeSwapchain& chain, u32 mips = 1) {
+        if (chain.compose_views.empty()) chain.compose_views.resize(chain.images.size());
+        auto& view = chain.compose_views[chain.index];
+        if (!view) {
+            auto [result, created] = instance.GetDevice().createImageViewUnique({
+                .image = vk::Image{chain.images[chain.index].image},
+                .viewType = vk::ImageViewType::e2D,
+                .format = static_cast<vk::Format>(swapchain_format),
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, mips, 0, 1},
+            });
+            if (result != vk::Result::eSuccess) return {};
+            view = std::move(created);
+        }
+        return *view;
+    }
+
+    // The frame thread owns placement. Both paths consume BuildUiLayers' exact geometry;
+    // conversion to vertices is pure (VrUiGeometry). All source/target images remain acquired.
+    template <typename Frame>
+    bool ComposeAdoptedUi(const Frame& frame) {
+        if (compose_failed || frame.record.space_serial != recenter_serial) return false;
+        const bool want_ui = VR::GetSettings().ui_compose_eyes && ui_compose_sampled && frame.ui_set &&
+                             frame.ui.valid && frame.ui.chain >= 0;
+        const OverlaySnapshot* snapshot = nullptr;
+        if (VR::GetSettings().overlay_compose_eyes && overlay_in_eye.IsActive() &&
+            !VR::Page::Runtime::Get().Visible()) {
+            for (const auto& candidate : overlay_history) {
+                if (candidate.head_time != 0 && candidate.head_time == frame.record.head_time &&
+                    candidate.space == frame.record.space_serial) {
+                    snapshot = &candidate;
+                    break;
+                }
+            }
+        }
+        if (!want_ui && !snapshot) return false;
+        EyeSwapchain* atlas = want_ui ? &ui_chains[frame.ui.chain] : nullptr;
+        if (atlas && (!atlas->acquired || !atlas->waited)) return false;
+        std::unique_lock game_lock{Scheduler::submit_mutex, std::defer_lock};
+        if (xrq.Own()) game_lock.lock(); // otherwise Submit already holds it
+        if (!ui_compose.Init(instance.GetDevice(), instance.GetGraphicsQueueFamilyIndex(),
+                             static_cast<vk::Format>(swapchain_format), instance.GetPhysicalDevice())) {
+            compose_failed = true;
+            LOG_WARNING(Render_Vulkan,"VR compose initialization failed; using layers");
+            return false;
+        }
+        const auto atlas_view = atlas ? ComposeView(*atlas, ui_chain_mips) : vk::ImageView{};
+        std::array<vk::ImageView, 2> targets{};
+        for (u32 i = 0; i < 2; ++i) {
+            auto& eye = swapchains[DibrBase + 2 * frame.pair + i];
+            if (!eye.acquired || !eye.waited) return false;
+            targets[i] = ComposeView(eye);
+            if (!targets[i]) return false;
+        }
+        if (atlas && !atlas_view) return false;
+        if (want_ui) UpdateUiPlacement(last_head);
+        UiLayerStorage storage{};
+        std::array<const XrCompositionLayerBaseHeader*, 12> layers{};
+        u32 count = 0;
+        // The projection layer applies the cinematic brightness once, after compositing.
+        if (want_ui) BuildUiLayers(storage, 1.0f, layers, count);
+        std::array<VrUiGeometry::Piece, 12> pieces{};
+        u32 piece_count = 0;
+        for (u32 i = 0; i < count; ++i) {
+            const auto piece = VrUiGeometry::FromLayer(*layers[i], view_space);
+            if (!piece) return false;
+            pieces[piece_count++] = *piece;
+        }
+        if (piece_count == 0 && (!snapshot || snapshot->items.empty())) {
+            shown_overlay_composed = snapshot != nullptr;
+            return want_ui;
+        }
+        const auto cmd = ui_compose.Begin();
+        if (!cmd) return false;
+        const vk::Image atlas_image = atlas ? vk::Image{atlas->images[atlas->index].image} : vk::Image{};
+        const vk::ImageMemoryBarrier2 read{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderSampledRead,
+            .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .image = atlas_image,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, ui_chain_mips, 0, 1},
+        };
+        if (atlas) cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount=1, .pImageMemoryBarriers=&read});
+        for (u32 i = 0; i < 2; ++i) {
+            const auto& eye = swapchains[DibrBase + 2 * frame.pair + i];
+            const vk::ImageMemoryBarrier2 target{
+                .srcStageMask=vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask=vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask=vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .dstAccessMask=vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite,
+                .oldLayout=vk::ImageLayout::eColorAttachmentOptimal,
+                .newLayout=vk::ImageLayout::eColorAttachmentOptimal,
+                .image=vk::Image{eye.images[eye.index].image},
+                .subresourceRange={vk::ImageAspectFlagBits::eColor,0,1,0,1},
+            };
+            cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount=1, .pImageMemoryBarriers=&target});
+            const auto& rect = frame.projections[i].rect;
+            ui_compose.Draw(cmd, targets[i], {u32(rect.extent.width),u32(rect.extent.height)},
+                            atlas_view, ui_chain_extent, {pieces.data(),piece_count},
+                            frame.eye_poses[i],frame.projections[i].fov,frame.ui.frame_pose);
+        }
+        auto restore = read;
+        restore.srcStageMask=vk::PipelineStageFlagBits2::eFragmentShader;
+        restore.srcAccessMask=vk::AccessFlagBits2::eShaderSampledRead;
+        restore.dstStageMask=vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+        restore.dstAccessMask=vk::AccessFlagBits2::eColorAttachmentRead;
+        std::swap(restore.oldLayout,restore.newLayout);
+        if (atlas) cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount=1, .pImageMemoryBarriers=&restore});
+        if (snapshot && !snapshot->items.empty()) {
+            VrOverlayRenderer::EyeViews eyes{frame.eye_poses,
+                {frame.projections[0].fov, frame.projections[1].fov}};
+            if (!overlay_in_eye.RecordOffscreen(cmd, ui_compose.SlotIndex(), eyes, snapshot->items))
+                return false;
+            const vk::ImageMemoryBarrier2 overlay_read{
+                .srcStageMask=vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .srcAccessMask=vk::AccessFlagBits2::eColorAttachmentWrite,
+                .dstStageMask=vk::PipelineStageFlagBits2::eFragmentShader,
+                .dstAccessMask=vk::AccessFlagBits2::eShaderSampledRead,
+                .oldLayout=vk::ImageLayout::eColorAttachmentOptimal,
+                .newLayout=vk::ImageLayout::eShaderReadOnlyOptimal,
+                .image=overlay_in_eye.OffscreenImage(),
+                .subresourceRange={vk::ImageAspectFlagBits::eColor,0,1,0,1},
+            };
+            cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount=1, .pImageMemoryBarriers=&overlay_read});
+            const vk::MemoryBarrier2 blend_order{
+                .srcStageMask=vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .srcAccessMask=vk::AccessFlagBits2::eColorAttachmentWrite,
+                .dstStageMask=vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .dstAccessMask=vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite,
+            };
+            cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1, .pMemoryBarriers=&blend_order});
+            const auto size = overlay_in_eye.OffscreenExtent();
+            for (u32 i=0; i<2; ++i) {
+                const auto& fov=frame.projections[i].fov;
+                const float l=std::tan(fov.angleLeft), r=std::tan(fov.angleRight);
+                const float u=std::tan(fov.angleUp), d=std::tan(fov.angleDown);
+                VrUiGeometry::Piece screen{};
+                screen.pose=frame.eye_poses[i];
+                const auto& q=screen.pose.orientation;
+                const auto offset=VR::Rotate(VR::Quat{q.x,q.y,q.z,q.w},
+                                             VR::Vec3{(l+r)*0.5f,(u+d)*0.5f,-1.0f});
+                screen.pose.position.x+=offset.x;
+                screen.pose.position.y+=offset.y;
+                screen.pose.position.z+=offset.z;
+                screen.width=r-l; screen.height=u-d;
+                screen.rect={{s32(i*size.width/2),0},{s32(size.width/2),s32(size.height)}};
+                const auto& rect=frame.projections[i].rect;
+                ui_compose.Draw(cmd,targets[i],{u32(rect.extent.width),u32(rect.extent.height)},
+                    overlay_in_eye.OffscreenView(),size,{&screen,1},frame.eye_poses[i],fov,frame.ui.frame_pose);
+            }
+        }
+        const auto sync = xrq.PlanGameBatch(0); // acquire was already waited by the game's copy
+        if (!ui_compose.Submit(instance.GetGraphicsQueue(),sync.signal,sync.signal_value)) return false;
+        xrq.GameBatchSubmitted(sync);
+        Common::SyncLog::Line("compose rec=%llu head_t=%lld ui=%u pieces=%u overlay=%u gpu_ms=%.4f",
+            static_cast<unsigned long long>(frame.record.id),static_cast<long long>(frame.record.head_time),
+            want_ui ? 1u : 0u,piece_count,snapshot ? 1u : 0u,ui_compose.LastGpuMs());
+        shown_overlay_composed = snapshot != nullptr;
+        return want_ui;
+    }
+
     // The image slot (swapchain 0 or 1) that is not on display (xr_mutex held). At most one slot is
     // shown: by a pair's left eye, a mono frame or the virtual screen.
     u32 FreeSlot() const {
@@ -19432,6 +21871,8 @@ struct OpenXRPresenter::Impl {
 
     // One immersive frame for both eyes, each with its own pose, FOV and crop (xr_mutex held).
     void ShowMono(const Pending& frame) {
+        shown_ui_composed = false;
+        shown_overlay_composed = false;
         for (u32 i = 0; i < 2; ++i) {
             content[i] = {true, frame.eye_poses[i], frame.projections[i], frame.swapchain,
                           frame.source};
@@ -19756,6 +22197,12 @@ struct OpenXRPresenter::Impl {
     XrSpace retired_space{XR_NULL_HANDLE};
     VR::Space::Shift app_space{};
     VR::Space::Fade recenter_fade{}; // frame thread
+    VR::QuickTurn::Gesture quick_turn_gesture{};
+    VR::Space::Fade quick_turn_fade{};
+    bool quick_turn_input{};
+    float quick_turn_dt{};
+    u64 quick_turn_record{};
+    u32 quick_turn_serial{};
     // The current tracking space's serial (VR::ShiftTrackingSpace; 0 = the session's LOCAL): the
     // one the last recenter changed to. Frame thread writes it under xr_mutex.
     u32 recenter_serial{0};
@@ -19943,6 +22390,10 @@ struct OpenXRPresenter::Impl {
         u64 mismatched{0};
     } ui_warp_check;
     bool ui_chains_failed{false};
+    VrUiCompose ui_compose;
+    bool shown_ui_composed{false};
+    bool compose_failed{false};
+    bool ui_compose_sampled{true};
     UiContent ui_shown{};                // what Submit shows
     std::atomic_bool ui_disabled{false}; // the runtime refused them: off for the session
     UiContent ui_pending{};              // present thread: CopyUiFrame -> ReleaseFrame
@@ -19963,6 +22414,7 @@ struct OpenXRPresenter::Impl {
         bool native{false}; // StereoEyes::native
         // Its UI (RecordUiCopy): `ui_set` false keeps the UI that is shown.
         bool ui_set{false};
+        bool compose{false}; // retain acquired images until the frame thread composes
         UiContent ui{};
         // The late warp's source: the frame's capture (in its VrStereoWarp slot), the camera
         // record it was drawn with, each eye's crop of the render and the stamp's other rows.
@@ -20081,6 +22533,7 @@ struct OpenXRPresenter::Impl {
     std::array<VR::Fov, 2> logged_fov{};
     bool cant_warned{false};
     bool velocity_logged{false};
+    bool right_stick_to_game{false};
     u32 wait_timeouts{0};
     u32 sync_failures{0};
     std::chrono::steady_clock::time_point last_input_log{};
@@ -20092,11 +22545,8 @@ struct OpenXRPresenter::Impl {
     u32 tracking_test_phase{}; // frame-loop thread only
     Actions actions{};
     PadMapper pad{};
-    VR::Interactions::MeleeRuntime melee_runtime;
-    mutable VR::Interactions::MeleeFeedbackRuntime melee_feedback_runtime;
-    VR::Interactions::VisceralRuntime visceral_runtime;
-    VR::Interactions::MeleeClassifier melee{melee_runtime,0};        // motion weapon: swing commit gate + big-swing heavies
-    VR::Interactions::MeleeClassifier melee_shadow{melee_runtime,1}; // ... the same with swings on (the deny tick, SwingGate)
+    VR::Melee::Classifier melee{};        // motion weapon: swing commit gate + big-swing heavies
+    VR::Melee::Classifier melee_shadow{}; // ... the same with swings on (the deny tick, SwingGate)
     std::array<HandHaptics, 2> haptics{}; // 0 = left (gun), 1 = right (weapon)
     // Vibration diagnostics (UpdateHaptics, frame thread): per hand since the last 5 s line.
     struct HapticStats {
@@ -20141,7 +22591,12 @@ struct OpenXRPresenter::Impl {
     float non_immersive_time{0.0f};
     float chord_time{0.0f};
     bool chord_fired{false};
-    // Modifier clicks and R3 recognition live in the XR-owned weapon-input DLL context.
+    // The left stick click (left_scheme=1): the sprint jump, the modifier, and its tap (the arc or
+    // L3).
+    VR::StickClick::LeftClick l3_click;
+    // left_scheme=2's gameplay: Y held is the modifier of the gestures (+ B) and, without y_menu,
+    // its tap the arc's Y press (the click's logic).
+    VR::StickClick::LeftClick y_click;
     // ... Y's own jobs on top (core/vr/y_menu.h, UpdateYGesture in UpdateInput, every context):
     // y_menu's tap = Options, hold = recenter, long hold = the flat screen's escape, and the
     // combos that replaced Y + X / Y + right stick.
@@ -20170,9 +22625,8 @@ struct OpenXRPresenter::Impl {
     bool left_y_bound{true};
     // The sprint latch, A's leap / dodge and the second click (left_scheme=2), and the Circle
     // edges of a leap or a dodge out of a sprint (both schemes): core/vr/left_locomotion.h.
-    VR::Interactions::LocoRuntime loco_runtime{};
-    VR::Interactions::LocoController loco{loco_runtime};
-    VR::Interactions::LocoSequencer loco_seq{loco_runtime};
+    VR::Loco::Controller loco;
+    VR::Loco::Sequencer loco_seq;
     bool loco_logged{false};
     int loco_log_dash{-2}; // VR_LOCO_LOG: the last logged dash reading (391, 390)
     int loco_log_window{-2};
@@ -20181,17 +22635,45 @@ struct OpenXRPresenter::Impl {
     // A leap or a dodge started this frame (UpdateLocomotion), for the quick items (it closes the
     // open arc); nullptr: none.
     const char* loco_combat{nullptr};
+    float quick_since_attack{10.0f}; // since_attack at the last UpdateQuickItems (a new swing)
+    bool r3_down{false};
+    bool r3_to_game{true};
+    float r3_time{0.0f}; // the right stick click held this long (motion)
+    bool r3_used{false}; // ... with the stick pushed or a weapon switched: no lock-on on release
+    bool r3_switched{false}; // ... a weapon switched (no deny tick on release)
+    bool b_down{false};
+    bool summon_bell_block_b{false};
+    bool b_to_touch{false};
+    bool touch_fired{false};
+    float b_time{0.0f};
     float touch_left{0.0f};
     float touch_x{0.25f};
-    VR::Interactions::GunRuntime gun_runtime;
-    VR::Interactions::GunDeliveryRuntime gun_delivery;
+    VR::Gun::WristReload wrist_reload;
+    VR::Gun::WristReloadMode reload_mode;
+    VR::Gun::NearBody reload_near; // the gun hand near the body: the stricter flick
+    // The reload attempt log: every reload, failed attempts at most 4 lines a second.
     VR::Gun::ReloadLogGate reload_log;
+    u32 reload_player_epoch{0};
+    s64 reload_seen_shot_ns{0};
+    u32 reload_space_serial{0};
+    bool trigger_l_down{false};
+    // The gun (UpdateGun): this pull's route (the game fires it directly, or the game's own L2),
+    // the pulls published, the predicted thump and the presenter's own cooldown, and the left grip
+    // of the last hands publication (the pull's pose).
+    bool gun_route_direct{false};
+    u32 gun_serial{0};
+    u32 gun_predicted{0};      // the pull whose thump was played at the pull
+    s64 gun_next_ready_ns{0};  // steady clock: the next shot the presenter expects to be allowed
+    u32 gun_mismatches{0};     // predicted thumps the game did not fire (logged)
+    u32 gun_dry_clicked{0};    // the pull whose empty click was played at the pull
     // The hit ticks (UpdateRangedHits): the damage hook's counts of his bullets and thrown items
     // that hit a character, the last shot's and throw's time (a hit only counts within a few
     // seconds of one), a gun hit waiting for the shot's recoil to play out.
-    const VR::Bloodborne::RangedHits feedback_initial_ranged{VR::Bloodborne::PlayerRangedHits()};
+    VR::Bloodborne::RangedHits ranged_seen{VR::Bloodborne::PlayerRangedHits()};
     s64 gun_shot_ns{0};
     s64 throw_ns{0};
+    s64 gun_hit_pending_ns{0};
+    s64 throw_tick_ns{0};
     VR::Body::TrackedHand grip_left_located{};
     // The head of the same sample (the reload's near-body test).
     bool grip_head_tracked{false};
@@ -20199,6 +22681,10 @@ struct OpenXRPresenter::Impl {
     VR::Body::Quat grip_head_q{};
     u32 grip_located_space{0};
     s64 grip_located_ns{0}; // when they were published (the injection's freeze counts from it)
+    bool grip_l_down{false};
+    bool was_locked{false};
+    bool stick_armed{true};
+    float up_hold{0.0f};
     // Virtual-screen menu stick (left stick as D-pad while the game shows menus).
     bool menu_stick_active{false};
     bool menu_armed{false};
@@ -20229,63 +22715,120 @@ struct OpenXRPresenter::Impl {
     // VR body feedback (frame thread): the live weapon grip adjust (hold A+B; while it is frozen
     // the published right grip is the frozen pose, the adjust itself uses the located one), the
     // ghost hands' opacity (the VR overlay draws them) and the body events.
-    VR::Interactions::GripAdjust grip_adjust{};
+    VR::Body::GripAdjust grip_adjust{};
     // The A+B chord and its roll (UpdateRollChord, StartRoll, UpdateRollRun, ApplyRoll).
     static constexpr s64 RollHoldNs = 150'000'000; // the game's facing, refreshed every frame
-    VR::Interactions::ShoulderRuntime shoulder_runtime{};
+    std::array<VR::ShoulderSwitch::Gate, 2> shoulder_switch{};
+    std::array<VR::ShoulderSwitch::Confirmation, 2> shoulder_confirmation{};
     std::array<bool, 2> shoulder_unarm_request{};
-    VR::Interactions::RollRuntime roll_chord{};
+    VR::Roll::Chord roll_chord{};
     bool roll_adjust{false};     // the grip adjust's A+B this frame
+    bool roll_active{false};     // a roll is under way (the game's facing held)
+    float roll_t{0.0f};          // since it started
+    float roll_after{0.0f};      // since its Circle sequence ended
+    bool roll_seq{false};        // its Circle tap (loco_seq's Dodge) is under way
+    bool roll_pressed{false};    // ... and has gone down
+    bool roll_dodge_seen{false}; // the game's dodge (SpEffect 392 / 393) came after the tap
+    float roll_stick_left{0.0f}; // the left stick is held toward the roll this much longer
+    XrVector2f roll_dir{0.0f, -1.0f};
     VR::Body::TrackedHand grip_right_located{};
     s32 adjust_family{-1};
     VR::Body::GripTrim adjust_from{};
     float adjust_autotest_time{0.0f};
     bool adjust_autotest_done{false};
     std::array<float, 2> ghost_alpha{};
-    VR::Interactions::BodyFeedback body_feedback_runtime;
+    std::array<bool, 2> ghost_shown{};
     bool ghost_logged{false};
     float mode_cycle_time{0.0f}; // VR_MODE_CYCLE_S
     // Motion weapon: swing gate (right_grip=transform), clutch (right_grip=draw) and the
     // heavy/charge state machine.
+    enum class Route { R1, R2, Heavy };
     enum class Heavy { Idle, Pending, Charging, Consumed };
     float context_age{10.0f};         // since the last SwitchContext (capped at 10 s)
+    bool swing_ready{false};          // SwingGate: swings may attack
+    float swing_quiet{0.0f};          // the weapon hand slow this long since the gate cleared
     const char* swing_block{nullptr}; // what holds swings back (logs)
+    bool hand_at_face{false};         // HandAtFace (hysteresis)
+    bool left_at_face{false};         // ... the left hand's (UpdateLeftMelee)
+    bool left_face_hold{false};       // left swings held back since it was at the face ...
+    float left_face_quiet{0.0f};      // ... until it is slow this long
     bool drawn{false};
-    mutable VR::Interactions::WeaponInput whip_transform_hold{};
+    bool sticky_drawn{false};
+    VR::Transform::GripHold whip_transform_hold{};
     bool grip_r_down{false};
+    const char* grip_r_block{nullptr}; // the held right-grip squeeze is no transform: why
+    bool grip_r_native{false};         // ... it went to the weapon-only transform (no L1)
     u32 transform_serial{0};           // native transform squeezes sent
+    float grip_press_time{0.0f};
+    bool talk_paused{false}; // talk_guard holds swings back (an NPC is talking)
+    bool trigger_r_down{false};
+    Route trigger_route{Route::R1};
     Heavy heavy{Heavy::Idle};
+    float heavy_time{0.0f};
+    bool heavy_tap_suppressed{false};
     float since_attack{10.0f};
-    PhysicalInteractions::QuickFeedbackState quick_feedback_legacy{};
-    uint64_t quick_feedback_legacy_sequence{};
+    bool arc_sustain{false}; // the pending big-swing buzz owns the weapon hand's sustain
+    bool quick_wipe_sustain{false}; // quick_use_wipe: the rasp owns both hands' hum
+    s64 quick_wipe_cue_ns{0};       // ... and the find cue's next tick (0: none due)
+    bool quick_hold_sustain{false}; // quick_hold_use: the ring's rising hum owns the left hand's
     bool melee_logged{false};
     // melee=physical (UpdatePhysicalMelee): the swing windows, the route (logged on change), the
     // blade tip's recent speeds, the window publication and the game's last hit.
-    VR::Interactions::MeleeWindow melee_window{melee_runtime,0};
+    VR::Melee::WindowTracker melee_window{};
     bool melee_physical{false};
     const char* melee_route_why{""};
+    float melee_clock{0.0f};
+    s64 melee_step_ns{0}; // the last WindowTracker::Step (the budget's real-time gap, Advance)
+    std::array<std::pair<float, float>, 16> melee_tip_history{};
+    u32 melee_tip_next{0};
     unsigned melee_recovery_logged{0}; // VR_SWING_LOG: the last recovery stroke logged
     s64 melee_open_ns{0};
     s64 melee_close_ns{0};
     u32 melee_prev_serial{0};
     bool melee_prev_aborted{false};
+    u32 melee_hit_serial{0};
+    u32 melee_impact_serial{0}; // the swing whose impact played last (HandleMeleeEvents) ...
+    s64 melee_impact_ns{0};     // ... when, and how heavy
+    float melee_impact_weight{0.0f};
+    bool melee_charge_sustain{false}; // the trigger charge's buzz owns the weapon hand's sustain
+    bool melee_whip_sustain{false};   // the physical whip's hum owns it
+    VR::Whip::SpinCounter melee_spin{}; // a spun whip's revolutions (UpdatePhysicalMelee)
+    VR::Whip::CrackGate melee_crack{};  // ... and its cracks (the wrist alone lashing it)
     // Physical viscerals (visceral_thrust, core/vr/visceral_thrust.h; UpdateVisceralThrust): the
     // thrust detector, the newest window's verdict, the heartbeat cue and what the game reads.
+    VR::Melee::Thrust::Detector thrust_detector{};
+    VR::Melee::Thrust::WindowVerdict thrust_verdict{};
+    VR::Melee::Thrust::Cue thrust_cue{};
+    u32 thrust_rejudged_serial{0}; // the visceral opening the thrust detector re-judged for
+    std::array<VR::Body::Tremor::WeaponFilter, 2> hand_tremor{}; // hand_tremor_filter (PublishHands)
+    VR::Body::Weight::Handling weapon_weight{};
+    VR::Body::TrackedHand weapon_weight_hand{};
+    GestureFrame weapon_weight_gesture{};
+    u64 weapon_weight_frame{};
+    bool weapon_weight_active{}, weapon_weight_mesh{};
+    VR::Body::TrackedHand guide_weapon_hand{};
+    u64 guide_weapon_frame{};
+    VR::Combat::ThrustState thrust_state{};
+    u32 thrust_logged_window{0};
     // Simon's Bowblade's bow (vr.ini bow; UpdateBow): its state, whether its bow form is up, the
     // shots sent, whether the string's tension owns the hands' sustain.
-    VR::Interactions::RangedRuntime ranged_runtime;
-    VR::Interactions::FireRuntime fire_runtime;
+    VR::Bow::Bow bow{};
+    VR::Bow::NockedTracking bow_tracking{};
     bool bow_up{false};
     int bow_hand_i{0}; // the hand the bow hangs on (0 left, 1 right) as last seen
     u32 bow_shots{0};
+    bool bow_sustain{false};
     bool bow_trigger_wait{false}; // the string's trigger held since the bow was up: no attack or
                                   // shot from it until released
     bool bow_shot_direct{false};  // this arrow leaves at the release (bow_direct), from its nock
     std::array<bool, 2> bow_trigger_active{}; // inactive input cannot loose an arrow
     u32 bow_direct_serial{0};     // the newest direct arrow (rejection restores an empty hand)
+    float bow_last_draw{0.0f}; // the tension's ease while the draw is held still
     float bow_string_w{0.0f};  // ApplyBowString: the string hand on the string (0 .. 1) ...
     float bow_rest_m{0.12f};   // ... and the string's rest from the bow hand (m)
     bool bow_at_bow{false};    // the string hand within bow_nock_cm of the bow (last frame)
+    bool bow_l_wait{false};    // the bow hand's trigger held from while the bow was up
+    float bow_still_s{0.0f};
     // Trick weapons played by hand (core/vr/trick_weapons.h). UpdateHandTransform: its tracker,
     // the left grip as the quick items latch it, a squeeze still its own (until let go), the
     // grab's feel in the hands. UpdateShield: the shield, up, the guard reactions seen.
@@ -20318,44 +22861,90 @@ struct OpenXRPresenter::Impl {
     static constexpr s64 GrabTransformNs = 2'500'000'000; // ... at most this long
     static constexpr s64 NearHoldNs = 150'000'000;   // a kept near miss may grab this long
     static constexpr s64 SlipRegrabNs = 350'000'000; // a slip off the handle: take it again within
-    VR::Interactions::BladeRuntime blade_runtime;
+    VR::Tricks::Blast blast{};
+    float blast_sustain{0.0f};
+    int blast_quarter{0}; // ... the build's detents passed
     int split_quarter{0}; // UpdateHandTransform: the split's pull, its detents passed
-    VR::Interactions::SawRuntime saw_runtime;
+    bool l2_trigger_prev{false}; // UpdateGun: the left trigger last frame (its silent special)
+    bool freed_trigger_down{false}; // ... pulled while the left hand was free (no gun)
+    bool gun_trigger_wait{false};   // ... held from while the hand had no gun: none until let go
+    VR::Tricks::SawSpin saw_spin{}; // UpdateSawSpin: the Whirligig's spin, the levels it wrote,
+    bool saw_trigger_r{false};      // ... the right trigger its own (both hands on the saw)
+    bool saw_left_down{false};      // ... the left trigger last frame (its one-handed pull)
+    float saw_sustain_l{0.0f};
+    float saw_sustain_r{0.0f};
+    VR::Tricks::ShieldRaise shield{};
     bool shield_up{false};
+    u32 shield_guard_serial{0};
+    bool shield_guard_seen{false};
     // UpdateBladeShots: the trigger's last state, the shots sent, the swing that sent one.
+    bool blade_trigger_down{false};
     u32 blade_shots{0};
+    u32 blade_shot_window{0};
+    s64 blade_fired_ns{0}; // the gun-blade's last shot (its cadence for the kick at the pull) ...
+    s64 blade_dry_ns{0};   // ... its last empty click
+    u32 blade_predicted{0}; // the shot whose kick played at the pull
     // UpdateWeaponWall: the newest strike felt (the left weapon's, the right one's, the clash's),
     // the right one's last thud (a swing's own wall clank too: one feel), the level written to
     // each hand and its grit's clock, the sparks (DrawOverlay steps and draws them).
+    std::array<u32, 3> wall_strike_seen{};
+    s64 wall_thud_ns{0};
+    std::array<float, 2> wall_sustain{};
+    std::array<float, 2> wall_grain_s{};
     VR::Sparks::Field wall_sparks{};
     std::array<float, 3> wall_spark_carry{}; // ... the sparks each contact's scrape owes
+    bool wall_on{false}; // weapon_wall on last frame (off: let go once, then nothing runs)
+    u32 wave_window{0};     // moon_wave: the swing window its sweep is of ...
+    VR::Tricks::WaveSweep wave_sweep{}; // ... through your line of sight, or its fastest line
+    float hum_level{0.0f}; // UpdateWeaponHum: the hum level written to the sword hand (0: none)
+    bool plunge_down_armed{true}; // UpdatePhysicalMelee: this fall may still open a blade-down plunge
     // UpdateLeftMelee (melee_left): the left hand's stroke classifier and window tracker, its
     // window's open / close times, its newest hit, whether left swings attack now, the stroke
     // dropped as the off hand's counter-motion.
-    VR::Interactions::MeleeClassifier melee_left{melee_runtime,2};
-    VR::Interactions::MeleeWindow melee_window_left{melee_runtime,1};
+    VR::Melee::Classifier melee_left{};
+    VR::Melee::WindowTracker melee_window_left{};
     s64 melee_left_open_ns{0};
     s64 melee_left_close_ns{0};
     u32 melee_left_prev_serial{0};       // the window the newest one replaced ...
     bool melee_left_prev_aborted{false}; // ... and whether it was no swing
+    u32 melee_left_hit_serial{0};
+    bool melee_left_on{false};
+    unsigned left_dropped_stroke{0};
+    bool left_single{false}; // ... a left-hand weapon of its own (not the dual blades' part)
+    float hum_rev{0.0f};   // ... and its rev (0 .. 1, eased)
     // The interactive visceral (visceral_pull; UpdateVisceralPull): the pull detector (armed at
     // the catch), the catch it measures, whether its yank was sent, the tension written to the
     // right hand, the fifths of the pull ticked, the heartbeat's phase (a beat at 1).
+    VR::Melee::Pull::PullDetector pull_detector{};
+    bool pull_sent{false};
+    u32 pull_space{0};
+    u32 pull_held_serial{0};
+    u32 pull_rip_seen{0};
+    u32 pull_failed_seen{0};
+    float pull_sustain{0.0f};
+    int pull_fibre{0};
+    s64 pull_fibre_ns{0};
+    float pull_beat{0.0f};
     // Physical gestures (UpdatePoseGestures, frame thread).
-    VR::Interactions::PoseRecognizer pose_recognizer{};
+    VR::PoseGesture::Recognizer pose_recognizer{};
+    u32 pose_fired_seen{0};      // the game's markers applied, as last seen
+    bool pose_fired_valid{false}; // ... seen once (the first sight is no new marker)
+    bool pose_active{false};      // the recogniser ran last frame (a zone, no gate)
     s64 pose_trace_ns{0};         // VR_POSE_LOG
+    s64 pose_last_ns{0};          // the last call (a gap: the hold ends)
+    u32 melee_whip_locks{0};            // the whip's lock-outs / reel-ins seen (its ticks)
+    u32 melee_whip_reels{0};
     // The combo budget (melee_budget): the right weapon and its form from the game's status (its
     // pace).
     s32 melee_variation{-1};
     bool melee_form_b{false};
     bool melee_charged_row{false};
     // ... and which swings the enemies may read (melee_telegraph; the game sends the AI notice).
-    VR::Interactions::MeleeTelegraph melee_telegraph{melee_runtime};
+    VR::Melee::TelegraphTracker melee_telegraph{};
     u32 melee_telegraph_serial{0};
     // Quick items (UpdateQuickItems).
-    PhysicalInteractions::QuickController quick{};
-    VR::Interactions::QuickRuntime quick_runtime;
-    PhysicalInteractions::QuickOutput quick_out{};
+    VR::Quick::Controller quick{};
+    VR::Quick::Output quick_out{};
     // quick_music_box_crank (UpdateMusicBox, core/vr/music_box.h): the box in the left hand frees
     // the right hand (music_box_free: no swings, no transform, the weapon put away); the crank,
     // the right grip's latch on it, the hunter's hand eased onto the knob (music_box_snap toward
@@ -20364,26 +22953,39 @@ struct OpenXRPresenter::Impl {
     VR::MusicBox::Crank music_box_crank{};
     bool music_box_grip{false};
     bool music_box_knocked{false}; // knocked off the knob with the grip still squeezed
+    bool music_box_trigger_wait{false}; // the right trigger held through the box: its release
     float music_box_snap{0.0f};
     VR::MusicBox::V3 music_box_knob{};
     VR::Body::Quat music_box_frame{};
     bool music_box_play{false};
     s64 music_box_play_ns{0};
     double music_box_miss_t{-10.0};
-    PhysicalInteractions::QuickMotionPreparation quick_motion_legacy{};
-    PhysicalInteractions::QuickGameplayPreparation quick_gameplay_legacy{};
+    bool quick_x_down{false};
+    XrQuaternionf quick_prev_q{0.0f, 0.0f, 0.0f, 1.0f}; // the left grip's last orientation
+    bool quick_prev_q_valid{false};
+    XrTime quick_prev_time{0};      // ... its predicted display time
+    VR::Quick::V3 quick_wv{};       // the left grip's angular velocity (rad/s, LOCAL)
+    // The same from the grip located at the input times (throw_fresh_pose).
+    XrQuaternionf quick_fresh_q{0.0f, 0.0f, 0.0f, 1.0f};
+    bool quick_fresh_q_valid{false};
+    XrTime quick_fresh_time{0};
+    VR::Quick::V3 quick_fresh_wv{};
     bool quick_inframe_warned{false};
     double quick_mark_t{0.0}; // VR_THROW_MARK: the grab's second body-log mark is due then
     // quick_use_stab (UpdateQuickStab): the stab gate of the blood in the hand (started again at
     // every take, Q::Output::grabs) and a stab for the next UpdateQuickItems (nullptr: none).
-    std::array<char,PI_LABEL_SIZE> quick_stab_zone{}; // copied label, no borrowed DLL pointer
-    bool quick_stab_pending{};
+    struct QuickStab {
+        u32 grabs{0};
+        VR::VialZones::Gate gate{};
+        float reach_age{10.0f}; // since the blood hand last reached for the arm (VialReaching)
+    };
+    QuickStab quick_stab{};
+    const char* quick_stab_zone{nullptr};
     // left_scheme=2, the belt vial (core/vr/belt_vial.h): the torso's lazy heading (also the stab
     // zones'), where the left hand is against the hip's box this frame, and a draw for UpdateVial
     // (the grip at the hip, Output::draw_vial).
-    VR::Interactions::HolsterRuntime holster_runtime{};
-    VR::Interactions::HolsterTracker holster_tracker{holster_runtime};
-    VR::Interactions::BeltTorso belt_torso{holster_runtime};
+    VR::Holsters::Tracker holster_tracker{};
+    VR::Belt::Torso belt_torso{};
     VR::Belt::Place belt_place{};
     bool vial_belt_draw{false};
     float vial_grip_release{-1.0f};
@@ -20393,22 +22995,12 @@ struct OpenXRPresenter::Impl {
     // tracker, the heading without the torso's (the last yaw-flattened HMD forward), when they were
     // last built (XrTime), and the near misses logged.
     VR::VialZones::Geometry vial_geo{};
-    uint64_t vial_zone_sequence{};
-    bool vial_weapon_swinging{};
+    VR::VialZones::NeckTracker vial_neck{};
+    VR::Vec3 vial_heading{0.0f, 0.0f, -1.0f};
     XrTime vial_geo_time{0};
     u32 vial_near_count{0};
     u32 vial_near_logged{0};
     s64 vial_near_ns{0};
-    // DLL context is destroyed after ~Impl joins the frame thread. Guest hooks
-    // only retain host request words, never module pointers. No hot reload.
-    VR::Interactions::Module interaction_module;
-    bool interaction_dll_requested{};
-    bool interaction_dll_fault{};
-    VR::Interactions::RequestSlot dll_inject_request;
-    VR::Interactions::RequestSlot dll_trick_request;
-    uint64_t dll_charge_request{};
-    PiVialFeedbackOutput dll_vial_feedback{}; // copied visual state only
-    std::array<char, PI_LABEL_SIZE> dll_inject_zone{};
     // Blood Vial self-injection.
     bool vial_armed{false};
     VR::Body::VialButton vial_button{}; // X: a press arms / disarms, holding it does nothing more
@@ -20433,23 +23025,29 @@ struct OpenXRPresenter::Impl {
     // Two-handed grip (core/vr/two_hand_grip.h; UpdateTwoHand on the input, ApplyTwoHand on the
     // published hands, both on the frame thread): the grab, the game's status as last read, the
     // turn kept while the left controller is occluded, the swing's bonus and the logs.
-    VR::Interactions::TwoHandRuntime two_hand_runtime;
-    uint64_t dll_two_action_id{}, dll_two_action_session{};
-    u32 dll_two_action_serial{};
-    u32 native_transport_serial{}, native_cancelled_through{};
-    bool native_transform_rejected{};
-    VR::Interactions::LeverRuntime physical_lever_runtime{};
-    VR::Interactions::LeverTracker physical_lever{physical_lever_runtime};
+    VR::TwoHand::Tracker two_hand{};
+    VR::Lever::Tracker physical_lever;
     VR::Lever::Output physical_lever_out{};
-    VR::Interactions::LeverAcquisition physical_lever_acquisition{physical_lever_runtime};
+    VR::Lever::Acquisition physical_lever_acquisition{};
+    VR::Lever::Rig physical_lever_rig{};
+    u32 physical_lever_space{};
+    s64 physical_lever_update_ns{};
+    std::array<float, 2> physical_lever_sustain{};
+    VR::Lever::Completion physical_lever_feedback_pending{};
     std::array<bool, 2> physical_lever_grip_valid{};
-    s64 physical_lever_note_ns{};      // the last "squeeze not sent" note (at most one a second)
-    s64 physical_lever_reach_log_ns{}; // the last reach line (2 a second at most)
-    bool physical_lever_armed_near{};  // this frame: the armed lever is near
-    s64 physical_lever_hold_log_ns{};
-    VR::Lever::Vec3 physical_lever_hold_hand{};
+    s64 physical_lever_note_ns{}; // the last "squeeze not sent" note (at most one a second)
+    VR::Lever::ArmState physical_lever_arm{};   // the armed lever's check, reach and ticks
+    s64 physical_lever_reach_log_ns{};          // the last reach line (2 a second at most)
+    s64 physical_lever_scan_ns{};               // the last proximity scan asked of the game
+    s64 physical_lever_hold_log_ns{};           // the last hold line (4 a second; 0: none yet)
+    VR::Lever::Vec3 physical_lever_hold_hand{}; // the holding hand at that line (metres)
+    bool physical_lever_armed_near{};           // this frame: the armed lever is near
     std::array<bool, 2> physical_lever_reaching{}; // this frame: each hand reaching for it
+    bool physical_lever_ready{};                // a hand could pull a lever (the game's word)
     VR::TwoHand::Output two_hand_out{};
+    VR::TwoHand::SupportGrip two_hand_support{};
+    VR::TwoHand::BladeMotion two_hand_blade_motion{}, two_hand_physical_motion{};
+    VR::TwoHand::BladeSample two_hand_intent_blade{};
     VR::TwoHand::BladeSample two_hand_blade{};
     u64 two_hand_blade_frame{};
     VR::Body::Vec3 two_hand_native_tip{};
@@ -20457,14 +23055,19 @@ struct OpenXRPresenter::Impl {
     bool two_hand_tip_known{};
     VR::TwoHand::BladeClearCache two_hand_blade_clear{};
     XrTime two_hand_apply_time{}; // ApplyTracked's last published-pose time (its dt)
+    VR::TwoHand::SwingHum two_hand_hum{};
     float two_hand_hum_level{};
     bool two_hand_combat{};
     bool two_hand_guide_available{false};
+    const char* two_hand_guide_why{nullptr}; // UpdateTwoHand: why it is not (nullptr: it is)
+    bool guide_grip_was{false};              // the guide's log: the right grip last frame
+    u32 guide_logs{0};
     bool two_hand_handle_available{false};
     VR::TwoHand::GuideGesture two_hand_guide_gesture{};
     VR::TwoHand::GameStatus two_hand_status{};
     bool two_hand_status_ok{false};
     s64 two_hand_update_ns{0}; // the last UpdateTwoHand (gameplay input)
+    VR::TwoHand::SwingMark two_hand_swing{};
     u32 two_hand_bonus_serial{0}; // the newest window judged two-handed (the hit thump)
     VR::Body::Quat two_hand_turn{}; // the last turn with both hands tracked (right hand's frame)
     bool two_hand_turn_ok{false};
@@ -20479,6 +23082,16 @@ struct OpenXRPresenter::Impl {
     // VR overlay (frame thread; vr_overlay.h): the renderer, the vial's animation and place in the
     // hand, this XR frame's input and what is faded in.
     VrOverlayRenderer overlay;
+    VrOverlayRenderer overlay_in_eye;
+    bool shown_overlay_composed{false};
+    bool overlay_deferred{false};
+    struct OverlaySnapshot {
+        s64 head_time{};
+        u32 space{};
+        std::vector<VrOverlay::DrawItem> items;
+    };
+    std::array<OverlaySnapshot, 32> overlay_history{};
+    u32 overlay_history_next{};
     // The VR settings page (vr.ini vr_menu=1; core/vr/vr_page_runtime.h), frame thread: its
     // swapchain, the image going up, where it hangs (the menu canvas's place), the layer as last
     // submitted (the pointer's target) and the page's own D-pad repeat and button edges.
@@ -20568,19 +23181,67 @@ struct OpenXRPresenter::Impl {
     bool laser_raised{false};
     bool vial_drawn{false};
     const char* vial_hide_reason{"reset"};
-    const u32 vignette_initial_hits{VR::HitTakenCount()};
-    const u32 feedback_initial_hits{VR::HitTakenCount()};
+    // Heal vignette (UpdateHealVignette).
+    const char* heal_trigger{nullptr}; // an injection healed this frame
+    u32 heal_seen{0};                  // VR::ItemHealCount() already shown
+    float heal_level{0.0f};            // 0 .. 1, linear
+    float heal_hold{0.0f};
+    bool heal_rising{false};
+    float heal_context{1.0f}; // 1 in gameplay, eased to 0 elsewhere (menus, screen, cinematics)
+    bool heal_here_logged{true};
+    // Hit vignette (UpdateHitVignette); heal_context fades it out of gameplay too.
+    u32 hit_seen{VR::HitTakenCount()}; // VR::HitTakenCount() already shown
+    float hit_level{0.0f};             // 0 .. 1, linear
+    float hit_hold{0.0f};
+    float hit_peak{1.0f}; // of hit_vignette_strength, by the HP the hit took
+    // Directional hit feedback (core/vr/hit_direction.h): the flash's source (none: the plain
+    // ring), and the haptics' own view of the hits (UpdateHitHaptics).
+    bool hit_dir_on{false};
+    // Stagger vignette (UpdateStaggerVignette); heal_context fades it out of gameplay too.
+    VR::Daze::Fader daze_fader{};
+    VR::Daze::Level daze_logged{VR::Daze::Level::None};
+    // Hit-stun vignette (UpdateHitStun): the hold, this frame's body status as
+    // UpdateStaggerVignette read it, and the seconds since the newest counted hit (its peak and
+    // direction are the hold's).
+    VR::HitStun::Hold stun_hold{};
+    std::int32_t stun_clip_now{-1};
+    std::int32_t stun_logged{-1};
+    bool stun_status_fresh{false};
+    bool stun_status_dead{false};
+    float hit_age_s{1e9f};
+    VR::HitDir::Event hit_dir{};
+    u32 hit_haptic_seen{VR::HitTakenCount()};
+    u32 hit_haptic_serial{0};    // the newest direction event seen
+    VR::HitDir::RumbleWeighting hit_rumble{}; // the game's rumble for a directional blow
     // The wrist gauge's low-HP safety net (UpdateVitalsNet): changes, the last HP lost, the
     // heartbeat, the rally rim's peak, the dark edges' inputs.
-    PiVitalsFeedbackOutput vitals_visual{};
+    VR::Vitals::ChangeTracker vitals_changes{};
+    s64 vitals_loss_ns{0};
+    VR::Vitals::Heartbeat vitals_heart{};
+    bool vitals_felt{false};
+    u64 vitals_beats_felt{0};
+    float vitals_hp{1.0f};
+    float vitals_regain{0.0f};
+    float vitals_regain_peak{0.0f};
+    VR::VitalColor::State vital_color_state{};
     VR::VitalColor::Output vital_color{};
+    bool vitals_edge_on{false};
     bool vitals_edge_logged{false};
+    bool hit_rising{false};
     bool overlay_debug{false};
     bool aim_in_grip_logged{false};
     // Lean to dodge.
-    VR::Interactions::LeanRuntime lean{};
+    VR::Lean::Detector lean{};
+    VR::Lean::Detector lean_iframes{}; // lean_iframes: the same lean, i-frames only
+    XrVector2f lean_stick{0.0f, 0.0f}; // the dodge direction (+y = view forward)
+    float lean_stick_left{0.0f};       // the left stick is held in it this much longer
+    float lean_circle_in{0.0f};        // Circle is pressed in this long
     bool lean_logged{false};
     std::FILE* trace_file{nullptr};
+    std::FILE* hand_filter_trace_file{nullptr};
+    s64 hand_filter_trace_start{};
+    u32 hand_filter_trace_frames{};
+    bool hand_filter_trace_done{};
     u64 trace_lines{0};
     // Timing (VR perf log).
     std::atomic<s64> copy_ns{0};
@@ -20664,6 +23325,7 @@ struct OpenXRPresenter::Impl {
     VR::Ui::MenuPopState ui_menu_pop{};
     VR::UiClass ui_pop_class{VR::UiClass::None};
     u64 ui_pop_box_seq{};
+    VR::MenuInput::ExitGuard menu_exit_guard;
     bool ui_menu_accept_down{}, ui_menu_back_down{};
     VR::Ui::FollowState hud_anchor{};
     // The death screen as a title (ui_death_distance_m, VR::Ui::StepDeathTitle): where YOU DIED
@@ -20674,6 +23336,7 @@ struct OpenXRPresenter::Impl {
         float pitch{};
         VR::Vec3 origin{};
         u64 banner_serial{0}; // the last banner (VR::LatestBanner) taken (ui_banner_title)
+        VR::Ui::UnknownBannerGate unknown{}; // one of unknown type waiting for a banner's dim
         bool death{true};     // YOU DIED's cut-out and size, else every other banner's
         u32 type{2};          // the banner's text-effect type (its cut-out)
     } ui_title{};
@@ -20814,6 +23477,51 @@ bool OpenXRPresenter::IsRequested() {
 
 bool OpenXRPresenter::IsRuntimeAvailable() {
     return Runtime().Initialize();
+}
+
+bool OpenXRPresenter::ProbeHeadset(HeadsetInfo& info) {
+    info = {};
+    XrInstanceCreateInfo create{XR_TYPE_INSTANCE_CREATE_INFO};
+    std::strncpy(create.applicationInfo.applicationName, "Bldbrne-VR benchmark scan",
+                 XR_MAX_APPLICATION_NAME_SIZE - 1);
+    create.applicationInfo.apiVersion = XR_API_VERSION_1_0;
+    uint32_t extension_count{};
+    std::vector<XrExtensionProperties> extensions;
+    if(XR_SUCCEEDED(xrEnumerateInstanceExtensionProperties(nullptr,0,&extension_count,nullptr))) {
+        extensions.resize(extension_count,{XR_TYPE_EXTENSION_PROPERTIES});
+        if(XR_FAILED(xrEnumerateInstanceExtensionProperties(nullptr,extension_count,&extension_count,extensions.data())))extensions.clear();
+    }
+    const auto has=[&](const char* name){return std::any_of(extensions.begin(),extensions.end(),[&](const auto& e){return std::strcmp(e.extensionName,name)==0;});};
+    const std::array<const char*,2> wanted{XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME};
+    const bool query_refresh=has(wanted[0]) && has(wanted[1]);
+    if(query_refresh){create.enabledExtensionCount=uint32_t(wanted.size());create.enabledExtensionNames=wanted.data();}
+    XrInstance instance{XR_NULL_HANDLE};
+    if (XR_FAILED(xrCreateInstance(&create, &instance))) return false;
+    XrSystemGetInfo get{XR_TYPE_SYSTEM_GET_INFO};
+    get.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    XrSystemId system{};
+    XrSystemProperties properties{XR_TYPE_SYSTEM_PROPERTIES};
+    std::array<XrViewConfigurationView, 2> views{{{XR_TYPE_VIEW_CONFIGURATION_VIEW},
+                                                {XR_TYPE_VIEW_CONFIGURATION_VIEW}}};
+    u32 count{};
+    const bool valid = XR_SUCCEEDED(xrGetSystem(instance, &get, &system)) &&
+        XR_SUCCEEDED(xrGetSystemProperties(instance, system, &properties)) &&
+        XR_SUCCEEDED(xrEnumerateViewConfigurationViews(instance, system,
+            XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2, &count, views.data())) && count == 2;
+    if (valid) {
+        if(query_refresh)info.refresh_hz=BenchmarkRefresh::Query(instance,system);
+        info.name = properties.systemName;
+        info.max_width = properties.graphicsProperties.maxSwapchainImageWidth;
+        info.max_height = properties.graphicsProperties.maxSwapchainImageHeight;
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            info.width[eye] = views[eye].recommendedImageRectWidth;
+            info.height[eye] = views[eye].recommendedImageRectHeight;
+            info.max_width = std::min(info.max_width, views[eye].maxImageRectWidth);
+            info.max_height = std::min(info.max_height, views[eye].maxImageRectHeight);
+        }
+    }
+    xrDestroyInstance(instance);
+    return valid && info.width[0] && info.width[1] && info.height[0] && info.height[1];
 }
 
 bool OpenXRPresenter::IsHeadsetConnected() {
@@ -21002,6 +23710,10 @@ bool OpenXRPresenter::IsRequested() {
     return false;
 }
 bool OpenXRPresenter::IsRuntimeAvailable() {
+    return false;
+}
+bool OpenXRPresenter::ProbeHeadset(HeadsetInfo& info) {
+    info = {};
     return false;
 }
 bool OpenXRPresenter::IsHeadsetConnected() {

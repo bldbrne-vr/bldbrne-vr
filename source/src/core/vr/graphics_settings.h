@@ -1,22 +1,40 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #pragma once
 #include <array>
 #include <atomic>
 #include <cstdlib>
 #include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
 
 namespace VR::Graphics {
-enum class Upscaler : int { Off, Dlss, Fsr4 };
+// Persisted IDs: keep existing providers stable when adding FSR 3.1.5.
+enum class Upscaler : int { Off = 0, Dlss = 1, Fsr4 = 2, Fsr31 = 3 };
+inline constexpr bool IsFsr(Upscaler provider) {
+    return provider == Upscaler::Fsr4 || provider == Upscaler::Fsr31;
+}
+inline constexpr const char* UpscalerName(Upscaler provider) {
+    switch (provider) {
+    case Upscaler::Dlss: return "DLSS";
+    case Upscaler::Fsr4: return "FSR 4";
+    case Upscaler::Fsr31: return "FSR 3.1.5";
+    default: return "Off";
+    }
+}
 enum class Profile : int { Performance, Balanced, Quality };
 // Only ACCEPT publishes these preferences. Renderer changes are latched at frame boundaries.
 struct Config {
     int scale_percent{};
     Upscaler upscaler{Upscaler::Off};
-    Profile dlss{Profile::Balanced}, fsr4{Profile::Balanced};
+    Profile dlss{Profile::Balanced}, fsr4{Profile::Balanced}; // the defaults: Balanced (2026-10-17)
     bool dlss5{};
     Profile neural{Profile::Balanced};
     int intensity{100}, detail{80}, lighting{85}; // DLSS 5 Enhancement at full strength by default
@@ -35,7 +53,7 @@ inline constexpr Profile NeuralPreset(Profile p) {
     return p == Profile::Performance ? p : Profile::Balanced;
 }
 inline constexpr Profile EffectiveProfile(const Config& c) {
-    return c.upscaler == Upscaler::Fsr4 ? c.fsr4 : c.dlss5 ? NeuralPreset(c.neural) : c.dlss;
+    return IsFsr(c.upscaler) ? c.fsr4 : c.dlss5 ? NeuralPreset(c.neural) : c.dlss;
 }
 inline void SetNeuralProfile(Config& c, Profile p) {
     p = NeuralPreset(p);
@@ -93,7 +111,7 @@ inline std::optional<Config> Parse(std::string_view text) {
         if (end != text.npos)
             text.remove_prefix(end + 1);
     }
-    if (n[0] != 1 || n[1] < -50 || n[1] > 50 || n[1] % 10 || n[2] < 0 || n[2] > 2 || n[3] < 0 ||
+    if (n[0] != 1 || n[1] < -50 || n[1] > 50 || n[1] % 10 || n[2] < 0 || n[2] > 3 || n[3] < 0 ||
         n[3] > 2 || n[4] < 0 || n[4] > 2 || n[5] < 0 || n[5] > 1 || n[6] < 0 || n[6] > 2 ||
         n[7] < 0 || n[7] > 100 || n[8] < 0 || n[8] > 100 || n[9] < 0 || n[9] > 100)
         return {};
@@ -137,6 +155,20 @@ inline void SetS1(Extent output, const Config& c) {
 inline Extent S1Output() {
     const auto v = s1_output.load(std::memory_order_relaxed);
     return {uint32_t(v >> 32), uint32_t(v)};
+}
+// S1's texture mip bias: log2 of its render scale (-1.0 at DLSS Performance's 0.50), as NVIDIA's
+// and AMD's upscaler guides ask, so material textures keep the output size's detail instead of
+// the smaller input's. 0 when the game started without S1 (no upscaler: textures as before), or
+// with VR_S1_MIP_BIAS=0. Set once at boot (SetS1), before the game makes its samplers.
+inline float S1MipBias() {
+    static const bool off = [] {
+        const char* v = std::getenv("VR_S1_MIP_BIAS");
+        return v && v[0] == '0';
+    }();
+    if (off || !S1Output().width)
+        return 0.0f;
+    const float ratio = WholeFrameRatio(Unpack(s1_config.load(std::memory_order_relaxed)));
+    return ratio > 0.0f && ratio < 1.0f ? std::log2(ratio) : 0.0f;
 }
 inline bool ResolutionRestartRequired() {
     const int scale = applied_scale.load(std::memory_order_relaxed);

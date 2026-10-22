@@ -9,8 +9,8 @@
 #include <string_view>
 #include "common/enum.h"
 #include "common/shared_first_mutex.h"
-#include "../../scratchpad/dual-eye-perf/sparse_range_cache.h"
-#include "../../scratchpad/dual-eye-perf/upload_batch.h"
+#include "video_core/native_stereo/sparse_range_cache.h"
+#include "video_core/native_stereo/upload_batch.h"
 #include "common/singleton.h"
 #include "common/types.h"
 #include "core/address_space.h"
@@ -318,6 +318,8 @@ public:
     s32 GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPoolBlockStats* stats);
 
     void InvalidateMemory(VAddr addr, u64 size) const;
+    /// InvalidateMemory for a protection change: no byte is written (the GPU's stay kept).
+    void InvalidateProtection(VAddr addr, u64 size) const;
 
 private:
     VMAHandle FindVMA(VAddr target) {

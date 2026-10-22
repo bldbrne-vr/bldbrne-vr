@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -14,8 +20,8 @@ struct GameFont;
 }
 
 // The VR settings page drawn on the CPU (vr_menu=1): a pixel clone of the game's Environment
-// settings page (game asset, baked in vr_page_art.h) with the game's own textures
-// (game asset) and font (game asset), plus our tab strip, the controller's
+// settings page (menu/optionsetting.gfx, baked in vr_page_art.h) with the game's own textures
+// (menu/common.tpf.dcx) and font (menu/<language>/font.gfx), plus our tab strip, the controller's
 // own button badges and the pointer's halo. Two images of the same size: the page, and the
 // selection glow (additive, its own layer so the presenter can pulse it like the game's cursor
 // without drawing the page again). Pure: no emulator state (the offline tool and the tests render

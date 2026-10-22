@@ -12,6 +12,9 @@
 // everywhere. So let's just move the handling of the failed assert to a single cpp file.
 
 void assert_fail_impl();
+// The macros: the failed check's place goes into user/log/crash.txt (every build), then as above.
+void assert_fail_at(const char* file, int line);
+[[noreturn]] void unreachable_at(const char* file, int line);
 [[noreturn]] void unreachable_impl();
 
 #ifdef _MSC_VER
@@ -24,7 +27,7 @@ void assert_fail_impl();
     do {                                                                                           \
         if (!(_a_)) [[unlikely]] {                                                                 \
             LOG_CRITICAL(Debug, "Assertion Failed!");                                              \
-            assert_fail_impl();                                                                    \
+            assert_fail_at(__FILE__, __LINE__);                                                    \
         }                                                                                          \
     } while (false)
 
@@ -32,20 +35,20 @@ void assert_fail_impl();
     do {                                                                                           \
         if (!(_a_)) [[unlikely]] {                                                                 \
             LOG_CRITICAL(Debug, "Assertion Failed!\n" __VA_ARGS__);                                \
-            assert_fail_impl();                                                                    \
+            assert_fail_at(__FILE__, __LINE__);                                                    \
         }                                                                                          \
     } while (false)
 
 #define UNREACHABLE()                                                                              \
     do {                                                                                           \
         LOG_CRITICAL(Debug, "Unreachable code!");                                                  \
-        unreachable_impl();                                                                        \
+        unreachable_at(__FILE__, __LINE__);                                                        \
     } while (0)
 
 #define UNREACHABLE_MSG(...)                                                                       \
     do {                                                                                           \
         LOG_CRITICAL(Debug, "Unreachable code!\n" __VA_ARGS__);                                    \
-        unreachable_impl();                                                                        \
+        unreachable_at(__FILE__, __LINE__);                                                        \
     } while (0)
 
 #ifdef _DEBUG

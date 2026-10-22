@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -16,18 +22,18 @@
 
 #include "core/vr/c0000_rig.h"
 
-// The whips' idle line (core/vr/bloodborne_whip.cpp), read from the user's own game files: the
+// The whips' idle line (core/vr/bloodborne_whip.cpp), read from the player's own game files: the
 // chain's rest shape before the part was ever seen in its idle clip (a flick into the whip as the
 // first transform of a session). Header only, no emulator dependencies (the unit tests).
 //
-// From the form-B part's anibnd (game asset -> game asset):
-//  - game asset: the hkaSkeleton (names, parents, reference pose);
-//  - game asset: the idle clip, an hkaSplineCompressedAnimation, sampled at its first
+// From the form-B part's anibnd (parts/wp_a_XXXX.partsbnd.dcx -> WP_A_XXXX_2.anibnd):
+//  - skeleton_2.hkx: the hkaSkeleton (names, parents, reference pose);
+//  - a999_000000_2.hkx: the idle clip, an hkaSplineCompressedAnimation, sampled at its first
 //    frame (block 0, local frame 0: each track's B-spline at 0, or its static value), bound to the
 //    skeleton's bones by its hkaAnimationBinding; a bone without a track keeps its reference pose.
 // Then the model-space FK (rotation, translation; the scales are not applied) and the chain as
 // ResolveChain finds it (B_blade_root's child that has children, and on down). The math is the
-// reference extraction's (scratchpad whipfin/gen_rest.py with whip/whipanim.py), in double
+// reference extraction's (offline analysis), in double
 // precision and the same order, rounded to float at the end.
 namespace VR::Whip {
 
@@ -44,7 +50,7 @@ struct WhipRest {
 // The whips and their form-B part files (ids and file names only).
 struct WhipPart {
     std::int32_t variation;
-    const char* model; // Runtime model identifier
+    const char* model; // parts/<model>.partsbnd.dcx
 };
 inline constexpr std::array<WhipPart, 2> WhipParts = {{
     {2400, "wp_a_1702"}, // Beast Cutter
@@ -657,7 +663,7 @@ inline std::optional<WhipRest> BuildIdle(std::int32_t variation, const std::vect
     return w;
 }
 
-// The whole of it from the part's anibnd (a BND4): its game asset and game asset.
+// The whole of it from the part's anibnd (a BND4): its skeleton_2.hkx and a999_000000_2.hkx.
 inline std::optional<WhipRest> FromAnibnd(std::int32_t variation, std::span<const u8> anibnd,
                                           std::string& why) {
     const auto skel = R::Bnd4Find(anibnd, "skeleton_2.hkx");

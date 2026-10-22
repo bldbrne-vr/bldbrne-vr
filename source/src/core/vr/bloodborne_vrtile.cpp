@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <array>
 #include <atomic>
@@ -22,6 +28,7 @@
 #include "core/file_sys/fs.h"
 #include "core/vr/bloodborne_vrtile.h"
 #include "core/vr/gfx_area_name.h"
+#include "core/vr/gfx_talk_window.h"
 #include "core/vr/gfx_tile.h"
 #include "core/vr/gfx_title.h"
 #include "core/vr/hook_util.h"
@@ -225,7 +232,7 @@ std::unique_ptr<VR::GameText::GameFont> ReadButtonFont() {
     return nullptr;
 }
 
-// The game's icon atlas game asset (core/vr/tpf_patch.h), changed in one pass: the retail
+// The game's icon atlas menu/common.tpf.dcx (core/vr/tpf_patch.h), changed in one pass: the retail
 // file is read and unpacked now (~0.1 s), then
 //  - with `buttons` (ui_vr_buttons): the button icons redrawn as the VR controllers' buttons
 //    (core/vr/key_glyphs.h: our badges, their letters in the game's font);
@@ -455,7 +462,12 @@ void InstallTitleLabel() {
         if (!original) {
             continue;
         }
-        auto movie = GfxTitle::AddLabel(*original);
+        const auto stereo = VR::GetStereo();
+        // Native multiview shares mode 2's camera setup; its startup switch distinguishes
+        // it from DIBR, as in the renderer and graphics settings page.
+        const bool dibr = stereo.stereo && stereo.mode == 2 &&
+                          std::getenv("VR_NATIVE_STEREO") == nullptr;
+        auto movie = GfxTitle::AddLabel(*original, dibr);
         if (movie.empty()) {
             LOG_INFO(Core, "VR title: {} is not the retail movie; left unchanged", name);
             continue;
@@ -466,25 +478,45 @@ void InstallTitleLabel() {
 
 // The area name's dark strip out of the HUD movie (core/vr/gfx_area_name.h), on the flat screen
 // and in VR alike; its smoke, rule and words stay.
+// The HUD movie's two dark boxes, both patched into the one override of menu/fe.gfx: the area
+// name's strip (core/vr/gfx_area_name.h) and the NPCs' subtitle box (core/vr/gfx_talk_window.h,
+// vr.ini ui_dialogue_backing). Each is left as it is on its own when its layout is unexpected.
 void InstallAreaNameDim() {
     constexpr const char* path = "/app0/dvdroot_ps4/menu/fe.gfx";
     auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
     const auto original = mnt->ReadFile(path);
     VR::PublishAreaDimRemoved(false);
     if (!original) {
-        LOG_INFO(Core, "VR area name: menu/fe.gfx not readable; its dark strip stays");
+        LOG_INFO(Core, "VR area name: menu/fe.gfx not readable; its dark strip and the subtitle "
+                       "box stay");
         return;
     }
-    auto result = VR::GfxAreaName::ClearDim(*original);
-    if (result.movie.empty()) {
+    std::vector<u8> movie;
+    auto area = VR::GfxAreaName::ClearDim(*original);
+    const bool area_done = !area.movie.empty();
+    if (area_done) {
+        LOG_INFO(Core, "VR area name: {} ({} gradient colours, menu/fe.gfx of {} bytes)",
+                 area.why, area.colours, original->size());
+        movie = std::move(area.movie);
+    } else {
         LOG_INFO(Core, "VR area name: menu/fe.gfx left as it is ({}); its dark strip stays",
-                 result.why);
+                 area.why);
+    }
+    const auto backing =
+        static_cast<VR::GfxTalkWindow::Backing>(VR::GetSettings().ui_dialogue_backing);
+    auto talk = VR::GfxTalkWindow::ClearBacking(
+        movie.empty() ? std::span<const u8>{*original} : std::span<const u8>{movie}, backing);
+    if (!talk.movie.empty()) {
+        LOG_INFO(Core, "VR subtitles: {} ({} colours)", talk.why, talk.colours);
+        movie = std::move(talk.movie);
+    } else {
+        LOG_INFO(Core, "VR subtitles: the box stays ({})", talk.why);
+    }
+    if (movie.empty()) {
         return;
     }
-    LOG_INFO(Core, "VR area name: {} ({} gradient colours, menu/fe.gfx of {} bytes)", result.why,
-             result.colours, original->size());
-    Core::FileSys::SetFileOverride(path, std::move(result.movie), "VR area name");
-    VR::PublishAreaDimRemoved(true);
+    Core::FileSys::SetFileOverride(path, std::move(movie), "VR HUD movie");
+    VR::PublishAreaDimRemoved(area_done);
 }
 
 void InstallTile() {

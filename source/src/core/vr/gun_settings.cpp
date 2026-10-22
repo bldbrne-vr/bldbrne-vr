@@ -1,6 +1,13 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
+#include <cmath>
 #include <ostream>
 #include <stdexcept>
 #include <fmt/format.h>
@@ -39,6 +46,13 @@ bool ParseGunSetting(const std::string& key, const std::string& value) {
     const auto f = [&value] { return std::stof(value); };
     if (key == "gun_wrist_reload") {
         s.wrist_reload = Flag(value);
+    } else if (key == "gun_headshot_multiplier") {
+        size_t consumed{};
+        const float amount = std::stof(value, &consumed);
+        if (value.find_first_not_of(" \t\r\n", consumed) != std::string::npos ||
+            !std::isfinite(amount) || amount < 1 || amount > 10)
+            throw std::invalid_argument{"headshot multiplier must be finite, 1..10"};
+        s.headshot_multiplier = amount;
     } else if (key == "gun_aim") {
         s.aim = Flag(value);
     } else if (key == "gun_fire") {
@@ -88,7 +102,9 @@ bool ParseGunSetting(const std::string& key, const std::string& value) {
 void WriteGunDefaults(std::ostream& out) {
     const GunSettings d{};
     out << "# ---- The gun (left trigger) ----\n"
-        << "# 1 = flick the left wrist after each shot to reload (VR Settings > Weapons)\n"
+        << "# confirmed head collision: multiplier of final gun damage; 1 disables (1..10)\n"
+        << "gun_headshot_multiplier=" << d.headshot_multiplier << "\n"
+        << "# 1 = Wrist flick; 0 = Off/Original, fire without a reload gesture (VR Settings > Weapons)\n"
         << "gun_wrist_reload=" << (d.wrist_reload ? 1 : 0) << "\n"
         << "# 1 = shots leave along the gun's visible barrel, wherever the hunter faces; 0 = the "
            "game's aim\n"

@@ -1,6 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 //
-// Fast renderer switches and statistics.
+// Fast renderer switches and statistics (fast/v2).
 //
 // Every optimization of the fast renderer has a bit in one 64-bit mask. The mask starts from
 // kDefaultMask, FAST_TOGGLES (hex or decimal) replaces it at start, and FAST_TOGGLE_FILE names a
@@ -22,7 +28,7 @@
 #include <string_view>
 #include "common/assert.h"
 #include "common/types.h"
-#include "../../scratchpad/fast-renderer/lean_scopes.h"
+#include "video_core/fast/lean_scopes.h"
 
 namespace FastRender {
 
@@ -80,8 +86,8 @@ enum Bit : u32 {
     NumBits = 64,
 };
 
-/// Scratchpad default adds measured borrowed packet views and the bbport ports measured faster in
-/// in-run A/B checks: 12,16,17,23-28,30-37,39-41,43-45,53-57,59-63. 19, 29, 42, 46-52, 58 and
+/// The default adds measured borrowed packet views and the bbport ports measured faster in
+/// in-run A/B (2026-10-13): 12,16,17,23-28,30-37,39-41,43-45,53-57,59-63. 19, 29, 42, 46-52, 58 and
 /// the diagnostic 38 stay off. 41 SmaaRecorder (vr_smaa.cpp), 43 PassContinue (vk_pass_breaks.h),
 /// 44 SmallReadSettle (buffer.h), 45 Fsr4Interleave (vr_fsr4_interleave.h) and 46 DlssDirect
 /// (vr_dlss_direct.h, CPU-only win so far, not yet verified bit-exact) are declared next to their code.
@@ -157,6 +163,10 @@ void NoteRecorderFlush(std::string_view reason, std::source_location site, bool 
 void NoteRecorderEncoded(u64 packets, u64 bytes, u64 sampled_ns, u64 samples);
 void NoteRecorderReplay(u64 ns);
 void NoteRecorderWait(u64 ns);
+// FAST_RECORDER_WAIT_DETAIL=1: attribute the existing drain wall/spin intervals by reason.
+// Diagnostic only; no scheduling, submission or memory-ordering changes.
+void NoteRecorderWaitReason(std::string_view reason, std::source_location site, u64 wait_ns,
+                            u64 spin_ns, bool on_stage_b);
 /// FAST_CPU_DRAIN_SPIN: the time a flush wait spent spinning before it slept or found the replay
 /// done (busy time on the waiting thread; on_stage_b: B's).
 void NoteRecorderSpin(u64 ns, bool on_stage_b);

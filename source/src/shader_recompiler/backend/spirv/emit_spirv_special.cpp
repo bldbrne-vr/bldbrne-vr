@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "../../../../scratchpad/dual-eye-perf/lighting_reconstruction.h"
+#include "video_core/native_stereo/lighting_reconstruction.h"
 #include <algorithm>
 
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"

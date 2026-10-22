@@ -5,6 +5,7 @@ path = [
     "REUSE.toml",
     "CMakeSettings.json",
     "CMakePresets.json",
+    ".github/shadps4.png",
     "cmake/CMakeDarwinPresets.json",
     "cmake/CMakeLinuxPresets.json",
     "cmake/CMakeWindowsPresets.json",
@@ -120,6 +121,11 @@ SPDX-FileCopyrightText = "Brian MacIntosh and LFA"
 SPDX-License-Identifier = "CC0-1.0"
 
 [[annotations]]
-path = "src/resources/vr/beast_chain_clink.pcm"
-SPDX-FileCopyrightText = "DenisChardonnet"
+path = ["src/resources/vr/beast_chain_clink.pcm"]
+SPDX-FileCopyrightText = "DenisChardonnet (BigSoundBank)"
 SPDX-License-Identifier = "CC0-1.0"
+
+[[annotations]]
+path = ["src/resources/vr/sangiran17.bin", "src/resources/vr/music_box_regal.dds"]
+SPDX-FileCopyrightText = "2026 BB-VR contributors"
+SPDX-License-Identifier = "AGPL-3.0-or-later"

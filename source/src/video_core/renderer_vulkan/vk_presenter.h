@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -21,6 +22,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/renderer_vulkan/vr_eye_upscale.h"
+#include "video_core/renderer_vulkan/vr_native_fsr1_probe.h"
 #include "video_core/renderer_vulkan/vr_stereo_warp.h"
 #include "video_core/renderer_vulkan/vr_ui_layer.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -195,6 +197,7 @@ private:
     // vr.ini eye_upscale / eye_sharpen for the eyes copied into the headset in the draw stream
     // (RecordStereoCopy): FSR 1 from the warped eyes into these (VrEyeUpscale, made at first use).
     std::unique_ptr<VrEyeUpscale> vr_upscale;
+    std::unique_ptr<VrNativeFsr1Probe> native_fsr1_probe;
     bool vr_upscale_failed{false};
     VrStereoWarp::EyeImages vr_eye_scaled;
     // VR UI layer: K/W targets, scene copy, resolve (recorded into draw_scheduler).

@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <filesystem>
+#include <fstream>
+#include <nlohmann/json.hpp>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -10,6 +13,7 @@
 #include <SDL3/SDL_messagebox.h>
 
 #include "common/arch.h"
+#include "common/crash_record.h"
 #include "common/key_manager.h"
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
@@ -66,6 +70,7 @@ int main(int argc, char* argv[]) {
     bool bigPicture = false;
     bool sameProcess = false;
     bool openXr = false;
+    std::string benchmark_headset;
     bool vrSim = false;
 
     std::optional<std::filesystem::path> addGameFolder;
@@ -89,6 +94,7 @@ int main(int argc, char* argv[]) {
     app.add_option("-f,--fullscreen", fullscreenStr, "Fullscreen mode (true|false)");
     app.add_flag("--openxr", openXr,
                  "Play in VR through the active OpenXR runtime (head tracking, stereo)");
+    app.add_option("--benchmark-headset", benchmark_headset, "Write connected headset dimensions as JSON and exit without starting the game");
     app.add_flag("--vr-sim", vrSim,
                  "Debug: drive the VR camera bridge with a synthetic head (no headset)");
 
@@ -144,11 +150,23 @@ int main(int argc, char* argv[]) {
         return app.exit(e);
     }
 
+    if (!benchmark_headset.empty()) {
+        Vulkan::OpenXRPresenter::HeadsetInfo info;
+        if (!Vulkan::OpenXRPresenter::ProbeHeadset(info)) return 2;
+        const nlohmann::json report{{"schema", 1}, {"benchmark_telemetry", 1}, {"name", info.name},
+            {"width", info.width}, {"height", info.height},
+            {"max_width", info.max_width}, {"max_height", info.max_height}, {"refresh_hz",info.refresh_hz}};
+        std::ofstream out(std::filesystem::u8path(benchmark_headset), std::ios::binary);
+        out << report.dump(2);
+        return out.good() ? 0 : 3;
+    }
     if (waitPid)
         Core::Debugger::WaitForPid(*waitPid);
 
     // Initialize main log with default config
     Common::Log::Setup("shadps4.log");
+    // A crash leaves its line in user/log/crash.txt, in every build (common/crash_record.h).
+    Common::CrashRecord::InstallExceptionNote();
 
     LOG_INFO(Debug, "Run: {}", std::span(argv, argc));
 

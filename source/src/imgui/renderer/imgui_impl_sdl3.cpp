@@ -8,6 +8,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "imgui_impl_sdl3.h"
+#include "input/benchmark_input.h"
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "sdl_window.h"
@@ -608,6 +609,7 @@ void Shutdown() {
 }
 
 static void UpdateMouseData() {
+    if (Input::BenchmarkInputLocked()) return;
     SdlData* bd = GetBackendData();
     ImGuiIO& io = ImGui::GetIO();
 
@@ -734,6 +736,7 @@ static void UpdateGamepadAnalog(SdlData* bd, ImGuiIO& io, ImGuiKey key, SDL_Game
 }
 
 static void UpdateGamepads() {
+    if (Input::BenchmarkInputLocked()) return;
     ImGuiIO& io = ImGui::GetIO();
     SdlData* bd = GetBackendData();
 

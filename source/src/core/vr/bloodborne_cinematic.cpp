@@ -1,5 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
+#include "core/vr/summon_bell.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -772,6 +779,12 @@ void CinematicUpdate(u8* player) {
     signals.ids_valid = g_request_ids || g_ring_ids;
     signals.event_id = Cine::PickEventId(s.pending.data(), g_ring_ids ? s.pending_count : 0,
                                          g_request_ids ? s.requested : -1);
+    // Only the bell clip following our accepted physical summon stays immersive.
+    if (VR::IsFirstPerson() && SummonBell::KeepBellInVR(
+            static_cast<double>(SteadyNs())*1e-9, signals.event_id)) {
+        signals.event=false;
+        signals.event_id=-1;
+    }
     signals.hp_valid = s.hp_valid;
     signals.hp = s.hp;
     signals.hp_max = s.hp_max;

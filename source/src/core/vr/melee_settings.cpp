@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <ostream>
@@ -133,6 +139,10 @@ bool ParseMeleeSetting(const std::string& key, const std::string& value) {
         s.budget_scale = std::clamp(f(), 0.25f, 3.0f);
     } else if (key == "melee_budget_offset_ms") {
         s.budget_offset_ms = std::clamp(f(), -300.0f, 1000.0f);
+    } else if (key == "melee_budget_quick_charges") {
+        s.budget_quick_charges = std::clamp(std::stoi(value), 1, 8);
+    } else if (key == "melee_budget_quick_s") {
+        s.budget_quick_s = std::clamp(f(), 0.0f, 2.0f);
     } else if (key == "melee_plunge") {
         s.plunge = Flag(value);
     } else if (key == "melee_plunge_min_drop_m") {
@@ -234,6 +244,12 @@ void WriteMeleeDefaults(std::ostream& out) {
         << "melee_budget_charges=" << d.budget_charges << "\n"
         << "melee_budget_scale=" << d.budget_scale << "\n"
         << "melee_budget_offset_ms=" << d.budget_offset_ms << "\n"
+        << "# quick weapons (a light swing recovering in this many seconds or less: the Saw "
+           "Cleaver, the Blade of\n# Mercy, the Rakuyo's twin blades...) get this many charges, "
+           "the third in a row a moment later and\n# slower back (no more than "
+           "melee_budget_charges = off)\n"
+        << "melee_budget_quick_charges=" << d.budget_quick_charges << "\n"
+        << "melee_budget_quick_s=" << d.budget_quick_s << "\n"
         << "# the plunge: a swing while you fall keeps its attack until you land, so the blade "
            "hits what you\n# land on; after a fall this deep (m) its hits deal x the damage. "
            "No plunge animation\n"

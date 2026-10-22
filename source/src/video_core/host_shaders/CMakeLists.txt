@@ -1,4 +1,5 @@
 # SPDX-FileCopyrightText: Copyright 2023 Citra Emulator Project
+# SPDX-FileCopyrightText: 2026 BB-VR contributors
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 set(SHADER_FILES
@@ -33,6 +34,8 @@ set(SHADER_FILES
     vr_temporal_merge.comp
     vr_temporal_prepare.comp
     vr_render_taa.comp
+    vr_ui_compose.vert
+    vr_ui_compose.frag
     vr_ui_resolve.comp
 )
 

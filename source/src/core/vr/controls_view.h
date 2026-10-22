@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -423,9 +429,9 @@ inline Words EntryWords(const Thumbs::Entry& e, const Config& c,
     if (id == "turn") {
         const int deg = static_cast<int>(c.snap_turn_deg + 0.5f);
         return {"Turn", {},
-                deg > 0 ? "Snap turn " + std::to_string(deg) + "\xC2\xB0. Flick down: next item. "
+                deg > 0 ? "Snap turn " + std::to_string(deg) + "\xC2\xB0. Down: flick item, hold 180 blink. "
                                                                  "Hold up: blood bullets."
-                        : "Smooth turn. Flick down: next item. Hold up: blood bullets."};
+                        : "Smooth turn. Down: flick item, hold 180 blink. Hold up: blood bullets."};
     }
     if (id == "item_next" || id == "bullets" || id == "leap" || id == "jump") {
         return {}; // told by the stick's or the click's own words

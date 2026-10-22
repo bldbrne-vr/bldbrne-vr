@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -104,6 +105,10 @@ public:
         if (!device_context->MakeCurrent(device_name)) {
             return;
         }
+        if (const u32 reopens = device_context->Reopens(); reopens != seen_reopen) [[unlikely]] {
+            seen_reopen = reopens;
+            FlushQueue();
+        }
 
         UpdateVolumeIfChanged();
         const u64 current_time = HostTimeUs();
@@ -147,6 +152,8 @@ public:
                              sample_rate);
             }
             alSourceQueueBuffers(source, 1, &buffer_id);
+        } else {
+            ++dropped_full; // the queue is full: this buffer is lost (a click)
         }
 
         // Check state and queue health
@@ -159,6 +166,20 @@ public:
             LOG_DEBUG(Lib_AudioOut, "Audio underrun detected (queued: {}), restarting source",
                       queued);
             alSourcePlay(source);
+            ++ran_dry; // the device played everything queued: a gap
+        }
+        // Every 10 s, only when something went wrong: what the listener would hear as clicks.
+        if (current_time - glitch_log_us >= 10'000'000) {
+            if (dropped_full || ran_dry) {
+                LOG_INFO(Lib_AudioOut,
+                         "Audio port ({} frames, {} ch): last {:.0f} s, {} buffers dropped (queue "
+                         "full), {} restarts (ran dry), {} queued now",
+                         buffer_frames, num_channels,
+                         static_cast<double>(current_time - glitch_log_us) * 1e-6, dropped_full,
+                         ran_dry, queued);
+            }
+            dropped_full = ran_dry = 0;
+            glitch_log_us = current_time;
         }
 
         // Only sleep if we have healthy buffer queue
@@ -230,6 +251,7 @@ private:
 
         device_registered = true;
         device_context = &OpenALDevice::GetInstance();
+        seen_reopen = device_context->Reopens();
 
         // Make this device's context current
         if (!device_context->MakeCurrent(device_name)) {
@@ -404,6 +426,25 @@ private:
                 LOG_ERROR(Lib_AudioOut, "Failed to set audio gain: {}", GetALErrorString(error));
             }
         }
+    }
+
+    // After the device moved to another output (OpenALDevice::FollowOutputLocked): the queue
+    // filled up while the device was stopped and would stay full, every timing wobble then
+    // dropping a buffer (clicks). Start it over: stop, take every buffer back, re-time.
+    void FlushQueue() {
+        alSourceStop(source);
+        ALint processed = 0;
+        alGetSourcei(source, AL_BUFFERS_PROCESSED, &processed);
+        while (processed-- > 0) {
+            ALuint buffer_id;
+            alSourceUnqueueBuffers(source, 1, &buffer_id);
+            if (alGetError() != AL_NO_ERROR) {
+                break;
+            }
+            available_buffers.push_back(buffer_id);
+        }
+        next_output_time = 0;
+        LOG_INFO(Lib_AudioOut, "Audio port queue restarted after an output change");
     }
 
     void HandleTiming(u64 current_time) {
@@ -1045,9 +1086,12 @@ private:
     u64 next_output_time{0};
     u64 last_volume_check_time{0};
     u32 output_count{0};
+    u32 dropped_full{0}, ran_dry{0}; // since glitch_log_us
+    u64 glitch_log_us{0};
 
     // OpenAL objects
     OpenALDevice* device_context{nullptr};
+    u32 seen_reopen{0}; // OpenALDevice::Reopens() last seen
     ALuint source{0};
     std::vector<ALuint> buffers;
     std::vector<ALuint> available_buffers;

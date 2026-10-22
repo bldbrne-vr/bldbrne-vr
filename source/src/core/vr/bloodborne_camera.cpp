@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -22,8 +28,9 @@
 #include "core/vr/bloodborne_camera.h"
 #include "core/vr/body_channel.h"
 #include "core/vr/grab_camera.h"
-#include "core/vr/interaction_native_camera.h"
+#include "core/vr/root_height_hold.h"
 #include "core/vr/bloodborne_enemy_bars.h"
+#include "core/vr/bloodborne_lights.h"
 #include "core/vr/bloodborne_evasion.h"
 #include "core/vr/bloodborne_facing.h"
 #include "core/vr/bloodborne_gun.h"
@@ -49,6 +56,8 @@
 #include "core/vr/bloodborne_whip.h"
 #include "core/vr/camera_shake.h"
 #include "core/vr/hook_util.h"
+#include "core/vr/bloodborne_visceral_stage.h"
+#include "core/vr/visceral_stage.h"
 #include "core/vr/inframe.h"
 #include "core/vr/live_tune.h"
 #include "core/vr/quick_settings.h"
@@ -107,6 +116,24 @@ constexpr u64 CameraFuncEnd = 0x143FAD0;
 // first-person aim camera, blends) passes here once per rendered frame, so this is where
 // the head pose, FOV and eye position are written.
 constexpr u64 RenderHookRva = 0x193BEC5;
+// After the optional override has copied its entire camera over r15. The first
+// hook runs before that copy; holding its position alone cannot constrain it.
+constexpr u64 RenderFinalRva = 0x193BF61;
+constexpr std::array<u8, 14> RenderFinalSig = {
+    0x49,0x8B,0x3E, 0x48,0x85,0xFF, 0xC5,0xFA,0x10,0x85,0xD4,0xFE,0xFF,0xFF};
+// Native camera-effects pass: immediately before multiplying the camera by the
+// accumulated effect transform at [rbp-0x80]. Both output cameras use this matrix.
+constexpr u64 CameraEffectRva = 0x1571C9D;
+constexpr std::array<u8, 15> CameraEffectSig = {
+    0xC5,0x78,0x28,0x63,0x10, 0xC5,0xF8,0x28,0x4B,0x20, 0xC5,0xF8,0x28,0x53,0x30};
+std::atomic<u8*> visceral_effect_controller{};
+std::atomic<u64> visceral_effect_record{};
+// Per-effect animation output, before the native evaluator composes it into the
+// shared matrix. Three complete non-relative instructions; modifies stack output only.
+constexpr u64 CameraEffectSourceRva = 0x17E067E;
+constexpr std::array<u8, 14> CameraEffectSourceSig = {
+    0xC5,0xF8,0x57,0xC0, 0xC5,0xF8,0x5C,0x45,0xB0,
+    0xC5,0xF9,0x6F,0x4D,0xC0};
 constexpr std::array<u8, 14> RenderHookSig = {
     0x49, 0x8B, 0x85, 0x10, 0x01, 0x00, 0x00, // mov rax, [r13+0x110]
     0x83, 0xB8, 0xC4, 0x00, 0x00, 0x00, 0x00, // cmp dword ptr [rax+0xC4], 0
@@ -122,6 +149,9 @@ constexpr u32 OffsetFollowOrgOffset = 0x160;
 constexpr u32 OffsetAspect = 0x54; // render camera: width / height of the projection
 constexpr u32 OffsetNear = 0x58;
 constexpr u32 OffsetFar = 0x5C;
+// fp_near_down_m ramps in between these view pitches (radians, + = down).
+constexpr float NearDownStart = 20.0f * 0.0174532925f;
+constexpr float NearDownFull = 40.0f * 0.0174532925f;
 // First-person camera mod (Nexus bloodborne/287): NOPs `mov [rbx+0x84], rax` here.
 constexpr u64 FirstPersonModRva = 0x143709B;
 constexpr std::array<u8, 8> FirstPersonModSig = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xE9};
@@ -164,42 +194,16 @@ u32 g_follow_without_render = 0;
 bool g_cinematic_flat = false;
 bool g_flat_handoff = false; // flat started, the game camera not handed back yet
 bool g_fov_snap = false;
-VR::Interactions::Module* g_camera_module{};
-bool g_camera_fault{};
-VR::Interactions::NativeCameraRuntime g_native_camera;
-bool InitNativeCameraDll() {
-    if (!VR::Interactions::DllRequested())
-        return true;
-    if (g_camera_module)
-        return !g_camera_fault && !g_native_camera.Faulted();
-    g_camera_module = new VR::Interactions::Module();
-    g_camera_module->EnableFaultBroadcast();
-    if (!g_camera_module->LoadBesideExecutable()) {
-        g_camera_fault = true;
-        LOG_ERROR(Core, "VR camera: interaction DLL unavailable: {}",
-                  g_camera_module->Diagnostic());
-        return false;
-    }
-    g_native_camera.Bind(*g_camera_module, g_camera_fault);
-    return true;
-}
-template <class V>
-void CameraPut(float (&out)[3], const V& v) {
-    out[0] = v.x;
-    out[1] = v.y;
-    out[2] = v.z;
-}
-VR::Body::Vec3 CameraVec(const float (&v)[3]) {
-    return {v[0], v[1], v[2]};
-}
 // The render hook ran without driving the camera: the next driven frame restarts the camera
 // filters, height and (comfort camera) body position, so after a lever ride, an elevator or a
 // cinematic the eye never glides.
-
+bool g_comfort_reset = true;
+// The first-person eye's root height through turns in place (core/vr/root_height_hold.h).
+VR::RootHeightHold g_root_hold;
 // Which first-person camera the last driven frame used (the comfort camera, dodge_camera=1, or the
 // old one); the other restarts when it takes over.
-
-
+bool g_comfort_path = false;
+bool g_legacy_reset = true;
 std::unique_ptr<Xbyak::CodeGenerator> g_code;
 u64 g_hits = 0;
 std::chrono::steady_clock::time_point g_last_log{};
@@ -637,15 +641,6 @@ void SpectatorView(u8* render, const VR::CameraOverride& result, const float* ey
     std::memcpy(render + OffsetPosition, p, sizeof(p));
 }
 
-bool CameraInteractionFaulted() {
-    if (!g_native_camera.Faulted())
-        return false;
-    // Same neutral publication as a missing/inactive camera, without a local policy retry.
-    BodyRenderTick(nullptr, nullptr, false);
-    EvasionRenderTick(nullptr, false);
-    return true;
-}
-
 // A remo cutscene (FromSoftware's in-engine cutscenes: a boss's entrance, Father Gascoigne's
 // 2026-10-15) renders through the follow camera, so it read as gameplay and played from the head
 // in first person. While one plays the main player is not updated (VR::LastPlayerUpdateNs stands
@@ -667,6 +662,7 @@ bool RemoCutscene() {
                          updated != 0 && now - updated > RemoStillNs;
     if (playing != g_remo_playing) {
         g_remo_playing = playing;
+        VR::SetRemoCutscene(playing); // the renderer draws the hunter's head meanwhile
         LOG_INFO(Core,
                  "VR camera: {} (a cutscene file opened {:.1f} s ago, no player update for "
                  "{:.1f} s)",
@@ -680,22 +676,86 @@ bool RemoCutscene() {
 
 // The render camera (a per-frame copy of the camera manager) is the last write before
 // rendering; the one VR tick per rendered frame happens here.
+struct FinalVisceralView {
+    u8* camera{};
+    u64 record{};
+    std::array<u8, 80> view{}; // +0x10 through +0x5F: transform and projection
+    bool hold{};
+};
+thread_local FinalVisceralView final_visceral_view;
+
+void PS4_SYSV_ABI VisceralCameraEffectSourceHook(const u8* instance, float* transform) {
+    VR::GrabCamera::ThrowPlacement held{};
+    if (!VisceralStagePlacement(VR::Body::SteadyNowNs(), VR::GetSettings().world_scale, held)) return;
+    // Native code has already read resource+4/+8 and instance+0x38 here.
+    // Keep the raw resource identity: its first word is not yet a verified ID.
+    const u8* resource{};
+    float elapsed{}, duration{};
+    std::memcpy(&resource, instance+0x30, sizeof(resource));
+    std::memcpy(&elapsed, instance+0x38, sizeof(elapsed));
+    std::memcpy(&duration, resource+4, sizeof(duration));
+    const float before[3]{transform[12],transform[13],transform[14]};
+    const bool middle_reduced = VR::VisceralStage::AttenuateMiddleKick(transform, elapsed, duration);
+    if (middle_reduced) TraceVisceralView("middle_kick_reduced",
+        visceral_effect_record.load(std::memory_order_relaxed), before, transform+12);
+    const bool reduced = VR::VisceralStage::AttenuateLateKick(transform, elapsed, duration);
+    if (reduced) TraceVisceralView("late_kick_reduced",
+        visceral_effect_record.load(std::memory_order_relaxed), before, transform+12);
+    const auto kind = fmt::format("effect_source_{:x}", reinterpret_cast<uintptr_t>(resource));
+    const float metadata[3]{elapsed,duration,0};
+    TraceVisceralView(kind.c_str(), visceral_effect_record.load(std::memory_order_relaxed),
+                      metadata, transform+12);
+}
+
+void PS4_SYSV_ABI VisceralCameraEffectHook(u8* controller, float* effect) {
+    if (controller != visceral_effect_controller.load(std::memory_order_acquire)) return;
+    VR::GrabCamera::ThrowPlacement held{};
+    const bool active = VisceralStagePlacement(VR::Body::SteadyNowNs(), VR::GetSettings().world_scale, held);
+    // This is the accumulated native effect during the visceral/finishing clip,
+    // not an identified effect ID. Headset pose is not part of this matrix.
+    // Keep native timing; reduce lunge separately from rotation/other translation.
+    const float before[3]{effect[12], effect[13], effect[14]};
+    const float rotation_before[3]{effect[0], effect[5], effect[10]};
+    const bool softened = active && VR::VisceralStage::SoftenShake(effect);
+    if (active) VR::VisceralStage::ReduceForwardLunge(effect);
+    const float rotation_after[3]{effect[0], effect[5], effect[10]};
+    TraceVisceralView(!active ? "effect_rotation_idle" : softened ? "effect_rotation" : "effect_rotation_skipped",
+                     visceral_effect_record.load(std::memory_order_relaxed),
+                     rotation_before, rotation_after);
+    TraceVisceralView(active ? "native_effect" : "native_effect_idle", visceral_effect_record.load(std::memory_order_relaxed),
+                      before, effect + 12);
+}
+
+void PS4_SYSV_ABI RenderFinalHook(u8* render, u8*) {
+    auto& view = final_visceral_view;
+    if (view.camera != render) return;
+    float expected[3], actual[3];
+    std::memcpy(expected, view.view.data() + OffsetPosition - OffsetMatrix, sizeof(expected));
+    std::memcpy(actual, render + OffsetPosition, sizeof(actual));
+    TraceVisceralView("late_camera", view.record, expected, actual);
+    // Observational: this earlier copy was ruled out by the headset trace.
+    view.camera = nullptr;
+}
+
 void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* render) {
-    if (CameraInteractionFaulted())
-        return;
+    final_visceral_view = {};
+    static VR::GrabCamera::PairPosition grab_position;
+    static VR::GrabCamera::ThrowCamera throw_camera;
     u8* manager = nullptr;
     std::memcpy(&manager, field_camera + OffsetFieldManager, sizeof(manager));
     const bool follow = g_follow_seen;
     g_follow_seen = false;
     if (manager == nullptr || render == nullptr) {
-        g_native_camera.Path(PI_CP_MISSING);
+        grab_position.Reset();
+        throw_camera.Reset();
         BodyRenderTick(nullptr, nullptr, false);
         EvasionRenderTick(nullptr, false);
         return;
     }
     if (RemoCutscene()) {
-        g_native_camera.Path(PI_CP_INACTIVE);
-        // PI_CP_INACTIVE also resets the DLL-owned root-height hold.
+        g_comfort_reset = true;
+        grab_position.Reset();
+        throw_camera.Reset();
         BodyRenderTick(nullptr, nullptr, false);
         EvasionRenderTick(nullptr, false);
         return; // the cutscene's camera: left to the game (virtual screen)
@@ -747,7 +807,9 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
         u8* aim = nullptr;
         std::memcpy(&aim, manager + OffsetManagerAimCam, sizeof(aim));
         if (aim == nullptr) {
-            g_native_camera.Path(PI_CP_INACTIVE);
+            g_comfort_reset = true;
+            grab_position.Reset();
+            throw_camera.Reset();
             BodyRenderTick(nullptr, nullptr, false);
             EvasionRenderTick(nullptr, false);
             return;
@@ -763,7 +825,9 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
         result = VR::OnCameraTick(g_follow_pitch, g_follow_yaw, g_follow_fov, g_follow_lock, false,
                                   aspect, true, anchor_ptr);
     } else {
-        g_native_camera.Path(PI_CP_INACTIVE);
+        g_comfort_reset = true;
+        grab_position.Reset();
+        throw_camera.Reset();
         BodyRenderTick(nullptr, nullptr, false);
         EvasionRenderTick(nullptr, false);
         return; // cutscene or scripted camera: left to the game (virtual screen)
@@ -771,7 +835,9 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
     g_last = result;
     ++g_render_ticks;
     if (!result.active) {
-        g_native_camera.Path(PI_CP_INACTIVE);
+        g_comfort_reset = true; // cinematic flat mode, virtual screen, VR off
+        grab_position.Reset();
+        throw_camera.Reset();
         BodyRenderTick(nullptr, nullptr, false);
         EvasionRenderTick(nullptr, false);
         return;
@@ -794,37 +860,11 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
     // The eye in front of the head centre along the view (head yaw: never filtered), plus the
     // first-person camera's lead over the hunter's eyes (fp_ahead_m / fp_ahead_down_m: the VR
     // body does not follow that part, bloodborne_body.cpp).
-    PiNativeCameraInput geometry_input{};
-    geometry_input.operation = PI_NC_GEOMETRY;
-    geometry_input.scale = scale;
-    auto& geometry_facts = geometry_input.geometry;
-    geometry_facts.fp_follow = fp_follow;
-    geometry_facts.view_yaw = result.view_yaw;
-    geometry_facts.view_pitch = result.view_pitch;
-    geometry_facts.forward_m = settings.fp_forward_m;
-    geometry_facts.near_m = settings.fp_near_m;
-    if (fp_follow) {
-        geometry_facts.ahead_m = VR::Tune::Get("fp.ahead_m", settings.fp_ahead_m);
-        geometry_facts.ahead_down_m = VR::Tune::Get("fp.ahead_down_m", settings.fp_ahead_down_m);
-        if (settings.fp_near_m > 0.f)
-            geometry_facts.near_down_m = VR::Tune::Get("fp.near_down_m", settings.fp_near_down_m);
-    }
-    const auto geometry = g_native_camera.Call(geometry_input).geometry;
-    if (CameraInteractionFaulted())
-        return;
-    const float eye_forward_m = geometry.eye_forward_m;
-    const float forward_x = geometry.forward_x, forward_z = geometry.forward_z;
+    const float eye_forward_m =
+        settings.fp_forward_m + (fp_follow ? VR::FirstPersonAheadM(result.view_pitch) : 0.0f);
+    const float forward_x = std::sin(result.view_yaw) * eye_forward_m * scale;
+    const float forward_z = std::cos(result.view_yaw) * eye_forward_m * scale;
     EyeTick eye{};
-    eye.now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-    bool roomscale_updated = false;
-    VR::GrabCamera::Sample grab_sample{};
-    const bool sampled = fp_follow && BodyGrabEye(eye.now_ns, grab_sample, g_native_camera);
-    const bool own_throw = sampled && grab_sample.own_throw;
-    const VR::Vec3 grab_eye{grab_sample.eye.x, grab_sample.eye.y, grab_sample.eye.z};
-    const bool grab = sampled && !own_throw;
-    const auto path = g_native_camera.Path(PI_CP_SELECT, fp_follow, grab, settings.dodge_camera);
-    if (CameraInteractionFaulted())
-        return;
     if (fp_follow) {
         // First person: the eye sits at head height above the character, a little in front
         // of the head centre along the view, so the hunter's own head stays behind the
@@ -847,12 +887,14 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
         const float phys_root[3] = {pivot[0], pivot[1] - org_offset[1], pivot[2]};
         float root_y = phys_root[1];
         float root_yaw = 0.0f;
-
-        const bool have_model = BodyRootHeight(root_y, &root_yaw);
-        root_y = g_native_camera.RootHeight(phys_root, root_y, root_yaw, scale, have_model, hold_on)
-                     .height;
-        if (CameraInteractionFaulted())
-            return;
+        if (g_comfort_reset) {
+            g_root_hold.Reset();
+        }
+        if (BodyRootHeight(root_y, &root_yaw) && hold_on) {
+            root_y = g_root_hold.Step(phys_root, root_y, root_yaw, scale);
+        } else {
+            g_root_hold.Reset();
+        }
         eye.target = {pivot[0], root_y + settings.fp_eye_height_m * scale, pivot[2]};
         eye.pivot = {pivot[0], pivot[1], pivot[2]};
         eye.org = {org_offset[0], org_offset[1], org_offset[2]};
@@ -863,28 +905,58 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
         p[0] = eye.target.x + forward_x;
         p[1] = eye.target.y;
         p[2] = eye.target.z + forward_z;
-        if (geometry.write_near)
-            std::memcpy(render + OffsetNear, &geometry.near_plane, sizeof(geometry.near_plane));
+        if (settings.fp_near_m > 0.0f) {
+            float near_m = settings.fp_near_m;
+            // fp_near_down_m: looking down (from 20 deg below the horizon, all of it from 40 deg)
+            // the near clip moves out to it, hiding the hunter's collar, chest and shoulder caps
+            // right under the eye; hands further away than it stay.
+            // VR_TUNE_FILE fp.near_down_m: live A/B in tests.
+            const float near_down = VR::Tune::Get("fp.near_down_m", settings.fp_near_down_m);
+            if (near_down > near_m) {
+                const float t =
+                    std::clamp((result.view_pitch - NearDownStart) / (NearDownFull - NearDownStart),
+                               0.0f, 1.0f);
+                near_m += (near_down - near_m) * t * t * (3.0f - 2.0f * t);
+            }
+            const float near_plane = near_m * scale;
+            std::memcpy(render + OffsetNear, &near_plane, sizeof(near_plane));
+        }
     }
 
-    if (path.path == PI_CAMERA_GRAB) {
+    VR::GrabCamera::ThrowPlacement stage{};
+    const bool staged = fp_follow && VisceralStagePlacement(eye.now_ns, scale, stage);
+    static bool stage_was_active = false;
+    if (stage_was_active && !staged) g_comfort_reset = true;
+    stage_was_active = staged;
+    bool roomscale_updated = false;
+    VR::GrabCamera::Sample grab_sample{};
+    const bool sampled = fp_follow && BodyGrabEye(eye.now_ns, grab_sample);
+    const bool own_throw = sampled && grab_sample.own_throw;
+    const VR::Vec3 grab_eye{grab_sample.eye.x, grab_sample.eye.y, grab_sample.eye.z};
+    const bool grab = sampled && !own_throw;
+    if (grab) {
         // Follow the animated body even when the physics capsule stays on the ground.
         // Head look, physical movement and stereo remain live.
         p[0] = grab_eye.x + forward_x + result.render_offset.x;
         p[1] = grab_eye.y + result.render_offset.y;
         p[2] = grab_eye.z + forward_z + result.render_offset.z;
-    } else if (path.path == PI_CAMERA_COMFORT) {
+        g_comfort_reset = true;
+        g_legacy_reset = true;
+        throw_camera.Reset();
+    } else if (fp_follow && (settings.dodge_camera || staged)) {
         // Dodge comfort camera (core/vr/motion_camera.h): the body position is followed with a
         // critically damped spring horizontally and a mode-dependent one vertically, pair-locked
         // for both eyes of a stereo pair; the forward offset, the stereo eye and real head
         // movement are added after it, unfiltered.
-        const char* reset = path.reset_reason
-                                ? PhysicalInteractions::MotionPackets::Reason(path.reset_reason)
-                                : nullptr;
+        const char* reset = g_comfort_reset ? "inactive" : !g_comfort_path ? "path" : nullptr;
+        g_comfort_reset = false;
+        g_comfort_path = true;
+        g_legacy_reset = true;
         const VR::Vec3 base = ComfortEye(eye, reset);
         // Resolve physical walking before the throw clearance check so it sees the same
         // tracked offset that will actually be rendered.
-        VR::UpdateRoomscaleWalk(result, base, fp_follow);
+        VR::UpdateRoomscaleWalk(result, staged ? VR::Vec3{stage.base.x, stage.base.y, stage.base.z} : base,
+                                fp_follow && !staged);
         roomscale_updated = true;
         // A freehand throw (a visceral, riposte, backstab): the view holds your place, your head
         // and hands tracked, and keeps off the victim; it glides back onto him when the throw
@@ -894,51 +966,116 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
                                   result.render_offset.y - result.eye_offset.y,
                                   result.render_offset.z - result.eye_offset.z + forward_z};
         const VR::Body::Vec3 base_b{base.x, base.y, base.z};
-        PiNativeCameraInput throw_input{};
-        throw_input.operation = PI_NC_THROW;
-        throw_input.throwing = own_throw;
-        throw_input.first = result.pair_first;
-        throw_input.now_ns = eye.now_ns;
-        throw_input.scale = scale;
-        throw_input.victim_valid = grab_sample.victim_valid;
-        CameraPut(throw_input.base, base_b);
-        CameraPut(throw_input.facing, grab_sample.facing);
-        CameraPut(throw_input.head, head);
-        CameraPut(throw_input.victim, grab_sample.victim);
-        const auto throw_state = g_native_camera.Call(throw_input);
-        if (CameraInteractionFaulted())
-            return;
-        const auto hold = CameraVec(throw_state.hold);
-        const auto push = CameraVec(throw_state.push);
-        result.throw_offset = {hold.x + push.x, hold.y + push.y, hold.z + push.z};
-        // One log line per throw: how far the game moved the hunter under your held view (the
-        // most, and when it ended: the glide back), and how far it kept you off the victim.
-        static bool throw_logging = false;
-        static float held_peak = 0.0f, held_end = -1.0f, push_peak = 0.0f; // game units
-        if (throw_state.cut) {
-            LOG_INFO(Core, "VR camera: a throw moved the hunter over {:.0f} m: the view cut to him",
-                     VR::GrabCamera::ThrowCamera::MaxM);
-        }
-        if (throw_state.running) {
-            throw_logging = true;
-            const float held = VR::Body::Length(CameraVec(throw_state.held));
-            held_peak = std::max(held_peak, held);
-            push_peak = std::max(push_peak, VR::Body::Length(push));
-            if (!own_throw && held_end < 0.0f) {
-                held_end = held;
+        VR::GrabCamera::ThrowPlacement shared{};
+        const bool stage_enabled = VisceralStageEnabled();
+        const bool have_shared = stage_enabled ? staged : BodyThrowPlacement(eye.now_ns, scale, shared);
+        if (stage_enabled && staged) shared = stage;
+        static bool shared_logging = false;
+        static unsigned shared_hits = 0, shared_silhouette = 0, shared_missing = 0;
+        static float shared_near_cm = 0.0f, shared_far_cm = 0.0f;
+        if (!stage_enabled && have_shared && shared.holding && result.pair_first) {
+            if (!shared_logging) {
+                LOG_INFO(Core, "VR visceral: shared camera/body clearance target {:.0f} cm",
+                         VR::GrabCamera::ThrowCamera::KeepOutM * 100.0f);
             }
-        } else if (throw_logging) {
-            const float cm = 100.0f / std::max(scale, 1e-3f);
-            LOG_INFO(Core,
-                     "VR camera: held your place through a throw (the hunter moved up to {:.0f} "
-                     "cm under it, {:.0f} cm when it ended: glided over {:.0f} ms), kept up to "
-                     "{:.0f} cm off the victim",
-                     held_peak * cm, std::max(held_end, 0.0f) * cm,
-                     throw_state.glide_s * 1000.0f, push_peak * cm);
-            throw_logging = false;
-            held_peak = 0.0f;
-            held_end = -1.0f;
-            push_peak = 0.0f;
+            shared_logging = true;
+            if (shared.surface.hit) {
+                // This is the pose's ray BEFORE retreat, not the final rendered
+                // head gap. Silhouette hits are projected collision geometry.
+                const float distance_cm = shared.surface.distance * 100.0f / shared.scale;
+                if (shared_hits + shared_silhouette == 0) {
+                    shared_near_cm = shared_far_cm = distance_cm;
+                } else {
+                    shared_near_cm = std::min(shared_near_cm, distance_cm);
+                    shared_far_cm = std::max(shared_far_cm, distance_cm);
+                }
+            }
+            if (!shared.surface.hit) ++shared_missing;
+            else if (shared.surface.projected) ++shared_silhouette;
+            else ++shared_hits;
+        } else if (!have_shared && shared_logging) {
+            LOG_INFO(Core, "VR visceral: shared camera/body placement ended; surface rays: "
+                           "{} eye-level, {} silhouette, {} unavailable",
+                     shared_hits, shared_silhouette, shared_missing);
+            if (shared_hits + shared_silhouette > 0) {
+                LOG_INFO(Core, "VR visceral: sampled collision distance BEFORE retreat "
+                               "{:.0f} to {:.0f} cm (negative = inside; includes silhouette hits); "
+                               "clearance target {:.0f} cm; final rendered head gap not measured",
+                         shared_near_cm, shared_far_cm,
+                         VR::GrabCamera::ThrowCamera::KeepOutM * 100.0f);
+            }
+            shared_logging = false;
+            shared_hits = shared_silhouette = shared_missing = 0;
+        }
+        if (have_shared) {
+            // The pose already used this base/root. Add only live tracked head
+            // movement here; another ray or blend would detach the body again.
+            result.throw_offset = {shared.base.x - base.x, shared.base.y - base.y,
+                                   shared.base.z - base.z};
+            result.throw_root = {shared.root.x, shared.root.y, shared.root.z};
+            result.throw_shared = true;
+            result.throw_weight = shared.weight;
+            result.throw_holding = shared.holding;
+            throw_camera.Reset();
+        } else if (stage_enabled) {
+            // Native placement owns separation. No camera retreat, fallback re-anchor or glide.
+            throw_camera.Reset();
+        } else {
+            const auto hold = throw_camera.Step(own_throw, base_b, grab_sample.facing, scale,
+                                                result.pair_first, eye.now_ns);
+            // Measure from the proposed eye centre before its keep-out correction,
+            // avoiding feedback that would alternate between pushing and pulling in.
+            VR::GrabCamera::SurfaceRay surface{};
+            if (result.pair_first && own_throw && grab_sample.victim_valid &&
+                VR::Body::Length(VR::Body::Vec3{base_b.x - grab_sample.victim.x, 0.0f,
+                                               base_b.z - grab_sample.victim.z}) <= 3.0f * scale) {
+                surface = CastVisceralSurface(static_cast<const u8*>(grab_sample.victim_character),
+                                               base_b + hold + head, grab_sample.victim,
+                                               grab_sample.facing, scale);
+            }
+            const auto push = throw_camera.KeepOut(base_b + hold + head, base_b,
+                                                   own_throw && grab_sample.victim_valid,
+                                                   grab_sample.victim, scale, result.pair_first, surface);
+            result.throw_offset = {hold.x + push.x, hold.y + push.y, hold.z + push.z};
+            result.throw_weight = throw_camera.Weight();
+            result.throw_holding = throw_camera.Holding();
+            // One log line per throw: how far the game moved the hunter under your held view (the
+            // most, and when it ended: the glide back), and how far it kept you off the victim.
+            static bool throw_logging = false;
+            static float held_peak = 0.0f, held_end = -1.0f, push_peak = 0.0f; // game units
+            static unsigned surface_hits = 0, silhouette_hits = 0, surface_missing = 0;
+            if (own_throw && result.pair_first) {
+                if (!surface.hit) ++surface_missing;
+                else if (surface.projected) ++silhouette_hits;
+                else ++surface_hits;
+            }
+            if (throw_camera.TakeCut()) {
+                LOG_INFO(Core, "VR camera: a throw moved the hunter over {:.0f} m: the view cut to him",
+                         VR::GrabCamera::ThrowCamera::MaxM);
+            }
+            if (throw_camera.Running()) {
+                throw_logging = true;
+                const float held = VR::Body::Length(throw_camera.Held());
+                held_peak = std::max(held_peak, held);
+                push_peak = std::max(push_peak, VR::Body::Length(push));
+                if (!own_throw && held_end < 0.0f) {
+                    held_end = held;
+                }
+            } else if (throw_logging) {
+                const float cm = 100.0f / std::max(scale, 1e-3f);
+                LOG_INFO(Core,
+                         "VR camera: held your place through a throw (the hunter moved up to {:.0f} "
+                         "cm under it, {:.0f} cm when it ended: glided over {:.0f} ms), kept up to "
+                         "{:.0f} cm off the victim; surface rays: {} eye-level, {} silhouette, {} unavailable",
+                         held_peak * cm, std::max(held_end, 0.0f) * cm,
+                         throw_camera.GlideTime() * 1000.0f, push_peak * cm,
+                         surface_hits, silhouette_hits, surface_missing);
+                throw_logging = false;
+                held_peak = 0.0f;
+                held_end = -1.0f;
+                push_peak = 0.0f;
+                surface_hits = silhouette_hits = surface_missing = 0;
+            }
         }
         p[0] = base.x + result.throw_offset.x + forward_x + result.render_offset.x;
         p[1] = base.y + result.throw_offset.y + result.render_offset.y;
@@ -948,18 +1085,42 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
         // camera height so rolls, jumps and stairs do not bob the view. The height only advances
         // on the first eye of a stereo pair (with or without smoothing): the second eye keeps it,
         // so the pair has no vertical offset.
-        PiNativeCameraInput legacy{};
-        legacy.operation = PI_NC_LEGACY_OWNED;
-        legacy.now_ns =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-        legacy.first = result.pair_first;
-        legacy.smoothing_ms = settings.vertical_smoothing_ms;
-        std::copy_n(p, 3, legacy.base);
-        const auto legacy_state = g_native_camera.Call(legacy);
-        if (CameraInteractionFaulted() || !legacy_state.applied)
-            return;
-        std::copy_n(legacy_state.position, 3, p);
-        const float height = p[1];
+        g_comfort_path = false;
+        throw_camera.Reset();
+        const bool restart = g_legacy_reset; // the comfort camera drove the last frame
+        static bool have_height = false;
+        static float height = 0.0f;
+        static auto last = std::chrono::steady_clock::now();
+        const float tau = settings.vertical_smoothing_ms * 0.001f;
+        if (!have_height || g_comfort_reset || restart || std::abs(p[1] - height) > 2.0f) {
+            // First frame, the first driven frame after the game's own camera (a lever ride, an
+            // elevator, a cinematic) or the comfort camera, or a teleport (lantern, cutscene,
+            // fall): on either eye, a pair across a teleport is broken anyway.
+            height = p[1];
+            have_height = true;
+            g_comfort_reset = false;
+            g_legacy_reset = false;
+            last = now;
+        } else if (result.pair_first) {
+            const float dt =
+                std::clamp(std::chrono::duration<float>(now - last).count(), 0.0f, 0.1f);
+            last = now;
+            height = tau <= 0.0f ? p[1] : height + (p[1] - height) * (1.0f - std::exp(-dt / tau));
+        }
+        // The horizontal body position is pair-locked too: the second eye of a stereo pair uses
+        // the first eye's, so moving (strafing, dodging at up to ~10 m/s) never pulls the two eyes
+        // apart or together by the 16.7 ms of travel between them. A teleport resets it.
+        static bool have_pair_xz = false;
+        static float pair_x = 0.0f, pair_z = 0.0f;
+        if (!have_pair_xz || restart || result.pair_first || std::abs(p[0] - pair_x) > 2.0f ||
+            std::abs(p[2] - pair_z) > 2.0f) {
+            pair_x = p[0];
+            pair_z = p[2];
+            have_pair_xz = true;
+        } else {
+            p[0] = pair_x;
+            p[2] = pair_z;
+        }
         if (fp_follow) {
             // VR_DODGE_LOG: the same dodge statistics for the old camera (A/B runs).
             LegacyEye(eye, VR::Vec3{p[0] - forward_x, height, p[2] - forward_z});
@@ -977,31 +1138,17 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
                                  p[1] - result.render_offset.y,
                                  p[2] - forward_z - result.render_offset.z};
         const s64 max_age = static_cast<s64>(1.5 * VR::GameFrameSeconds() * 1e9);
-        PiNativeCameraInput pair{};
-        pair.operation = PI_NC_PAIR;
-        pair.now_ns = eye.now_ns;
-        pair.max_age_ns = max_age;
-        pair.grabbing = grab;
-        pair.first = result.pair_first;
-        pair.lock_enabled = settings.pair_lock_position;
-        pair.have_decision = have_decision;
-        if (have_decision) {
-            pair.first_ns = decision.first_ns;
-            pair.decided_ns = decision.decided_ns;
-            pair.decision_locked = decision.locked;
+        if (const auto locked = grab_position.Step(base, grab, result.pair_first, eye.now_ns,
+                                                   settings.pair_lock_position, max_age,
+                                                   have_decision ? &decision : nullptr)) {
+            p[0] = locked->x + forward_x + result.render_offset.x;
+            p[1] = locked->y + result.render_offset.y;
+            p[2] = locked->z + forward_z + result.render_offset.z;
         }
-        CameraPut(pair.base, base);
-        const auto locked = g_native_camera.Call(pair);
-        if (CameraInteractionFaulted())
-            return;
-        if (locked.applied) {
-            p[0] = locked.position[0] + forward_x + result.render_offset.x;
-            p[1] = locked.position[1] + result.render_offset.y;
-            p[2] = locked.position[2] + forward_z + result.render_offset.z;
-        }
+    } else {
+        grab_position.Reset();
+        throw_camera.Reset();
     }
-    if (CameraInteractionFaulted())
-        return;
     // Use the actual comfort-smoothed base: compensating the raw root would make its spring
     // drag the view behind a physical step. The game still owns walking and all collision.
     const VR::Vec3 old_offset = result.render_offset;
@@ -1015,6 +1162,9 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
     g_last = result;
     std::memcpy(render + OffsetPosition, p, sizeof(p));
     VR::SetRecordRenderPosition(result.record_id, VR::Vec3{p[0], p[1], p[2]});
+    const float stage_tracked[3]{forward_x + result.render_offset.x, result.render_offset.y,
+                                 forward_z + result.render_offset.z};
+    TraceVisceralCamera(result.record_id, p, stage_tracked);
     // The late warp: the eye forward of the head centre went in (first person only).
     VR::SetRecordEyeForward(result.record_id, fp_follow ? eye_forward_m : 0.0f, fp_follow);
     // What the game projects this frame with (after our FOV and near-plane writes): DIBR stereo
@@ -1044,6 +1194,34 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
     if (fp_follow) {
         SpectatorView(render, result, p, scale);
     }
+    final_visceral_view.camera = render;
+    final_visceral_view.record = result.record_id;
+    u8* effect_controller{};
+    std::memcpy(&effect_controller, field_camera + 0x110, sizeof(effect_controller));
+    visceral_effect_record.store(result.record_id, std::memory_order_relaxed);
+    visceral_effect_controller.store(effect_controller, std::memory_order_release);
+    final_visceral_view.hold = staged;
+    std::memcpy(final_visceral_view.view.data(), render + OffsetMatrix,
+                final_visceral_view.view.size());
+    // Read-only orientation trace, including after stage release. Correlate with
+    // the actual draw camera by record, rather than inferring it from an effect.
+    const float* basis = reinterpret_cast<const float*>(render + OffsetMatrix);
+    TraceVisceralView("render_right", result.record_id, basis, basis);
+    TraceVisceralView("render_up", result.record_id, basis+4, basis+4);
+    TraceVisceralView("render_forward", result.record_id, basis+8, basis+8);
+    VR::CameraRecord trace_record{};
+    static const bool trace_orientation = std::getenv("VR_VISCERAL_STAGE_TRACE") != nullptr;
+    if (trace_orientation && VR::GetRecord(result.record_id, trace_record)) {
+        const float head_angles[3]{trace_record.head_yaw,trace_record.head_pitch,trace_record.head_roll};
+        const float view_angles[3]{result.view_yaw,result.render_pitch,result.view_roll};
+        TraceVisceralView("head_view_angles", result.record_id, head_angles, view_angles);
+        const float heading[3]{result.base_yaw,result.yaw,result.vfov};
+        const float game_heading[3]{g_follow_yaw,g_follow_pitch,g_follow_fov};
+        TraceVisceralView("heading", result.record_id, heading, game_heading);
+    }
+    const float head_position[3]{result.head_position.x,result.head_position.y,result.head_position.z};
+    const float head_offset[3]{result.render_offset.x,result.render_offset.y,result.render_offset.z};
+    TraceVisceralView("head", result.record_id, head_position, head_offset);
     if (g_shake.on) {
         auto& s = g_shake;
         s.written_render = render;
@@ -1157,8 +1335,6 @@ void OnEbootLoaded(VAddr base, u64 size) {
     if (!VR::IsEnabled() || g_installed) {
         return;
     }
-    if (!InitNativeCameraDll()) return;
-    InstallVitalsVisual();
     // Instant Blood Vial injection and the cinematic detection share their own hook and do not
     // depend on the camera. The body's pose hook is installed after relocation (its vtable slots
     // are filled then); only its VR_BODY_HOOK=code variant patches code here.
@@ -1183,6 +1359,7 @@ void OnEbootLoaded(VAddr base, u64 size) {
     MenuEbootLoaded(base, size);
     LampsEbootLoaded(base, size);
     InstallEnemyBars(base, size); // ui_enemy_hp_bars: the enemies' HP bars on / off, live
+    InstallLights(base, size); // body_fill_lights: camera-attached fill lights follow the hunter
     InstallStatus(base, size); // status build-ups: the faster drain and the meter's rows
     EvasionEbootLoaded(base, size);
     BodyEbootLoaded(base, size);
@@ -1213,7 +1390,7 @@ void OnEbootLoaded(VAddr base, u64 size) {
     }
 
     try {
-        g_code = std::make_unique<Xbyak::CodeGenerator>(4096);
+        g_code = std::make_unique<Xbyak::CodeGenerator>(8192);
         using Xbyak::util::r13;
         using Xbyak::util::rbx;
         void* camera_stub = EmitHostCallStub(
@@ -1253,6 +1430,52 @@ void OnEbootLoaded(VAddr base, u64 size) {
                     r13, &r15);
                 WriteJump(render, RenderHookSig.size(), render_stub);
                 g_render_hook = true;
+                u8* const final_site = module + RenderFinalRva;
+                if (std::memcmp(final_site, RenderFinalSig.data(), RenderFinalSig.size()) == 0 &&
+                    MakeWritable(final_site, RenderFinalSig.size())) {
+                    void* final_stub = EmitHostCallStub(*g_code,
+                        reinterpret_cast<void*>(&RenderFinalHook), RenderFinalSig.data(),
+                        RenderFinalSig.size(), reinterpret_cast<u64>(final_site + RenderFinalSig.size()), r15);
+                    WriteJump(final_site, RenderFinalSig.size(), final_stub);
+                    LOG_INFO(Core, "VR visceral: final camera guard installed after native override copy");
+                } else {
+                    LOG_ERROR(Core, "VR visceral: final camera guard signature mismatch");
+                }
+                u8* const effect_site = module + CameraEffectRva;
+                {
+                    u8* const source_site = module + CameraEffectSourceRva;
+                    if (std::memcmp(source_site, CameraEffectSourceSig.data(), CameraEffectSourceSig.size()) == 0 &&
+                        MakeWritable(source_site, CameraEffectSourceSig.size())) {
+                        void* source_stub = Hook::EmitHostCallStubWith(*g_code,
+                            reinterpret_cast<void*>(&VisceralCameraEffectSourceHook),
+                            CameraEffectSourceSig.data(), CameraEffectSourceSig.size(),
+                            reinterpret_cast<u64>(source_site + CameraEffectSourceSig.size()),
+                            [](Xbyak::CodeGenerator& c) {
+                                using namespace Xbyak::util;
+                                c.mov(rdi, rbx);
+                                c.lea(rsi, ptr[rbp - 0x60]);
+                            });
+                        WriteJump(source_site, CameraEffectSourceSig.size(), source_stub);
+                        LOG_INFO(Core, "VR visceral: middle and late native kick attenuation installed (0.1% excess)");
+                    } else {
+                        LOG_ERROR(Core, "VR visceral: individual camera-effect trace signature mismatch");
+                    }
+                }
+                if (std::memcmp(effect_site, CameraEffectSig.data(), CameraEffectSig.size()) == 0 &&
+                    MakeWritable(effect_site, CameraEffectSig.size())) {
+                    void* effect_stub = Hook::EmitHostCallStubWith(*g_code,
+                        reinterpret_cast<void*>(&VisceralCameraEffectHook), CameraEffectSig.data(),
+                        CameraEffectSig.size(), reinterpret_cast<u64>(effect_site + CameraEffectSig.size()),
+                        [](Xbyak::CodeGenerator& c) {
+                            using namespace Xbyak::util;
+                            c.mov(rdi, r12);
+                            c.lea(rsi, ptr[rbp - 0x80]);
+                        });
+                    WriteJump(effect_site, CameraEffectSig.size(), effect_stub);
+                    LOG_INFO(Core, "VR visceral: native lunge 20%, matrix shake 50% installed at 0x1571C9D");
+                } else {
+                    LOG_ERROR(Core, "VR visceral: native camera-effect signature mismatch");
+                }
             } else {
                 LOG_WARNING(Core, "VR: render-camera signature not found; first-person mods "
                                   "will not follow the headset");

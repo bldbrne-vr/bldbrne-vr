@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -6,8 +12,6 @@
 
 #include "common/types.h"
 #include "core/vr/arm_ik.h"
-#include "physical_interactions/fire_action_api.h"
-#include "physical_interactions/gun_delivery_api.h"
 
 // VR combat: data handed between the OpenXR frame thread and the game (no guest code), like the
 // body and quick-item channels.
@@ -76,20 +80,6 @@ struct GunEvent {
 };
 
 // Presenter (one writer).
-void EnableGunFireTransport();
-bool GunFireTransportEnabled();
-bool GunFireBusy();
-uint32_t SubmitGunFire(const PiGunDeliveryRequest& request);
-bool CancelGunFire(uint32_t ticket);
-bool PollGunFire(PiGunDeliveryResult& result);
-bool PollGunHandoff(PiGunDeliveryResult& result);
-bool BeginGunHandoff(uint32_t ticket);
-bool AckGunHandoff(uint32_t ticket,bool accepted);
-bool RejectGunHandoff(uint32_t ticket);
-bool GunFireOwns(uint32_t ticket);
-bool ClaimGunFire(uint64_t actor,uint32_t family,int32_t attach,uintptr_t pointer,uint32_t handle,int64_t now,GunPull& out);
-void AdvanceGunFire(uint64_t actor,uint32_t family,int32_t attach,bool two_handed,int64_t now);
-bool ObserveGunHandoffShot(uint32_t ticket,uint32_t family,uintptr_t actor,uint32_t handle);
 void PublishGunPull(const GunPull& pull);
 // Any thread. False before the first pull.
 bool LatestGunPull(GunPull& out);
@@ -101,9 +91,10 @@ bool LatestGunStatus(GunStatus& out);
 
 // Any thread. A full ring (64) drops the new event.
 void PushGunEvent(const GunEvent& event);
-// Latest successful gun shot, retained even if the feedback queue overflows.
+// Latest successful chambered gun shot (excludes sprayers/Gatling), retained even if
+// the feedback queue overflows. Continuous-fire emissions still produce ordinary feedback.
 // Steady-clock timestamp; compare against GunStatus::player_since_ns after a load.
-s64 LatestGunShotNs();
+s64 LatestReloadShotNs();
 // Presenter: up to `max` queued events, oldest first.
 u32 PollGunEvents(GunEvent* out, u32 max);
 
@@ -180,6 +171,7 @@ struct MeleeStatus {
     // handgun's punch (the bare fist's, the gun in the hand: a harder swing, never at the trigger).
     bool left_dual{false};
     bool left_gun{false};
+    bool left_shield{false}; // a shield uses the punch detector, but is not a gun aim
     // The hunter falling (melee_plunge's air tracker: in the air and going down), and how far so
     // far (m): a blade held point down then is a plunge (the presenter opens its window).
     bool falling{false};
@@ -272,14 +264,6 @@ struct BladeShot {
 };
 
 // Presenter (one writer).
-// Selected together by presenter and game consumer at startup in DLL mode.
-void EnableBladeFireTransport();
-bool BladeFireTransportEnabled();
-uint32_t SubmitBladeFire(const PiFireRequest& request);
-bool CancelBladeFire(uint32_t ticket);
-bool PollBladeFire(PiFireResult& result);
-bool ClaimBladeFire(uint64_t actor,int32_t variation,bool form,int32_t bow_hand,int64_t now,BladeShot& out);
-bool FinishBladeFire(uint32_t ticket,uint32_t outcome,int64_t now,const char* reason);
 void PublishBladeShot(const BladeShot& shot);
 // Any thread. False before the first shot.
 bool LatestBladeShot(BladeShot& out);
@@ -302,17 +286,7 @@ struct TransformPull {
     // A hand transform (hand_transform, core/vr/trick_weapons.h): no swing ever joins its run
     // (no flick, no transform attack).
     bool no_join{false};
-    // DLL requests bind to copied game facts, never to a guest pointer.
-    std::uint64_t character_generation{};
-    std::int32_t weapon_id{-1}, style{-1}, weapon_slot{-1};
 };
-
-// Checked again on each buffered game tick, immediately before starting execution.
-inline bool TransformContextMatches(const TransformPull& pull, std::uint64_t generation,
-                                    std::int32_t weapon, std::int32_t style, std::int32_t slot) {
-    return generation && pull.character_generation == generation && pull.weapon_id == weapon &&
-           pull.style == style && pull.weapon_slot == slot;
-}
 
 struct TransformStatus {
     std::int64_t ns{0};
@@ -324,8 +298,6 @@ struct TransformStatus {
     std::int32_t clip{-1};    // the clip a squeeze would play
     std::uint32_t handled{0}; // the newest squeeze serial the game has seen
     const char* why{""};      // when !ok (a static string)
-    std::uint64_t character_generation{};
-    std::int32_t weapon_slot{-1};
 };
 
 enum class TransformEventKind : std::uint8_t {
@@ -346,16 +318,7 @@ struct TransformEvent {
     const char* why{""}; // a static string
 };
 
-// DLL mode: a single request, explicit claim/cancel and a retained terminal outcome.
-// Allocate a process-wide serial so presenter recreation cannot replay an old request.
-std::uint32_t NextTransformSerial();
-bool SubmitTransformPull(const TransformPull& pull); // presenter; false = busy/invalid
-bool CancelTransformPull(std::uint32_t serial);      // presenter; only before claim
-bool ClaimTransformPull(TransformPull& out);         // game thread, once per request
-bool PollTransformOutcome(TransformEvent& out);      // presenter; consumes terminal result
-bool TransformPullBusy();
-
-// Legacy comparison path (one presenter writer).
+// Presenter (one writer).
 void PublishTransformPull(const TransformPull& pull);
 // Any thread. False before the first squeeze.
 bool LatestTransformPull(TransformPull& out);

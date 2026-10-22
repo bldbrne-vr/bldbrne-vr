@@ -4,7 +4,7 @@
 #pragma once
 
 #include "shader_recompiler/frontend/instruction.h"
-#include "../../../scratchpad/dual-eye-perf/recorded_code_words.h"
+#include "video_core/native_stereo/recorded_code_words.h"
 
 namespace Shader::Gcn {
 

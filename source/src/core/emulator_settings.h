@@ -401,7 +401,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
 // Windows static guest red-zone protection
 struct WindowsGuestRedZoneProtectionSettings {
     Setting<WindowsGuestRedZoneProtectionMode> windows_guest_red_zone_protection_mode{
-        WindowsGuestRedZoneProtectionMode::Disabled};
+        Core::WindowsGuestRedZoneProtection::DefaultMode};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{make_override<WindowsGuestRedZoneProtectionSettings>(
@@ -725,8 +725,16 @@ public:
     SETTING_FORWARD(m_audio, OpenALOutputMode, openal_output_mode)
 
     // Windows static guest red-zone protection
-    SETTING_FORWARD(m_windows_guest_red_zone_protection, WindowsGuestRedZoneProtectionMode,
-                    windows_guest_red_zone_protection_mode)
+    WindowsGuestRedZoneProtectionMode GetWindowsGuestRedZoneProtectionMode() const {
+        return Core::WindowsGuestRedZoneProtection::EffectiveMode(
+            m_windows_guest_red_zone_protection.windows_guest_red_zone_protection_mode.get(
+                m_configMode));
+    }
+    void SetWindowsGuestRedZoneProtectionMode(WindowsGuestRedZoneProtectionMode mode,
+                                             bool game_specific = false) {
+        m_windows_guest_red_zone_protection.windows_guest_red_zone_protection_mode.set(
+            Core::WindowsGuestRedZoneProtection::EffectiveMode(mode), game_specific);
+    }
 
     // Debug settings
     SETTING_FORWARD_BOOL(m_debug, DebugDump, debug_dump)

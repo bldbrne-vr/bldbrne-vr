@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // VR additions to the presenter: DIBR stereo (stereo_mode 2) and the UI layer at the flip.
@@ -20,7 +21,7 @@
 // DIBR warp without a HUD, or (AER, mono, a frame DIBR could not warp) the copy post-processed
 // like the frame itself. The frame's own image keeps scene + UI (the desktop window).
 
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
+#include "video_core/native_stereo/native_stereo.h"
 
 #include <algorithm>
 #include <chrono>
@@ -29,6 +30,7 @@
 #include <string>
 
 #include "common/logging/log.h"
+#include "core/vr/bloodborne_enemy_bars.h"
 #include "core/vr/conditions_channel.h"
 #include "core/vr/live_tune.h"
 #include "core/vr/ui_conditions.h"
@@ -109,7 +111,7 @@ void Presenter::RecordVrStereo(vk::CommandBuffer cmdbuf, Frame& frame, vk::Exten
                 const float p95 =
                     measured ? stats.skew_deg[std::min(measured - 1, (measured * 95) / 100)]
                              : 0.0f;
-                LOG_INFO(Render_Vulkan,
+                LOG_BENCHMARK_INFO(Render_Vulkan,
                          "VR dibr gpu: {} flips, {} DIBR frames, {} warped to both eyes ({} drawn "
                          "with an older camera update than the flip's, {} newer; sent with the "
                          "flip's {} (0 = every frame with its own pose); head turned between the "
@@ -202,11 +204,13 @@ void Presenter::RecordVrStereo(vk::CommandBuffer cmdbuf, Frame& frame, vk::Exten
             frame.vr_tag.record = drawn; // `tag` refers to it: the crops and poses below use it
         }
     }
-    if (info.size != game_size || frame.width != game_size.width ||
-        frame.height != game_size.height) {
+    const bool dibr_dlss = rasterizer->VrDibrDlssFrame();
+    if ((!dibr_dlss && info.size != game_size) || (dibr_dlss && !frame.vr_ui.valid) ||
+        frame.width != game_size.width || frame.height != game_size.height) {
         ++stats.size;
         return;
     }
+    if (dibr_dlss) game_size = info.size;
     // The DIBR eyes go to their own swapchains (OpenXRPresenter::RecordStereoCopy, one eye each,
     // sized from its crop): only the format is shared with the centre image's swapchains, never
     // their size. (Until 2026-10-07 those had to be the render's size; on Meta Link, whose
@@ -322,6 +326,7 @@ void Presenter::RecordVrStereo(vk::CommandBuffer cmdbuf, Frame& frame, vk::Exten
         stereo.eye_offset_m = frame.vr_eye_offset_m;
         // The late warp's source: this capture, with the settings its eyes were warped with.
         stereo.late = vr_warp->GetLateCapture(settings);
+        stereo.late.render_taa = frame.vr_tag.aa_mode == VR::Aa::Mode::Taa;
         if (settings.depth) {
             stereo.depth_buffer = vr_warp->DepthBuffer();
             stereo.depth_offset = {vr_warp->DepthOffset(0), vr_warp->DepthOffset(1)};
@@ -704,6 +709,16 @@ void Presenter::RecordVrUi(vk::CommandBuffer cmdbuf, Frame& frame, vk::Extent2D 
         }
     }
     params.cut_count = std::min<u32>(hud.count, static_cast<u32>(params.cut.size()));
+    // A raised boss bar in the HP cluster's rows: that cut stops short of it (StatusLeftBossCutX).
+    if (VR::Bloodborne::BossBarUp()) {
+        for (u32 i = 0; i < params.cut_count; ++i) {
+            if (std::string_view{hud.segment[i].name} == "status_left") {
+                params.cut[i].x1 = std::min(
+                    params.cut[i].x1,
+                    static_cast<s32>(std::ceil(VR::Ui::StatusLeftBossCutX * k)));
+            }
+        }
+    }
     // The status build-up meter (ui_conditions=view): while the game shows a row, in a gameplay
     // frame or a small dialog's or note's (the belt's pieces show), never a screen-wide one, its
     // rows' rect is cut 3: its pixels go into the atlas's strip, out of the HP cluster's piece and

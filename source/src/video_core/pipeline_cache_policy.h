@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -82,13 +88,13 @@ constexpr Word Tag = 0x5652u;
 constexpr Word UpstreamShaderVersion = 3u; // upstream's ShaderBinary / ShaderMeta number
 constexpr Word UpstreamKeyVersion = 4u;    // upstream's PipelineKey number
 
-constexpr Word VrKeyLayoutRevision = 4u;  // the stage hashes are permutation ids
-constexpr Word VrMetaLayoutRevision = 13u; // named by the permutation id (the header holds it)
+constexpr Word VrKeyLayoutRevision = 10u;  // the stage hashes are permutation ids
+constexpr Word VrMetaLayoutRevision = 20u; // RuntimeInfo::billboard_face_eye
 // FAST_CPU_PERM_IDS off (the default): the indexed naming's words, the caches' before the ids.
-constexpr Word VrKeyLayoutRevisionIndexed = 3u;
-constexpr Word VrMetaLayoutRevisionIndexed = 12u; // cached motion permutations (vr_motion's flag)
-constexpr Word VrRevision = 8u;           // VrPushData: the motion buffers' addresses pushed too
-constexpr Word VrVertexRevision = 5u;     // geometry-stage sprites face the eye (RewriteGeometrySprites)
+constexpr Word VrKeyLayoutRevisionIndexed = 9u;
+constexpr Word VrMetaLayoutRevisionIndexed = 19u; // RuntimeInfo::billboard_face_eye
+constexpr Word VrRevision = 9u;           // NonUniform on final per-eye image/atomic operands
+constexpr Word VrVertexRevision = 6u;     // geometry-stage sprites face the eye (RewriteGeometrySprites)
 constexpr Word VrFragmentRevision = 1u;   // only what the SPIR-V reads of the written colour targets
 constexpr Word VrCutRevision = 1u;        // the vr_cut permutations: the same colour-target change
 

@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -20,13 +26,13 @@ using namespace Draw;
 
 namespace {
 
-// ---- Layout (stage px), from the game's Environment page (game asset) -------------------
+// ---- Layout (stage px), from the game's Environment page (optionsetting.gfx) -------------------
 // (the title, help line and key guide: core/vr/vr_page_draw.h)
 
 constexpr float HeaderX = 533.2f; // StaticText_111010 / 111011
 constexpr float LabelRight = 594.3f - 29.0f + 322.0f; // Text_0 #38, right aligned
 constexpr float LabelDy = 19.1f + Ascent24;
-// The two groups (2026-10-09, the user: "the 'show enemy health bars' is still very close to its
+// The two groups (2026-10-09, the tester: "the 'show enemy health bars' is still very close to its
 // header above"). Each group header sits HeaderAboveLabel over its first row's label, baseline to
 // baseline: the movie's 30.15 (StaticText_111010) + 8, so a header's descenders ("Display",
 // "Body") clear a long label's ascenders by about half a line (12.5..13.25 px on the glyphs, were

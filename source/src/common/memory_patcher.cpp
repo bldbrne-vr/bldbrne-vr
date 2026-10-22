@@ -8,7 +8,9 @@
 #include <sstream>
 #include <set>
 #include "core/vr/graphics_resolution.h"
-#include "../../scratchpad/dual-eye-perf/native_stereo.h"
+#include "core/vr/near_code.h"
+#include "core/vr/vr_session.h"
+#include "video_core/native_stereo/native_stereo.h"
 #include <string>
 #include <nlohmann/json.hpp>
 #include <pugixml.hpp>
@@ -176,12 +178,20 @@ static VR::Graphics::Extent TemplateResolution(pugi::xml_document& doc, std::str
 
 // Adapt only the complete, enabled Kyo-derived VR allocation template in memory.
 // The XML on disk is never modified. Guest code is patched before its first instruction.
+// APP_VER 01.00 or 01.09: the same 1.09 executable (the launcher checks it and gives the launch
+// copy of the patch file the game's own APP_VER).
 static void ApplyHeadsetResolution(pugi::xml_document& doc, std::string_view version) {
-    if (!NativeStereo::AsymmetricProjection() || version != "01.00") return;
+    const bool dibr = VR::IsEnabled() && !std::getenv("VR_NATIVE_STEREO");
+    // The isolated DLSS experiment supplies its own input-resolution patch and output size.
+    const char* experiment = std::getenv("VR_DIBR_DLSS");
+    if (dibr && experiment && std::string_view(experiment) == "1") return;
+    if ((!NativeStereo::AsymmetricProjection() && !dibr) ||
+        (version != "01.00" && version != "01.09"))
+        return;
     const auto config = VR::Graphics::Accepted();
-    const bool fixed = std::getenv("VR_NATIVE_FIXED_RESOLUTION") != nullptr;
+    const bool fixed = !dibr && std::getenv("VR_NATIVE_FIXED_RESOLUTION") != nullptr;
     // S1: the whole template at the upscaler's input size (DLSS 5: its neural working size).
-    const bool s1 = config.upscaler != VR::Graphics::Upscaler::Off && WholeFrameRequested();
+    const bool s1 = !dibr && config.upscaler != VR::Graphics::Upscaler::Off && WholeFrameRequested();
     if (fixed && !s1) return;
     const auto output = fixed ? TemplateResolution(doc, version)
                               : VR::Graphics::OutputResolution(
@@ -225,23 +235,111 @@ static void ApplyHeadsetResolution(pugi::xml_document& doc, std::string_view ver
     for (auto& [line, value] : edits) line.attribute("Value").set_value(value.c_str());
     if (s1) {
         VR::Graphics::SetS1(output, config);
-        LOG_INFO(Loader, "VR resolution: S1 (FAST bit 51) whole frame {}x{} per eye, "
+        LOG_BENCHMARK_INFO(Loader, "VR resolution: S1 (FAST bit 51) whole frame {}x{} per eye, "
                  "reconstructed by {} preset {} (scale {:.2f}) to {}x{} after the composite; "
                  "provider OFF or scale changes require restart",
                  target.width, target.height,
                  VR::Graphics::Neural(config)                     ? "DLSS 5"
-                 : config.upscaler == VR::Graphics::Upscaler::Dlss ? "DLSS"
-                                                                   : "FSR 4",
+                 : VR::Graphics::UpscalerName(config.upscaler),
                  int(VR::Graphics::EffectiveProfile(config)),
                  VR::Graphics::WholeFrameRatio(config), output.width, output.height);
         if (fixed) return;
     }
     VR::Graphics::SetAppliedResolution(output, config.scale_percent);
     const auto left = VR::Graphics::Headset(0), right = VR::Graphics::Headset(1);
-    LOG_INFO(Loader, "VR resolution: headset L {}x{} R {}x{}, scale {:+}%, scene/post/output "
-             "{}x{} per eye (8-pixel alignment, shared multiview extent); scale changes require restart",
+    LOG_BENCHMARK_INFO(Loader, "VR resolution: headset L {}x{} R {}x{}, scale {:+}%, scene/post/output "
+             "{}x{} (8-pixel alignment, {}); scale changes require restart",
              left.width, left.height, right.width, right.height, config.scale_percent,
-             target.width, target.height);
+             target.width, target.height, dibr ? "DIBR center render" : "shared multiview extent");
+}
+
+// The Model LOD patch's mov ecx, imm32 (b9 <bias> 90) in the game's code, once it is applied.
+constexpr uintptr_t LodPatchAddress = 0x0216fc09;
+static bool g_lod_patch_enabled = false;
+
+static u8* LodInstruction() {
+    if (!g_lod_patch_enabled || g_eboot_address == 0) {
+        return nullptr;
+    }
+    auto* const p = reinterpret_cast<u8*>(g_eboot_address + (LodPatchAddress - 0x400000));
+    // The patch's own shape (mov ecx, imm32; nop), or nothing is touched.
+    return p[0] == 0xB9 && p[5] == 0x90 ? p : nullptr;
+}
+
+// Live changes (2026-10-17 review: rewriting code other threads may be executing is
+// cross-modifying code, not defined without synchronizing them): once every startup patch is in,
+// before the game's first instruction, the patch becomes mov ecx, [rip + slot] (8B 0D disp32, the
+// same 6 bytes), the slot four bytes of our own near memory (core/vr/near_code.h: mapped
+// read / write within rel32 reach of the eboot, a 64-byte line of its own). A change in game is
+// then an aligned 4-byte data store, read whole by every thread. No near memory: the immediate
+// stays and a change applies at the next start.
+static s32* g_lod_slot = nullptr;
+
+static const char* LodName(int bias) {
+    return bias == 0 ? "Performance" : bias == -1 ? "Balanced" : "Quality";
+}
+
+static void SetUpLodSlot(int bias) {
+    if (g_lod_slot != nullptr) {
+        return; // once
+    }
+    u8* const p = LodInstruction();
+    if (p == nullptr || g_eboot_image_size == 0) {
+        return;
+    }
+    u8* const slot = VR::Hook::NearAlloc(g_eboot_address, g_eboot_image_size, 64, 64);
+    s32 disp32{};
+    if (slot == nullptr ||
+        !VR::Hook::Rel32(reinterpret_cast<u64>(p + 6), reinterpret_cast<u64>(slot), disp32)) {
+        LOG_WARNING(Loader, "VR distant detail: no near memory for a live slot; changes take a "
+                            "restart");
+        return;
+    }
+    __atomic_store_n(reinterpret_cast<s32*>(slot), static_cast<s32>(bias), __ATOMIC_SEQ_CST);
+    p[0] = 0x8B;
+    p[1] = 0x0D; // mov ecx, [rip + disp32]
+    std::memcpy(p + 2, &disp32, sizeof(disp32));
+    g_lod_slot = reinterpret_cast<s32*>(slot);
+    LOG_INFO(Loader, "VR distant detail: LOD bias {} ({}), live slot at {:#x}", bias,
+             LodName(bias), reinterpret_cast<uintptr_t>(slot));
+}
+
+bool LodLiveAvailable() {
+    return g_lod_slot != nullptr;
+}
+
+bool SetLodBiasLive(int bias) {
+    s32* const slot = g_lod_slot;
+    if (slot == nullptr) {
+        return false;
+    }
+    __atomic_store_n(slot, static_cast<s32>(bias), __ATOMIC_SEQ_CST);
+    LOG_INFO(Loader, "VR distant detail: LOD bias {} ({}), applied live", bias, LodName(bias));
+    return true;
+}
+
+// vr.ini lod_bias (the VR page's Display > Distant detail): the Model LOD patch's bias, its
+// mov ecx, imm32 at 0x0216fc09 ("b9 <bias> 90"), set in memory; the XML on disk is not modified.
+// SetUpLodSlot then has it read the bias from a slot (a change in game: SetLodBiasLive).
+static void ApplyLodBias(pugi::xml_document& doc) {
+    const int bias = VR::GetSettings().lod_bias;
+    for (auto metadata : doc.child("Patch").children("Metadata")) {
+        if (!std::string_view(metadata.attribute("Name").value()).starts_with("Model LOD") ||
+            !metadata.attribute("isEnabled").as_bool())
+            continue;
+        for (auto line : metadata.child("PatchList").children("Line")) {
+            if (std::string_view(line.attribute("Address").value()) != "0x0216fc09")
+                continue;
+            const auto le = static_cast<u32>(bias);
+            const std::string value =
+                fmt::format("b9{:02X}{:02X}{:02X}{:02X}90", le & 0xFF, (le >> 8) & 0xFF,
+                            (le >> 16) & 0xFF, (le >> 24) & 0xFF);
+            line.attribute("Value").set_value(value.c_str());
+            g_lod_patch_enabled = true; // (SetLodBiasLive checks the bytes it finds)
+            LOG_INFO(Loader, "VR distant detail: LOD bias {} ({})", bias,
+                     bias == 0 ? "Performance" : bias == -1 ? "Balanced" : "Quality");
+        }
+    }
 }
 
 void ApplyPatchesFromXML(std::filesystem::path path) {
@@ -253,6 +351,7 @@ void ApplyPatchesFromXML(std::filesystem::path path) {
 
     if (result) {
         ApplyHeadsetResolution(doc, app_version);
+        ApplyLodBias(doc);
         auto patchXML = doc.child("Patch");
         for (pugi::xml_node_iterator it = patchXML.children().begin();
              it != patchXML.children().end(); ++it) {
@@ -362,6 +461,9 @@ void OnGameLoaded() {
         }
     }
     ApplyPendingPatches();
+    // Every startup patch is in (every patch file and the queued ones): the Model LOD patch reads
+    // its bias from a slot from now on.
+    SetUpLodSlot(VR::GetSettings().lod_bias);
 }
 
 void AddPatchToQueue(const patchInfo& patchToAdd) {

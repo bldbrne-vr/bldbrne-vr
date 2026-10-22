@@ -1,7 +1,13 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #pragma once
 #include <chrono>
 #include <memory>
+#include <span>
 #include <tsl/robin_map.h>
 #include "video_core/renderer_vulkan/vr_scene_proxy.h"
 #include "video_core/renderer_vulkan/vr_temporal_failure.h"
@@ -20,6 +26,8 @@ struct VrTemporalCapture {
     Scheduler& scheduler;
     VrTemporalScene scene;
     Motion::IndexRangeCache index_ranges;
+    std::span<const u8> motion_index_data;
+    u64 motion_index_address{};
     // Toggle bit 36: PipelineCache::GetVrMotionPipeline's non-null answers by base pipeline.
     // Only VrTemporalSelect calls it and the cache changes an entry only inside such a call, so
     // an entry here is the cache's own (see VrTemporalSelect). Cleared while the bit is off.
@@ -82,6 +90,8 @@ struct VrTemporalCapture {
         // by nearest blits when the game may have written it (S1UiDepth).
         VideoCore::UniqueImage ui_ds;
         vk::UniqueImageView ui_ds_view;
+        vk::Image ui_ds_source{}; // the image whose contents the twin last copied
+        vk::ImageAspectFlags ui_ds_valid_aspects{};
         vk::Format ui_ds_format{};
         vk::ImageLayout ui_ds_layout{vk::ImageLayout::eUndefined};
         uint32_t ui_ds_layers{};
@@ -89,7 +99,8 @@ struct VrTemporalCapture {
         bool ui_ds_failed{};
         uint64_t hud_frames{}, hud_syncs{}, hud_draws{};
     } s1;
-    vk::ImageView S1UiDepth(VideoCore::Image& ds, bool sync);
+    vk::ImageView S1UiDepth(VideoCore::Image& ds, vk::ImageAspectFlags tested_aspects,
+                            bool shared_view_only);
     bool S1Color(const VideoCore::Image& x);
     bool S1Depth(const VideoCore::Image& depth);
     bool S1SrgbViews(vk::Format srgb);

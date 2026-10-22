@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <chrono>
 
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
+#include "common/path_util.h"
 #include "common/sha1.h"
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
@@ -289,8 +293,19 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
         u64 unsupported_cpu_patch_instruction_count{};
         for (const auto& [segment_addr, segment_size] : executable_segments) {
             // Windows static guest red-zone protection
-            const auto result =
-                PatchRedZoneMemoryInstructions(segment_addr, segment_size, function_starts);
+            const auto patch_start = std::chrono::steady_clock::now();
+            const auto result = PatchRedZoneMemoryInstructions(
+                segment_addr, segment_size, function_starts,
+                Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "red-zone");
+            const auto patch_ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - patch_start)
+                                      .count();
+            LOG_INFO(Core_Linker,
+                     "Windows guest red-zone analysis for {}: cache={}, decoded={}/{}, "
+                     "cache_written={}, elapsed_ms={:.1f}",
+                     name, result.analysis_cache_hit ? "hit" : "miss",
+                     result.decoded_function_count, result.function_count,
+                     result.analysis_cache_written, patch_ms);
             analyzed_function_count += result.function_count;
             stack_dependent_instruction_count += result.stack_dependent_memory_instruction_count;
             control_flow_instruction_count += result.control_flow_memory_instruction_count;

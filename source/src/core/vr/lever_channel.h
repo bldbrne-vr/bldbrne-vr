@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #pragma once
 
 #include "core/vr/lever_prompt.h"
@@ -26,7 +32,7 @@ struct Offer {
 // hand that comes within reach and log how close the hands get. Never an offer: a grab still goes
 // through a request and the game's checks. `armed` false: still in place but not grabbable now
 // (used or running, animating, physical levers off, or its normal prompt is back for a while
-// after B or a refused pull); the XR side keeps asking while near.
+// after a refused pull); the XR side keeps asking while near.
 struct Nearby {
     std::int64_t ns{};
     std::uint64_t id{}; // object handle
@@ -97,7 +103,7 @@ class Transport {
     // The steady time a parked capstan's hand pull stopped being possible, so its own scheduler
     // puts its bar back at rest once (the game still holds it unturned): written by the XR side
     // (physical levers switched off, or no display mode a hand pulls in) and by the selection
-    // classifier (its prompt given back, by B or a refused pull). The first request stands until
+    // classifier (its prompt given back, by a refused pull). The first request stands until
     // the scheduler serves it. Zero: idle (the native gate skips the host).
     std::atomic<std::int64_t> unpark{0};
     void RequestUnpark(std::int64_t ns) {
@@ -109,9 +115,8 @@ class Transport {
         scan.store(where.ns, std::memory_order_release);
     }
     bool RequestedScan(ScanRequest &where) const { return scan_where_.Load(where, 4); }
-    // XR writer: B at a hand-pulled lever (hint fresh, nothing held) asks for its normal prompt
-    // and button back (lever_prompt.h FallbackNs, FallbackPress). The native gate compares it
-    // with verdict.fallback, so a change reaches the host on the next selection pass.
+    // Legacy serial address used by the native gate; retain its layout. B no longer increments
+    // it: ordinary interact presses must not restore a hand-pulled lever's prompt.
     std::atomic<std::uint64_t> prompt_fallback{0};
     // Any thread: a lever's prompt may have changed (a refused pull demoted it, a hold began, the
     // XR side's readiness changed). The native gate compares it with verdict.serial, so the host
@@ -125,6 +130,9 @@ class Transport {
     // Game thread only (native selection gate and its host classifier): which selected lever
     // instance has its prompt replaced. Read by generated code at fixed offsets.
     PromptVerdict verdict{};
+    // Game thread only, under the adapter's busy guard: the lever instances whose normal prompt
+    // and button are back for a while (B, a refused pull).
+    PromptState prompt_state{};
     // Game thread writer: the map object a physical hold or settle owns right now (0: none).
     // The script-prompt gate hides an EMEVD action-button prompt only on this object.
     std::atomic<std::uint64_t> held_object{0};

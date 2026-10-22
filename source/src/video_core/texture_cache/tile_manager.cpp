@@ -1,8 +1,9 @@
-#include "../../../scratchpad/dual-eye-perf/profile_scopes.h"
+#include "video_core/native_stereo/profile_scopes.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
+#include "video_core/native_stereo/native_stereo.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -442,8 +443,8 @@ void TileManager::TileImageViaBuffer(Image& in_image, std::span<vk::BufferImageC
     }
 }
 
-// FAST bit 39: re-tile straight from the image (documents/vr-gpu-guide.md 2.5 C). The download
-// into a linear scratch buffer was ~81% of a resync's GPU time (guide 2.5, clinic hall); the
+// FAST bit 39: re-tile straight from the image. The download
+// into a linear scratch buffer was ~81% of a resync's GPU time (clinic hall); the
 // 3d5ebf4e direct image-to-buffer copies (vk_rasterizer.cpp IsComputeImageCopy) and the texel
 // buffer resyncs (buffer_cache.cpp SynchronizeBufferFromImage) both come through here. bbport
 // leaves this chain as its next GPU item (docs/parallel_gpu.md:542-548, ROADMAP.md:37): its
@@ -778,8 +779,8 @@ bool TileManager::RetileFromImage(Image& in_image, u32 width, u32 height, vk::Bu
                              static_cast<u32>(sizeof(push)), &push);
         cmdbuf.dispatch(dim_x, 1, 1);
     }
-    // The tiler's writes before any later use of the guest bytes (documents/vr-gpu-guide.md 2.5 E:
-    // the download path's tiler had none of its own).
+    // The tiler's writes before any later use of the guest bytes (the
+    // download path's tiler had none of its own).
     const vk::MemoryBarrier2 after{
         .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
         .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,

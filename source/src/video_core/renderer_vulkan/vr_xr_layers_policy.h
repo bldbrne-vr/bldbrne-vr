@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -11,7 +17,7 @@
 // layer covers the view, so without the colour scale extension a fade dropped the layers below
 // half brightness (a cut through black), and the virtual screen, a menu panel without the world
 // around it and the time before the first frame showed black around them. SteamVR has no colour
-// scale extension and shows its own light-grey void there: the user's Quest 3 through SteamVR
+// scale extension and shows its own light-grey void there: the tester's Quest 3 through SteamVR
 // (2026-10-15) had 0.3-1.4 s of an empty light view at every flat/VR switch, and the virtual screen
 // floated in it. The base layer is one projection layer of a black 16x16 image (cleared once and
 // released; the runtime keeps showing the last image released), submitted first whenever no eye

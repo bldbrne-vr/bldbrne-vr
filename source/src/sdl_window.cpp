@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <SDL3/SDL_events.h>
@@ -25,6 +26,7 @@
 #include "core/vr/vr_session.h"
 #include "imgui/friends_layer.h"
 #include "imgui/renderer/imgui_core.h"
+#include "input/benchmark_input.h"
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
@@ -206,6 +208,10 @@ void WindowSDL::WaitEvent() {
     SDL_Event event;
 
     if (!SDL_WaitEvent(&event)) {
+        return;
+    }
+
+    if (Input::BenchmarkInputLocked() && Input::IsBenchmarkPlayerEvent(event.type)) {
         return;
     }
 

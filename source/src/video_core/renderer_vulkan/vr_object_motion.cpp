@@ -1,7 +1,13 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 // Adapted from bbport ObjectMotion; native stereo, lazy activation, nonblocking retirement.
 #include <algorithm>
 #include <cstring>
+#include "video_core/native_stereo/profile_scopes.h"
 #include "video_core/renderer_vulkan/vr_temporal_optimizations.h"
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -159,6 +165,7 @@ Shader::VrMotion VrObjectMotion::Specialization() const {
     return active ? specialization : Shader::VrMotion{};
 }
 uint32_t VrObjectMotion::Prepare(const Motion::Draw& draw) {
+    ScratchProfile::Cpu scratch_motion(44, "VrObjectMotion::Prepare");
     if (!active)
         return 0;
     const auto exhausted = history->Stats().exhausted;

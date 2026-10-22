@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -9,12 +10,14 @@
 #include <unordered_set>
 
 #include <xxhash.h>
+#include "shader_recompiler/ir/passes/billboard_face_eye.h"
 
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
+#include "video_core/native_stereo/native_stereo.h"
 #include "common/hash.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "core/vr/graphics_settings.h"
+#include "core/vr/vr_session.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "video_core/cache_storage.h"
@@ -149,7 +152,8 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
 
 void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
-                        const Shader::StageSpecialization& spec, u64 perm_id, size_t perm_idx) {
+                        const Shader::StageSpecialization& spec, u64 perm_id, size_t perm_idx,
+                        u64 vertex_output_locations) {
     if (!Storage::DataBase::Instance().IsOpened()) {
         return;
     }
@@ -171,7 +175,9 @@ void RegisterShaderMeta(const Shader::Info& info,
     meta.Write(u64{perm_idx});
 
     spec.Serialize(ar);
-    info.Serialize(ar);
+    auto serialized_info = info;
+    serialized_info.vertex_output_locations = vertex_output_locations;
+    serialized_info.Serialize(ar);
 
     Storage::DataBase::Instance().Save(Storage::BlobType::ShaderMeta,
                                        Serialization::BlobName(perm_id), ar.TakeOff());
@@ -508,7 +514,9 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
     // other mode's permutation still takes its index here, so the ones this session adds never
     // reuse it, but its pipeline is not built: it can never be selected, and its push range
     // would be this session's.
-    if (spec.runtime_info.native_stereo != NativeStereo::Enabled()) {
+    if (spec.runtime_info.native_stereo != NativeStereo::Enabled() ||
+        spec.runtime_info.billboard_face_eye != Shader::Optimization::BillboardFaceEye::Enabled(
+            NativeStereo::Enabled(), VR::IsEnabled(), std::getenv("VR_BILLBOARD_FACE_EYE"))) {
         load_other_mode = true;
     }
     // Object motion runs only with an upscaler (VrObjectMotion::Begin). A session started without
@@ -538,6 +546,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
 
     vk::ShaderModule module{};
 
+    const u64 vertex_output_locations = program->info.vertex_output_locations;
     std::unique_lock program_lock(programs_mutex);
     auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
     if (new_program) {
@@ -574,7 +583,8 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
     ++programs_generation;
     // Like a compile's selection: the pipeline is created with its stages' own runtime infos.
     load_runtime_infos[stage] = spec.runtime_info;
-    it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx, expected_id);
+    it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx, expected_id,
+                                vertex_output_locations);
 
     selection.infos[stage] = &it_pgm.value()->info;
     selection.modules[stage] = module;

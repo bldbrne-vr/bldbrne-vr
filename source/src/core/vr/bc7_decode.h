@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-FileCopyrightText: 2014 Intel Corporation (the BPTC partition and anchor tables, as in Mesa)
 // SPDX-License-Identifier: GPL-2.0-or-later AND MIT
 
@@ -9,7 +10,7 @@
 #include <cstring>
 
 // A CPU decoder for BC7 (BPTC unorm) blocks, header-only: the VR settings page draws the game's
-// own menu art (game asset, BC7) into its page image on the CPU. The partition and
+// own menu art (menu/common.tpf.dcx, BC7) into its page image on the CPU. The partition and
 // anchor tables and the bit layout follow the BPTC specification (the tables as in Mesa's
 // texcompress_bptc_tmp.h, MIT, Intel 2014). Unit-tested against Pillow's decoder
 // (tests/test_vr_page.cpp).

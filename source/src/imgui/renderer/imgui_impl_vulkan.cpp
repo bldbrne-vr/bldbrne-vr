@@ -1,5 +1,6 @@
-#include "../../../scratchpad/dual-eye-perf/push_state_memo.h"
+#include "video_core/native_stereo/push_state_memo.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // Based on imgui_impl_vulkan.cpp from Dear ImGui repository

@@ -1,11 +1,12 @@
-#include "../../../scratchpad/dual-eye-perf/draw_registers.h"
-#include "../../../scratchpad/dual-eye-perf/owned_optional_reuse.h"
-#include "../../../scratchpad/dual-eye-perf/profile_scopes.h"
+#include "video_core/native_stereo/draw_registers.h"
+#include "video_core/native_stereo/owned_optional_reuse.h"
+#include "video_core/native_stereo/profile_scopes.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
-#include "../../../scratchpad/dual-eye-perf/lighting_reconstruction.h"
+#include "video_core/native_stereo/native_stereo.h"
+#include "video_core/native_stereo/lighting_reconstruction.h"
 #include "core/vr/vr_session.h"
 #include <ranges>
 
@@ -19,6 +20,7 @@
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
+#include "shader_recompiler/ir/passes/billboard_face_eye.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/fast_render.h"
@@ -131,6 +133,11 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
     };
     info.Initialize(stage);
     info.native_stereo = NativeStereo::Enabled();
+    // This override is startup-only. getenv scans/locks the process environment;
+    // do not repeat it for every shader selection on the draw workers.
+    static const char* const billboard_override = std::getenv("VR_BILLBOARD_FACE_EYE");
+    info.billboard_face_eye = Shader::Optimization::BillboardFaceEye::Enabled(
+        info.native_stereo, VR::IsEnabled(), billboard_override);
     if (stage == Stage::Vertex || stage == Stage::Fragment) info.vr_motion = selection.vr_motion;
     info.native_multiview = info.native_stereo && stage != Stage::Compute && view_mask == 3;
     // VrPushData: each draw pushes its projection, light tiles and cut radii
@@ -491,7 +498,8 @@ const GraphicsPipeline* PipelineCache::SelectGraphicsPipeline(u32 view_mask, Asy
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, selection.graphics_key, *pipeline_cache, selection.infos,
-            selection.runtime_infos, selection.fetch_shader, selection.modules, sdata, false);
+            selection.runtime_infos, selection.fetch_shader, selection.modules, sdata, false,
+            selection.vertex_output_locations);
 
         // Not the probe's, nor a motion variant with its buffers' addresses baked in (without
         // VrPushData: this process's allocations).
@@ -1060,6 +1068,8 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& selection,
         if (PrepVerifyInterval() || FastRender::On(GraphicsPrepBit))
             OnProgramSelected(program, index, runtime_info, selection_start);
         const auto& module = program.modules[index];
+        if (l_stage == LogicalStage::Vertex)
+            selection.vertex_output_locations = module.vertex_output_locations;
         // The stage hash: the permutation's name (its id with FAST_CPU_PERM_IDS, else
         // HashCombine(program, index); pipeline_cache_policy.h), the disk cache's name.
         return {&program.info, module.module,
@@ -1087,9 +1097,10 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& selection,
         // motion permutation is written only when the draw pushes them (VrPushData).
         if (!runtime_info.vr_motion.Baked()) {
             RegisterShaderBinary(std::move(spv), perm_id, params.hash, 0);
-            RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_id, 0);
+            RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_id, 0,
+                               program->info.vertex_output_locations);
         }
-        program->AddPermut(module, std::move(spec), perm_id);
+        program->AddPermut(module, std::move(spec), perm_id, program->info.vertex_output_locations);
         auto* published = program.get();
         {
             std::unique_lock lock(programs_mutex);
@@ -1184,10 +1195,11 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& selection,
 
         if (cacheable && !runtime_info.vr_motion.Baked()) {
             RegisterShaderBinary(std::move(spv), perm_id, params.hash, perm_idx);
-            RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_id, perm_idx);
+            RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_id, perm_idx,
+                               new_info.vertex_output_locations);
         }
         std::unique_lock lock(programs_mutex);
-        program->AddPermut(module, std::move(spec), perm_id);
+        program->AddPermut(module, std::move(spec), perm_id, new_info.vertex_output_locations);
     } else if (!it->module) {
         // Bit 40 warm-up (vk_pipeline_serialization.cpp): the driver rejected a cached pipeline
         // built from this permutation, so its cached module was dropped. Compile it again at its
@@ -1201,11 +1213,13 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& selection,
                                spv, &program->modules, &spec);
         if (!runtime_info.vr_motion.Baked()) {
             RegisterShaderBinary(std::move(spv), perm_id, params.hash, perm_idx);
-            RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_id, perm_idx);
+            RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_id, perm_idx,
+                               new_info.vertex_output_locations);
         }
         std::unique_lock lock(programs_mutex);
         ++programs_generation;
-        program->InsertPermut(module, std::move(spec), perm_idx, perm_id);
+        program->InsertPermut(module, std::move(spec), perm_idx, perm_id,
+                              new_info.vertex_output_locations);
     } else {
         info.AddBindings(binding);
         module = it->module;

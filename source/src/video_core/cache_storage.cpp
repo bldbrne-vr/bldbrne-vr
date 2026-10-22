@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <cstdlib>
+#include "common/shader_cache_lock.h"
+#include "common/render_diagnostic.h"
+#include "imgui/notifications_layer.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/polyfill_thread.h"
@@ -23,7 +28,16 @@
 #include <string_view>
 #include <system_error>
 
+#ifdef _WIN32
+// The launcher probes this export without running the executable.
+extern "C" __declspec(dllexport) int BbvrSharedShaderCacheV1() { return 1; }
+#endif
+
 namespace {
+#ifdef _WIN32
+Common::ShaderCacheLock cache_lock;
+#endif
+
 
 std::mutex submit_mutex{};
 std::atomic<u32> num_requests{};
@@ -121,10 +135,35 @@ void DataBase::Open() {
             mz_zip_writer_init_file(&zip_ar, cache_path.string().c_str(), 0);
         }
     } else {
-        cache_path = GetUserPath(PathType::CacheDir) / game_info.GameSerial();
-        if (!std::filesystem::exists(cache_path)) {
-            std::filesystem::create_directories(cache_path);
+        auto cache_root = GetUserPath(PathType::CacheDir);
+#ifdef _WIN32
+        // Only the pipeline/shader cache moves. User data, saves, configuration and
+        // upscaler-private caches remain in the benchmark child's private profile.
+        if (const auto shared = _wgetenv(L"BBVR_SHADER_CACHE_ROOT"); shared && *shared) {
+            const std::filesystem::path requested{shared};
+            if (requested.is_absolute()) cache_root = requested;
         }
+#endif
+        cache_path = cache_root / game_info.GameSerial();
+        if (!Common::PrepareShaderCacheDirectory(cache_path)) {
+            LOG_BENCHMARK_WARNING(Render, "Pipeline cache directory unavailable; this session uses memory only");
+            RENDER_DIAGNOSTIC_ONCE("Shader disk cache directory unavailable: {}", cache_path.string());
+            shadNotifications::QueueNotification(
+                "Shader disk cache unavailable. This session may stutter while shaders compile.",
+                12.0f, shadNotifications::position::TopLeft);
+            return;
+        }
+#ifdef _WIN32
+        if (!cache_lock.Acquire(cache_path, std::chrono::seconds{3})) {
+            LOG_BENCHMARK_WARNING(Render, "Pipeline cache busy or unavailable; this session uses memory only");
+            RENDER_DIAGNOSTIC_ONCE("Shader disk cache unavailable after bounded retry: error={} path={}",
+                                  cache_lock.LastError(), cache_path.string());
+            shadNotifications::QueueNotification(
+                "Shader disk cache busy or unavailable. This session may stutter. Close other game instances before relaunching.",
+                12.0f, shadNotifications::position::TopLeft);
+            return;
+        }
+#endif
         // Writes a killed session left half done (see TmpSuffix).
         std::error_code ec;
         std::vector<std::filesystem::path> unfinished;
@@ -173,6 +212,9 @@ void DataBase::Close() {
     }
 
     opened = false;
+#ifdef _WIN32
+    cache_lock.Release();
+#endif
     LOG_INFO(Render, "Cache dumped ({} entries written this session, {} failed)",
              num_written.load(), num_write_failures.load());
 }

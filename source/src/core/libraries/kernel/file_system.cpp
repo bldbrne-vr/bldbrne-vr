@@ -6,6 +6,8 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/assert.h"
+#include "common/slow_scope.h"
+#include "common/memory_write_trace.h"
 #include "common/error.h"
 #include "common/logging/log.h"
 #include "common/scope_exit.h"
@@ -344,6 +346,7 @@ s64 PS4_SYSV_ABI sceKernelWrite(s32 fd, const void* buf, u64 nbytes) {
 static thread_local std::vector<u8> file_buf{};
 
 s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
+    Common::Slow::Scope slow{Common::Slow::FileRead, nbytes};
     const auto* memory = Core::Memory::Instance();
     // Invalidate up to the actual number of bytes that could be read.
     const auto remaining = file->GetSize() - file->Tell();
@@ -355,7 +358,10 @@ s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
     if (bytes < 0) {
         return bytes;
     }
+    Common::MemoryWriteTrace::Event("file.copy.begin", reinterpret_cast<std::uintptr_t>(buf), bytes,
+        Common::MemoryWriteTrace::SourceWord(file_buf.data(), bytes));
     std::memcpy(buf, file_buf.data(), bytes);
+    Common::MemoryWriteTrace::Event("file.copy.end", reinterpret_cast<std::uintptr_t>(buf), bytes);
     return bytes;
 }
 

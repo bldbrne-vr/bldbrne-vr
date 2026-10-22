@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -12,7 +18,7 @@
 // measured from) from your head where it was at that moment. The takeover is for the game's own
 // camera taking over (a load, a teleport, a cutscene with its own camera): the hunter and his
 // camera are somewhere else afterwards. But a hitch is a gap too (a shader compile, a stall of the
-// game, the mock's eye dumps; the user's vr.ini has camera_stale_ms=150): ducked 0.5 m during a
+// game, the mock's eye dumps; the tester's vr.ini has camera_stale_ms=150): ducked 0.5 m during a
 // 0.2 s hitch, the origin went to the ducked head, so standing up put the view 0.5 m above the
 // hunter until a recenter (the duck track's runs/before: 2.068 m against 1.568).
 //

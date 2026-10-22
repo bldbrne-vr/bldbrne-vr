@@ -5,12 +5,10 @@
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "core/libraries/ajm/ajm.h"
-#include "core/libraries/ajm/ajm_at9.h"
 #include "core/libraries/ajm/ajm_context.h"
 #include "core/libraries/ajm/ajm_error.h"
 #include "core/libraries/ajm/ajm_instance.h"
 #include "core/libraries/ajm/ajm_instance_statistics.h"
-#include "core/libraries/ajm/ajm_mp3.h"
 #include "core/libraries/error_codes.h"
 
 #include <span>
@@ -64,10 +62,15 @@ void AjmContext::WorkerThread(std::stop_token stop) {
     Common::SetCurrentThreadName("shadPS4:AjmWorker");
     while (!stop.stop_requested()) {
         auto batch = batch_queue.PopWait(stop);
-        if (batch != nullptr && !batch->canceled) {
-            bool expected = false;
-            batch->processed.compare_exchange_strong(expected, true);
-            ProcessBatch(batch->id, batch->jobs);
+        if (batch != nullptr) {
+            if (!batch->canceled) {
+                bool expected = false;
+                batch->processed.compare_exchange_strong(expected, true);
+                ProcessBatch(batch->id, batch->jobs);
+            }
+            // Cancellation skips decoding, but BatchWait still needs completion before it
+            // can retire the batch and return CANCELLED. Signal from the worker so a wait
+            // cannot return while an already-started decode still accesses guest buffers.
             batch->finished.release();
         }
     }

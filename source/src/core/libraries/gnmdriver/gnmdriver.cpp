@@ -1,4 +1,4 @@
-#include "../../../../scratchpad/dual-eye-perf/pacing_audit.h"
+#include "video_core/native_stereo/pacing_audit.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -14,6 +14,7 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/gnmdriver/gnm_error.h"
+#include "core/libraries/gnmdriver/submission_validation.h"
 #include "core/libraries/gnmdriver/gnmdriver_init.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/process.h"
@@ -2088,34 +2089,30 @@ int PS4_SYSV_ABI sceGnmSqttWaitForEvent() {
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
-static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf_idx, u32 flip_mode,
-                                   s64 flip_arg, void* unk) {
+static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf_idx,
+                                   s64 flip_arg) {
     // check for `prepareFlip` packet
     cmdbuf += size - 64;
-    ASSERT_MSG(cmdbuf[0] == 0xc03e1000, "Can't find `prepareFlip` packet");
+    if (cmdbuf[0] != 0xc03e1000)
+        return ORBIS_GNM_ERROR_SUBMISSION_AND_FLIP_FAILED_INVALID_COMMAND_BUFFER;
 
     std::array<u32, 7> backup{};
     std::memcpy(backup.data(), cmdbuf, backup.size() * sizeof(decltype(backup)::value_type));
 
-    ASSERT_MSG(((backup[2] & 3) == 0u) || (backup[1] != PM4CmdNop::PayloadType::PrepareFlipLabel),
-               "Invalid flip packet");
-    ASSERT_MSG(buf_idx != 0xffff'ffffu, "Invalid VO buffer index");
-
-    const s32 flip_result = VideoOut::sceVideoOutSubmitEopFlip(vo_handle, buf_idx, flip_mode,
-                                                               flip_arg, nullptr /*unk*/);
-    if (flip_result != 0) {
-        if (flip_result == 0x80290012) {
-            LOG_ERROR(Lib_GnmDriver, "Flip queue is full");
-            return 0x80d11081;
-        } else {
-            LOG_ERROR(Lib_GnmDriver, "Flip request failed");
-            return flip_result;
-        }
-    }
+    const auto type = backup[1];
+    if ((type != PM4CmdNop::PayloadType::PrepareFlip &&
+         type != PM4CmdNop::PayloadType::PrepareFlipLabel &&
+         type != PM4CmdNop::PayloadType::PrepareFlipInterruptLabel &&
+         type != PM4CmdNop::PayloadType::PrepareFlipInterrupt) ||
+        (type == PM4CmdNop::PayloadType::PrepareFlipLabel && (backup[2] & 3) != 0))
+        return ORBIS_GNM_ERROR_SUBMISSION_AND_FLIP_FAILED_INVALID_COMMAND_BUFFER;
 
     uintptr_t label_addr{};
-    ASSERT_MSG(VideoOut::sceVideoOutGetBufferLabelAddress(vo_handle, &label_addr) == 16,
-               "sceVideoOutGetBufferLabelAddress call failed");
+    if (VideoOut::sceVideoOutGetBufferLabelAddress(vo_handle, &label_addr) != 16)
+        return ORBIS_GNM_ERROR_SUBMISSION_AND_FLIP_FAILED_REQUEST_FAILED;
+    u64 ticket{};
+    const s32 flip_result = VideoOut::PrepareEopFlip(vo_handle, buf_idx, ticket);
+    if (flip_result != ORBIS_OK) return flip_result;
 
     // Write event to lock the VO surface
     auto* write_lock = reinterpret_cast<PM4CmdWriteData*>(cmdbuf);
@@ -2169,9 +2166,8 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
         }
     }
 
-    // Owned diagnostic identity inside this patched NOP's otherwise unused payload.
-    // It lets the decoder correlate the flip packet with the queued callback.
-    nop->data_block[1] = buf_idx;
+    const auto payload = VideoOut::EncodeFlip({buf_idx, vo_handle, flip_arg, ticket});
+    std::copy(payload.begin(), payload.end(), nop->data_block + 1);
     return ORBIS_OK;
 }
 
@@ -2189,11 +2185,15 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
     LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
 
+    if (!ValidCommandBuffers(count, dcb_gpu_addrs, dcb_sizes_in_bytes,
+                             ccb_sizes_in_bytes, true))
+        return ORBIS_GNM_ERROR_SUBMISSION_FAILED_INVALID_ARGUMENT;
+
     auto* cmdbuf = dcb_gpu_addrs[count - 1];
     const auto size_dw = dcb_sizes_in_bytes[count - 1] / 4;
 
     const s32 patch_result =
-        PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode, flip_arg, nullptr /*unk*/);
+        PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_arg);
     if (patch_result != ORBIS_OK) {
         return patch_result;
     }
@@ -2211,26 +2211,9 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
 
-    if (!dcb_gpu_addrs || !dcb_sizes_in_bytes) {
-        LOG_ERROR(Lib_GnmDriver, "dcbGpuAddrs and dcbSizesInBytes must not be NULL");
-        return 0x80d11000;
-    }
-
-    for (u32 i = 0; i < count; i++) {
-        if (dcb_sizes_in_bytes[i] == 0) {
-            LOG_ERROR(Lib_GnmDriver, "Submitting a null DCB {}", i);
-            return 0x80d11000;
-        }
-        if (dcb_sizes_in_bytes[i] > 0x3ffffc) {
-            LOG_ERROR(Lib_GnmDriver, "dcbSizesInBytes[{}] ({}) is limited to (2*20)-1 DWORDS", i,
-                      dcb_sizes_in_bytes[i]);
-            return 0x80d11000;
-        }
-        if (ccb_sizes_in_bytes && ccb_sizes_in_bytes[i] > 0x3ffffc) {
-            LOG_ERROR(Lib_GnmDriver, "ccbSizesInBytes[{}] ({}) is limited to (2*20)-1 DWORDS", i,
-                      ccb_sizes_in_bytes[i]);
-            return 0x80d11000;
-        }
+    if (!ValidCommandBuffers(count, dcb_gpu_addrs, dcb_sizes_in_bytes, ccb_sizes_in_bytes)) {
+        LOG_ERROR(Lib_GnmDriver, "Invalid command buffer submission");
+        return ORBIS_GNM_ERROR_SUBMISSION_FAILED_INVALID_ARGUMENT;
     }
 
     WaitGpuIdle();

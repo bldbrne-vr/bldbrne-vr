@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -12,7 +18,7 @@
 // fetch that still tears across that rewrite - the old first bytes (the FS / REX prefixes) with
 // the jump's new tail - decodes an instruction from the jump's displacement. In every crash it was
 // port I/O, privileged in user mode, so Windows raised EXCEPTION_PRIV_INSTRUCTION at the site,
-// whose bytes by then were the finished jump: the user's usertest_1113_crash.txt "Unhandled
+// whose bytes by then were the finished jump: the tester's usertest_1113_crash.txt "Unhandled
 // Exception code 0xc0000096 at 0x6c7b799 .. bytes e9 df ec 42 04 90 90 90" (byte 2, EC = in al,dx)
 // and 4 of 1843 mock runs (ee, ed, ef: out / in; 6d: insd), in CSChrThread* / HavokWorkerThread.
 // Until 2026-10-09 such a fault reached the patch handler only with static red-zone patching on;

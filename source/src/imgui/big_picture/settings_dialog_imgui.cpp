@@ -759,10 +759,11 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             AddSettingCheckbox("Enable Readback Linear Images", readbackLinearImagesSetting);
             AddSettingCheckbox("Enable Direct Memory Access", directMemoryAccessSetting);
 #ifdef _WIN32
-            // Windows static guest red-zone protection
-            AddSettingCombo("Windows Guest Red Zone Protection (Requires Restart)",
-                            windowsGuestRedZoneProtectionModeSetting,
-                            windowsGuestRedZoneProtectionModeOptions);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("Windows Guest Red Zone Protection");
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("Always enabled");
 #endif
             AddSettingCheckbox("Enable Devkit Console Mode", devkitConsoleSetting);
             AddSettingCheckbox("Enable PS4 Neo Mode", neoModeSetting);

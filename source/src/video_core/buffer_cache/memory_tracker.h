@@ -8,9 +8,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -18,11 +20,57 @@
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
+#include "common/memory_write_trace.h"
+#include "common/thread.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
+#include "video_core/buffer_cache/kept_page_upload.h"
 #include "video_core/buffer_cache/region_manager.h"
 
 namespace VideoCore {
+
+#ifdef BBVR_NO_LOGS
+using KeptLock = std::mutex;
+#else
+/// Freeze hunt (2026-10-18, logs-on builds only): kept_lock remembers its holder and its last
+/// waiter, and MemoryTracker's watchdog logs a hold past 3 s with their thread ids (the freeze
+/// when the intro movie is skipped: StageB waiting in its upload, every thread idle). Match the
+/// ids to a stack dump of the frozen game.
+struct KeptLock {
+    static s64 Now() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+    void lock() {
+        if (!m.try_lock()) {
+            waiter.store(Common::CurrentThreadId(), std::memory_order_relaxed);
+            waiters.fetch_add(1, std::memory_order_relaxed);
+            m.lock();
+            waiters.fetch_sub(1, std::memory_order_relaxed);
+        }
+        since.store(Now(), std::memory_order_relaxed);
+        owner.store(Common::CurrentThreadId(), std::memory_order_relaxed);
+    }
+    bool try_lock() {
+        if (!m.try_lock()) {
+            return false;
+        }
+        since.store(Now(), std::memory_order_relaxed);
+        owner.store(Common::CurrentThreadId(), std::memory_order_relaxed);
+        return true;
+    }
+    void unlock() {
+        owner.store(0, std::memory_order_relaxed);
+        m.unlock();
+    }
+    std::mutex m;
+    std::atomic<u32> owner{0};  // the holder's thread id (0: free)
+    std::atomic<s64> since{0};  // when it was taken
+    std::atomic<u32> waiter{0}; // the last thread that had to wait
+    std::atomic<u32> waiters{0};
+};
+#endif
 
 class MemoryTracker {
 public:
@@ -31,7 +79,11 @@ public:
     static constexpr size_t MANAGER_POOL_SIZE = 32;
 
 public:
-    explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
+    explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {
+#ifndef BBVR_NO_LOGS
+        hang_watch = std::jthread([this](std::stop_token stop) { WatchKeptLock(stop); });
+#endif
+    }
     ~MemoryTracker() = default;
 
     /// Returns true if a region has been modified from the CPU
@@ -193,12 +245,15 @@ public:
     /// Removes all protection from a page and ensures GPU data has been flushed if requested.
     /// `write_fault`: a guest write fault at `cpu_addr`, before the write lands
     /// (FAST_GPU_PAGE_KEEP: its GPU-modified pages are kept aside, KeepGpuPages).
-    void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush,
-                          bool write_fault = false) noexcept {
+    /// `emulator_write`: the emulator's own write of exactly [cpu_addr, cpu_addr + written)
+    /// (a file read, a video frame; a protection change writes nothing: `written` 0): the
+    /// pages it writes in part are kept aside the same way, its own bytes never.
+    void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush, bool write_fault = false,
+                          bool emulator_write = false, u64 written = 0) noexcept {
         IteratePages<false>(
             cpu_addr, size,
-            [this, cpu_addr, write_fault, &on_flush](RegionManager* manager, u64 offset,
-                                                     size_t size) {
+            [this, cpu_addr, write_fault, emulator_write, written,
+             &on_flush](RegionManager* manager, u64 offset, size_t size) {
                 const bool should_flush = [&] {
                     // Perform both the GPU modification check and CPU state change with the lock
                     // in case we are racing with GPU thread trying to mark the page as GPU
@@ -210,7 +265,10 @@ public:
                         return true;
                     }
                     if (write_fault && KeepGpuPages()) {
-                        KeepGpuPagesAside(manager, offset, size, cpu_addr);
+                        KeepGpuPagesAside(manager, offset, size, cpu_addr, cpu_addr + 8, false);
+                    } else if (emulator_write && KeepGpuPages()) {
+                        KeepGpuPagesAside(manager, offset, size, cpu_addr, cpu_addr + written,
+                                          true);
                     }
                     manager->template ChangeRegionState<Type::CPU, true>(
                         manager->GetCpuAddr() + offset, size);
@@ -287,10 +345,13 @@ public:
     /// uploads as before. A range the CPU changed at all uploads whole (memory reused for new
     /// data: no stale GPU byte survives where the new data happens to equal the old guest
     /// bytes). A fault inside the GPU-written bytes (the CPU rewriting them, e.g. resetting a
-    /// counter) uploads the whole page as before, and so does a page the pool (KeptPages) has no
-    /// room for. Only guest write faults take part, never the emulator's own writes into guest
-    /// memory; those, and a buffer the garbage collector drops, forget the kept pages of their
-    /// range (ForgetKept): their next upload is whole again.
+    /// counter) uploads the whole page as before, and so does a page evicted from the full pool
+    /// (KeptPages, the oldest first). The emulator's own writes into guest memory take part the same way (the triangles
+    /// came back after a rest-warp at the Central Yharnam lamp, 2026-10-15, with no guest fault
+    /// kept since the start: a map load's file reads are the likely door): the bytes it wrote always upload, and a page they cover
+    /// whole or a GPU-written range they touch upload whole. An unmap, and a buffer the garbage
+    /// collector drops, forget the kept pages of their range (ForgetKept): their next upload is
+    /// whole again.
     static bool KeepGpuPages() {
         static const bool on = [] {
             const char* value = std::getenv("FAST_GPU_PAGE_KEEP");
@@ -306,11 +367,20 @@ public:
         }
         std::scoped_lock lk{kept_lock};
         const VAddr first = Common::AlignDown(address, TRACKER_BYTES_PER_PAGE);
-        for (size_t i = 0; i < KeptPages; ++i) {
-            const VAddr page = kept_index[i];
-            if (page != 0 && page >= first && page < address + bytes) {
-                SetKept((*kept_pages)[i], 0);
-                kept_count.fetch_sub(1, std::memory_order_release);
+        const VAddr end = address + bytes;
+        if ((end - first) / TRACKER_BYTES_PER_PAGE <= 64) {
+            for (VAddr page = first; page < end; page += TRACKER_BYTES_PER_PAGE) {
+                if (KeptPage* kept = FindKept(page); kept != nullptr) {
+                    ReleaseKept(*kept);
+                }
+            }
+            return;
+        }
+        // Over the compact slot -> page index (64 KB), not the 33 MB of kept pages.
+        for (u32 slot = 0; slot < KeptPages; ++slot) {
+            const VAddr page = (*kept_slot_page)[slot];
+            if (page != 0 && page >= first && page < end) {
+                ReleaseKept((*kept_pages)[slot]);
             }
         }
     }
@@ -319,10 +389,21 @@ public:
     /// for what to upload. `gpu_ranges(page, size, f)` calls f(start, end) for each GPU-written
     /// byte range of the page (BufferCache::gpu_modified_ranges). The pages are write-protected
     /// again by then (ForEachModifiedRange), so later guest writes fault anew.
-    template <typename Emit, typename GpuRanges>
-    void ForUpload(VAddr address, u64 bytes, Emit&& emit, GpuRanges&& gpu_ranges) {
+    /// `lost(start, end, why)`: GPU-written bytes this upload replaces with the guest's (the
+    /// catch-all log of how the ghost triangles' GPU-written data could still be lost: a page
+    /// that was not kept aside, a range the CPU wrote in, a range it changed).
+    template <typename Emit, typename GpuRanges, typename Lost>
+    void ForUpload(VAddr address, u64 bytes, Emit&& emit, GpuRanges&& gpu_ranges, Lost&& lost) {
+        const auto plain_emit = [&](VAddr at, u64 size) {
+            emit(at, size);
+#ifdef BBVR_MEMORY_WRITE_TRACE
+            gpu_ranges(at, size, [&](VAddr start, VAddr stop) {
+                lost(std::max(start, at), std::min(stop, at + size), LostWhy::NotKept);
+            });
+#endif
+        };
         if (kept_count.load(std::memory_order_acquire) == 0) [[likely]] {
-            emit(address, bytes);
+            plain_emit(address, bytes);
             return;
         }
         std::scoped_lock lk{kept_lock};
@@ -337,16 +418,37 @@ public:
             const VAddr lo = std::max(page, address);
             const VAddr hi = std::min(page + TRACKER_BYTES_PER_PAGE, end);
             if (plain < lo) {
-                emit(plain, lo - plain);
+                plain_emit(plain, lo - plain);
             }
             plain = hi;
-            EmitKeptPage(*kept, lo, hi, emit, gpu_ranges);
-            SetKept(*kept, 0);
-            kept_count.fetch_sub(1, std::memory_order_release);
+            EmitKeptPage(*kept, lo, hi, emit, gpu_ranges, lost);
+            ReleaseKept(*kept);
         }
         if (plain < end) {
-            emit(plain, end - plain);
+            plain_emit(plain, end - plain);
         }
+    }
+
+    /// Why ForUpload replaced GPU-written bytes (its `lost` callback).
+    enum class LostWhy : u8 {
+        NotKept,     // the page was not kept aside (no keep for the path that made it CPU modified)
+        WroteInside, // the CPU or the emulator wrote inside the GPU-written range
+        Changed,     // the CPU changed bytes of the range since the page was kept aside
+    };
+    static constexpr const char* LostName(LostWhy why) {
+        switch (why) {
+        case LostWhy::NotKept:
+            return "page not kept aside";
+        case LostWhy::WroteInside:
+            return "written inside the range";
+        case LostWhy::Changed:
+            return "changed by the CPU";
+        }
+        return "?";
+    }
+    /// Pages evicted from the full pool (the oldest: they upload whole).
+    u64 KeptPoolFull() const {
+        return kept_evictions.load(std::memory_order_relaxed);
     }
 
     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
@@ -362,119 +464,345 @@ public:
 
 private:
     // FAST_GPU_PAGE_KEEP: the pages kept aside, in a pool allocated once (the fault handler does
-    // not allocate). `page` 0: a free slot. kept_index mirrors each slot's page in 2 KB, so a
-    // lookup does not touch the 1 MB of kept bytes.
-    static constexpr size_t KeptPages = 256;
+    // not allocate), found through an open-addressed hash (kept_hash, page -> slot). A page
+    // leaves the pool at its upload; one never uploaded again (memory the game rewrote and no
+    // longer draws) would stay: when the pool is full the oldest page is evicted (it uploads
+    // whole, as with no keep). 2026-10-15: 256 pages and no eviction: from a lamp's travel on the
+    // pool stayed full of pages never drawn again (32769 pages refused in 7 minutes), and the
+    // hunter's face lost its GPU data again.
+    // 8192 pages (33 MB): about 75 pages a second are kept aside for memory never drawn again
+    // (measured 2026-10-15), so a page kept aside lives about 100 s before it can be evicted,
+    // longer than any loading screen during which the face is not drawn.
+    static constexpr size_t KeptPages = 8192;
+    static constexpr size_t KeptBucketBits = 15;
+    static constexpr size_t KeptBuckets = size_t{1} << KeptBucketBits; // 4x the pages
     struct KeptPage {
         VAddr page{};
-        VAddr fault{};
+        VAddr write_lo{}; // the bytes written since the page was kept aside (a fault: its 8)
+        VAddr write_hi{};
+        u64 seq{};        // when it was kept aside (the oldest is evicted)
+        bool emulator{};  // ... by the emulator (a file read), not a guest write fault
         std::array<u8, TRACKER_BYTES_PER_PAGE> bytes{};
     };
+    struct KeptBucket {
+        VAddr page{}; // 0: empty
+        u32 slot{};
+    };
+    struct KeptOrder {
+        u32 slot{};
+        u64 seq{}; // the slot's seq when it was kept (a different one: released since)
+    };
+    static constexpr u32 KeptOrderSize = 2 * KeptPages;
 
-    KeptPage* FindKept(VAddr page) {
-        for (size_t i = 0; i < KeptPages; ++i) {
-            if (kept_index[i] == page) {
-                return &(*kept_pages)[i];
-            }
-        }
-        return nullptr;
+    static size_t KeptHome(VAddr page) {
+        return static_cast<size_t>(((page >> TRACKER_PAGE_BITS) * 0x9E3779B97F4A7C15ull) >>
+                                   (64 - KeptBucketBits));
     }
 
-    void SetKept(KeptPage& kept, VAddr page) {
+    KeptPage* FindKept(VAddr page) {
+        for (size_t i = KeptHome(page);; i = (i + 1) & (KeptBuckets - 1)) {
+            const KeptBucket& b = (*kept_hash)[i];
+            if (b.page == 0) {
+                return nullptr;
+            }
+            if (b.page == page) {
+                return &(*kept_pages)[b.slot];
+            }
+        }
+    }
+
+    // A slot for `page` (not in the pool): a free one, else the oldest page's (evicted). kept_lock
+    // held.
+    KeptPage& AcquireKept(VAddr page) {
+        u32 slot;
+        if (kept_free_count != 0) {
+            slot = kept_free[--kept_free_count];
+        } else {
+            // The oldest page still kept: the ring's front, past slots released since (their
+            // seq no longer matches).
+            for (;;) {
+                const KeptOrder front = (*kept_order)[kept_order_head];
+                kept_order_head = (kept_order_head + 1) % KeptOrderSize;
+                --kept_order_count;
+                if ((*kept_pages)[front.slot].seq == front.seq) {
+                    slot = front.slot;
+                    break;
+                }
+            }
+            KeptPage& old = (*kept_pages)[slot];
+            keep_stats.evicted.fetch_add(1, std::memory_order_relaxed);
+            const u64 n = kept_evictions.fetch_add(1, std::memory_order_relaxed);
+            if (n < 16 || (n & 1023) == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "FAST_GPU_PAGE_KEEP: the pool is full ({} pages): the oldest, page "
+                         "{:#x}, makes room for {:#x} ({} evictions so far)",
+                         KeptPages, old.page, page, n + 1);
+            }
+            Common::MemoryWriteTrace::Event("gpu.keep.evicted", old.page,
+                                           TRACKER_BYTES_PER_PAGE);
+            ReleaseKept(old);
+            slot = kept_free[--kept_free_count];
+        }
+        KeptPage& kept = (*kept_pages)[slot];
         kept.page = page;
-        kept_index[&kept - kept_pages->data()] = page;
+        kept.seq = ++kept_seq;
+        (*kept_slot_page)[slot] = page;
+        if (kept_order_count == KeptOrderSize) {
+            // Full of released slots' entries: keep the live ones, in order, in place (each is
+            // written at or behind where it is read; amortized O(1)).
+            u32 kept_live = 0;
+            for (u32 i = 0; i < kept_order_count; ++i) {
+                const KeptOrder e = (*kept_order)[(kept_order_head + i) % KeptOrderSize];
+                if ((*kept_pages)[e.slot].seq == e.seq) {
+                    (*kept_order)[(kept_order_head + kept_live++) % KeptOrderSize] = e;
+                }
+            }
+            kept_order_count = kept_live;
+        }
+        (*kept_order)[(kept_order_head + kept_order_count) % KeptOrderSize] = {slot, kept.seq};
+        ++kept_order_count;
+        size_t i = KeptHome(page);
+        while ((*kept_hash)[i].page != 0) {
+            i = (i + 1) & (KeptBuckets - 1);
+        }
+        (*kept_hash)[i] = {page, slot};
+        kept_count.fetch_add(1, std::memory_order_release);
+        return kept;
+    }
+
+    // The page leaves the pool (its upload, ForgetKept, an eviction). kept_lock held.
+    void ReleaseKept(KeptPage& kept) {
+        if (kept.page == 0) {
+            return;
+        }
+        // The hash: backward-shift deletion (no tombstones).
+        size_t i = KeptHome(kept.page);
+        while ((*kept_hash)[i].page != kept.page) {
+            i = (i + 1) & (KeptBuckets - 1);
+        }
+        for (size_t j = i;;) {
+            j = (j + 1) & (KeptBuckets - 1);
+            const VAddr moved = (*kept_hash)[j].page;
+            if (moved == 0) {
+                break;
+            }
+            const size_t home = KeptHome(moved);
+            // Leave it where it is when its home lies cyclically in (i, j].
+            if (i <= j ? (i < home && home <= j) : (i < home || home <= j)) {
+                continue;
+            }
+            (*kept_hash)[i] = (*kept_hash)[j];
+            i = j;
+        }
+        (*kept_hash)[i] = {};
+        const u32 slot = static_cast<u32>(&kept - kept_pages->data());
+        (*kept_slot_page)[slot] = 0;
+        kept.page = 0;
+        kept.seq = 0;
+        kept_free[kept_free_count++] = slot;
+        kept_count.fetch_sub(1, std::memory_order_release);
+    }
+
+    static std::array<u32, KeptPages> AllKeptSlots() {
+        std::array<u32, KeptPages> slots{};
+        for (u32 i = 0; i < KeptPages; ++i) {
+            slots[i] = KeptPages - 1 - i;
+        }
+        return slots;
     }
 
     // The manager's lock held, before the page's CPU state changes: each GPU-modified page of
     // [offset, offset + size) that is still CPU-clean (write-protected: this is its first write
-    // since its last upload) is kept aside as it is now.
-    void KeepGpuPagesAside(RegionManager* manager, u64 offset, size_t size, VAddr fault) {
+    // since its last upload) is kept aside as it is now, [lo, hi) the bytes written. An emulator
+    // write leaves out the pages it covers whole (none of theirs to keep), and widens the written
+    // bytes of a page kept earlier (CPU modified by then: its upload is still to come).
+    void KeepGpuPagesAside(RegionManager* manager, u64 offset, size_t size, VAddr lo, VAddr hi,
+                           bool emulator) {
+        const auto t0 = std::chrono::steady_clock::now();
+        KeepGpuPagesAsideImpl(manager, offset, size, lo, hi, emulator);
+        const s64 ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - t0)
+                           .count();
+        keep_stats.calls.fetch_add(1, std::memory_order_relaxed);
+        keep_stats.ns.fetch_add(static_cast<u64>(ns), std::memory_order_relaxed);
+        keep_stats.max_ns.store(std::max<u64>(keep_stats.max_ns.load(std::memory_order_relaxed),
+                                              static_cast<u64>(ns)),
+                                std::memory_order_relaxed);
+        MaybeLogKeepStats();
+    }
+
+    // Bound copying while holding the region lock. Exceeding this limit still needs
+    // a correctness-preserving fallback; do not replace it with unbounded fault work.
+    static constexpr u32 KeepCapPerCall = 32;
+
+    // Once a second while pages are kept aside: what the keep cost (the sewers' stutter hunt,
+    // 2026-10-15; logs-on builds only print it).
+    struct KeepStats {
+        std::atomic<u64> kept{0}, evicted{0}, capped{0}, calls{0}, ns{0}, max_ns{0};
+    };
+    KeepStats keep_stats;
+    std::atomic<s64> keep_log_ns{0};
+    void MaybeLogKeepStats() {
+        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        s64 last = keep_log_ns.load(std::memory_order_relaxed);
+        if (last == 0) {
+            keep_log_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+            return;
+        }
+        if (now - last < 1'000'000'000 ||
+            !keep_log_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+            return;
+        }
+        const u64 kept = keep_stats.kept.exchange(0, std::memory_order_relaxed);
+        const u64 evicted = keep_stats.evicted.exchange(0, std::memory_order_relaxed);
+        const u64 capped = keep_stats.capped.exchange(0, std::memory_order_relaxed);
+        const u64 calls = keep_stats.calls.exchange(0, std::memory_order_relaxed);
+        const u64 ns = keep_stats.ns.exchange(0, std::memory_order_relaxed);
+        const u64 max_ns = keep_stats.max_ns.exchange(0, std::memory_order_relaxed);
+        if (kept == 0 && evicted == 0 && capped == 0) {
+            return;
+        }
+        LOG_INFO(Render_Vulkan,
+                 "FAST_GPU_PAGE_KEEP: last {:.1f} s: {} pages kept aside, {} evicted, {} over the "
+                 "cap; {} writes took {:.2f} ms (max {:.3f} ms); {} kept now",
+                 static_cast<double>(now - last) * 1e-9, kept, evicted, capped, calls,
+                 static_cast<double>(ns) * 1e-6, static_cast<double>(max_ns) * 1e-6,
+                 kept_count.load(std::memory_order_relaxed));
+    }
+
+    void KeepGpuPagesAsideImpl(RegionManager* manager, u64 offset, size_t size, VAddr lo, VAddr hi,
+                               bool emulator) {
+        u32 kept_now = 0;
         const u64 first = Common::AlignDown(offset, TRACKER_BYTES_PER_PAGE);
+        // The pages an emulator write covers whole: one pass over the pool for all of them (a map
+        // load's file reads span megabytes).
+        // (Within this region's part of the range: the callback runs once per region.)
+        const VAddr region_lo = manager->GetCpuAddr() + first;
+        const VAddr region_hi = manager->GetCpuAddr() + offset + size;
+        const VAddr whole_lo = std::max(Common::AlignUp(lo, TRACKER_BYTES_PER_PAGE), region_lo);
+        const VAddr whole_hi =
+            std::min(Common::AlignDown(hi, TRACKER_BYTES_PER_PAGE),
+                     Common::AlignUp(region_hi, TRACKER_BYTES_PER_PAGE));
+        if (emulator && whole_hi > whole_lo) {
+            ForgetKept(whole_lo, whole_hi - whole_lo);
+        }
         for (u64 at = first; at < offset + size; at += TRACKER_BYTES_PER_PAGE) {
-            if (!manager->template IsRegionModified<Type::GPU>(at, TRACKER_BYTES_PER_PAGE) ||
-                manager->template IsRegionModified<Type::CPU>(at, TRACKER_BYTES_PER_PAGE)) {
+            const VAddr page = manager->GetCpuAddr() + at;
+            if (emulator && page >= whole_lo && page < whole_hi) {
                 continue;
             }
-            const VAddr page = manager->GetCpuAddr() + at;
+            if (!manager->template IsRegionModified<Type::GPU>(at, TRACKER_BYTES_PER_PAGE)) {
+                continue;
+            }
+            if (manager->template IsRegionModified<Type::CPU>(at, TRACKER_BYTES_PER_PAGE)) {
+                if (emulator && hi > lo && kept_count.load(std::memory_order_acquire) != 0) {
+                    std::scoped_lock lk{kept_lock};
+                    if (KeptPage* kept = FindKept(page); kept != nullptr) {
+                        kept->write_lo = kept->write_hi > kept->write_lo
+                                             ? std::min(kept->write_lo, lo)
+                                             : lo;
+                        kept->write_hi = std::max(kept->write_hi, hi);
+                        kept->emulator = true;
+                    }
+                }
+                continue;
+            }
+            if (kept_now >= KeepCapPerCall) {
+                keep_stats.capped.fetch_add(1, std::memory_order_relaxed);
+                Common::MemoryWriteTrace::Event("gpu.keep.capped", page,
+                                               TRACKER_BYTES_PER_PAGE);
+                continue;
+            }
+            ++kept_now;
+            keep_stats.kept.fetch_add(1, std::memory_order_relaxed);
             std::scoped_lock lk{kept_lock};
             KeptPage* kept = FindKept(page);
             if (kept == nullptr) {
-                kept = FindKept(0);
-                if (kept == nullptr) {
-                    continue; // no room: the page uploads whole, as before
-                }
-                kept_count.fetch_add(1, std::memory_order_release);
+                kept = &AcquireKept(page);
             }
-            SetKept(*kept, page);
-            kept->fault = fault;
+            kept->write_lo = lo;
+            kept->write_hi = hi;
+            kept->emulator = emulator;
             std::memcpy(kept->bytes.data(), reinterpret_cast<const void*>(page),
                         TRACKER_BYTES_PER_PAGE);
         }
     }
 
     // ForUpload, kept_lock held: [lo, hi) of a kept page.
-    template <typename Emit, typename GpuRanges>
-    void EmitKeptPage(const KeptPage& kept, VAddr lo, VAddr hi, Emit& emit,
-                      GpuRanges& gpu_ranges) {
-        std::array<std::pair<VAddr, VAddr>, 16> ranges{};
-        size_t count = 0;
-        bool fault_inside = false;
-        bool overflow = false;
-        gpu_ranges(kept.page, TRACKER_BYTES_PER_PAGE, [&](VAddr start, VAddr stop) {
-            fault_inside = fault_inside || (kept.fault < stop && kept.fault + 8 > start);
-            if (count < ranges.size()) {
-                ranges[count++] = {start, stop};
-            } else {
-                overflow = true;
-            }
-        });
-        if (count == 0 || fault_inside || overflow) {
-            emit(lo, hi - lo); // nothing the GPU wrote, or the CPU rewrites it: as before
-            return;
-        }
-        const u8* guest = reinterpret_cast<const u8*>(kept.page);
-        u64 kept_bytes = 0;
-        VAddr cursor = lo;
-        for (size_t r = 0; r < count; ++r) {
-            const VAddr start = std::clamp(ranges[r].first, lo, hi);
-            const VAddr stop = std::clamp(ranges[r].second, lo, hi);
-            if (start >= stop || start < cursor) {
-                continue;
-            }
-            if (cursor < start) {
-                emit(cursor, start - cursor); // outside the GPU-written bytes: as before
-            }
-            // A GPU-written range the CPU changed at all uploads whole; one it left alone keeps
-            // the GPU's bytes.
-            if (std::memcmp(guest + (start - kept.page), kept.bytes.data() + (start - kept.page),
-                            stop - start) != 0) {
-                emit(start, stop - start);
-            } else {
-                kept_bytes += stop - start;
-            }
-            cursor = stop;
-        }
-        if (cursor < hi) {
-            emit(cursor, hi - cursor);
-        }
+    // A range the write touched uploads whole (2026-10-15: until then a write inside any of
+    // them uploaded the whole page, every other GPU range of it too).
+    template <typename Emit, typename GpuRanges, typename Lost>
+    void EmitKeptPage(const KeptPage& kept, VAddr lo, VAddr hi, Emit& emit, GpuRanges& gpu_ranges,
+                      Lost& lost) {
+        const u64 kept_bytes = EmitKeptPageUpload(
+            kept.page, TRACKER_BYTES_PER_PAGE, kept.bytes.data(),
+            reinterpret_cast<const void*>(kept.page), kept.write_lo, kept.write_hi,
+            lo, hi, gpu_ranges, emit, [&](VAddr start, VAddr stop, bool touched) {
+                lost(start, stop, touched ? LostWhy::WroteInside : LostWhy::Changed);
+            });
         if (kept_bytes != 0) {
+            Common::MemoryWriteTrace::Event("gpu.keep.preserved", kept.page, kept_bytes);
             const u64 n = kept_logs.fetch_add(1, std::memory_order_relaxed);
             if (n < 64 || (n & 1023) == 0) {
                 LOG_INFO(Render_Vulkan,
-                         "FAST_GPU_PAGE_KEEP: page {:#x}: {} GPU-written bytes kept (the guest "
-                         "write at {:#x} beside them would have replaced them with the guest's "
-                         "stale bytes); {} kept so far",
-                         kept.page, kept_bytes, kept.fault, n + 1);
+                         "FAST_GPU_PAGE_KEEP: page {:#x}: {} GPU-written bytes kept (the {} "
+                         "write at {:#x}..{:#x} beside them would have replaced them with the "
+                         "guest's stale bytes); {} kept so far",
+                         kept.page, kept_bytes, kept.emulator ? "emulator's" : "guest",
+                         kept.write_lo, kept.write_hi, n + 1);
             }
         }
     }
 
     std::unique_ptr<std::array<KeptPage, KeptPages>> kept_pages =
         std::make_unique<std::array<KeptPage, KeptPages>>();
-    std::array<VAddr, KeptPages> kept_index{};
-    std::mutex kept_lock;
+    std::unique_ptr<std::array<KeptBucket, KeptBuckets>> kept_hash =
+        std::make_unique<std::array<KeptBucket, KeptBuckets>>();
+    std::unique_ptr<std::array<VAddr, KeptPages>> kept_slot_page = // each slot's page (0: free)
+        std::make_unique<std::array<VAddr, KeptPages>>();
+    std::array<u32, KeptPages> kept_free{AllKeptSlots()}; // free slots (a stack)
+    u32 kept_free_count{KeptPages};
+    u64 kept_seq{0};
+    std::unique_ptr<std::array<KeptOrder, KeptOrderSize>> kept_order =
+        std::make_unique<std::array<KeptOrder, KeptOrderSize>>();
+    u32 kept_order_head{0};
+    u32 kept_order_count{0};
+    KeptLock kept_lock;
     std::atomic<u32> kept_count{0};
+#ifndef BBVR_NO_LOGS
+    // KeptLock's watchdog: a hold past 3 s is logged once (and again every 10 s while it lasts).
+    void WatchKeptLock(std::stop_token stop) {
+        Common::SetCurrentThreadName("hang:KeptLock");
+        s64 reported_since = 0, reported_at = 0;
+        while (!stop.stop_requested()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            const u32 owner = kept_lock.owner.load(std::memory_order_relaxed);
+            const s64 since = kept_lock.since.load(std::memory_order_relaxed);
+            const s64 now = KeptLock::Now();
+            if (owner == 0 || now - since < 3'000'000'000) {
+                continue;
+            }
+            if (since == reported_since && now - reported_at < 10'000'000'000) {
+                continue;
+            }
+            reported_since = since;
+            reported_at = now;
+            LOG_CRITICAL(Render_Vulkan,
+                         "FREEZE HUNT: kept_lock held {:.1f} s by thread {}; {} waiting (the "
+                         "last: thread {}); {} pages kept",
+                         static_cast<double>(now - since) * 1e-9, owner,
+                         kept_lock.waiters.load(std::memory_order_relaxed),
+                         kept_lock.waiter.load(std::memory_order_relaxed),
+                         kept_count.load(std::memory_order_relaxed));
+            Common::Log::Flush();
+        }
+    }
+    std::jthread hang_watch; // last: stopped and joined first
+#endif
     std::atomic<u64> kept_logs{0};
+    std::atomic<u64> kept_evictions{0};
 
     /// Unlocked bit tests (bits 17/24). FAST_TRACKER_VERIFY=N re-checks one call in N per
     /// thread under the lock and classifies disagreements; sampled calls return the locked answer.

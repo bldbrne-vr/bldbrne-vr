@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -68,7 +74,7 @@ constexpr std::array<u8, 28> MenuOpenSig = {
 };
 constexpr u64 GenericJobVtableRva = 0x5345EE0;
 constexpr u32 OffsetJobName = 0x30;
-// The banners in the middle of the screen (the HUD movie game asset's text effects): MenuMan +0x15C8
+// The banners in the middle of the screen (the HUD movie fe.gfx's text effects): MenuMan +0x15C8
 // is a ring of 17 queued types. SetTextEffect (0x13360B0, the event scripts' SetTextEffect and the
 // game's own callers inline the same code) writes the type at the index +0x1610 and moves it on;
 // the HUD's update (0x1BF9910) plays the one at +0x160C (the clip of slot type: 1 KillDemon (PREY
@@ -377,8 +383,13 @@ void WatchTextEffects(u8* man) {
             }
             // A lantern warp leaves and arrives without the lamp's cutscene: the text effect it
             // queues on arrival is no banner (2026-10-14: an empty 50-degree title for seconds).
-            if (type == 0 && (VR::LampWarpDeparting() || VR::LampWarpArrivedWithin(10.0f))) {
-                LOG_INFO(Core, "VR ui: an unknown text effect around a lantern warp: no banner");
+            // Nor is one queued as any load arrives (a respawn, the game's own lamp travel:
+            // 2026-10-22, the loading page's item name as a stretched title after a death); a
+            // banner whose type is seen is never dropped.
+            if (type == 0 && (VR::LampWarpDeparting() || VR::LampWarpArrivedWithin(10.0f) ||
+                              VR::PlayerArrivedWithin(10.0f))) {
+                LOG_INFO(Core, "VR ui: an unknown text effect around a load or lantern warp: no "
+                               "banner");
                 continue;
             }
             VR::PublishBanner(type);

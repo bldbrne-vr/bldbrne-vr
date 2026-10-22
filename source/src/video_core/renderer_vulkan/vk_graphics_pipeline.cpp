@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
+#include "video_core/native_stereo/native_stereo.h"
 #include <algorithm>
 #include <utility>
 #include <boost/container/small_vector.hpp>
@@ -34,7 +35,8 @@ GraphicsPipeline::GraphicsPipeline(
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader_,
-    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
+    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading,
+    u64 vertex_output_locations)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
     // A motion variant: its fragment permutation's flag, compiled or preloaded (the warm-up
@@ -206,8 +208,7 @@ GraphicsPipeline::GraphicsPipeline(
     } else if (is_rect_list || is_quad_list) {
         const auto type = is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
         if (!preloading) {
-            const auto& fs_info = runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info;
-            sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info);
+            sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, vertex_output_locations);
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationControl,
@@ -224,9 +225,8 @@ GraphicsPipeline::GraphicsPipeline(
         });
     } else if (is_rect_list || is_quad_list) {
         if (!preloading) {
-            const auto& fs_info = runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info;
             sdata.tes = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
-                AuxShaderType::PassthroughTES, fs_info);
+                AuxShaderType::PassthroughTES, vertex_output_locations);
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationEvaluation,

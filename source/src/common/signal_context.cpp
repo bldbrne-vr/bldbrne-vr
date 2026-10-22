@@ -31,6 +31,20 @@ void* GetRip(void* ctx) {
 #endif
 }
 
+void* GetRsp(void* ctx) {
+#if defined(_WIN32)
+    return (void*)((EXCEPTION_POINTERS*)ctx)->ContextRecord->Rsp;
+#elif defined(__APPLE__) && defined(ARCH_X86_64)
+    return (void*)((ucontext_t*)ctx)->uc_mcontext->__ss.__rsp;
+#elif defined(__FreeBSD__)
+    return (void*)((ucontext_t*)ctx)->uc_mcontext.mc_rsp;
+#elif defined(ARCH_X86_64)
+    return (void*)((ucontext_t*)ctx)->uc_mcontext.gregs[REG_RSP];
+#else
+    return nullptr;
+#endif
+}
+
 bool IsWriteError(void* ctx) {
 #if defined(_WIN32)
     return ((EXCEPTION_POINTERS*)ctx)->ExceptionRecord->ExceptionInformation[0] == 1;

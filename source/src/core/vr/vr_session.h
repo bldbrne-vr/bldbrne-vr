@@ -1,11 +1,19 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
 #include <array>
+#include <optional>
 #include <string>
 #include "common/types.h"
 #include "core/vr/aa_mode.h"
+#include "core/vr/assist_settings.h"
 #include "core/vr/cinematic_state.h"
 #include "core/vr/space_shift.h"
 
@@ -160,6 +168,7 @@ struct CameraRecord {
 // Metadata attached to every guest frame at the GPU frame boundary.
 struct FrameTag {
     bool valid{false};
+    Aa::Mode aa_mode{Aa::DefaultMode}; // mode used to render this frame
     bool immersive{false}; // false: show on the virtual screen
     s32 eye{-1};           // 0 = left, 1 = right, -1 = mono (both eyes)
     // The stereo pair of an eye frame: the camera record's (stereo_mode 1), or a left frame and
@@ -215,7 +224,7 @@ struct Settings {
     float fp_eye_height_m{1.55f}; // first person: eye height above the feet (game units)
     float fp_forward_m{0.1f};     // first person: eye in front of the head centre
     // First person: near clip (0.2 would hide more of the hunter's collar and sleeves under the
-    // eye; 0.1 is what the user verified as comfortable).
+    // eye; 0.1 is what the tester verified as comfortable).
     float fp_near_m{0.1f};
     // First person, looking down (ramped in from 20 to 40 deg below the horizon): the near clip
     // moves out to this, hiding the collar, chest and shoulder caps right under the eye (0 = off).
@@ -226,7 +235,7 @@ struct Settings {
     // legs included, ends up that much behind the camera (nothing is bent), so less of his collar
     // and chest is right under your eyes; your hands stay on your controllers.
     float fp_ahead_m{0.0f};
-    float fp_ahead_down_m{0.03f}; // with the body cutaway: the user's pick (option c)
+    float fp_ahead_down_m{0.03f}; // with the body cutaway: the chosen design (option c)
     // The render camera rolls with your head about the view axis, so the eye cameras (AER) and
     // the warp's baseline (DIBR) lie on the line between your eyes. 0 = a level camera (the old
     // behaviour: with the head tilted, near objects get vertical disparity, about 1.5 deg on a hand
@@ -236,7 +245,7 @@ struct Settings {
     float positional_limit_m{0.5f}; // max distance the head may move the camera
     // ...and below the recentered head (core/vr/head_room.h: the sphere above, a cylinder of its
     // radius this deep below; a duck that leans forward is followed all the way; 0 = the sphere;
-    // 0.65 until the evening of 2026-10-08, the user: "15cm more? (so up to 30 in total)")
+    // 0.65 until the evening of 2026-10-08, the tester: "15cm more? (so up to 30 in total)")
     float positional_limit_down_m{0.80f};
     bool roomscale_walk{true}; // standing first person: the feet follow physical steps
     float roomscale_start_m{0.28f};
@@ -254,7 +263,7 @@ struct Settings {
     // (vertical half = max(up + bias, down - bias) + fov_margin_deg). Only with DIBR while the late
     // warp shows the eyes (it undoes the bias exactly: nothing you see moves or tilts), never on
     // the menu panel. 0 = off (as before 2026-10-07); sized from your head motion: 5 with a margin
-    // of 8 (documents/vr-resolution-hypothesis.md, R4), the default since the TILT 2560 review
+    // of 8, the default since the TILT 2560 review
     // (2026-10-07). -15 .. 15.
     float render_pitch_bias_deg{5.0f};
     // render_pitch_min_margin_deg: while the bias applies, the margin is at least this
@@ -352,7 +361,7 @@ struct Settings {
     // world keeps moving at the GPU's pace (one more DIBR swapchain pair and late-warp capture
     // slot); 2: three. Read at startup (renderer_vulkan/vr_stereo_queue.h).
     s32 stereo_adopt_finished{1};
-    // Picture quality (documents/bloodborne-vr.md "Sharpness").
+    // Picture quality.
     // texture_aniso: the game's filtered textures (bilinear or trilinear, not shadow maps or
     // point-sampled buffers) are sampled with at least this anisotropic filtering: sharp floors and
     // walls at grazing angles instead of the blur of the coarser mip (texture_cache/sampler.cpp).
@@ -367,8 +376,15 @@ struct Settings {
     // of the render camera and a resolve with a reprojected history, core/vr/render_taa.h,
     // renderer_vulkan/vr_render_taa.h) or neither, the eyes' TAA alone (off: vr.ini only).
     // Immersive DIBR frames only; the flat screen keeps the game's FXAA.
-    Aa::Mode aa_mode{Aa::DefaultMode};
+    Aa::Mode aa_mode{Aa::DefaultMode}; // startup only; live readers use GetRequested/ActiveAaMode
     u64 aa_fxaa_fs{Aa::DefaultFxaaFs}; // the game's FXAA draw (fragment shader hash)
+    // lod_bias (the VR page's Display > Distant detail): the Model LOD patch's bias, set as the
+    // patches apply; a change in game is a store to its data slot (memory_patcher.cpp
+    // SetLodBiasLive), at the next start when there is no slot. 0 Performance, the game's own
+    // distant models
+    // (the default since 2026-10-17: +11% frame rate in Old Yharnam); -1 Balanced; -2 Quality,
+    // every object's full model at any distance (the default before).
+    int lod_bias{0};
     // aa_mode=taa's knobs (core/vr/render_taa.h):
     //  taa_jitter: the Halton (2, 3) jitter's amplitude, x +-0.5 render px (0 = none: a temporal
     //    filter of the head's own motion only). 0 .. 1.
@@ -453,11 +469,13 @@ struct Settings {
     // (2026-10-06, mock: -77% crawl on the Dream's trees, a still view unchanged). 0 = off,
     // 0.3 .. 0.9.
     float eye_taa{0.85f};
+    // DIBR-only eye history override: -1 inherits, 0 disables, 0..0.9 blends history.
+    float dibr_eye_taa{-1.0f};
     // eye_taa_follow: with eye_taa, the history also follows the game camera (walking, smooth
-    // turns: vr_eye_taa_math.h Choose; the baseline filter started it again on every such refresh, two
+    // turns: vr_eye_taa_math.h Choose; the original eye TAA started it again on every such refresh, two
     // thirds of real play), and still views are moved by the displayed camera (the 0.1 m forward
     // lever included). While the world moves the history is depth-checked: a sample the new view
-    // just uncovered, the body and held items get none. 0 = exactly the baseline TAA.
+    // just uncovered, the body and held items get none. 0 = exactly the original eye TAA.
     bool eye_taa_follow{true};
     // eye_taa_gate_px: while the world moves, a history sample nearer than this pixel's surface is
     // dropped when the two would move apart by more than this many eye pixels in one refresh (a
@@ -483,7 +501,7 @@ struct Settings {
     float gpu_submit_ms{1.5f};
     // Per-draw CPU shortcuts of the command processor (video_core/renderer_vulkan/vk_perf_memo.h;
     // the image is the same, VR_PERF_CHECK=1 compares them with the full work). On by default
-    // since 2026-10-09 (the user asked for them on): correct (0 mismatches in ~30 M
+    // since 2026-10-09 (requested on): correct (0 mismatches in ~30 M
     // shadow-checked draws), saving ~0.15-0.33 ms of the command processor per game frame in the
     // clinic hall (within the A/B noise on the developer's PC). 0 = off (the full work per draw).
     // perf_spec_memo: the pipeline cache remembers which program permutation the same inputs (the
@@ -616,7 +634,7 @@ struct Settings {
     bool health_color{true};
     bool stamina_color{true};
     float health_color_strength{0.5f};
-    float stamina_color_strength{0.5f};
+    float stamina_color_strength{0.7f}; // 0.5, then 0.9, 0.8, 0.7 (2026-10-15)
     bool vial_hide_two_handed{true}; // no vial during two-handed attacks (that hand is on the hilt)
     float vial_inject_hold_s{0.3f};  // the game's vial stays this long after a stab (at the wrist)
     // Fixed wall-clock pause, followed by vial_inject_release_ms of easing back to tracking.
@@ -713,7 +731,7 @@ struct Settings {
     // before. Any read failure falls back to classic (one log line).
     s32 hud_vitals{1};
     float vitals_gauge_scale{1.0f};      // the gauge's size (1 = 52.9 x 34.5 mm)
-    // its centre this far up the forearm from the wrist (0.048 until 2026-10-06: the user asked
+    // its centre this far up the forearm from the wrist (0.048 until 2026-10-06: requested
     // for it a tiny bit closer to the wrist)
     float vitals_gauge_from_wrist_m{0.035f};
     float vitals_gauge_standoff_m{0.003f};   // its underside this far above the measured surface
@@ -812,11 +830,13 @@ struct Settings {
     // shown sharp over the live stereo world: menus and dialogs on a canvas fixed in space, the HUD
     // fixed to the view's lower corners and lower middle (ui_hud_anchor; or on a band that follows
     // the head lazily), lock-on markers and banners where the game puts them. 0 = off (the HUD panel in the eye images, menus on the frozen menu
-    // panel), 1 = on (the default, as the user asked for the UI on its own layer; hud_scale then no
+    // panel), 1 = on (the default, as requested: the UI on its own layer; hud_scale then no
     // longer sizes the gameplay HUD: ui_hud_scale_deg does; when the runtime refuses the layers the
     // session falls back to 0), 2 = check only (the UI is shadowed and compared, nothing visible
     // changes; `VR ui:` statistics).
     s32 ui_layer{1};
+    bool ui_compose_eyes{true}; // ui_compose=eyes|layers; native stereo, read at start
+    bool overlay_compose_eyes{true}; // overlay_compose=eyes|layer
     // Where menus go: 0 layer (the UI layer's canvas over the live world, when ui_layer=1), 1
     // frozen (the menu panel over a frozen, dimmed world), 2 hud (the HUD panel at menu_hud_scale).
     // Without the key, menu_panel=0 means hud; anything else layer.
@@ -876,6 +896,10 @@ struct Settings {
     float ui_hud_corner_yaw_deg{30.0f};
     float ui_hud_corner_pitch_deg{-21.0f};
     float ui_hud_distance_m{2.0f};  // the HUD's distance
+    // The lower group (subtitles, action prompts, item pickups) this much further than the HUD
+    // (2026-10-17, the tester: NPC dialogue at 2 m felt slightly cross-eyed); its size in degrees
+    // stays.
+    float ui_lower_push_m{0.30f};
     float ui_hud_scale_deg{0.042f}; // degrees per 1080p screen pixel (body text 24 px = 1.0 deg)
     float ui_hud_pitch_deg{0.0f};   // moves every HUD row up (+) or down
     float ui_hud_follow_deg{28.0f};       // band anchor: it follows the head's yaw beyond this
@@ -950,15 +974,20 @@ struct Settings {
     // hunter's own HUD always show.
     bool ui_enemy_hp_bars{false};
     // The boss's health bar (the HUD movie's 3 BossTop items, core/vr/bloodborne_enemy_bars.h):
-    // 0 = hidden (the default, 2026-10-15: the user's pick), 1 = shown near the top of the view
-    // instead of the bottom; live (the VR page's Graphics > Display > Show boss health bar).
-    bool ui_boss_hp_bar{false};
+    // 1 = shown near the top of the view instead of the bottom (the default since 2026-10-18,
+    // the tester: boss bars on, enemy bars off; hidden by default 2026-10-15 .. 10-18), 0 = hidden;
+    // live (the VR page's Graphics > Display > Show boss health bar).
+    bool ui_boss_hp_bar{true};
     // The game's button icons (menus' key guide, dialogs, messages) show the VR controllers'
     // buttons: cross A, circle B, square LG, triangle RG, L1 LT, R1 RT, OPTIONS the Menu button;
     // the gameplay HUD's action prompts by the gameplay layout: cross B, circle A, triangle X
     // (swap_sticks: Y, X, A) (core/vr/key_glyphs.h, redrawn in the game's icon atlas at load);
     // 0 = the DualShock 4's. At the start only.
     bool ui_vr_buttons{true};
+    // The dark box behind the NPCs' subtitles (core/vr/gfx_talk_window.h, the HUD movie patched at
+    // load): 0 = none (the words alone, the tester's 2026-10-16 choice), 1 = faint, 2 = the game's.
+    // At the start only.
+    int ui_dialogue_backing{0};
     // The game's status build-up meter (poison, rapid poison, bleed, frenzy, beasthood;
     // VR::Ui::Conditions, ui_layer=1 with the belt): 0 = view, a small piece of its own under the
     // view's centre (its row 0 ui_conditions_pitch_deg from it, ui_conditions_scale x the HUD's
@@ -1006,7 +1035,29 @@ struct Settings {
     // Dodge comfort camera (first person, core/vr/motion_camera.h): the view travels with the body
     // when you dodge; height changes from stairs and falls arrive smoothed. 0 = the old camera.
     bool dodge_camera{true};
-    float follow_smoothing_ms{25.0f}; // horizontal follow of the body (0 = rigid)
+    // Horizontal follow of the body (0 = rigid, 2026-10-18: the hands stay on the view while the
+    // game eases him into and out of a walk; a spring here trailed the body and the arms jumped).
+    float follow_smoothing_ms{0.0f};
+    bool follow_rigid_seen{false}; // the one-time follow_smoothing_ms 25 -> 0 migration ran
+    // The hands' tremor damped while they are nearly still (core/vr/hand_tremor_filter.h).
+    bool hand_tremor_filter{true};
+    // Weighted weapons, ON by default (2026-10-21). An explicit choice overrides all
+    // legacy controls, independent of their order in vr.ini. Absent: the private legacy tuning
+    // (weapon_weight= above 0) when vr.ini sets it, else the default, on.
+    // Serialized values preserve old On=1 / Off=0 preferences; 2 selects Light.
+    std::optional<int> weighted_weapons{};
+    bool weapon_weight_legacy{false}; // vr.ini set weapon_weight= above 0 (private tuning)
+    float WeaponWeightStrength() const {
+        return weighted_weapons ? (*weighted_weapons == 2 ? .35f : *weighted_weapons ? 1.0f : 0.0f)
+                                : weapon_weight_legacy ? weapon_weight : 1.0f;
+    }
+    bool WeightedWeaponsPreset() const { return weighted_weapons.value_or(!weapon_weight_legacy); }
+    float weapon_weight{0.0f}; // legacy tuning: weapon inertia + drag, 0 off .. 1 full
+    bool weapon_mesh_weight{false}; // opt-in measured geometry; requires weapon_weight > 0
+    bool weapon_pose_motor{false}; // private experimental rotational motor; measured rigid shapes only
+    float weapon_lift_response{0.0f}; // opt-in acceleration load; requires load_response
+    float weapon_load_response{0.0f}; // opt-in bounded load compliance; requires gravity
+    float weapon_gravity{0.0f}; // opt-in gravitational sag, requires weapon_weight > 0
     bool pair_lock_position{true};    // both eyes of a stereo pair use one body position
     float dodge_vertical_ms{150.0f};  // height smoothing during a dodge
     float vertical_stop_factor{0.5f}; // multiplies vertical_smoothing_ms while standing
@@ -1039,8 +1090,8 @@ struct Settings {
     float evasion_settle_tau_ms{1000.0f};
     bool evasion_pelvis{true};         // false: the pelvis capsule never moves
     bool evasion_feedback{true};       // haptics: a knock at a wall, a whoosh on a near miss
-    // Difficulty tuning (core/vr/bloodborne_tuning.h); 0 = vanilla, nothing patched.
-    s32 player_hp_bonus_pct{10};       // extra max HP for the hunter, %
+    s32 player_hp_bonus_pct{Assists::DefaultHpBonus}; // extra max HP for the hunter, %
+    s32 outgoing_damage_pct{0};       // player outgoing HP damage adjustment, -30..30 percent
     s32 offhand_damage_pct{10};        // extra damage of the left-hand weapon (gun etc.), %
     // Instant ragdoll on a right-hand melee kill (core/vr/bloodborne_ragdoll.h): an enemy whose
     // death animation ends in the ragdoll goes limp the moment your blade kills it, pushed along
@@ -1053,9 +1104,15 @@ struct Settings {
     // 22 by default (about one kill in five; 15 before 2026-10-09), 0 = always at once, 100 =
     // never. Read at each kill; vr.ini only (no VR page row).
     s32 melee_ragdoll_vanilla_pct{22};
-    // Dodge i-frames (core/vr/bloodborne_iframes.h): extra invincibility after a quickstep's or
-    // roll's own, in the game's 30 fps frames (1/30 s each); 0 = vanilla, nothing patched.
-    s32 dodge_iframes_extra{1};
+    s32 dodge_iframes_extra{Assists::DefaultDodgeFrames};
+    // Lean i-frames (core/vr/bloodborne_iframes.h IframesLeanGrant): a quick sideways or backward
+    // lean of the head (the lean_dodge_speed / _dist_m thresholds) makes the hunter invulnerable
+    // for this many ms of game time at any frame rate (0 .. 300, 0 = off), at most once per
+    // lean_iframes_cooldown_ms. No dodge is pressed and no animation plays (standing, motion
+    // controls; lean_dodge=1 dodges for real instead). The tester, 2026-10-15: 100 ms, then 180 ms
+    // with a 480 ms cooldown.
+    s32 lean_iframes_ms{200}; // (180 until the tester's +20 ms, 2026-10-15 night)
+    float lean_iframes_cooldown_ms{480.0f};
     // Attacks through dodges (core/vr/anim_classes.h GateOut::dodge_attack): a physical swing or a
     // gun shot works at any moment of a backstep, quickstep or roll (the dodge plays on; 0 = they
     // wait for the dodge's own attack window, as the game). dodge_attack_iframes=0: the dodge's
@@ -1074,11 +1131,23 @@ struct Settings {
     // Item pickups in first-person VR: granted at once with the game's pop-up and sound, without
     // the pickup animation (core/vr/bloodborne_pickup.h); false = the game's animation.
     bool pickup_instant{true};
+    // A new hunter's name (core/libraries/ime/ime_dialog.cpp): the system keyboard is a desktop
+    // window the headset never shows, so its name box is answered at once with a random name, as
+    // if typed and confirmed (2026-10-16); 0 = the keyboard as before.
+    bool auto_name{true};
+    // The light sets' camera-attached fill lights (core/vr/bloodborne_lights.h): 1 = they follow
+    // the hunter's heading instead of your head (no sliding highlights, but less of the game's
+    // sheen when you look sideways); 0 (the default, the tester 2026-10-20: keep the original look)
+    // = they follow the camera, your head, as the game makes them. Live.
+    bool body_fill_lights{false};
     bool cinematic_scripted{true};          // NPC talk, scripted event animations, revival
     bool cinematic_item{true}; // a canned item use from the arc (the Shaman Bone Blade's stab)
     // The Doll's Level Up kneel (core/vr/cinematic_state.h IsLevelUpKneel): false = it stays in
     // first-person VR and Level Up is on the menu panel; true = flat (the virtual screen).
     bool cinematic_levelup{false};
+    // Walking through a fog gate (core/vr/cinematic_state.h Category::FogGate): false = it stays
+    // in first-person VR (2026-10-18); true = flat (the virtual screen), as before.
+    bool cinematic_foggate{false};
     float cinematic_fade_ms{150.0f};        // fade to black on the way in; 0 = hard cut
     float cinematic_return_fade_ms{80.0f};  // VR fades in on the way back; -1 = the old way
     float cinematic_exit_ms{50.0f};         // signals off (or control back) this long first
@@ -1181,6 +1250,11 @@ void PublishAreaDimRemoved(bool removed);
 // fade and the arrival's queued text effects must not read as an area name or a banner.
 // PublishLampWarp(false) as it starts, (true) once the new player is there.
 void PublishLampWarp(bool arrived);
+// Unknown/same-map transitions permit extra cleanup only under memory pressure. The lamp
+// adapter may confirm a cross-map arrival from a verified source and accepted destination.
+void RequestTransitionTextureCleanup(bool area_changed = false);
+// One render-thread consumer: sequence in bits 1..63, coalesced area-change hint in bit 0.
+[[nodiscard]] u64 TakeTransitionTextureCleanupRequest();
 // The game's own lantern box ("Return to the Hunter's Dream?" YES / NO) while the VR lamp page
 // answers it: never shown (it flashed up half-drawn before the page). PublishLampBoxHidden(true)
 // tentatively as a lamp-type box opens (bloodborne_menu.cpp) and on every lamp-site tick that
@@ -1192,6 +1266,12 @@ void PublishLampBoxHidden(bool hidden);
 [[nodiscard]] bool LampWarpDeparting();
 // Arrived less than `seconds` ago.
 [[nodiscard]] bool LampWarpArrivedWithin(float seconds);
+// Any load's arrival (the game's start, a lamp warp, a respawn): a new main player, noted by the
+// main player's update (bloodborne_heal.cpp OnMainPlayerUpdate). The text effects the game queues
+// as it arrives are no banners either.
+void NotePlayerArrival();
+// A new main player less than `seconds` ago.
+[[nodiscard]] bool PlayerArrivedWithin(float seconds);
 void PublishItemPickup(bool shown);
 [[nodiscard]] bool IsItemPickupUp();
 void PublishActionPrompt(bool shown);
@@ -1260,6 +1340,13 @@ void PublishHead(const HeadState& state);
 
 // ---- Input -----------------------------------------------------------------------
 void AddTurn(float radians); // + = turn right
+// The arms' pose copy (core/vr/bloodborne_body.cpp Gather), before this game frame's camera
+// update: the turn queued so far is claimed for this frame (`claim`; a stereo pair's second eye
+// takes no new one), and the camera update applies exactly the claimed turn, so the arms are
+// placed with the heading the camera will have (2026-10-18: the arms were a turn behind for the
+// frame of every snap turn, a frame's turn behind all through a smooth one). Returns the claimed
+// turn not yet applied (radians, + = right).
+float ClaimTurnForArms(bool claim);
 // Tab on the keyboard (sdl_window.cpp), or the Menu hold with menu_hold=screen: toggles the virtual
 // screen. While a cinematic is going flat or flat (FadeOut, Flat) it is the escape hatch instead:
 // first-person VR comes back at once and the rest of that animation (on a ladder: that climb)
@@ -1305,8 +1392,12 @@ struct CameraOverride {
                           // game world axes and units
     // The part of the render camera position that holds your place through a freehand throw and
     // keeps you off its victim (game world axes and units; bloodborne_camera.cpp,
-    // GrabCamera::ThrowCamera): the VR body leaves it out of its camera dip.
+    // GrabCamera::ThrowCamera). The whole-body rig follows it, separately from leaning.
     Vec3 throw_offset{};
+    Vec3 throw_root{}; // presented root from the same pose decision as the camera
+    bool throw_shared{};
+    float throw_weight{}; // the hold/recovery blend shared by the whole hunter
+    bool throw_holding{}; // lock the presented root through native paired positioning
     // The camera record of this update (SetRecordRenderPosition).
     u64 record_id{};
     // False on the second eye of a stereo pair: the head sample and the state that changes the
@@ -1374,7 +1465,10 @@ void SetRecordPlayerPosition(u64 id, const Vec3& position);
 // At the flip of the frame whose draws just completed: returns its tag (the camera record its
 // first draw used; without draws the one queued with `flip`, the latest record when there is
 // none) and advances the eye.
-FrameTag OnGpuFrameBoundary(u64 flip);
+// finish_rendering drains the draw worker, recorder and GPU; called only for an AA change.
+FrameTag OnGpuFrameBoundary(u64 flip, void (*finish_rendering)());
+Aa::Mode GetActiveAaMode();
+Aa::Mode GetRequestedAaMode();
 // Per-draw stereo parameters for the vertex shader (see ApplyStereoShift).
 struct DrawStereo {
     float shift{}; // clip-space x shift for perspective geometry
@@ -1432,6 +1526,11 @@ void SetFrameRecord(u64 id);
 [[nodiscard]] bool FlipTagTest();
 // Camera record `id` while it is still in the record ring (the last 64 camera updates).
 [[nodiscard]] bool GetRecord(u64 id, CameraRecord& record);
+// The newest camera update's head yaw (radians, tracking space, + = turned left) while the
+// headset drives the camera; false otherwise (menus, cinematics, the virtual screen).
+[[nodiscard]] bool NewestHeadYaw(float& yaw);
+// Latest camera tick, without draw-frame lag; used to wait for a blink turn's new eyes.
+[[nodiscard]] bool NewestCameraRecord(CameraRecord& record);
 [[nodiscard]] bool DebugDrawLog(); // true for a few frames when VR_DEBUG_DRAWS is set
 // Debug (VR_LAG_TEST): the camera alternates heading per record; see the presenter overlay.
 // VR_LAG_TEST=2 also puts that heading into the record's head yaw, so a frame submitted with the
@@ -1571,9 +1670,6 @@ enum class InjectResult : u32 {
 // Input thread: the answer to the last request (Pending until there is one). A request the
 // player update has not taken within the timeout is expired here and answered with Expired.
 [[nodiscard]] InjectResult PollInjectResult();
-// Input-thread cancellation: withdraw only work not yet claimed by the player hook.
-// A taken action must still be polled; timeout/cancellation does not prove it failed.
-void CancelPendingInject();
 // True while the instant-injection hook is installed and has not disabled itself. When false
 // a stab is refused (never the game's own vial with its animation; inject=0: X is that button).
 [[nodiscard]] bool InstantInjectAvailable();
@@ -1585,6 +1681,10 @@ void NotePlayerUpdate();
 // When it last ran (steady_clock ns; 0: never). A cutscene that stops the player's updates shows
 // as this standing still (bloodborne_camera.cpp RemoCutscene). Any thread.
 [[nodiscard]] s64 LastPlayerUpdateNs();
+// A remo cutscene plays (bloodborne_camera.cpp RemoCutscene; the game's camera): its frames are
+// not first person (the head, the cape and the body are drawn). Any thread.
+void SetRemoCutscene(bool playing);
+[[nodiscard]] bool RemoCutscenePlaying();
 // Takes the pending request; `expired` = it is older than the timeout (answer Expired).
 [[nodiscard]] bool TakeInjectRequest(bool& expired);
 void FinishInjectRequest(InjectResult result);

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -85,6 +86,9 @@ inline constexpr bool Enabled = false;
 #else
 inline constexpr bool Enabled = true;
 #endif
+// Only launcher benchmark children opt into sparse measurement records in release builds.
+bool BenchmarkEnabled() noexcept;
+
 template <typename... Args>
 constexpr void Discard(std::string_view, const Args&...) noexcept {}
 } // namespace Common::Log
@@ -130,3 +134,24 @@ constexpr void Discard(std::string_view, const Args&...) noexcept {}
     LOG_GENERIC(Common::Log::Class::log_class, spdlog::level::err, __VA_ARGS__)
 #define LOG_CRITICAL(log_class, ...)                                                               \
     LOG_GENERIC(Common::Log::Class::log_class, spdlog::level::critical, __VA_ARGS__)
+
+// These selected evidence records survive BBVR_NO_LOGS. Normal release play neither
+// evaluates their arguments nor initializes logging. General logging stays compiled out.
+#ifdef BBVR_NO_LOGS
+#define LOG_BENCHMARK(log_class, log_level, format, ...) \
+    do { \
+        if (Common::Log::Enabled || Common::Log::BenchmarkEnabled()) { \
+            if (auto logger = Common::Log::ALL_LOGGERS[Common::Log::Class::log_class]; \
+                logger && logger->should_log(log_level)) { \
+                logger->log(log_level, format, ##__VA_ARGS__); \
+            } \
+        } \
+    } while (false)
+#else
+#define LOG_BENCHMARK(log_class, log_level, ...) \
+    LOG_GENERIC(Common::Log::Class::log_class, log_level, __VA_ARGS__)
+#endif
+#define LOG_BENCHMARK_INFO(log_class, ...) \
+    LOG_BENCHMARK(log_class, spdlog::level::info, __VA_ARGS__)
+#define LOG_BENCHMARK_WARNING(log_class, ...) \
+    LOG_BENCHMARK(log_class, spdlog::level::warn, __VA_ARGS__)

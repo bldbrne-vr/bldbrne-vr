@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -26,16 +32,12 @@
 #include "core/vr/bow.h"
 #include "core/vr/bow_channel.h"
 #include "core/vr/combat_channel.h"
-#include "core/vr/quick_channel.h"
 #include "core/vr/gun_aim.h"
-#include "core/vr/interaction_native_aim.h"
-#include "core/vr/interaction_native_bow_sound.h"
-#include "core/vr/interaction_native_attack.h"
-#include "core/vr/interaction_native_delivery_module.h"
 #include "core/vr/gun_settings.h"
 #include "core/vr/hook_util.h"
 #include "core/vr/melee_settings.h"
 #include "core/vr/melee_window.h"
+#include "core/vr/shield_guard.h"
 #include "core/vr/trick_weapons.h"
 #include "core/vr/vr_session.h"
 
@@ -247,8 +249,13 @@ constexpr s32 BloodBullets = 901;
 constexpr s32 HandLeft = -2;
 constexpr s32 HandRight = -1;
 constexpr s32 JudgeShot = 800;
+constexpr s32 JudgeAsh = 810;
 constexpr s32 PalmDummy = 3;          // L_Hand: the bullet's start (TAE 318 dummy)
 constexpr s32 PartLineDummy = 20100;  // the left part's dummies 100 (behind) .. 215 (the muzzle)
+constexpr s32 FirstFlashSlot = 30100; // private effect slots (the vial uses 30000-30007)
+constexpr s32 FlashSlots = 4;
+constexpr s32 FirstBladeFlashSlot = 30110; // the gun-blades' flash: 30110-30113
+constexpr float DryCooldownS = 0.3f;
 // The palm (the game's start) sits 7-8 cm below the pistol's bore; a larger move means the muzzle
 // dummy is not where this hand's gun would have it.
 constexpr float MaxOriginShiftM = 0.12f;
@@ -261,6 +268,8 @@ constexpr s64 PullPoseMaxAgeNs = 1500 * Ms;
 constexpr s64 HandsMaxAgeNs = 100 * Ms;
 constexpr s64 AnchorMaxAgeNs = 200 * Ms;
 constexpr s64 StatusMaxAgeNs = 250 * Ms;
+constexpr s64 KickNs = 600 * Ms;
+constexpr s64 StalePullNs = 500 * Ms; // a pull the pose tick first sees this late is ignored
 constexpr s64 StatsNs = 10000 * Ms;
 
 using InvokeGunFn = u8(PS4_SYSV_ABI*)(void* chr, s32 bid, s32 dummy, u32 dir, s32 hand_a,
@@ -445,139 +454,23 @@ s32 BehaviorId(u8* chr, s32 judge) {
     return fn != nullptr ? fn(chr, judge, HandLeft, 0, 0) : -1;
 }
 
-// Copy the native weapon parameter facts in the original guarded call order.
-PiGunPreparationFacts ReadBulletCost(u8* chr, s32 fallback, s32 hand) {
-    PiGunPreparationFacts f{};
-    f.command = PI_GUN_PREP_COST;
-    f.fallback_cost = fallback;
+// A hand's weapon's bullets per shot (EquipParamWeapon.bulletConsumeNum), or `fallback`.
+s32 BulletCost(u8* chr, s32 fallback, s32 hand = HandLeft) {
     const auto weapon_id = VtableFn<GetWeaponIdFn>(chr, SlotGetWeaponId, GetWeaponIdRva);
-    if (weapon_id == nullptr || g_weapon_row == nullptr)
-        return f;
+    if (weapon_id == nullptr || g_weapon_row == nullptr) {
+        return fallback;
+    }
     const s32 id = weapon_id(chr, hand);
-    if (id < 0)
-        return f;
+    if (id < 0) {
+        return fallback;
+    }
     WeaponRowOut out{};
     g_weapon_row(&out, id);
-    if (!Plausible(out.row, 2))
-        return f;
-    f.cost_valid = 1;
-    f.native_cost = Read<s8>(out.row + WeaponBulletCost);
-    return f;
-}
-
-// Emitter, pose-tick and mutex-serialized sound policies have separate contexts; copied
-// facts cross their publications. Installed hooks retain each module through process exit.
-VR::Interactions::Module* g_emitter_module{};
-VR::Interactions::Module* g_gaze_module{};
-VR::Interactions::Module* g_bow_sound_module{};
-VR::Interactions::NativeBowSound g_bow_sound_policy{};
-bool g_bow_sound_fault{};
-VR::Interactions::NativeAim g_emitter_policy{},g_gaze_policy{};
-VR::Interactions::NativeAttackRuntime g_native_gun_policy{}; // Game:Main, as gaze
-bool g_emitter_fault{},g_gaze_fault{},g_native_aim_dll{};
-bool InitNativeAimDll() {
-    if (!VR::Interactions::DllRequested())
-        return true;
-    g_native_aim_dll = true;
-    VR::Interactions::NativeDelivery::Require();
-    if (g_emitter_module)
-        return !g_emitter_fault && !g_gaze_fault && !g_bow_sound_fault;
-    g_emitter_module = new VR::Interactions::Module();
-    g_emitter_module->EnableFaultBroadcast();
-    g_gaze_module = new VR::Interactions::Module();
-    g_gaze_module->EnableFaultBroadcast();
-    g_bow_sound_module = new VR::Interactions::Module();
-    g_bow_sound_module->EnableFaultBroadcast();
-    if (!g_emitter_module->LoadBesideExecutable() || !g_gaze_module->LoadBesideExecutable() ||
-        !g_bow_sound_module->LoadBesideExecutable()) {
-        g_emitter_fault = true;
-        LOG_ERROR(Core, "VR gun: native aim/sound DLL unavailable: {} / {} / {}",
-                  g_emitter_module->Diagnostic(), g_gaze_module->Diagnostic(),
-                  g_bow_sound_module->Diagnostic());
-        return false;
+    if (!Plausible(out.row, 2)) {
+        return fallback;
     }
-    using namespace VR::Interactions;
-    static const auto delivery_binding = NativeDelivery::MakeBinding(*g_emitter_module);
-    NativeDelivery::Bind(&delivery_binding);
-    g_emitter_policy.Bind(*g_emitter_module, g_emitter_fault);
-    g_gaze_policy.Bind(*g_gaze_module, g_gaze_fault);
-    g_native_gun_policy.Bind(*g_gaze_module);
-    g_bow_sound_policy.Bind(*g_bow_sound_module, g_bow_sound_fault);
-    return true;
-}
-B::Vec3 AimVec(const float (&v)[3]) {
-    return {v[0], v[1], v[2]};
-}
-void AimPut(float (&v)[3], B::Vec3 p) {
-    v[0] = p.x;
-    v[1] = p.y;
-    v[2] = p.z;
-}
-void AimPut(float (&v)[4], B::Quat q) {
-    v[0] = q.x;
-    v[1] = q.y;
-    v[2] = q.z;
-    v[3] = q.w;
-}
-const char* AimReason(uint32_t r) {
-    static constexpr const char* text[] = {nullptr,
-                                           "aim disabled",
-                                           "hands",
-                                           "view",
-                                           "arm",
-                                           "nobarrel",
-                                           "bow=0",
-                                           "no release of yours",
-                                           "its release already shot",
-                                           "recentered since",
-                                           "no left hand"};
-    return r <= PI_AIM_NO_LEFT ? text[r] : "module";
-}
-void AimHands(PiNativeAimInput& f, B::HandsSample& hands) {
-    f.have_hands = B::LatestHands(hands);
-    const auto& h = hands.hand[B::C0000::Left];
-    f.hands.ns = hands.steady_ns;
-    f.hands.space = hands.space_serial;
-    f.hands.head_valid = hands.head_valid;
-    f.hands.position_valid = h.position_valid;
-    f.hands.position_tracked = h.position_tracked;
-    f.hands.orientation_valid = h.orientation_valid;
-    AimPut(f.hands.p, h.p);
-    AimPut(f.hands.q, h.q);
-    AimPut(f.hands.head_q, hands.head_q);
-}
-void AimAnchor(PiNativeAimInput& f, B::Anchor& a) {
-    f.have_anchor = B::LatestAnchor(a);
-    f.anchor = {a.valid, a.base_yaw, a.steady_ns};
-}
-PiNativeAimInput AimFrame(u8* out, u8* launcher, u8* player, uint32_t operation, s64 now) {
-    PiNativeAimInput f{};
-    f.operation = operation;
-    f.now_ns = now;
-    f.dry = g_dry_aim;
-    f.bid = Read<s32>(launcher + OffsetLauncherBid);
-    const float idx = Read<float>(out + ShotIndexFromOut);
-    f.index = std::isfinite(idx) ? static_cast<s32>(idx) : 0;
-    std::memcpy(f.rows, out, sizeof(f.rows));
-    AimPut(f.chr_forward, ChrForward(player));
-    return f;
-}
-bool ApplyAimRows(u8* out, const PiNativeAimInput& f, const PiNativeAimOutput& r) {
-    if (g_native_aim_dll && VR::Interactions::ProcessFaultLatch().Tripped())
-        return false;
-    if (!f.dry && r.handled && !r.reason)
-        std::memcpy(out, r.rows, sizeof(r.rows));
-    return true;
-}
-PiAimPull AimPull(const Combat::GunPull& p) {
-    PiAimPull f{};
-    f.serial = p.serial;
-    f.direct = p.direct;
-    f.press_ns = p.press_ns;
-    f.grip_valid = p.grip_valid;
-    f.space = p.space_serial;
-    AimPut(f.q, p.grip_q);
-    return f;
+    const s32 cost = Read<s8>(out.row + WeaponBulletCost);
+    return cost > 0 && cost <= 20 ? cost : fallback;
 }
 
 // ---- The barrel ray (shared by the emitter hook and the pose tick) ------------------------------
@@ -616,6 +509,7 @@ struct DirectShot {
 
 std::mutex g_shot_mutex;
 DirectShot g_direct{};
+u32 g_game_shot_serial = 0; // the last pull the game's own shot took its grip from
 Combat::GunPull g_handed{}; // a direct pull the pose tick handed to the game's L2 (its grip)
 
 // The emitter's last ray, for the launch tail's readback (VR_GUN_LOG).
@@ -690,11 +584,23 @@ bool LineAllowed() {
 // the game's sounds while the bow form is up and the sound is not known yet; until then the bow's
 // shots are the game's own (the presenter: Combat::MeleeStatus::bow_direct).
 constexpr s32 ThrowWhoosh = 751;          // the throws' release (a direct arrow before the twang)
-// The DLL owns the sound ring, launch window and two-launch confirmation.
-// Both hook and emitter callers serialize this context under the existing mutex.
+constexpr s64 TwangBeforeNs = 100 * Ms;   // the release sound this long before the launch ...
+constexpr s64 TwangAfterNs = 60 * Ms;     // ... or this long after it
+constexpr float TwangNearM = 1.0f;        // ... this close to the bow hand
+struct HeardSound {
+    s32 type{0};
+    s32 id{-1};
+    B::Vec3 pos{};
+    s64 ns{0};
+};
 std::mutex g_heard_mutex;
+std::array<HeardSound, 8> g_heard{};
+u32 g_heard_next{0};
+s64 g_twang_launch_ns{0}; // a game-fired arrow still waiting for its sound (under g_heard_mutex)
+B::Vec3 g_twang_hand{};
 std::atomic<bool> g_twang_listen{false};
 std::atomic<s32> g_twang{-1};
+std::atomic<s32> g_twang_candidate{-1}; // heard at one arrow: learned when the next one plays it
 std::atomic<bool> g_bow_no_rows{false}; // the bow has no arrow rows for a direct shot
 std::unique_ptr<Xbyak::CodeGenerator> g_listen_code;
 
@@ -703,8 +609,8 @@ s32 TaeSoundType() {
     return g_sound_table != nullptr && Read<u8>(g_sound_table + 3) != 0 ? 0xA : 1;
 }
 
-void LearnTwang(s32 id, uint32_t action, const char* how) {
-    if (action != PI_BOW_SOUND_CONFIRMED) {
+void LearnTwang(s32 id, const char* how) {
+    if (g_twang_candidate.exchange(id) != id) {
         LOG_INFO(Core, "VR bow: release sound {}? ({}): the next game-fired arrow confirms it", id,
                  how);
         return;
@@ -719,24 +625,31 @@ void LearnTwang(s32 id, uint32_t action, const char* how) {
              id, how);
 }
 
+// A sound near the bow hand within the window round a game-fired arrow's launch (heard under
+// g_heard_mutex).
+bool TwangOf(const HeardSound& h, s64 launch_ns, const B::Vec3& hand) {
+    return h.id >= 0 && h.type == TaeSoundType() && h.ns >= launch_ns - TwangBeforeNs &&
+           h.ns <= launch_ns + TwangAfterNs && B::Length(h.pos - hand) <= TwangNearM;
+}
+
 void PS4_SYSV_ABI OnGameSound(s32 type, s32 id, const float* pos) {
-    if (!g_twang_listen.load(std::memory_order_relaxed)) return;
-    const bool position_valid = Plausible(reinterpret_cast<const u8*>(pos), 12);
-    PiNativeBowSoundInput input{};
-    input.operation = PI_BOW_SOUND_HEARD;
-    input.type = type;
-    input.id = id;
-    if (position_valid)
-        for (int i = 0; i < 3; ++i) input.position[i] = pos[i];
-    input.now_ns = NowNs();
-    PiNativeBowSoundOutput output{};
+    if (!g_twang_listen.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const bool p = Plausible(reinterpret_cast<const u8*>(pos), 12);
+    const HeardSound h{type, id, p ? B::Vec3{pos[0], pos[1], pos[2]} : B::Vec3{}, NowNs()};
+    s32 learned = -1;
     {
         std::scoped_lock lock{g_heard_mutex};
-        input.expected_type = TaeSoundType();
-        output = g_bow_sound_policy.Call(input);
+        g_heard[g_heard_next++ % g_heard.size()] = h;
+        if (g_twang_launch_ns != 0 && TwangOf(h, g_twang_launch_ns, g_twang_hand)) {
+            learned = id;
+            g_twang_launch_ns = 0;
+        }
     }
-    if (output.action)
-        LearnTwang(output.id, output.action, "just after the game's arrow left");
+    if (learned >= 0) {
+        LearnTwang(learned, "just after the game's arrow left");
+    }
 }
 
 // The PlaySound detour (bow=1, bow_direct=1, its release sound not known yet). VR_SOUND_TRACE's
@@ -781,87 +694,97 @@ void InstallTwangListener(u8* module) {
 
 // A game-fired arrow just left (BowArrow): the sound the clip played with it, now or just after.
 void HearTwang(const B::Vec3& hand, s64 now) {
-    if (g_twang.load(std::memory_order_relaxed) >= 0 || !g_twang_listen.load()) return;
-    PiNativeBowSoundInput input{};
-    input.operation = PI_BOW_SOUND_LAUNCH;
-    input.now_ns = now;
-    input.hand[0] = hand.x;
-    input.hand[1] = hand.y;
-    input.hand[2] = hand.z;
-    PiNativeBowSoundOutput output{};
+    if (g_twang.load(std::memory_order_relaxed) >= 0 || !g_twang_listen.load()) {
+        return;
+    }
+    s32 learned = -1;
     {
         std::scoped_lock lock{g_heard_mutex};
-        input.expected_type = TaeSoundType();
-        output = g_bow_sound_policy.Call(input);
+        s64 best_ns = 0;
+        for (const HeardSound& h : g_heard) {
+            if (TwangOf(h, now, hand) && h.ns >= best_ns) {
+                best_ns = h.ns;
+                learned = h.id;
+            }
+        }
+        if (learned < 0) {
+            g_twang_launch_ns = now; // the sound may come after the launch in this update
+            g_twang_hand = hand;
+        }
     }
-    if (output.action)
-        LearnTwang(output.id, output.action, "just before the game's arrow left");
+    if (learned >= 0) {
+        LearnTwang(learned, "just before the game's arrow left");
+    }
 }
 
 // Simon's Bowblade's arrows (vr.ini bow, core/vr/bow.h): a launch of its behaviour rows (variation
-// 3200; the game's own shot, R1 / R2 pressed at the presenter's release) within 1500 ms
+// 3200; the game's own shot, R1 / R2 pressed at the presenter's release) within BowShotMaxAgeNs
 // of that release flies along the drawn line (string hand -> bow hand, just before the release)
 // from the bow hand. True when the launch was the Bowblade's (aimed or not).
+constexpr s32 BowbladeVariation = 3200;
+constexpr s64 BowShotMaxAgeNs = 1500 * Ms;
+constexpr float BowOriginAheadM = 0.10f; // the arrow starts this far ahead of the bow hand
+u32 g_bow_aimed_serial = 0; // the release whose first arrow was aimed (the game's thread)
+
 bool BowArrow(u8* out, u8* launcher, u8* player) {
     const s32 bid = Read<s32>(launcher + OffsetLauncherBid);
-    PiNativeAimInput classify{};
-    classify.operation = PI_AIM_CLASSIFY;
-    classify.bid = bid;
-    classify.now_ns = NowNs();
-    if (!g_emitter_policy.Run(classify))
-        return true;
-    if (!g_emitter_policy.Output().preparation.bow_family)
+    if (bid < 100000000 || bid >= 200000000 || (bid - 100000000) / 1000 != BowbladeVariation) {
         return false;
+    }
     const s64 now = NowNs();
-    auto f = AimFrame(out, launcher, player, PI_AIM_BOW, now);
-    const auto idx = f.index;
+    const float index_f = Read<float>(out + ShotIndexFromOut);
+    const s32 idx = std::isfinite(index_f) ? static_cast<s32>(index_f) : 0;
     auto* const rows = reinterpret_cast<float*>(out);
-    const auto vanilla = G::FlightOfRows(rows);
-    const auto bullet = Read<s32>(launcher + OffsetLauncherBullet);
+    const B::Vec3 vanilla = G::FlightOfRows(rows);
+    const s32 bullet = Read<s32>(launcher + OffsetLauncherBullet);
     Combat::BowShot shot{};
-    f.bow_enabled = VR::Bow::GetBowSettings().enabled;
-    f.have_bow_shot = Combat::BowShotChannel().Load(shot);
-    f.bow.serial = shot.serial;
-    f.bow.release_ns = shot.release_ns;
-    f.bow.space = shot.space_serial;
-    f.bow.hand = shot.bow_hand;
-    for (int i = 0; i < 3; ++i)
-        f.bow.dir[i] = shot.dir[i];
+    const char* why = nullptr;
+    if (!VR::Bow::GetBowSettings().enabled) {
+        why = "bow=0";
+    } else if (!Combat::BowShotChannel().Load(shot) || shot.serial == 0 ||
+               now - shot.release_ns > BowShotMaxAgeNs) {
+        why = "no release of yours";
+    } else if (idx == 0 && shot.serial == g_bow_aimed_serial) {
+        why = "its release already shot";
+    }
     B::Anchor anchor{};
-    AimAnchor(f, anchor);
+    if (why == nullptr &&
+        (!B::LatestAnchor(anchor) || !anchor.valid || now - anchor.steady_ns > AnchorMaxAgeNs)) {
+        why = "view";
+    }
     B::HandsSample hands{};
-    AimHands(f, hands);
-    const auto game_start = B::Vec3{f.rows[3], f.rows[7], f.rows[11]};
-    B::Vec3 hand{};
-    f.operation=PI_AIM_BOW_PREPARE;
-    if (!g_emitter_policy.Run(f))
-        return true;
-    const auto preparation = g_emitter_policy.Output().preparation;
-    const s32 hand_dummy = preparation.bow_hand_dummy;
-    if (preparation.query_bow_hand)
-        f.have_bow_hand = DummyAt(player, hand_dummy, hand);
-    f.operation = PI_AIM_BOW;
-    AimPut(f.bow_hand_point, hand);
-    if (!g_emitter_policy.Run(f))
-        return true;
-    const auto& result = g_emitter_policy.Output();
-    const char* why = AimReason(result.reason);
-    if (why) {
-        if (idx == 0 && LineAllowed())
-            LOG_INFO(Core, "VR bow: ARROW bid={} bullet={} idx={} along the game's aim {} ({})",
-                     bid, bullet, idx, YawPitch(vanilla), why);
+    if (why == nullptr && B::LatestHands(hands) && hands.space_serial != shot.space_serial) {
+        why = "recentered since";
+    }
+    if (why != nullptr) {
+        if (idx == 0 && LineAllowed()) {
+            LOG_INFO(Core, "VR bow: ARROW bid={} bullet={} idx={} along the game's aim {} ({})", bid,
+                     bullet, idx, YawPitch(vanilla), why);
+        }
         return true;
     }
-    const auto dir = AimVec(result.dir);
-    const auto start = AimVec(result.start);
-    const bool moved = result.moved;
-    if (g_native_aim_dll && VR::Interactions::ProcessFaultLatch().Tripped())
-        return true;
-    if (result.hear_twang)
-        HearTwang(hand, now);
-    if (!ApplyAimRows(out, f, result))
-        return true;
-    const bool written = result.written;
+    if (idx == 0) {
+        g_bow_aimed_serial = shot.serial;
+    }
+    const B::Vec3 dir = B::Normalize(
+        B::TrackingToWorld({shot.dir[0], shot.dir[1], shot.dir[2]}, anchor.base_yaw, 1.0f),
+        vanilla);
+    const B::Vec3 game_start{rows[3], rows[7], rows[11]};
+    B::Vec3 start = game_start;
+    B::Vec3 hand{};
+    const s32 hand_dummy = shot.bow_hand == 0 ? 340 : 300; // the fist the bow is in
+    const bool have_hand = DummyAt(player, hand_dummy, hand);
+    const bool moved = !g_dry_aim && have_hand;
+    if (idx == 0 && have_hand) {
+        HearTwang(hand, now); // bow_direct: its release sound, once
+    }
+    if (moved) {
+        start = hand + dir * BowOriginAheadM;
+        rows[3] = start.x;
+        rows[7] = start.y;
+        rows[11] = start.z;
+    }
+    const bool written = !g_dry_aim && G::WriteLookRows(rows, dir, ChrForward(player));
     if (idx == 0 && LineAllowed()) {
         LOG_INFO(Core,
                  "VR bow: ARROW #{} {} bid={} bullet={} draw {:.2f} ray{} (the game's {}, {:.1f} "
@@ -886,34 +809,37 @@ struct BladeAimShot {
     s64 ns{0};
     B::Vec3 origin{};
     B::Vec3 dir{};
+    B::Vec3 shift{}; // the first bullet's move (the others take it too)
 };
 BladeAimShot g_blade_aim{};
 
 bool BladeAim(u8* out, u8* launcher, u8* player) {
-    const auto& a = g_blade_aim;
-    auto f = AimFrame(out, launcher, player, PI_AIM_BLADE, NowNs());
-    f.blade.bid = a.bid;
-    f.blade.serial = a.serial;
-    f.blade.ns = a.ns;
-    AimPut(f.blade.origin, a.origin);
-    AimPut(f.blade.dir, a.dir);
-    if (!g_emitter_policy.Run(f))
-        return true;
-    const auto& result = g_emitter_policy.Output();
-    if (!result.handled)
+    BladeAimShot& a = g_blade_aim;
+    if (a.bid < 0 || Read<s32>(launcher + OffsetLauncherBid) != a.bid ||
+        NowNs() - a.ns > DirectMaxAgeNs) {
         return false;
-    const auto idx = f.index;
-    const auto vanilla = G::FlightOfRows(f.rows);
-    const bool written = result.written;
-    if (!ApplyAimRows(out, f, result))
-        return true;
+    }
+    auto* const rows = reinterpret_cast<float*>(out);
+    const float index_f = Read<float>(out + ShotIndexFromOut);
+    const s32 idx = std::isfinite(index_f) ? static_cast<s32>(index_f) : 0;
+    const B::Vec3 vanilla = G::FlightOfRows(rows);
+    const B::Vec3 start{rows[3], rows[7], rows[11]};
+    if (idx == 0) {
+        a.shift = a.origin - start;
+    }
+    bool written = false;
+    if (!g_dry_aim) {
+        rows[3] += a.shift.x;
+        rows[7] += a.shift.y;
+        rows[11] += a.shift.z;
+        written = G::WriteLookRows(rows, a.dir, ChrForward(player));
+    }
     if (idx == 0 && LineAllowed()) {
         LOG_INFO(Core,
                  "VR blade shot: #{} launched bid={} bullet={} along {} (the game's {}, {:.1f} deg "
                  "off), moved {:.0f} cm{}",
                  a.serial, a.bid, Read<s32>(launcher + OffsetLauncherBullet), YawPitch(a.dir),
-                 YawPitch(vanilla), B::Angle(vanilla, a.dir) / B::Deg,
-                 B::Length(AimVec(result.shift)) * 100.0f,
+                 YawPitch(vanilla), B::Angle(vanilla, a.dir) / B::Deg, B::Length(a.shift) * 100.0f,
                  written ? "" : " (NOT WRITTEN: dry run)");
     }
     return true;
@@ -925,6 +851,7 @@ bool BladeAim(u8* out, u8* launcher, u8* player) {
 // not a gun row, during an item animation (SpEffect 207) of goods 2000 (the goods the animation's
 // TAE event 65 uses, [player+0x1C0]). Thrown items never carry 207 (the quick items throw them
 // directly) and keep their own flight.
+constexpr s32 AugurGoods = 2000;
 constexpr s32 ItemAnimEffect = 207;
 constexpr u32 OffsetAnimGoods = 0x1C0;
 
@@ -932,64 +859,73 @@ constexpr u32 OffsetAnimGoods = 0x1C0;
 // ToolGazeTick, every update; 0: not yet.
 std::atomic<s64> g_tool_gaze_ns{0};
 
-bool ToolGazeTick(s64 now) {
-    PiNativeAimInput f{};
-    f.operation = PI_AIM_GAZE;
-    f.now_ns = now;
-    B::HandsSample hands{};
-    AimHands(f, hands);
-    if (!g_gaze_policy.Run(f))
+// The left hand's pointing (tracked, fresh), and the head's (its forward), in the tracking space.
+bool LeftPoint(const B::HandsSample& hands, s64 now, B::Vec3& point) {
+    const B::TrackedHand& hand = hands.hand[B::C0000::Left];
+    if (now - hands.steady_ns > HandsMaxAgeNs || !B::IsTracked(hand)) {
         return false;
-    if (g_gaze_policy.Output().gaze)
-        g_tool_gaze_ns.store(now, std::memory_order_relaxed);
+    }
+    point = B::Rotate(B::Normalize(hand.q), B::Vec3{0.0f, 0.0f, -1.0f});
     return true;
+}
+B::Vec3 GazeOf(const B::HandsSample& hands) {
+    return B::Rotate(B::Normalize(hands.head_q), B::Vec3{0.0f, 0.0f, -1.0f});
+}
+
+void ToolGazeTick(s64 now) {
+    B::HandsSample hands{};
+    B::Vec3 point{};
+    if (B::LatestHands(hands) && hands.head_valid && LeftPoint(hands, now, point) &&
+        B::Angle(point, GazeOf(hands)) <= VR::Tricks::GazeDeg * B::Deg) {
+        g_tool_gaze_ns.store(now, std::memory_order_relaxed);
+    }
 }
 
 // The burst flies where you look when your hand pointed there within GazeS (thrust at what you
 // look at, it need not still point there as the clip lets it go), else where the hand points;
 // the game's own aim without either. The left hand feels it leave (GunEventKind::ToolBurst).
 bool ToolAim(u8* out, u8* launcher, u8* player) {
+    if (!VR::Tricks::GetTrickSettings().tool_aim ||
+        Read<s32>(launcher + OffsetLauncherCategory) == CategoryGun ||
+        Read<s32>(player + OffsetAnimGoods) != AugurGoods || !HasEffect(player, ItemAnimEffect)) {
+        return false;
+    }
     const s64 now = NowNs();
-    auto f = AimFrame(out, launcher, player, PI_AIM_TOOL, now);
-    f.tool_aim = VR::Tricks::GetTrickSettings().tool_aim;
-    f.category = Read<s32>(launcher + OffsetLauncherCategory);
-    f.anim_goods = Read<s32>(player + OffsetAnimGoods);
-    f.operation = PI_AIM_TOOL_PREPARE;
-    if (!g_emitter_policy.Run(f))
-        return true;
-    const auto preparation = g_emitter_policy.Output().preparation;
-    if (preparation.query_item_effect)
-        f.item_effect = HasEffect(player, preparation.item_effect);
-    f.operation = PI_AIM_TOOL;
+    auto* const rows = reinterpret_cast<float*>(out);
+    const B::Vec3 vanilla = G::FlightOfRows(rows);
+    const float index_f = Read<float>(out + ShotIndexFromOut);
+    const s32 idx = std::isfinite(index_f) ? static_cast<s32>(index_f) : 0;
     B::HandsSample hands{};
     B::Anchor anchor{};
-    if (f.item_effect) {
-        AimHands(f, hands);
-        AimAnchor(f, anchor);
+    B::Vec3 point{};
+    const bool have = B::LatestHands(hands);
+    const bool tracked = have && LeftPoint(hands, now, point);
+    const s64 seen = g_tool_gaze_ns.load(std::memory_order_relaxed);
+    const bool look = have && hands.head_valid && now - hands.steady_ns <= HandsMaxAgeNs &&
+                      seen != 0 && now - seen <= static_cast<s64>(VR::Tricks::GazeS * 1e9f);
+    const char* why = nullptr;
+    if (!look && !tracked) {
+        why = "no left hand";
+    } else if (!B::LatestAnchor(anchor) || !anchor.valid ||
+               now - anchor.steady_ns > AnchorMaxAgeNs) {
+        why = "view";
     }
-    f.tool_gaze_ns = g_tool_gaze_ns.load(std::memory_order_relaxed);
-    const auto seen = f.tool_gaze_ns;
-    if (!g_emitter_policy.Run(f))
-        return true;
-    const auto& result = g_emitter_policy.Output();
-    if (!result.handled)
-        return false;
-    const auto idx = f.index;
-    const auto vanilla = G::FlightOfRows(f.rows);
-    const auto dir = AimVec(result.dir);
-    const bool look = result.look;
-    const auto* why = AimReason(result.reason);
-    if (!ApplyAimRows(out, f, result))
-        return true;
-    if (result.emit_tool_burst)
+    B::Vec3 dir = vanilla;
+    if (why == nullptr) {
+        const B::Vec3 along = look ? GazeOf(hands) : point;
+        dir = B::Normalize(B::TrackingToWorld(along, anchor.base_yaw, 1.0f), vanilla);
+        if (!g_dry_aim) {
+            G::WriteLookRows(rows, dir, ChrForward(player));
+        }
+    }
+    if (idx == 0) {
         Combat::PushGunEvent({Combat::GunEventKind::ToolBurst, 0, 0, 0.0f, now, ""});
+    }
     if (idx == 0 && LineAllowed()) {
-        LOG_INFO(Core,
-                 "VR tool aim: the Augur's burst bid={} bullet={} along {} (the game's {}, "
-                 "{:.1f} deg off){}",
-                 Read<s32>(launcher + OffsetLauncherBid),
-                 Read<s32>(launcher + OffsetLauncherBullet), YawPitch(dir), YawPitch(vanilla),
-                 B::Angle(vanilla, dir) / B::Deg,
+        LOG_INFO(Core, "VR tool aim: the Augur's burst bid={} bullet={} along {} (the game's {}, "
+                       "{:.1f} deg off){}",
+                 Read<s32>(launcher + OffsetLauncherBid), Read<s32>(launcher + OffsetLauncherBullet),
+                 YawPitch(dir), YawPitch(vanilla), B::Angle(vanilla, dir) / B::Deg,
                  why != nullptr ? fmt::format(" (the game's aim: {})", why)
                  : look         ? fmt::format(" (where you look: the hand pointed there {:.0f} "
                                               "ms before)",
@@ -1007,20 +943,17 @@ void NoteShot(const B::Vec3& start, const B::Vec3& ray) {
 }
 
 void PS4_SYSV_ABI GunEmitterHook(u8* out, u8* /*saved_ymm*/, u8* launcher) {
-    if (g_native_aim_dll && VR::Interactions::ProcessFaultLatch().Tripped())
-        return;
     u8* const player = MainPlayer();
     const bool own = player != nullptr && out != nullptr && Plausible(launcher) &&
                      Read<u32>(launcher + OffsetLauncherOwner) == Read<u32>(player + OffsetHandle);
     if (own && g_log >= 1 && Read<s32>(launcher + OffsetLauncherCategory) != CategoryGun &&
         LineAllowed()) {
         // VR_GUN_LOG: every other launch of the hunter's (the right hand's shots, the tools).
-        LOG_INFO(
-            Core,
-            "VR gun: launch bid={} bullet={} category={} anim goods={} item anim={} idx={:.0f}",
-            Read<s32>(launcher + OffsetLauncherBid), Read<s32>(launcher + OffsetLauncherBullet),
-            Read<s32>(launcher + OffsetLauncherCategory), Read<s32>(player + OffsetAnimGoods),
-            HasEffect(player, ItemAnimEffect) ? 1 : 0, Read<float>(out + ShotIndexFromOut));
+        LOG_INFO(Core,
+                 "VR gun: launch bid={} bullet={} category={} anim goods={} item anim={} idx={:.0f}",
+                 Read<s32>(launcher + OffsetLauncherBid), Read<s32>(launcher + OffsetLauncherBullet),
+                 Read<s32>(launcher + OffsetLauncherCategory), Read<s32>(player + OffsetAnimGoods),
+                 HasEffect(player, ItemAnimEffect) ? 1 : 0, Read<float>(out + ShotIndexFromOut));
     }
     if (own && BladeAim(out, launcher, player)) {
         return; // a right-hand shot of ours: from where the tick put it, along its line
@@ -1037,14 +970,7 @@ void PS4_SYSV_ABI GunEmitterHook(u8* out, u8* /*saved_ymm*/, u8* launcher) {
         return; // not the hunter's gun: items (5), right-hand trick guns (1), every NPC
     }
     const s32 bid = Read<s32>(launcher + OffsetLauncherBid);
-    PiNativeAimInput metadata_input{};
-    metadata_input.operation = PI_AIM_GUN_METADATA;
-    metadata_input.bid = bid;
-    metadata_input.now_ns = NowNs();
-    if (!g_emitter_policy.Run(metadata_input))
-        return;
-    const G::GunInfo info =
-        PhysicalInteractions::GunPreparation::Info(g_emitter_policy.Output().gun_preparation);
+    const G::GunInfo info = G::GunOfBehavior(bid);
     if (info.family == G::Family::None) {
         return;
     }
@@ -1057,80 +983,63 @@ void PS4_SYSV_ABI GunEmitterHook(u8* out, u8* /*saved_ymm*/, u8* launcher) {
     B::Vec3 start{rows[3], rows[7], rows[11]};
     const B::Vec3 vanilla = G::FlightOfRows(rows);
 
-    auto f = AimFrame(out, launcher, player, PI_AIM_GUN, now);
-    f.aim = gs.aim;
-    f.origin_barrel = gs.origin_barrel;
-    f.assist_strength = gs.assist;
-    f.assist_deg = gs.assist_deg;
-    f.assist_unlocked = gs.assist_unlocked;
+    // The grip: the direct pull of this frame, else the newest pull (the game's own shot, aimed
+    // when the trigger broke), else the newest hand sample.
+    RaySource src{};
+    bool direct = false;
     {
         std::scoped_lock lock{g_shot_mutex};
-        f.direct.bid = g_direct.bid;
-        f.direct.ns = g_direct.ns;
-        f.direct.pull.serial = g_direct.serial;
-        f.direct.pull.press_ns = g_direct.pull_ns;
-        f.direct.pull.grip_valid = g_direct.grip_valid;
-        f.direct.pull.space = g_direct.space_serial;
-        AimPut(f.direct.pull.q, g_direct.grip_q);
+        if (g_direct.bid == bid && g_direct.grip_valid && now - g_direct.ns <= DirectMaxAgeNs) {
+            src = {true, "pull", "", g_direct.grip_q, g_direct.pull_ns, g_direct.serial, -1};
+            direct = true;
+        }
     }
     B::HandsSample hands{};
-    AimHands(f, hands);
-    Combat::GunPull sent{};
-    f.have_sent = Combat::LatestGunPull(sent);
-    f.sent = AimPull(sent);
-    {
-        std::scoped_lock lock{g_shot_mutex};
-        f.handed = AimPull(g_handed);
+    const bool have_hands = B::LatestHands(hands);
+    if (!src.ok) {
+        // The newest of: a pull the presenter sent to L2, a direct pull handed to L2.
+        Combat::GunPull pull{};
+        const bool sent = Combat::LatestGunPull(pull) && !pull.direct;
+        Combat::GunPull handed{};
+        {
+            std::scoped_lock lock{g_shot_mutex};
+            handed = g_handed;
+        }
+        if (!sent || (handed.serial != 0 && handed.press_ns > pull.press_ns)) {
+            pull = handed;
+        }
+        if (pull.serial != 0 && pull.grip_valid && now - pull.press_ns <= PullPoseMaxAgeNs &&
+            (pull.serial != g_game_shot_serial || idx > 0) &&
+            (!have_hands || hands.space_serial == pull.space_serial)) {
+            src = {true, "pull", "", pull.grip_q, pull.press_ns, pull.serial, -1};
+            if (idx == 0) {
+                g_game_shot_serial = pull.serial;
+            }
+        }
+    }
+    if (!src.ok && have_hands && B::IsTracked(hands.hand[B::C0000::Left]) &&
+        now - hands.steady_ns <= HandsMaxAgeNs) {
+        src = {true, "now", "", hands.hand[B::C0000::Left].q, 0, 0, now - hands.steady_ns};
+    }
+    const char* why = gs.aim ? nullptr : "aim disabled";
+    if (!src.ok) {
+        why = "hands";
     }
     B::Anchor anchor{};
-    AimAnchor(f, anchor);
-    B::BodyStatus body{};
-    f.have_body = B::LatestBodyStatus(body);
-    f.body = {body.driven, body.drawn_weight[B::C0000::Left], body.steady_ns};
-    const auto attach = G::AttachOf(info.attach);
-    f.barrel_frame_valid = attach.has_value();
-    if (attach)
-        AimPut(f.barrel_forward, attach->forward);
-    const auto trim = B::DefaultWeaponGrip();
-    f.blade_pitch = VR::GetSettings().blade_pitch_deg;
-    f.trim_yaw = trim.yaw_deg;
-    f.trim_pitch = trim.pitch_deg;
-    f.trim_roll = trim.roll_deg;
-    bool locked = false, have_target = false;
-    B::Vec3 target{}, muzzle{}, palm{};
-    std::array<float, 12> muzzle_rows{};
-    const s32 muzzle_id = info.attach == 348 || info.family == G::Family::Sprayer ? 20206 : 20215;
-    // Gate live world reads only. The DLL rechecks every interaction eligibility condition.
-    if (gs.aim && f.have_anchor && anchor.valid && now - anchor.steady_ns <= AnchorMaxAgeNs &&
-        f.have_body && body.driven && body.drawn_weight[B::C0000::Left] >= .5f) {
-        locked = VR::IsLockedOn();
-        have_target = Read<u8>(player + OffsetLockChosen) != 0;
-        target = Read3(player + OffsetLockPoint);
-        f.have_muzzle = DummyAt(player, muzzle_id, muzzle, &muzzle_rows);
-        if (gs.origin_barrel && f.have_muzzle)
-            f.have_palm = DummyAt(player, PalmDummy, palm);
+    if (why == nullptr &&
+        (!B::LatestAnchor(anchor) || !anchor.valid || now - anchor.steady_ns > AnchorMaxAgeNs)) {
+        why = "view";
     }
-    f.locked = locked;
-    f.have_target = have_target;
-    AimPut(f.target, target);
-    AimPut(f.muzzle, muzzle);
-    AimPut(f.palm, palm);
-    if (!g_emitter_policy.Run(f))
-        return;
-    const auto& result = g_emitter_policy.Output();
-    if (g_native_aim_dll && VR::Interactions::ProcessFaultLatch().Tripped())
-        return;
-    RaySource src{result.source_ok != 0,
-                  result.source == PI_AIM_SOURCE_PULL  ? "pull"
-                  : result.source == PI_AIM_SOURCE_NOW ? "now"
-                                                       : "",
-                  "",
-                  {result.q[0], result.q[1], result.q[2], result.q[3]},
-                  result.pull_ns,
-                  result.serial,
-                  result.hands_age_ns};
-    const bool direct = result.direct;
-    const auto* why = AimReason(result.reason);
+    B::BodyStatus body{};
+    // The arm as drawn (a kept dodge's shot, dodge_attack, leaves along the barrel in your hand).
+    if (why == nullptr && (!B::LatestBodyStatus(body) || now - body.steady_ns > StatusMaxAgeNs ||
+                           !body.driven || body.drawn_weight[B::C0000::Left] < 0.5f)) {
+        why = "arm";
+    }
+    const B::Vec3 barrel = BarrelInGripNow(info.attach);
+    if (why == nullptr && B::LengthSq(barrel) == 0.0f) {
+        why = "nobarrel";
+    }
     if (why != nullptr) {
         std::atomic<u64>& counter = why[0] == 'h'   ? g_stats.vanilla_hands
                                     : why[0] == 'v' ? g_stats.vanilla_view
@@ -1147,26 +1056,44 @@ void PS4_SYSV_ABI GunEmitterHook(u8* out, u8* /*saved_ymm*/, u8* launcher) {
                      G::FamilyName(info.family), bid, bullet, idx, YawPitch(vanilla), why,
                      direct ? " DIRECT" : "");
         }
-        if (result.emit_game_shot) {
-            Combat::ObserveGunHandoffShot(src.serial, static_cast<u32>(info.family),
-                                          reinterpret_cast<uintptr_t>(player),
-                                          Read<u32>(player + OffsetHandle));
+        if (idx == 0 && !direct) {
             Combat::PushGunEvent({Combat::GunEventKind::GameShot, src.serial,
                                   static_cast<u8>(info.family), 0.0f, now, why});
             StoreKick(info.family, info.attach, now);
         }
         return;
     }
-    const auto ray = AimVec(result.ray);
-    const G::AssistOut a{AimVec(result.dir), result.assist_weight, result.assist_angle,
-                         result.assist_moved};
-    const auto shift = AimVec(result.shift);
-    const bool moved = result.moved;
-    const bool written = result.written;
-    const bool have_muzzle = f.have_muzzle;
-    if (!ApplyAimRows(out, f, result))
-        return;
-    start = AimVec(result.start);
+    const B::Vec3 ray = G::BarrelRayWorld(src.q, barrel, anchor.base_yaw);
+    const bool locked = VR::IsLockedOn();
+    const bool have_target = Read<u8>(player + OffsetLockChosen) != 0;
+    const B::Vec3 target = Read3(player + OffsetLockPoint);
+    G::AssistCfg cfg{};
+    cfg.strength = gs.assist;
+    cfg.cone_deg = gs.assist_deg;
+    cfg.unlocked = gs.assist_unlocked;
+    const G::AssistOut a =
+        G::GentleAssist(ray, start, target, have_target, locked, info.gravity, cfg);
+    // The start onto the barrel's line, unless the game pulled it back from a wall (then it is no
+    // longer the palm) or the muzzle is not where a gun in this hand would have it.
+    B::Vec3 shift{};
+    bool moved = false;
+    B::Vec3 palm{};
+    const s32 muzzle_id = info.attach == 348 || info.family == G::Family::Sprayer ? 20206 : 20215;
+    B::Vec3 muzzle{};
+    std::array<float, 12> muzzle_rows{};
+    const bool have_muzzle = DummyAt(player, muzzle_id, muzzle, &muzzle_rows);
+    if (gs.origin_barrel && have_muzzle && DummyAt(player, PalmDummy, palm) &&
+        B::Length(start - palm) <= 0.01f) {
+        B::Vec3 p = start;
+        moved = G::OriginOnBarrel(p, a.dir, muzzle, MaxOriginShiftM, &shift);
+        if (moved && !g_dry_aim) {
+            rows[3] = p.x;
+            rows[7] = p.y;
+            rows[11] = p.z;
+            start = p;
+        }
+    }
+    const bool written = !g_dry_aim && G::WriteLookRows(rows, a.dir, ChrForward(player));
     g_stats.aimed.fetch_add(1, std::memory_order_relaxed);
     if (a.weight > 0.0f) {
         g_stats.assisted.fetch_add(1, std::memory_order_relaxed);
@@ -1174,16 +1101,17 @@ void PS4_SYSV_ABI GunEmitterHook(u8* out, u8* /*saved_ymm*/, u8* launcher) {
     if (moved) {
         g_stats.origin_moved.fetch_add(1, std::memory_order_relaxed);
     }
-    if (result.emit_game_shot) {
-        Combat::ObserveGunHandoffShot(src.serial, static_cast<u32>(info.family),
-                                      reinterpret_cast<uintptr_t>(player),
-                                      Read<u32>(player + OffsetHandle));
+    if (idx == 0 && !direct) {
         Combat::PushGunEvent({Combat::GunEventKind::GameShot, src.serial,
                               static_cast<u8>(info.family), 1.0f, now, ""});
         StoreKick(info.family, info.attach, now);
     }
     u32 n = 0;
-    const s64 since_ns = result.since_ns;
+    static s64 last_shot_ns = 0; // the emitter's own (game thread)
+    const s64 since_ns = idx == 0 && last_shot_ns != 0 ? now - last_shot_ns : -1;
+    if (idx == 0) {
+        last_shot_ns = now;
+    }
     {
         std::scoped_lock lock{g_shot_mutex};
         if (idx == 0) {
@@ -1248,13 +1176,24 @@ void PS4_SYSV_ABI GunEmitterHook(u8* out, u8* /*saved_ymm*/, u8* launcher) {
 
 struct TickState {
     const u8* chr{nullptr};
-    PiAttackGunRequestOutput request{}; // Approved lifecycle snapshot, owned by DLL.
-    Combat::GunPull pull{}; // Copied pose facts for native dispatch/correlation only.
-    PiAttackGunTimingOutput timing{}; // Approved snapshot; timers live in DLL state.
+    s64 last_ns{0};
+    u32 handled{0}; // the newest pull serial looked at
+    bool pending{false};
+    Combat::GunPull pull{};
+    bool first_look{true};
+    float cooldown_left{0.0f};
+    float flash_left{0.0f};
+    s32 flash_slot{FirstFlashSlot};
+    s32 flash_ffx{-1};
+    s32 flash_dummy{20215};
+    float regen_left{0.0f};
+    u32 shots{0};
+    s64 last_shot_ns{0};
+    u32 updates{0};
     // Cached each few updates.
     s32 bid{-1};
     G::GunInfo info{};
-    std::optional<G::DirectGun> gun; // copied approved metadata; never a DLL pointer
+    const G::DirectGun* gun{nullptr};
     bool can_fire{false};
     bool two_handed{false};
     // Logs.
@@ -1265,36 +1204,11 @@ struct TickState {
 };
 TickState g_tick{};
 
-PiNativeGunPull PackGunRequest(const Combat::GunPull& pull) {
-    return {pull.serial, pull.direct, pull.grip_valid, pull.space_serial, pull.press_ns,
-            {pull.grip_q.x, pull.grip_q.y, pull.grip_q.z, pull.grip_q.w},
-            {pull.grip_p.x, pull.grip_p.y, pull.grip_p.z}, 0};
-}
-PiAttackGunRequestOutput GunRequest(TickState& t, const PiAttackGunRequestFacts& facts, s64 now) {
-    PiNativeAttackInput input{};
-    input.operation = PI_ATTACK_GUN_REQUEST;
-    input.now_ns = now;
-    input.decision.request = facts;
-    t.request = g_native_gun_policy.Call(input).request;
-    const auto& p = t.request.pull;
-    t.pull = {p.serial, p.direct != 0, p.press_ns, p.grip_valid != 0,
-              {p.q[0], p.q[1], p.q[2], p.q[3]}, {p.p[0], p.p[1], p.p[2]}, p.space};
-    return t.request;
-}
-
-PiAttackGunTimingOutput GunTiming(uint32_t side, const PiAttackGunTimingFacts& facts, s64 now) {
-    PiNativeAttackInput input{};
-    input.operation = PI_ATTACK_GUN_TIMING;
-    input.side = side;
-    input.now_ns = now;
-    input.decision.timing = facts;
-    const auto output = g_native_gun_policy.Call(input);
-    if (g_native_gun_policy.Faulted()) {
-        PiAttackGunTimingOutput disabled{};
-        disabled.flash_ffx = -1;
-        return disabled;
-    }
-    return output.timing;
+float StepSeconds(TickState& t, s64 now) {
+    const float dt =
+        t.last_ns != 0 ? std::clamp(static_cast<float>(now - t.last_ns) * 1e-9f, 0.0f, 0.1f) : 0.0f;
+    t.last_ns = now;
+    return dt;
 }
 
 // The game's sound for a gun event, at `pos` (event 128's type, SoundType 1).
@@ -1310,86 +1224,51 @@ u64 Sound(s32 id, B::Vec3 pos) {
 }
 
 void RequestFlash(u8* chr, const TickState& t) {
-    if (!g_flash || g_dry_run || t.timing.flash_ffx < 0) {
+    if (!g_flash || g_dry_run || t.flash_ffx < 0) {
         return;
     }
     u8* const ctl = chr + OffsetSfxCtl;
     if (Read<u8*>(ctl) != g_base + SfxCtlVtableRva) {
         return;
     }
-    const s32 dummy = t.timing.flash_dummy;
-    g_sfx_slot(ctl, t.timing.flash_slot, t.timing.flash_ffx, &dummy, 0);
+    const s32 dummy = t.flash_dummy;
+    g_sfx_slot(ctl, t.flash_slot, t.flash_ffx, &dummy, 0);
 }
 
-PiGunPreparationOutput GunPreparation(const PiGunPreparationFacts& facts, s64 now) {
-    PiNativeAttackInput p{};
-    p.operation = PI_ATTACK_GUN_PREPARATION;
-    p.now_ns = now;
-    p.decision.gun_preparation = facts;
-    return g_native_gun_policy.Call(p).gun_preparation;
-}
-s32 BulletCost(u8* chr, s32 fallback, s32 hand = HandLeft) {
-    const auto output = GunPreparation(ReadBulletCost(chr, fallback, hand), NowNs());
-    return g_native_gun_policy.Faulted() ? -1 : output.cost;
-}
 void Fire(u8* chr, TickState& t, s64 now) {
     const auto& gs = G::GetGunSettings();
     const G::DirectGun& gun = *t.gun;
     const u32 serial = t.pull.serial;
     const float pull_ms = static_cast<float>(now - t.pull.press_ns) * 1e-6f;
-    const auto deny_policy_fault = [&] {
-        Combat::PushGunEvent({Combat::GunEventKind::Denied, serial, static_cast<u8>(gun.family),
-                              0.f, now, "interaction DLL fault"});
-    };
     B::Vec3 muzzle{};
     if (!DummyAt(chr, gun.flash_dummy, muzzle) && !DummyAt(chr, PalmDummy, muzzle)) {
         muzzle = {};
     }
     const s32 q_before = GoodsCount(chr, QuicksilverBullets);
     const s32 b_before = GoodsCount(chr, BloodBullets);
-    PiGunPreparationFacts admission{};
-    admission.command = PI_GUN_PREP_PLAN;
-    admission.can_fire = g_can_fire(chr, 0) != 0;
-    // The effect list is only read after native CanFire succeeds, as before.
-    admission.ash = admission.can_fire && HasEffect(chr, BoneMarrowAsh);
-    const auto plan = GunPreparation(admission, now);
-    if (g_native_gun_policy.Faulted()) {
-        deny_policy_fault();
-        return;
-    }
-    if (plan.dry_fire) {
+    if (g_can_fire(chr, 0) == 0) {
         const u64 h = Sound(gun.dry, muzzle);
-        t.timing = GunTiming(0, {PI_AGT_DRY}, now);
+        t.cooldown_left = DryCooldownS;
         g_stats.dry.fetch_add(1, std::memory_order_relaxed);
         Combat::PushGunEvent({Combat::GunEventKind::Dry, serial, static_cast<u8>(gun.family), 0.0f,
                               now, "no bullets"});
         LOG_INFO(Core,
                  "VR gun: DRY #{} serial={} pull->e0={:.1f} ms bullets 900:{} 901:{} -> click {} "
                  "(h={:#x}), no bullet{}",
-                 t.timing.shots, serial, pull_ms, q_before, b_before, gun.dry, h,
+                 t.shots, serial, pull_ms, q_before, b_before, gun.dry, h,
                  g_dry_run ? " DRY RUN" : "");
         return;
     }
-    const bool ash = admission.ash;
-    const s32 judge = plan.judge;
+    const bool ash = HasEffect(chr, BoneMarrowAsh);
+    const s32 judge = ash ? JudgeAsh : JudgeShot;
     const s32 bid = BehaviorId(chr, judge);
     RowOut row{};
     if (bid > 0) {
         g_behavior_row(&row, bid, 1);
     }
-    PiGunPreparationFacts row_facts{PI_GUN_PREP_ROW, bid, static_cast<uint32_t>(gun.family)};
-    row_facts.have_row = Plausible(row.row, 4);
-    if (row_facts.have_row) {
-        row_facts.ref_type = Read<u8>(row.row + RowRefType);
-        if (row_facts.ref_type == 1)
-            row_facts.category = Read<u8>(row.row + RowCategory);
-    }
-    const auto prepared = GunPreparation(row_facts, now);
-    if (g_native_gun_policy.Faulted()) {
-        deny_policy_fault();
-        return;
-    }
-    const bool row_ok = prepared.row_ok;
+    const bool row_ok = Plausible(row.row, 4) && Read<u8>(row.row + RowRefType) == 1 &&
+                        Read<u8>(row.row + RowCategory) == CategoryGun &&
+                        G::GunOfBehavior(bid).family == gun.family;
     if (!row_ok) {
         g_stats.handed.fetch_add(1, std::memory_order_relaxed);
         {
@@ -1417,11 +1296,7 @@ void Fire(u8* chr, TickState& t, s64 now) {
                     t.pull.grip_valid,
                     t.pull.space_serial};
     }
-    const s32 cost = BulletCost(chr, prepared.cost);
-    if (cost < 0) {
-        deny_policy_fault();
-        return;
-    } // Nothing was invoked.
+    const s32 cost = BulletCost(chr, G::GunOfBehavior(bid).cost);
     u8 ok = 0;
     u8 consumed = 0;
     if (!g_dry_run) {
@@ -1429,18 +1304,22 @@ void Fire(u8* chr, TickState& t, s64 now) {
         // As the event does: after the shot, whatever it returned.
         consumed = g_consume(chr, cost);
     }
-    PiAttackGunTimingFacts timing{};
-    timing.command = PI_AGT_SHOT;
-    timing.family = static_cast<uint32_t>(gun.family);
-    timing.ash = ash;
-    timing.regen_pause = gs.regen_pause;
-    timing.have_regen = g_regen;
-    timing.rate_scale = gs.rate_scale;
-    t.timing = GunTiming(0, timing, now);
-    if (t.timing.renew_flash) RequestFlash(chr, t);
+    ++t.shots;
+    // The flash: the next private slot (overlapping flashes each keep their own node), renewed
+    // every update for the clip's flash time.
+    t.flash_slot = FirstFlashSlot + static_cast<s32>(t.shots % FlashSlots);
+    t.flash_ffx = ash ? gun.flash_ffx_ash : gun.flash_ffx;
+    t.flash_dummy = gun.flash_dummy;
+    t.flash_left = gun.flash_s;
+    RequestFlash(chr, t);
     const u64 h = Sound(gun.bang, muzzle);
+    if (gs.regen_pause && g_regen) {
+        t.regen_left = gun.regen_pause_s;
+    }
+    t.cooldown_left = gun.cadence_s * gs.rate_scale;
     StoreKick(gun.family, t.info.attach, now);
-    const s64 since_ns = t.timing.since_ns;
+    const s64 since_ns = t.last_shot_ns != 0 ? now - t.last_shot_ns : -1;
+    t.last_shot_ns = now;
     (ok != 0 ? g_stats.fired : g_stats.fired_failed).fetch_add(1, std::memory_order_relaxed);
     Combat::PushGunEvent({Combat::GunEventKind::Fired, serial, static_cast<u8>(gun.family),
                           ok != 0 ? 1.0f : 0.0f, now, ""});
@@ -1448,46 +1327,47 @@ void Fire(u8* chr, TickState& t, s64 now) {
              "VR gun: FIRE #{} serial={} {} pull->e0={:.1f} ms{} bid={} judge={} bullet={} dmy={} "
              "ok={} cost={} consumed={} bullets 900:{}->{} 901:{}->{} flash ffx {}@{} slot {} "
              "bang {} (h={:#x}) cool {:.3f} s regen pause {:.3f} s thread '{}'{}",
-             t.timing.shots, serial, G::FamilyName(gun.family), pull_ms,
+             t.shots, serial, G::FamilyName(gun.family), pull_ms,
              since_ns >= 0 ? fmt::format(" ({:.0f} ms after the last shot)",
                                          static_cast<double>(since_ns) * 1e-6)
                            : std::string{},
              bid, judge, bullet, gun.shot_dummy, ok, cost, consumed, q_before,
              GoodsCount(chr, QuicksilverBullets), b_before, GoodsCount(chr, BloodBullets),
-             t.timing.flash_ffx, t.timing.flash_dummy, t.timing.flash_slot, gun.bang, h, t.timing.cooldown, t.timing.regen_left,
+             t.flash_ffx, t.flash_dummy, t.flash_slot, gun.bang, h, t.cooldown_left, t.regen_left,
              Common::GetCurrentThreadName(), g_dry_run ? " DRY RUN (nothing fired)" : "");
 }
 
-PiAttackGunGateFacts ReadGunGateFacts(const u8* chr, const GunBody& body) {
-    PiAttackGunGateFacts facts{};
-    facts.body = body.body;
-    facts.driven = body.driven;
-    facts.left_ik = body.left_ik;
-    facts.left_weight = body.left_weight;
-    facts.body_reason = static_cast<uint32_t>(body.reason);
-    // Read-only native facts are copied once. No game action occurs while assembling them.
-    if (const auto* data = DataModule(chr)) {
-        facts.have_data = 1;
-        facts.hp = Read<s32>(data + OffsetHp);
-        facts.stamina = Read<s32>(data + OffsetStamina);
+const char* HardReason(const u8* chr, const GunBody& body) {
+    if (!body.body) {
+        return "body off";
     }
-    facts.menu = VR::IsGameMenuOpen();
-    facts.cinematic = VR::CinematicActive();
-    return facts;
-}
-PiAttackGunGateOutput GunGatePolicy(const PiAttackGunGateFacts& facts, bool pull = false) {
-    PiNativeAttackInput input{};
-    input.operation = pull ? PI_ATTACK_GUN_PULL : PI_ATTACK_GUN_GATE;
-    input.decision.gun = facts;
-    const auto output = g_native_gun_policy.Call(input);
-    if (g_native_gun_policy.Faulted()) {
-        PiAttackGunGateOutput denied{};
-        denied.action = static_cast<uint32_t>(G::PullAction::Deny);
-        denied.reason = PI_AG_FAULT;
-        return denied;
+    switch (body.reason) {
+    case B::GateReason::Dead:
+        return "dead";
+    case B::GateReason::Throw:
+        return "visceral or grab";
+    case B::GateReason::Ladder:
+        return "ladder";
+    case B::GateReason::Event:
+        return "event";
+    default:
+        break;
     }
-    return output.gun;
+    if (const u8* data = DataModule(chr); data != nullptr && Read<s32>(data + OffsetHp) <= 0) {
+        return "dead";
+    }
+    if (VR::IsGameMenuOpen()) {
+        return "menu";
+    }
+    if (VR::CinematicActive()) {
+        return "cinematic";
+    }
+    if (!body.driven) {
+        return "not first person";
+    }
+    return nullptr;
 }
+
 // VR_GUN_SCAN=<ms> (tests): every <ms> where the hunter is and faces, the camera's view and the
 // game's lock-on candidates (LockTgtMan [0x553E860]: a list from +0x08 linked through +0x80, the
 // world lock point at +0x00, flags at +0x90; the quick items' SCAN line, faster), and for 4 s after
@@ -1669,10 +1549,9 @@ void ProbePull(u8* chr, TickState& t, s64 now) {
     pull.grip_valid = true;
     pull.grip_q = B::FromTo(barrel, tracking);
     pull.space_serial = hands.space_serial;
-    PiAttackGunRequestFacts request{};
-    request.command = PI_AGR_PROBE;
-    request.pull = PackGunRequest(pull);
-    GunRequest(t, request, now);
+    t.pending = true;
+    t.pull = pull;
+    t.first_look = true;
     LOG_INFO(Core,
              "VR gun: PROBE shot {} at the target's anim {} +{:.0f} ms (delay {} ms), the target "
              "{:.2f} m away",
@@ -1682,7 +1561,7 @@ void ProbePull(u8* chr, TickState& t, s64 now) {
 
 void LogStats(TickState& t, s64 now) {
     if (now - t.last_stats_ns < StatsNs ||
-        (g_log == 0 && g_stats.lines.load() == 0 && t.timing.shots == 0)) {
+        (g_log == 0 && g_stats.lines.load() == 0 && t.shots == 0)) {
         return;
     }
     t.last_stats_ns = now;
@@ -1816,56 +1695,105 @@ bool InstallFire(u8* module, bool wcm_ok) {
 // transformed R2 (550, 910 or 500, else its first bullet row: its bullets are checked and spent);
 // the Moonlight Sword's waves (the first after its R2 550 and after its charged R2 570, nothing
 // else); the Stake Driver's charged R2 (570 or 930, when a bullet). The log lists them all.
-PiAttackBladeRowsOutput SelectBladeRows(s32 variation, VR::Tricks::Shot shot, bool charged,
-                                             s64 now) {
-    PiNativeAttackInput input{};
-    input.operation = PI_ATTACK_BLADE_ROWS;
-    input.now_ns = now;
-    auto& facts = input.decision.blade_rows;
-    facts.command = PI_ABR_SELECT;
-    facts.variation = variation;
-    facts.shot = static_cast<uint32_t>(shot);
-    facts.charged = charged;
-    auto output = g_native_gun_policy.Call(input).blade_rows;
-    if (!output.scan) return output;
+struct BladeRows {
+    s32 variation{-1};
+    s32 shot{-1};    // judge, -1 none
+    s32 charged{-1}; // judge, -1 none
+};
+
+BladeRows ScanBladeRows(s32 variation, VR::Tricks::Shot shot) {
+    namespace T = VR::Tricks;
+    BladeRows r{};
+    r.variation = variation;
+    std::array<s32, 32> found{};
+    u32 n = 0;
     std::string list;
-    // Preserve the native scan and its log in one host batch. The DLL selects from the
-    // copied mask, including the original first-32 matching-row limit.
-    for (s32 judge = output.first; judge <= output.last; ++judge) {
+    for (s32 judge = 400; judge <= 999; ++judge) {
         RowOut row{};
         g_behavior_row(&row, 100000000 + variation * 1000 + judge, 1);
-        if (!Plausible(row.row, 4) || Read<u8>(row.row + RowRefType) != 1) continue;
-        const uint32_t bit = static_cast<uint32_t>(judge - output.first);
-        facts.bullet_mask[bit / 32] |= uint32_t{1} << (bit % 32);
+        if (!Plausible(row.row, 4) || Read<u8>(row.row + RowRefType) != 1) {
+            continue;
+        }
+        if (n < found.size()) {
+            found[n++] = judge;
+        }
         list += fmt::format(" {} (bullet {} category {})", judge, Read<s32>(row.row + RowRefId),
                             Read<u8>(row.row + RowCategory));
     }
-    facts.command = PI_ABR_REPLY;
-    facts.token = output.token;
-    output = g_native_gun_policy.Call(input).blade_rows;
-    if (output.log) {
-        LOG_INFO(Core, "VR blade shot: variation {}'s bullet rows (judges 400-999):{} -> shot {}, "
-                       "charged {}", variation, list.empty() ? std::string{" none"} : list,
-                       output.shot, output.charged);
+    const auto first_of = [&](std::span<const s32> judges) {
+        for (const s32 j : judges) {
+            if (std::find(found.begin(), found.begin() + n, j) != found.begin() + n) {
+                return j;
+            }
+        }
+        return -1;
+    };
+    const auto first_in = [&](s32 lo, s32 hi) {
+        for (u32 k = 0; k < n; ++k) {
+            if (found[k] >= lo && found[k] <= hi) {
+                return found[k];
+            }
+        }
+        return -1;
+    };
+    switch (shot) {
+    case T::Shot::GunBlade:
+        r.shot = first_of(T::HeavyJudgesB);
+        r.shot = r.shot >= 0 ? r.shot : (n > 0 ? found[0] : -1);
+        break;
+    case T::Shot::MoonWave:
+        // Only the rows right after its R2 and charged R2: any other bullet row of the weapon may
+        // be an attack the game charges bullets for (its transformed L2), never fired free here.
+        r.shot = first_in(551, 569);
+        r.charged = first_in(571, 599);
+        r.charged = r.charged >= 0 ? r.charged : r.shot;
+        break;
+    case T::Shot::StakeBlast:
+        // Its own charged rows only: an attack row there is the charged swing's (the melee's).
+        r.charged = first_of(T::ChargedJudgesB);
+        r.shot = r.charged;
+        break;
+    case T::Shot::Bow:
+        // The quick shot: its R1 (400 .. 449); the charged: its charged R2, else its R2.
+        r.shot = first_in(400, 449);
+        r.charged = first_of(T::ChargedJudgesB);
+        r.charged = r.charged >= 0 ? r.charged : first_of(T::HeavyJudgesB);
+        r.charged = r.charged >= 0 ? r.charged : r.shot;
+        if (r.shot < 0) {
+            r.shot = r.charged;
+        }
+        break;
+    case T::Shot::None:
+        break;
     }
-    return output;
+    LOG_INFO(Core, "VR blade shot: variation {}'s bullet rows (judges 400-999):{} -> shot {}, "
+                   "charged {}",
+             variation, list.empty() ? std::string{" none"} : list, r.shot, r.charged);
+    return r;
 }
 
 struct BladeTick {
     u8* chr{nullptr};
     u32 handled{0};
-    PiAttackGunTimingOutput timing{}; // Independent right-hand DLL timers.
-
+    BladeRows rows{};
+    float cooldown_left{0.0f};
+    s64 last_ns{0};
+    u32 shots{0};
+    // The gun-blade's muzzle flash, renewed every update for its time (as the gun's).
+    s32 flash_ffx{-1};
+    s32 flash_dummy{-1};
+    s32 flash_slot{FirstBladeFlashSlot};
+    float flash_left{0.0f};
 };
 BladeTick g_blade{};
 
 void RequestBladeFlash(u8* chr, const BladeTick& t) {
-    if (!g_flash || g_dry_run || t.timing.flash_ffx < 0) {
+    if (!g_flash || g_dry_run || t.flash_ffx < 0) {
         return;
     }
     u8* const ctl = chr + OffsetSfxCtl;
     if (Read<u8*>(ctl) == g_base + SfxCtlVtableRva) {
-        g_sfx_slot(ctl, t.timing.flash_slot, t.timing.flash_ffx, &t.timing.flash_dummy, 0);
+        g_sfx_slot(ctl, t.flash_slot, t.flash_ffx, &t.flash_dummy, 0);
     }
 }
 
@@ -1881,7 +1809,6 @@ void InstallGun(VAddr base, u64 size) {
                  size);
         return;
     }
-    if(!InitNativeAimDll())return;
     g_base = module;
     if (const char* value = std::getenv("VR_GUN_LOG"); value != nullptr) {
         g_log = std::max(std::atoi(value), 1);
@@ -1927,65 +1854,110 @@ void InstallGun(VAddr base, u64 size) {
 // weapon_wall (core/vr/solid_weapon.h): the left gun's line along its barrel, from its back
 // (dummy 20100) to its muzzle, as far from the left hand's grip (L_Weapon's origin, dummy 340)
 // along the barrel; measured once per gun as it is in the hand (GunBarrelReach).
-// Approved DLL snapshot only; the cache key, retry decisions and geometry live in the DLL.
-PiAttackGunBarrelOutput g_barrel{};
+constexpr s32 LeftGripDummy = 340;
+struct BarrelReach {
+    s32 key{-1}; // family * 1000 + attach
+    bool valid{false};
+    s32 attach{-1};
+    float back{0.0f};
+    float front{0.0f};
+};
+BarrelReach g_barrel{};
 
 void MeasureBarrel(u8* chr, const TickState& t, bool in_hand) {
-    PiNativeAttackInput input{};
-    input.operation = PI_ATTACK_GUN_BARREL;
-    auto& facts = input.decision.barrel;
-    facts.command = PI_AGB_BEGIN;
-    facts.family = static_cast<uint32_t>(t.info.family);
-    facts.attachment = t.info.attach;
-    facts.in_hand = in_hand;
-    auto output = g_native_gun_policy.Call(input).barrel;
-    s32 muzzle_id = -1;
-    // Grip -> back -> muzzle, stopping at the first unavailable native point.
-    for (int i = 0; output.query && i < 3; ++i) {
-        B::Vec3 point{};
-        facts.command = PI_AGB_REPLY;
-        facts.request_id = output.request_id;
-        facts.reply_id = output.query_id;
-        facts.have = DummyAt(chr, output.query_id, point);
-        facts.point[0] = point.x; facts.point[1] = point.y; facts.point[2] = point.z;
-        muzzle_id = output.query_id;
-        output = g_native_gun_policy.Call(input).barrel;
+    if (!in_hand || t.info.family == G::Family::None) {
+        g_barrel.valid = false;
+        g_barrel.key = -1;
+        return;
     }
-    g_barrel = output;
-    if (!output.measured) return;
+    const s32 key = static_cast<s32>(t.info.family) * 1000 + t.info.attach;
+    if (key == g_barrel.key) {
+        return; // measured
+    }
+    g_barrel.valid = false; // another gun: none until it shows in the hand
+    const s32 muzzle_id =
+        t.info.attach == 348 || t.info.family == G::Family::Sprayer ? 20206 : 20215;
+    B::Vec3 grip{};
+    B::Vec3 back{};
+    B::Vec3 muzzle{};
+    if (!DummyAt(chr, LeftGripDummy, grip) || !DummyAt(chr, PartLineDummy, back) ||
+        !DummyAt(chr, muzzle_id, muzzle) || B::Length(muzzle - back) < 0.05f ||
+        B::Length(back - grip) > 1.0f) {
+        return; // not shown in the hand yet
+    }
+    const B::Vec3 axis = B::Normalize(muzzle - back);
+    g_barrel = {key, true, t.info.attach, B::Dot(back - grip, axis), B::Dot(muzzle - grip, axis)};
     LOG_INFO(Core,
              "VR gun: {}'s barrel for weapon_wall: {:.0f} .. {:.0f} cm along it from the left "
              "grip (attach {}, muzzle dummy {})",
-             G::FamilyName(t.info.family), output.back * 100.0f, output.front * 100.0f,
+             G::FamilyName(t.info.family), g_barrel.back * 100.0f, g_barrel.front * 100.0f,
              t.info.attach, muzzle_id);
 }
 
+// shield_guard (core/vr/shield_guard.h): the two shields' rows raised while it is on, the
+// game's values back when it is turned off. Cheap: two row lookups a frame.
+void ShieldGuardTick() {
+    static std::array<VR::Shield::RowPatch, VR::Shield::Targets.size()> patches{};
+    static std::array<bool, VR::Shield::Targets.size()> warned{};
+    const bool on = VR::Tricks::GetTrickSettings().shield_guard;
+    for (std::size_t i = 0; i < patches.size(); ++i) {
+        const VR::Shield::Target& target = VR::Shield::Targets[i];
+        u8* const row = const_cast<u8*>(GunWeaponParamRow(target.weapon));
+        if (row == nullptr) {
+            continue;
+        }
+        const auto result = patches[i].Step(row, target.at_least, on);
+        const VR::Shield::Guard& g = patches[i].Game();
+        const VR::Shield::Guard& w = patches[i].Written();
+        if (result == VR::Shield::RowPatch::Result::Raised) {
+            LOG_INFO(Core,
+                     "VR shield: weapon {} guards better: physical {:.0f} -> {:.0f}%, arcane "
+                     "{:.0f} -> {:.0f}, fire {:.0f} -> {:.0f}, bolt {:.0f} -> {:.0f}, stability "
+                     "{} -> {}",
+                     target.weapon, g.phys, w.phys, g.mag, w.mag, g.fire, w.fire, g.thun, w.thun,
+                     g.repel, w.repel);
+        } else if (result == VR::Shield::RowPatch::Result::Restored) {
+            LOG_INFO(Core, "VR shield: weapon {}: the game's own guard values back",
+                     target.weapon);
+        } else if (result == VR::Shield::RowPatch::Result::Implausible && !warned[i]) {
+            warned[i] = true;
+            LOG_WARNING(Core, "VR shield: weapon {}'s row differs from 1.09: left as it is",
+                        target.weapon);
+        }
+    }
+}
+
 void GunPoseTick(u8* chr, const GunBody& body) {
-    if(g_native_aim_dll&&VR::Interactions::ProcessFaultLatch().Tripped())return;
     if (g_base == nullptr || chr == nullptr) {
         return;
     }
+    ShieldGuardTick();
     auto& t = g_tick;
     const auto& gs = G::GetGunSettings();
     const s64 now = NowNs();
-    if(!ToolGazeTick(now))return;
-    const bool owner_changed = chr != t.chr;
-    PiAttackGunTimingFacts timing_facts{};
-    timing_facts.command = PI_AGT_TICK;
-    timing_facts.owner_changed = owner_changed;
-    const auto timing = GunTiming(0, timing_facts, now);
-    if (g_native_gun_policy.Faulted()) return;
+    ToolGazeTick(now);
+    const float dt = StepSeconds(t, now);
     static u32 player_epoch = 0;
     static s64 player_since_ns = 0;
-    if (owner_changed) {
+    if (chr != t.chr) {
         ++player_epoch;
         player_since_ns = now;
+        // A new character object (a load): nothing of the old one carries over.
+        const u32 handled = t.handled;
         t = {};
         t.chr = chr;
+        t.handled = handled;
+        t.last_ns = now;
     }
-    t.timing = timing;
-    if (timing.renew_flash) RequestFlash(chr, t);
-    if (timing.pause_regen && !g_dry_run) {
+    t.cooldown_left = std::max(t.cooldown_left - dt, 0.0f);
+    t.regen_left = std::max(t.regen_left - dt, 0.0f);
+    if (t.flash_left > 0.0f) {
+        t.flash_left -= dt;
+        if (t.flash_left > 0.0f) {
+            RequestFlash(chr, t);
+        }
+    }
+    if (t.regen_left > 0.0f && !g_dry_run) {
         u8* const ctrl = Read<u8*>(chr + OffsetChrCtrl);
         u8* const regen = Plausible(ctrl) ? Read<u8*>(ctrl + OffsetCtrlRegen) : nullptr;
         if (Plausible(regen)) {
@@ -1999,127 +1971,103 @@ void GunPoseTick(u8* chr, const GunBody& body) {
     }
     // The left gun (every 4th update; at once for a new pull).
     Combat::GunPull pull{};
-    const bool identified = Combat::GunFireTransportEnabled();
-    PiAttackGunRequestFacts request{};
-    request.command = PI_AGR_SYNC;
-    request.identified = identified;
-    request.have_pull = !identified && Combat::LatestGunPull(pull);
-    request.pull = PackGunRequest(pull);
-    request.transport_busy = identified && Combat::GunFireBusy();
-    GunRequest(t, request, now);
-    if (g_native_gun_policy.Faulted())
-        return;
-    bool have_pull = t.request.new_pull;
-    if (t.request.refresh_equipment) {
+    const bool have_pull = Combat::LatestGunPull(pull) && pull.serial != t.handled;
+    if (t.updates++ % 4 == 0 || have_pull) {
         t.bid = BehaviorId(chr, JudgeShot);
-        const auto prepared = GunPreparation({PI_GUN_PREP_METADATA, t.bid}, now);
-        if (g_native_gun_policy.Faulted())
-            return;
-        t.info = PhysicalInteractions::GunPreparation::Info(prepared);
-        t.gun = PhysicalInteractions::GunPreparation::Direct(prepared);
+        t.info = G::GunOfBehavior(t.bid);
+        t.gun = G::DirectGunOf(t.info.family);
         t.can_fire = t.info.family != G::Family::None && g_can_fire(chr, 0) != 0;
         t.two_handed = TwoHanded(chr);
     }
-    if (identified) {
-        const auto actor = Quick::InteractionActorGeneration(reinterpret_cast<uintptr_t>(chr),
-                                                             Read<u32>(chr + OffsetHandle));
-        Combat::AdvanceGunFire(actor, static_cast<u32>(t.info.family), t.info.attach, t.two_handed,
-                               now);
-        request = {};
-        request.command = PI_AGR_OWNERSHIP;
-        request.identified = true;
-        request.owns_pending = !t.request.pending || Combat::GunFireOwns(t.pull.serial);
-        GunRequest(t, request, now);
-        if (g_native_gun_policy.Faulted()) return;
-        have_pull=Combat::ClaimGunFire(actor,static_cast<u32>(t.info.family),t.info.attach,
-            reinterpret_cast<uintptr_t>(chr),Read<u32>(chr+OffsetHandle),now,pull);
-    }
-    auto gun_facts = ReadGunGateFacts(chr, body);
+    const char* hard = HardReason(chr, body);
+    const bool busy = !body.left_ik || body.left_weight < 0.5f;
     const bool hidden = HeldLeftHidden();
     MeasureBarrel(chr, t, !t.two_handed && !hidden && VR::Tricks::GetTrickSettings().weapon_wall);
-    gun_facts.family = static_cast<uint32_t>(t.info.family);
-    gun_facts.have_gun = t.gun.has_value();
-    gun_facts.two_handed = t.two_handed;
-    gun_facts.hidden = hidden;
-    gun_facts.fire_direct = gs.fire_direct;
-    gun_facts.can_fire = t.can_fire;
-    gun_facts.pending = t.request.pending;
-    gun_facts.cooldown = t.timing.cooldown;
-    gun_facts.busy_ms = gs.buffer_ms;
-    gun_facts.busy_mode = static_cast<uint32_t>(gs.busy);
-    const auto gun_gate = GunGatePolicy(gun_facts);
-    if (g_native_gun_policy.Faulted()) return;
-    const bool direct_ok = gun_gate.direct_ok;
+    const u8* data = DataModule(chr);
+    const bool stamina = data == nullptr || Read<s32>(data + OffsetStamina) > 0;
+    const bool direct_ok = gs.fire_direct && t.gun != nullptr && !t.two_handed && body.body;
     Combat::GunStatus status{};
     status.ns = now;
     status.family = static_cast<u8>(t.info.family);
     status.attach = t.info.attach;
     status.aim = g_aim;
-    status.in_hand = gun_gate.in_hand;
+    status.in_hand = t.info.family != G::Family::None && !t.two_handed && !hidden;
     status.player_epoch = player_epoch;
     status.player_since_ns = player_since_ns;
     status.direct_ok = direct_ok;
     status.can_fire = t.can_fire;
-    status.cooldown_left_s = t.timing.cooldown;
-    status.cadence_s = t.gun.has_value() ? t.gun->cadence_s * gs.rate_scale : 0.0f;
-    status.ready = gun_gate.ready;
+    status.cooldown_left_s = t.cooldown_left;
+    status.cadence_s = t.gun != nullptr ? t.gun->cadence_s * gs.rate_scale : 0.0f;
+    status.ready = direct_ok && hard == nullptr && !busy && !hidden && stamina &&
+                   t.cooldown_left <= 0.0f && t.can_fire && !t.pending;
     if (t.info.family != t.logged_family || direct_ok != t.logged_direct) {
         t.logged_family = t.info.family;
         t.logged_direct = direct_ok;
         LOG_INFO(Core, "VR gun: left weapon {} (bid {} attach {}){}: {}",
                  G::FamilyName(t.info.family), t.bid, t.info.attach,
                  t.two_handed ? " held two-handed" : "",
-                 direct_ok            ? "the bang at the pull"
-                 : !t.gun.has_value() ? "the game's own L2 (not a direct-fire gun)"
-                                      : "the game's own L2");
+                 direct_ok          ? "the bang at the pull"
+                 : t.gun == nullptr ? "the game's own L2 (not a direct-fire gun)"
+                                    : "the game's own L2");
     }
 
     // VR_GUN_PARRY_PROBE (tests): a due shot at the followed target's attack.
-    if (g_scan.probe_at != 0 && now >= g_scan.probe_at && !t.request.pending && t.gun.has_value() &&
-        (!identified || !Combat::GunFireBusy())) {
+    if (g_scan.probe_at != 0 && now >= g_scan.probe_at && !t.pending && t.gun != nullptr) {
         g_scan.probe_at = 0;
         ProbePull(chr, t, now);
     }
-    request = {};
-    request.command = PI_AGR_RECEIVE;
-    request.identified = identified;
-    request.have_pull = have_pull;
-    request.pull = PackGunRequest(pull);
-    GunRequest(t, request, now);
-    if (g_native_gun_policy.Faulted()) return;
-    if (t.request.stale) {
-        if (identified) Combat::PushGunEvent({Combat::GunEventKind::Denied, pull.serial,
-            static_cast<u8>(t.info.family), 0.f, now, "stale gun request"});
-        LOG_INFO(Core, "VR gun: pull {} ignored ({} ms old)", pull.serial,
-                 (now - pull.press_ns) / Ms);
-    }
-    if (t.request.superseded) {
-        const auto serial = t.request.superseded_serial;
-        g_stats.denied.fetch_add(1, std::memory_order_relaxed);
-        Combat::PushGunEvent({Combat::GunEventKind::Denied, serial,
-                              static_cast<u8>(t.info.family), 0.f, now, "superseded"});
-        LOG_INFO(Core, "VR gun: pull {} dropped (pull {} came first)", serial, pull.serial);
-    }
-    status.handled = t.request.handled;
-    if (t.request.pending) {
-        request = {};
-        request.command = PI_AGR_DECIDE;
-        request.gate = gun_facts;
-        GunRequest(t, request, now);
-        if (g_native_gun_policy.Faulted()) return;
-        if (!t.request.decide) return;
-        const auto& verdict = t.request.verdict;
-        const G::PullDecision d{static_cast<G::PullAction>(verdict.action),
-                               PhysicalInteractions::GunGateReasonText(verdict.reason)};
-        if (t.request.wait_note) {
-            LOG_INFO(Core, "VR gun: pull {} waits ({}; cooldown {:.3f} s, arm {} {:.2f})",
-                     t.pull.serial, d.why, t.timing.cooldown, body.left_ik ? "yours" : "game's",
-                     body.left_weight);
+    // A new pull (one from before a load or a long stall is not one: it was never for this
+    // moment).
+    if (have_pull) {
+        t.handled = pull.serial;
+        if (pull.direct && now - pull.press_ns > StalePullNs) {
+            LOG_INFO(Core, "VR gun: pull {} ignored ({} ms old)", pull.serial,
+                     (now - pull.press_ns) / Ms);
+        } else if (pull.direct) {
+            if (t.pending) {
+                g_stats.denied.fetch_add(1, std::memory_order_relaxed);
+                Combat::PushGunEvent({Combat::GunEventKind::Denied, t.pull.serial,
+                                      static_cast<u8>(t.info.family), 0.0f, now, "superseded"});
+                LOG_INFO(Core, "VR gun: pull {} dropped (pull {} came first)", t.pull.serial,
+                         pull.serial);
+            }
+            t.pending = true;
+            t.pull = pull;
+            t.first_look = true;
         }
+    }
+    status.handled = t.handled;
+    if (t.pending) {
+        G::PullDecision d{};
+        if (!direct_ok) {
+            // The route changed under the pull (another weapon, two hands): the game's own L2.
+            d = {G::PullAction::Vanilla, t.gun == nullptr ? "no direct gun" : "two-handed"};
+        } else {
+            G::PullInputs in{};
+            in.age_ms = static_cast<float>(now - t.pull.press_ns) * 1e-6f;
+            in.first = t.first_look;
+            in.cooldown_left_s = t.cooldown_left;
+            in.hard = hard;
+            in.busy = busy;
+            in.hidden = hidden;
+            in.stamina = stamina;
+            in.busy_ms = gs.buffer_ms;
+            in.busy_mode = gs.busy == G::Busy::Vanilla ? G::BusyMode::Vanilla
+                           : gs.busy == G::Busy::Drop  ? G::BusyMode::Drop
+                                                       : G::BusyMode::Buffer;
+            d = G::DecidePull(in);
+            if (d.action == G::PullAction::Wait && t.first_look) {
+                LOG_INFO(Core, "VR gun: pull {} waits ({}; cooldown {:.3f} s, arm {} {:.2f})",
+                         t.pull.serial, d.why, t.cooldown_left, body.left_ik ? "yours" : "game's",
+                         body.left_weight);
+            }
+        }
+        t.first_look = false;
         switch (d.action) {
         case G::PullAction::Wait:
             break;
         case G::PullAction::Fire:
+            t.pending = false;
             t.can_fire = g_can_fire(chr, 0) != 0;
             Fire(chr, t, now);
             if (body.dodge_attack && t.can_fire) {
@@ -2130,6 +2078,7 @@ void GunPoseTick(u8* chr, const GunBody& body) {
             }
             break;
         case G::PullAction::Deny:
+            t.pending = false;
             g_stats.denied.fetch_add(1, std::memory_order_relaxed);
             Combat::PushGunEvent({Combat::GunEventKind::Denied, t.pull.serial,
                                   static_cast<u8>(t.info.family), 0.0f, now, d.why});
@@ -2137,6 +2086,7 @@ void GunPoseTick(u8* chr, const GunBody& body) {
                      static_cast<float>(now - t.pull.press_ns) * 1e-6f, d.why);
             break;
         case G::PullAction::Vanilla:
+            t.pending = false;
             g_stats.handed.fetch_add(1, std::memory_order_relaxed);
             {
                 std::scoped_lock lock{g_shot_mutex};
@@ -2149,7 +2099,7 @@ void GunPoseTick(u8* chr, const GunBody& body) {
             break;
         }
     }
-    status.cooldown_left_s = t.timing.cooldown;
+    status.cooldown_left_s = t.cooldown_left;
     Combat::PublishGunStatus(status);
     if (!t.status_logged) {
         t.status_logged = true;
@@ -2162,66 +2112,13 @@ void GunPoseTick(u8* chr, const GunBody& body) {
 }
 
 bool GunBarrelReach(s32& attach, float& back, float& front) {
-    if (!g_barrel.valid || g_native_gun_policy.Faulted() ||
-        (g_native_aim_dll && VR::Interactions::ProcessFaultLatch().Tripped())) {
+    if (!g_barrel.valid) {
         return false;
     }
-    attach = g_barrel.attachment;
+    attach = g_barrel.attach;
     back = g_barrel.back;
     front = g_barrel.front;
     return true;
-}
-
-PiAttackBladePoseOutput BladePosePolicy(const PiAttackBladePoseFacts& facts, s64 now) {
-    PiNativeAttackInput input{};
-    input.operation = PI_ATTACK_BLADE_POSE;
-    input.now_ns = now;
-    input.decision.blade_pose = facts;
-    const auto output = g_native_gun_policy.Call(input);
-    if (g_native_gun_policy.Faulted()) {
-        PiAttackBladePoseOutput denied{};
-        denied.reason = PI_ABP_FAULT;
-        return denied;
-    }
-    return output.blade_pose;
-}
-const char* BladePoseReason(const PiAttackBladePoseOutput& output) {
-    switch (output.reason) {
-    case PI_ABP_OK: return nullptr;
-    case PI_ABP_NO_AIM: return "no aim (the view, or a recenter since the release)";
-    case PI_ABP_NO_BOW_HAND: return "no bow hand";
-    case PI_ABP_NO_LINE: return "no barrel line (the weapon's dummies)";
-    case PI_ABP_NO_HAND: return "no hand";
-    case PI_ABP_NONFINITE: return "invalid native shot geometry";
-    default: return PhysicalInteractions::GunGateReasonText(PI_AG_FAULT);
-    }
-}
-
-PiAttackBladeGateOutput BladeGatePolicy(const PiAttackBladeGateFacts& facts, s64 now) {
-    PiNativeAttackInput input{};
-    input.operation = PI_ATTACK_BLADE_GATE;
-    input.now_ns = now;
-    input.decision.blade_gate = facts;
-    const auto output = g_native_gun_policy.Call(input);
-    if (g_native_gun_policy.Faulted()) {
-        PiAttackBladeGateOutput denied{};
-        denied.reason = PI_AB_FAULT;
-        return denied;
-    }
-    return output.blade_gate;
-}
-const char* BladeGateReason(const PiAttackBladeGateOutput& output) {
-    switch (output.reason) {
-    case PI_AB_OK: return nullptr;
-    case PI_AB_TOO_OLD: return "too old";
-    case PI_AB_NO_STATUS: return "no melee status";
-    case PI_AB_WEAPON: return "not that weapon in its transformed form";
-    case PI_AB_HARD: return PhysicalInteractions::GunGateReasonText(output.hard);
-    case PI_AB_ARM: return "the game has the arm";
-    case PI_AB_COOLDOWN: return "cooldown";
-    case PI_AB_STAMINA: return Combat::NoStamina;
-    default: return PhysicalInteractions::GunGateReasonText(PI_AG_FAULT);
-    }
 }
 
 // bow_direct: an arrow costs stamina as a swing does: its behaviour row's cost (the game's shot
@@ -2237,38 +2134,42 @@ s32 BowStaminaCost(s32 bid, bool charged, s32& row_cost) {
             row_cost = Read<s32>(row.row + RowStamina);
         }
     }
-    PiAttackBladeGateFacts facts{};
-    facts.command = PI_AB_COST;
-    facts.charged = charged;
-    facts.stamina_pct = VR::Melee::GetMeleeSettings().stamina_pct;
-    facts.have_row = row_cost >= 0;
-    facts.row_cost = row_cost;
-    const auto output = BladeGatePolicy(facts, NowNs());
-    return output.reason == PI_AB_OK ? output.cost : -1;
+    const s32 base = row_cost >= 1 && row_cost <= 200 ? row_cost : 20;
+    const s32 pct = charged ? 100 : std::clamp(VR::Melee::GetMeleeSettings().stamina_pct, 0, 100);
+    return pct > 0 ? std::max((base * pct + 50) / 100, 1) : 0; // (at least 1, as a swing's share)
+}
+
+// (A charged arrow always costs stamina: melee_stamina_pct=0 frees the quick shot only.)
+bool BowOutOfStamina(u8* chr, bool charged) {
+    const u8* data = DataModule(chr);
+    return (charged || VR::Melee::GetMeleeSettings().stamina_pct > 0) && data != nullptr &&
+           Read<s32>(data + OffsetStamina) <= 0;
 }
 
 void BladeShotTick(u8* chr, const BladeBody& body) {
-    if(g_native_aim_dll&&VR::Interactions::ProcessFaultLatch().Tripped())return;
     namespace T = VR::Tricks;
     if (g_base == nullptr || chr == nullptr || !g_fire) {
         return;
     }
     auto& t = g_blade;
     const s64 now = NowNs();
-    const bool owner_changed = chr != t.chr;
-    PiAttackGunTimingFacts timing_facts{};
-    timing_facts.command = PI_AGT_TICK;
-    timing_facts.owner_changed = owner_changed;
-    const auto timing = GunTiming(1, timing_facts, now);
-    if (g_native_gun_policy.Faulted()) return;
-    if (owner_changed) {
+    const float dt =
+        t.last_ns != 0 ? std::clamp(static_cast<float>(now - t.last_ns) * 1e-9f, 0.0f, 0.1f) : 0.0f;
+    t.last_ns = now;
+    if (chr != t.chr) {
         const u32 handled = t.handled;
         t = {};
         t.chr = chr;
         t.handled = handled;
+        t.last_ns = now;
     }
-    t.timing = timing;
-    if (timing.renew_flash) RequestBladeFlash(chr, t);
+    t.cooldown_left = std::max(t.cooldown_left - dt, 0.0f);
+    if (t.flash_left > 0.0f) {
+        t.flash_left -= dt;
+        if (t.flash_left > 0.0f) {
+            RequestBladeFlash(chr, t);
+        }
+    }
     {
         // bow_direct: the game's sounds heard while the bow is up and its release sound unknown.
         const auto& bs = VR::Bow::GetBowSettings();
@@ -2280,185 +2181,128 @@ void BladeShotTick(u8* chr, const BladeBody& body) {
                              std::memory_order_relaxed);
     }
     Combat::BladeShot req{};
-    Combat::MeleeStatus ms{};
-    const bool current_status = Combat::LatestMeleeStatus(ms) && now - ms.ns <= StatusMaxAgeNs;
-    const bool identified = Combat::BladeFireTransportEnabled();
-    if (identified) {
-        const auto actor = Quick::InteractionActorGeneration(reinterpret_cast<uintptr_t>(chr), Read<u32>(chr + OffsetHandle));
-        if (!Combat::ClaimBladeFire(actor,current_status ? ms.variation : -1,
-                                   current_status && ms.form_b,current_status ? ms.bow_hand : -1,now,req)) return;
-    } else if (!Combat::LatestBladeShot(req) || req.serial == t.handled) {
+    if (!Combat::LatestBladeShot(req) || req.serial == t.handled) {
         return;
     }
     t.handled = req.serial;
     const auto shot = static_cast<T::Shot>(req.shot);
-    const auto complete = [&](uint32_t outcome, const char* why) {
-        if (identified) Combat::FinishBladeFire(req.serial,outcome,now,why);
-    };
-    PiAttackBladeGateFacts admission{};
-    admission.command = PI_AB_REQUEST;
-    admission.shot = req.shot;
-    admission.charged = req.charged;
-    admission.press_ns = req.press_ns;
-    admission.cooldown = t.timing.cooldown;
-    admission.stamina_pct = VR::Melee::GetMeleeSettings().stamina_pct;
-    auto admitted = BladeGatePolicy(admission, now);
-    if (admitted.query_status) {
-        admission.command = PI_AB_STATUS;
-        admission.have_status = Combat::LatestMeleeStatus(ms);
-        admission.status_ns = ms.ns;
-        admission.variation = ms.variation;
-        admission.form_b = ms.form_b;
-        admission.bow_hand = ms.bow_hand;
-        admitted = BladeGatePolicy(admission, now);
+    Combat::MeleeStatus ms{};
+    const T::ShotWeapon* w = nullptr;
+    const char* why = nullptr;
+    const GunBody gb{true, body.driven, body.arm_free, 1.0f, body.reason, false};
+    if (now - req.press_ns > StalePullNs) {
+        why = "too old";
+    } else if (!Combat::LatestMeleeStatus(ms) || now - ms.ns > StatusMaxAgeNs) {
+        why = "no melee status";
+    } else if (w = T::ShotWeaponOf(ms.variation); w == nullptr || w->shot != shot || !ms.form_b ||
+                                                    (shot == T::Shot::Bow && ms.bow_hand < 0)) {
+        why = "not that weapon in its transformed form";
+    } else if (const char* hard = HardReason(chr, gb); hard != nullptr) {
+        why = hard;
+    } else if (!body.arm_free) {
+        why = "the game has the arm";
+    } else if (t.cooldown_left > 0.0f) {
+        why = "cooldown";
+    } else if (shot == T::Shot::Bow && BowOutOfStamina(chr, req.charged)) {
+        why = Combat::NoStamina;
     }
-    const T::ShotWeapon approved_weapon{admitted.variation, static_cast<T::Shot>(admitted.shot),
-        admitted.cadence, admitted.charge, admitted.flash_ffx, admitted.bang,
-        admitted.dry_sound, admitted.base, admitted.tip};
-    const T::ShotWeapon* w = &approved_weapon;
-    if (admitted.query_body) {
-        admission.command = PI_AB_BODY;
-        const GunBody gb{true, body.driven, body.arm_free, 1.0f, body.reason, false};
-        admission.body = ReadGunGateFacts(chr, gb);
-        admitted = BladeGatePolicy(admission, now);
-    }
-    const char* why = BladeGateReason(admitted);
     s32 judge = -1;
     if (why == nullptr) {
-        const auto rows = SelectBladeRows(ms.variation, shot, req.charged, now);
-        if (!rows.ready) {
-            why = PhysicalInteractions::GunGateReasonText(PI_AG_FAULT);
-        } else {
-            judge = rows.selected;
-            if (rows.missing_reason) {
-                why = rows.missing_reason == PI_ABR_NO_BLAST_ROW
-                          ? "no bullet row (the blast may be an attack: the charged swing's)"
-                          : "no bullet row";
+        if (t.rows.variation != ms.variation) {
+            t.rows = ScanBladeRows(ms.variation, shot);
+        }
+        judge = req.charged && t.rows.charged >= 0 ? t.rows.charged : t.rows.shot;
+        if (judge < 0) {
+            why = shot == T::Shot::StakeBlast
+                      ? "no bullet row (the blast may be an attack: the charged swing's)"
+                      : "no bullet row";
+            if (shot == T::Shot::Bow) {
+                g_bow_no_rows.store(true); // its shots stay the game's own
             }
-            if (rows.bow_no_rows) g_bow_no_rows.store(true);
         }
     }
     // Where it leaves from, which way: the transformed part's line (its own two dummies), else the
     // presenter's (the wave out through the blade, the punch, the drawn arrow) in the world.
     B::Vec3 base{};
     B::Vec3 tip{};
-    const bool have_line_points = why == nullptr && w->base >= 0 && DummyAt(chr, w->base, base) &&
-                                  DummyAt(chr, w->tip, tip);
+    const bool line = why == nullptr && w->base >= 0 && DummyAt(chr, w->base, base) &&
+                      DummyAt(chr, w->tip, tip) && B::Length(tip - base) > 0.05f;
     B::Vec3 origin{};
     B::Vec3 dir{};
-    if (why == nullptr) {
-        PiAttackBladePoseFacts pose{};
-        pose.command = PI_ABP_BEGIN;
-        pose.shot = req.shot;
-        pose.dir_valid = req.dir_valid;
-        pose.have_line = have_line_points;
-        pose.request_space = req.space_serial;
-        AimPut(pose.base, base);
-        AimPut(pose.tip, tip);
-        AimPut(pose.request_dir, req.dir);
-        auto output = BladePosePolicy(pose, now);
-        B::Anchor anchor{};
-        if (output.query_anchor) {
-            pose.have_anchor = B::LatestAnchor(anchor);
-            pose.anchor_valid = anchor.valid;
-            pose.anchor_ns = anchor.steady_ns;
-            pose.yaw = anchor.base_yaw;
+    B::Anchor anchor{};
+    B::HandsSample hands{};
+    const bool mapped = why == nullptr && req.dir_valid && B::LatestAnchor(anchor) &&
+                        anchor.valid && now - anchor.steady_ns <= AnchorMaxAgeNs &&
+                        B::LatestHands(hands) && hands.space_serial == req.space_serial;
+    if (why == nullptr && shot == T::Shot::Bow) {
+        // The arrow: from just ahead of the bow hand along the drawn line (as BowArrow's).
+        B::Vec3 hand{};
+        if (!mapped) {
+            why = "no aim (the view, or a recenter since the release)";
+        } else if (!DummyAt(chr, ms.bow_hand == 0 ? 340 : 300, hand)) {
+            why = "no bow hand";
+        } else {
+            dir = B::Normalize(B::TrackingToWorld(req.dir, anchor.base_yaw, 1.0f), ChrForward(chr));
+            origin = hand + dir * BowOriginAheadM;
         }
-        pose.command = PI_ABP_ANCHOR;
-        output = BladePosePolicy(pose, now);
-        if (output.query_hands) {
-            B::HandsSample hands{};
-            pose.have_hands = B::LatestHands(hands);
-            pose.hands_space = hands.space_serial;
-        }
-        pose.command = PI_ABP_PLAN;
-        output = BladePosePolicy(pose, now);
-        why = BladePoseReason(output);
-        if (why == nullptr) {
-            if (output.query_bow_hand) {
-                B::Vec3 hand{};
-                pose.have_bow_hand = DummyAt(chr, ms.bow_hand == 0 ? 340 : 300, hand);
-                AimPut(pose.bow_hand, hand);
-                if (pose.have_bow_hand) AimPut(pose.forward, ChrForward(chr));
-            } else {
-                if (output.query_forward) AimPut(pose.forward, ChrForward(chr));
-                if (output.query_fist) {
-                    B::Vec3 fist{};
-                    pose.have_fist = DummyAt(chr, 300, fist);
-                    AimPut(pose.fist, fist);
-                }
-            }
-            pose.command = PI_ABP_FINISH;
-            output = BladePosePolicy(pose, now);
-            why = BladePoseReason(output);
-            if (output.valid) {
-                origin = AimVec(output.origin);
-                dir = AimVec(output.dir);
-            }
+    } else if (why == nullptr) {
+        const B::Vec3 along = line ? B::Normalize(tip - base) : ChrForward(chr);
+        dir = mapped ? B::Normalize(B::TrackingToWorld(req.dir, anchor.base_yaw, 1.0f), along)
+                     : along;
+        B::Vec3 fist{};
+        const bool have_fist = !line && DummyAt(chr, 300, fist); // R_Weapon's grip
+        origin = !line ? fist : shot == T::Shot::MoonWave ? (base + tip) * 0.5f : tip;
+        if (shot == T::Shot::GunBlade && !line) {
+            why = "no barrel line (the weapon's dummies)";
+        } else if (!line && !have_fist) {
+            why = "no hand";
         }
     }
     if (why != nullptr) {
-        complete(PI_FIRE_DENIED,why);
         Combat::PushMeleeEvent({Combat::MeleeEventKind::Shot, req.serial,
                                 static_cast<float>(req.shot), -1.0f, now, why});
         LOG_INFO(Core, "VR blade shot: #{} {} refused ({})", req.serial, static_cast<int>(req.shot),
                  why);
         return;
     }
-    // The Stake Driver's blast takes a bullet too (the user, 2026-10-12): its weapon's own cost,
+    // The Stake Driver's blast takes a bullet too (2026-10-12): its weapon's own cost,
     // at least one, from the Quicksilver and Blood Bullets.
-    const s32 raw_stake_cost = shot == T::Shot::StakeBlast ? BulletCost(chr, 1, HandRight) : 0;
-    if (raw_stake_cost < 0) {
-        complete(PI_FIRE_DENIED, "interaction DLL fault");
-        return;
-    }
+    const s32 stake_cost = shot == T::Shot::StakeBlast ? std::max(BulletCost(chr, 1, HandRight), 1)
+                                                       : 0;
     // (An unreadable count, -1, never holds a blast back: the consume below decides.)
     const s32 quick = shot == T::Shot::StakeBlast ? GoodsCount(chr, QuicksilverBullets) : 0;
     const s32 blood = shot == T::Shot::StakeBlast ? GoodsCount(chr, BloodBullets) : 0;
-    PiAttackBladeGateFacts resources{};
-    resources.command = PI_AB_DRY;
-    resources.shot = req.shot;
-    resources.stake_cost = raw_stake_cost;
-    resources.quick = quick;
-    resources.blood = blood;
-    resources.right_can_fire = shot != T::Shot::GunBlade || g_can_fire(chr, 1) != 0;
-    const auto resource_gate = BladeGatePolicy(resources, now);
-    if (resource_gate.reason != PI_AB_OK) {
-        complete(PI_FIRE_DENIED, BladeGateReason(resource_gate));
-        return;
-    }
-    const s32 stake_cost = resource_gate.cost;
-    if (resource_gate.dry) {
-        complete(PI_FIRE_DRY,"no bullets");
+    const bool dry = (shot == T::Shot::GunBlade && g_can_fire(chr, 1) == 0) ||
+                     (shot == T::Shot::StakeBlast && quick >= 0 && blood >= 0 &&
+                      quick + blood < stake_cost);
+    if (dry) {
         Sound(w->dry, tip);
-        t.timing = GunTiming(1, {PI_AGT_DRY}, now);
+        t.cooldown_left = DryCooldownS;
         Combat::PushMeleeEvent({Combat::MeleeEventKind::Shot, req.serial,
                                 static_cast<float>(req.shot), 0.0f, now, "no bullets"});
         LOG_INFO(Core, "VR blade shot: #{} DRY (no bullets)", req.serial);
         return;
     }
     if (shot == T::Shot::MoonWave) {
-        PiAttackBladePoseFacts assist{};
-        assist.command = PI_ABP_ASSIST;
-        assist.shot = req.shot;
-        assist.have_target = Read<u8>(chr + OffsetLockChosen) != 0;
-        assist.locked = VR::IsLockedOn();
-        AimPut(assist.target, Read3(chr + OffsetLockPoint));
-        AimPut(assist.origin, origin);
-        AimPut(assist.dir, dir);
-        const auto output = BladePosePolicy(assist, now);
-        if (output.reason != PI_ABP_OK) {
-            complete(PI_FIRE_DENIED, BladePoseReason(output));
-            return;
-        }
-        if (output.assist_weight > 0.f) {
+        // A bit of target assist (2026-10-13): within MoonWaveAssistDeg of the target
+        // the game picked (locked on or not), the wave turns part of the way to it, as a gun's
+        // shot does (GentleAssist); a wave sent away from it flies where it was sent.
+        G::AssistCfg cfg{};
+        cfg.strength = T::MoonWaveAssist;
+        cfg.cone_deg = T::MoonWaveAssistDeg;
+        cfg.unlocked = true;
+        const bool have_target = Read<u8>(chr + OffsetLockChosen) != 0;
+        const G::AssistOut a = G::GentleAssist(dir, origin, Read3(chr + OffsetLockPoint),
+                                               have_target, VR::IsLockedOn(), false, cfg);
+        if (a.weight > 0.0f) {
             LOG_INFO(Core, "VR blade shot: #{} the wave {:.1f} deg off the target: turned {:.1f} deg "
-                           "toward it", req.serial, output.assist_angle, output.assist_moved);
-            dir = AimVec(output.dir);
+                           "toward it",
+                     req.serial, a.angle_deg, a.moved_deg);
+            dir = a.dir;
         }
     }
     const s32 bid = 100000000 + ms.variation * 1000 + judge;
-    g_blade_aim = {req.serial, bid, now, origin, dir};
+    g_blade_aim = {req.serial, bid, now, origin, dir, {}};
     u8 ok = 0;
     u8 consumed = 0;
     s32 cost = 0;
@@ -2471,33 +2315,33 @@ void BladeShotTick(u8* chr, const BladeBody& body) {
         ok = g_invoke_gun(chr, bid, start, 0, HandRight, HandRight, 1, 1);
         if (shot == T::Shot::GunBlade) {
             cost = BulletCost(chr, 1, HandRight);
-            // Invocation already happened: keep its known outcome, but never guess a
-            // resource write after a policy fault. No retry/refund is issued.
-            if (cost >= 0)
-                consumed = g_consume(chr, cost);
+            consumed = g_consume(chr, cost);
         } else if (shot == T::Shot::StakeBlast && ok != 0) {
             cost = stake_cost;
             consumed = g_consume(chr, cost);
         }
     }
-    PiAttackGunTimingFacts shot_timing{};
-    shot_timing.command = PI_AGT_SHOT;
-    shot_timing.variation = ms.variation;
-    shot_timing.shot = static_cast<uint32_t>(shot);
-    t.timing = GunTiming(1, shot_timing, now);
+    ++t.shots;
     if (ok != 0 && (shot == T::Shot::GunBlade || shot == T::Shot::StakeBlast)) {
         g_blade_kick_variation.store(ms.variation, std::memory_order_relaxed);
         g_blade_kick_ns.store(now, std::memory_order_release);
     }
     if (shot == T::Shot::GunBlade) {
-        if (t.timing.renew_flash) RequestBladeFlash(chr, t);
+        t.cooldown_left = w->cadence_s;
+        t.flash_slot = FirstBladeFlashSlot + static_cast<s32>(t.shots % FlashSlots);
+        t.flash_ffx = w->flash_ffx;
+        t.flash_dummy = w->tip;
+        t.flash_left = 1.0f;
+        RequestBladeFlash(chr, t);
         Sound(w->bang, tip);
+    } else if (shot == T::Shot::StakeBlast) {
+        t.cooldown_left = w->cadence_s; // the blast's cooldown
     } else if (shot == T::Shot::Bow && ok != 0) {
         const s32 twang = g_twang.load(std::memory_order_relaxed);
         Sound(twang >= 0 ? twang : ThrowWhoosh, origin); // the string's release
         s32 row_cost = -1;
         const s32 stamina = BowStaminaCost(bid, req.charged, row_cost);
-        if (bow_data != nullptr && stamina >= 0) {
+        if (bow_data != nullptr) {
             const s32 game_took = bow_before - Read<s32>(bow_data + OffsetStamina);
             const s32 after = std::max(bow_before - stamina, VR::Melee::StaminaFloor);
             std::memcpy(bow_data + OffsetStamina, &after, sizeof(after));
@@ -2509,7 +2353,6 @@ void BladeShotTick(u8* chr, const BladeBody& body) {
                      game_took);
         }
     }
-    complete(ok != 0 ? PI_FIRE_FIRED : PI_FIRE_DENIED,ok != 0 ? "" : "the game refused it");
     Combat::PushMeleeEvent({Combat::MeleeEventKind::Shot, req.serial, static_cast<float>(req.shot),
                             ok != 0 ? 1.0f : -1.0f, now, ok != 0 ? "" : "the game refused it"});
     LOG_INFO(Core,
@@ -2587,23 +2430,21 @@ void GunLaunchTail(u8* p) {
     }
 }
 
-VR::Body::RecoilFacts GunTargetFacts() {
-    VR::Body::RecoilFacts facts{};
-    facts.gun_ns = g_kick_ns.load(std::memory_order_acquire);
-    facts.family = g_kick_family.load(std::memory_order_relaxed);
-    facts.attach = g_kick_attach.load(std::memory_order_relaxed);
-    facts.blade_ns = g_blade_kick_ns.load(std::memory_order_acquire);
-    facts.variation = g_blade_kick_variation.load(std::memory_order_relaxed);
-    facts.visual = G::GetGunSettings().recoil_visual;
-    facts.left_hidden = HeldLeftHidden();
-    return facts;
-}
-
-void LogGunTargetKick(const VR::Body::RecoilLog& kick) {
-    if (g_log >= 3 && kick.active) {
-        LOG_INFO(Core, "VR gun: kick e={:.2f} pitch={:.1f} deg back={:.1f} cm at +{:.0f} ms",
-                 kick.envelope, kick.envelope * kick.pitch, kick.envelope * kick.back * 100.0f,
-                 kick.age_ms);
+void GunKick(VR::Body::ModelTarget& left_target, s64 now_ns) {
+    const s64 at = g_kick_ns.load(std::memory_order_acquire);
+    const float visual = G::GetGunSettings().recoil_visual;
+    if (at == 0 || visual <= 0.0f || now_ns - at > KickNs || now_ns < at || HeldLeftHidden()) {
+        return;
+    }
+    const auto family = static_cast<G::Family>(g_kick_family.load(std::memory_order_relaxed));
+    const s32 attach = g_kick_attach.load(std::memory_order_relaxed);
+    const G::Kick kick = G::KickOf(family);
+    const float e = G::KickEnvelope(kick, static_cast<float>(now_ns - at) * 1e-6f) * visual;
+    left_target = G::ApplyKick(left_target, attach, kick, e);
+    if (g_log >= 3) {
+        LOG_INFO(Core, "VR gun: kick e={:.2f} pitch={:.1f} deg back={:.1f} cm at +{:.0f} ms", e,
+                 e * kick.pitch_deg, e * kick.back_m * 100.0f,
+                 static_cast<float>(now_ns - at) * 1e-6f);
     }
 }
 
@@ -2613,9 +2454,24 @@ void StakeDischarge(u8* chr, s64 now_ns) {
     // a116_042630 (charged R2), event 96: native discharge FFX 252020 for 0.1 s.
     // Its character-animation attachment is replaced by the tracked weapon's tip.
     if (chr != nullptr) {
-        g_blade.timing = GunTiming(1, {PI_AGT_DISCHARGE}, now_ns);
-        if (g_blade.timing.renew_flash) RequestBladeFlash(chr, g_blade);
+        g_blade.flash_slot = FirstBladeFlashSlot + static_cast<s32>(++g_blade.shots % FlashSlots);
+        g_blade.flash_ffx = 252020;
+        g_blade.flash_dummy = 11206;
+        g_blade.flash_left = 0.1f;
+        RequestBladeFlash(chr, g_blade);
     }
+}
+
+void BladeKick(VR::Body::ModelTarget& right_target, s64 now_ns) {
+    const s64 at = g_blade_kick_ns.load(std::memory_order_acquire);
+    const float visual = G::GetGunSettings().recoil_visual;
+    constexpr s64 BladeKickNs = 1200 * Ms; // (the slowest, the stake's, settled to under 0.1%)
+    if (at == 0 || visual <= 0.0f || now_ns - at > BladeKickNs || now_ns < at) {
+        return;
+    }
+    const G::Kick kick = G::BladeKickOf(g_blade_kick_variation.load(std::memory_order_relaxed));
+    const float e = G::KickEnvelope(kick, static_cast<float>(now_ns - at) * 1e-6f) * visual;
+    right_target = G::ApplyBladeKick(right_target, kick, e);
 }
 
 const u8* GunWeaponParamRow(s32 weapon) {

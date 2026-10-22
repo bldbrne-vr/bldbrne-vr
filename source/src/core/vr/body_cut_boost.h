@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -6,7 +12,7 @@
 #include <cstdint>
 #include <cmath>
 
-// VR body cutaway boost (vr.ini body_cutaway_boost; the user, 2026-10-08: "sometimes when enemies
+// VR body cutaway boost (vr.ini body_cutaway_boost; the tester, 2026-10-08: "sometimes when enemies
 // hit me or I move my head a tiny bit or down, I see a bit through the shoulders/body of the
 // hunter, was wondering if in those cases we can fade it out a bit more").
 //
@@ -16,7 +22,7 @@
 // still drawn and the rest of it nearer is cut open with a hard edge, showing the lining. Two
 // things put the camera that close to his collar and shoulders:
 //  - a hit reaction, a stagger or a kept dodge: the game's clip moves his upper body under the
-//    head-locked camera (the trunk alignment lets go in a damage clip); the user's log measured the
+//    head-locked camera (the trunk alignment lets go in a damage clip); the tester's log measured the
 //    camera 23 cm (median, max 80) from his eye in damage windows, 18 cm in dodges, 7 cm otherwise;
 //  - your head a little behind or below his eye: his trunk leans back at most 20 degrees, and a
 //    head drop within the 8 cm height deadband leaves his upper body where it is.

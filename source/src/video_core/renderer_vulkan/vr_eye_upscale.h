@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -15,8 +21,8 @@ VK_DEFINE_HANDLE(VmaAllocation)
 
 namespace Vulkan {
 
-// The eyes' upscale and sharpening before the headset (vr.ini eye_upscale / eye_sharpen,
-// documents/bloodborne-vr.md "Sharpness"). The DIBR and late-warp eyes have the render's pixels
+// The eyes' upscale and sharpening before the headset (vr.ini eye_upscale / eye_sharpen).
+// The DIBR and late-warp eyes have the render's pixels
 // (9 - 12 px per degree at the centre with the 4:3 presets); the compositor used to enlarge them
 // bilinearly to the headset (~25 px per degree on a Quest 3), a soft and blocky stretch. Each eye
 // is enlarged once here with FSR 1's EASU (an edge-directed Lanczos-2), then sharpened with its

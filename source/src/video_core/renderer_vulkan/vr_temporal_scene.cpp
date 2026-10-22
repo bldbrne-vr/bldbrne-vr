@@ -1,4 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #include "video_core/renderer_vulkan/vr_temporal_scene.h"
 #include "video_core/renderer_vulkan/vr_fsr4_interleave.h"
 #include "video_core/renderer_vulkan/vr_dlss_direct.h"
@@ -26,7 +31,7 @@ float Halton(uint32_t n, uint32_t base) {
 VrTemporalScene::VrTemporalScene(const Instance &i, Scheduler &s)
     : runtime(i, s), images(i, s), objects(i, s), camera_motion(i, s) {}
 VrTemporalScene::Result VrTemporalScene::Begin(uint64_t id, const VR::Graphics::Config &config,
-                                               const VrTemporalPair::Plan &next, bool cut) {
+                                               const VrTemporalPair::Plan &next, bool cut, bool probe) {
     // Do not apply a menu acceptance midway through a stereo frame or begin history twice.
     if (begun && id == frame)
         return begin_result;
@@ -37,6 +42,8 @@ VrTemporalScene::Result VrTemporalScene::Begin(uint64_t id, const VR::Graphics::
         runtime.ResetHistory();
         return begin_result = Result::Invalid;
     }
+    recovery_probe = probe;
+    cut = cut || recovery_probe;
     const bool consecutive = begun && frame != UINT64_MAX && id == frame + 1;
     if (!consecutive || cut || next != plan || config.upscaler != accepted.upscaler ||
         VR::Graphics::EffectiveProfile(config) != VR::Graphics::EffectiveProfile(accepted)) {
@@ -80,7 +87,9 @@ VrTemporalScene::Result VrTemporalScene::Begin(uint64_t id, const VR::Graphics::
     const auto &size = plan.eyes[0];
     const uint32_t phases = Motion::JitterPhases(size.input_width, size.output_width);
     const uint32_t sample = uint32_t(frame % phases) + 1;
-    jitter = {Halton(sample, 2) - .5f, Halton(sample, 3) - .5f};
+    jitter = recovery_probe ? std::array<float, 2>{}
+                            : std::array<float, 2>{Halton(sample, 2) - .5f,
+                                                   Halton(sample, 3) - .5f};
     active = true;
     return begin_result = Result::Ready;
 }
@@ -137,6 +146,26 @@ bool VrTemporalScene::CaptureCameraFull(const CameraPair &data, float xs, float 
             if (pair[eye].view != current[eye].view ||
                 pair[eye].projection != current[eye].projection ||
                 pair[eye].offset != current[eye].offset) {
+#ifndef BBVR_NO_LOGS
+                static const bool trace = [] {
+                    const char* value = std::getenv("VR_TEMPORAL_TRACE");
+                    return value && *value && *value != '0';
+                }();
+                if (trace && problem != "multiple different scene cameras in one frame") {
+                    const auto delta = [](const auto& a, const auto& b) {
+                        double largest = 0.0;
+                        for (size_t i = 0; i < a.size(); ++i)
+                            largest = std::max(largest, std::abs(double(a[i]) - double(b[i])));
+                        return largest;
+                    };
+                    LOG_INFO(Render_Vulkan,
+                             "VR temporal camera conflict: frame {} eye {} max absolute delta "
+                             "view={:.9g} projection={:.9g} offset={:.9g}",
+                             frame, eye, delta(pair[eye].view, current[eye].view),
+                             delta(pair[eye].projection, current[eye].projection),
+                             delta(pair[eye].offset, current[eye].offset));
+                }
+#endif
                 problem = "multiple different scene cameras in one frame";
                 complete_motion = false;
                 return false;
@@ -281,6 +310,7 @@ VrTemporalScene::Resolve(const std::array<VrTemporalImages::Source, 2> &sources,
         static const bool capture = std::getenv("VR_TEMPORAL_CAPTURE_DIR") != nullptr;
         if (capture) {
             nlohmann::json meta{{"frame",frame},{"reset",reset},{"jitter",jitter},
+                {"recovery_probe",recovery_probe},
                 {"input",{size.input_width,size.input_height}},
                 {"output",{size.output_width,size.output_height}},
                 {"provider",int(accepted.upscaler)},{"dlss5",accepted.dlss5}};

@@ -11,6 +11,9 @@ void* GetXmmPointer(void* ctx, u8 index);
 
 void* GetRip(void* ctx);
 
+// The stack pointer at the fault (x86-64; null elsewhere).
+void* GetRsp(void* ctx);
+
 void IncrementRip(void* ctx, u64 length);
 
 bool IsWriteError(void* ctx);

@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -11,7 +17,7 @@
 #include <vector>
 
 // Scripted controller poses for testing the VR body without a headset. The mock OpenXR runtime
-// (the test harness, MOCKXR_HANDS) returns them from xrLocateSpace for the grip and aim spaces,
+// (the MockXR test runtime, MOCKXR_HANDS) returns them from xrLocateSpace for the grip and aim spaces,
 // and --vr-sim builds the same hands relative to its synthetic head (VR_BODY_SIM_HANDS). Standard
 // library only, so the mock includes it as it is.
 //

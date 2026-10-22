@@ -3,11 +3,16 @@
 
 #pragma once
 
+#include <chrono>
+#include <array>
 #include <atomic>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
 #include <span>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 #include "common/lru_cache.h"
@@ -134,8 +139,11 @@ public:
         }
     }
 
-    /// Invalidates any buffer in the logical page range.
-    void InvalidateMemory(VAddr device_addr, u64 size);
+    /// Invalidates any buffer in the logical page range. `emulator_write`: the emulator writes
+    /// exactly these bytes (a file read; an unmap is not one), FAST_GPU_PAGE_KEEP keeps the GPU's
+    /// bytes beside them.
+    void InvalidateMemory(VAddr device_addr, u64 size, bool emulator_write = false,
+                          bool protection_only = false);
 
     /// InvalidateMemory for a guest write fault there, before the write lands
     /// (FAST_GPU_PAGE_KEEP: MemoryTracker::KeepGpuPages).
@@ -152,6 +160,11 @@ public:
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
+
+    /// Read-only motion indices: CPU data directly, or a bounded cached GPU snapshot.
+    /// Recording thread, before draw binding. Never writes guest memory; the returned
+    /// view is consumed by this draw and must not outlive the next ReadForMotion call.
+    [[nodiscard]] std::span<const u8> ReadForMotion(VAddr address, u32 size);
 
     static void PrepareVertexInputs(const Vulkan::GraphicsPipeline& pipeline,
                                     u32 step_rate_0, u32 step_rate_1,
@@ -244,6 +257,12 @@ public:
 
     /// Runs the garbage collector.
     void RunGarbageCollector();
+    /// Experiment: merged stream buffers grow geometrically (VR_BUFFER_GROW_FILE, logs-on builds).
+    static bool BufferGrowGeometric();
+    static void PollBufferGrowSwitch();
+    // Diagnostics (the VR_DRAW_CTL inspector's gpumem): the GPU's bytes of the range copied back
+    // to guest memory at the frame's end (with readbacks off they never are otherwise).
+    void RequestReadback(VAddr addr, u64 size);
 
 private:
     template <typename Func>
@@ -276,7 +295,7 @@ private:
     void ChangeRegister(BufferId buffer_id);
 
     bool SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
-                           bool is_texel_buffer);
+                           bool is_texel_buffer, bool retire_cpu_uploads = false);
 
     vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                             size_t total_size_bytes, bool async_upload = false);
@@ -327,10 +346,44 @@ private:
     Buffer gds_buffer;
     Buffer bda_pagetable_buffer;
     Common::SlotVector<Buffer> slot_buffers;
+    struct MotionSnapshot {
+        VAddr address{};
+        u64 serial{}, write_seq{}, last_use{};
+        std::vector<u8> bytes;
+    };
+    std::vector<MotionSnapshot> motion_snapshots;
+    u64 motion_snapshot_use{}, motion_snapshot_bytes{};
     u64 total_used_memory = 0;
+    // FAST_GPU_PAGE_KEEP's catch-all log (NoteGpuBytesReplaced): each page's replacements.
+    // `why`: MemoryTracker::LostWhy. Pages seen: an open-addressed table (no lock, no
+    // allocation; a full table logs every 64th replacement only).
+    void NoteGpuBytesReplaced(VAddr start, VAddr stop, u8 why);
+    static constexpr size_t ReplacedSlots = 1 << 16;
+    std::unique_ptr<std::array<std::atomic<u64>, ReplacedSlots>> replaced_pages{
+        std::make_unique<std::array<std::atomic<u64>, ReplacedSlots>>()};
+    std::unique_ptr<std::array<std::atomic<u32>, ReplacedSlots>> replaced_counts{
+        std::make_unique<std::array<std::atomic<u32>, ReplacedSlots>>()};
+    std::atomic<u64> replaced_total{0};
+    std::chrono::steady_clock::time_point replaced_t0{std::chrono::steady_clock::now()};
     u64 trigger_gc_memory = 0;
     u64 critical_gc_memory = 0;
     u64 gc_tick = 0;
+    // FAST_GPU_SETTLE (off unless '1'): a range a shader or a copy wrote that the GPU then leaves
+    // alone is copied back to guest memory once (SettleGpuWrites, at the frame's end). With
+    // readbacks off the game's copy of GPU-made data (FaceGen morphs, written once per load)
+    // stays stale, and any later upload of its page (a write fault beside it, an emulator write,
+    // an eviction) put the stale bytes back: faces gone, eyes left. Settled, the game's copy is
+    // the GPU's. Data rewritten every frame never settles, so it is never copied.
+    struct SettleWrite {
+        u64 size{};
+        u64 tick{};
+    };
+    std::unordered_map<VAddr, SettleWrite> settle_writes;
+    std::mutex settle_mutex;
+    u64 settle_logs{};
+    std::vector<std::pair<VAddr, u64>> readback_requests; // settle_mutex
+    void NoteGpuWrite(VAddr addr, u64 size);
+    void SettleGpuWrites();
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
     RangeSet gpu_modified_ranges;
     SplitRangeMap<BufferId> buffer_ranges;

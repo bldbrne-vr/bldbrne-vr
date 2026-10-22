@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -11,12 +17,12 @@
 
 // Bloodborne's own item names and icons for the quick-item arc, read from the game's files (never
 // shipped with the emulator):
-//  - names: the localized item-name archive (DCX DFLT -> BND4 -> the goods-name FMG,
+//  - names: dvdroot_ps4/msg/<language>/item.msgbnd.dcx (DCX DFLT -> BND4 -> the goods-name FMG,
 //    file id 10), the console language's folder (engus when it has none);
-//  - icons: item icon textures (DCX -> PS4 TPF -> one 400 x 400
+//  - icons: dvdroot_ps4/menu/menu_knowledge_<iconId>.tpf.dcx (DCX -> PS4 TPF -> one 400 x 400
 //    BC7 texture, padded to 416 x 416 and micro-tiled (tile mode 13: 8 x 8 blocks in Morton
 //    order, tiles row by row); detiled here, uploaded as BC7 by the in-frame renderer);
-//  - text: labels rasterised from the game's own font outlines, or
+//  - text: labels rasterised from the game's own font outlines (menu/<language>/font.gfx), or
 //    from the emulator's embedded Noto Sans (CJK for Japanese, Korean and Chinese) when the game
 //    font lacks a character, with a soft halo, as a two-channel (fill, halo) bitmap;
 //  - held items: the game's own item models and textures (sfx archive, see GetModel).
@@ -42,16 +48,16 @@ struct LabelBitmap {
     std::vector<u8> rg; // two bytes per texel: fill coverage, halo coverage (soft, for the shadow)
 };
 // Rasterises `utf8` at `px` (glyph em size) into `out`: in the game's own HUD and menu font when
-// every character has a glyph there (a Scaleform font
+// every character has a glyph there (dvdroot_ps4/menu/<language>/font.gfx: a Scaleform font
 // library, one DefineFont3 tag of quadratic glyph outlines, "TT-Reimin Y10 Bold" in the western
 // languages), else in Noto Sans. False until a font is ready (call again later) or when the text
 // is empty. Any thread; at most a millisecond or two.
 bool RasterizeLabel(const char* utf8, u32 px, LabelBitmap& out);
 
-// A held item's model from the game's common and DLC effect archives
-// (DCX -> BND4 -> FLVER2, all meshes,
+// A held item's model from the game's own effect library (dvdroot_ps4/sfx/
+// common and DLC effect archives, DCX -> BND4): sNNNNN.flver (FLVER2, all meshes,
 // each mesh's first non-LOD face set, the default bone's transform applied: metres, the model's own axes, +Y along
-// the item as authored) and its diffuse texture (PS4 TPF, BC1 / BC3 / BC7 with the
+// the item as authored) and its diffuse texture sNNNNN.tpf (PS4 TPF, BC1 / BC3 / BC7 with the
 // game's mip chain, micro-tiled: detiled here to linear blocks, level after level).
 struct ModelVertex {
     float position[3];
@@ -85,7 +91,7 @@ struct Model {
 // Starts the loader (names, font) once; GoodsName / GetIcon start it too.
 void Start();
 
-// A texture of the game's menu atlas (the VR settings page draws the
+// A texture of the game's menu atlas file menu/common.tpf.dcx (the VR settings page draws the
 // game's own frames, ornaments and key-guide glyphs from it): BC7 decoded to RGBA8, straight
 // alpha, row by row. nullptr until loaded (the first call requests it; RequestMenuTextures asks
 // for several from one read of the file), or when the file has no such texture (logged).

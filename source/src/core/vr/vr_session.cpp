@@ -1,8 +1,20 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
+#include "core/file_sys/file_override.h"
+#include "core/vr/outgoing_damage.h"
+#include "core/vr/summon_bell.h"
 #include "core/vr/lever_settings.h"
+#include "core/vr/eye_distance.h"
+#include "core/vr/eye_history.h"
 #include "core/vr/y_menu.h"
 #include "core/vr/lamp_channel.h"
+#include "common/sync_log.h"
 #include <algorithm>
 #include <atomic>
 #include "core/vr/color_settings.h"
@@ -25,6 +37,7 @@
 #include <vector>
 
 #include "common/logging/log.h"
+#include "common/memory_patcher.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
 #include "common/thread.h"
@@ -41,7 +54,6 @@
 #include "core/vr/head_room.h"
 #include "core/vr/body_channel.h"
 #include "core/vr/roomscale_walk.h"
-#include "core/vr/interaction_roomscale.h"
 #include "core/vr/live_tune.h"
 #include "core/vr/melee_settings.h"
 #include "core/vr/bow.h"
@@ -55,6 +67,8 @@
 #include "core/vr/render_tilt.h"
 #include "core/vr/seqlock.h"
 #include "core/vr/transform_settings.h"
+#include "core/vr/aa_transition.h"
+#include "core/vr/flip_ticket.h"
 #include "core/vr/two_hand_settings.h"
 #include "core/vr/vr_ini.h"
 #include "core/vr/vr_session.h"
@@ -106,6 +120,7 @@ s32 LiveMode(StereoConfig config) {
 
 struct State {
     Settings settings{};
+    Aa::FrameTransition aa_transition;
     std::atomic_bool enabled{false};
     std::atomic_bool simulated{false};
     std::atomic<u32> display_mode{static_cast<u32>(DisplayMode::Auto)};
@@ -118,6 +133,8 @@ struct State {
     HeadState head{};
 
     std::atomic<float> pending_turn{0.0f};
+    std::atomic<float> arms_turn{0.0f};     // claimed by the arms' pose copy, not yet applied
+    std::atomic<bool> arms_claimed{false};  // a pose copy claimed since the last camera update
 
     // Game thread.
     bool driving{false};
@@ -148,9 +165,7 @@ struct State {
     std::atomic_bool game_owns{true};
     float base_yaw{};
     std::mutex roomscale_mutex;
-    Interactions::RoomscaleController roomscale_walk{}; // camera caller only
-    Interactions::Module* roomscale_module{};
-    bool roomscale_fault{};
+    Roomscale::Controller roomscale_walk{}; // camera thread only
     Roomscale::Output roomscale_out{};      // under roomscale_mutex
     s64 roomscale_input_ns{}, roomscale_output_ns{};
     bool roomscale_allowed{}, roomscale_applied{};
@@ -338,6 +353,19 @@ struct State {
     // When the presenter last brought first-person VR (the projection) up, -1 while the virtual
     // screen is shown (NoteCinematicLayer): the way back ends once VR has faded in.
     std::atomic<s64> cinematic_projection_ns{-1};
+    // After a load: until when first-person VR waits for the arrival animation
+    // (Cinematic::Machine::ArrivalHoldUntil, 0 = no wait), and the camera tick that first found
+    // the main player's updates stopped (the wait before the first update after the load).
+    std::atomic<s64> arrival_hold_until{0};
+    s64 arrival_wait_since{0}; // camera tick thread
+    s64 arrival_seen_until{0}; // camera tick thread: the last wait's end
+    // The loading page's end: the camera's first tick after a gap in which a new main player
+    // arrived (camera tick thread), counted for the machine (Signals::load_end, taken by the
+    // main player's update).
+    s64 load_end_ns{0};
+    std::atomic<u64> load_end_serial{0};
+    u64 load_end_taken{0};
+    bool arrival_holding{false}; // camera tick thread: ArrivalHold held the camera last tick
 };
 
 // FAST_CPU_LEAN_SCOPES: the state's address once it is constructed, a plain load per S() (both
@@ -460,12 +488,14 @@ float ComputeVfov(const HeadState& head, float aspect, float bias = 0.0f) {
     const auto cover = [&](float extra) {
         return Tilt::CoverHalfVfov(head.eye_fov, aspect, bias, extra);
     };
-    // A5 is image-affecting and opt-in. Derive a culling frustum from the eye
-    // union with one degree per edge for near objects at the offset eye origins.
-    // Both modes keep asymmetric projection; this changes only the game camera.
+    // A5: the culling frustum from the eye union with one degree per edge (for near objects at
+    // the offset eye origins), the headset's own FOVs whatever they are. Both modes keep the
+    // asymmetric projection; this changes only the game camera. On by default since 2026-10-15
+    // (the sewers: 16% fewer draws, +7 fps average, no popping in the headset);
+    // VR_NATIVE_TIGHT_FRUSTUM=0 turns it off.
     static const bool tight_env = [] {
         const char* value = std::getenv("VR_NATIVE_TIGHT_FRUSTUM");
-        return value && value[0] == '1';
+        return !(value && value[0] == '0');
     }();
     static const bool native_asymmetric = std::getenv("VR_NATIVE_STEREO") != nullptr &&
                                           std::getenv("VR_NATIVE_ASYMMETRIC") != nullptr;
@@ -611,6 +641,8 @@ void ParseSettingsLine(Settings& s, const std::string& key, const std::string& v
         if (const auto mode = Aa::ParseMode(value)) {
             s.aa_mode = *mode;
         }
+    } else if (key == "lod_bias") {
+        s.lod_bias = std::clamp(std::stoi(value), -2, 0);
     } else if (key == "aa_fxaa_fs") {
         s.aa_fxaa_fs = std::stoull(value, nullptr, 0);
     } else if (key == "taa_jitter") {
@@ -676,6 +708,8 @@ void ParseSettingsLine(Settings& s, const std::string& key, const std::string& v
         s.eye_sharpen = std::clamp(f(), 0.0f, 1.0f);
     } else if (key == "eye_size_min_factor") {
         s.eye_size_min_factor = std::clamp(f(), 1.0f, 2.0f);
+    } else if (key == "dibr_eye_taa") {
+        s.dibr_eye_taa = VR::EyeHistory::Override(f());
     } else if (key == "eye_taa") {
         const float v = f();
         s.eye_taa = v <= 0.0f ? 0.0f : std::clamp(v, 0.3f, 0.9f);
@@ -743,6 +777,10 @@ void ParseSettingsLine(Settings& s, const std::string& key, const std::string& v
                          : value == "hud"  ? static_cast<s32>(MenuPresent::Hud)
                                            : static_cast<s32>(MenuPresent::Layer);
         s.menu_present_set = true;
+    } else if (key == "ui_compose") {
+        if (value == "eyes" || value == "layers") s.ui_compose_eyes = value == "eyes";
+    } else if (key == "overlay_compose") {
+        if (value == "eyes" || value == "layer") s.overlay_compose_eyes = value == "eyes";
     } else if (key == "ui_layer") {
         s.ui_layer = std::clamp(static_cast<s32>(f()), 0, 2);
     } else if (key == "ui_menu_distance_m") {
@@ -785,6 +823,8 @@ void ParseSettingsLine(Settings& s, const std::string& key, const std::string& v
         s.ui_hud_corner_pitch_deg = std::clamp(f(), -45.0f, 45.0f);
     } else if (key == "ui_hud_distance_m") {
         s.ui_hud_distance_m = std::clamp(f(), 0.5f, 10.0f);
+    } else if (key == "ui_lower_push_m") {
+        s.ui_lower_push_m = std::clamp(f(), 0.0f, 3.0f);
     } else if (key == "ui_hud_scale_deg") {
         s.ui_hud_scale_deg = std::clamp(f(), 0.01f, 0.1f);
     } else if (key == "ui_hud_pitch_deg") {
@@ -901,10 +941,22 @@ void ParseSettingsLine(Settings& s, const std::string& key, const std::string& v
         s.ui_lock_marker_alpha = std::clamp(f(), 0.0f, 1.0f);
     } else if (key == "ui_enemy_hp_bars") {
         s.ui_enemy_hp_bars = value == "1" || value == "true";
-    } else if (key == "ui_boss_hp_bar") {
+    } else if (key == "ui_boss_bar") {
         s.ui_boss_hp_bar = value == "1" || value == "true";
+    } else if (key == "ui_boss_hp_bar") {
+        // 0.3.0 and earlier (hidden by default, and that default written to every vr.ini): no
+        // longer read, so every player gets the bar shown (0.3.1, design choice);
+        // ui_boss_bar=0 hides it.
     } else if (key == "ui_vr_buttons") {
         s.ui_vr_buttons = value == "1" || value == "true";
+    } else if (key == "ui_dialogue_backing") {
+        if (value == "none" || value == "0") {
+            s.ui_dialogue_backing = 0;
+        } else if (value == "faint" || value == "1") {
+            s.ui_dialogue_backing = 1;
+        } else if (value == "game" || value == "2") {
+            s.ui_dialogue_backing = 2;
+        }
     } else if (key == "ui_conditions") {
         if (value == "view" || value == "0") {
             s.ui_conditions = 0;
@@ -1009,6 +1061,29 @@ void ParseSettingsLine(Settings& s, const std::string& key, const std::string& v
         s.dodge_camera = value == "1" || value == "true";
     } else if (key == "follow_smoothing_ms") {
         s.follow_smoothing_ms = std::clamp(f(), 0.0f, 100.0f);
+    } else if (key == "follow_rigid_seen") {
+        s.follow_rigid_seen = value == "1" || value == "true";
+    } else if (key == "hand_tremor_filter") {
+        s.hand_tremor_filter = value == "1" || value == "true";
+    } else if (key == "weighted_weapons") {
+        s.weighted_weapons = value == "2" ? 2 : (value == "1" || value == "true" ? 1 : 0);
+    } else if (key == "weapon_weight") {
+        const float amount = f();
+        s.weapon_weight = std::isfinite(amount) ? std::clamp(amount, 0.0f, 1.0f) : 0.0f;
+        s.weapon_weight_legacy = s.weapon_weight > 0.0f; // the default file's 0 is no tuning
+    } else if (key == "weapon_mesh_weight") {
+        s.weapon_mesh_weight = value == "1" || value == "true";
+    } else if (key == "weapon_pose_motor") {
+        s.weapon_pose_motor = value == "1" || value == "true";
+    } else if (key == "weapon_lift_response") {
+        const float amount = f();
+        s.weapon_lift_response = std::isfinite(amount) ? std::clamp(amount,0.0f,1.0f) : 0.0f;
+    } else if (key == "weapon_load_response") {
+        const float amount = f();
+        s.weapon_load_response = std::isfinite(amount) ? std::clamp(amount,0.0f,1.0f) : 0.0f;
+    } else if (key == "weapon_gravity") {
+        const float amount = f();
+        s.weapon_gravity = std::isfinite(amount) ? std::clamp(amount,0.0f,1.0f) : 0.0f;
     } else if (key == "pair_lock_position") {
         s.pair_lock_position = value == "1" || value == "true";
     } else if (key == "dodge_vertical_ms") {
@@ -1064,6 +1139,10 @@ void ParseSettingsLine(Settings& s, const std::string& key, const std::string& v
         s.evasion_feedback = value == "1" || value == "true";
     } else if (key == "player_hp_bonus_pct") {
         s.player_hp_bonus_pct = std::clamp(static_cast<s32>(std::lround(f())), 0, 100);
+        Assists::live.SetHpBonus(s.player_hp_bonus_pct);
+    } else if (key == "outgoing_damage_pct") {
+        s.outgoing_damage_pct = OutgoingDamage::Clamp(f());
+        OutgoingDamage::live_percent.store(s.outgoing_damage_pct, std::memory_order_relaxed);
     } else if (key == "offhand_damage_pct") {
         s.offhand_damage_pct = std::clamp(static_cast<s32>(std::lround(f())), 0, 100);
     } else if (key == "melee_kill_ragdoll") {
@@ -1074,6 +1153,14 @@ void ParseSettingsLine(Settings& s, const std::string& key, const std::string& v
         s.melee_ragdoll_vanilla_pct = std::clamp(static_cast<s32>(std::lround(f())), 0, 100);
     } else if (key == "dodge_iframes_extra") {
         s.dodge_iframes_extra = std::clamp(static_cast<s32>(std::lround(f())), 0, 10);
+        Assists::live.SetDodgeFrames(s.dodge_iframes_extra);
+    } else if (key == "lean_iframes_ms") {
+        s.lean_iframes_ms = std::clamp(static_cast<s32>(std::lround(f())), 0, 300);
+    } else if (key == "lean_iframes_cooldown_ms") {
+        s.lean_iframes_cooldown_ms = std::clamp(f(), 200.0f, 5000.0f);
+    } else if (key == "lean_iframes") {
+        // (Before 2026-10-15 evening: in the game's 1/30 s frames, 3 written by default. Ignored:
+        // it would pin 100 ms over lean_iframes_ms' new default.)
     } else if (key == "dodge_attack") {
         s.dodge_attack = value == "1" || value == "true";
     } else if (key == "dodge_attack_iframes") {
@@ -1341,16 +1428,24 @@ void ParseSettingsLine(Settings& s, const std::string& key, const std::string& v
         s.cinematic_pickup = value == "1" || value == "true";
     } else if (key == "lamp_travel") {
         Lamps::SetEnabled(value == "1" || value == "true");
+    } else if (key == "physical_summon_bell") {
+        SummonBell::enabled.store(value == "1" || value == "true");
     } else if (key == "physical_levers") {
         Lever::SetEnabled(value == "1" || value == "true");
     } else if (key == "pickup_instant") {
         s.pickup_instant = value == "1" || value == "true";
+    } else if (key == "auto_name") {
+        s.auto_name = value == "1" || value == "true";
+    } else if (key == "body_fill_lights") {
+        s.body_fill_lights = value == "1" || value == "true";
     } else if (key == "cinematic_scripted") {
         s.cinematic_scripted = value == "1" || value == "true";
     } else if (key == "cinematic_item") {
         s.cinematic_item = value == "1" || value == "true";
     } else if (key == "cinematic_levelup") {
         s.cinematic_levelup = value == "1" || value == "true";
+    } else if (key == "cinematic_foggate") {
+        s.cinematic_foggate = value == "1" || value == "true";
     } else if (key == "cinematic_fade_ms") {
         s.cinematic_fade_ms = std::clamp(f(), 0.0f, 2000.0f);
     } else if (key == "cinematic_return_fade_ms") {
@@ -1406,17 +1501,26 @@ Vec3 NeckPivot(const Pose& head) {
 
 bool LagTestEnabled();
 
+Aa::Mode GetActiveAaMode() {
+    return S().aa_transition.Active();
+}
+
+Aa::Mode GetRequestedAaMode() {
+    return S().aa_transition.Requested();
+}
+
 Settings& GetSettings() {
     return S().settings;
 }
 
 namespace {
-// The vr.ini stereo values become the mode in effect (and the live switch starts from them).
-void PublishStereoSettings() {
+// Initialize the frame settings before rendering starts. Live requests are queued separately.
+void PublishFrameSettings() {
     auto& st = S();
     const u32 word = PackStereo(st.settings.stereo, st.settings.stereo_mode);
     st.stereo_word.store(word);
     st.stereo_request.store(word);
+    st.aa_transition.Initialize(st.settings.aa_mode);
 }
 // vr.ini in the user directory, or the file VR_INI names (test runs use their own copy and never
 // touch the player's settings).
@@ -1430,19 +1534,10 @@ std::filesystem::path SettingsPath() {
 } // Anonymous namespace
 
 void LoadSettings() {
-    auto& room_state=S();
-    if(VR::Interactions::DllRequested() && !room_state.roomscale_module){
-        room_state.roomscale_module=new Interactions::Module();room_state.roomscale_module->EnableFaultBroadcast();
-        if(!room_state.roomscale_module->LoadBesideExecutable()){
-            room_state.roomscale_fault=true;LOG_ERROR(Core,"VR roomscale: DLL unavailable: {}",room_state.roomscale_module->Diagnostic());
-        }
-        room_state.roomscale_walk.Bind(*room_state.roomscale_module,room_state.roomscale_fault);
-    }
-
     const auto path = SettingsPath();
     std::ifstream file{path};
     if (!file) {
-        PublishStereoSettings();
+        PublishFrameSettings();
         if (std::error_code ec; std::filesystem::exists(path, ec) || ec) {
             // There but unreadable (another program holds it, its permissions): the defaults
             // apply for this session and the player's file is left as it is.
@@ -1592,6 +1687,9 @@ void LoadSettings() {
                    "history, the steadiest edges in motion),\n# off (the game's AA off: the eyes' "
                    "temporal AA alone; vr.ini only)\n"
                 << "aa_mode=" << Aa::Name(d.aa_mode) << "\n"
+                << "# Distant detail: 0 Performance (the game's distant models), -1 Balanced, -2 "
+                   "Quality\n# (full models at any distance); a change in game applies at once\n"
+                << "lod_bias=" << d.lod_bias << "\n"
                 << "# with aa_mode=taa: the jitter (0 .. 1 = +-half a render pixel), its cycle "
                    "(8 or 16),\n# the current frame's least share (the history's length: 1 / "
                    "it frames), the history's\n# clip box in sigma, the disocclusion test "
@@ -1637,6 +1735,8 @@ void LoadSettings() {
                 << "# the eyes' temporal anti-aliasing while you look around: how much of the "
                    "previous\n# refreshes each one keeps (0 = off, 0.5 .. 0.9)\n"
                 << "eye_taa=" << d.eye_taa << "\n"
+                << "# DIBR only: -1 = the DIBR default (0.25, never above eye_taa), 0 disables, 0..0.9 blends history\n"
+                << "dibr_eye_taa=" << d.dibr_eye_taa << "\n"
                 << "# with eye_taa: 1 = it also follows the game camera (walking, smooth turns), "
                    "0 = only\n# while the world stands still\n"
                 << "eye_taa_follow=" << (d.eye_taa_follow ? 1 : 0) << "\n"
@@ -1954,6 +2054,8 @@ void LoadSettings() {
                    "longer applies to it).\n"
                 << "# 0 = off (the HUD panel above, menus on the frozen panel), 1 = on, 2 = check "
                    "only\n"
+                << "ui_compose=eyes\n"
+                << "overlay_compose=eyes\n"
                 << "ui_layer=" << d.ui_layer << "\n"
                 << "# where menus go: layer (the UI layer's canvas), frozen (the menu panel over a "
                    "frozen,\n"
@@ -2010,6 +2112,8 @@ void LoadSettings() {
                 << "# HUD distance (m), size (deg per 1080p pixel: 0.042 = text 1 deg), height (+ "
                    "= up, deg)\n"
                 << "ui_hud_distance_m=" << d.ui_hud_distance_m << "\n"
+                << "# Subtitles, prompts and item pickups this much further than the HUD (m)\n"
+                << "ui_lower_push_m=" << d.ui_lower_push_m << "\n"
                 << "ui_hud_scale_deg=" << d.ui_hud_scale_deg << "\n"
                 << "ui_hud_pitch_deg=" << d.ui_hud_pitch_deg << "\n"
                 << "# band: it follows your head beyond these angles (deg: sideways, up, down) "
@@ -2080,14 +2184,21 @@ void LoadSettings() {
                 << "ui_lock_marker_scale=" << d.ui_lock_marker_scale << "\n"
                 << "ui_lock_marker_alpha=" << d.ui_lock_marker_alpha << "\n"
                 << "# the bars over the enemies you hit or lock on to (and their damage "
-                   "numbers): 1 = shown, 0 = hidden\n# (the boss bar: ui_boss_hp_bar)\n"
+                   "numbers): 1 = shown, 0 = hidden\n# (the boss bar: ui_boss_bar)\n"
                 << "ui_enemy_hp_bars=" << (d.ui_enemy_hp_bars ? 1 : 0) << "\n"
                 << "# the boss's health bar: 0 = hidden, 1 = shown near the top of the view\n"
-                << "ui_boss_hp_bar=" << (d.ui_boss_hp_bar ? 1 : 0) << "\n"
+                << "ui_boss_bar=" << (d.ui_boss_hp_bar ? 1 : 0) << "\n"
                 << "# the game's button icons as the VR controllers' (cross A, circle B, square "
                    "LG, triangle RG,\n# L1 LT, R1 RT, OPTIONS Menu; the action prompts: cross B, "
                    "circle A, triangle X);\n# 0 = the DualShock 4's (at the start)\n"
                 << "ui_vr_buttons=" << (d.ui_vr_buttons ? 1 : 0) << "\n"
+                << "# the dark box behind the NPCs' subtitles: none = the words alone, faint, "
+                   "game = the game's own\n# (at the start)\n"
+                << "ui_dialogue_backing="
+                << (d.ui_dialogue_backing == 1   ? "faint"
+                    : d.ui_dialogue_backing == 2 ? "game"
+                                                 : "none")
+                << "\n"
                 << "# the status build-up meter (poison, bleed, frenzy, ...): view = a small "
                    "piece under the view's centre\n# while a build-up shows, game = where the "
                    "game draws it (top centre, out of view in VR)\n"
@@ -2125,6 +2236,23 @@ void LoadSettings() {
                 << "dodge_camera=" << (d.dodge_camera ? 1 : 0) << "\n"
                 << "# horizontal follow of the body (ms, 0 = rigid; 40 = softer)\n"
                 << "follow_smoothing_ms=" << d.follow_smoothing_ms << "\n"
+                << "# the one-time switch of an older follow_smoothing_ms=25 to 0 already happened\n"
+                << "follow_rigid_seen=1\n"
+                << "# the hands' tremor damped while nearly still (adaptive filtering reduces motion lag)\n"
+                << "hand_tremor_filter=" << (d.hand_tremor_filter ? 1 : 0) << "\n"
+                << "# experimental weapon weight + air resistance: 0 off, 1 on; fractions soften it\n"
+                << "# weighted weapons: rigid weapon weight, gravity and air resistance\n"
+                << "# weighted_weapons: 0 off, 1 regular (default), 2 light\n"
+                << "weighted_weapons=1\n"
+                << "weapon_weight=" << d.weapon_weight << "\n"
+                << "# optional gravity sag: 0 off, 1 full; requires weapon_weight > 0\n"
+                << "# optional bounded load compliance; requires weight and gravity\n"
+                << "weapon_pose_motor=" << d.weapon_pose_motor << "\n"
+                << "weapon_lift_response=" << d.weapon_lift_response << "\n"
+                << "weapon_load_response=" << d.weapon_load_response << "\n"
+                << "weapon_gravity=" << d.weapon_gravity << "\n"
+                << "# measured weapon geometry, experimental and independent of gravity\n"
+                << "weapon_mesh_weight=" << d.weapon_mesh_weight << "\n"
                 << "# both eyes of a stereo pair use one body position (correct depth while "
                    "moving)\n"
                 << "pair_lock_position=" << (d.pair_lock_position ? 1 : 0) << "\n"
@@ -2185,6 +2313,8 @@ void LoadSettings() {
                 << "player_hp_bonus_pct=" << d.player_hp_bonus_pct << "\n"
                 << "# extra damage in % for the left-hand weapon (gun etc.), 0 = vanilla\n"
                 << "offhand_damage_pct=" << d.offhand_damage_pct << "\n"
+                << "# outgoing HP damage adjustment (-30..30 percent), 0 = unchanged\n"
+                << "outgoing_damage_pct=" << d.outgoing_damage_pct << "\n"
                 << "# 1 = an enemy your blade kills goes limp at once (its death animation cut "
                    "short) if its death ends in the\n# ragdoll; bullets, fire bombs, the left hand, "
                    "viscerals and backstabs keep the death animation; 0 = always the game's\n"
@@ -2199,6 +2329,12 @@ void LoadSettings() {
                 << "# extra invincibility after a quickstep's or roll's own i-frames, in 1/30 s "
                    "frames (0 .. 10; backsteps have none), 0 = vanilla\n"
                 << "dodge_iframes_extra=" << d.dodge_iframes_extra << "\n"
+                << "# a quick sideways or backward lean of the head (lean_dodge_speed / _dist_m) "
+                   "makes you invulnerable for this\n# many ms of game time, at most once per the "
+                   "cooldown; no dodge and no animation (0 .. 300, 0 = off;\n# standing, motion "
+                   "controls)\n"
+                << "lean_iframes_ms=" << d.lean_iframes_ms << "\n"
+                << "lean_iframes_cooldown_ms=" << d.lean_iframes_cooldown_ms << "\n"
                 << "# 1 = a swing or a gun shot works at any moment of a dodge (the dodge goes on), "
                    "0 = they wait for the dodge's attack window\n# (needs arm_keep_on_dodge=1: "
                    "a dodge that takes the arms takes no attack)\n"
@@ -2226,9 +2362,17 @@ void LoadSettings() {
                 << "lamp_travel=1\n"
                 << "# grab and pull supported levers with either hand (0 = original interaction)\n"
                 << "physical_levers=1\n"
+                << "# First-person NPC signs: B draws a bell, shake to summon, B cancels\n"
+                << "physical_summon_bell=1\n"
                 << "# item pickups in first-person VR: the game's 'picked up' pop-up at once, no "
                    "pickup animation (0 = the game's animation)\n"
                 << "pickup_instant=" << (d.pickup_instant ? 1 : 0) << "\n"
+                << "# a new hunter's name box answered at once with a random name (the system "
+                   "keyboard cannot be seen\n# in the headset; 0 = the keyboard)\n"
+                << "auto_name=" << (d.auto_name ? 1 : 0) << "\n"
+                << "# the game's camera-attached fill lights follow the hunter's heading, not "
+                   "your head (0 = your head, the game's look)\n"
+                << "body_fill_lights=" << (d.body_fill_lights ? 1 : 0) << "\n"
                 << "# NPC talk, scripted event animations, revival\n"
                 << "cinematic_scripted=" << (d.cinematic_scripted ? 1 : 0) << "\n"
                 << "# a canned item use from the quick-item arc (the Shaman Bone Blade's stab): "
@@ -2238,6 +2382,8 @@ void LoadSettings() {
                    "Level Up is on the menu panel; 1 = flat (the game's camera, the menu on the "
                    "virtual screen)\n"
                 << "cinematic_levelup=" << (d.cinematic_levelup ? 1 : 0) << "\n"
+                << "# walking through a fog gate: 0 = it stays in first-person VR; 1 = flat\n"
+                << "cinematic_foggate=" << (d.cinematic_foggate ? 1 : 0) << "\n"
                 << "# fade to black when the flat screen comes (ms, 0 = hard cut)\n"
                 << "cinematic_fade_ms=" << d.cinematic_fade_ms << "\n"
                 << "# the way back: the screen cuts to black, first-person VR fades in (ms, 0 = "
@@ -2319,6 +2465,19 @@ void LoadSettings() {
         LOG_INFO(Core, "VR: stereo_mode 1 -> 2 (DIBR is the new default; Menu + left stick "
                        "switches back)");
     }
+    if (!loaded.follow_rigid_seen) {
+        // One time (0.3.4): every vr.ini written before carries follow_smoothing_ms=25, the old
+        // default, which would keep the spring that trailed the body (the arms jumped against the
+        // view as the game eased him into and out of a walk). Another value someone chose stays,
+        // and a 25 set after this is kept.
+        if (loaded.follow_smoothing_ms == 25.0f) {
+            loaded.follow_smoothing_ms = 0.0f;
+            SaveSetting("follow_smoothing_ms", "0");
+            LOG_INFO(Core, "VR: follow_smoothing_ms 25 -> 0 (the body is followed rigidly now)");
+        }
+        loaded.follow_rigid_seen = true;
+        SaveSetting("follow_rigid_seen", "1");
+    }
     if (loaded.physical_evasion && loaded.lean_dodge) {
         // A quick lean would both roll and move the hurtboxes.
         loaded.lean_dodge = false;
@@ -2328,7 +2487,7 @@ void LoadSettings() {
     if (loaded.camera_roll) {
         LOG_INFO(Core, "VR: camera_roll=1: the render camera rolls with your head");
     }
-    PublishStereoSettings();
+    PublishFrameSettings();
     LOG_INFO(Core, "VR: loaded settings from {}", Common::FS::PathToUTF8String(path));
 }
 
@@ -2412,8 +2571,10 @@ bool IsAreaDimRemoved() {
 }
 
 namespace {
+std::atomic<u64> g_transition_texture_cleanup{0};
 std::atomic<s64> g_lamp_warp_ns{0};
 std::atomic<s64> g_lamp_arrival_ns{0};
+std::atomic<s64> g_player_arrival_ns{0};
 } // Anonymous namespace
 
 namespace {
@@ -2427,6 +2588,19 @@ void PublishLampBoxHidden(bool hidden) {
 bool IsLampBoxHidden() {
     const s64 at = g_lamp_box_hidden_ns.load(std::memory_order_acquire);
     return at != 0 && NowNs() - at < 500'000'000;
+}
+
+void RequestTransitionTextureCleanup(bool area_changed) {
+    // Preserve the strongest pending hint if the lamp arrival and generic player replacement
+    // are published before the render thread consumes them. A later transition gets its own hint.
+    u64 previous = g_transition_texture_cleanup.load(std::memory_order_relaxed);
+    while (!g_transition_texture_cleanup.compare_exchange_weak(
+        previous, ((previous & ~u64{1}) + 2) | (previous & 1) | u64{area_changed},
+        std::memory_order_relaxed)) {}
+}
+
+u64 TakeTransitionTextureCleanupRequest() {
+    return g_transition_texture_cleanup.fetch_and(~u64{1}, std::memory_order_relaxed);
 }
 
 void PublishLampWarp(bool arrived) {
@@ -2444,6 +2618,15 @@ bool LampWarpArrivedWithin(float seconds) {
     const s64 arrival = g_lamp_arrival_ns.load(std::memory_order_acquire);
     return arrival != 0 && arrival >= g_lamp_warp_ns.load(std::memory_order_acquire) &&
            NowNs() - arrival < static_cast<s64>(seconds * 1e9f);
+}
+
+void NotePlayerArrival() {
+    g_player_arrival_ns.store(NowNs(), std::memory_order_release);
+}
+
+bool PlayerArrivedWithin(float seconds) {
+    const s64 arrival = g_player_arrival_ns.load(std::memory_order_acquire);
+    return arrival != 0 && NowNs() - arrival < static_cast<s64>(seconds * 1e9f);
 }
 
 void PublishItemPickup(bool shown) {
@@ -2683,6 +2866,19 @@ HeadState GetHead() {
     return st.head;
 }
 
+float ClaimTurnForArms(bool claim) {
+    auto& st = S();
+    if (!claim) {
+        return st.arms_turn.load();
+    }
+    const float queued = st.pending_turn.exchange(0.0f);
+    float total = st.arms_turn.load();
+    while (!st.arms_turn.compare_exchange_weak(total, total + queued)) {
+    }
+    st.arms_claimed.store(true);
+    return total + queued;
+}
+
 void AddTurn(float radians) {
     if (!IsImmersive() || GameOwnsCamera()) {
         return; // loading screens, cutscenes, lock-on: never queue turns
@@ -2830,6 +3026,61 @@ void ApplySpaceShift(State& st, const HeadState& sample) {
     }
 }
 
+// After a load the camera waits for the hunter's arrival (Cinematic::ArrivalHoldNs): the screen
+// that showed the loading page stays up and the arrival goes flat straight from it, one switch at
+// its end instead of VR, then the flat arrival and VR again. The wait runs from the loading page's
+// end (load_end_ns: after a death the new main player arrives seconds before it) and from the
+// machine's own window (ArrivalHoldUntil). Before the first main-player update the machine cannot
+// tell: that wait starts at the first camera tick that finds the updates stopped (at most
+// ArrivalHoldNs: a player hook that never runs costs that after a load). A cutscene file opened
+// as the wait ends (the respawn scene in the Hunter's Dream) keeps the screen up until the remo
+// rule takes the camera (bloodborne_camera.cpp RemoCutscene: 0.4 s without a player update). Only
+// while the screen is up: first-person VR already shown is never taken back, and a menu is never
+// held.
+bool ArrivalWait(State& st, s64 now) {
+    if (!st.settings.cinematic || IsImmersive() || MenuPanelActive()) {
+        st.arrival_wait_since = 0;
+        return false;
+    }
+    const s64 until = st.arrival_hold_until.load(std::memory_order_acquire);
+    if (until != 0) {
+        st.arrival_seen_until = until;
+    }
+    const s64 load_end_until = st.load_end_ns != 0 ? st.load_end_ns + Cinematic::ArrivalHoldNs : 0;
+    if (now < until || now < load_end_until) {
+        return true;
+    }
+    constexpr s64 CutsceneLeadNs = 1000 * Cinematic::Millis;
+    const s64 opened = Core::FileSys::LastCutsceneOpenNs();
+    const s64 seen = std::max(st.arrival_seen_until, load_end_until);
+    if (seen != 0 && now < seen + CutsceneLeadNs && opened != 0 && now - opened < CutsceneLeadNs) {
+        return true;
+    }
+    const s64 alive = st.player_alive_ns.load(std::memory_order_relaxed);
+    if (alive != 0 && now - alive <= Cinematic::LongGapNs) {
+        st.arrival_wait_since = 0;
+        return false;
+    }
+    if (st.arrival_wait_since == 0) {
+        st.arrival_wait_since = now;
+    }
+    return now - st.arrival_wait_since < Cinematic::ArrivalHoldNs;
+}
+
+bool ArrivalHold(State& st) {
+    const s64 now = NowNs();
+    const bool hold = ArrivalWait(st, now);
+    if (hold != st.arrival_holding) {
+        st.arrival_holding = hold;
+        LOG_INFO(Core, "VR cine: arrival wait {}{}", hold ? "on (the screen stays up)" : "off",
+                 st.load_end_ns != 0 && !hold
+                     ? fmt::format(", {:.2f} s after the loading page ended",
+                                   static_cast<double>(now - st.load_end_ns) * 1e-9)
+                     : std::string{});
+    }
+    return hold;
+}
+
 } // namespace
 
 bool KeepEyeFov() {
@@ -2894,6 +3145,17 @@ CameraOverride OnCameraTick(float game_pitch, float game_yaw, float game_vfov, b
         st.gap_ns = last != 0 ? now - last : 0;
         st.driving = false;
     }
+    // The loading page ended: the first tick after a gap in which a new main player arrived (a
+    // load; a cutscene or a hitch makes none). The arrival wait runs from here (ArrivalHold, and
+    // the machine through Signals::load_end).
+    if (const s64 arrival = g_player_arrival_ns.load(std::memory_order_acquire);
+        arrival != 0 && arrival > last) {
+        st.load_end_ns = now;
+        st.load_end_serial.fetch_add(1, std::memory_order_release);
+        LOG_INFO(Core, "VR cine: the loading page ended ({:.2f} s after the new main player): the "
+                       "arrival wait runs from here",
+                 static_cast<double>(now - arrival) * 1e-9);
+    }
     // One head sample for the whole tick: a recenter is carried into exactly its space before
     // anything below reads it (a second read could already be in a newer one).
     const HeadState live = GetHead();
@@ -2911,8 +3173,10 @@ CameraOverride OnCameraTick(float game_pitch, float game_yaw, float game_vfov, b
     record.space_serial = st.shift_applied;
     CameraOverride result{};
     // Cinematic flat mode: the game's third-person camera is shown on the virtual screen, exactly
-    // like a cutscene (not driven, the right stick goes to the game).
-    const bool want = IsEnabled() && GetDisplayMode() == DisplayMode::Auto && !CinematicFlat();
+    // like a cutscene (not driven, the right stick goes to the game). Likewise just after a load,
+    // while the hunter's arrival may still start (ArrivalHold).
+    const bool want = IsEnabled() && GetDisplayMode() == DisplayMode::Auto && !CinematicFlat() &&
+                      !ArrivalHold(st);
     HeadState sampled = want ? live : HeadState{};
     // Menu panel: the view stays where you looked when the menu opened (mono), so the game image
     // on the panel holds still while you look around the panel.
@@ -3156,7 +3420,13 @@ CameraOverride OnCameraTick(float game_pitch, float game_yaw, float game_vfov, b
                 st.recenter_deferred = true;
                 LOG_INFO(Core, "VR: recenter during a menu: applied when the menu closes");
             }
-            if (const float turn = st.pending_turn.exchange(0.0f); turn != 0.0f) {
+            // The turn the arms' pose copy claimed for this frame (ClaimTurnForArms); with no pose
+            // copy since the last update (no first-person arms), all of the queued turn.
+            float turn = st.arms_turn.exchange(0.0f);
+            if (!st.arms_claimed.exchange(false)) {
+                turn += st.pending_turn.exchange(0.0f);
+            }
+            if (turn != 0.0f) {
                 st.base_yaw = WrapAngle(st.base_yaw + turn);
                 if (std::abs(turn) > 0.1f) {
                     ++st.turn_serial; // the eyes must not mix pre- and post-turn images
@@ -3251,8 +3521,10 @@ CameraOverride OnCameraTick(float game_pitch, float game_yaw, float game_vfov, b
         // shimmer.
         float jitter_yaw = 0.0f;
         // (Never with aa_mode=taa: the render TAA jitters the frame itself, in clip space.)
-        if (s.eye_taa > 0.0f && s.eye_taa_jitter > 0.0f && stereo.stereo && stereo.mode == 2 &&
-            !menu_hold && EyeTaaAccumulating() && s.aa_mode != Aa::Mode::Taa) {
+        if (VR::EyeHistory::Weight(std::getenv("VR_NATIVE_STEREO") != nullptr, false,
+                                  s.eye_taa, s.taa_eye_taa, s.dibr_eye_taa) > 0.0f &&
+            s.eye_taa_jitter > 0.0f && stereo.stereo && stereo.mode == 2 &&
+            !menu_hold && EyeTaaAccumulating() && GetActiveAaMode() != Aa::Mode::Taa) {
             static constexpr std::array<std::array<float, 2>, 8> Halton{{
                 {0.5f, 1.0f / 3.0f},
                 {0.25f, 2.0f / 3.0f},
@@ -3511,6 +3783,8 @@ CameraOverride OnCameraTick(float game_pitch, float game_yaw, float game_vfov, b
         st.driving = false;
         st.gap_pending = false; // not a gap: the bridge stopped driving (the takeover is full)
         st.pending_turn.store(0.0f);
+        st.arms_turn.store(0.0f);
+        st.arms_claimed.store(false);
         st.game_owns.store(true, std::memory_order_relaxed);
         // Not driving: no pair is open, so a live mode switch applies at once.
         st.stereo_word.store(st.stereo_request.load(), std::memory_order_release);
@@ -3530,6 +3804,10 @@ CameraOverride OnCameraTick(float game_pitch, float game_yaw, float game_vfov, b
         }
     }
     result.record_id = record.id;
+    Common::SyncLog::Line("cam rec=%llu head_t=%lld turn=%u base_yaw=%.5f head_yaw=%.5f driven=%d",
+                          static_cast<unsigned long long>(record.id),
+                          static_cast<long long>(record.head_time), record.turn_serial,
+                          record.base_yaw, record.head_yaw, record.driven ? 1 : 0);
     return result;
 }
 
@@ -3537,7 +3815,6 @@ Vec3 RoomscaleWalkInput(bool allowed, const char* why) {
     auto& st = S();
     const s64 now = NowNs();
     std::scoped_lock lk{st.roomscale_mutex};
-    allowed=allowed && !Interactions::ProcessFaultLatch().Tripped();
     st.roomscale_allowed = allowed;
     st.roomscale_why = why != nullptr ? why : "";
     st.roomscale_input_ns = now;
@@ -3556,8 +3833,7 @@ void UpdateRoomscaleWalk(CameraOverride& camera, const Vec3& base, bool first_pe
     Body::BodyStatus body{};
     const bool body_ok = Body::LatestBodyStatus(body) && now >= body.steady_ns &&
                          now - body.steady_ns < 150'000'000 && body.roomscale_ok;
-    if(st.roomscale_module && Interactions::ProcessFaultLatch().Tripped())st.roomscale_fault=true;
-    const bool allowed = !st.roomscale_fault && s.roomscale_walk && s.positional && !s.seated && first_person &&
+    const bool allowed = s.roomscale_walk && s.positional && !s.seated && first_person &&
                          camera.active && camera.head_tracked && !IsGameMenuOpen() &&
                          !MenuPanelActive() && !CinematicActive() && body_ok &&
                          st.roomscale_allowed && now >= st.roomscale_input_ns &&
@@ -3575,10 +3851,14 @@ void UpdateRoomscaleWalk(CameraOverride& camera, const Vec3& base, bool first_pe
     f.view_yaw = camera.view_yaw;
     f.base = {base.x, base.z};
     f.head = {camera.head_position.x, camera.head_position.z};
-    const auto& posture=Body::GetBodySettings();
-    const auto decision=st.roomscale_walk.Update(f,{s.roomscale_start_m,s.roomscale_stop_m,s.roomscale_max_stick},
-        {camera.neck_offset.x,camera.neck_offset.z},body.roomscale_yaw,posture.body_lean_side_deg,posture.body_align,posture.body_posture_lean,posture.body_align_max_m);
-    f.offset=decision.tracking_offset;const auto& out=decision.motion;const float lean_scale=decision.lean_scale;
+    f.offset = Roomscale::ToTracking({camera.neck_offset.x, camera.neck_offset.z}, camera.base_yaw);
+    const auto& posture = Body::GetBodySettings();
+    const float lean_scale = Roomscale::LeanScale(
+        {camera.neck_offset.x, camera.neck_offset.z}, body.roomscale_yaw,
+        posture.body_lean_side_deg, posture.body_align, posture.body_posture_lean,
+        posture.body_align_max_m);
+    const auto out = st.roomscale_walk.Update(
+        f, {s.roomscale_start_m, s.roomscale_stop_m, s.roomscale_max_stick, lean_scale});
     if (out.walking != st.roomscale_logged_walking) {
         LOG_INFO(Core, "VR roomscale: {} (offset {:.2f} m, lean allowance x{:.2f}, allowed {})",
                  out.walking ? "walking" : "stopped", Roomscale::Length(f.offset - out.consume),
@@ -3587,7 +3867,8 @@ void UpdateRoomscaleWalk(CameraOverride& camera, const Vec3& base, bool first_pe
     }
     // Out past the start for a second without walking: why (at most every 3 s).
     const float far = Roomscale::Length(f.offset);
-    const float start=decision.start_distance;
+    const float start =
+        std::clamp(s.roomscale_start_m, 0.15f, 0.75f) * std::clamp(lean_scale, 0.35f, 1.75f);
     st.roomscale_far_s = !out.walking && far >= start
                              ? st.roomscale_far_s + GameFrameSeconds()
                              : 0.0f;
@@ -3616,7 +3897,7 @@ void UpdateRoomscaleWalk(CameraOverride& camera, const Vec3& base, bool first_pe
     }
     st.roomscale_out = out;
     st.roomscale_output_ns = now;
-    const auto delta=decision.world_consume;
+    const auto delta = Roomscale::ToWorld(out.consume, camera.base_yaw);
     st.head_origin.x += out.consume.x;
     st.head_origin.z += out.consume.z;
     st.neck_origin.x += out.consume.x;
@@ -3741,6 +4022,28 @@ s32 LagTestMode() {
     return mode;
 }
 
+bool NewestCameraRecord(CameraRecord& record) {
+    auto& st = S();
+    std::scoped_lock lk{st.record_mutex};
+    const u64 latest = st.next_record_id - 1;
+    const auto& r = st.records[latest % State::RecordCount];
+    if (latest == 0 || r.id != latest || !r.driven) return false;
+    record = r;
+    return true;
+}
+
+bool NewestHeadYaw(float& yaw) {
+    auto& st = S();
+    std::scoped_lock lk{st.record_mutex};
+    const u64 latest = st.next_record_id - 1;
+    const auto& r = st.records[latest % State::RecordCount];
+    if (latest == 0 || r.id != latest || !r.driven) {
+        return false;
+    }
+    yaw = r.head_yaw;
+    return true;
+}
+
 bool GetRecord(u64 id, CameraRecord& record) {
     auto& st = S();
     std::scoped_lock lk{st.record_mutex};
@@ -3763,9 +4066,10 @@ bool DebugDrawLog() {
            (g_debug_menu_frames >= 40 && g_debug_menu_frames < 42);
 }
 
-FrameTag OnGpuFrameBoundary(u64 flip) {
+FrameTag OnGpuFrameBoundary(u64 flip, void (*finish_rendering)()) {
     auto& st = S();
     FrameTag tag{};
+    tag.aa_mode = st.aa_transition.Active();
     tag.valid = IsEnabled();
     if (!tag.valid) {
         return tag;
@@ -3787,25 +4091,12 @@ FrameTag OnGpuFrameBoundary(u64 flip) {
             ++st.boundaries_without_tick;
         }
 
-        // The frame's own camera update: the one queued when the game submitted this flip
-        // (the game thread may already have placed the camera for the next frame). Older
-        // entries were never flipped and are dropped.
+        // Match the packet's ticket even if concurrent submitters reached the GPU in
+        // a different order. Earlier tickets may still be pending, not abandoned.
         u64 frame_record = latest;
-        bool matched = false;
-        while (flip != 0 && st.flip_count != 0) {
-            const State::FlipEntry entry = st.flip_queue[st.flip_head];
-            if (entry.ticket > flip) {
-                break;
-            }
-            st.flip_head = (st.flip_head + 1) % State::FlipQueueSize;
-            --st.flip_count;
-            if (entry.ticket == flip) {
-                frame_record = entry.record;
-                matched = true;
-                break;
-            }
-            ++st.flips_dropped;
-        }
+        const auto entry = TakeFlipTicket(st.flip_queue, st.flip_head, st.flip_count, flip);
+        const bool matched = entry.has_value();
+        if (entry) frame_record = entry->record;
         if (!matched) {
             ++st.flips_unmatched;
         } else if (frame_record != latest) {
@@ -3927,6 +4218,13 @@ FrameTag OnGpuFrameBoundary(u64 flip) {
         g_debug_menu_open = open;
     }
 
+    // The finished frame keeps its old AA tag. Publish the requested mode only after all
+    // its rendering work has completed, before selecting the next frame's jitter/draws.
+    if (st.aa_transition.AtBoundary(finish_rendering)) {
+        LOG_INFO(Core, "VR aa transition: {} -> {} at frame {} (rendering completed)",
+                 Aa::Name(tag.aa_mode), Aa::Name(st.aa_transition.Active()), tag.seq);
+    }
+
     // Prepare the next frame's draws: the other eye. stereo_mode 0 keeps the eye in step with the
     // camera updates' parity (only a left frame's update moves the whole view, so a pair is a left
     // frame and the right frame after it): when they disagree, the next frame repeats this eye,
@@ -3975,7 +4273,7 @@ FrameTag OnGpuFrameBoundary(u64 flip) {
         }
         st.taa_resolved_frame = false;
         st.current_taa_jitter = {};
-        if (st.current_frame_dibr && ts.aa_mode == Aa::Mode::Taa && ts.taa_jitter > 0.0f &&
+        if (st.current_frame_dibr && GetActiveAaMode() == Aa::Mode::Taa && ts.taa_jitter > 0.0f &&
             st.taa_width > 0 && st.taa_height > 0 && st.taa_unresolved < 8) {
             RenderTaa::Jitter px =
                 RenderTaa::Halton(++st.taa_phase, static_cast<std::uint32_t>(ts.taa_phases));
@@ -4207,10 +4505,7 @@ float HeightBodyOffsetM() {
 
 float EffectiveIpd(const HeadState& head) {
     const auto& s = S().settings;
-    if (s.ipd_mm > 0.0f) {
-        return s.ipd_mm * 0.001f;
-    }
-    return head.ipd * s.ipd_scale;
+    return EyeDistance::Effective(head.ipd, s.ipd_mm, s.ipd_scale);
 }
 
 namespace {
@@ -4248,8 +4543,22 @@ bool SaveGraphicsForRestart() {
 }
 
 bool ApplySetting(const std::string& key, const std::string& value) {
+    if (Ini::Trim(key) == "aa_mode") {
+        if (const auto mode = Aa::ParseMode(value)) {
+            S().aa_transition.Request(*mode);
+            return true;
+        }
+        return false;
+    }
     try {
         ParseSettingsLine(S().settings, std::string{Ini::Trim(key)}, std::string{Ini::Trim(value)});
+        if (Ini::Trim(key) == "lod_bias") {
+            // Distant detail at once: the running game's LOD code rewritten (memory_patcher).
+            if (!MemoryPatcher::SetLodBiasLive(S().settings.lod_bias)) {
+                LOG_INFO(Core, "VR: distant detail {} saved; it applies at the next start",
+                         S().settings.lod_bias);
+            }
+        }
         return true;
     } catch (const std::exception& e) {
         LOG_WARNING(Core, "VR: setting {}={} refused ({})", key, value, e.what());
@@ -4450,18 +4759,6 @@ bool RequestInject() {
     return true;
 }
 
-void CancelPendingInject() {
-    auto& st = S();
-    u64 awaited = st.inject_awaited.load(std::memory_order_acquire);
-    if (awaited == 0 || (awaited & InjectPhaseMask) != InjectPending) return;
-    // This CAS is the cancellation/execution ownership boundary. A taken request
-    // cannot be withdrawn, and remains outstanding until its definitive answer.
-    if (st.inject_request.compare_exchange_strong(awaited, InjectIdle, std::memory_order_acq_rel)) {
-        st.inject_result.store((static_cast<u32>(awaited >> 48) << 8) |
-                               static_cast<u32>(InjectResult::Expired), std::memory_order_release);
-    }
-}
-
 InjectResult PollInjectResult() {
     auto& st = S();
     u64 awaited = st.inject_awaited.load(std::memory_order_acquire);
@@ -4512,6 +4809,18 @@ void NotePlayerUpdate() {
 
 s64 LastPlayerUpdateNs() {
     return S().player_alive_ns.load(std::memory_order_relaxed);
+}
+
+namespace {
+std::atomic<bool> g_remo_cutscene{false};
+} // namespace
+
+void SetRemoCutscene(bool playing) {
+    g_remo_cutscene.store(playing, std::memory_order_release);
+}
+
+bool RemoCutscenePlaying() {
+    return g_remo_cutscene.load(std::memory_order_acquire);
 }
 
 bool TakeInjectRequest(bool& expired) {
@@ -4608,7 +4917,8 @@ Cinematic::Config CinematicConfig(const Settings& s) {
                       s.cinematic_scripted,
                       s.cinematic_ladder,
                       s.cinematic_item,
-                      s.cinematic_levelup};
+                      s.cinematic_levelup,
+                      s.cinematic_foggate};
     cfg.fade_ns = MsToNs(s.cinematic_fade_ms);
     cfg.return_fade_ns =
         s.cinematic_return_fade_ms < 0.0f ? -1 : MsToNs(s.cinematic_return_fade_ms);
@@ -4677,6 +4987,12 @@ Cinematic::Step UpdateCinematic(const Cinematic::Signals& signals) {
     const s64 now = NowNs();
     Cinematic::Signals in = signals;
     CinematicTest(now, in);
+    // The loading page ended since the last update (the camera tick saw it): the arrival window.
+    if (const u64 load_end = st.load_end_serial.load(std::memory_order_acquire);
+        load_end != st.load_end_taken) {
+        st.load_end_taken = load_end;
+        in.load_end = true;
+    }
     const bool allowed = IsEnabled() && GetDisplayMode() == DisplayMode::Auto;
     // A flat period only starts from first-person VR that is being shown. With the virtual
     // screen already up (no head pose, no camera bridge, a camera the headset does not drive) it
@@ -4686,6 +5002,8 @@ Cinematic::Step UpdateCinematic(const Cinematic::Signals& signals) {
         st.cinematic.Update(in, now, CinematicConfig(st.settings), allowed,
                             st.cinematic_suppress.exchange(false, std::memory_order_acq_rel),
                             can_enter, st.cinematic_projection_ns.load(std::memory_order_acquire));
+    st.arrival_hold_until.store(allowed ? st.cinematic.ArrivalHoldUntil() : 0,
+                                std::memory_order_release);
     if (step.changed) {
         if (step.resync) {
             st.resync_to_head.store(true);

@@ -1,10 +1,11 @@
 #include "video_core/host_copies.h"
 #include "video_core/flip_order_trace.h"
-#include "../../../scratchpad/dual-eye-perf/pgo_capture.h"
-#include "../../../scratchpad/dual-eye-perf/profile_scopes.h"
-#include "../../../scratchpad/dual-eye-perf/push_state_memo.h"
-#include "../../../scratchpad/fast-renderer/b_handler_profile.h"
+#include "video_core/native_stereo/pgo_capture.h"
+#include "video_core/native_stereo/profile_scopes.h"
+#include "video_core/native_stereo/push_state_memo.h"
+#include "video_core/fast/b_handler_profile.h"
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -49,6 +50,21 @@ bool GpuTimingWanted() {
         return value != nullptr && *value != '\0' && *value != '0';
     }();
     return wanted;
+}
+
+// VR_GPU_TIMING_WINDOW_S=<s> (the launcher's performance scan): a `VR gpu frame:` window closes
+// after this much time instead of after 300 frames, so a slow PC reaches the scan's warm-up and
+// measurement windows as soon as a fast one; the scan's head sweep has the same period, so every
+// window holds one whole sweep. 0 / unset: 300 frames.
+std::chrono::nanoseconds GpuTimingWindow() {
+    static const std::chrono::nanoseconds window = [] {
+        const char* value = std::getenv("VR_GPU_TIMING_WINDOW_S");
+        const double s = value != nullptr ? std::atof(value) : 0.0;
+        return std::chrono::nanoseconds{std::isfinite(s) && s >= 0.5 && s <= 60.0
+                                            ? static_cast<s64>(s * 1e9)
+                                            : 0};
+    }();
+    return window;
 }
 
 // VR_GPU_PASSES=1 (with VR_GPU_TIMING=1): also each render pass of the game's frames, timed and
@@ -112,6 +128,7 @@ struct GpuFrameTimer {
     std::vector<std::pair<u64, u64>> spans; // the frame being read back: each buffer's start, end
     u64 prev_end{0};
     std::vector<float> busy_ms, span_ms, gap_ms; // the window
+    std::chrono::steady_clock::time_point window_start{}; // its first frame (VR_GPU_TIMING_WINDOW_S)
     u64 buffers{0};
     u32 skipped{0};
 };
@@ -259,7 +276,7 @@ void GpuPassReport(GpuFrameTimer& t, std::size_t frames) {
 }
 
 __attribute__((no_profile_instrument_function)) void GpuTimerReport(GpuFrameTimer& t) {
-#ifdef CODEX_SCRATCH_PGO_GENERATE
+#ifdef BBVR_PGO_GENERATE
     ScratchPgo::Tick();
 #endif
     const auto rank = [](std::vector<float>& v, double q) -> double {
@@ -287,7 +304,7 @@ __attribute__((no_profile_instrument_function)) void GpuTimerReport(GpuFrameTime
     const double span_max = *std::max_element(t.span_ms.begin(), t.span_ms.end());
     const double busy_p50 = rank(t.busy_ms, 0.5);
     const double busy_p99 = rank(t.busy_ms, 0.99);
-    LOG_INFO(Render_Vulkan,
+    LOG_BENCHMARK_INFO(Render_Vulkan,
              "VR gpu frame: {} game frames: GPU busy per frame avg {:.2f} / p50 {:.2f} / p99 "
              "{:.2f} / max {:.2f} ms, span (first start -> last end) avg {:.2f} / max {:.2f} ms, "
              "idle before a frame avg {:.2f} ms; {:.1f} command buffers per frame, {} untimed",
@@ -325,6 +342,10 @@ void GpuTimerFinishFrame(GpuFrameTimer& t) {
     busy += end - start;
     const u64 first = t.spans.front().first;
     const double to_ms = t.tick_ns * 1e-6;
+    const auto now = std::chrono::steady_clock::now();
+    if (t.busy_ms.empty()) {
+        t.window_start = now;
+    }
     t.busy_ms.push_back(static_cast<float>(static_cast<double>(busy) * to_ms));
     t.span_ms.push_back(static_cast<float>(static_cast<double>(last - first) * to_ms));
     t.gap_ms.push_back(t.prev_end != 0 && first > t.prev_end
@@ -333,7 +354,8 @@ void GpuTimerFinishFrame(GpuFrameTimer& t) {
     t.prev_end = last;
     t.buffers += t.spans.size();
     t.spans.clear();
-    if (t.busy_ms.size() >= 300) {
+    const auto window = GpuTimingWindow();
+    if (window.count() > 0 ? now - t.window_start >= window : t.busy_ms.size() >= 300) {
         GpuTimerReport(t);
     }
 }
@@ -371,6 +393,11 @@ static void GpuFrameTimerMarkNow(Scheduler& scheduler, const Instance& instance)
         t.target = &scheduler; // timed from its next command buffer on
         LOG_INFO(Render_Vulkan,
                  "VR gpu frame: timing the game's frames on the GPU (VR_GPU_TIMING)");
+        if (const auto window = GpuTimingWindow(); window.count() > 0) {
+            // The scan's analyzer reads this to judge warm-up and windows in seconds.
+            LOG_BENCHMARK_INFO(Render_Vulkan, "VR gpu frame: windows of {:.1f} s",
+                               std::chrono::duration<double>(window).count());
+        }
         if (GpuPassesWanted()) {
             auto [pr, pp] = device.createQueryPool({
                 .queryType = vk::QueryType::eTimestamp,
@@ -1485,6 +1512,13 @@ void Scheduler::Finish() {
     SubmitExecution(info);
     recorder.Drain("finish");
     Wait(presubmit_tick);
+}
+
+void Scheduler::WaitSubmitted() {
+    const u64 tick = CurrentTick();
+    if (tick > 1) {
+        Wait(tick - 1);
+    }
 }
 
 void Scheduler::Wait(u64 tick) {

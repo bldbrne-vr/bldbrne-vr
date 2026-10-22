@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 // Late warp (vr.ini late_warp, renderer_vulkan/vr_late_warp.h) math shared by VrLateWarp, its
 // reprojection shader (host_shaders/vr_late_reproject.comp) and the CPU reference / tests.
@@ -738,7 +744,7 @@ Hit March(const Line& line, const Fetch& fetch, int width, int height, float r_l
 // surface, and at a depth edge (the bilinear footprint is not one surface) the nearest texel, so
 // the edge cannot smear across a silhouette. But V slides over the capture by a new sub-pixel
 // phase every refresh, and the nearest texel flips there: the capture's own anti-aliased edge is
-// shown in whole-texel jumps (the late warp's crawl on fine detail, perf/aliasing.md: Dream trees
+// shown in whole-texel jumps (the late warp's crawl on fine detail: Dream trees
 // 13.0 -> 17.8). Where the two sides of the edge move apart by little between the capture and V
 // (q(r) = q0 + r g: |g| (w_hi - w_lo) px), the capture's edge is still where V sees it to within
 // that, and the bilinear colour slides it smoothly instead; where they move apart by more

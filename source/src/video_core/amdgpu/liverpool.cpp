@@ -1,11 +1,12 @@
 #include "video_core/flip_order_trace.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "video_core/fast_render.h"
-#include "../../../scratchpad/fast-renderer/drain_audit.h"
-#include "../../../scratchpad/dual-eye-perf/graphics_submission_scan.h"
-#include "../../../scratchpad/dual-eye-perf/speculative_pool.h"
+#include "video_core/fast/drain_audit.h"
+#include "video_core/native_stereo/graphics_submission_scan.h"
+#include "video_core/native_stereo/speculative_pool.h"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,7 @@
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/videoout/driver.h"
+#include "core/libraries/videoout/video_out.h"
 #include "core/memory.h"
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -420,8 +422,8 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
-    // The command processor is the frame's critical path (documents/bloodborne-vr.md
-    // "Performance"): keep it ahead of the game's own worker threads and background load
+    // The command processor is the frame's critical path:
+    // keep it ahead of the game's own worker threads and background load
     // (VR_CP_NORMAL_PRIORITY=1: the old normal priority, for A/B tests).
     if (!std::getenv("VR_CP_NORMAL_PRIORITY")) {
         Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
@@ -979,20 +981,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
                     SyncRecorder("flip_handoff");
+                    const auto flip = Libraries::VideoOut::DecodeFlip(
+                        std::span{nop->data_block + 1, size_t(nop->header.count.Value())});
+                    ASSERT_MSG(flip.has_value(), "Invalid patched flip identity");
+                    if (!flip) break;
                     static const bool trace_flip = std::getenv("VR_FLIP_ORDER_TRACE") != nullptr;
                     if (trace_flip) {
-                        const u32 buffer = nop->data_block[1];
+                        const u32 buffer = flip->buffer;
                         if (buffer < vo_port->buffer_labels.size())
-                            FlipOrderTrace::Event(
-                                "packet",
+                            FlipOrderTrace::Event("packet",
                                 reinterpret_cast<uintptr_t>(&vo_port->buffer_labels[buffer]),
-                                vo_port->buffer_labels[buffer], 8, buffer);
-                        LOG_INFO(Render, "Flip order packet: buffer={} label={}", buffer,
-                                 buffer < vo_port->buffer_labels.size()
-                                     ? vo_port->buffer_labels[buffer]
-                                     : ~u64{0});
+                                vo_port->buffer_labels[buffer], 8, flip->ticket);
+                        LOG_INFO(Render, "Flip order packet: buffer={} ticket={}", buffer,
+                                 flip->ticket);
                     }
+                    // Retain IRQ observers; the flip itself belongs to this packet, not a FIFO.
                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                    Libraries::VideoOut::ExecuteEopFlip(*flip);
                     break;
                 }
                 case PM4CmdNop::PayloadType::DebugMarkerPush: {

@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -17,28 +23,26 @@
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "core/vr/bloodborne_assets.h"
+#include "core/vr/body_channel.h"
+#include "core/vr/body_frame.h"
 #include "core/vr/bloodborne_gun.h"
-#include "core/vr/bloodborne_heal.h"
 #include "core/vr/bloodborne_held.h"
+#include "core/vr/bloodborne_heal.h"
 #include "core/vr/bloodborne_melee.h"
 #include "core/vr/bloodborne_quickitems.h"
 #include "core/vr/bloodborne_whip.h"
-#include "core/vr/body_channel.h"
-#include "core/vr/body_frame.h"
-#include "core/vr/grip_lab_pose.h"
-#include "core/vr/grip_preview.h"
 #include "core/vr/hook_util.h"
 #include "core/vr/hook_wrap.h"
 #include "core/vr/inframe.h"
-#include "core/vr/interaction_native_quick.h"
-#include "core/vr/interaction_native_vial_visual.h"
-#include "core/vr/item_attachment.h"
 #include "core/vr/live_tune.h"
-#include "core/vr/music_box.h"
-#include "core/vr/player_body.h"
+#include "core/vr/grip_preview.h"
 #include "core/vr/quick_channel.h"
+#include "core/vr/music_box.h"
 #include "core/vr/quick_items.h"
+#include "core/vr/grip_lab_pose.h"
+#include "core/vr/item_attachment.h"
 #include "core/vr/quick_settings.h"
+#include "core/vr/player_body.h"
 #include "core/vr/seqlock.h"
 #include "core/vr/vial_drain.h"
 #include "core/vr/vial_liquid.h"
@@ -53,31 +57,6 @@ namespace Q = VR::Quick;
 namespace F = VR::InFrame;
 using Hook::Plausible;
 using Hook::Read;
-
-// Owned by the existing in-frame renderer caller. Retain the module while guest
-// hooks are installed; fill history survives controls resets as the old static did.
-VR::Interactions::Module* g_vial_visual_module{};
-bool g_vial_visual_fault{};
-VR::Interactions::NativeVialVisualRuntime g_vial_visual;
-void InitVialVisualDll() {
-    static const bool initialized = [] {
-        if (!VR::Interactions::DllRequested())
-            return true;
-        g_vial_visual_module = new VR::Interactions::Module();
-        g_vial_visual_module->EnableFaultBroadcast();
-        // Bind before load: a missing/incompatible DLL must never run legacy policy.
-        g_vial_visual.Bind(*g_vial_visual_module, g_vial_visual_fault);
-        if (!g_vial_visual_module->LoadBesideExecutable()) {
-            g_vial_visual_fault = true;
-            g_vial_visual_module->ReportFault();
-            LOG_ERROR(Core, "VR vial visual: interaction DLL unavailable: {}",
-                      g_vial_visual_module->Diagnostic());
-            return false;
-        }
-        return true;
-    }();
-    (void)initialized;
-}
 
 // quick_arc_pick=sector, except in left_scheme=2: there the trigger off the cards is the gun, and
 // the sector (anything 7-30 cm from the arc's centre, +-120 degrees) took most gun pulls as a card.
@@ -1591,6 +1570,14 @@ struct SiteState {
     u32 uses{0};
     u32 throws{0};
     u32 denies{0};
+    // The hunter's own motion (the render ticks' character translation), for a throw's carry.
+    struct Motion {
+        s64 ns{0};
+        VR::Body::Vec3 p{};
+    };
+    std::array<Motion, 16> motion{};
+    u32 motion_count{0};
+    u64 motion_record{0};
     // quick_use_wipe: a paper applied by a wipe; its buff (the goods' refId SpEffect) is looked
     // for on the hunter until it shows (the log) or 1.5 s pass.
     s32 wipe_ref{-1};
@@ -1599,51 +1586,55 @@ struct SiteState {
 };
 SiteState g_site{};
 
-// The player-update hook's busy guard owns this context. Renderer visuals use their own module.
-VR::Interactions::Module* g_native_quick_module{};
-bool g_native_quick_fault{};
-VR::Interactions::NativeQuickRuntime g_native_quick;
-void InitNativeQuickDll() {
-    if (!VR::Interactions::DllRequested() || g_native_quick_module)
-        return;
-    g_native_quick_module = new VR::Interactions::Module();
-    g_native_quick_module->EnableFaultBroadcast();
-    g_native_quick.Bind(*g_native_quick_module, g_native_quick_fault);
-    if (!g_native_quick_module->LoadBesideExecutable()) {
-        g_native_quick_fault = true;
-        g_native_quick_module->ReportFault();
-        LOG_ERROR(Core, "VR quick native: interaction DLL unavailable: {}",
-                  g_native_quick_module->Diagnostic());
-    }
-}
-
-// Host copies the latest render anchor. Duplicate/freshness/history decisions are DLL-owned.
+// Every update: the newest render tick's character position into the history.
 void SampleMotion() {
     VR::Body::Anchor anchor{};
-    PiNativeQuickInput p{};
-    p.operation = PI_NQ_SAMPLE;
-    p.now_ns = NowNs();
-    p.anchor_available = VR::Body::LatestAnchor(anchor);
-    p.anchor_valid = anchor.valid;
-    p.record = anchor.record;
-    p.sample_ns = anchor.steady_ns;
-    p.position[0] = anchor.chr_t.x;
-    p.position[1] = anchor.chr_t.y;
-    p.position[2] = anchor.chr_t.z;
-    g_native_quick.Call(p);
+    if (!VR::Body::LatestAnchor(anchor) || !anchor.valid || anchor.record == g_site.motion_record) {
+        return;
+    }
+    g_site.motion_record = anchor.record;
+    g_site.motion[g_site.motion_count++ % g_site.motion.size()] = {anchor.steady_ns, anchor.chr_t};
 }
 
-std::string MotionWhy(const PiNativeQuickOutput& o, float world_scale) {
-    switch (o.reason) {
-    case PI_NQ_TICKS:
-        return fmt::format("{} render ticks seen", o.ticks);
-    case PI_NQ_STALE:
-        return fmt::format("the last render tick {} ms old", o.age_ns / Ms);
-    case PI_NQ_SPAN:
-        return "no render tick 30 .. 300 ms before the last";
-    default:
-        return fmt::format("{:.2f} m/s over {} ms", o.speed / world_scale, o.interval_ns / Ms);
+// The hunter's horizontal velocity (world units / s) over the last ~150 ms of render ticks; zero
+// without a recent history or after a jump no run makes (a warp, a respawn). `why`: what it was
+// measured over, or why not (the log).
+VR::Body::Vec3 CharacterVelocity(float world_scale, std::string& why) {
+    const u32 n = std::min<u32>(g_site.motion_count, g_site.motion.size());
+    if (n < 2) {
+        why = fmt::format("{} render ticks seen", n);
+        return {};
     }
+    const auto& motion = g_site.motion;
+    const auto at = [&](u32 back) -> const SiteState::Motion& {
+        return motion[(g_site.motion_count - 1 - back) % motion.size()];
+    };
+    const SiteState::Motion& newest = at(0);
+    if (NowNs() - newest.ns > 250 * Ms) {
+        why = fmt::format("the last render tick {} ms old", (NowNs() - newest.ns) / Ms);
+        return {};
+    }
+    const SiteState::Motion* older = nullptr;
+    for (u32 back = 1; back < n; ++back) {
+        const SiteState::Motion& s = at(back);
+        if (newest.ns - s.ns > 300 * Ms) {
+            break;
+        }
+        older = &s;
+        if (newest.ns - s.ns >= 150 * Ms) {
+            break;
+        }
+    }
+    if (older == nullptr || newest.ns - older->ns < 30 * Ms) {
+        why = "no render tick 30 .. 300 ms before the last";
+        return {};
+    }
+    const float dt = static_cast<float>(newest.ns - older->ns) * 1e-9f;
+    VR::Body::Vec3 v = (newest.p - older->p) * (1.0f / dt);
+    v.y = 0.0f;
+    const float speed = std::hypot(v.x, v.z);
+    why = fmt::format("{:.2f} m/s over {} ms", speed / world_scale, (newest.ns - older->ns) / Ms);
+    return speed > 15.0f * world_scale ? VR::Body::Vec3{} : v;
 }
 
 const char* UiGate() {
@@ -1791,21 +1782,15 @@ void Act(u8* player, const Pointers& p, const Q::Request& r) {
         // Armed before the call: the launch may come during it.
         VR::Body::Anchor anchor{};
         const bool have_anchor = VR::Body::LatestAnchor(anchor);
+        const VR::Body::Vec3 local{r.v_world[0], r.v_world[1], r.v_world[2]};
         const float world_scale = have_anchor ? anchor.world_scale : 1.0f;
-        PiNativeQuickInput prepare{};
-        prepare.operation = PI_NQ_THROW;
-        prepare.now_ns = NowNs();
-        prepare.anchor_available = have_anchor;
-        prepare.world_scale = anchor.world_scale;
-        prepare.base_yaw = anchor.base_yaw;
-        prepare.inherit_motion = Q::GetQuickSettings().throw_inherit_motion;
-        std::copy_n(r.v_world.data(), 3, prepare.local_velocity);
-        const auto prepared = g_native_quick.Call(prepare);
-        if (!prepared.applied)
-            return Answer(r, Q::Outcome::Denied, "interaction DLL fault", before, before);
-        const VR::Body::Vec3 world{prepared.world[0], prepared.world[1], prepared.world[2]};
-        const VR::Body::Vec3 carry{prepared.carry[0], prepared.carry[1], prepared.carry[2]};
-        const std::string why = MotionWhy(prepared, world_scale);
+        const VR::Body::Vec3 world = VR::Body::TrackingToWorld(
+            local, have_anchor ? anchor.base_yaw : 0.0f, world_scale);
+        // Your hand moved relative to the play space, which the hunter carries: a throw while
+        // running carries his speed (throw_inherit_motion).
+        std::string why;
+        const VR::Body::Vec3 carry =
+            CharacterVelocity(world_scale, why) * Q::GetQuickSettings().throw_inherit_motion;
         if (std::hypot(carry.x, carry.z) > 0.2f * world_scale || g_log > 0) {
             LOG_INFO(Core, "VR quick: throw carries the hunter's motion ({:.2f}, {:.2f}) m/s ({})",
                      carry.x / world_scale, carry.z / world_scale, why);
@@ -2589,7 +2574,7 @@ struct RubLook {
     // Its origin (the held end) from the card's centre in the card's frame (the eye's right, up,
     // toward the eye; metres at the card's 9 cm), and its roll about the eye's axis (degrees,
     // negative: its far end droops): fitted to the RubPinch grip on a proxy hand, held 2 cm into
-    // the palm (the user, 2026-10-12).
+    // the palm (2026-10-12).
     std::array<float, 3> pinch{};
     float roll_deg{0.0f};
 };
@@ -2712,49 +2697,36 @@ GoodsLook GoodsLookOf(s32 goods) {
     }
     return {};
 }
+// The held liquid's free surface (a goods model's, as the vial's own), reset per item.
+VR::Held::Liquid::Motion g_goods_liquid{};
+s32 g_goods_liquid_for{-1};
+
 // Use the same carried vessel as the renderer, in tracking metres. Head turns and walking
 // through the game do not become fake liquid impulses; recentering changes the space serial.
-PiLiquidOutput LiquidSurface(uint32_t slot, s32 goods, const Mapping& map,
-                             const std::array<float, 12>& mv, float centre_y, s64 now, float radius,
-                             float half_height, float fill, bool goods_response = false) {
-    InitVialVisualDll();
-    PiNativeVialVisualInput input{};
-    input.operation = PI_VV_LIQUID;
-    input.now_ns = now;
-    auto& pose = input.liquid;
-    pose.slot = slot;
-    pose.goods = goods;
-    pose.space = map.space_serial;
-    pose.valid = 1;
-    pose.response = goods_response ? PI_LIQUID_GOODS_RESPONSE : PI_LIQUID_DEFAULT_RESPONSE;
-    pose.radius = radius;
-    pose.half_height = half_height;
-    pose.fill = fill;
+VR::Held::Liquid::V3 LiquidSurface(VR::Held::Liquid::Motion& motion, const Mapping& map,
+                                  const std::array<float, 12>& mv, float centre_y, s64 now,
+                                  VR::Held::Liquid::Response response = {}) {
+    namespace L = VR::Held::Liquid;
     const Q::V3 centre{mv[3] + centre_y * mv[1], mv[7] + centre_y * mv[5],
                        mv[11] + centre_y * mv[9]};
     const auto tracking = [&](Q::V3 view) {
         return map.ToTracking(map.Carried(map.ViewToWorld(view)));
     };
     const Q::V3 origin = tracking(centre);
-    pose.position[0] = origin.x;
-    pose.position[1] = origin.y;
-    pose.position[2] = origin.z;
+    L::Pose pose{};
+    pose.position = {origin.x, origin.y, origin.z};
+    pose.space = map.space_serial;
+    pose.valid = true;
+    L::V3 up{};
     for (int a = 0; a < 3; ++a) {
         const Q::V3 column{mv[a], mv[4 + a], mv[8 + a]};
         const Q::V3 direction = tracking(centre + column) - origin;
         pose.valid = pose.valid && Q::Length(direction) > 1e-5f;
         const Q::V3 axis = Q::Normalize(direction);
-        pose.axes[a][0] = axis.x;
-        pose.axes[a][1] = axis.y;
-        pose.axes[a][2] = axis.z;
+        pose.axes[a] = {axis.x, axis.y, axis.z};
+        up[a] = axis.y; // tracking +Y is gravity up, independent of the eye/view
     }
-    const auto out = g_vial_visual.Call(input);
-    if (!out.applied) {
-        PiLiquidOutput quiet{};
-        quiet.normal[1] = 1;
-        return quiet;
-    }
-    return out.liquid;
+    return motion.Update(up, now, pose, response);
 }
 
 // Papers and the Empty Phantasm Shell follow the hand, even away from the eye.
@@ -2834,12 +2806,16 @@ void BuildHeld(F::List& list, const Mapping& map, const std::array<float, 12>& m
             if (i == goods_look.liquid) {
                 // The Blood Vial's glass and sloshing liquid (Shade::Syringe): world up in the
                 // mesh's axes drives the surface; its plane keeps the volume.
+                namespace L = VR::Held::Liquid;
+                if (g_goods_liquid_for != goods) {
+                    g_goods_liquid = {};
+                    g_goods_liquid_for = goods;
+                }
+                const auto normal = LiquidSurface(g_goods_liquid, map, item.mv,
+                                                   0.5f * (goods_look.bottom + goods_look.top), now);
                 const float half = 0.5f * (goods_look.top - goods_look.bottom);
-                const auto surface = LiquidSurface(PI_LIQUID_GOODS, goods, map, item.mv,
-                                                   0.5f * (goods_look.bottom + goods_look.top), now,
-                                                   goods_look.radius, half, goods_look.fill);
-                const auto& normal = surface.normal;
-                const float distance = surface.distance;
+                const float distance =
+                    L::Plane(normal, goods_look.radius, half, goods_look.fill);
                 item.shade = F::Shade::Syringe;
                 item.color = {normal[0], normal[1], normal[2], distance};
                 item.uv = {goods_look.bottom, goods_look.top, goods_look.radius, goods_look.fill};
@@ -2907,11 +2883,15 @@ void BuildHeld(F::List& list, const Mapping& map, const std::array<float, 12>& m
                 std::array<float, 4>{-0.112f, 0.046f, 0.047f, 0.68f} : liquid_profile == 2 ?
                 std::array<float, 4>{-0.049f, 0.016f, 0.033f, 0.48f} :
                 std::array<float, 4>{-0.100f, 0.014f, 0.032f, 0.76f};
-            const auto surface = LiquidSurface(PI_LIQUID_GOODS, goods, map, item.mv,
-                                               0.5f * (chamber[0] + chamber[1]), now, chamber[2],
-                                               0.5f * (chamber[1] - chamber[0]), chamber[3], true);
-            const auto& normal = surface.normal;
-            const float distance = surface.distance;
+            if (g_goods_liquid_for != goods) {
+                g_goods_liquid = {};
+                g_goods_liquid_for = goods;
+            }
+            const auto normal = LiquidSurface(g_goods_liquid, map, item.mv,
+                                               0.5f * (chamber[0] + chamber[1]), now,
+                                               VR::Held::Liquid::ResponseForGoods(goods));
+            const float distance = VR::Held::Liquid::Plane(normal, chamber[2],
+                                                 0.5f * (chamber[1] - chamber[0]), chamber[3]);
             item.shade = F::Shade::NativeLiquid;
             item.color = {normal[0], normal[1], normal[2], distance};
             item.uv = chamber;
@@ -3062,11 +3042,12 @@ struct DrainLog {
     int stage{0}; // 1 first frame, 2 half, 3 empty
 };
 DrainLog g_drain_log{};
+VR::Held::Liquid::Motion g_vial_liquid{};
 
 // The vial model's rows (view <- its mesh, metres) on the palm dummy `m` (its world rows), where
 // FFX 173 puts the game's own vial; `c` (out): its origin in view.
 // `look`: drawn (true) or for the injection's contact (false). The contact keeps the tuned
-// place; the drawn vial sits 4 mm further up the fist's channel and 5 mm off the palm (the user,
+// place; the drawn vial sits 4 mm further up the fist's channel and 5 mm off the palm (
 // 2026-10-12: the relaxed fingers rest on its glass, more of its blood shows), its needle with it.
 std::array<float, 12> VialRows(const Mapping& map, const std::array<float, 12>& m, Q::V3& c,
                                bool look = true) {
@@ -3103,7 +3084,7 @@ std::array<float, 12> VialRows(const Mapping& map, const std::array<float, 12>& 
 // vial_needle (core/vr/vial_needle.h): the needle and its hub on the vial whose rows are `vial`
 // (its model `model`), in the same list as the vial, so they are carried with it
 // (inframe_hand_sync) and drawn with the same pose, depth and disparity. The stabbing end and
-// the axis come from the user's own model (NeedleRootOf, once per model). VR_TUNE_FILE keys
+// the axis come from the player's own model (NeedleRootOf, once per model). VR_TUNE_FILE keys
 // (tests): needle.on (0 hides it), needle.len / needle.dia / needle.hub_len / needle.hub_dia /
 // needle.inset (mm), needle.end (-1 the bottom, +1 the top), needle.r/g/b and needle.spec /
 // needle.sharp / needle.px / needle.tint (the shaft), hub.r/g/b and hub.spec / hub.sharp /
@@ -3137,7 +3118,7 @@ std::array<float, 3> AddVialNeedle(F::List& list, const std::array<float, 12>& v
                                    const VR::Assets::Model& model, s64 now, bool draw) {
     namespace H = VR::Held;
     H::NeedleLook look{};
-    // Needle length is cosmetic; contact is at the end of the hub.
+    // Needle length is cosmetic; contact is set back from the hub end.
     if (VR::Tune::Get("drain.look", 1.0f) >= 0.5f) {
         look.length_m = H::AntiqueNeedleLength;
     }
@@ -3206,27 +3187,21 @@ std::array<float, 3> AddVialNeedle(F::List& list, const std::array<float, 12>& v
                  1000.0f * (root.InsetFor(0.5f * look.hub_diameter_m) + look.inset_m), tip[0],
                  tip[1], tip[2], static_cast<double>(now) * 1e-9);
     }
-    // The contact sits 0.5 cm back from the hub's far end, towards the vial (tune
-    // vial.contact_back_mm): at the hub's end it felt a little too close to the needle.
-    PiNativeVialVisualInput contact{};
-    contact.operation = PI_VV_CONTACT;
-    contact.back_m = VR::Tune::Get("vial.contact_back_mm", 5.0f) * 0.001f;
-    contact.hub_length_m = look.hub_length_m;
-    std::copy(hub.mv.begin(), hub.mv.end(), contact.rows);
-    const auto out = g_vial_visual.Call(contact);
-    return {out.contact[0], out.contact[1], out.contact[2]};
+    // Contact only: another 5 mm toward the syringe body (10 mm total behind the hub end).
+    // Neither the hub nor the visible needle rows move. Explicit tuning still overrides it.
+    const float back = VR::Tune::Get("vial.contact_back_mm", H::VialContactBackM * 1000.0f) * 0.001f;
+    return H::VialContactPoint(hub.mv, look.hub_length_m, back);
 }
 
 // Whether the needle goes on our vial this camera update (core/vr/vial_needle.h NeedleVisible).
 bool NeedleOn(bool ours, bool model, bool menu) {
-    PiNativeVialVisualInput in{};
-    in.operation = PI_VV_NEEDLE;
+    VR::Held::NeedleInputs in{};
     in.setting = VR::GetSettings().vial_needle;
     in.tuned_off = VR::Tune::Get("needle.on", 1.0f) < 0.5f;
     in.ours = ours;
     in.model = model;
     in.menu = menu;
-    return g_vial_visual.Call(in).needle_visible != 0;
+    return VR::Held::NeedleVisible(in);
 }
 
 void BuildVialDrain(F::List& list, const Mapping& map, const std::array<float, 12>& m, s64 now,
@@ -3235,18 +3210,17 @@ void BuildVialDrain(F::List& list, const Mapping& map, const std::array<float, 1
     if (!model) {
         return;
     }
-    InitVialVisualDll();
-    PiNativeVialVisualInput visual{};
-    visual.operation = PI_VV_DRAIN;
-    visual.now_ns = now;
-    visual.word = word;
-    visual.variation_lo = VR::Tune::Get("vial.fill_var_lo", -10.0f) * 0.01f;
-    visual.variation_hi = VR::Tune::Get("vial.fill_var_hi", 5.0f) * 0.01f;
-    visual.override_fill = VR::Tune::Get("drain.fill", -1.0f);
-    const auto level = g_vial_visual.Call(visual);
-    if (g_vial_visual.Faulted())
-        return;
-    const float fill = level.fill, shown = level.shown;
+    float fill = VR::Held::DrainFillAt(word, now);
+    // How full it looks: each drawn vial a little different, -10% .. +5% (vial.fill_var_lo / _hi,
+    // percent; both 0: off). Visual only: the heal and the drain's timing are unchanged.
+    static VR::Held::FillVariation fill_variation;
+    float shown = std::min(
+        fill * fill_variation.Scale(now, fill, VR::Tune::Get("vial.fill_var_lo", -10.0f) * 0.01f,
+                                    VR::Tune::Get("vial.fill_var_hi", 5.0f) * 0.01f),
+        1.05f);
+    if (const float test = VR::Tune::Get("drain.fill", -1.0f); test >= 0.0f) {
+        fill = shown = std::min(test, 1.0f);
+    }
     Q::V3 c{};
     F::Item item{};
     item.mesh = F::MeshId::Model;
@@ -3272,6 +3246,7 @@ void BuildVialDrain(F::List& list, const Mapping& map, const std::array<float, 1
     // Cosmetic antique syringe look. drain.look=0 restores the original mesh and shader for comparison.
     // Its bounds, attachment, needle, fill word and injection timing are retained.
     if (VR::Tune::Get("drain.look", 1.0f) >= 0.5f) {
+        namespace L = VR::Held::Liquid;
         constexpr float bottom = 0.0352f, top = 0.1408f, radius = 0.0146f;
         const float fit = (y1 - y0) / 0.176f;
         const float cx = item.emissive[0], cz = item.emissive[1];
@@ -3282,11 +3257,9 @@ void BuildVialDrain(F::List& list, const Mapping& map, const std::array<float, 1
                 item.mv[4 * r + a] *= fit;
             }
         }
+        const auto normal = LiquidSurface(g_vial_liquid, map, item.mv, 0.5f * (bottom + top), now);
         // A small air pocket makes motion visible, even with a full dose.
-        const auto surface = LiquidSurface(PI_LIQUID_VIAL, -1, map, item.mv, 0.5f * (bottom + top),
-                                           now, radius, (top - bottom) * 0.5f, shown * 0.87f);
-        const auto& normal = surface.normal;
-        const float distance = surface.distance;
+        const float distance = L::Plane(normal, radius, (top - bottom) * 0.5f, shown * 0.87f);
         item.mesh = F::MeshId::Syringe;
         item.tex = F::Tex::None;
         item.shade = F::Shade::Syringe;
@@ -3296,16 +3269,13 @@ void BuildVialDrain(F::List& list, const Mapping& map, const std::array<float, 1
     }
     item.depth_pull = VR::Tune::Get("drain.pull", DrainPull);
     list.Add(item);
-    // The little funnel's far end is the physical syringe tip. Compute it even
-    // when the needle is hidden; neither its length nor drain.look affects contact. Drawn on the
+    // Compute the contact behind the funnel's far end even when the needle is hidden;
+    // neither needle length nor drain.look affects contact. Drawn on the
     // vial as you see it; the contact from the vial's tuned place (VialRows' `look`).
     AddVialNeedle(list, needle_rows, *model, now, NeedleOn(true,true,false));
     Q::V3 contact_c{};
     const auto tip_view =
         AddVialNeedle(list, VialRows(map, m, contact_c, false), *model, now, false);
-    // A rejected contact packet cannot publish a synthetic tip at the origin.
-    if (g_vial_visual.Faulted())
-        return;
     VR::VialContact::Sample contact{};
     if (have_body && body.injection_body.grip_valid) {
         // Keep the attachment in the controller's local frame. The XR thread
@@ -3602,7 +3572,6 @@ void InstallQuickItems(VAddr base, u64 size) {
                     verdict(use_ok), verdict(menu_ok), verdict(row_ok));
         return;
     }
-    InitNativeQuickDll();
     g_base = module;
     g_use_goods = reinterpret_cast<UseGoodsFn>(module + UseGoodsRva);
     g_goods_row = reinterpret_cast<GoodsRowFn>(module + GoodsRowRva);
@@ -3752,7 +3721,7 @@ struct WipeLog {
 WipeLog g_wipe_log{};
 u32 g_wipe_serial = 0;
 
-// quick_use_wipe's measurement, once per take (the user's 2026-10-08 "easier to find the spot"):
+// quick_use_wipe's measurement, once per take (the tester's 2026-10-08 "easier to find the spot"):
 // where the game's own blade trail (the light move's SpawnFFX_Blade dummies, drawn along the
 // blade you see) lies against the segment the paper is measured on, LOCAL cm.
 void LogWipeTrail(u8* chr, const Mapping& map, Q::V3 base, Q::V3 tip) {
@@ -3827,7 +3796,7 @@ void WipeSample(u8* chr, const std::array<float, 8 * 12>& palm, const Mapping& m
         card = f.origin + (f.right * rub.mid[0] + f.up * rub.mid[1] + n * rub.mid[2]) * k_rub;
         rect_right = f.right;
         rect_up = f.up;
-        // A little wiggle room round its outline (the user, 2026-10-12): easy to apply.
+        // A little wiggle room round its outline (2026-10-12): easy to apply.
         const float margin = VR::Tune::Get("wipe.rub_margin", 0.015f);
         half_w = rub.half[0] * k_rub + margin;
         half_h = rub.half[1] * k_rub + margin;
@@ -3936,6 +3905,21 @@ VR::Holsters::Targets BuildHolsters(F::List& list, const Mapping& map, const Q::
                                                   qs.holster_forward_cm * .01f * map.scale);
         if (h.assignment[i] == 1)
             mount = VR::BodyMounts::FitVialPouch(mount, chest_armor, size);
+        if (i == 0 && h.assignment[i] == 1) {
+            // Seat places the pouch OUTWARD along -back; extra grab reach is +back, into body.
+            const auto origin = map.ToTracking(mount.origin);
+            const auto back = Q::Normalize(map.ToTracking(mount.origin + mount.back) - origin);
+            h.pouch_back = {back.x, back.y, back.z};
+        }
+        if (i == 2) {
+            const auto origin = map.ToTracking(mount.origin);
+            const auto right = Q::Normalize(map.ToTracking(mount.origin + mount.right) - origin);
+            const auto up = Q::Normalize(map.ToTracking(mount.origin + mount.up) - origin);
+            const auto back = Q::Normalize(map.ToTracking(mount.origin + mount.back) - origin);
+            h.chest_axes = {VR::Holsters::P3{right.x, right.y, right.z},
+                            VR::Holsters::P3{up.x, up.y, up.z},
+                            VR::Holsters::P3{back.x, back.y, back.z}};
+        }
         const auto surface = map.WorldToView(mount.origin);
         const Q::V3 x = dir(mount.right), y = dir(mount.up), z = dir(mount.back);
         const float k = i == 2 ? .72f : 1.0f;

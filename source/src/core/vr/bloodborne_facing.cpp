@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -19,7 +25,6 @@
 #include "core/vr/body_facing.h"
 #include "core/vr/body_settings.h"
 #include "core/vr/hook_util.h"
-#include "core/vr/interaction_native_facing.h"
 #include "core/vr/live_tune.h"
 #include "core/vr/vr_session.h"
 #include "input/controller.h"
@@ -142,6 +147,18 @@ constexpr std::array<u8, 52> TurnAnglesSig = {
 };
 
 constexpr s64 Ms = 1'000'000;
+constexpr s64 AnchorMaxAgeNs = 250 * Ms; // an older view: the VR view is not driven
+constexpr s64 StatusMaxAgeNs = 250 * Ms; // an older body status: the pose hook is not running
+constexpr s64 GapResetNs = 500 * Ms;     // no update this long: start over at his heading
+constexpr float PointDistance = 50.0f;   // m ahead (game units at world_scale 1)
+constexpr float PointHeight = 1.3f;      // m above his feet, about a lock dummy's height
+constexpr float StickMoveMin = 0.25f;    // left stick deflection that counts as moving
+// Standing, the game turns him toward the lock point only beyond 90 degrees (HKS Act_Turn: a turn
+// clip): a smaller turn (a snap turn, your heading) is applied to his orientation directly, at most
+// this fast, closing this share of the gap per second, while he idles.
+constexpr float IdleTurnMaxDegS = 240.0f;
+constexpr float IdleTurnRate = 10.0f;
+constexpr float IdleTurnMinDeg = 1.5f;
 constexpr float Pi = 3.14159265f;
 
 enum class Mode { Point, Strafe, Probe };
@@ -192,6 +209,8 @@ std::mutex g_reading_mutex;
 FacingReading g_reading{}; // LatestFacing
 
 struct State {
+    B::FacingTracker tracker{};
+    s64 last_ns{0};
     bool was_active{false};
     bool was_locked{false};
     const char* last_why{nullptr};
@@ -200,6 +219,7 @@ struct State {
     u64 activations{0};
     s64 log_ns{0};
     float max_error{0.0f}; // |heading - his yaw| while active, since the last line
+    s64 blocked_since{0};  // the game's facing since (0: the heading drives him)
     u64 idle_turns{0};     // frames turned directly while idle
     u64 item_frames{0};    // frames of an item in use (no lock point)
     float probe_yaw{0.0f}; // logs: the physics yaw - pi
@@ -221,59 +241,51 @@ u8* MainPlayer() {
     return Plausible(chr) ? chr : nullptr;
 }
 
-VR::Interactions::NativeFacingRuntime g_facing;
-VR::Interactions::Module* g_facing_module{};
-bool g_facing_fault{};
-void InitFacingDll() {
-    if (!VR::Interactions::DllRequested() || g_facing_module)
-        return;
-    // Calls remain serialized by g_busy. Installed hooks retain the module through exit.
-    g_facing_module = new VR::Interactions::Module();
-    g_facing_module->EnableFaultBroadcast();
-    g_facing.Bind(*g_facing_module, g_facing_fault);
-    if (!g_facing_module->LoadBesideExecutable()) {
-        g_facing_fault = true;
-        g_facing_module->ReportFault();
-        LOG_ERROR(Core, "VR facing: interaction DLL unavailable: {}",
-                  g_facing_module->Diagnostic());
-    }
-}
-void CopyStick(PiFacingFacts& facts) {
+// The left stick moves him (the game pad the controllers feed).
+bool StickMoving() {
     auto* const pads = Common::Singleton<Input::GameControllers>::Instance();
-    if (!pads)
-        return;
-    const auto state = (*pads)[0]->ReadState();
-    facts.have_pad = 1;
-    facts.pad_x = state.axes[static_cast<size_t>(Input::Axis::LeftX)];
-    facts.pad_y = state.axes[static_cast<size_t>(Input::Axis::LeftY)];
-}
-const char* FacingReason(uint32_t reason, const char* body) {
-    switch (reason) {
-    case PI_FB_NONE:
-        return nullptr;
-    case PI_FB_DISABLED:
-        return "body_facing=0";
-    case PI_FB_TUNE:
-        return "facing.off (tune)";
-    case PI_FB_ROLL:
-        return "the A+B roll";
-    case PI_FB_FRAME:
-        return "W is not a rotation";
-    case PI_FB_THIRD:
-        return "third person";
-    case PI_FB_ANCHOR:
-        return "no first-person view";
-    case PI_FB_CINEMATIC:
-        return "cinematic flat";
-    case PI_FB_DISPLAY:
-        return "virtual screen";
-    case PI_FB_STATUS:
-        return "no body status";
-    case PI_FB_BODY:
-        return body;
-    default:
-        return "interaction DLL fault";
+    if (pads == nullptr) {
+        return false;
     }
+    const auto state = (*pads)[0]->ReadState();
+    const float x =
+        (static_cast<float>(state.axes[static_cast<size_t>(Input::Axis::LeftX)]) - 128.0f) / 127.0f;
+    const float y =
+        (static_cast<float>(state.axes[static_cast<size_t>(Input::Axis::LeftY)]) - 128.0f) / 127.0f;
+    return x * x + y * y > StickMoveMin * StickMoveMin;
+}
+
+B::FacingParams Params() {
+    const auto& b = B::GetBodySettings();
+    B::FacingParams p{};
+    p.deadzone = b.body_facing_deadzone_deg * 0.0174532925f;
+    p.moving_deadzone = b.body_facing_moving_deg * 0.0174532925f;
+    p.tau = b.body_facing_ms * 0.001f;
+    return p;
+}
+
+// Why the game keeps his facing this frame (nullptr: the VR heading drives it).
+const char* Blocked(s64 now, const B::Anchor& anchor, bool have_anchor) {
+    if (!VR::IsFirstPerson()) {
+        return "third person";
+    }
+    if (!have_anchor || !anchor.valid || now - anchor.steady_ns > AnchorMaxAgeNs) {
+        return "no first-person view";
+    }
+    if (VR::CinematicFlat()) {
+        return "cinematic flat";
+    }
+    if (VR::GetDisplayMode() != VR::DisplayMode::Auto) {
+        return "virtual screen";
+    }
+    B::BodyStatus status{};
+    if (!B::LatestBodyStatus(status) || now - status.steady_ns > StatusMaxAgeNs) {
+        return "no body status";
+    }
+    if (status.facing_block != nullptr) {
+        return status.facing_block;
+    }
+    return nullptr;
 }
 
 void LogLine(State& s, const char* what, float chr_yaw, float want, const B::Anchor& anchor,
@@ -283,7 +295,7 @@ void LogLine(State& s, const char* what, float chr_yaw, float want, const B::Anc
              "locked {} moving {} | updates {} writes {} idle turns {} item frames {} max off "
              "{:.1f} deg | physics yaw-pi {}{}",
              what, Deg(chr_yaw), Deg(want), Deg(anchor.view_yaw),
-             Deg(B::FacingWrap(anchor.view_yaw - want)), g_facing.Catching() ? " catching" : "",
+             Deg(B::FacingWrap(anchor.view_yaw - want)), s.tracker.Catching() ? " catching" : "",
              why != nullptr ? fmt::format(" | game's own: {}", why) : std::string{}, locked ? 1 : 0,
              moving ? 1 : 0, s.updates, s.writes, s.idle_turns, s.item_frames, Deg(s.max_error),
              s.probe_ok ? fmt::format("{:.1f}", Deg(s.probe_yaw)) : std::string{"-"},
@@ -298,6 +310,35 @@ u8* OwnModule(u8* chr, u32 offset) {
     u8* const module = Plausible(mods) ? Read<u8*>(mods + offset) : nullptr;
     return Plausible(module) && Read<const u8*>(module + OffsetModuleOwner) == chr ? module
                                                                                    : nullptr;
+}
+
+// Standing: turns him toward `want` (his orientation's yaw, the physics module's angles) by at
+// most the idle turn rate this frame. Returns true when it turned him.
+bool IdleTurn(State& s, u8* chr, float chr_yaw, float want, float dt) {
+    u8* const flags = OwnModule(chr, OffsetActionFlagModule);
+    u8* const physics = OwnModule(chr, OffsetPhysicsModule);
+    if (flags == nullptr || physics == nullptr ||
+        (Read<u8>(flags + OffsetActionFlags) & FlagIdle) == 0) {
+        return false;
+    }
+    const float error = B::FacingWrap(want - chr_yaw);
+    if (std::abs(error) < IdleTurnMinDeg / 57.2957795f) {
+        return false;
+    }
+    float* const angles = reinterpret_cast<float*>(physics + OffsetPhysicsAngles);
+    float yaw{};
+    std::memcpy(&yaw, angles + 1, sizeof(yaw));
+    // His orientation must be the one W shows (yaw + pi), else nothing is written.
+    if (!std::isfinite(yaw) || std::abs(B::FacingWrap(yaw - Pi - chr_yaw)) > 0.05f) {
+        return false;
+    }
+    const float max_step = IdleTurnMaxDegS / 57.2957795f * dt;
+    const float step =
+        std::clamp(error * (1.0f - std::exp(-IdleTurnRate * dt)), -max_step, max_step);
+    const float turned = B::FacingWrap(yaw + step);
+    std::memcpy(angles + 1, &turned, sizeof(turned));
+    ++s.idle_turns;
+    return true;
 }
 
 // Right after LockTgtMan::Update (the game's lock-on state for this frame is written).
@@ -316,76 +357,87 @@ void PS4_SYSV_ABI OnLockUpdated() {
         g_busy.clear(std::memory_order_release);
         return;
     }
-    PiFacingFacts facts{};
-    std::memcpy(facts.world_rows, ctrl + OffsetCtrlWorld, sizeof(facts.world_rows));
+    std::array<float, 12> w{};
+    std::memcpy(w.data(), ctrl + OffsetCtrlWorld, sizeof(w));
+    B::ChrFrame frame{};
+    const bool w_ok = B::ChrFrameFromRows(w, frame);
+    const float chr_yaw = w_ok ? B::ChrYaw(frame) : 0.0f;
+    // The game just wrote the real lock-on state: +0xF8 set = locked on to an enemy.
     const bool locked = Read<u8>(chr + OffsetLockChosen) != 0;
-    facts.locked = locked;
     B::Anchor anchor{};
-    facts.have_anchor = B::LatestAnchor(anchor);
-    facts.anchor_valid = anchor.valid;
-    facts.anchor_ns = anchor.steady_ns;
-    facts.base_yaw = anchor.base_yaw;
-    facts.view_yaw = anchor.view_yaw;
-    facts.world_scale = anchor.world_scale;
-    const auto& settings = B::GetBodySettings();
-    facts.enabled = settings.body_facing;
-    facts.deadzone_deg = settings.body_facing_deadzone_deg;
-    facts.moving_deg = settings.body_facing_moving_deg;
-    facts.follow_ms = settings.body_facing_ms;
-    facts.tune_off = VR::Tune::Get("facing.off", 0.0f) != 0.0f;
-    facts.strafe_only = VR::Tune::Get("facing.strafe_only", 0.0f) != 0.0f;
-    facts.hold_until_ns = g_hold_until.load(std::memory_order_relaxed);
-    facts.first_person = VR::IsFirstPerson();
-    facts.cinematic_flat = VR::CinematicFlat();
-    facts.auto_display = VR::GetDisplayMode() == VR::DisplayMode::Auto;
-    B::BodyStatus status{};
-    facts.have_body = B::LatestBodyStatus(status);
-    facts.body_ns = status.steady_ns;
-    facts.body_blocked = status.facing_block != nullptr;
-    facts.mode = static_cast<uint32_t>(FacingMode());
-    facts.idle_turn_enabled = g_idle_turn;
-    CopyStick(facts);
-    u8* const flags = OwnModule(chr, OffsetActionFlagModule);
-    if (flags) {
-        const u8 bits = Read<u8>(flags + OffsetActionFlags);
-        facts.idle = (bits & FlagIdle) != 0;
-        facts.item_use = (bits & FlagItemUse) != 0;
+    const bool have_anchor = B::LatestAnchor(anchor);
+    const char* why = nullptr;
+    if (!B::GetBodySettings().body_facing) {
+        why = "body_facing=0";
+    } else if (VR::Tune::Get("facing.off", 0.0f) != 0.0f) {
+        why = "facing.off (tune)"; // VR_TUNE_FILE: live A/B in tests
+    } else if (now < g_hold_until.load(std::memory_order_relaxed)) {
+        why = "the A+B roll";
+    } else if (!w_ok) {
+        why = "W is not a rotation";
+    } else {
+        why = Blocked(now, anchor, have_anchor);
     }
-    u8* const physics = OwnModule(chr, OffsetPhysicsModule);
-    facts.have_physics = physics != nullptr;
-    if (physics) {
-        facts.physics_yaw = Read<float>(physics + OffsetPhysicsAngles + 4);
-        s.probe_yaw = B::FacingWrap(facts.physics_yaw - Pi);
+    const bool moving = StickMoving();
+    if (u8* const physics = OwnModule(chr, OffsetPhysicsModule); physics != nullptr) {
+        s.probe_yaw = B::FacingWrap(Read<float>(physics + OffsetPhysicsAngles + 4) - Pi);
         s.probe_ok = true;
     }
-    const auto decision = g_facing.Step(facts, now);
-    const char* why = FacingReason(decision.reason, status.facing_block);
-    const bool moving = decision.moving, active = decision.active;
-    const float chr_yaw = decision.chr_yaw, want = decision.want;
-    if (decision.write_point) {
-        const std::array<float, 4> point{decision.point[0], decision.point[1], decision.point[2],
-                                         1.0f};
-        std::memcpy(chr + OffsetLockPoint, point.data(), sizeof(point));
-        chr[OffsetLockChosen] = 1;
+    if (s.last_ns == 0 || now - s.last_ns > GapResetNs || !s.tracker.Valid()) {
+        s.tracker.Reset(chr_yaw);
     }
-    if (decision.write_strafe) {
-        ctrl[OffsetCtrlFreeMove] = 0;
-        ++s.writes;
+    const float dt =
+        s.last_ns != 0 ? std::clamp(static_cast<float>(now - s.last_ns) * 1e-9f, 0.0f, 0.1f) : 0.0f;
+    s.last_ns = now;
+    bool active = false;
+    float want = chr_yaw;
+    if (why != nullptr || locked) {
+        // The game (or its lock-on) turns him. A short gap (a hitch, a frame without a fresh view)
+        // keeps the heading; after a longer one or a lock-on it starts from where he is.
+        if (s.blocked_since == 0) {
+            s.blocked_since = now;
+        }
+        // The A+B roll keeps the heading: he turns back to it afterwards.
+        const bool roll = now < g_hold_until.load(std::memory_order_relaxed);
+        if (locked || (now - s.blocked_since > GapResetNs && !roll)) {
+            s.tracker.Reset(chr_yaw);
+        }
+    } else {
+        s.blocked_since = 0;
+        want = s.tracker.Step({anchor.base_yaw, anchor.view_yaw}, moving, dt, Params());
+        active = FacingMode() != Mode::Probe;
+        if (active) {
+            const B::FacingPoint p =
+                B::FacingAim(frame.t.x, frame.t.y, frame.t.z, want,
+                             PointDistance * anchor.world_scale, PointHeight * anchor.world_scale);
+            u8* const flags = OwnModule(chr, OffsetActionFlagModule);
+            const bool item_use =
+                flags != nullptr && (Read<u8>(flags + OffsetActionFlags) & FlagItemUse) != 0;
+            s.item_frames += item_use ? 1 : 0;
+            if (FacingMode() == Mode::Point && !item_use &&
+                VR::Tune::Get("facing.strafe_only", 0.0f) == 0.0f) {
+                const std::array<float, 4> point{p.x, p.y, p.z, 1.0f};
+                std::memcpy(chr + OffsetLockPoint, point.data(), sizeof(point));
+                chr[OffsetLockChosen] = 1;
+            }
+            ctrl[OffsetCtrlFreeMove] = 0;
+            ++s.writes;
+            if (g_idle_turn && !moving && FacingMode() == Mode::Point) {
+                IdleTurn(s, chr, chr_yaw, want, dt);
+            }
+        }
+        s.max_error = std::max(s.max_error, std::abs(B::FacingWrap(want - chr_yaw)));
     }
-    if (decision.write_yaw) {
-        std::memcpy(physics + OffsetPhysicsAngles + 4, &decision.physics_yaw,
-                    sizeof(decision.physics_yaw));
-        ++s.idle_turns;
-    }
-    s.item_frames += active && facts.item_use ? 1 : 0;
-    if (decision.admitted)
-        s.max_error = std::max(s.max_error, decision.error);
     g_active.store(active, std::memory_order_relaxed);
     {
         // The stick's reference is the view's yaw while the first-person VR view gives the game
         // camera its orientation (core/vr/bloodborne_camera.cpp), else the game's own camera.
+        const bool view_ok = w_ok && have_anchor && anchor.valid &&
+                             now - anchor.steady_ns <= AnchorMaxAgeNs && VR::IsFirstPerson() &&
+                             !VR::CinematicFlat() &&
+                             VR::GetDisplayMode() == VR::DisplayMode::Auto;
         std::scoped_lock lock{g_reading_mutex};
-        g_reading.valid = decision.view_ok;
+        g_reading.valid = view_ok;
         g_reading.heading = active;
         g_reading.hunter_yaw = active ? want : chr_yaw;
         g_reading.stick_yaw = anchor.view_yaw;
@@ -495,7 +547,6 @@ void InstallFacing(VAddr base, u64 size) {
             stubs[i] = EmitSite(*g_code, site, reinterpret_cast<u64>(module + LockUpdateRva),
                                 reinterpret_cast<u64>(module + site.rva + site.setup + 5));
         }
-        InitFacingDll();
         for (size_t i = 0; i < CallSites.size(); ++i) {
             Hook::WriteJump(module + CallSites[i].rva, CallSites[i].setup + 5, stubs[i]);
         }
@@ -514,6 +565,16 @@ void InstallFacing(VAddr base, u64 size) {
 
 bool FacingActive() {
     return g_active.load(std::memory_order_relaxed);
+}
+
+bool PhysicsYawNow(float& yaw) {
+    u8* const chr = MainPlayer();
+    u8* const physics = chr != nullptr ? OwnModule(chr, OffsetPhysicsModule) : nullptr;
+    if (physics == nullptr) {
+        return false;
+    }
+    yaw = B::FacingWrap(Read<float>(physics + OffsetPhysicsAngles + 4) - Pi);
+    return std::isfinite(yaw);
 }
 
 void HoldGameFacing(s64 until_ns) {

@@ -68,6 +68,8 @@ typedef struct BbDlssApi {
     int32_t (*Initialize)(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
                           PFN_vkGetInstanceProcAddr get_instance_proc,
                           PFN_vkGetDeviceProcAddr get_device_proc);
+    // Failure may still record commands and retain partial resources. Complete that
+    // command buffer, then ReleaseFeature(view), before retrying or shutting down.
     int32_t (*CreateFeature)(uint32_t view, VkCommandBuffer command, const BbDlssFeature* feature);
     int32_t (*Evaluate)(uint32_t view, VkCommandBuffer command, const BbDlssEvaluate* evaluate);
     // The caller must have waited for the GPU work that used the feature.

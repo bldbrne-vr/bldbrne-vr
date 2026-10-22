@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
 #include <array>
@@ -15,6 +21,9 @@
 #include "common/thread.h"
 #include "core/vr/bloodborne_gun.h"
 #include "core/vr/bloodborne_held.h"
+#include "core/vr/bow.h"
+#include "core/vr/bow_pose.h"
+#include "core/vr/bow_channel.h"
 #include "core/vr/bloodborne_iframes.h"
 #include "core/vr/bloodborne_layout.h"
 #include "core/vr/bloodborne_melee.h"
@@ -27,32 +36,22 @@
 #include "core/vr/whip_moves.h"
 #include "core/vr/whip_settings.h"
 #include "core/vr/body_channel.h"
-#include "core/vr/bow.h"
-#include "core/vr/bow_channel.h"
-#include "core/vr/bow_pose.h"
-#include "core/vr/bow_string_cleanup.h"
 #include "core/vr/combat_channel.h"
 #include "core/vr/feature_cost.h"
 #include "core/vr/hook_util.h"
-#include "core/vr/interaction_bow_string.h"
-#include "core/vr/interaction_native_attack.h"
-#include "core/vr/interaction_native_geometry.h"
-#include "core/vr/interaction_native_melee.h"
-#include "core/vr/interaction_native_saw.h"
-#include "core/vr/interaction_native_skeleton.h"
+#include "core/vr/bloodborne_visceral_stage.h"
 #include "core/vr/melee_settings.h"
+#include "core/vr/left_attack.h"
 #include "core/vr/melee_window.h"
 #include "core/vr/plunge.h"
 #include "core/vr/solid_weapon.h"
-#include "core/vr/stake_driver.h"
 #include "core/vr/transform_settings.h"
 #include "core/vr/trick_weapons.h"
 #include "core/vr/two_hand_grip.h"
+#include "core/vr/stake_driver.h"
 #include "core/vr/visceral_channel.h"
 #include "core/vr/visceral_thrust.h"
 #include "core/vr/vr_session.h"
-#include "core/vr/whip_damage.h"
-#include "core/vr/whip_spin.h"
 
 namespace VR::Bloodborne {
 
@@ -65,7 +64,7 @@ using Hook::Plausible;
 using Hook::Read;
 
 // Module-relative addresses in the 1.09 eboot (patch file address - 0x400000). Every prologue is
-// unique in .text (combat/gunfire/uniq.py, scratchpad/melee/sigs.py).
+// unique in .text (offline analysis).
 
 // BehaviorModule::InvokeAttack, `bool(BehaviorModule* = [[chr+0x3B0]+0x98], s32 bid, s32
 // attackType, u32 index <= 7, s32 flags)`: TAE event 1's call. A new bid in a slot ends the old
@@ -315,6 +314,7 @@ constexpr s64 HitGraceNs = 120 * Ms;     // a hit this long after the end still 
 // swing into the dodge (it goes on and ends them).
 constexpr s64 DodgeCarryGraceNs = 150 * Ms;
 constexpr s64 StatusLogNs = 10000 * Ms;
+constexpr float RightArmMin = 0.9f;
 // The hit dummy belongs to the weapon in hand: this near R_Weapon (a part not shown answers more
 // than 3 m away). 2 m: the transformed Bloodletter's head is 1.05-1.5 m out of the hand, its hit
 // dummy past 1.5 m, so every form-B swing was refused (the 2026-10-13 run).
@@ -351,6 +351,33 @@ bool g_regen = false;
 bool g_free_flag = false; // InvokeAttack's no-stamina-consumption flag matched (..._pct=0)
 bool g_map_hook = false;
 InvokeAttackFn g_invoke = nullptr;
+using HandCodeFn = s32(PS4_SYSV_ABI*)(u8* chr);
+HandCodeFn g_hand_original = nullptr;
+bool g_left_hand_hook = false;
+std::unique_ptr<Xbyak::CodeGenerator> g_hand_code;
+
+s32 PS4_SYSV_ABI PhysicalAttackHand(u8* chr) {
+    return M::LeftAttack::Applies(chr) ? HandLeft : g_hand_original(chr);
+}
+
+// InvokeAttack -> 0x1576090 asks PlayerIns::GetAttackHand independently of the
+// behavior row. Native L2 normally selects -2 through the animation/input state.
+// A physical swing has neither. Override only our scoped call on this thread;
+// shooting, right/dual attacks, other actors and other threads execute the original.
+bool InstallLeftAttackHand(u8* module) {
+    constexpr size_t Replay = 16; // whole instructions, no relative operands
+    g_hand_code = std::make_unique<Xbyak::CodeGenerator>(64);
+    auto& c = *g_hand_code;
+    auto* original = const_cast<u8*>(c.getCurr());
+    for (size_t i = 0; i < Replay; ++i) c.db(HandCodeSig[i]);
+    c.jmp(Xbyak::util::ptr[Xbyak::util::rip]);
+    c.dq(reinterpret_cast<u64>(module + HandCodeRva + Replay));
+    c.ready();
+    if (!Hook::MakeWritable(module + HandCodeRva, Replay)) return false;
+    g_hand_original = reinterpret_cast<HandCodeFn>(original);
+    Hook::WriteJump(module + HandCodeRva, Replay, reinterpret_cast<void*>(&PhysicalAttackHand));
+    return true;
+}
 TryThrowAllFn g_try_throw = nullptr;
 PlaySoundFn g_play_sound = nullptr;
 BladeFfxFn g_blade_ffx = nullptr;
@@ -359,10 +386,6 @@ const u8* g_sound_table = nullptr;
 std::unique_ptr<Xbyak::CodeGenerator> g_code;
 // VR_MELEE_LOG: 1 = + the capsule's first frames of each window, 2 = + every frame of it.
 int g_log = 0;
-// Native saw uses its context only on the pose caller. NativeMelee and NativeGeometry are
-// stateless: callers read the immutable table without entering that context or sharing state.
-VR::Interactions::Module* g_native_saw_module{};
-VR::Interactions::NativeAttackRuntime g_native_attack_runtime{};
 bool g_dry_run = false;   // VR_MELEE_DRYRUN: everything decided and logged, no attack (the
                           // telegraph's AI notices are still sent: they are no attack)
 bool g_telegraph = false; // the AI notices matched (melee_telegraph can send them)
@@ -507,6 +530,8 @@ u64 Sound(s32 id, B::Vec3 pos) {
 // ---- The attacks of our windows (the pose tick writes, the damage and map hooks read) ----------
 
 struct Attack {
+    s32 weapon_variation{-1};
+    bool form_b{false};
     u32 serial{0};
     s32 bid{-1};
     u32 handle{0xFFFFFFFFu};
@@ -548,7 +573,7 @@ std::mutex g_attack_mutex;
 std::array<Attack, 4> g_attacks{}; // the newest four (a ring)
 u32 g_attack_next = 0;
 // The whip forms' damage pace (vr.ini whip_pace): one meter, every whip window that hurt.
-PiWhipPaceState g_whip_pace{}; // (g_attack_mutex)
+VR::Whip::PaceMeter g_whip_pace; // (g_attack_mutex)
 
 Attack* FindAttack(s32 bid, u32 handle, s64 now) {
     // handle 0 (a whip's capsules 1-3, which come with other handles): the newest such attack (two
@@ -603,9 +628,25 @@ Stats g_stats{};
 
 // A flick mid-swing (core/vr/melee_window.h FlickJoins): the window whose stroke a transform
 // joined, and where its hand-off from the old form's attack to the transform attack stands.
-namespace FlickPhase {
-constexpr u32 Old = PI_AF_OLD, Gap = PI_AF_GAP, Live = PI_AF_LIVE, Done = PI_AF_DONE;
-}
+enum class FlickPhase : u8 {
+    Old,  // the old form's attack (if any) serves the window until the switch is handed over
+    Gap,  // that attack ended (the old part goes): waiting for the new form in the hand
+    Live, // the transform attack (or the new form's own row) serves the rest of the window
+    Done, // nothing more for this window (it ended, or the transform stopped before its switch)
+};
+
+struct FlickStroke {
+    u32 window{0};
+    u32 run{0};    // the transform run
+    u32 serial{0}; // its squeeze
+    bool to_b{false};
+    s32 style{-1}; // the form it switches to
+    FlickPhase phase{FlickPhase::Done};
+    u32 waited{0}; // updates the new form's hit dummy was not in the hand yet
+    u32 old_hits{0};
+    s64 old_created_ns{0};
+    s64 gap_ns{0};
+};
 
 struct TickState {
     const u8* chr{nullptr};
@@ -615,11 +656,12 @@ struct TickState {
     s32 variation{-1};
     const M::WeaponMoves* moves{nullptr};
     s32 style{-1};
+    s32 style_prev{-1};
     u32 style_stable{0}; // updates the style has kept its value
     bool form_b{false};
     const char* weapon_why{"not read yet"};
     // The window being served.
-    VR::Interactions::NativeLatch latch{g_native_attack_runtime, 1};
+    M::LatchState latch{};
     Attack cur{};         // its attack (a copy of the ring's)
     bool cur_live{false}; // created and not finalized
     // The combo budget could not pay the window (Combat::MeleeWindow::unpaid): no attack, its
@@ -635,7 +677,7 @@ struct TickState {
     bool trail_checked{false}; // the trail's dummies were found (or replaced by the defaults)
     B::Vec3 last_a{};
     float regen_left{0.0f};
-    VR::Interactions::NativeFlick flick{g_native_attack_runtime};
+    FlickStroke flick{};
     // Logs.
     s32 logged_variation{-2};
     s32 geo_variation{-2}; // the blade geometry logged for (VR_MELEE_LOG)
@@ -652,10 +694,25 @@ struct TickState {
     u32 cut_serial{0};
     u32 dodge_cancel{0}; // the swing in its follow-through as this dodge began: the dodge ends it
     // The swing buffer (swing_buffer_ms): the window held for the game's attack window.
-    VR::Interactions::NativeSwingBuffer buffer{g_native_attack_runtime};
+    M::SwingBuffer buffer{};
     u32 buffer_logged{0};
+    // The two-handed form's blade in R_Weapon's frame (MeleeStatus::blade_tip), measured once
+    // per settled form.
+    struct TwoHandGeometry {
+        s32 variation{-1};
+        s32 style{-1};
+        bool valid{false};
+        B::Vec3 tip{};
+        float strike_near{0.0f};
+    } two_hand_geo{};
+    // The blade's ends at the last pose tick (TrackBlade), and the weapon they were read for.
+    s64 blade_ns{0};
+    B::Vec3 blade_base{}, blade_tip{};
+    float blade_yaw{0.0f}; // the play space's heading then
+    s32 blade_variation{-1};
+    s32 blade_style{-1};
     // The plunge (melee_plunge): the hunter in the air, from the motion signals.
-    VR::Interactions::NativeAir air{g_native_attack_runtime};
+    VR::Melee::Plunge::Tracker air{};
     // Simon's Bowblade's bow form (vr.ini bow): the hand its bow hangs on (-1: not the bow).
     s8 bow_hand{-1};
     s8 bow_part{-1};
@@ -677,35 +734,12 @@ struct BowStringRequest {
     s64 ns{};
 };
 SeqLock<BowStringRequest> g_bow_string_request;
-// One Game:Main native part-pose owner, separate from the body and physical-chain contexts.
-VR::Interactions::Module* g_bow_string_module{};
-VR::Interactions::BowString g_bow_string_policy{};
-VR::Bow::StringCleanup g_bow_string_cleanup{};
-bool g_bow_string_fault{}, g_bow_string_dll{};
-const u8* g_bow_string_last_node{};
-const u8* g_bow_string_last_skeleton{};
-u64 g_bow_string_identity{};
-bool InitBowStringDll() {
-    if (!VR::Interactions::DllRequested())
-        return true;
-    g_bow_string_dll = true;
-    if (g_bow_string_module)
-        return !g_bow_string_fault;
-    g_bow_string_module = new VR::Interactions::Module();
-    g_bow_string_module->EnableFaultBroadcast();
-    if (!g_bow_string_module->LoadBesideExecutable()) {
-        g_bow_string_fault = true;
-        LOG_ERROR(Core, "VR bow: string DLL unavailable: {}", g_bow_string_module->Diagnostic());
-        return false;
-    }
-    g_bow_string_policy.Bind(*g_bow_string_module, g_bow_string_fault);
-    return true;
-}
 
 // Two pose ticks further apart than this give no blade velocity ...
 constexpr s64 BladeTickMaxNs = 100 * Ms;
 // ... nor two with the play space turned more than this between them (a snap turn; a smooth turn
 // at the default 120 degrees a second is 2 to 4 degrees an update).
+constexpr float BladeTurnRad = 8.0f * 3.14159265f / 180.0f;
 
 // The right weapon's blade every pose tick (melee_kill_ragdoll: the kill ragdoll's push, read by
 // the damage step through MeleeHitInfoOf): its two ends and their velocities from this tick and the
@@ -756,7 +790,9 @@ float StepSeconds(TickState& t, s64 now) {
 // attached to a body dummy has +0x138 = 2 and the dummy at +0x13C): the hand the Bowblade's bow
 // hangs on in its bow form, 0 left (dummies 340-359) or 1 right (300-339). Neither found: the left
 // (the game's bow form holds the bow in the left hand), logged.
+constexpr s32 BowbladeVariation = 3200;
 constexpr s32 StakeDriverVariation = 1100;
+constexpr s32 BeastCutterVariation = 2400;
 constexpr u32 OffsetChrAsm = 0x4D0;
 constexpr u32 OffsetAsmParts = 0x28;
 constexpr s32 RightPartSlot = 11;
@@ -817,158 +853,157 @@ s8 BowHandOf(u8* chr, TickState& t) {
 // charged swing opens it: the heavy row's capsule with that judge. A bullet row is fired by the
 // gun module instead (BladeShotTick). Looked up once; the log says which.
 const M::WeaponMoves* StakeMovesFor(s32 variation, const M::WeaponMoves* moves) {
-    static M::WeaponMoves stake{}; // native-side approved row storage, not a judge cache
-    PiNativeAttackInput input{};
-    input.operation = PI_ATTACK_STAKE_ROWS;
-    auto& facts = input.decision.stake;
-    facts.command = PI_SR_BEGIN;
-    facts.variation = variation;
-    facts.have_moves = moves != nullptr;
-    facts.charged_valid = moves && moves->rows[5].Valid();
-    facts.heavy_valid = moves && moves->rows[4].Valid();
-    facts.enabled = VR::Tricks::GetTrickSettings().stake_blast;
-    facts.geometry = g_stake_geometry;
-    std::string kinds;
-    for (int stage = 0; stage < 4; ++stage) {
-        const auto packet = g_native_attack_runtime.Call(input);
-        if (!packet.valid)
-            return nullptr;
-        const auto& result = packet.stake;
-        if (result.query) {
-            const s32 judge = result.query_judge;
-            const s32 kind = GunBehaviorRefType(100000000 + variation * 1000 + judge);
-            kinds += fmt::format(" {}: {}", judge,
-                                 kind < 0    ? "no row"
-                                 : kind == 0 ? "an attack"
-                                             : "a bullet");
-            facts.command = PI_SR_REPLY;
-            facts.token = result.token;
-            facts.reply_judge = judge;
-            facts.kind = kind;
-            continue;
-        }
-        if (result.build && moves) {
-            stake = *moves;
-            auto& row = stake.rows[result.target_row];
-            row = moves->rows[result.source_row];
-            row.judge = static_cast<s16>(result.judge);
-            row.charge = result.charge;
-            if (result.patch_stats) {
-                row.stamina = static_cast<s16>(result.stamina);
-                row.mv = static_cast<s16>(result.mv);
-                row.radius = result.radius;
-                row.dmy1 = result.dmy1;
-                row.dmy2 = result.dmy2;
+    namespace T = VR::Tricks;
+    static M::WeaponMoves stake{};
+    static s32 judge = 0; // 0 not looked up yet, -1 none
+    if (variation != StakeDriverVariation || moves == nullptr || moves->rows[5].Valid() ||
+        !moves->rows[4].Valid() || !T::GetTrickSettings().stake_blast || !g_stake_geometry) {
+        return moves;
+    }
+    if (judge == 0) {
+        judge = -1;
+        std::string kinds;
+        for (const s32 j : T::ChargedJudgesB) {
+            const s32 kind = GunBehaviorRefType(100000000 + variation * 1000 + j);
+            kinds += fmt::format(" {}: {}", j, kind < 0 ? "no row" : kind == 0 ? "an attack" : "a bullet");
+            if (kind == 0 && judge < 0) {
+                judge = j;
             }
         }
-        if (result.log)
-            LOG_INFO(Core, "VR melee: the Stake Driver's transformed charged R2 rows:{} -> {}",
-                     kinds,
-                     result.use ? fmt::format("the charged swing opens judge {}", result.judge)
-                                : std::string{"no attack row (a bullet is the gun module's)"});
-        return result.use ? &stake : moves;
+        if (judge > 0) {
+            stake = *moves;
+            stake.rows[5] = moves->rows[4];
+            stake.rows[5].judge = static_cast<s16>(judge);
+            stake.rows[5].charge = true;
+            if (judge == 930) {
+                // Retail native blast metadata; its body-relative sphere is relocated per
+                // attack instance, never by changing the shared parameter table.
+                stake.rows[5].stamina = 150;
+                stake.rows[5].mv = 355;
+                stake.rows[5].radius = 1.0f;
+                stake.rows[5].dmy1 = 11206;
+                stake.rows[5].dmy2 = -1;
+            }
+        }
+        LOG_INFO(Core, "VR melee: the Stake Driver's transformed charged R2 rows:{} -> {}", kinds,
+                 judge > 0 ? fmt::format("the charged swing opens judge {}", judge)
+                           : std::string{"no attack row (a bullet is the gun module's)"});
     }
-    if (g_native_saw_module)
-        g_native_saw_module->ReportFault();
-    return nullptr;
+    return judge > 0 ? &stake : moves;
+}
+
+// The bare right fist (2026-10-16, the tester: a swing with the empty hand played the game's punch
+// animation; it should hit as the weapons do, with no animation). Its rows are left out of the
+// generated table (gen_judges.py keeps only parts a right-hand weapon dummy holds; the fist's hit
+// is the hand's own dummy 10100), so a bare hand had no physical moves and its swing pressed R1.
+// The game's own light / heavy / charged rows of the fist (judges 0 / 150 / 170, BehaviorParam_PC
+// and AtkParam_Pc of 1.09; game-derived like core/vr/melee_moves.h, for the same runtime
+// extraction before the source release), used only while the game has them as attacks.
+const M::WeaponMoves* FistMovesFor(s32 variation, const M::WeaponMoves* moves) {
+    namespace T = VR::Tricks;
+    static constexpr M::WeaponMoves fists{
+        T::FistVariation,
+        "Bare fist",
+        {{{0, 15, 100, 10100, -1, 0.400f, 0.060f, false, -1, -1, -1, -1, 0.0f, 0.0f},
+          {150, 30, 125, 10100, -1, 0.400f, 0.090f, false, -1, -1, -1, -1, 0.0f, 0.0f},
+          {170, 45, 145, 10100, -1, 0.400f, 0.120f, true, -1, -1, -1, -1, 0.0f, 0.0f},
+          {},
+          {},
+          {}}}};
+    static s32 checked = 0; // 0 not looked up yet, 1 the game has them, -1 not
+    static u32 retry = 0;
+    if (moves != nullptr || variation != T::FistVariation) {
+        return moves;
+    }
+    // Until the game answers for all three (its param table not up yet reads "no row": asked
+    // again every 60 updates, the swing the game's R1 meanwhile).
+    if (checked == 0 && retry++ % 60 == 0) {
+        std::string kinds;
+        bool all = true;
+        bool known = true;
+        for (std::size_t i = 0; i < 3; ++i) {
+            const s32 judge = fists.rows[i].judge;
+            const s32 kind = GunBehaviorRefType(100000000 + variation * 1000 + judge);
+            kinds += fmt::format(" {}: {}", judge,
+                                 kind < 0 ? "no row" : kind == 0 ? "an attack" : "not an attack");
+            all = all && kind == 0;
+            known = known && kind >= 0;
+        }
+        if (!known) {
+            return moves;
+        }
+        checked = all ? 1 : -1;
+        LOG_INFO(Core, "VR melee: the bare right fist's rows:{} -> {}", kinds,
+                 all ? "a swing punches (physical, no animation)"
+                     : "left to the game's R1 (a row is not an attack)");
+    }
+    return checked > 0 ? &fists : moves;
 }
 
 void ReadWeapon(u8* chr, TickState& t) {
-    PiNativeAttackInput input{};
-    input.operation = PI_ATTACK_WEAPON;
-    auto& facts = input.decision.weapon;
-    facts.command = PI_NW_ID;
-    facts.bid = BehaviorId(chr, 0);
-    const auto fail = [&] {
-        t.variation = t.style = -1;
-        t.style_stable = 0;
-        t.form_b = false;
-        t.moves = nullptr;
-        t.bow_hand = -1;
-        t.bow_arrow_part = -1;
-        t.bow_arrow_logged = false;
-        t.weapon_why = PhysicalInteractions::NativeWeaponReasons[PI_NWR_MODULE];
-    };
-    auto result = g_native_attack_runtime.Call(input);
-    if (!result.valid) {
-        fail();
-        return;
-    }
-    t.variation = result.weapon.variation;
-    facts.request_id = result.weapon.request_id;
+    const s32 bid0 = BehaviorId(chr, 0);
+    const s32 variation_before = t.variation;
+    t.variation =
+        bid0 >= 100000000 && bid0 < 200000000 && bid0 % 1000 == 0 ? (bid0 - 100000000) / 1000 : -1;
     t.moves = t.variation >= 0 ? M::FindMoves(t.variation) : nullptr;
     // whip=physical: a whip form's rows on its simulated chain (core/vr/bloodborne_whip.h).
     t.moves = WhipMovesFor(t.variation, t.moves);
     t.moves = StakeMovesFor(t.variation, t.moves);
-    facts.command = PI_NW_STYLE;
-    facts.style = WeaponStyle(chr);
-    result = g_native_attack_runtime.Call(input);
-    if (!result.valid) {
-        fail();
-        return;
+    t.moves = FistMovesFor(t.variation, t.moves);
+    t.style = WeaponStyle(chr);
+    if (t.style == t.style_prev && t.variation == variation_before) {
+        ++t.style_stable;
+    } else {
+        t.style_stable = 0;
+        t.style_prev = t.style;
     }
-    t.style = result.weapon.style;
-    t.style_stable = result.weapon.stable_frames;
-    t.form_b = result.weapon.form_b;
-    // The DLL approves the bow form before the host resolves its native hand/part dummies.
-    t.bow_hand = result.weapon.bow_eligible ? BowHandOf(chr, t) : -1;
+    t.form_b = VR::Tricks::PhysicalMeleeFormB(t.variation, t.style);
+    // Simon's Bowblade's bow form (vr.ini bow, core/vr/bow.h): the hand its bow hangs on.
+    t.bow_hand = t.variation == BowbladeVariation && t.form_b ? BowHandOf(chr, t) : -1;
     if (t.bow_hand < 0) {
         t.bow_arrow_part = -1;
         t.bow_arrow_logged = false;
     }
-    facts.command = PI_NW_ELIGIBILITY;
-    facts.have_moves = t.moves != nullptr;
-    if (t.moves)
-        for (int i = 0; i < 6; ++i)
-            if (t.moves->rows[i].Valid())
-                facts.valid_rows |= 1u << i;
-    result = g_native_attack_runtime.Call(input);
-    if (!result.valid) {
-        fail();
-        return;
+    if (t.variation < 0) {
+        t.weapon_why = "no right weapon row";
+    } else if (t.moves == nullptr) {
+        t.weapon_why = "no physical moves for this weapon";
+    } else if (t.style == 2) {
+        t.weapon_why = "the left weapon held two-handed";
+    } else if (t.style < 0 || t.style > 5) {
+        t.weapon_why = "unknown weapon style";
+    } else if (M::ChooseMove(*t.moves, t.form_b, M::MoveKind::Light).row == nullptr) {
+        t.weapon_why = t.form_b ? "no physical moves in form B" : "no physical moves in form A";
+    } else {
+        t.weapon_why = nullptr;
     }
-    t.weapon_why = PhysicalInteractions::NativeWeaponReasons[result.weapon.reason];
 }
 
 // The live dmy1 -> dmy2 distance of a row (0: a sphere row; -1: a dummy not found).
 float SpanNow(u8* chr, const M::MoveRow& r) {
-    PiNativeGeometryInput input{};
-    input.operation = PI_NG_SPAN;
-    input.dmy2 = r.dmy2;
-    B::Vec3 a{}, b{};
-    if (r.dmy2 >= 0 && DummyAt(chr, r.dmy1, a) && DummyAt(chr, r.dmy2, b)) {
-        input.flags = PI_NGF_HAVE;
-        PhysicalInteractions::AttackPackets::Pack(input.state.a, a);
-        PhysicalInteractions::AttackPackets::Pack(input.point, b);
+    if (r.dmy2 < 0) {
+        return 0.0f;
     }
-    PiNativeGeometryOutput output{};
-    return VR::Interactions::NativeGeometry(g_native_saw_module, input, output) && output.valid
-               ? output.measured_span
-               : -1.f;
+    B::Vec3 a{};
+    B::Vec3 b{};
+    return DummyAt(chr, r.dmy1, a) && DummyAt(chr, r.dmy2, b) ? B::Length(a - b) : -1.0f;
 }
 
 // The capsule radius a physical swing gives the row (core/vr/melee_window.h SwingRadius:
 // melee_radius_scale, the floor, the blade fit while the part has the model's shape).
 float RowRadius(u8* chr, const M::MoveRow& r, bool* fitted = nullptr) {
     const auto& ms = VR::Melee::GetMeleeSettings();
-    PiNativeGeometryInput input{};
-    input.operation = PI_NG_RADIUS;
-    input.scale = ms.radius_scale;
-    input.fit = ms.radius_fit;
-    input.margin = ms.radius_margin_cm * .01f;
-    input.row_radius = r.radius;
-    input.blade = r.blade;
-    input.span = r.span;
-    input.span_now = SpanNow(chr, r);
-    PiNativeGeometryOutput result{};
-    if (!VR::Interactions::NativeGeometry(g_native_saw_module, input, result) || !result.valid) {
-        if (fitted)
-            *fitted = false;
-        return r.radius;
+    M::RadiusConfig c{};
+    c.scale = ms.radius_scale;
+    c.fit = ms.radius_fit;
+    c.margin = ms.radius_margin_cm * 0.01f;
+    const float span_now = SpanNow(chr, r);
+    const float out = M::SwingRadius(r.radius, r.blade, r.span, span_now, c);
+    if (fitted != nullptr) {
+        M::RadiusConfig nofit = c;
+        nofit.fit = false;
+        *fitted = out < M::SwingRadius(r.radius, r.blade, r.span, span_now, nofit) - 1e-4f;
     }
-    if (fitted)
-        *fitted = result.fitted;
-    const float out = result.radius;
     return out;
 }
 
@@ -1075,37 +1110,74 @@ constexpr const char* AttackWaitWhy = "the game takes no attack yet";
 // `known_style`: the weapon's form just changed through our own transform (a known-good switch).
 const char* BlockReason(u8* chr, const MeleeBody& body, const TickState& t, bool flick_stroke,
                         bool known_style) {
-    PiNativeMeleeInput p{};
-    auto& g = p.gate;
-    g.body = body.body; g.reason = static_cast<u32>(body.reason); g.driven = body.driven;
-    g.menu = VR::IsGameMenuOpen(); g.cinematic = VR::CinematicActive();
-    g.attack_wait = body.attack_wait; g.dodge_attack = body.dodge_attack;
-    g.dodge_cancel = t.dodge_cancel; g.latch_active = t.latch.State().active; g.latch_serial = t.latch.State().serial;
-    g.right_ik = body.right_ik; g.right_weight = body.right_weight; g.held = body.held; g.owner_id = body.owner_id;
-    PiNativeMeleeOutput result{};
-    const auto call = [&](u32 operation) {
-        p.operation = operation;
-        return VR::Interactions::NativeMelee(g_native_saw_module, p, result) && result.valid;
-    };
-    const auto text = [&]() { return result.reason == 9 ? AttackWaitWhy : PhysicalInteractions::NativeMeleeReasons[result.reason]; };
-    if (!call(PI_NATIVE_MELEE_GATE_BODY)) return PhysicalInteractions::NativeMeleeReasons[17];
-    if (result.reason) return text();
-    const char* transform = TransformSwingBlock();
-    g.transform_block = transform != nullptr; g.weapon_block = t.weapon_why != nullptr;
-    g.flick_stroke = flick_stroke; g.moves = t.moves != nullptr; g.style_stable = t.style_stable; g.known_style = known_style;
-    if (!call(PI_NATIVE_MELEE_GATE_WEAPON)) return PhysicalInteractions::NativeMeleeReasons[17];
-    if (result.reason == 13) return transform;
-    if (result.reason == 14) return t.weapon_why;
-    if (result.reason) return text();
-    g.attack_type = Read<s32>(chr + OffsetAttackType); g.style = t.style;
+    if (!body.body) {
+        return "body off";
+    }
+    switch (body.reason) {
+    case B::GateReason::Dead:
+        return "dead";
+    case B::GateReason::Throw:
+        return "visceral or grab";
+    case B::GateReason::Ladder:
+        return "ladder";
+    case B::GateReason::Event:
+        return "event";
+    default:
+        break;
+    }
+    if (!body.driven) {
+        return "not first person";
+    }
+    if (VR::IsGameMenuOpen()) {
+        return "menu";
+    }
+    if (VR::CinematicActive()) {
+        return "cinematic";
+    }
+    if (body.attack_wait && !body.dodge_attack) {
+        // A kept hit or dodge (your arm, the game's clip): no swing before its cancel window
+        // (a dodge with dodge_attack takes it at once). A new swing waits swing_buffer_ms for it.
+        return AttackWaitWhy;
+    }
+    if (body.dodge_attack && t.dodge_cancel != 0 && t.latch.active &&
+        t.latch.serial == t.dodge_cancel) {
+        return "the dodge cancels the swing in progress"; // its follow-through (MeleePoseTick)
+    }
+    if ((!body.right_ik && !body.dodge_attack) || body.right_weight < RightArmMin) {
+        return "the game has the right arm";
+    }
+    if (body.held && body.owner_id >= 0) {
+        const s32 base = body.owner_id % 1'000'000;
+        if (base >= 19000 && base <= 19999) {
+            return "transforming";
+        }
+    }
+    // The weapon-only transform before its form switch has settled (no player clip to see;
+    // transform_flick=0 only: with the flick a swing joins the transform).
+    if (const char* transform = TransformSwingBlock(); transform != nullptr) {
+        return transform;
+    }
+    // A flick's stroke goes on into a form without moves of its own (a whip with whip=canned):
+    // the transform attack serves the rest of it.
+    if (t.weapon_why != nullptr && !(flick_stroke && t.moves != nullptr)) {
+        return t.weapon_why;
+    }
+    if (t.style_stable < 2 && !flick_stroke && !known_style) {
+        return "the weapon form is changing";
+    }
+    // The attack's hand as the game computes it (vt+0x380): -2 would make it the left weapon's.
+    const s32 attack_type = Read<s32>(chr + OffsetAttackType);
     const u8* hks = HksState(chr);
-    g.input_bits = hks != nullptr ? Read<u16>(hks + OffsetInputBits) : u16{0};
-    if (!call(PI_NATIVE_MELEE_GATE_HAND)) return PhysicalInteractions::NativeMeleeReasons[17];
-    if (result.reason) return text();
-    const u8* data = Module(chr, L::OffsetDataModule);
-    g.have_data = data != nullptr; g.hp = data ? Read<s32>(data + OffsetHp) : 1;
-    if (!call(PI_NATIVE_MELEE_GATE_HP)) return PhysicalInteractions::NativeMeleeReasons[17];
-    return text();
+    const u16 bits = hks != nullptr ? Read<u16>(hks + OffsetInputBits) : u16{0};
+    const bool l2 = (bits & 0x80) == 0 && (bits & 0x40) != 0;
+    if (attack_type == 4 || (attack_type == 11 && t.style == 1) || (attack_type == -1 && l2)) {
+        return "the attack would be the left hand's (L2 held)";
+    }
+    if (const u8* data = Module(chr, L::OffsetDataModule);
+        data != nullptr && Read<s32>(data + OffsetHp) <= 0) {
+        return "dead";
+    }
+    return nullptr;
 }
 
 void PauseRegen(u8* chr) {
@@ -1204,31 +1276,13 @@ constexpr M::MoveRow SawRows[] = {
 };
 struct SawAttackState {
     u8* chr{nullptr};
+    VR::Tricks::SawAttackClock clock{};
     Attack attack{};
     bool live{false};
+    bool exhausted{false};
+    u32 pulse{0};
 };
 SawAttackState g_saw{};
-
-// Dedicated serial native pose owner; no calls from XR, damage hooks or part-pose contexts.
-
-VR::Interactions::NativeSaw g_native_saw_policy{};
-bool g_native_saw_fault{}, g_native_saw_dll{};
-u64 g_native_saw_owner{};
-bool InitNativeSawDll() {
-    if (!VR::Interactions::DllRequested()) return true;
-    g_native_saw_dll = true;
-    if (g_native_saw_module) return !g_native_saw_fault;
-    g_native_saw_module = new VR::Interactions::Module();
-    g_native_saw_module->EnableFaultBroadcast();
-    if (!g_native_saw_module->LoadBesideExecutable()) {
-        g_native_saw_fault = true;
-        LOG_ERROR(Core, "VR saw: native policy DLL unavailable: {}", g_native_saw_module->Diagnostic());
-        return false;
-    }
-    g_native_saw_policy.Bind(*g_native_saw_module, g_native_saw_fault);
-    g_native_attack_runtime.Bind(*g_native_saw_module);
-    return true;
-}
 
 void EndSawAttack(s64 now) {
     if (!g_saw.live) {
@@ -1250,113 +1304,92 @@ bool SawAttackTick(u8* chr, const MeleeBody& body, const TickState& t,
         EndSawAttack(now);
         g_saw = {};
         g_saw.chr = chr;
-        ++g_native_saw_owner; // opaque native owner generation, never an address in the DLL
     }
     Combat::SawRequest request{};
-    PiNativeSawInput input{};
-    input.operation = PI_NATIVE_SAW_BEGIN;
-    input.owner = g_native_saw_owner;
-    input.now_ns = now;
-    input.have_request = Combat::LatestSawRequest(request);
-    input.request_ns = request.ns;
-    input.rev = request.rev;
-    input.held = request.held;
-    input.enabled = Tr::GetTrickSettings().saw_spin;
-    input.physical = g_physical;
-    input.variation = t.variation;
-    input.form_b = t.form_b;
-    input.gate_clear = gate == nullptr;
-    input.body = body.body;
-    input.transforming = TransformRun().active;
-    input.dt = dt;
-    input.dry_run = g_dry_run;
-    input.regen = g_regen;
-    u8* module = nullptr;
-    u8* data = nullptr;
-    s32 bid = -1;
-    const M::MoveRow* row = nullptr;
-    for (int step = 0; step < 8; ++step) {
-        PiNativeSawOutput output{};
-        if (!g_native_saw_policy.Step(input, output)) break;
-        if (output.flags & PI_NATIVE_SAW_END) EndSawAttack(now);
-        bool pose_ok = true;
-        if (output.flags & PI_NATIVE_SAW_WRITE_POSE) {
-            pose_ok = SetSawWeaponPose(chr, output.pose_time,
-                                      (output.flags & PI_NATIVE_SAW_POSE_ACTIVE) != 0);
-        }
-        if (output.reason == 1) {
+    const bool fresh = Combat::LatestSawRequest(request) && Tr::SawFresh(request.ns, now);
+    const bool owns = fresh && Tr::GetTrickSettings().saw_spin && g_physical &&
+                      t.variation == 3100 && t.form_b && request.rev > 0.0f;
+    const bool allowed = owns && gate == nullptr && body.body && !TransformRun().active;
+    if (!fresh || !request.held) {
+        g_saw.exhausted = false; // empty stamina requires releasing the trigger before restarting
+    }
+    if (!allowed) {
+        EndSawAttack(now);
+        g_saw.clock = {};
+        SetSawWeaponPose(chr, 0.0f, false);
+        return owns;
+    }
+    const bool pulse = g_saw.clock.Step(request.rev, request.held && !g_saw.exhausted, dt);
+    if (!SetSawWeaponPose(chr, g_saw.clock.Time(), !g_saw.exhausted)) {
+        EndSawAttack(now);
+        return owns;
+    }
+    if (!g_saw.clock.Active()) {
+        EndSawAttack(now);
+        return owns;
+    }
+    u8* const module = Module(chr, OffsetAttackModule);
+    u8* const data = Module(chr, L::OffsetDataModule);
+    B::Vec3 blade{}, grip{};
+    if (module == nullptr || data == nullptr || !DummyAt(chr, 12100, blade) ||
+        !DummyAt(chr, RightWeaponDummy, grip) || B::Length(blade - grip) > DummyNearM) {
+        EndSawAttack(now);
+        SetSawWeaponPose(chr, 0.0f, false);
+        return owns;
+    }
+    if (pulse) {
+        EndSawAttack(now);
+        if (Read<s32>(data + OffsetStamina) <= 0) {
+            g_saw.exhausted = true;
+            SetSawWeaponPose(chr, 0.0f, false);
             LOG_INFO(Core, "VR saw: stopped (no stamina; release the trigger to restart)");
-        } else if (output.reason == 2) {
-            LOG_WARNING(Core, "VR saw: native grinding row {} unavailable", row->judge);
+            return owns;
         }
-        if (output.flags & PI_NATIVE_SAW_REGISTER) {
-            Attack a{};
-            a.serial = output.serial;
-            a.bid = bid;
-            const u32 slot = FirstSlot + (a.serial & 1);
-            a.handle = Read<u32>(module + OffsetAttackSlots + slot * 8);
-            a.row = row;
-            a.saw = true;
-            a.created_ns = now;
-            a.since_counted_s = Tr::SawHitS;
-            g_saw.attack = a;
-            g_saw.live = true;
-            {
-                std::scoped_lock lock{g_attack_mutex};
-                g_attacks[g_attack_next++ % g_attacks.size()] = a;
-            }
-            LOG_DEBUG(Core, "VR saw: grinding judge {} bid {} handle {:#x}", row->judge, bid, a.handle);
+        const M::MoveRow& row = SawRows[g_saw.pulse++ & 1];
+        const s32 bid = BehaviorId(chr, row.judge);
+        if (bid < 0 || GunBehaviorRefType(bid) != 0) {
+            g_saw.exhausted = true;
+            SetSawWeaponPose(chr, 0.0f, false);
+            LOG_WARNING(Core, "VR saw: native grinding row {} unavailable", row.judge);
+            return owns;
         }
-        if (output.flags & PI_NATIVE_SAW_REFRESH_ATTACK) {
-            const Attack& a = g_saw.attack;
-            Invoke(chr, module, a.bid, FirstSlot + (a.serial & 1), a.row->stamina, M::SwingStamina{});
+        const u32 serial = 0x80000000u | g_saw.pulse;
+        const u32 slot = FirstSlot + (serial & 1);
+        const u8 ok = g_dry_run ? 0 : Invoke(chr, module, bid, slot, row.stamina, M::SwingStamina{});
+        if (ok == 0) {
+            g_saw.exhausted = true;
+            return owns;
         }
-        if (output.flags & PI_NATIVE_SAW_PAUSE_REGEN) PauseRegen(chr);
-        if (!output.next) return output.owns != 0;
-        input = {};
-        input.operation = output.next;
-        switch (output.next) {
-        case PI_NATIVE_SAW_POSE:
-            input.success = pose_ok;
-            break;
-        case PI_NATIVE_SAW_GEOMETRY: {
-            module = Module(chr, OffsetAttackModule);
-            data = Module(chr, L::OffsetDataModule);
-            B::Vec3 blade{}, grip{};
-            input.success = module != nullptr && data != nullptr && DummyAt(chr, 12100, blade) &&
-                            DummyAt(chr, RightWeaponDummy, grip);
-            PhysicalInteractions::AttackPackets::Pack(input.blade, blade);
-            PhysicalInteractions::AttackPackets::Pack(input.grip, grip);
-            break;
+        Attack a{};
+        a.serial = serial;
+        a.bid = bid;
+        a.handle = Read<u32>(module + OffsetAttackSlots + slot * 8);
+        a.row = &row;
+        a.saw = true;
+        a.created_ns = now;
+        a.since_counted_s = Tr::SawHitS;
+        g_saw.attack = a;
+        g_saw.live = true;
+        {
+            std::scoped_lock lock{g_attack_mutex};
+            g_attacks[g_attack_next++ % g_attacks.size()] = a;
         }
-        case PI_NATIVE_SAW_STAMINA:
-            input.stamina = Read<s32>(data + OffsetStamina);
-            break;
-        case PI_NATIVE_SAW_BEHAVIOR:
-            row = &SawRows[output.row];
-            bid = BehaviorId(chr, row->judge);
-            input.success = bid >= 0 && GunBehaviorRefType(bid) == 0;
-            break;
-        case PI_NATIVE_SAW_INVOKE:
-            input.success = !g_dry_run && Invoke(chr, module, bid,
-                FirstSlot + (output.serial & 1), row->stamina, M::SwingStamina{}) != 0;
-            break;
-        case PI_NATIVE_SAW_REFRESH: {
-            const Attack& a = g_saw.attack;
-            const u32 slot = FirstSlot + (a.serial & 1);
-            input.success = Read<u32>(module + OffsetAttackSlots + slot * 8) == a.handle &&
-                            HitEntry(a.handle, a.bid) != nullptr;
-            break;
-        }
-        default: break;
+        LOG_DEBUG(Core, "VR saw: grinding judge {} bid {} handle {:#x}", row.judge, bid, a.handle);
+    } else if (g_saw.live && !g_dry_run) {
+        const Attack& a = g_saw.attack;
+        const u32 slot = FirstSlot + (a.serial & 1);
+        // Never let an unexpectedly retired hitbox recreate itself and charge stamina each frame.
+        if (Read<u32>(module + OffsetAttackSlots + slot * 8) != a.handle ||
+            HitEntry(a.handle, a.bid) == nullptr) {
+            EndSawAttack(now);
+        } else {
+            Invoke(chr, module, a.bid, slot, a.row->stamina, M::SwingStamina{});
         }
     }
-    // Fatal transport/peer failure: stop this host-owned attack; never retry legacy policy.
-    g_native_saw_fault = true;
-    if (g_native_saw_module) g_native_saw_module->ReportFault();
-    EndSawAttack(now);
-    SetSawWeaponPose(chr, 0.0f, false);
-    return true;
+    if (g_saw.live && g_regen) {
+        PauseRegen(chr);
+    }
+    return owns;
 }
 
 // The window's attack is over (ended, replaced, or the window gone): stamina for an onset window
@@ -1380,40 +1413,21 @@ Attack Finalize(u8* chr, TickState& t, const Combat::MeleeWindow* w, const char*
         }
     }
     const u8* data = Module(chr, L::OffsetDataModule);
-    PiNativeMeleeInput policy{};
-    policy.operation = PI_NATIVE_MELEE_FINALIZE;
-    auto& f = policy.finish;
-    f.hits = a.hits;
-    f.replaced = replaced;
-    f.have_window = w != nullptr;
-    f.serial = a.serial;
-    if (w) {
-        f.window_serial = w->serial;
-        f.window_aborted = w->aborted;
-        f.prev_serial = w->prev_serial;
-        f.prev_aborted = w->prev_aborted;
-    }
-    f.verdict_light = a.verdict_light;
-    f.have_light = a.light != nullptr;
-    f.have_row = a.row != nullptr;
-    f.cost = a.cost;
-    f.light_stamina = a.light ? a.light->stamina : 0;
-    f.row_stamina = a.row ? a.row->stamina : 0;
-    f.light_stamina_pct = a.light_stamina_pct;
-    PiNativeMeleeOutput decision{};
-    const bool approved =
-        VR::Interactions::NativeMelee(g_native_saw_module, policy, decision) &&
-        decision.valid;
-    const bool aborted = approved && decision.aborted;
-    if (aborted)
+    const bool aborted = w != nullptr && ((w->serial == a.serial && w->aborted) ||
+                                          (w->prev_serial == a.serial && w->prev_aborted));
+    if (aborted) {
         g_stats.aborted.fetch_add(1, std::memory_order_relaxed);
-    if (approved && decision.refund_reason) {
-        constexpr const char* reasons[] = {
-            nullptr, "the stroke became the transform attack, nothing hit yet",
-            "the swing never committed and hit nothing",
-            "a wound-up swing judged light, nothing hit"};
-        if (decision.refund_reason <= 3)
-            Refund(chr, decision.refund, a.serial, reasons[decision.refund_reason]);
+    }
+    if (a.hits == 0 && replaced) {
+        Refund(chr, a.cost, a.serial, "the stroke became the transform attack, nothing hit yet");
+    } else if (a.hits == 0 && aborted) {
+        Refund(chr, a.cost, a.serial, "the swing never committed and hit nothing");
+    } else if (a.hits == 0 && a.verdict_light && a.light != nullptr && a.row != nullptr &&
+               a.row->stamina > 0) {
+        // The heavy row's cost minus the light row's (the cost the game took, scaled).
+        Refund(chr, a.cost - M::PartialCost(a.cost * a.light->stamina / a.row->stamina,
+                                         a.light_stamina_pct), a.serial,
+               "a wound-up swing judged light, nothing hit");
     }
     LOG_INFO(Core,
              "VR melee: #{} {}{} ended after {:.0f} ms, {} frames ({}): {} hits {:.1f} damage, {} "
@@ -1427,23 +1441,16 @@ Attack Finalize(u8* chr, TickState& t, const Combat::MeleeWindow* w, const char*
 
 // The weapon's own swing sound and trail of `row` (its clip's), else the Saw Cleaver's.
 void SetSwingFx(TickState& t, const M::MoveRow& r) {
-    PiNativeMeleeInput p{};
-    p.operation = PI_NATIVE_MELEE_FX_SELECT;
-    p.fx.form_b = t.form_b;
-    p.fx.whoosh = r.whoosh;
-    p.fx.ffx = r.trail_ffx;
-    p.fx.base_id = r.trail_base;
-    p.fx.tip_id = r.trail_tip;
-    p.fx.group = r.Group();
-    p.fx.dmy2 = r.dmy2;
-    PiNativeMeleeOutput o{};
-    if (VR::Interactions::NativeMelee(g_native_saw_module, p, o) && o.valid) {
-        t.whoosh = o.whoosh;
-        t.trail_ffx = o.ffx;
-        t.trail_base = o.base_id;
-        t.trail_tip = o.tip_id;
+    t.whoosh = r.whoosh > 0 ? r.whoosh : t.form_b ? 611 : 610;
+    if (r.trail_ffx > 0 && r.trail_base > 0 && r.trail_tip > 0) {
+        t.trail_ffx = r.trail_ffx;
+        t.trail_base = r.trail_base;
+        t.trail_tip = r.trail_tip;
     } else {
-        t.whoosh = t.trail_ffx = t.trail_base = t.trail_tip = -1;
+        const s32 group = r.Group();
+        t.trail_ffx = TrailFfx;
+        t.trail_base = group * 1000 + 100;
+        t.trail_tip = r.dmy2 >= 0 ? r.dmy2 : group * 1000 + 110;
     }
     t.trail_checked = false;
 }
@@ -1462,22 +1469,6 @@ std::string BudgetText(const Combat::MeleeWindow& w, bool flick) {
                        w.budget_refill_s, w.budget_late ? ", paid at the commit" : "");
 }
 
-// Row pointers never cross the DLL boundary: the policy selects an index in copied
-// validity facts, which the pose owner resolves against its immutable native row table.
-M::MoveChoice ChooseAttackMove(const M::WeaponMoves& moves, bool form_b, M::MoveKind want) {
-    PiNativeAttackInput p{};
-    p.operation = PI_ATTACK_CHOOSE;
-    p.decision.move.form_b = form_b;
-    p.decision.move.want = static_cast<u32>(want);
-    for (size_t i = 0; i < moves.rows.size(); ++i)
-        p.decision.move.valid_rows[i] = moves.rows[i].Valid();
-    const auto o = g_native_attack_runtime.Call(p);
-    if (!o.valid || o.decision.row_index < 0)
-        return {};
-    return {&moves.rows[o.decision.row_index], static_cast<M::MoveKind>(o.decision.kind),
-            o.decision.lighter != 0};
-}
-
 // Opens the window's attack on `row` (core/vr/melee_moves.h): InvokeAttack on our slot, the
 // game's own hit list and capsule, melee_stamina_pct of its stamina (50% by default: Invoke);
 // then the swing sound, trail and (a swing that cost the game's full stamina) the regen pause.
@@ -1491,23 +1482,9 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
                 float near_m = DummyNearM, bool soft = false) {
     u8* const module = Module(chr, OffsetAttackModule);
     u8* const data = Module(chr, L::OffsetDataModule);
-    const auto* fallback_light =
-        light ? light
-              : (t.moves ? ChooseAttackMove(*t.moves, t.form_b, M::MoveKind::Light).row : nullptr);
-    PiNativeAttackInput selection{};
-    selection.operation = PI_ATTACK_AFFORDABLE;
-    selection.decision.admit.have_row = row != nullptr;
-    selection.decision.admit.have_light = fallback_light != nullptr;
-    selection.decision.admit.kind = static_cast<u32>(kind);
-    selection.decision.admit.lighter = lighter;
-    selection.decision.admit.row_stamina = row ? row->stamina : 0;
-    selection.decision.admit.stamina = data ? Read<s32>(data + OffsetStamina) : 0;
-    const auto selected = g_native_attack_runtime.Call(selection);
-    if (!selected.valid)
-        return false;
-    const M::MoveChoice affordable{selected.decision.use_light ? fallback_light : row,
-                                   static_cast<M::MoveKind>(selected.decision.kind),
-                                   selected.decision.lighter != 0};
+    const auto affordable = M::AffordableMove({row, kind, lighter}, light ? light :
+        (t.moves ? M::ChooseMove(*t.moves, t.form_b, M::MoveKind::Light).row : nullptr),
+        data ? Read<s32>(data + OffsetStamina) : 0);
     if (affordable.kind != kind) {
         LOG_INFO(Core, "VR melee: #{} {} -> light (stamina {} < strong cost {})",
                  w.serial, M::MoveKindName(kind), data ? Read<s32>(data + OffsetStamina) : 0,
@@ -1523,46 +1500,19 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
     B::Vec3 dmy{}, grip{};
     const bool have_dmy = row != nullptr && DummyAt(chr, row->dmy1, dmy);
     const bool have_grip = DummyAt(chr, RightWeaponDummy, grip);
-    PiNativeAttackInput admission{};
-    admission.operation = PI_ATTACK_ADMIT;
-    auto& facts = admission.decision.admit;
-    facts.have_row = row != nullptr;
-    facts.kind = static_cast<u32>(kind);
-    facts.light_pct = VR::Melee::GetMeleeSettings().stamina_pct;
-    facts.regen_pause = VR::Melee::GetMeleeSettings().regen_pause;
-    facts.have_module = module != nullptr;
-    facts.have_data = data != nullptr;
-    facts.bid = bid;
-    facts.have_dummy = have_dmy;
-    facts.have_grip = have_grip;
-    facts.dummy[0] = dmy.x;
-    facts.dummy[1] = dmy.y;
-    facts.dummy[2] = dmy.z;
-    facts.grip[0] = grip.x;
-    facts.grip[1] = grip.y;
-    facts.grip[2] = grip.z;
-    facts.near_m = near_m;
-    // Query native stamina only after the earlier module/row/geometry gates pass.
-    facts.stamina = INT32_MAX;
-    auto admitted = g_native_attack_runtime.Call(admission);
-    if (!admitted.valid)
-        return false;
-    if (admitted.decision.proceed) {
-        facts.stamina = Read<s32>(data + OffsetStamina);
-        admitted = g_native_attack_runtime.Call(admission);
-        if (!admitted.valid)
-            return false;
+    const M::SwingStamina stamina_rule = SwingRule(kind);
+    const char* refuse = nullptr;
+    if (module == nullptr || data == nullptr) {
+        refuse = "no behaviour module";
+    } else if (row == nullptr || bid < 0) {
+        refuse = "no row";
+    } else if (!have_dmy) {
+        refuse = "the hit dummy is not on the weapon in hand";
+    } else if (have_grip && B::Length(dmy - grip) > near_m) {
+        refuse = "the hit dummy is not near the hand";
+    } else if (M::StaminaRefuses(stamina_rule, Read<s32>(data + OffsetStamina))) {
+        refuse = "no stamina";
     }
-    const auto& rule = admitted.decision;
-    const M::SwingStamina stamina_rule{rule.pct, rule.charge != 0, rule.refuse_empty != 0,
-                                       rule.regen_pause != 0};
-    constexpr const char* refusal_text[] = {nullptr,
-                                            "no behaviour module",
-                                            "no row",
-                                            "the hit dummy is not on the weapon in hand",
-                                            "the hit dummy is not near the hand",
-                                            "no stamina"};
-    const char* refuse = refusal_text[admitted.decision.reason];
     if (refuse != nullptr && soft) {
         LOG_INFO(Core,
                  "VR melee: #{} {} not opened in the old form: {} (variation {} style {} judge {}); "
@@ -1572,7 +1522,8 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
     }
     if (refuse != nullptr) {
         g_stats.denied.fetch_add(1, std::memory_order_relaxed);
-        t.latch.End();
+        t.latch.active = false;
+        t.latch.done = true;
         Combat::PushMeleeEvent({Combat::MeleeEventKind::Denied, w.serial, 0.0f, 0.0f, now, refuse});
         LOG_INFO(Core, "VR melee: #{} {}{} refused: {} (variation {} style {} judge {} bid {})",
                  w.serial, transform ? "TRANSFORM ATTACK " : "", M::MoveKindName(want), refuse,
@@ -1588,34 +1539,8 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
     const s32 stamina_after = Read<s32>(data + OffsetStamina);
     const u32 handle = Read<u32>(module + OffsetAttackSlots + slot * 8);
     u8* const entry = ok != 0 ? HitEntry(handle, bid) : nullptr;
-    const auto plunge_cfg = PlungeConfig();
-    PiNativeAttackInput outcome{};
-    outcome.operation = PI_ATTACK_OPEN_RESULT;
-    outcome.now_ns = now;
-    outcome.config = VR::Interactions::AP::Pack(plunge_cfg);
-    auto& opened = outcome.decision.opened;
-    opened.variation = t.variation;
-    opened.judge = judge;
-    opened.form_b = t.form_b;
-    opened.kind = static_cast<u32>(kind);
-    opened.transform = transform;
-    opened.powered = w.powered;
-    opened.ok = ok != 0;
-    opened.dry_run = g_dry_run;
-    opened.verdict_known = w.verdict_known;
-    opened.verdict = w.verdict;
-    opened.stamina_before = stamina_before;
-    opened.stamina_after = stamina_after;
-    opened.two_hand = w.two_hand;
-    opened.regen_available = g_regen;
-    opened.regen_pause = stamina_rule.regen_pause;
-    const auto result = g_native_attack_runtime.Call(outcome);
-    if (!result.valid) {
-        t.latch.End();
-        return false;
-    }
-    const auto& approved = result.decision;
-    const bool stake_native = approved.stake;
+    const bool stake_native = t.variation == StakeDriverVariation && t.form_b &&
+                              kind == M::MoveKind::Charged && judge == 930;
     if (stake_native && entry != nullptr && g_stake_geometry) {
         if (!VR::Tricks::RelocateStakeBlast({entry, EntrySize})) {
             LOG_WARNING(Core, "VR stake: charged attack geometry differs from retail 1.09");
@@ -1626,23 +1551,21 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
     if (entry != nullptr) {
         radius_before = Read<float>(entry + OffsetEntryRadius);
         // Only the radius the row asked for (a sanity check of the offset), never twice.
-        PiNativeGeometryInput guard{};
-        guard.operation = PI_NG_RADIUS_GUARD;
-        guard.flags = stake_native ? PI_NGF_STAKE : 0;
-        guard.current_radius = radius_before;
-        guard.row_radius = row->radius;
-        PiNativeGeometryOutput allowed{};
-        if (VR::Interactions::NativeGeometry(g_native_saw_module, guard, allowed) &&
-            allowed.valid && allowed.success) {
-            PiNativeGeometryInput patch{};
-            patch.operation = PI_NG_RADIUS_PATCH;
-            patch.flags = IsWhipRow(row) ? PI_NGF_WHIP : 0;
-            patch.current_radius = radius_before;
-            patch.desired_radius = RowRadius(chr, *row);
-            PiNativeGeometryOutput result{};
-            if (VR::Interactions::NativeGeometry(g_native_saw_module, patch, result) &&
-                result.valid && (result.write_flags & PI_NGW_RADIUS)) {
-                radius_after = result.radius;
+        if (!stake_native && std::abs(radius_before - row->radius) < 0.02f) {
+            float want = RowRadius(chr, *row);
+            // A whip form's capsules on the chain: wider (x1.6, at least 25 cm) so a lash that
+            // lands near an enemy, or slaps the ground in front of one, catches it.
+            if (IsWhipRow(row)) {
+                want = std::max(want * 1.6f, 0.25f);
+            }
+            // The Beast Cutter, both forms, wider (2026-10-16, the tester: its swings sometimes
+            // missed): form A 21 -> 22 cm; the whip's light (its 35 cm row) 39 -> 45, heavy,
+            // charged and the transform attack 25 -> 31.
+            if (t.variation == BeastCutterVariation) {
+                want = !IsWhipRow(row) ? 0.22f : row->radius >= 0.3f ? 0.45f : 0.31f;
+            }
+            if (std::abs(want - radius_before) > 0.002f) {
+                radius_after = want;
                 std::memcpy(entry + OffsetEntryRadius, &radius_after, sizeof(radius_after));
             }
         }
@@ -1652,6 +1575,8 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
         DodgeAttackCut(t, w.serial, "opened");
     }
     Attack a{};
+    a.weapon_variation = t.variation;
+    a.form_b = t.form_b;
     a.serial = w.serial;
     a.bid = bid;
     a.handle = handle;
@@ -1659,8 +1584,9 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
     a.row = row;
     a.light = light;
     a.transform = transform;
-    a.powered = approved.powered;
-    a.cost = approved.cost;
+    a.powered = w.powered && !transform && t.variation == StakeDriverVariation &&
+                t.form_b && kind == M::MoveKind::Charged;
+    a.cost = std::max(stamina_before - stamina_after, 0);
     a.stamina_rule = stamina_rule;
     a.light_stamina_pct = VR::Melee::GetMeleeSettings().stamina_pct;
     a.since_counted_s = since_s;
@@ -1671,10 +1597,14 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
                                VR::Whip::WhipRecover(t.variation, static_cast<std::size_t>(kind)) > 0.0f
                            ? t.variation
                            : -1;
-    a.two_hand = approved.two_hand;
-    a.verdict_light = approved.verdict_light;
-    a.plunge = approved.plunge;
-    a.drop_m = approved.drop_m;
+    a.two_hand = std::clamp(w.two_hand, 1.0f, 2.0f);
+    a.verdict_light =
+        !transform && w.verdict_known && w.verdict == 0 && kind != M::MoveKind::Light;
+    // Opened while the hunter falls (or just landed from a deep fall): a plunge, held to the
+    // landing (MeleePoseTick).
+    const auto plunge_cfg = PlungeConfig();
+    a.plunge = !transform && !a.powered && ok != 0 && t.air.Opens(now, plunge_cfg);
+    a.drop_m = a.plunge ? t.air.Drop(now, plunge_cfg) : 0.0f;
     if (a.plunge) {
         LOG_INFO(Core,
                  "VR melee: #{} PLUNGE: opened in the air ({:.2f} m fallen, {:.1f} m/s down): "
@@ -1686,23 +1616,24 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
         g_attacks[g_attack_next++ % g_attacks.size()] = a;
     }
     t.cur = a;
-    t.cur_live = approved.live;
+    t.cur_live = ok != 0 || g_dry_run;
     t.unpaid_live = false;
     t.cur_frames = 1;
     t.whoosh_done = false;
     t.last_a = {};
     SetSwingFx(t, *row);
-    if (approved.regen_pause) {
-        t.regen_left = approved.regen_seconds;
+    if (stamina_rule.regen_pause && g_regen) {
+        t.regen_left = M::RecoverSeconds(kind); // full-cost light or strong attack
     }
-    if (approved.end_latch) {
-        t.latch.End();
+    if (ok == 0 && !g_dry_run) {
+        t.latch.active = false;
+        t.latch.done = true;
     }
     Combat::PushMeleeEvent(
-        {approved.live ? Combat::MeleeEventKind::Opened : Combat::MeleeEventKind::Denied, w.serial,
-         static_cast<float>(a.cost), static_cast<float>(static_cast<u8>(kind)), now,
-         approved.live ? "" : "the game made no attack"});
-    if (approved.discharge) {
+        {ok != 0 || g_dry_run ? Combat::MeleeEventKind::Opened : Combat::MeleeEventKind::Denied,
+         w.serial, static_cast<float>(a.cost), static_cast<float>(static_cast<u8>(kind)), now,
+         ok != 0 || g_dry_run ? "" : "the game made no attack"});
+    if (a.powered && ok != 0) {
         StakeDischarge(chr, now);
         Combat::PushMeleeEvent({Combat::MeleeEventKind::Shot, w.serial,
                                static_cast<float>(VR::Tricks::Shot::StakeBlast), 1.0f,
@@ -1718,13 +1649,13 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
              lighter ? fmt::format(" (asked {})", M::MoveKindName(want)) : std::string{},
              w.committed ? "committed" : "onset", static_cast<double>(now - w.open_ns) * 1e-6, bid,
              judge, slot, ok, handle, stamina_before, stamina_after,
-             StaminaText(stamina_rule, row->stamina, full_cost), row->mv, radius_before,
-             radius_after >= 0.0f ? radius_after : radius_before, t.variation,
-             w.committed ? "" : "(onset)", t.form_b ? "B" : "A", t.style, arm, w.tip_speed, since_s,
-             row->dmy1, have_grip ? B::Length(dmy - grip) * 1000.0f : -1.0f,
-             BudgetText(w, transform || t.flick.State().window == w.serial),
+             StaminaText(stamina_rule, row->stamina, full_cost), row->mv,
+             radius_before, radius_after >= 0.0f ? radius_after : radius_before, t.variation,
+             w.committed ? "" : "(onset)", t.form_b ? "B" : "A", t.style, arm, w.tip_speed,
+             since_s, row->dmy1, have_grip ? B::Length(dmy - grip) * 1000.0f : -1.0f,
+             BudgetText(w, transform || t.flick.window == w.serial),
              g_dry_run ? " DRY RUN (no attack)" : "");
-    return approved.live;
+    return ok != 0 || g_dry_run;
 }
 
 // A window the combo budget could not pay: no attack (no stamina, no hit list), its whoosh at the
@@ -1758,20 +1689,21 @@ void Create(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, s64 
             bool flick = false) {
     if (t.moves == nullptr || (flick && t.weapon_why != nullptr)) {
         if (flick) {
-            t.flick.Gap(); // no old-form swing: straight to the transform attack
+            t.flick.phase = FlickPhase::Gap; // no old-form swing: straight to the transform attack
             return;
         }
-        t.latch.End();
+        t.latch.active = false; // (the gates refuse a weapon without moves first)
+        t.latch.done = true;
         return;
     }
     const auto want = static_cast<M::MoveKind>(std::min<u8>(w.kind, 2));
-    const M::MoveChoice choice = ChooseAttackMove(*t.moves, t.form_b, want);
-    const M::MoveRow* light = ChooseAttackMove(*t.moves, t.form_b, M::MoveKind::Light).row;
+    const M::MoveChoice choice = M::ChooseMove(*t.moves, t.form_b, want);
+    const M::MoveRow* light = M::ChooseMove(*t.moves, t.form_b, M::MoveKind::Light).row;
     if (w.unpaid) {
         // The combo budget had no charge for this swing: it does not register. A flick's stroke
         // goes straight to its transform attack (transforms never need charges).
         if (flick) {
-            t.flick.Gap();
+            t.flick.phase = FlickPhase::Gap;
             LOG_INFO(Core,
                      "VR melee: #{} {} not registered (combo budget {}/{}): the flick's "
                      "transform attack serves the stroke",
@@ -1788,14 +1720,16 @@ void Create(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, s64 
                    : flick               ? FlickNearM
                                          : DummyNearM,
                    flick);
-    if (flick && !made && t.latch.State().active) {
-        t.flick.Gap(); // the transform attack serves the whole stroke
+    if (flick && !made && t.latch.active) {
+        t.flick.phase = FlickPhase::Gap; // the transform attack serves the whole stroke
     }
 }
 
 // ---- A flick mid-swing (core/vr/melee_window.h FlickJoins) --------------------------------------
 
-const char* FlickPhaseName(u32 p) {
+constexpr u32 FlickPartWaitUpdates = 8; // the new form's hit dummy must reach the hand by then
+
+const char* FlickPhaseName(FlickPhase p) {
     switch (p) {
     case FlickPhase::Old:
         return "old";
@@ -1809,114 +1743,134 @@ const char* FlickPhaseName(u32 p) {
     return "?";
 }
 
-void FlickNotice(TickState& t, const PiNativeAttackOutput& o, bool switched = false) {
-    if (!o.valid)
+void FlickDone(TickState& t, const char* why) {
+    FlickStroke& f = t.flick;
+    if (f.phase == FlickPhase::Done) {
         return;
-    const auto& d = o.flick;
-    const auto& f = t.flick.State();
-    constexpr const char* reasons[] = {"",
-                                       "a newer transform",
-                                       "the transform stopped before its switch",
-                                       "the window closed before the new form was in the hand",
-                                       "the new form has no physical move",
-                                       "the new form's hit dummy never came to the hand"};
-    if (d.flags & PI_AFO_LOG_DONE) {
-        LOG_INFO(Core, "VR melee: #{} flick of transform #{}: no transform attack ({}; was {})",
-                 f.window, f.serial, reasons[d.reason <= PI_AFR_NO_PART ? d.reason : 0],
-                 FlickPhaseName(d.prior_phase));
-    } else if (d.reason == PI_AFR_ENDED) {
-        LOG_INFO(Core,
-                 "VR melee: #{} flick of transform #{}: no transform attack (the stroke ended {}; "
-                 "was {})",
-                 f.window, f.serial,
-                 switched ? "before the new form was in the hand" : "before the switch",
-                 FlickPhaseName(d.prior_phase));
-    } else if (d.reason == PI_AFR_OLD_ABORTED) {
-        LOG_INFO(Core,
-                 "VR melee: #{} transform #{} stopped before its switch: the stroke goes on in the "
-                 "old form",
-                 f.window, f.serial);
     }
-    if (d.flags & PI_AFO_END_LATCH)
-        t.latch.End();
+    LOG_INFO(Core, "VR melee: #{} flick of transform #{}: no transform attack ({}; was {})",
+             f.window, f.serial, why, FlickPhaseName(f.phase));
+    f.phase = FlickPhase::Done;
+    if (t.latch.serial == f.window && t.latch.active && !t.cur_live) {
+        t.latch.active = false; // nothing alive for this window any more
+        t.latch.done = true;
+    }
 }
 
+// Every update, before the latch: a window joining the newest transform run, and the old form's
+// attack ended as the switch is handed to the game (before the old part's dummies leave the blade:
+// a capsule following a hidden part would sweep across the map).
 void FlickTick(u8* chr, TickState& t, const Combat::MeleeWindow& w, bool have,
                const TransformRunInfo& run, s64 now) {
+    FlickStroke& f = t.flick;
     const auto& ts = VR::Transform::GetTransformSettings();
-    PiAttackFlickFacts facts{};
-    facts.command = PI_AF_TICK;
-    facts.window = w.serial;
-    facts.run = run.id;
-    facts.serial = run.serial;
-    facts.style = run.style;
-    facts.cur_serial = t.cur.serial;
-    facts.open_ns = w.open_ns;
-    facts.close_ns = w.close_ns;
-    facts.press_ns = run.start_ns;
-    facts.flags = (have ? PI_AF_HAVE : 0) | (w.powered ? PI_AF_POWERED : 0) |
-                  (w.open ? PI_AF_OPEN : 0) | (run.active ? PI_AF_ACTIVE : 0) |
-                  (run.switched ? PI_AF_SWITCHED : 0) | (run.no_join ? PI_AF_NO_JOIN : 0) |
-                  (run.flick ? PI_AF_RUN_FLICK : 0) | (run.aborted ? PI_AF_ABORTED : 0) |
-                  (run.switch_asked ? PI_AF_SWITCH_ASKED : 0) |
-                  (g_physical && ts.flick ? PI_AF_ENABLED : 0) | (t.cur_live ? PI_AF_CUR_LIVE : 0) |
-                  (run.to_b ? PI_AF_TO_B : 0);
-    const auto decision = t.flick.Call(facts, now);
-    if (!decision.valid)
+    if (have && !w.powered && w.serial != 0 && w.serial != f.window && run.id != 0 && run.id != f.run &&
+        !run.no_join && !(t.latch.serial == w.serial && t.latch.done)) {
+        M::FlickJoinInput in{};
+        in.enabled = g_physical && ts.flick;
+        in.window = w.serial;
+        in.open = w.open;
+        in.open_ns = w.open_ns;
+        in.close_ns = w.close_ns;
+        in.run = run.id;
+        in.run_active = run.active;
+        in.switched = run.switched;
+        in.press_ns = run.start_ns;
+        in.now = now;
+        if (M::FlickJoins(in)) {
+            f = {};
+            f.window = w.serial;
+            f.run = run.id;
+            f.serial = run.serial;
+            f.to_b = run.to_b;
+            f.style = run.style;
+            f.phase = FlickPhase::Old;
+            if (!run.switched && !run.flick) {
+                TransformMakeFlick(run.id, w.serial); // the rest of the clip at the flick's pace
+            }
+            const M::MoveRow* row =
+                ts.attack && t.variation >= 0 ? M::FindTransformMove(t.variation, run.to_b) : nullptr;
+            LOG_INFO(Core,
+                     "VR melee: #{} the stroke joins transform #{} ({}, {}; window {} {:.0f} ms "
+                     "{} the squeeze): {}",
+                     w.serial, run.serial, run.to_b ? "A->B" : "B->A",
+                     run.switched ? "switched" : run.switch_asked ? "switching" : "before its switch",
+                     w.open ? "open" : "closed",
+                     std::abs(static_cast<double>(w.open_ns - run.start_ns)) * 1e-6,
+                     w.open_ns <= run.start_ns ? "before" : "after",
+                     row != nullptr ? fmt::format("the transform attack (judge {}, mv {}) after the "
+                                                  "switch",
+                                                  row->judge, row->mv)
+                                    : std::string{ts.attack ? "no transform attack for this weapon "
+                                                              "and direction: the new form's swing"
+                                                            : "transform_attack=0: the new form's "
+                                                              "swing"});
+        }
+    }
+    if (f.phase == FlickPhase::Done || f.window == 0) {
         return;
-    const auto& f = t.flick.State();
-    if (decision.flick.flags & PI_AFO_MAKE_FLICK)
-        TransformMakeFlick(run.id, w.serial);
-    if (decision.flick.flags & PI_AFO_JOINED) {
-        const M::MoveRow* row =
-            ts.attack && t.variation >= 0 ? M::FindTransformMove(t.variation, run.to_b) : nullptr;
-        LOG_INFO(Core,
-                 "VR melee: #{} the stroke joins transform #{} ({}, {}; window {} {:.0f} ms "
-                 "{} the squeeze): {}",
-                 w.serial, run.serial, run.to_b ? "A->B" : "B->A",
-                 run.switched       ? "switched"
-                 : run.switch_asked ? "switching"
-                                    : "before its switch",
-                 w.open ? "open" : "closed",
-                 std::abs(static_cast<double>(w.open_ns - run.start_ns)) * 1e-6,
-                 w.open_ns <= run.start_ns ? "before" : "after",
-                 row != nullptr ? fmt::format("the transform attack (judge {}, mv {}) after the "
-                                              "switch",
-                                              row->judge, row->mv)
-                                : std::string{ts.attack ? "no transform attack for this weapon "
-                                                          "and direction: the new form's swing"
-                                                        : "transform_attack=0: the new form's "
-                                                          "swing"});
     }
-    if (decision.flick.flags & PI_AFO_FINALIZE) {
-        const Attack old =
-            Finalize(chr, t, &w, "the form switches: the transform attack takes over", now, true);
-        PiAttackFlickFacts reply{};
-        reply.command = PI_AF_OLD_RESULT;
-        reply.window = f.window;
-        reply.run = f.run;
-        reply.old_hits = old.hits;
-        reply.old_created_ns = old.created_ns;
-        t.flick.Call(reply, now);
+    if (!have || w.serial != f.window) {
+        f.phase = FlickPhase::Done; // a newer window: this stroke is over
+        return;
     }
-    FlickNotice(t, decision, run.switched);
+    if (t.latch.serial == f.window && t.latch.done && !t.cur_live) {
+        if (f.phase != FlickPhase::Live) {
+            LOG_INFO(Core,
+                     "VR melee: #{} flick of transform #{}: no transform attack (the stroke ended "
+                     "{}; was {})",
+                     f.window, f.serial,
+                     run.switched ? "before the new form was in the hand" : "before the switch",
+                     FlickPhaseName(f.phase));
+        }
+        f.phase = FlickPhase::Done; // the window is over (ended, refused)
+        return;
+    }
+    if (run.id != f.run) {
+        FlickDone(t, "a newer transform");
+        return;
+    }
+    if (f.phase == FlickPhase::Old) {
+        if (run.aborted) {
+            f.phase = FlickPhase::Done; // stopped before its switch: the old form goes on
+            LOG_INFO(Core, "VR melee: #{} transform #{} stopped before its switch: the stroke "
+                           "goes on in the old form",
+                     f.window, f.serial);
+            return;
+        }
+        if (run.switch_asked || run.switched) {
+            if (t.cur_live && t.cur.serial == f.window) {
+                const Attack old = Finalize(chr, t, &w, "the form switches: the transform attack "
+                                                        "takes over",
+                                            now, true);
+                f.old_hits = old.hits;
+                f.old_created_ns = old.created_ns;
+            }
+            f.phase = FlickPhase::Gap;
+            f.gap_ns = now;
+        }
+    }
+    if (f.phase == FlickPhase::Gap && run.aborted) {
+        FlickDone(t, "the transform stopped before its switch");
+    }
 }
 
 // The stroke's attack after the switch (the latch's create or refresh while the hand-off is under
 // way): the transform attack, or the new form's own row, once the new form's part is in the hand.
 void FlickOpen(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, s64 now) {
-    const auto& f = t.flick.State();
+    FlickStroke& f = t.flick;
     const TransformRunInfo& run = TransformRun();
-    PiAttackFlickFacts gate{};
-    gate.command = PI_AF_OPEN_GATE;
-    gate.run = run.id;
-    gate.style = t.style;
-    gate.flags = (run.aborted ? PI_AF_ABORTED : 0) | (run.switched ? PI_AF_SWITCHED : 0) |
-                 (w.open ? PI_AF_OPEN : 0) | (t.cur_live ? PI_AF_CUR_LIVE : 0);
-    const auto opened = t.flick.Call(gate, now);
-    FlickNotice(t, opened);
-    if (!opened.valid || !(opened.flick.flags & PI_AFO_PROCEED))
+    if (run.id != f.run || run.aborted) {
+        FlickDone(t, "the transform stopped before its switch");
         return;
+    }
+    if (!run.switched || t.style != f.style) {
+        return; // the switch is not done yet
+    }
+    if (!w.open) {
+        FlickDone(t, "the window closed before the new form was in the hand");
+        return;
+    }
     const auto want = static_cast<M::MoveKind>(std::min<u8>(w.kind, 2));
     const bool attack = VR::Transform::GetTransformSettings().attack;
     const M::MoveRow* row =
@@ -1926,45 +1880,36 @@ void FlickOpen(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, s
     bool lighter = false;
     const M::MoveRow* light = nullptr;
     if (row == nullptr && t.moves != nullptr) {
-        const M::MoveChoice choice = ChooseAttackMove(*t.moves, t.form_b, want);
+        const M::MoveChoice choice = M::ChooseMove(*t.moves, t.form_b, want);
         row = choice.row;
         kind = choice.kind;
         lighter = choice.lighter;
-        light = ChooseAttackMove(*t.moves, t.form_b, M::MoveKind::Light).row;
+        light = M::ChooseMove(*t.moves, t.form_b, M::MoveKind::Light).row;
     }
-    PiAttackFlickFacts part{};
-    part.command = PI_AF_PART;
-    part.flags = (row ? PI_AF_HAVE_ROW : 0) | (t.cur_live ? PI_AF_CUR_LIVE : 0);
-    part.since_s = w.since_counted_s;
-    part.near_m = FlickNearM;
-    const bool whip = row && IsWhipRow(row) && row->Group() == WhipHandleDummy / 1000;
-    B::Vec3 dmy{}, grip{};
-    if (row) {
-        const bool have_dummy = DummyAt(chr, whip ? WhipHandleDummy : row->dmy1, dmy);
-        const bool have_grip = have_dummy && DummyAt(chr, RightWeaponDummy, grip);
-        part.flags |= (have_dummy ? PI_AF_HAVE_DUMMY : 0) | (have_grip ? PI_AF_HAVE_GRIP : 0);
-        part.dummy[0] = dmy.x;
-        part.dummy[1] = dmy.y;
-        part.dummy[2] = dmy.z;
-        part.grip[0] = grip.x;
-        part.grip[1] = grip.y;
-        part.grip[2] = grip.z;
-    }
-    const auto ready = t.flick.Call(part, now);
-    FlickNotice(t, ready);
-    if (!ready.valid || !(ready.flick.flags & PI_AFO_PROCEED))
+    if (row == nullptr) {
+        FlickDone(t, "the new form has no physical move");
         return;
-    const float since = ready.flick.since_s;
+    }
+    // The new form's part must be in the hand (the game shows it the update after the switch). A
+    // whip's: its handle (the transform attack's tip dummy rides the chain, paying out with the
+    // flick: core/vr/bloodborne_whip.h).
+    const bool whip = IsWhipRow(row) && row->Group() == WhipHandleDummy / 1000;
+    B::Vec3 dmy{}, grip{};
+    if (!DummyAt(chr, whip ? WhipHandleDummy : row->dmy1, dmy) ||
+        !DummyAt(chr, RightWeaponDummy, grip) || B::Length(dmy - grip) > FlickNearM) {
+        if (++f.waited > FlickPartWaitUpdates) {
+            FlickDone(t, "the new form's hit dummy never came to the hand");
+        }
+        return;
+    }
+    // Its cadence: the stroke's own, but a second hit of the same stroke (the old form's attack
+    // already hit) counts from that attack (the game's own R1 -> trick attack takes 0.57 s).
+    const float since =
+        f.old_hits > 0 ? static_cast<float>(now - f.old_created_ns) * 1e-9f : w.since_counted_s;
     OpenAttack(chr, t, w, arm, now, row, kind, want, lighter, light, transform, since,
                whip ? WhipNearM : FlickNearM);
-    PiAttackFlickFacts result{};
-    result.command = PI_AF_OPEN_RESULT;
-    result.window = f.window;
-    result.run = f.run;
-    result.budget_used = w.budget_used;
-    result.flags = t.cur_live ? PI_AF_CUR_LIVE : 0;
-    const auto accepted = t.flick.Call(result, now);
-    if (accepted.valid && (accepted.flick.flags & PI_AFO_MARK_FLICK)) {
+    if (t.cur_live) {
+        f.phase = FlickPhase::Live;
         t.cur.flick = true;
         {
             std::scoped_lock lock{g_attack_mutex};
@@ -1974,7 +1919,7 @@ void FlickOpen(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, s
                 }
             }
         }
-        if (accepted.flick.flags & PI_AFO_REFUND_BUDGET) {
+        if (w.budget_used > 0 && f.old_hits == 0) {
             // The combo budget: the stroke is the transform's now (charges back).
             Combat::PushMeleeEvent({Combat::MeleeEventKind::BudgetRefund, w.serial,
                                     static_cast<float>(w.budget_used), 0.0f, now,
@@ -1989,26 +1934,20 @@ void FlickOpen(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, s
                                          M::MoveKindName(kind), row->judge),
                  static_cast<double>(now - run.start_ns) * 1e-6,
                  static_cast<double>(now - run.switched_ns) * 1e-6, f.waited);
+    } else {
+        f.phase = FlickPhase::Done;
     }
 }
 
 void Refresh(u8* chr, TickState& t, const Combat::MeleeWindow& w, s64 now) {
     u8* const module = Module(chr, OffsetAttackModule);
-    PiNativeAttackInput begin{};
-    begin.operation = PI_ATTACK_REFRESH_BEGIN;
-    begin.decision.refresh.have_module = module != nullptr;
-    begin.decision.refresh.live = t.cur_live;
-    begin.decision.refresh.unpaid_live = t.unpaid_live;
-    begin.decision.refresh.have_row = t.cur.row != nullptr;
-    begin.decision.refresh.dry_run = g_dry_run;
-    const auto refresh = g_native_attack_runtime.Call(begin);
-    if (!refresh.valid || !refresh.decision.proceed) {
+    if (module == nullptr || (!t.cur_live && !t.unpaid_live) || t.cur.row == nullptr) {
         return;
     }
     const bool unpaid = !t.cur_live; // the combo budget's: no attack to keep alive
     const u32 slot = FirstSlot + (t.cur.serial & 1);
     u8 ok = 1;
-    if (refresh.decision.invoke) {
+    if (!g_dry_run && !unpaid) {
         // (A new attack here would cost the swing's share again: it must not happen, logged.)
         ok = Invoke(chr, module, t.cur.bid, slot, t.cur.row->stamina, t.cur.stamina_rule);
         const u32 handle = Read<u32>(module + OffsetAttackSlots + slot * 8);
@@ -2029,45 +1968,21 @@ void Refresh(u8* chr, TickState& t, const Combat::MeleeWindow& w, s64 now) {
     (void)ok;
     // The classifier's verdict on a heavy window (a wound-up swing judged light), and the blade's
     // speed for the damage hook.
-    const auto metadata = [&](const Attack& attack) {
-        PiNativeAttackInput p{};
-        p.operation = PI_ATTACK_REFRESH_ROW;
-        p.now_ns = now;
-        p.config = VR::Interactions::AP::Pack(PlungeConfig());
-        auto& f = p.decision.refresh;
-        f.serial = attack.serial;
-        f.window_serial = w.serial;
-        f.verdict_known = w.verdict_known;
-        f.verdict = w.verdict;
-        f.kind = static_cast<u32>(attack.kind);
-        f.transform = attack.transform;
-        f.verdict_light = attack.verdict_light;
-        f.plunge = attack.plunge;
-        f.tip = attack.tip;
-        f.two_hand = attack.two_hand;
-        f.window_tip = w.tip_speed;
-        f.window_two_hand = w.two_hand;
-        f.drop_m = attack.drop_m;
-        return g_native_attack_runtime.Call(p);
-    };
-    const auto current = metadata(t.cur);
-    if (!current.valid)
-        return;
-    t.cur.verdict_light = current.decision.verdict_light;
+    const bool judged_light = w.serial == t.cur.serial && w.verdict_known && w.verdict == 0 &&
+                              t.cur.kind != M::MoveKind::Light && !t.cur.transform;
+    t.cur.verdict_light = t.cur.verdict_light || judged_light;
     if (!unpaid) {
         std::scoped_lock lock{g_attack_mutex};
         for (Attack& r : g_attacks) {
             if (r.serial == t.cur.serial && r.created_ns == t.cur.created_ns) {
-                const auto updated = metadata(r);
-                if (!updated.valid)
-                    return;
-                r.verdict_light = updated.decision.verdict_light;
-                if (updated.decision.update_window) {
-                    r.tip = updated.decision.tip;
-                    r.two_hand = updated.decision.two_hand;
+                r.verdict_light = r.verdict_light || judged_light;
+                if (w.serial == t.cur.serial) {
+                    r.tip = w.tip_speed;
+                    // Two-handed (both hands moved): known once the left hand has moved.
+                    r.two_hand = std::max(r.two_hand, std::clamp(w.two_hand, 1.0f, 2.0f));
                 }
                 if (r.plunge) {
-                    r.drop_m = updated.decision.drop_m;
+                    r.drop_m = std::max(r.drop_m, t.air.Drop(now, PlungeConfig()));
                     t.cur.drop_m = r.drop_m;
                 }
             }
@@ -2082,36 +1997,33 @@ void Refresh(u8* chr, TickState& t, const Combat::MeleeWindow& w, s64 now) {
         B::Vec3 grip{};
         const bool have_grip = DummyAt(chr, RightWeaponDummy, grip);
         const float near_m = IsWhipRow(t.cur.row) ? WhipNearM : DummyNearM;
-        PiNativeMeleeInput p{};
-        p.operation = PI_NATIVE_MELEE_FX_RESOLVE;
-        auto& x = p.fx;
-        x.have_base = have_base;
-        x.have_tip = have_tip;
-        x.have_grip = have_grip;
-        x.near_m = near_m;
-        x.base[0] = base.x;
-        x.base[1] = base.y;
-        x.base[2] = base.z;
-        x.tip[0] = tip.x;
-        x.tip[1] = tip.y;
-        x.tip[2] = tip.z;
-        x.grip[0] = grip.x;
-        x.grip[1] = grip.y;
-        x.grip[2] = grip.z;
-        x.ffx = t.trail_ffx;
-        x.base_id = t.trail_base;
-        x.tip_id = t.trail_tip;
-        x.group = t.cur.row->Group();
-        x.dmy2 = t.cur.row->dmy2;
-        PiNativeMeleeOutput o{};
-        if (!VR::Interactions::NativeMelee(g_native_saw_module, p, o) || !o.valid)
-            return;
-        if (o.requery) {
+        const auto on_part = [&](bool have, B::Vec3 p) {
+            return have && (!have_grip || B::Length(p - grip) <= near_m);
+        };
+        const bool base_ok = on_part(have_base, base);
+        const bool tip_ok = on_part(have_tip, tip);
+        if (!base_ok || !tip_ok) {
+            // A dummy of the clip's trail that is not on the part in hand (the Saw Cleaver's form
+            // B names 101, its part has 100) is replaced by the default end, 100 at the tip or
+            // the row's second dummy; the other one is kept (its form-B trail 12100 -> 12110,
+            // tip to mid-blade, as the game's clip), the clip's FFX only while one of its own
+            // dummies is.
+            const s32 group = t.cur.row->Group();
+            const s32 def_base = group * 1000 + 100;
+            const s32 def_tip = t.cur.row->dmy2 >= 0 ? t.cur.row->dmy2 : group * 1000 + 110;
             const s32 old_base = t.trail_base;
             const s32 old_tip = t.trail_tip;
-            t.trail_base = o.base_id;
-            t.trail_tip = o.tip_id;
-            t.trail_ffx = o.ffx;
+            if (!base_ok) {
+                t.trail_base = def_base;
+            }
+            if (!tip_ok) {
+                t.trail_tip = def_tip;
+            }
+            if (t.trail_base == t.trail_tip || (!base_ok && !tip_ok)) {
+                t.trail_base = def_base;
+                t.trail_tip = def_tip;
+                t.trail_ffx = TrailFfx;
+            }
             if (g_log >= 1) {
                 LOG_INFO(Core, "VR melee: #{} trail dummies {} / {} not on the part; {} / {} (FFX {})",
                          t.cur.serial, old_base, old_tip, t.trail_base, t.trail_tip, t.trail_ffx);
@@ -2120,28 +2032,9 @@ void Refresh(u8* chr, TickState& t, const Combat::MeleeWindow& w, s64 now) {
             have_tip = DummyAt(chr, t.trail_tip, tip);
         }
     }
-    PiNativeMeleeInput fx{};
-    fx.operation = PI_NATIVE_MELEE_FX_EMIT;
-    fx.fx.committed = w.committed;
-    fx.fx.whoosh_done = t.whoosh_done;
-    fx.fx.whoosh_enabled = ms.whoosh;
-    fx.fx.trail_enabled = ms.trail;
-    fx.fx.trail_available = g_trail;
-    fx.fx.dry_run = g_dry_run;
-    fx.fx.have_base = have_base;
-    fx.fx.have_tip = have_tip;
-    fx.fx.base[0] = base.x;
-    fx.fx.base[1] = base.y;
-    fx.fx.base[2] = base.z;
-    fx.fx.tip[0] = tip.x;
-    fx.fx.tip[1] = tip.y;
-    fx.fx.tip[2] = tip.z;
-    PiNativeMeleeOutput effects{};
-    if (!VR::Interactions::NativeMelee(g_native_saw_module, fx, effects) || !effects.valid)
-        return;
-    t.whoosh_done = effects.whoosh_done;
-    if (effects.emit_whoosh) {
-        const B::Vec3 at{effects.sound_at[0], effects.sound_at[1], effects.sound_at[2]};
+    if (w.committed && !t.whoosh_done && ms.whoosh) {
+        t.whoosh_done = true;
+        const B::Vec3 at = have_base && have_tip ? (base + tip) * 0.5f : base;
         const u64 h = Sound(t.whoosh, at);
         if (g_log >= 1) {
             LOG_INFO(Core, "VR melee: #{} whoosh {} at {} (h={:#x}), trail FFX {} {} -> {}{}",
@@ -2149,7 +2042,7 @@ void Refresh(u8* chr, TickState& t, const Combat::MeleeWindow& w, s64 now) {
                      have_base && have_tip ? "" : " (no dummies: no trail)");
         }
     }
-    if (effects.emit_trail) {
+    if (ms.trail && g_trail && have_base && have_tip && !g_dry_run) {
         u8* const ctl = chr + OffsetSfxCtl;
         if (Read<u8*>(ctl) == g_base + SfxCtlVtableRva) {
             g_blade_ffx(ctl, TrailSlot, t.trail_ffx, &t.trail_base, &t.trail_tip);
@@ -2216,7 +2109,7 @@ u32 PS4_SYSV_ABI MeleeMapHit(u8* module, u8* /*map*/, u8* res, u32 /*soft*/) {
     const u32 handle = Read<u32>(res + ResHandle);
     u32 serial = 0;
     bool report = false;
-    PiNativeMeleeOutput wall{};
+    bool whip = false;
     {
         std::scoped_lock lock{g_attack_mutex};
         Attack* a = FindAttack(bid, handle, now);
@@ -2231,18 +2124,17 @@ u32 PS4_SYSV_ABI MeleeMapHit(u8* module, u8* /*map*/, u8* res, u32 /*soft*/) {
             return 0;
         }
         serial = a->serial;
-        PiNativeMeleeInput input{}; input.operation = PI_NATIVE_MELEE_WALL;
-        input.damage.whip = IsWhipRow(a->row); input.walls = a->walls;
-        if (!VR::Interactions::NativeMelee(g_native_saw_module,input,wall) || !wall.valid) return 0;
-        report = wall.report; a->walls = wall.walls;
+        whip = IsWhipRow(a->row);
+        // The first contact only: a blade dragged along a wall touches it every frame.
+        report = ++a->walls == 1;
         a->last_wall_ns = now;
     }
     if (report) {
         g_stats.walls.fetch_add(1, std::memory_order_relaxed);
-        if (wall.bite_wall) {
+        if (!whip) {
             // (A whip's chain metres out on the floor does not catch the hand: the clank only.)
             g_bite_wall.store(true, std::memory_order_relaxed);
-            g_bite_hold.store(wall.bite_hold, std::memory_order_relaxed);
+            g_bite_hold.store(0.06f, std::memory_order_relaxed);
             g_bite_ns.store(now, std::memory_order_release);
         }
         Combat::PushMeleeEvent({Combat::MeleeEventKind::Wall, serial, 1.0f, 0.0f, now, ""});
@@ -2253,7 +2145,7 @@ u32 PS4_SYSV_ABI MeleeMapHit(u8* module, u8* /*map*/, u8* res, u32 /*soft*/) {
                  serial, V3(at), bid, Read<s32>(res + ResAtkParam),
                  static_cast<double>(now) * 1e-9);
     }
-    return wall.suppress_bounce; // the game retains sparks and sound
+    return 1; // never the canned wall bounce for a physical swing (sparks and sound stay)
 }
 
 bool InstallMapHit(u8* module) {
@@ -2594,26 +2486,65 @@ void PlungeLanded(TickState& t, const VR::Melee::Plunge::State& s, s64 now) {
 // Once learned, the game's own attack, as the right hand's: its stamina rule, slots 4 / 5 (the
 // right hand's are 6 / 7, the game's own 0 .. 2), kept alive every update, ended by not refreshing.
 // Light swings only (one row), paid from the right hand's combo budget (the presenter); no flick
-// or plunge of its own. A handgun in the left hand (Tricks::PunchGun) punches with the bare fist's
-// learned row, the gun in the hand: the first such attack must show its hitbox at the left fist
+// or plunge of its own. An eligible gun in the left hand (Tricks::PunchGun) punches with the
+// bare fist's learned row, the gun in the hand: its first hitbox must show at the left fist
 // (CheckGunPunch), else gun punches stay off. A window that closed without its swing (no commit,
 // or the presenter dropped it as the off hand's counter-motion) and hit nothing gives its stamina
 // back; one closed so before the game ever saw it open makes no attack. A refusal is sent back
 // (LeftDenied: the deny tick, the charge back).
 constexpr u32 LeftFirstSlot = 4;
-// All recognition decisions run on the existing pose-owned native attack context.
-PiNativeAttackOutput LeftPolicy(const PiAttackLeftFacts& facts) {
-    PiNativeAttackInput p{};
-    p.operation = PI_ATTACK_LEFT;
-    p.decision.left = facts;
-    return g_native_attack_runtime.Call(p);
+constexpr s32 LeftDefaultCost = 20;
+constexpr float LeftApartM = 0.30f;    // do not learn a side with the fists together
+constexpr float GunPunchReachM = 0.5f; // a gun punch's hitbox this close to the left fist ...
+constexpr float KnownRowReachM = 1.0f; // ... a known row's (the Torch's burning head) this close
+constexpr u32 GunPunchFrames = 6;      // ... seen within this many updates of its attack
+
+// A left attack not seen in the game before (the fist's punch with a gun or a shield in the hand,
+// a known row: Tricks::KnownLeftRow): unknown until its first attack shows where it hits. Each
+// left weapon's own (`what`: the gun's variation, minus the shield's family, the row's key), so a
+// shield's failing never turns a gun's punches off.
+enum class GunPunch : u8 { Unknown, Good, Bad };
+struct HitCheck {
+    s32 what{0};
+    GunPunch state{GunPunch::Unknown};
+};
+// Separate checks for four gun variations, two shields, and three native left-melee rows.
+std::array<HitCheck, 10> g_hit_checks{};
+GunPunch& HitCheckOf(s32 what) {
+    for (HitCheck& c : g_hit_checks) {
+        if (c.what == what) {
+            return c.state;
+        }
+    }
+    for (HitCheck& c : g_hit_checks) {
+        if (c.what == 0) {
+            c.what = what;
+            return c.state;
+        }
+    }
+    return g_hit_checks.back().state;
 }
 
 struct LeftTick {
-    VR::Interactions::NativeLeftRows rows{g_native_attack_runtime};
-    // Published under the native attack mutex for the concurrent damage hook.
-    bool gun{false};
-    VR::Interactions::NativeLatch latch{g_native_attack_runtime, 0};
+    s32 key{-1};         // what the rows were found for (variation * 10 + form B)
+    s32 hand{HandRight}; // the rows' hand: -1 the right weapon's part, -2 the left weapon
+    s32 variation{-1};
+    bool gun{false}; // a handgun's punch: the fist's rows (variation 100), the gun in the hand
+    s32 check{0};    // its first hit checked at the left fist for this (HitCheckOf; 0: none)
+    s32 punch{0};    // the gun's variation, minus the shield's family (0: no punch)
+    std::array<s32, 24> judges{};
+    u32 count{0};
+    u32 next{0}; // the learned row (or the one being tried)
+    bool verified{false};
+    // The right weapon's left part learns from your first swings (CheckLeftProbe): the live attack
+    // tries judges[next]; a wrong one ended opens the next within the same swing (reprobe); a row
+    // whose side two swings never showed is passed over (unseen).
+    bool probing{false};
+    bool reprobe{false};
+    u8 unseen{0};
+    s32 cost{LeftDefaultCost};
+    s32 whoosh{-1}; // the dual blades' left swing sound (the right weapon's light row's; -1: none)
+    M::LatchState latch{};
     // The live attack (its identity also under g_attack_mutex: the damage step reads it).
     bool live{false};
     u32 serial{0};
@@ -2626,6 +2557,9 @@ struct LeftTick {
     s64 created_ns{0};
     s64 ended_ns{0};
     const char* logged_why{nullptr};
+#ifndef BBVR_NO_LOGS
+    s64 diagnostic_ns{0}; // weapon lookup snapshots, at most once every two seconds
+#endif
 };
 LeftTick g_left{};
 
@@ -2638,15 +2572,20 @@ std::string& LearnedLeftRows() {
 // A row learned before, in this session or an earlier one: the weapon keeps it through its
 // transforms (a split, a join) and from session to session.
 void RestoreLeftRow(LeftTick& l) {
-    PiAttackLeftRowsFacts f{};
-    f.command = PI_ALR_RESTORE;
-    f.learned = VR::Tricks::LeftRowOf(LearnedLeftRows(), l.rows.State().key);
-    const auto o = l.rows.Call(f);
-    if (o.valid && (o.rows.flags & PI_ALRO_RESTORED)) {
-        const auto& row = l.rows.State();
-        LOG_INFO(Core, "VR melee left: judge {} {}", row.judges[row.next],
-                 o.rows.flags & PI_ALRO_KNOWN ? "known: the game's own left-hand attack"
-                                              : "remembered (melee_left_rows)");
+    const s32 learned = VR::Tricks::LeftRowOf(LearnedLeftRows(), l.key);
+    const s32 judge = learned >= 0 ? learned : VR::Tricks::KnownLeftRow(l.key);
+    for (u32 i = 0; judge >= 0 && i < l.count; ++i) {
+        if (l.judges[i] == judge) {
+            l.next = i;
+            l.verified = true;
+            if (learned < 0 && l.check == 0) {
+                l.check = l.key; // known, never seen: its first hit is checked
+            }
+            LOG_INFO(Core, "VR melee left: judge {} {}", judge,
+                     learned >= 0 ? "remembered (melee_left_rows)"
+                                  : "known: the game's own left-hand attack");
+            return;
+        }
     }
 }
 
@@ -2654,38 +2593,44 @@ void RestoreLeftRow(LeftTick& l) {
 // form's (judges 400 .. 999) that are not the right hand's own (the table's) nor its B->A trick
 // attack (790) or a shot (800 ..); a left weapon's L2 (800 ..) first, then its others (0 .. 399).
 void ScanLeftRows(LeftTick& l, const M::WeaponMoves* moves) {
-    PiAttackLeftRowsFacts f{};
-    f.command = PI_ALR_SCAN_BEGIN;
-    if (moves) {
-        f.flags = PI_ALR_MOVES;
-        for (size_t i = 0; i < moves->rows.size(); ++i)
-            f.right_judges[i] = moves->rows[i].judge;
-    }
-    auto o = l.rows.Call(f);
-    for (u32 queries = 0; o.valid && (o.rows.flags & PI_ALRO_QUERY); ++queries) {
-        if (queries >= 600) {
-            if (g_native_saw_module)
-                g_native_saw_module->ReportFault();
+    l.count = 0;
+    l.next = 0;
+    l.verified = false;
+    std::string list;
+    const auto add = [&](s32 judge) {
+        if (l.count >= l.judges.size()) {
             return;
         }
-        PiAttackLeftRowsFacts reply{};
-        reply.command = PI_ALR_SCAN_REPLY;
-        reply.judge = o.rows.query_judge;
-        reply.ref_type =
-            GunBehaviorRefType(100000000 + l.rows.State().variation * 1000 + reply.judge);
-        o = l.rows.Call(reply);
+        if (moves != nullptr && l.hand == HandRight) {
+            for (const M::MoveRow& r : moves->rows) {
+                if (r.judge == judge) {
+                    return; // the right hand's own
+                }
+            }
+        }
+        if (GunBehaviorRefType(100000000 + l.variation * 1000 + judge) == 0) {
+            l.judges[l.count++] = judge;
+            list += fmt::format(" {}", judge);
+        }
+    };
+    if (l.hand == HandLeft) {
+        for (s32 j = 800; j <= 899; ++j) {
+            add(j);
+        }
+        for (s32 j = 0; j <= 399; ++j) {
+            add(j);
+        }
+    } else {
+        for (s32 j = 400; j <= 999; ++j) {
+            if (j != 790 && (j < 800 || j > 899)) {
+                add(j);
+            }
+        }
     }
-    if (!o.valid)
-        return;
-    const auto& rows = l.rows.State();
-    std::string list;
-    for (u32 i = 0; i < rows.count; ++i)
-        list += fmt::format(" {}", rows.judges[i]);
-    LOG_INFO(Core, "VR melee left: variation {} ({}): native attack rows to observe:{}",
-             rows.variation,
-             l.gun                   ? "a handgun's punch: the fist's, learned with the hand empty"
-             : rows.hand == HandLeft ? "the left weapon"
-                                     : "the right weapon's left part",
+    LOG_INFO(Core, "VR melee left: variation {} ({}): native attack rows to observe:{}", l.variation,
+             l.gun                ? "a handgun's punch: the fist's, learned with the hand empty"
+             : l.hand == HandLeft ? "the left weapon"
+                                  : "the right weapon's left part",
              list.empty() ? std::string{" none"} : list);
 }
 
@@ -2711,91 +2656,59 @@ void LeftFinalize(u8* chr, LeftTick& l, bool refund, const char* why, s64 now) {
         std::scoped_lock lock{g_attack_mutex};
         hits = l.hits;
     }
-    PiNativeMeleeInput p{};
-    p.operation = PI_NATIVE_MELEE_FINALIZE;
-    p.finish.left = 1;
-    p.finish.refund = refund;
-    p.finish.hits = hits;
-    p.finish.cost = l.paid;
-    PiNativeMeleeOutput o{};
-    if (VR::Interactions::NativeMelee(g_native_saw_module, p, o) && o.valid &&
-        o.refund_reason == 4)
-        Refund(chr, o.refund, l.serial, "a left swing that never came and hit nothing");
+    if (refund && hits == 0 && l.paid > 0) {
+        Refund(chr, l.paid, l.serial, "a left swing that never came and hit nothing");
+    }
     l.paid = 0;
 }
 
 void LeftOpen(u8* chr, LeftTick& l, const Combat::MeleeWindow& w, s64 now) {
     u8* const module = Module(chr, OffsetAttackModule);
     u8* const data = Module(chr, L::OffsetDataModule);
-    const s32 judge = l.rows.State().judges[l.rows.State().next];
+    const s32 judge = l.judges[l.next];
     // A gun's punch: the fist's row itself (the game's id for the left hand is the gun's).
     const s32 bid = l.gun ? 100000000 + VR::Tricks::FistVariation * 1000 + judge
-                          : BehaviorId(chr, judge, l.rows.State().hand);
-    PiAttackLeftFacts admission{};
-    admission.command = PI_AL_ADMIT;
-    admission.hand = l.rows.State().hand;
-    admission.bid = bid;
-    admission.light_pct = VR::Melee::GetMeleeSettings().stamina_pct;
-    admission.stamina = INT32_MAX;
-    admission.flags = (l.rows.State().verified ? PI_AL_VERIFIED : 0) | (l.gun ? PI_AL_GUN : 0) |
-                      (w.unpaid ? PI_AL_UNPAID : 0) | (module ? PI_AL_MODULE : 0) |
-                      (data ? PI_AL_DATA : 0) |
-                      (VR::Melee::GetMeleeSettings().regen_pause ? PI_AL_REGEN : 0);
-    auto approved = LeftPolicy(admission);
-    if (!approved.valid)
-        return;
-    if (approved.left.flags & PI_ALO_PROCEED) {
-        admission.stamina = Read<s32>(data + OffsetStamina);
-        approved = LeftPolicy(admission);
-        if (!approved.valid)
-            return;
-    }
-    const auto& decision = approved.left;
-    const M::SwingStamina rule{decision.pct, decision.charge != 0, decision.refuse_empty != 0,
-                               decision.regen_pause != 0};
-    const bool probe = (decision.flags & PI_ALO_PROBE) != 0;
-    constexpr const char* reasons[] = {nullptr,
-                                       "no observed left-hand row",
-                                       "combo budget unpaid",
-                                       "no behaviour module",
-                                       "no row",
-                                       "no stamina"};
-    const char* refuse = reasons[decision.reason];
+                          : BehaviorId(chr, judge, l.hand);
+    M::SwingStamina rule = SwingRule(M::MoveKind::Light);
+    // Gun punches only; preserve exhaustion/recovery flags. Dual-wield parts have punch=0,
+    // shields have negative family ids. Right-hand attacks and shooting use other paths.
+    rule.pct = VR::Tricks::GunPunchStaminaPct(l.punch, rule.pct);
+    const bool probe = !l.verified && l.hand == HandRight && !l.gun; // a left part's: tried
+    const char* refuse = !l.verified && !probe                ? "no observed left-hand row"
+                         : w.unpaid                           ? "combo budget unpaid"
+                         : module == nullptr || data == nullptr ? "no behaviour module"
+                         : bid < 0                            ? "no row"
+                         : M::StaminaRefuses(rule, Read<s32>(data + OffsetStamina))
+                             ? "no stamina"
+                             : nullptr;
     if (refuse != nullptr) {
-        l.latch.End();
+        l.latch.active = false;
+        l.latch.done = true;
         Combat::PushMeleeEvent({Combat::MeleeEventKind::LeftDenied, w.serial, 0.0f, 0.0f, now,
                                 refuse});
         LOG_INFO(Core, "VR melee left: #{} refused: {} (judge {})", w.serial, refuse, judge);
         return;
     }
     const u32 slot = LeftFirstSlot + (w.serial & 1);
-    PiAttackLeftRowsFacts begin{};
-    begin.command = PI_ALR_BEGIN_OPEN;
-    if (!l.rows.Call(begin).valid)
-        return;
+    l.probing = probe;
+    l.reprobe = false;
     const s32 before = Read<s32>(data + OffsetStamina);
-    const u8 ok = g_dry_run ? 0 : Invoke(chr, module, bid, slot, l.rows.State().cost, rule);
+    const u8 ok = [&] {
+        if (g_dry_run) return u8{0};
+        M::LeftAttack::Scope scope(M::LeftAttack::NativeWeapon(l.variation, l.gun) ? chr : nullptr);
+        return Invoke(chr, module, bid, slot, l.cost, rule);
+    }();
     const u32 handle = Read<u32>(module + OffsetAttackSlots + slot * 8);
     const s32 after = Read<s32>(data + OffsetStamina);
-    PiAttackLeftFacts result{};
-    result.command = PI_AL_OPEN_RESULT;
-    result.stamina = before;
-    result.after = after;
-    result.whoosh = l.rows.State().whoosh;
-    result.flags = (ok ? PI_AL_OK : 0) | (g_dry_run ? PI_AL_DRY_RUN : 0) |
-                   (VR::Melee::GetMeleeSettings().whoosh ? PI_AL_WHOOSH : 0);
-    const auto outcome = LeftPolicy(result);
-    if (!outcome.valid)
-        return;
     {
         std::scoped_lock lock{g_attack_mutex};
-        l.live = outcome.left.live;
+        l.live = ok != 0;
         l.serial = w.serial;
         l.bid = bid;
         l.slot = slot;
         l.handle = handle;
         l.frames = 0;
-        l.paid = outcome.left.paid;
+        l.paid = ok != 0 ? std::max(before - after, 0) : 0;
         l.hits = 0;
         l.created_ns = now;
         l.ended_ns = 0;
@@ -2803,21 +2716,21 @@ void LeftOpen(u8* chr, LeftTick& l, const Combat::MeleeWindow& w, s64 now) {
     LOG_INFO(Core, "VR melee left: #{} open judge {} bid {} slot {} ok={} stamina {} -> {}{}",
              w.serial, judge, bid, slot, ok, before, after,
              l.gun   ? " (a punch with the gun in the hand)"
-             : probe ? fmt::format(" (trying it: candidate {} of {})", l.rows.State().next + 1,
-                                   l.rows.State().count)
+             : probe ? fmt::format(" (trying it: candidate {} of {})", l.next + 1, l.count)
                      : std::string{});
-    if (outcome.left.flags & PI_ALO_DENY) {
+    if (ok == 0 && !g_dry_run) {
         // As the right hand's Denied: the deny tick, the charge back.
         Combat::PushMeleeEvent({Combat::MeleeEventKind::LeftDenied, w.serial, 0.0f, 0.0f, now,
                                 "the game made no attack"});
     }
-    // The dual blades' left blade whooshes as the right one does (the user, 2026-10-14): the
+    // The dual blades' left blade whooshes as the right one does (2026-10-14): the
     // weapon's own light swing sound, once as its attack opens, at the left hand.
     B::Vec3 at{};
-    if ((outcome.left.flags & PI_ALO_SOUND) && DummyAt(chr, LeftWeaponDummy, at)) {
-        const u64 h = Sound(l.rows.State().whoosh, at);
-        LOG_INFO(Core, "VR melee left: #{} whoosh {} at {} (h={:#x})", w.serial,
-                 l.rows.State().whoosh, V3(at), h);
+    if (ok != 0 && l.whoosh > 0 && VR::Melee::GetMeleeSettings().whoosh &&
+        DummyAt(chr, LeftWeaponDummy, at)) {
+        const u64 h = Sound(l.whoosh, at);
+        LOG_INFO(Core, "VR melee left: #{} whoosh {} at {} (h={:#x})", w.serial, l.whoosh, V3(at),
+                 h);
     }
 }
 
@@ -2825,67 +2738,68 @@ void LeftOpen(u8* chr, LeftTick& l, const Combat::MeleeWindow& w, s64 now) {
 // untested, so its hitbox must show up at the left fist. Else it ends now (its stamina back unless
 // it hit) and gun punches stay off (logged); with the fists together, the hitbox between them or
 // not built yet, ask again next update.
-// The DLL first approves dummy queries from the copied native hit entry. Preserve
-// short-circuit left/right reads; probing never invokes a candidate to discover its side.
-PiAttackLeftFacts LeftHitFacts(u8* chr, const LeftTick& l) {
-    PiAttackLeftFacts facts{};
-    facts.command = PI_AL_ENTRY;
-    facts.frames = l.frames;
-    facts.next = l.rows.State().next;
-    facts.count = l.rows.State().count;
-    facts.unseen = l.rows.State().unseen;
-    facts.check = l.rows.State().check;
-    if (l.gun)
-        facts.flags |= PI_AL_GUN;
-    if (const u8* entry = HitEntry(l.handle, l.bid)) {
-        facts.flags |= PI_AL_ENTRY_PRESENT;
-        facts.point[0] = Read<float>(entry + OffsetEntryA);
-        facts.point[1] = Read<float>(entry + OffsetEntryA + 4);
-        facts.point[2] = Read<float>(entry + OffsetEntryA + 8);
-    }
-    const auto query = LeftPolicy(facts);
-    if (query.valid && (query.left.flags & PI_ALO_QUERY_DUMMIES)) {
-        B::Vec3 left{}, right{};
-        if (DummyAt(chr, LeftWeaponDummy, left)) {
-            facts.flags |= PI_AL_HAVE_LEFT;
-            facts.left[0] = left.x;
-            facts.left[1] = left.y;
-            facts.left[2] = left.z;
-            if (DummyAt(chr, RightWeaponDummy, right)) {
-                facts.flags |= PI_AL_HAVE_RIGHT;
-                facts.right[0] = right.x;
-                facts.right[1] = right.y;
-                facts.right[2] = right.z;
-            }
-        }
-    }
-    return facts;
-}
 void CheckGunPunch(u8* chr, LeftTick& l, s64 now) {
-    auto facts = LeftHitFacts(chr, l);
-    facts.command = PI_AL_PUNCH;
-    const auto o = LeftPolicy(facts);
-    if (!o.valid)
-        return;
-    if (o.left.reason == 1) {
-        LOG_INFO(Core,
-                 "VR melee left: #{} a punch with the gun in the hand: no hitbox seen in {} "
-                 "updates: gun punches off for this session",
-                 l.serial, l.frames);
-    } else if (o.left.reason == 2) {
-        LOG_INFO(Core,
-                 "VR melee left: #{} the first hit {} (check {}): its hitbox {:.2f} m from the "
-                 "left fist, {:.2f} m from the right: {}",
-                 l.serial, l.gun ? "of a punch with a gun or shield in the hand" : "of a known row",
-                 l.rows.State().check, o.left.to_left, o.left.to_right,
-                 o.left.flags & PI_ALO_GOOD ? "at the left hand, on"
-                                            : "NOT at the left hand, off for this session");
+    GunPunch& state = HitCheckOf(l.check);
+    const float reach = l.gun ? GunPunchReachM : KnownRowReachM;
+    const auto off = [&](const char* why) {
+        state = GunPunch::Bad;
+        LeftFinalize(chr, l, true, why, now);
+    };
+    u8* const entry = HitEntry(l.handle, l.bid);
+    B::Vec3 left{};
+    B::Vec3 right{};
+    B::Vec3 a{};
+    if (entry != nullptr) {
+        a = {Read<float>(entry + OffsetEntryA), Read<float>(entry + OffsetEntryA + 4),
+             Read<float>(entry + OffsetEntryA + 8)};
     }
-    if (o.left.flags & PI_ALO_FINALIZE)
-        LeftFinalize(chr, l, true,
-                     o.left.reason == 1 ? "the gun punch showed no hitbox"
-                                        : "the gun punch's hitbox is not at the hand",
-                     now);
+    if (entry == nullptr || !B::IsFinite(a) || B::LengthSq(a) == 0.0f ||
+        !DummyAt(chr, LeftWeaponDummy, left) || !DummyAt(chr, RightWeaponDummy, right)) {
+        if (l.frames >= GunPunchFrames) {
+            LOG_INFO(Core, "VR melee left: #{} a punch with the gun in the hand: no hitbox seen in "
+                           "{} updates: gun punches off for this session", l.serial, l.frames);
+            off("the gun punch showed no hitbox");
+        }
+        return;
+    }
+    if (M::LeftAttack::NativeWeapon(l.variation, l.gun) && l.judges[l.next] == 800) {
+        // Retail 1.09 torch/Gratia L2 hit0 uses local dummy 100. GetAttackHand=-2
+        // maps it to the left weapon (20100), not the body or right weapon.
+        B::Vec3 weapon{};
+        if (!DummyAt(chr, 20100, weapon)) {
+            if (l.frames >= GunPunchFrames) off("left weapon dummy unavailable");
+            return;
+        }
+        const float error = B::Length(a - weapon);
+        const float reach = B::Length(weapon - left);
+        const bool ok = M::LeftAttack::AtWeapon(error, reach);
+        LOG_INFO(Core, "VR melee left: #{} native weapon check {}: hit to dummy 20100 {:.3f} m, "
+                       "dummy to grip {:.3f} m: {}", l.serial, l.check, error, reach,
+                 ok ? "on the left weapon" : "wrong placement; off for this session");
+        if (ok) state = GunPunch::Good;
+        else off("native left attack is not on its weapon dummy");
+        return;
+    }
+    if (B::Length(left - right) < LeftApartM) {
+        return; // the fists together: no side to tell
+    }
+    const float to_left = B::Length(a - left);
+    const float to_right = B::Length(a - right);
+    const VR::Tricks::CapsuleSide side = VR::Tricks::SideOf(to_left, to_right);
+    if (side == VR::Tricks::CapsuleSide::Unsure && to_left <= reach) {
+        return; // between the fists: no side to tell yet
+    }
+    const bool ok = to_left <= reach && side == VR::Tricks::CapsuleSide::Left;
+    LOG_INFO(Core, "VR melee left: #{} the first hit {} (check {}): its hitbox {:.2f} m from the left "
+                   "fist, {:.2f} m from the right: {}",
+             l.serial, l.gun ? "of a punch with a gun or shield in the hand" : "of a known row",
+             l.check, to_left, to_right,
+             ok ? "at the left hand, on" : "NOT at the left hand, off for this session");
+    if (ok) {
+        state = GunPunch::Good;
+    } else {
+        off("the gun punch's hitbox is not at the hand");
+    }
 }
 
 // A left part's row being tried (VR::Tricks::ProbeStep): its hitbox at the left fist, learned and
@@ -2894,20 +2808,29 @@ void CheckGunPunch(u8* chr, LeftTick& l, s64 now) {
 // swing, passed over after two such swings.
 void CheckLeftProbe(u8* chr, LeftTick& l, s64 now) {
     namespace Tr = VR::Tricks;
-    auto facts = LeftHitFacts(chr, l);
-    facts.command = PI_AL_PROBE;
-    const s32 judge = l.rows.State().judges[l.rows.State().next];
-    const u32 old_next = l.rows.State().next;
-    facts.flags |= PI_AL_MODEL;
-    const auto o = LeftPolicy(facts);
-    if (!o.valid)
-        return;
-    const float to_left = o.left.to_left, to_right = o.left.to_right;
-    switch (static_cast<Tr::Probe>(o.left.probe)) {
+    u8* const entry = HitEntry(l.handle, l.bid);
+    B::Vec3 left{};
+    B::Vec3 right{};
+    B::Vec3 a{};
+    if (entry != nullptr) {
+        a = {Read<float>(entry + OffsetEntryA), Read<float>(entry + OffsetEntryA + 4),
+             Read<float>(entry + OffsetEntryA + 8)};
+    }
+    const bool seen = entry != nullptr && B::IsFinite(a) && B::LengthSq(a) > 0.0f &&
+                      DummyAt(chr, LeftWeaponDummy, left) &&
+                      DummyAt(chr, RightWeaponDummy, right) &&
+                      B::Length(left - right) >= LeftApartM;
+    const float to_left = seen ? B::Length(a - left) : 0.0f;
+    const float to_right = seen ? B::Length(a - right) : 0.0f;
+    const s32 judge = l.judges[l.next];
+    switch (Tr::ProbeStep(seen, to_left, to_right, l.frames)) {
     case Tr::Probe::Wait:
         return;
     case Tr::Probe::Learned:
-        LearnedLeftRows() = Tr::WithLeftRow(LearnedLeftRows(), l.rows.State().key, judge);
+        l.probing = false;
+        l.verified = true;
+        l.unseen = 0;
+        LearnedLeftRows() = Tr::WithLeftRow(LearnedLeftRows(), l.key, judge);
         VR::SaveSetting("melee_left_rows", LearnedLeftRows());
         LOG_INFO(Core,
                  "VR melee left: #{} learned judge {} from your swing: its hitbox {:.2f} m from "
@@ -2920,11 +2843,16 @@ void CheckLeftProbe(u8* chr, LeftTick& l, s64 now) {
                  "the next one",
                  l.serial, judge, to_right);
         LeftFinalize(chr, l, true, "a right-hand row", now);
+        l.unseen = 0;
+        ++l.next;
+        l.reprobe = l.next < l.count;
         return;
     case Tr::Probe::Unseen:
         LeftFinalize(chr, l, true, "its hitbox's side unseen", now);
-        if (o.left.next != old_next) {
+        if (++l.unseen >= 2) {
             LOG_INFO(Core, "VR melee left: judge {}: its side never showed: the next one", judge);
+            l.unseen = 0;
+            ++l.next;
         }
         return;
     }
@@ -2936,39 +2864,24 @@ void LeftRefresh(u8* chr, LeftTick& l, s64 now) {
         return;
     }
     u8* const module = Module(chr, OffsetAttackModule);
-    PiAttackLeftFacts facts{};
-    facts.command = PI_AL_REFRESH;
-    facts.check = l.rows.State().check;
-    const auto refresh = [&](bool after_probe) {
-        facts.flags = (l.live ? PI_AL_LIVE : 0) | (module ? PI_AL_MODULE : 0) |
-                      (l.rows.State().verified ? PI_AL_VERIFIED : 0) |
-                      (l.rows.State().probing ? PI_AL_PROBING : 0) |
-                      (g_dry_run ? PI_AL_DRY_RUN : 0) | (after_probe ? PI_AL_GAME_FACTS : 0);
-        return LeftPolicy(facts);
-    };
-    auto decision = refresh(false);
-    if (!decision.valid)
-        return;
-    if (decision.left.flags & PI_ALO_END) {
+    if (module == nullptr || (!l.verified && !l.probing)) {
         LeftEnd(l, "no verified attack", now);
         return;
     }
-    if (decision.left.flags & PI_ALO_PROBE) {
+    if (l.probing) {
         CheckLeftProbe(chr, l, now);
         if (!l.live) {
             return; // not refreshed: the game ends it this update
         }
     }
-    decision = refresh(true);
-    if (!decision.valid)
-        return;
-    if (decision.left.flags & PI_ALO_CHECK_PUNCH) {
+    if (l.check != 0 && HitCheckOf(l.check) == GunPunch::Unknown) {
         CheckGunPunch(chr, l, now);
         if (!l.live) {
             return; // not refreshed: the game ends it this update
         }
     }
-    if (decision.left.flags & PI_ALO_INVOKE) {
+    if (!g_dry_run) {
+        M::LeftAttack::Scope scope(M::LeftAttack::NativeWeapon(l.variation, l.gun) ? chr : nullptr);
         g_invoke(module, l.bid, 0, l.slot, 1);
     }
     ++l.frames;
@@ -2979,30 +2892,23 @@ void LeftRefresh(u8* chr, LeftTick& l, s64 now) {
 // swings instead, CheckLeftProbe: physical swings never let the game show one; one shown anyway
 // is learned here too.)
 void ObserveLeftRow(u8* chr, LeftTick& l) {
-    PiAttackLeftFacts admission{};
-    admission.command = PI_AL_OBSERVE_GATE;
-    auto intent = LeftPolicy(admission);
-    if (!intent.valid || !(intent.left.flags & PI_ALO_QUERY_DUMMIES))
+    if (l.verified || l.count == 0) {
         return;
+    }
     u8* const module = Module(chr, OffsetAttackModule);
     B::Vec3 left{};
     B::Vec3 right{};
-    const bool have_left = module != nullptr && DummyAt(chr, LeftWeaponDummy, left);
-    const bool have_right = have_left && DummyAt(chr, RightWeaponDummy, right);
-    admission.flags = PI_AL_GAME_FACTS | (module ? PI_AL_MODULE : 0) |
-                      (have_left ? PI_AL_HAVE_LEFT : 0) | (have_right ? PI_AL_HAVE_RIGHT : 0);
-    PhysicalInteractions::AttackPackets::Pack(admission.left, left);
-    PhysicalInteractions::AttackPackets::Pack(admission.right, right);
-    intent = LeftPolicy(admission);
-    if (!intent.valid || !(intent.left.flags & PI_ALO_QUERY_GAME))
+    if (module == nullptr || !DummyAt(chr, LeftWeaponDummy, left) ||
+        !DummyAt(chr, RightWeaponDummy, right) || B::Length(left - right) < LeftApartM) {
         return;
+    }
     for (u32 slot = 0; slot < 3; ++slot) {
         const u8* const native = module + OffsetAttackSlots + slot * 8;
         if (Read<u8>(native + 4) == 0) {
             continue; // not refreshed by a native attack this update
         }
-        for (u32 i = 0; i < l.rows.State().count; ++i) {
-            const s32 bid = BehaviorId(chr, l.rows.State().judges[i], l.rows.State().hand);
+        for (u32 i = 0; i < l.count; ++i) {
+            const s32 bid = BehaviorId(chr, l.judges[i], l.hand);
             u8* const entry = bid >= 0 ? HitEntry(Read<u32>(native), bid) : nullptr;
             if (entry == nullptr) {
                 continue;
@@ -3010,32 +2916,17 @@ void ObserveLeftRow(u8* chr, LeftTick& l) {
             const B::Vec3 a{Read<float>(entry + OffsetEntryA),
                             Read<float>(entry + OffsetEntryA + 4),
                             Read<float>(entry + OffsetEntryA + 8)};
-            PiAttackLeftFacts facts{};
-            facts.command = PI_AL_OBSERVE;
-            facts.flags = PI_AL_ENTRY_PRESENT | PI_AL_HAVE_LEFT | PI_AL_HAVE_RIGHT;
-            facts.point[0] = a.x;
-            facts.point[1] = a.y;
-            facts.point[2] = a.z;
-            facts.left[0] = left.x;
-            facts.left[1] = left.y;
-            facts.left[2] = left.z;
-            facts.right[0] = right.x;
-            facts.right[1] = right.y;
-            facts.right[2] = right.z;
-            const auto observed = LeftPolicy(facts);
-            if (observed.valid && (observed.left.flags & PI_ALO_LEARN)) {
-                PiAttackLeftRowsFacts observed_row{};
-                observed_row.command = PI_ALR_OBSERVE;
-                observed_row.index = i;
-                if (!l.rows.Call(observed_row).valid)
-                    return;
-                LearnedLeftRows() = VR::Tricks::WithLeftRow(LearnedLeftRows(), l.rows.State().key,
-                                                            l.rows.State().judges[i]);
+            if (B::IsFinite(a) && B::LengthSq(a) > 0.0f &&
+                VR::Tricks::SideOf(B::Length(a - left), B::Length(a - right)) ==
+                    VR::Tricks::CapsuleSide::Left) {
+                l.next = i;
+                l.verified = true;
+                LearnedLeftRows() = VR::Tricks::WithLeftRow(LearnedLeftRows(), l.key, l.judges[i]);
                 VR::SaveSetting("melee_left_rows", LearnedLeftRows());
                 LOG_INFO(Core,
                          "VR melee left: learned judge {} from native slot {} (kept in vr.ini: "
                          "melee_left_rows)",
-                         l.rows.State().judges[i], slot);
+                         l.judges[i], slot);
                 return;
             }
         }
@@ -3047,108 +2938,115 @@ void LeftMeleeTick(u8* chr, const TickState& t, const MeleeBody& body, s64 now,
                    Combat::MeleeStatus& status) {
     namespace Tr = VR::Tricks;
     auto& l = g_left;
-    PiAttackLeftFacts selection{};
-    selection.command = PI_AL_SELECT;
-    selection.variation = t.variation;
-    selection.style = t.style;
-    selection.flags = t.form_b ? PI_AL_FORM_B : 0;
-    auto selected = LeftPolicy(selection);
-    if (!selected.valid)
-        return;
-    if (selected.left.flags & PI_ALO_QUERY_LEFT) {
-        selection.bid = BehaviorId(chr, 0, HandLeft);
+    s32 variation = -1;
+    s32 hand = HandRight;
+    bool gun = false;
+    s32 punch = 0; // the gun's variation, minus the shield's family (its first hit's check)
+    if (t.variation >= 0 && t.form_b && Tr::LeftPartWeapon(t.variation)) {
+        variation = t.variation;
+    } else if (t.style >= 0 && t.style != 2 && t.style != 3) { // the left weapon in its hand
+        // Judge 0 is a generic action for guns, not their equipped weapon variation.
+        // Read the same weapon-specific L2 row that the shooting path uses.
+        const s32 v = Tr::LeftWeaponVariation(BehaviorId(chr, Tr::LeftWeaponJudge, HandLeft));
         VR::Body::BodyStatus body_status{};
-        selection.flags |= PI_AL_LEFT_FACTS;
-        if (VR::Body::LatestBodyStatus(body_status))
-            selection.flags |= PI_AL_BODY_STATUS;
-        selection.family = body_status.left_weapon_family;
-        selected = LeftPolicy(selection);
-        if (!selected.valid)
-            return;
+        const bool shield = VR::Body::LatestBodyStatus(body_status) &&
+                            Tr::IsShieldFamily(body_status.left_weapon_family);
+        if (Tr::LeftMeleeWeapon(v) || Tr::PunchGun(v) || shield) {
+            gun = Tr::PunchGun(v) || shield; // a shield bashes with the fist's punch, as a gun
+            variation = gun ? Tr::FistVariation : v; // a gun's punch: the fist's rows (and key)
+            hand = HandLeft;
+            punch = shield ? -body_status.left_weapon_family : gun ? v : 0;
+        }
     }
-    const s32 variation = selected.left.variation, hand = selected.left.hand,
-              punch = selected.left.punch;
-    const bool gun = selected.left.gun;
-    PiAttackLeftRowsFacts config{};
-    config.command = PI_ALR_CONFIG;
-    config.variation = variation;
-    config.hand = hand;
-    config.punch = punch;
-    config.flags = gun ? PI_ALR_GUN : 0;
-    const auto configured = l.rows.Call(config);
-    if (!configured.valid)
-        return;
-    if (configured.rows.flags & PI_ALRO_CHANGED) {
+    const s32 key = variation >= 0 ? variation * 10 + (hand == HandRight ? 1 : 0) : -1;
+    if (key != l.key || gun != l.gun || punch != l.punch) {
         LeftEnd(l, "another weapon", now);
-        l.latch.End();
+        l.latch.active = false;
+        l.latch.done = true;
+        l.key = key;
+        l.hand = hand;
+        l.variation = variation;
+        l.punch = punch;
+        l.check = punch; // (a known row's, RestoreLeftRow)
         {
             std::scoped_lock lock{g_attack_mutex};
-            l.gun = gun;
+            l.gun = gun; // (the damage step reads it)
         }
+        l.cost = LeftDefaultCost;
+        l.count = 0;
+        l.probing = false;
+        l.reprobe = false;
+        l.unseen = 0;
         if (variation >= 0) {
             ScanLeftRows(l, hand == HandRight ? t.moves : nullptr);
             RestoreLeftRow(l);
-            PiAttackLeftRowsFacts cost{};
-            cost.command = PI_ALR_COST;
-            if (hand == HandRight && t.moves) {
-                if (const M::MoveRow* light =
-                        ChooseAttackMove(*t.moves, true, M::MoveKind::Light).row;
-                    light) {
-                    cost.flags = PI_ALR_LIGHT;
-                    cost.cost = light->stamina;
-                    cost.whoosh = light->whoosh;
+            l.whoosh = hand == HandRight ? 611 : -1; // (the form-B default, as the right's)
+            if (hand == HandRight && t.moves != nullptr) {
+                if (const M::MoveRow* light = M::ChooseMove(*t.moves, true, M::MoveKind::Light).row;
+                    light != nullptr) {
+                    l.cost = light->stamina; // the right hand's light: the same weapon's pace
+                    if (light->whoosh > 0) {
+                        l.whoosh = light->whoosh; // ... and its swing sound
+                    }
                 }
             }
-            if (!l.rows.Call(cost).valid)
-                return;
         }
     }
     if (g_physical && Tr::GetTrickSettings().melee_left && !l.gun) {
         ObserveLeftRow(chr, l); // (a gun's punch is never shown: its trigger shoots)
     }
     const TransformRunInfo& run = TransformRun();
-    PiAttackLeftFacts gate{};
-    gate.command = PI_AL_GATE;
-    gate.variation = variation;
-    gate.next = l.rows.State().next;
-    gate.count = l.rows.State().count;
-    gate.hand = l.rows.State().hand;
-    gate.check = l.rows.State().check;
-    gate.weight = body.left_weight;
-    gate.flags = (Tr::GetTrickSettings().melee_left ? PI_AL_ENABLED : 0) |
-                 (g_physical ? PI_AL_PHYSICAL : 0) | (l.gun ? PI_AL_GUN : 0) |
-                 (l.rows.State().verified ? PI_AL_VERIFIED : 0) | (body.body ? PI_AL_BODY : 0) |
-                 (body.driven ? PI_AL_DRIVEN : 0) | (run.active ? PI_AL_RUN : 0) |
-                 (body.left_ik ? PI_AL_LEFT_IK : 0);
-    auto allowed = LeftPolicy(gate);
-    if (!allowed.valid)
-        return;
-    if (allowed.left.flags & PI_ALO_QUERY_GAME) {
-        gate.flags |= PI_AL_GAME_FACTS;
-        if (VR::IsGameMenuOpen())
-            gate.flags |= PI_AL_MENU;
-        else if (VR::CinematicActive())
-            gate.flags |= PI_AL_CINEMATIC;
-        allowed = LeftPolicy(gate);
-        if (!allowed.valid)
-            return;
+    const char* why = !Tr::GetTrickSettings().melee_left ? "melee_left=0"
+                      : !g_physical                      ? "melee=canned"
+                      : variation < 0                    ? "no left-hand blade or weapon"
+                      : M::LeftAttack::NativeWeapon(variation, gun) && !g_left_hand_hook
+                          ? "native left attack hand hook unavailable"
+                      : l.next >= l.count                ? "no left-hand row found"
+                      : !l.verified && l.gun ? "a punch with the gun: the fist's punch is not "
+                                               "learned yet (punch once with the hand empty)"
+                      : !l.verified && l.hand == HandLeft
+                          ? "waiting to observe a native left attack"
+                      : l.check != 0 && HitCheckOf(l.check) == GunPunch::Bad
+                          ? "its first hit was not at the left hand (off for this session)"
+                      : VR::IsGameMenuOpen()              ? "menu"
+                      : VR::CinematicActive()             ? "cinematic"
+                      : !body.body || !body.driven       ? "body off"
+                      : run.active                       ? "a transform is running"
+                      : !body.left_ik || body.left_weight < 0.5f ? "the game has the left arm"
+                                                                 : nullptr;
+#ifndef BBVR_NO_LOGS
+    // Read-only comparison with the gun's judge-800 lookup. Do not use these values to
+    // select an attack: this diagnoses weapons rejected before a left swing can open.
+    if (l.diagnostic_ns == 0 || now - l.diagnostic_ns >= 2'000'000'000) {
+        l.diagnostic_ns = now;
+        const s32 lookup0 = BehaviorId(chr, 0, HandLeft);
+        const s32 lookup800 = BehaviorId(chr, 800, HandLeft);
+        const auto decoded = [](s32 bid) {
+            return bid >= 100000000 && bid < 200000000 ? (bid - 100000000) / 1000 : -1;
+        };
+        VR::Body::BodyStatus bs{};
+        Combat::GunStatus gs{};
+        const bool have_body = VR::Body::LatestBodyStatus(bs);
+        const bool have_gun = Combat::LatestGunStatus(gs);
+        LOG_INFO(Core,
+                 "VR melee left DIAG: style={} right_variation={} form_b={} "
+                 "judge0={} variation0={} supported0={} judge800={} variation800={} "
+                 "supported800={} body_status={} body_age_ms={} left_family={} left_slot={} "
+                 "gun_status={} gun_age_ms={} gun_family={} gun_in_hand={} gun_direct={} "
+                 "selected={} hand={} punch={} rows={} next={} verified={} check={} "
+                 "physical={} enabled={} driven={} left_ik={} left_weight={:.2f} gate={}",
+                 t.style, t.variation, t.form_b, lookup0, decoded(lookup0),
+                 Tr::LeftMeleeWeapon(decoded(lookup0)) || Tr::PunchGun(decoded(lookup0)),
+                 lookup800, decoded(lookup800),
+                 Tr::LeftMeleeWeapon(decoded(lookup800)) || Tr::PunchGun(decoded(lookup800)),
+                 have_body, have_body ? (now - bs.steady_ns) / 1'000'000 : -1,
+                 bs.left_weapon_family, bs.left_weapon_slot, have_gun,
+                 have_gun ? (now - gs.ns) / 1'000'000 : -1, static_cast<unsigned>(gs.family),
+                 gs.in_hand, gs.direct_ok, variation, hand, punch, l.count, l.next, l.verified,
+                 l.check, g_physical, Tr::GetTrickSettings().melee_left, body.driven,
+                 body.left_ik, body.left_weight, why != nullptr ? why : "ready");
     }
-    constexpr const char* reasons[] = {
-        nullptr,
-        "melee_left=0",
-        "melee=canned",
-        "no left-hand blade or weapon",
-        "no left-hand row found",
-        "a punch with the gun: the fist's punch is not learned yet (punch once with the hand "
-        "empty)",
-        "waiting to observe a native left attack",
-        "its first hit was not at the left hand (off for this session)",
-        "menu",
-        "cinematic",
-        "body off",
-        "a transform is running",
-        "the game has the left arm"};
-    const char* why = reasons[allowed.left.reason];
+#endif
     if (why != l.logged_why) {
         l.logged_why = why;
         LOG_INFO(Core, "VR melee left: {}", why == nullptr ? "left swings attack" : why);
@@ -3164,19 +3062,18 @@ void LeftMeleeTick(u8* chr, const TickState& t, const MeleeBody& body, s64 now,
     li.stale = have && !w.open &&
                (w.aborted || (w.close_ns != 0 && now - w.close_ns > StaleCloseNs));
     li.gates = why == nullptr;
-    if (have && w.serial != l.latch.State().serial && l.live) {
+    if (have && w.serial != l.latch.serial && l.live) {
         // A newer window replaced the live one before an update saw it close (the latch just stops
         // refreshing it): finished here, its stamina back when it was no swing.
         LeftFinalize(chr, l, w.prev_serial == l.serial && w.prev_aborted, "a new swing", now);
     }
-    switch (l.latch.Step(li)) {
+    switch (M::StepLatch(l.latch, li)) {
     case M::LatchStep::Create:
         LeftOpen(chr, l, w, now);
         break;
     case M::LatchStep::Refresh:
         LeftRefresh(chr, l, now);
-        if (l.rows.State().reprobe && !l.live && have && w.open && w.serial == l.serial &&
-            why == nullptr) {
+        if (l.reprobe && !l.live && have && w.open && w.serial == l.serial && why == nullptr) {
             LeftOpen(chr, l, w, now); // a left part's next candidate, in the same swing
         }
         break;
@@ -3195,7 +3092,7 @@ void LeftMeleeTick(u8* chr, const TickState& t, const MeleeBody& body, s64 now,
         break;
     case M::LatchStep::Wait:
     case M::LatchStep::Idle:
-        if (!l.latch.State().active) {
+        if (!l.latch.active) {
             LeftEnd(l, "over", now);
         }
         break;
@@ -3203,10 +3100,11 @@ void LeftMeleeTick(u8* chr, const TickState& t, const MeleeBody& body, s64 now,
     status.left_ok = why == nullptr;
     status.left_why = why != nullptr ? why : "";
     status.left_learning = variation >= 0 && g_physical && Tr::GetTrickSettings().melee_left &&
-                           !l.rows.State().verified && !l.gun;
-    status.left_handled = l.latch.State().serial;
+                           !l.verified && !l.gun;
+    status.left_handled = l.latch.serial;
     status.left_dual = variation >= 0 && hand == HandRight;
     status.left_gun = l.gun;
+    status.left_shield = l.punch < 0;
 }
 
 // The damage step: a hit of the left swing's attack (its row and capsule): the left hand's impact.
@@ -3252,9 +3150,6 @@ void InstallMelee(VAddr base, u64 size) {
     if (size <= WorldChrManRva + 8) {
         LOG_INFO(Core, "VR melee: eboot too small ({:#x}) for Bloodborne 1.09; melee is vanilla",
                  size);
-        return;
-    }
-    if (!InitBowStringDll() || !InitNativeSawDll()) {
         return;
     }
     // VR_MELEE_AI_LOG (tests): the AIs' side of the attack notices, also with melee=vanilla (the
@@ -3352,6 +3247,13 @@ void InstallMelee(VAddr base, u64 size) {
         LOG_ERROR(Core, "VR melee: code emission failed ({}); no map-hit detour", error.what());
         g_map_hook = false;
     }
+    try {
+        g_left_hand_hook = InstallLeftAttackHand(module);
+    } catch (const Xbyak::Error& error) {
+        LOG_ERROR(Core, "VR melee: left attack hand hook failed ({})", error.what());
+    }
+    LOG_INFO(Core, "VR melee left: scoped native weapon hand selection {}",
+             g_left_hand_hook ? "ready" : "unavailable (torch/Gratia swings disabled)");
     g_installed = true;
     g_physical = true;
     LOG_INFO(Core,
@@ -3381,28 +3283,37 @@ bool MeleePhysicalWanted() {
 // weapon or form change, a gap or a snap turn starts over; the hands reused (a stereo pair's
 // second eye) wait for the next sample, the velocity then over both updates.
 void TrackBlade(u8* chr, TickState& t, const MeleeBody& body, s64 now) {
-    if (body.hands_reused) return;
+    if (body.hands_reused) {
+        return;
+    }
     B::Vec3 base{}, tip{}, grip{};
     const char* how = nullptr;
-    PiNativeAttackInput input{};
-    input.operation = PI_ATTACK_BLADE;
-    input.valid = MeleeBladeSegment(chr, base, tip, how, &grip);
-    input.now_ns = now; input.yaw = body.base_yaw;
-    input.variation = t.variation; input.style = t.style;
-    PhysicalInteractions::AttackPackets::Pack(input.base, base);
-    PhysicalInteractions::AttackPackets::Pack(input.tip, tip);
-    PhysicalInteractions::AttackPackets::Pack(input.grip, grip);
-    const auto result = g_native_attack_runtime.Call(input);
-    if (!result.valid || result.clear_reach) {
+    if (!MeleeBladeSegment(chr, base, tip, how, &grip)) {
+        t.blade_ns = 0;
         g_blade_reach.valid = false;
         return;
     }
-    if (result.reach_valid) g_blade_reach = {true, result.reach_base, result.reach_tip};
-    if (result.publish) {
-        namespace P = PhysicalInteractions::AttackPackets;
-        std::scoped_lock lock{g_attack_mutex};
-        g_blade = {true, P::V(result.base), P::V(result.tip), P::V(result.base_velocity), P::V(result.tip_velocity), now};
+    // Its reach from the grip (weapon_wall's solid blade, the body's: along R_Weapon -Y).
+    g_blade_reach = {true, B::Length(base - grip), B::Length(tip - grip)};
+    const float turn = std::remainder(body.base_yaw - t.blade_yaw, 2.0f * 3.14159265f);
+    const bool same = t.blade_ns != 0 && now > t.blade_ns && now - t.blade_ns <= BladeTickMaxNs &&
+                      t.blade_variation == t.variation && t.blade_style == t.style &&
+                      std::abs(turn) <= BladeTurnRad;
+    if (same) {
+        const float inv_dt = 1e9f / static_cast<float>(now - t.blade_ns);
+        const B::Vec3 base_vel = (base - t.blade_base) * inv_dt;
+        const B::Vec3 tip_vel = (tip - t.blade_tip) * inv_dt;
+        if (B::IsFinite(base_vel) && B::IsFinite(tip_vel)) {
+            std::scoped_lock lock{g_attack_mutex};
+            g_blade = {true, base, tip, base_vel, tip_vel, now};
+        }
     }
+    t.blade_ns = now;
+    t.blade_base = base;
+    t.blade_tip = tip;
+    t.blade_yaw = body.base_yaw;
+    t.blade_variation = t.variation;
+    t.blade_style = t.style;
 }
 
 void TrackPartBlades(u8* chr, const TickState& t) {
@@ -3433,42 +3344,20 @@ void TrackPartBlades(u8* chr, const TickState& t) {
         std::array<float, 12> grip{};
         s32 found = -1;
         if (DummyMtx(chr, hand == 0 ? LeftWeaponDummy : RightWeaponDummy, grip)) {
-            PiNativeGeometryInput input{};
-            input.operation = PI_NG_PART;
-            input.hand = hand;
-            // Four attachments, each with a two-point shortcut and 22-point fallback.
-            // The DLL requests only the reads reached by the original short-circuit flow.
-            for (int stage = 0; stage < 104; ++stage) {
-                PiNativeGeometryOutput result{};
-                if (!VR::Interactions::NativeGeometry(g_native_saw_module, input, result) ||
-                    !result.valid)
-                    break;
-                if (result.done) {
-                    if (result.success) {
-                        found = 10 + result.state.part_index;
-                        blade.seen = true;
-                        blade.base = {result.state.base[0], result.state.base[1],
-                                      result.state.base[2]};
-                        blade.tip = {result.state.tip[0], result.state.tip[1], result.state.tip[2]};
-                    }
-                    break;
+            VR::Solid::Shape line{};
+            const auto point = [&](int id, B::Vec3& p) {
+                B::Vec3 world{};
+                if (!DummyAt(chr, id, world)) {
+                    return false;
                 }
-                input.operation = PI_NG_PART_REPLY;
-                input.state = result.state;
-                input.reply_id = result.state.query;
-                input.flags = 0;
-                if (result.state.phase == 10) {
-                    input.attachment = attachment(result.state.query);
-                } else {
-                    B::Vec3 world{};
-                    if (DummyAt(chr, result.state.query, world)) {
-                        const auto point = InFrameCm(grip, world) * 0.01f;
-                        PhysicalInteractions::AttackPackets::Pack(input.point, point);
-                        input.flags = PI_NGF_HAVE;
-                    }
-                }
-                if (stage == 103 && g_native_saw_module)
-                    g_native_saw_module->ReportFault();
+                p = InFrameCm(grip, world) * 0.01f;
+                return true;
+            };
+            found = VR::Solid::AttachedPartLine(hand, attachment, point, line);
+            if (found >= 0) {
+                blade.seen = true;
+                blade.base = line.base;
+                blade.tip = line.tip;
             }
         }
         if (blade.logged != key * 2 + (found >= 0 ? 1 : 0)) {
@@ -3483,12 +3372,6 @@ void TrackPartBlades(u8* chr, const TickState& t) {
 void MeleePoseTick(u8* chr, const MeleeBody& body) {
     // The weapon-only transform shares this tick and its right-arm state (and goes first: its
     // gate holds swings back while the form changes).
-    if (g_native_saw_dll && (g_native_saw_fault ||
-                            VR::Interactions::ProcessFaultLatch().Tripped())) {
-        EndSawAttack(NowNs());
-        SetSawWeaponPose(chr, 0.0f, false);
-        return;
-    }
     TransformPoseTick(chr, body);
     // ... and the physical whip (whip=physical: the chain of a whip form on the hand).
     WhipPoseTick(chr, body);
@@ -3502,18 +3385,18 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
     const float dt = StepSeconds(t, now);
     if (chr != t.chr) {
         // A new character object (a load): nothing of the old one carries over.
-        const auto latch = t.latch;
-        g_native_attack_runtime.OwnerReset();
+        const M::LatchState latch = t.latch;
         t = {};
         t.chr = chr;
         t.last_ns = now;
         t.latch = latch;
-        t.latch.End();
+        t.latch.active = false;
+        t.latch.done = true;
         std::scoped_lock lock{g_attack_mutex};
-        const auto left_latch = g_left.latch;
+        const M::LatchState left_latch = g_left.latch;
         g_left = {};
-        g_left.latch = left_latch;
-        g_left.latch.Cover();
+        g_left.latch.serial = left_latch.serial;
+        g_left.latch.done = true;
     }
     // The plunge (melee_plunge): the hunter in the air, from his last update's motion signals.
     const VR::Melee::Plunge::Config plunge_cfg = PlungeConfig();
@@ -3554,7 +3437,7 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
     }
     Combat::MeleeWindow w{};
     const bool have = Combat::LatestMeleeWindow(w) && now - w.ns < WindowMaxAgeNs;
-    const bool new_window = have && w.serial != t.latch.State().serial;
+    const bool new_window = have && w.serial != t.latch.serial;
     if (t.updates++ % 4 == 0 || new_window) {
         ReadWeapon(chr, t);
     } else if (const s32 style = WeaponStyle(chr); style != t.style) {
@@ -3597,16 +3480,12 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
     const TransformRunInfo& run = TransformRun();
     FlickTick(chr, t, w, have, run, now);
     const bool flick_stroke =
-        have && t.flick.State().window == w.serial && t.flick.State().phase != FlickPhase::Done;
+        have && t.flick.window == w.serial && t.flick.phase != FlickPhase::Done;
     const bool known_style = run.switched && run.style == t.style && run.switched_ns != 0 &&
                              now - run.switched_ns < 1'000'000'000;
     const char* gate = BlockReason(chr, body, t, flick_stroke, known_style);
     if (SawAttackTick(chr, body, t, gate, dt, now)) {
         gate = "the saw's grinding attack"; // never create an ordinary swing alongside the spin
-    }
-    if (g_native_saw_fault) {
-        g_gate_block.store("physical interaction DLL failure", std::memory_order_relaxed);
-        return;
     }
     g_gate_block.store(gate, std::memory_order_relaxed); // (a telegraph needs a swing possible)
     // A new window replaces the one served: that one is over.
@@ -3629,7 +3508,7 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
     // A plunge's attack holds until the hunter has landed (core/vr/plunge.h).
     const bool plunge_hold = have && t.cur_live && t.cur.plunge && w.serial == t.cur.serial &&
                              t.air.Holds(now, t.cur.created_ns, plunge_cfg);
-    li.open = (w.open && !(whip_slow && t.latch.State().active)) || (have && WhipHoldsWindow(w, now)) ||
+    li.open = (w.open && !(whip_slow && t.latch.active)) || (have && WhipHoldsWindow(w, now)) ||
               plunge_hold;
     li.stale = !w.open && w.close_ns != 0 && now - w.close_ns > StaleCloseNs;
     li.gates = gate == nullptr;
@@ -3639,7 +3518,7 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
     // stagger's attack window about to open) waits for it, its window still open, at most
     // swing_buffer_ms; then (or at any other refusal) the latch refuses it as before.
     const bool buffer_pending =
-        have && (w.serial != t.latch.State().serial || (!t.latch.State().active && !t.latch.State().done));
+        have && (w.serial != t.latch.serial || (!t.latch.active && !t.latch.done));
     const s64 buffer_ns =
         static_cast<s64>(VR::Melee::GetMeleeSettings().swing_buffer_ms * 1e6f);
     const bool buffering =
@@ -3658,14 +3537,14 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
     if (g_thrust_wait.load(std::memory_order_relaxed)) {
         li.max_wait = std::max(li.max_wait, ThrustWaitFrames); // the thrust verdict first
     }
-    if (whip_slow && !t.latch.State().active) {
+    if (whip_slow && !t.latch.active) {
         li.ready = false;
         li.max_wait = 1u << 30; // until the chain is fast, or the next window
     }
     if (new_window) {
         g_stats.windows.fetch_add(1, std::memory_order_relaxed);
     }
-    const M::LatchStep step = t.latch.Step(li);
+    const M::LatchStep step = M::StepLatch(t.latch, li);
     const s64 held_ns = t.buffer_logged == w.serial ? t.buffer.HeldNs(w.serial, now) : 0;
     if (step == M::LatchStep::Create && held_ns > 0) {
         g_stats.buffer_opened.fetch_add(1, std::memory_order_relaxed);
@@ -3674,14 +3553,14 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
     }
     switch (step) {
     case M::LatchStep::Create:
-        if (flick_stroke && t.flick.State().phase != FlickPhase::Old) {
+        if (flick_stroke && t.flick.phase != FlickPhase::Old) {
             FlickOpen(chr, t, w, body.right_weight, now); // the switch is under way or done
         } else {
             Create(chr, t, w, body.right_weight, now, flick_stroke);
         }
         break;
     case M::LatchStep::Refresh:
-        if (flick_stroke && t.flick.State().phase == FlickPhase::Gap) {
+        if (flick_stroke && t.flick.phase == FlickPhase::Gap) {
             FlickOpen(chr, t, w, body.right_weight, now);
         } else if (t.unpaid_live && !t.cur_live && !w.unpaid && w.serial == t.cur.serial) {
             // The presenter paid for it at its commit (a charge came back): its attack now (its
@@ -3715,10 +3594,10 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
     case M::LatchStep::Idle:
         break;
     }
-    if (step == M::LatchStep::Idle && t.cur_live && !t.latch.State().active) {
+    if (step == M::LatchStep::Idle && t.cur_live && !t.latch.active) {
         Finalize(chr, t, have ? &w : nullptr, "over", now);
     }
-    if (!t.latch.State().active) {
+    if (!t.latch.active) {
         t.unpaid_live = false;
     }
     Combat::MeleeStatus status{};
@@ -3727,7 +3606,7 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
     status.physical = g_physical;
     // A flick's stroke keeps the swing route while it lasts, also into a form without moves of
     // its own (the presenter would close the window and press R1 / R2 for the rest of it).
-    const bool flick_live = flick_stroke && w.open && t.flick.State().phase != FlickPhase::Done;
+    const bool flick_live = flick_stroke && w.open && t.flick.phase != FlickPhase::Done;
     status.ok = g_physical && body.body && (t.weapon_why == nullptr || flick_live);
     status.variation = t.variation;
     status.form_b = t.form_b;
@@ -3735,39 +3614,32 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
     // Publish geometry, not world velocity: XR differentiates this tip on its final steered
     // pose in tracking space, so locomotion/snap turns cannot manufacture an attack. Measured
     // once per settled form (the dummies of a spinning part move; the dmy lookups are not free).
-    PiNativeAttackInput geometry_input{};
-    geometry_input.operation = PI_ATTACK_TWO_HAND_GEOMETRY;
-    auto& geometry_facts = geometry_input.decision.geometry;
-    geometry_facts.command = PI_ATG_CHECK;
-    geometry_facts.variation = t.variation;
-    geometry_facts.style = t.style;
-    geometry_facts.stable_frames = t.style_stable;
-    auto geometry_result = g_native_attack_runtime.Call(geometry_input);
-    if (geometry_result.valid && geometry_result.geometry.measure) {
-        B::Vec3 base{}, tip{};
-        const char* how = nullptr;
-        float strike_near = 0.f;
-        std::array<float, 12> grip{};
-        geometry_facts.command = PI_ATG_REPLY;
-        geometry_facts.request_id = geometry_result.geometry.request_id;
-        geometry_facts.have = MeleeBladeSegment(chr, base, tip, how, nullptr, &strike_near) &&
-                              DummyMtx(chr, RightWeaponDummy, grip);
-        if (geometry_facts.have) {
-            PhysicalInteractions::AttackPackets::Pack(geometry_facts.tip,
-                                                      InFrameCm(grip, tip) * .01f);
-            geometry_facts.strike_near = strike_near;
+    if (t.style == 3 && VR::TwoHand::SharedHandle(t.variation / 10)) {
+        auto& g = t.two_hand_geo;
+        if (g.variation != t.variation || g.style != t.style) {
+            g = {};
+            g.variation = t.variation;
+            g.style = t.style;
         }
-        geometry_result = g_native_attack_runtime.Call(geometry_input);
-    }
-    if (geometry_result.valid && geometry_result.geometry.eligible) {
-        const auto& geometry = geometry_result.geometry;
-        status.blade_tip_valid = geometry.valid;
-        status.blade_tip = PhysicalInteractions::AttackPackets::V(geometry.tip);
-        status.blade_strike_near = geometry.strike_near;
+        if (!g.valid && t.style_stable >= 12) {
+            B::Vec3 base{}, tip{};
+            const char* how = nullptr;
+            float strike_near = 0.0f;
+            std::array<float, 12> grip{};
+            if (MeleeBladeSegment(chr, base, tip, how, nullptr, &strike_near) &&
+                DummyMtx(chr, RightWeaponDummy, grip)) {
+                g.tip = InFrameCm(grip, tip) * 0.01f;
+                g.strike_near = strike_near;
+                g.valid = B::IsFinite(g.tip) && B::Length(g.tip) > 0.05f && std::isfinite(strike_near);
+            }
+        }
+        status.blade_tip_valid = g.valid;
+        status.blade_tip = g.tip;
+        status.blade_strike_near = g.strike_near;
     }
     status.bow_hand = t.bow_hand;
     status.bow_direct = t.bow_hand >= 0 && VR::Bow::GetBowSettings().direct && GunBowDirectOk();
-    status.handled = t.latch.State().serial;
+    status.handled = t.latch.serial;
     {
         const VR::Melee::Plunge::State& air = t.air.Current();
         status.falling = plunge_cfg.enabled && air.airborne && air.descending;
@@ -4053,7 +3925,9 @@ s32 TryVisceralNow(u8* player, bool fresh, const char*& skipped) {
             if (Plausible(node) && Read<u8>(node + L::OffsetThrowState) != 0) {
                 skipped = "already in a throw";
             } else if (!g_dry_run) {
+                const u64 stage = BeginVisceralStage(player);
                 result = g_try_throw(throws, PadTypeR1, 0);
+                ConfirmVisceralStage(stage, result >= 0);
             }
         }
     }
@@ -4188,12 +4062,9 @@ bool MeleeDamage(u8* res, u8* target, float* damage) {
         if (found->whip_variation >= 0 && found->pace < 0.0f && VR::Whip::GetWhipSettings().pace &&
             std::isfinite(*damage) && *damage > 0.0f) {
             const M::MoveKind kind = found->verdict_light ? M::MoveKind::Light : found->kind;
-            PiNativeMeleeInput pace{}; pace.operation = PI_NATIVE_MELEE_PACE;
-            pace.pace = g_whip_pace; pace.pace_at_ns = found->created_ns;
-            pace.pace_recover_s = VR::Whip::WhipRecover(found->whip_variation, static_cast<std::size_t>(kind));
-            PiNativeMeleeOutput approved{};
-            if (!VR::Interactions::NativeMelee(g_native_saw_module, pace, approved) || !approved.valid) return false;
-            g_whip_pace = approved.pace; found->pace = approved.pace_share;
+            found->pace = g_whip_pace.Pay(
+                found->created_ns,
+                VR::Whip::WhipPaceRecover(found->whip_variation, static_cast<std::size_t>(kind)));
         }
         a = *found;
     }
@@ -4203,41 +4074,69 @@ bool MeleeDamage(u8* res, u8* target, float* damage) {
     // (A whip's chain still lashes after its window closed: its hits take the speed of the chain's
     // own tip, mapped onto a blade's scale: core/vr/whip_spin.h BladeEquivalentTip.)
     const WhipChainState chain = IsWhipRow(a.row) ? WhipChainNow(now) : WhipChainState{};
-    PiNativeMeleeInput input{};
-    input.operation = PI_NATIVE_MELEE_DAMAGE;
-    auto& d = input.damage;
-    d.kind = static_cast<u32>(a.kind); d.saw = a.saw; d.powered = a.powered;
-    d.speed_damage = ms.speed_damage; d.budget = ms.budget; d.flick = a.flick;
-    d.have_window = have_w; d.whip = IsWhipRow(a.row); d.chain_applies = chain.applies;
-    d.transform = a.transform; d.verdict_light = a.verdict_light; d.have_light = a.light != nullptr; d.have_row = a.row != nullptr;
-    d.plunge = a.plunge;
-    const auto plunge = PlungeConfig();
-    d.plunge_enabled = plunge.enabled; d.plunge_min_m = plunge.min_drop_m; d.plunge_damage = plunge.damage;
-    d.chain_variation = chain.variation; d.bid = a.bid; d.row_mv = a.row ? a.row->mv : 0; d.light_mv = a.light ? a.light->mv : 0;
-    d.tip = a.tip; d.window_tip = w.tip_speed; d.window_peak = w.tip_peak; d.chain_tip = chain.tip;
-    d.since_s = a.since_counted_s; d.two_hand = a.two_hand; d.window_two_hand = w.two_hand; d.drop_m = a.drop_m;
-    input.pace_share = a.pace; input.pace.have = a.pace >= 0;
-    d.before = *damage; d.hitstop = a.row ? a.row->hitstop : .09f;
-    d.chain_grip[0] = chain.grip.x; d.chain_grip[1] = chain.grip.y; d.chain_grip[2] = chain.grip.z;
-    if (chain.applies && chain.variation == 2400 && a.bid >= 100000000 && (a.bid-100000000)/1000 == 2400) {
-        for (int i=0;i<3;++i) d.contact[i] = Read<float>(res + ResPosition + i*4);
-    }
-    PiNativeMeleeOutput hit{};
-    if (!VR::Interactions::NativeMelee(g_native_saw_module,input,hit) || !hit.valid) return false;
-    const float tip = hit.tip, factor = hit.factor, two_hand = hit.two_hand;
-    const float row_factor = hit.row_factor, plunge_factor = hit.plunge_factor;
-    const float contact_distance = hit.contact_distance, range_factor = hit.range_factor;
-    const float before = d.before, after = hit.after, hitstop = hit.hitstop;
-    const float felt = hit.felt;
-    const bool whip_paced = a.pace >= 0;
-    const float whip_pace = whip_paced ? a.pace : 1.f;
-    if (hit.write_damage) *damage = after;
+    const float tip =
+        chain.applies && chain.tip > 0.0f ? VR::Whip::BladeEquivalentTip(chain.tip)
+                      : std::max(have_w ? (IsWhipRow(a.row) ? std::max(w.tip_speed, w.tip_peak)
+                                                            : w.tip_speed)
+                                        : 0.0f,
+                                 a.tip);
+    M::DamageConfig cfg{};
+    cfg.speed =
+        !a.saw && !a.powered && ms.speed_damage &&
+        (have_w || a.tip > 0.0f || (chain.applies && chain.tip > 0.0f));
+    // The combo budget sets the rate instead; a whip form's own moves: their pace (whip_pace).
+    const bool whip_paced = a.pace >= 0.0f;
+    const float whip_pace = whip_paced ? a.pace : 1.0f;
+    cfg.cadence = !a.saw && !whip_paced && (!ms.budget || a.flick);
+    float factor = M::DamageFactor(tip, a.since_counted_s, a.kind, cfg);
+    // The two-handed grip's swing (core/vr/two_hand_grip.h): in the HIT line's factor.
+    const float two_hand =
+        std::max(a.two_hand, have_w ? std::clamp(w.two_hand, 1.0f, 2.0f) : 1.0f);
     if (two_hand > 1.0f) {
-        LOG_INFO(Core, "VR melee: #{} two-handed swing: x{:.2f} (in the HIT line's factor)", a.serial,two_hand);
+        factor *= two_hand;
+        LOG_INFO(Core, "VR melee: #{} two-handed swing: x{:.2f} (in the HIT line's factor)",
+                 a.serial, two_hand);
     }
+    float row_factor = 1.0f;
+    if (!a.transform && a.verdict_light && a.light != nullptr && a.row != nullptr &&
+        a.row->mv > 0) {
+        // A wound-up swing the classifier judged light: the light row's motion value.
+        row_factor = static_cast<float>(a.light->mv) / static_cast<float>(a.row->mv);
+    }
+    // A plunge after a deep enough fall (core/vr/plunge.h): the fall is its speed.
+    const float plunge_factor =
+        a.plunge ? VR::Melee::Plunge::DamageFactor(a.drop_m, PlungeConfig()) : 1.0f;
     if (plunge_factor > 1.0f) {
-        LOG_INFO(Core, "VR melee: #{} PLUNGE hit after a {:.2f} m fall: x{:.2f}",a.serial,a.drop_m,plunge_factor);
+        factor = std::max(factor, 1.0f);
+        LOG_INFO(Core, "VR melee: #{} PLUNGE hit after a {:.2f} m fall: x{:.2f}", a.serial,
+                 a.drop_m, plunge_factor);
     }
+    float contact_distance = -1.0f;
+    float range_factor = 1.0f;
+    // Use each enemy's actual collision point. Two enemies hit by the same sweep
+    // can therefore take different damage, even with the tip fully extended.
+    // The attack's behavior id also identifies its weapon, including upgrade levels.
+    const s32 attack_variation = a.bid >= 100000000 ? (a.bid - 100000000) / 1000 : -1;
+    if (chain.applies && chain.variation == 2400 && attack_variation == 2400) {
+        const B::Vec3 contact{Read<float>(res + ResPosition), Read<float>(res + ResPosition + 4),
+                              Read<float>(res + ResPosition + 8)};
+        if (B::IsFinite(contact) && B::IsFinite(chain.grip)) {
+            contact_distance = B::Length(contact - chain.grip);
+            range_factor = VR::Whip::ContactDamageFactor(attack_variation, true, contact_distance);
+        }
+    }
+    const float before = *damage;
+    float after = before;
+    // The hit's feel (the presenter's impact: its strength from the damage, a knock under 1): the
+    // damage before a whip's pace, so every lash that lands feels as it did before whip_pace (the
+    // pace is the game's damage per second, not a weaker blow on the hand).
+    float felt = before;
+    if (std::isfinite(before) && before > 0.0f) {
+        felt = before * factor * row_factor * plunge_factor * range_factor;
+        after = felt * whip_pace;
+        *damage = after;
+    }
+    const float hitstop = a.row != nullptr ? a.row->hitstop : 0.09f;
     {
         std::scoped_lock lock{g_attack_mutex};
         for (Attack& r : g_attacks) {
@@ -4249,7 +4148,7 @@ bool MeleeDamage(u8* res, u8* target, float* damage) {
     }
     g_stats.hits.fetch_add(1, std::memory_order_relaxed);
     g_bite_wall.store(false, std::memory_order_relaxed);
-    g_bite_hold.store(hit.bite_hold, std::memory_order_relaxed);
+    g_bite_hold.store(std::clamp(hitstop * 0.8f, 0.05f, 0.1f), std::memory_order_relaxed);
     g_bite_ns.store(now, std::memory_order_release);
     Combat::PushMeleeEvent({Combat::MeleeEventKind::Hit, a.serial, felt, hitstop, now, ""});
     const u8* data = Plausible(target) ? Module(target, L::OffsetDataModule) : nullptr;
@@ -4259,8 +4158,12 @@ bool MeleeDamage(u8* res, u8* target, float* damage) {
              "open, t={:.3f}",
              a.serial, a.transform ? "TRANSFORM ATTACK " : "", M::MoveKindName(a.kind), bid,
              Read<s32>(res + ResAtkParam), fmt::ptr(target),
-             data != nullptr ? Read<s32>(data + OffsetHp) : -1, before, after, factor * row_factor * range_factor * whip_pace,
-             tip, hit.speed_factor, a.since_counted_s, hit.cadence_factor,
+             data != nullptr ? Read<s32>(data + OffsetHp) : -1, before, after,
+             factor * row_factor * range_factor * whip_pace,
+             tip, cfg.speed ? M::SpeedFactor(tip, cfg) : 1.0f, a.since_counted_s,
+             cfg.speed && cfg.cadence
+                 ? M::CadenceFactor(a.since_counted_s, M::RecoverSeconds(a.kind))
+                 : 1.0f,
              (row_factor != 1.0f ? fmt::format(", judged light x{:.2f}", row_factor)
                                  : std::string{}) +
                  (chain.applies && chain.tip > 0.0f
@@ -4316,26 +4219,40 @@ bool MeleeHitInfoOf(u8* res, MeleeHitInfo& out) {
     }
     Combat::MeleeWindow w{};
     const bool have_w = Combat::LatestMeleeWindow(w) && w.serial == a.serial;
+    out.weapon_variation = a.weapon_variation;
+    out.form_b = a.form_b;
+    out.two_handed = std::max(a.two_hand, have_w ? w.two_hand : 1.0f) > 1.0f;
     out.swing = true;
     out.serial = a.serial;
     out.kind = M::MoveKindName(a.kind);
     out.transform = a.transform;
-    PiNativeMeleeInput input{}; input.operation = PI_NATIVE_MELEE_INFO;
-    input.damage.have_window = have_w; input.damage.window_tip = w.tip_speed; input.damage.tip = a.tip;
-    PiNativeMeleeOutput info{};
-    if (!VR::Interactions::NativeMelee(g_native_saw_module,input,info) || !info.valid) { out={}; return false; }
-    out.tip_speed = info.tip;
+    out.tip_speed = std::max(have_w ? w.tip_speed : 0.0f, a.tip);
     return true;
 }
 
-VR::Body::BiteFacts MeleeTargetFacts() {
-    VR::Body::BiteFacts facts{};
-    facts.ns = g_bite_ns.load(std::memory_order_acquire);
-    facts.hold = g_bite_hold.load(std::memory_order_relaxed);
-    facts.wall = g_bite_wall.load(std::memory_order_relaxed);
-    facts.enabled = VR::Melee::GetMeleeSettings().bite;
-    return facts;
+void MeleeBite(VR::Body::ModelTarget& right_target, s64 now_ns) {
+    static s64 anchor_for = 0;
+    static B::ModelTarget anchor{};
+    const s64 at = g_bite_ns.load(std::memory_order_acquire);
+    if (at == 0 || !VR::Melee::GetMeleeSettings().bite || now_ns < at || now_ns - at > 400 * Ms) {
+        return;
+    }
+    if (at != anchor_for) {
+        anchor_for = at;
+        anchor = right_target; // where the blade was when it bit
+    }
+    const bool wall = g_bite_wall.load(std::memory_order_relaxed);
+    const float since = static_cast<float>(now_ns - at) * 1e-9f;
+    const float follow =
+        wall ? M::BiteFollow(since, 0.06f, 0.12f, 0.25f)
+             : M::BiteFollow(since, g_bite_hold.load(std::memory_order_relaxed), 0.08f, 0.5f);
+    if (follow >= 1.0f) {
+        return;
+    }
+    right_target.p = B::Lerp(anchor.p, right_target.p, follow);
+    right_target.q = B::Slerp(anchor.q, right_target.q, follow);
 }
+
 
 // quick_use_wipe (core/vr/bloodborne_quickitems.cpp): the right weapon's blade as its own hit
 // capsule has it, for the paper wiped along it: the first move of the form in the hand (the light
@@ -4343,93 +4260,91 @@ VR::Body::BiteFacts MeleeTargetFacts() {
 // end, else from the grip, to dmy1; a whip's row on the chain: the grip to the chain's handle end),
 // both ends on the weapon in the hand (within BladeNearM of its grip). World; false (`how` says
 // why) when the weapon or its dummies are not known. Game:Main, as the pose tick that reads it.
-const char* GeometryReason(uint32_t reason) {
-    constexpr const char* reasons[] = {nullptr,
-                                       "the right weapon not read",
-                                       "no hit capsule in form A",
-                                       "no hit capsule in form B",
-                                       "no right grip dummy",
-                                       "the whip: the grip to the chain's handle end",
-                                       "the hit capsule's dummy not on the weapon shown",
-                                       "the hit capsule",
-                                       "the haft (the blade trail) to the hit capsule",
-                                       "the hit sphere and its trail",
-                                       "the grip to the hit sphere",
-                                       "a module fault"};
-    return reasons[reason <= PI_NGR_MODULE ? reason : PI_NGR_MODULE];
-}
-const M::MoveRow* FirstGeometryRow(u8* chr, const TickState& t, const char*& how) {
-    PiNativeGeometryInput p{};
-    p.operation = PI_NG_CHOOSE;
-    p.form_b = t.form_b;
-    if (g_installed && chr && chr == t.chr && t.moves) {
-        p.flags = PI_NGF_AVAILABLE;
-        for (size_t i = 0; i < t.moves->rows.size(); ++i)
-            if (t.moves->rows[i].Valid())
-                p.valid_rows |= 1u << i;
-    }
-    PiNativeGeometryOutput o{};
-    if (!VR::Interactions::NativeGeometry(g_native_saw_module, p, o) || !o.valid) {
-        how = GeometryReason(PI_NGR_MODULE);
-        return nullptr;
-    }
-    if (!o.success) {
-        how = GeometryReason(o.state.reason);
-        return nullptr;
-    }
-    return &t.moves->rows[o.row_index];
-}
-PiNativeGeometryInput GeometryRow(const M::MoveRow& row) {
-    PiNativeGeometryInput p{};
-    p.dmy1 = row.dmy1;
-    p.dmy2 = row.dmy2;
-    p.trail_base = row.trail_base;
-    p.trail_tip = row.trail_tip;
-    p.blade = row.blade;
-    if (IsWhipRow(&row))
-        p.flags = PI_NGF_WHIP;
-    return p;
-}
-bool MeleeBladeSegment(u8* chr, B::Vec3& base, B::Vec3& tip, const char*& how, B::Vec3* grip_out,
-                       float* strike_near) {
-    const auto* row = FirstGeometryRow(chr, g_tick, how);
-    if (!row)
+bool MeleeBladeSegment(u8* chr, B::Vec3& base, B::Vec3& tip, const char*& how,
+                       B::Vec3* grip_out, float* strike_near) {
+    constexpr float BladeNearM = 2.0f;
+    const TickState& t = g_tick;
+    if (!g_installed || chr == nullptr || chr != t.chr || t.moves == nullptr) {
+        how = "the right weapon not read";
         return false;
-    auto p = GeometryRow(*row);
-    p.operation = PI_NG_SEGMENT;
-    for (int stage = 0; stage < 8; ++stage) {
-        PiNativeGeometryOutput o{};
-        if (!VR::Interactions::NativeGeometry(g_native_saw_module, p, o) || !o.valid) {
-            how = GeometryReason(PI_NGR_MODULE);
-            return false;
-        }
-        const auto& s = o.state;
-        if (s.reason)
-            how = GeometryReason(s.reason);
-        if ((o.write_flags & PI_NGW_GRIP) && grip_out)
-            *grip_out = {s.grip[0], s.grip[1], s.grip[2]};
-        if (o.write_flags & PI_NGW_BASE)
-            base = {s.base[0], s.base[1], s.base[2]};
-        if (o.write_flags & PI_NGW_TIP)
-            tip = {s.tip[0], s.tip[1], s.tip[2]};
-        if ((o.write_flags & PI_NGW_STRIKE) && strike_near)
-            *strike_near = s.strike_near;
-        if (o.done)
-            return o.success;
-        B::Vec3 point{};
-        const bool have = DummyAt(chr, s.query, point);
-        p.operation = PI_NG_REPLY;
-        p.state = s;
-        p.reply_id = s.query;
-        p.flags = (p.flags & ~PI_NGF_HAVE) | (have ? PI_NGF_HAVE : 0);
-        p.point[0] = point.x;
-        p.point[1] = point.y;
-        p.point[2] = point.z;
     }
-    if (g_native_saw_module)
-        g_native_saw_module->ReportFault();
-    how = GeometryReason(PI_NGR_MODULE);
-    return false;
+    const M::MoveRow* row = nullptr;
+    const std::size_t first = t.form_b ? 3 : 0;
+    for (std::size_t k = first; k < first + 3 && row == nullptr; ++k) {
+        if (t.moves->rows[k].Valid()) {
+            row = &t.moves->rows[k];
+        }
+    }
+    if (row == nullptr) {
+        how = t.form_b ? "no hit capsule in form B" : "no hit capsule in form A";
+        return false;
+    }
+    B::Vec3 grip{};
+    if (!DummyAt(chr, RightWeaponDummy, grip)) {
+        how = "no right grip dummy";
+        return false;
+    }
+    if (grip_out != nullptr) {
+        *grip_out = grip;
+    }
+    const auto on_weapon = [&](s32 id, B::Vec3& p) {
+        return id >= 0 && DummyAt(chr, id, p) && B::Length(p - grip) <= BladeNearM;
+    };
+    if (IsWhipRow(row)) {
+        base = grip;
+        how = "the whip: the grip to the chain's handle end";
+        if (strike_near != nullptr) {
+            *strike_near = 0.0f;
+        }
+        return on_weapon(WhipHandleDummy, tip);
+    }
+    B::Vec3 a{};
+    if (!on_weapon(row->dmy1, a)) {
+        how = "the hit capsule's dummy not on the weapon shown";
+        return false;
+    }
+    B::Vec3 b{};
+    if (row->dmy2 >= 0 && on_weapon(row->dmy2, b)) {
+        const bool a_first = B::Length(a - grip) <= B::Length(b - grip);
+        base = a_first ? a : b;
+        tip = a_first ? b : a;
+        how = "the hit capsule";
+        if (strike_near != nullptr) {
+            *strike_near = B::Length(base - grip); // the capsule's own near end, not the haft
+        }
+        // A capsule out at the end of a long haft (the Hunter Axe's form B: its 26 cm head 1.1 m
+        // from the grip, out of the left hand's reach; the 2026-10-08 mock measure): from the
+        // grip side of the blade trail the game draws along the weapon (the haft) to the
+        // capsule's far end, so the paper can be wiped where the hand reaches.
+        constexpr float HaftFarM = 0.6f;
+        B::Vec3 t0{};
+        B::Vec3 t1{};
+        if (B::Length(base - grip) > HaftFarM && row->trail_base >= 0 && row->trail_tip >= 0 &&
+            on_weapon(row->trail_base, t0) && on_weapon(row->trail_tip, t1)) {
+            const B::Vec3 near_end = B::Length(t0 - grip) <= B::Length(t1 - grip) ? t0 : t1;
+            if (B::Length(near_end - grip) < B::Length(base - grip) - 0.2f) {
+                base = near_end;
+                how = "the haft (the blade trail) to the hit capsule";
+            }
+        }
+        return true;
+    }
+    // A sphere (an axe's head, the wheel): from the trail's other end, else the grip, to it.
+    const s32 other = row->trail_base == row->dmy1 ? row->trail_tip : row->trail_base;
+    if (other != row->dmy1 && on_weapon(other, b) && B::Length(b - a) >= 0.1f) {
+        base = b;
+        how = "the hit sphere and its trail";
+    } else {
+        base = grip;
+        how = "the grip to the hit sphere";
+    }
+    tip = a;
+    if (strike_near != nullptr) {
+        // A head round the hit sphere: its model reach off dmy1, else a typical 15 cm head.
+        *strike_near = std::max(B::Length(a - grip) - (row->blade > 0.0f ? row->blade : 0.15f),
+                                0.0f);
+    }
+    return true;
 }
 
 bool MeleeBladeReach(float& base, float& tip) {
@@ -4450,65 +4365,45 @@ bool MeleeBowGeometry(const u8* chr, VR::Bow::NativeGeometry& out, bool arrow_pr
     // the same checked layout used by the physical whip's native part hook.
     const auto bone = [&](int slot, std::string_view wanted, B::QsTransform& result) {
         const auto* part = Read<const u8*>(parts + OffsetAsmParts + 8 * (RightPartSlot + slot));
-        if (!Plausible(part) || Read<const u8*>(part) != g_base + WeaponPartVtableRva)
-            return false;
+        if (!Plausible(part) || Read<const u8*>(part) != g_base + WeaponPartVtableRva) return false;
         const auto* anim = Read<const u8*>(part + 0x158);
         const auto* state = Plausible(anim) ? Read<const u8*>(anim) : nullptr;
         const auto* player = Plausible(state) ? Read<const u8*>(state) : nullptr;
         const auto* node = Plausible(player) ? Read<const u8*>(player + 0x20) : nullptr;
-        if (!Plausible(node))
-            return false;
+        if (!Plausible(node)) return false;
         const auto* pose = node + 0x38;
         const auto* skel = Read<const u8*>(pose);
-        if (!Plausible(skel))
-            return false;
+        if (!Plausible(skel)) return false;
         const int count = Read<s32>(skel + 0x30);
         const auto* names = Read<const u8*>(skel + 0x28);
         const auto* parents = Read<const s16*>(skel + 0x18);
         const auto* locals = Read<const B::HkQsTransform*>(pose + 0x08);
         if (count < 1 || count > 64 || Read<s32>(pose + 0x10) != count ||
             Read<s32>(skel + 0x20) != count || !Plausible(names) ||
-            !Plausible(reinterpret_cast<const u8*>(parents), 2) ||
-            !Plausible(reinterpret_cast<const u8*>(locals), 16))
-            return false;
-        PiNativeSkeletonInput skeleton{};
-        skeleton.size = sizeof(skeleton);
+            !Plausible(reinterpret_cast<const u8*>(parents), 2) || !Plausible(reinterpret_cast<const u8*>(locals), 16)) return false;
+        std::array<B::QsTransform, 64> model{};
         for (int i = 0; i < count; ++i) {
             const int parent = parents[i];
-            if (parent < -1 || parent >= i)
-                return false;
+            if (parent < -1 || parent >= i) return false;
             const auto local = B::FromHavok(locals[i]);
-            if (!B::IsFinite(local) || B::Dot(local.q, local.q) < 0.5f)
-                return false;
-            // Validate each native prefix entry before following its name pointer, preserving
-            // the original early-read gates. Model composition belongs to the DLL.
-            skeleton.parent[i] = parent;
-            skeleton.local[i] = PhysicalInteractions::NativeSkeletonPackets::Pack(local);
+            if (!B::IsFinite(local) || B::Dot(local.q, local.q) < 0.5f) return false;
+            model[i] = parent >= 0 ? B::Compose(model[parent], local) : local;
             const auto raw = Read<uintptr_t>(names + 16 * i) & ~uintptr_t{1};
             const auto* name = reinterpret_cast<const char*>(raw);
-            if (!Plausible(reinterpret_cast<const u8*>(name), 1))
-                continue;
+            if (!Plausible(reinterpret_cast<const u8*>(name), 1)) continue;
             std::size_t len = 0;
-            while (len < 48 && name[len] != 0)
-                ++len;
+            while (len < 48 && name[len] != 0) ++len;
             if (std::string_view{name, len} == wanted) {
-                skeleton.count = i + 1;
-                skeleton.target = i;
-                PiNativeSkeletonOutput solved{};
-                if (!VR::Interactions::NativeSkeleton(g_native_saw_module, skeleton, solved) ||
-                    !solved.valid)
-                    return false;
-                if (wanted == "B_String")
-                    g_bow_string_rig = {node, skel, count, i};
-                result = PhysicalInteractions::NativeSkeletonPackets::Unpack(solved.model);
+                if (wanted == "B_String") g_bow_string_rig = {node, skel, count, i};
+                result = model[i];
                 return true;
             }
         }
         return false;
     };
     B::QsTransform grip{}, string{};
-    if (!bone(g_tick.bow_part, "B_Grip", out.bow_root) || !bone(g_tick.bow_part, "B_Bowgrip", grip))
-        return false;
+    if (!bone(g_tick.bow_part, "B_Grip", out.bow_root) ||
+        !bone(g_tick.bow_part, "B_Bowgrip", grip)) return false;
     out.bow_grip = grip.t;
     // The empty bow must not depend on the arrow part or an active string rig.
     return !arrow_present || (bone(g_tick.bow_part, "B_String", string) &&
@@ -4525,77 +4420,51 @@ void MeleeBowString(B::Vec3 target, s64 ns) {
 
 void MeleeBowPartPose(u8* node) {
     BowStringRequest req{};
-    if (!g_bow_string_request.Load(req) || req.rig.node != node)
-        return;
+    if (!g_bow_string_request.Load(req) || req.rig.node != node) return;
     const auto& r = req.rig;
     auto* const pose = node + 0x38;
-    if (Read<const u8*>(pose) != r.skeleton || r.count < 1 || r.count > 64 || r.bone < 0 ||
-        r.bone >= r.count || Read<s32>(pose + 0x10) != r.count)
-        return;
+    if (Read<const u8*>(pose) != r.skeleton || r.count < 1 || r.count > 64 ||
+        r.bone < 0 || r.bone >= r.count || Read<s32>(pose + 0x10) != r.count) return;
     auto* const locals = Read<B::HkQsTransform*>(pose + 0x08);
     const auto* parents = Read<const s16*>(r.skeleton + 0x18);
     auto* const flags = Read<u32*>(pose + 0x28);
-    if (!Plausible(reinterpret_cast<const u8*>(locals), 16) ||
-        !Plausible(reinterpret_cast<const u8*>(parents), 2) ||
-        !Plausible(reinterpret_cast<const u8*>(flags), 4) || Read<s32>(pose + 0x30) != r.count)
-        return;
+    if (!Plausible(reinterpret_cast<const u8*>(locals), 16) || !Plausible(reinterpret_cast<const u8*>(parents), 2) || !Plausible(reinterpret_cast<const u8*>(flags), 4) ||
+        Read<s32>(pose + 0x30) != r.count) return;
     const s64 now = NowNs();
+    const bool active = req.ns > 0 && now >= req.ns && now - req.ns < 250 * Ms &&
+                        VR::Bow::GetBowSettings().enabled;
+    // Restore the original translation if animation throttling reused our last write.
+    static const u8* last_node{};
+    static const u8* last_skeleton{};
+    static B::Vec3 original{}, written{};
+    static bool edited{};
     auto current = B::FromHavok(locals[r.bone]);
-    if (g_bow_string_last_node != node || g_bow_string_last_skeleton != r.skeleton) {
-        g_bow_string_last_node = node;
-        g_bow_string_last_skeleton = r.skeleton;
-        ++g_bow_string_identity;
+    if (last_node != node || last_skeleton != r.skeleton) {
+        last_node = node;
+        last_skeleton = r.skeleton;
+        edited = false;
     }
-    const auto dirty = [&] {
-        for (int i = 0; i < r.count; ++i)
-            flags[i] = 2;
-        const u16 value = 0x0100;
-        std::memcpy(pose + 0x38, &value, sizeof(value));
-    };
-    const auto cleanup = [&] {
-        if (g_bow_string_cleanup.Restore(g_bow_string_identity, r.count, r.bone, current.t)) {
-            B::ToHavok(current, locals[r.bone]);
-            dirty();
-        }
+    const bool reused = edited && B::LengthSq(current.t - written) < 1e-12f;
+    if (!active) {
+        if (reused) { current.t = original; B::ToHavok(current, locals[r.bone]); }
+        edited = false;
         Combat::BowPartNode().store(0, std::memory_order_release);
-    };
-    if (g_bow_string_dll && (!g_bow_string_module || g_bow_string_fault ||
-                             VR::Interactions::ProcessFaultLatch().Tripped())) {
-        cleanup();
-        return;
-    }
-    VR::Bow::StringFrame f{};
-    f.rig = g_bow_string_identity;
-    f.now_ns = now;
-    f.request_ns = req.ns;
-    f.count = r.count;
-    f.bone = r.bone;
-    f.enabled = VR::Bow::GetBowSettings().enabled;
-    f.target = req.target;
-    for (int i = 0; i < r.count; ++i) {
-        f.parents[i] = parents[i];
-        f.pose[i] = B::FromHavok(locals[i]);
-    }
-    if (!g_bow_string_policy.Step(f)) {
-        cleanup();
-        return;
-    }
-    if (g_bow_string_dll && VR::Interactions::ProcessFaultLatch().Tripped()) {
-        cleanup();
-        return;
-    }
-    const auto& result = g_bow_string_policy.Output();
-    if (!result.valid)
-        return;
-    if (result.write != VR::Bow::StringWrite::None) {
-        current.t = result.translation;
+        if (!reused) return;
+    } else {
+        if (!reused) original = current.t;
+        std::array<B::QsTransform, 64> local{};
+        for (int i = 0; i < r.count; ++i) local[i] = B::FromHavok(locals[i]);
+        if (!VR::Bow::MoveString(local.data(), parents, r.count, r.bone, req.target)) return;
+        current.t = local[r.bone].t;
         B::ToHavok(current, locals[r.bone]);
+        written = current.t;
+        edited = true;
     }
-    if (result.clear_node)
-        Combat::BowPartNode().store(0, std::memory_order_release);
-    g_bow_string_cleanup.Accept(f.rig, f.count, f.bone, result);
-    if (result.write != VR::Bow::StringWrite::None)
-        dirty();
+    // Same local-authoritative state as hkaPose::setPoseLocalSpace. The original
+    // hook tail calls syncModelSpace immediately after this callback.
+    for (int i = 0; i < r.count; ++i) flags[i] = 2;
+    const u16 dirty = 0x0100;
+    std::memcpy(pose + 0x38, &dirty, sizeof(dirty));
 }
 
 s32 MeleePartLine(int hand, B::Vec3& base, B::Vec3& tip, bool& seen) {
@@ -4614,40 +4483,27 @@ s32 MeleePartLine(int hand, B::Vec3& base, B::Vec3& tip, bool& seen) {
 // SpawnFFX_Blade dummies: the game draws the swing's trail between them, along the blade you
 // see), both on the weapon in the hand. False when the row has none or they are not shown.
 bool MeleeBladeTrail(u8* chr, B::Vec3& a, B::Vec3& b, s32& id_a, s32& id_b) {
-    const char* how = nullptr;
-    const auto* row = FirstGeometryRow(chr, g_tick, how);
-    if (!row)
+    constexpr float BladeNearM = 2.0f;
+    const TickState& t = g_tick;
+    if (!g_installed || chr == nullptr || chr != t.chr || t.moves == nullptr) {
         return false;
-    auto p = GeometryRow(*row);
-    p.operation = PI_NG_TRAIL;
-    for (int stage = 0; stage < 8; ++stage) {
-        PiNativeGeometryOutput o{};
-        if (!VR::Interactions::NativeGeometry(g_native_saw_module, p, o) || !o.valid)
-            return false;
-        const auto& s = o.state;
-        if (o.write_flags & PI_NGW_IDS) {
-            id_a = p.trail_base;
-            id_b = p.trail_tip;
-        }
-        if (o.write_flags & PI_NGW_BASE)
-            a = {s.base[0], s.base[1], s.base[2]};
-        if (o.write_flags & PI_NGW_TIP)
-            b = {s.tip[0], s.tip[1], s.tip[2]};
-        if (o.done)
-            return o.success;
-        B::Vec3 point{};
-        const bool have = DummyAt(chr, s.query, point);
-        p.operation = PI_NG_REPLY;
-        p.state = s;
-        p.reply_id = s.query;
-        p.flags = (p.flags & ~PI_NGF_HAVE) | (have ? PI_NGF_HAVE : 0);
-        p.point[0] = point.x;
-        p.point[1] = point.y;
-        p.point[2] = point.z;
     }
-    if (g_native_saw_module)
-        g_native_saw_module->ReportFault();
-    return false;
+    const M::MoveRow* row = nullptr;
+    const std::size_t first = t.form_b ? 3 : 0;
+    for (std::size_t k = first; k < first + 3 && row == nullptr; ++k) {
+        if (t.moves->rows[k].Valid()) {
+            row = &t.moves->rows[k];
+        }
+    }
+    B::Vec3 grip{};
+    if (row == nullptr || row->trail_base < 0 || row->trail_tip < 0 ||
+        !DummyAt(chr, RightWeaponDummy, grip)) {
+        return false;
+    }
+    id_a = row->trail_base;
+    id_b = row->trail_tip;
+    return DummyAt(chr, id_a, a) && DummyAt(chr, id_b, b) && B::Length(a - grip) <= BladeNearM &&
+           B::Length(b - grip) <= BladeNearM;
 }
 
 } // namespace VR::Bloodborne

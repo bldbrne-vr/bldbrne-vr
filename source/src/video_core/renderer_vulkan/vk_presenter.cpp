@@ -1,10 +1,13 @@
-#include "../../../scratchpad/dual-eye-perf/asymmetric_projection.h"
-#include "../../../scratchpad/dual-eye-perf/capture_marker.h"
+#include "common/render_diagnostic.h"
+#include "video_core/native_stereo/asymmetric_projection.h"
+#include "video_core/native_stereo/capture_marker.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "../../../scratchpad/dual-eye-perf/native_stereo.h"
+#include "video_core/native_stereo/native_stereo.h"
 #include "common/debug.h"
+#include "video_core/vma_fallback.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -15,6 +18,7 @@
 #include "core/libraries/system/systemservice.h"
 #include "core/vr/desktop_mirror.h"
 #include "core/vr/graphics_settings.h"
+#include "core/vr/graphics_status.h"
 #include "core/vr/live_tune.h"
 #include "imgui/friends_layer.h"
 #include "imgui/invitation_prompt_layer.h"
@@ -563,6 +567,7 @@ Presenter::~Presenter() {
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();
+    native_fsr1_probe.reset(); // destroy imported views before their Frame images
     rasterizer->SetVrStereoWarp(nullptr);
     rasterizer->SetVrUiLayer(nullptr);
     Check(draw_scheduler.CommandBuffer().reset());
@@ -618,8 +623,11 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     VkImage unsafe_image{};
     VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
 
-    VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
-                                     &unsafe_image, &frame->allocation, nullptr);
+    const VkResult result = VideoCore::CreateWithFallback(
+        "a frame image", alloc_info, [&](const VmaAllocationCreateInfo& ci) {
+            return vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &ci, &unsafe_image,
+                                  &frame->allocation, nullptr);
+        });
     if (result != VK_SUCCESS) [[unlikely]] {
         LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}",
                      vk::to_string(vk::Result{result}));
@@ -721,7 +729,7 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
     return {};
 }
 
-#include "../../../scratchpad/dual-eye-perf/native_present.inl"
+#include "video_core/native_stereo/native_present.inl"
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address, const VR::FrameTag& vr_tag) {
@@ -839,6 +847,14 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         }
     }
 
+    if (vr_tag.immersive) {
+        RENDER_DIAGNOSTIC_ONCE("immersive flip native_enabled={} source_layered={} source={}x{} format={} hdr={} warp={} xr={}",
+            NativeStereo::Enabled(), image.native_stereo, image_size.width, image_size.height,
+            static_cast<int>(view_info.format), frame->is_hdr, bool(vr_warp), bool(openxr_presenter));
+        if (NativeStereo::Enabled() && !image.native_stereo) {
+            RENDER_DIAGNOSTIC_ONCE("native immersive flip has no stereo source layers");
+        }
+    }
     // Continue with host-side passes that draw the displayed (scaled) frame.
     image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
                   cmdbuf);
@@ -918,6 +934,30 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         vr_warp->BeginFrame(0);
         vr_ui_layer->EndFrame();
         rasterizer->VrEndFrame();
+    }
+
+    // One diagnostic window per process; loading/flat flips cannot consume it.
+    // Eye allocations persist across Frame reuse; only count them as current when
+    // this flip actually produced stereo. Recording a copy does not validate pixels.
+    static Common::RenderDiagnostic::FirstStereoTransition first_transition;
+    if (const auto sample = first_transition.Observe(vr_tag.immersive)) {
+        try {
+            const bool current = frame->vr_stereo;
+            const auto left = current ? frame->vr_eye_extent[0] : vk::Extent2D{};
+            const auto right = current ? frame->vr_eye_extent[1] : vk::Extent2D{};
+            Common::RenderDiagnostic::Write(fmt::format(
+                "first VR transition immersive_flip={}/120 saw_flat={} immersive={} valid={} hold={} "
+                "native={} layered={} source={}x{} format={} hdr={} warp={} xr={} "
+                "stereo={} copy_recorded={} L_present={} L={}x{} R_present={} R={}x{} "
+                "ui_valid={} mirror_requested={} mirror_eye_active={} graphics_status={}",
+                sample, first_transition.saw_flat, vr_tag.immersive, vr_tag.valid, vr_tag.hold,
+                NativeStereo::Enabled(), image.native_stereo, image_size.width, image_size.height,
+                static_cast<int>(view_info.format), frame->is_hdr, bool(vr_warp), bool(openxr_presenter),
+                current, frame->vr_published, current && bool(frame->vr_eye_image[0]),
+                left.width, left.height, current && bool(frame->vr_eye_image[1]),
+                right.width, right.height, frame->vr_ui.valid, static_cast<int>(mirror_view),
+                frame->vr_desktop_eye, VR::Graphics::run_status.load(std::memory_order_relaxed)));
+        } catch (...) { /* Diagnostic formatting must not interrupt rendering. */ }
     }
 
     DebugState.game_resolution = {image_size.width, image_size.height};

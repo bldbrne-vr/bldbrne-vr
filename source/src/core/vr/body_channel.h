@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
@@ -34,6 +40,7 @@ namespace VR::Body {
 // After every main-player pose copy (pose hook). A status older than about 250 ms means the hook
 // is not running (loading, third person, the body off).
 struct BodyStatus {
+    GrabCamera::ThrowPlacement throw_placement{};
     GrabCamera::Sample grab_eye{}; // unmodified animation, before VR body/visibility edits
     VialContact::Anatomy injection_body{};
     BodyMounts::Pose mounts{};

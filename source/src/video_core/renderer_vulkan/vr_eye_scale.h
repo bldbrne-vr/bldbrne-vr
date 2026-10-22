@@ -1,8 +1,14 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
+// Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
+// You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
+// keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
+// licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #pragma once
 
-// vr.ini eye_size (documents/bloodborne-vr.md "Sharpness"): how large each eye image goes to the
+// vr.ini eye_size: how large each eye image goes to the
 // headset, from its crop of the render. Header-only (tests/test_eye_scale.cpp); used by
 // OpenXRPresenter::EyeOutputExtents and VrEyeUpscale.
 
@@ -147,7 +153,7 @@ struct Choice {
 // The default of vr.ini eye_size_min_factor: auto never shows the crop as rendered with only RCAS
 // on its raw pixels (3200x2400 at Link 1x: x1.0, +80% stair-steps in the Dream against 2560's
 // x1.23 EASU); a small EASU step does as well as the panel size (+29% / +5% at equal sharpness,
-// +0.13 ms of late warp; res/r1_precheck.md, 2026-10-07).
+// +0.13 ms of late warp; 2026-10-07).
 inline constexpr float DefaultMinFactor = 1.13f;
 
 // The factor for eye crops `crops` (render pixels):
