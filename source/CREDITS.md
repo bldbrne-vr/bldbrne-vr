@@ -41,6 +41,9 @@ Bloodborne VR builds on the work of many people. Licences and notices are in
 
 ## VR body, hands and items: ideas and tuning
 
+These projects were inspiration only: the ideas and tuning below were studied and implemented
+independently in this project. No code has been taken from them.
+
 - **FRIK** (the Fallout 4 VR body mod): the clavicle reach toward far targets and its constants
   (`src/core/vr/arm_ik.h`).
 - **BetterVR** (the Breath of the Wild VR mod for Cemu): the elbow pole in body space, out to the
