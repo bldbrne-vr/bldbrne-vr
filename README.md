@@ -255,6 +255,13 @@ For software licences, third-party notices and attribution, see [Notices](source
 
 ## Changelog
 
+### 0.5.6
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.5.6)
+
+- **Far shadows** in the VR settings (Graphics): Reduced, the new default, skips the farthest shadows for more FPS in big open areas; Full draws them all. It applies at once.
+- Sharper shadows with foveated rendering on.
+
 ### 0.5.5
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.5.5)
