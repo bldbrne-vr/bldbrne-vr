@@ -255,6 +255,21 @@ For software licences, third-party notices and attribution, see [Notices](source
 
 ## Changelog
 
+### 0.5.5
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.5.5)
+
+- **Fewer and shorter hitches:** smoother streaming into new areas, memory freed in the background, and no more full GPU flush from the game's copy shader.
+- **Sharp menus with foveated rendering:** the pause and equipment menus, echoes and insight are drawn at full detail; only the 3D world is foveated.
+- **More GPU headroom:** stronger foveated rendering by default, foveation in DIBR mode too, and a cheaper HUD.
+- **Upscaler presets:** Ultra Performance, Performance, Balanced, Balanced Plus, Quality and Ultra Quality, each with its own DLSS model.
+- **Less graphics memory:** about 1 GB less at 2000 x 2160 per eye with DLSS Quality.
+- **Faster on Intel CPUs:** no power-saving cores, and the missing SSE4a instructions are replaced in advance.
+- **Upscaler changes wait for a restart** instead of half-applying live.
+- **Slightly stronger aim help** for thrown items, and retuned melee charge timing.
+- **Launcher:** per-eye size, a graphics memory estimate and a headset list under Scaling.
+- Fixed: As the player height after a recenter from the headset's button (Meta Link), and disappearing body slots and wrist vitals at some per-eye sizes.
+
 ### 0.5.0
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.5.0)
