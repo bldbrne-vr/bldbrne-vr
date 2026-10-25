@@ -255,6 +255,16 @@ For software licences, third-party notices and attribution, see [Notices](source
 
 ## Changelog
 
+### 0.7.0
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.7.0)
+
+- **Smooth busy areas**: Frame overlap (VR settings > Graphics, on by default) lets the game prepare its next frame while the current one is finished. The constant jitter when looking around in places like Old Yharnam and the Sewers is gone.
+- **Solid weapons hit walls**: your weapons stop at walls and level geometry, not only at each other (VR settings > Weapons > Solid weapons).
+- **Fewer shadows when busy** (VR settings > Graphics, off by default): in very busy views it also skips the next-farthest shadows.
+- **Quick items stay put**: the item cards no longer turn and roll with your head.
+- Upscaling (DLSS / FSR): every scene draw now gets the upscaler's jitter.
+
 ### 0.5.6
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.5.6)
