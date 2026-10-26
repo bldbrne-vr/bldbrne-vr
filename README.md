@@ -185,6 +185,7 @@ Defaults below are for a fresh configuration of this version; existing saved set
 | **Exhaustion desaturation** | On | Briefly soften colors at exhausted stamina, then fade back. Never full grayscale. |
 | **Stamina intensity** | 50% | Strength of the brief exhaustion effect. |
 | **Shoulder weapon switch** | On | B at right shoulder / Y at left: tap to switch, hold about 0.7 seconds for unarmed. Tap unarmed to restore the remembered weapon. |
+| **Riposte burst** | On | A visceral's rip flashes the view black, red and white with ink outlines, for under a second. |
 
 </details>
 
@@ -193,7 +194,7 @@ Defaults below are for a fresh configuration of this version; existing saved set
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| **Solid weapons** | Weapons only | Stop at walls and each other. Weapons only: just each other. |
+| **Solid weapons** | On | Stop at walls and each other. Weapons only: just each other. |
 | **Grip guide** | On | Hold the right grip to show where your left hand can grab. |
 | **Swing feel** | 100% | Faint feedback during fast swings with both hands on one weapon. |
 | **Wrist-flick reload** | On | After a shot, release the trigger and flick your left wrist firmly in any direction to reload. |
@@ -232,6 +233,7 @@ Defaults below are for a fresh configuration of this version; existing saved set
 | **DLSS** | Off | NVIDIA RTX cards: renders smaller and reconstructs both eyes. Use **SAVE AND RESTART**: the change applies from the next start. |
 | **FSR** | Off | FSR 4 or FSR 3.1.5: renders smaller and reconstructs both eyes. Turns DLSS off. |
 | **Profile** | Balanced | Ultra Performance (33% of the output size), Performance (50%), Balanced (58%) or Quality (67%). DLSS and FSR remember their own profile. |
+| **Native stereo eyes** | Auto | Launcher only. Multiview: the graphics driver repeats each draw. Layers: each eye is drawn on its own, which fixes a white right eye on AMD RX 6000 cards. Auto uses layers on RX 6000 and multiview on all other cards. Applies at the next launch. |
 
 </details>
 
@@ -254,6 +256,20 @@ No game files are included. You must provide your own lawfully obtained copy of 
 For software licences, third-party notices and attribution, see [Notices](source/NOTICE.md), [Licence](source/LICENSE) and [Credits](source/CREDITS.md).
 
 ## Changelog
+
+### 0.8.0
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.0)
+
+- **Riposte burst** (on by default): a parry riposte or a backstab flashes your view black, blood red and white with ink outlines.
+- **Weapons clash with their real shapes**: your two weapons meet where they really are (the folded Saw Cleaver's blade, an axe's head, the scythe's curve), not along a thin line. Walls still meet a line along the blade.
+- **DLSS and FSR in DIBR**: the upscalers now work with DIBR stereo too.
+- **AMD Radeon**: no more white right eye on RX 6000 cards (new **Native stereo eyes** option, Auto by default); with DLSS or FSR the HUD is no longer doubled and the wrist display shows; no shader recompiles when switching DIBR and native; FSR 3.1.5 is recommended on AMD.
+- **Lighter HUD**: much less copying for the HUD each frame, most noticeable on AMD cards.
+- **Lean dodge**: 250 ms of invincibility (was 200).
+- **Molotov fire** reaches 1.5 times as far.
+- **PERF SCAN**: clearer results with a big Apply button, and it now works on every supported game version, with or without The Old Hunters.
+- Choosing a PKG file as the game now explains that the extracted game folder is needed.
 
 ### 0.7.0
 
