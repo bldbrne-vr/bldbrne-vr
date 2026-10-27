@@ -259,6 +259,15 @@ For software licences, third-party notices and attribution, see [Notices](source
 
 ## Changelog
 
+### 0.8.2
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.2)
+
+- **Accurate game timing**: the game measures every frame and moves by its real length (bbport's frame-rate hooks) instead of a fixed 60 FPS frame, so movement, dodges, attacks, camera smoothing, cloth and effects stay right through dips and frame-rate caps. On for everyone; same frame rate.
+- **FSR Balanced Plus** renders at 62% (it was the same as Balanced, 58%).
+- **DLSS** is a little lighter on the GPU (8-bit colour copies for the game's 8-bit picture).
+- **PERF SCAN** asks for 13.8% headroom (was 13.5%).
+
 ### 0.8.1
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.1)
