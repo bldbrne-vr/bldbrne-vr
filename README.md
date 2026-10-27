@@ -42,9 +42,9 @@ These are the default **Motion** controls with **Move with: Left stick**, using 
 - **Move:** push the stick. **Run:** click it while moving; centre it to stop running.
 - **Jump:** while running forward, press **A** on the right controller or click the left stick again. Steering away from your run direction makes A dodge instead.
 - **Shoot / parry:** aim your gun and press the trigger.
-- **Quick items:** squeeze the grip to open the item arc; use the trigger on a card to take or use it. With body slots enabled, grip at a pouch to take its item.
+- **Quick items:** squeeze the grip to open the quick-item fan, move your hand a little toward an item to light it and use the trigger to take or use it; pull the hand away to close. With body slots enabled, grip at a pouch to take its item, or reach over your right shoulder with the left hand and grip for a Blood Vial.
 - **Heal:** press **X**, then bring the vial to your wrist or body. Press X again to put it away. With **Blood Vial: Button**, X heals directly.
-- **Y:** open the item arc. On SteamVR's menu layout, Y opens the game menu instead; hold it to recenter.
+- **Y:** open the quick-item menu. On SteamVR's menu layout, Y opens the game menu instead; hold it to recenter.
 - **Menu:** open the game menu; hold to recenter. On SteamVR, this button opens the dashboard instead.
 
 ### RIGHT CONTROLLER
@@ -60,7 +60,7 @@ These are the default **Motion** controls with **Move with: Left stick**, using 
 
 ### Physical actions
 
-- **Soft dodge:** lean, step or duck to move the hunter out of a blow. This physical evasion does not play a roll animation; the separate lean-to-roll option is off by default.
+- **Soft dodge:** lean, step or duck to move the hunter out of a blow. A quick lean, or a quick duck of at least 18 cm, also gives a moment of invincibility. This physical evasion does not play a roll animation; the separate lean-to-roll option is off by default.
 - **Switch at the shoulder:** with **Shoulder weapon switch** enabled, tap **B at your right shoulder** or **Y at your left shoulder**. Hold there for about **0.7 seconds** to go unarmed; tap again to draw your weapon back.
 - **Two-hand a weapon:** squeeze the right grip to free your left hand, bring the left hand to the handle, then squeeze the left grip. Release **both grips** to let go. The Whirligig Saw skips the initial right-grip squeeze.
 - **Split Blade of Mercy / Rakuyo:** squeeze the right grip, grip the hilt with your left hand, then pull apart. To rejoin, bring the blades together side by side and squeeze the left grip again.
@@ -172,6 +172,8 @@ Defaults below are for a fresh configuration of this version; existing saved set
 | --- | --- | --- |
 | **Item access** | Menu | Choose the quick-item menu, body pouches, or both. Body pouches use the left grip; pocket/chest items follow equipped quick slots 1/2. |
 | **Pouch touch feedback** | On | A small vibration when your hand finds a pouch. |
+| **Shoulder vial** | On | Reach over your right shoulder with the left hand and squeeze the grip to draw a Blood Vial. Needs Item access: Body slots or Both. |
+| **Quick item menu** | Fan A | Fan A (gothic panes) or Fan B (engraved brass): move the hand a little toward an item from where the menu opened; pull it away to close. Boxes: the old arc of cards, your fist on an item. |
 
 </details>
 
@@ -256,6 +258,20 @@ No game files are included. You must provide your own lawfully obtained copy of 
 For software licences, third-party notices and attribution, see [Notices](source/NOTICE.md), [Licence](source/LICENSE) and [Credits](source/CREDITS.md).
 
 ## Changelog
+
+### 0.8.1
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.1)
+
+- **New quick item menu**: your items on a fan round the left hand; Fan A is the new default (Fan B and the old Boxes in VR settings > Inventory and the launcher).
+- **Shoulder vial**: left hand over the right shoulder + grip draws a Blood Vial.
+- **Duck**: ducks like a crouch, and a quick duck (18 cm) gives 125 ms of invincibility. **Lean dodge** is a little easier (1.18 m/s).
+- **HUD in VR**: HP, items, echoes and insight in their own rows above the view; banners and the area name below it.
+- **Fixed**: missing prompts, item pop-ups, HUD and game menu in Central Yharnam, the Tomb of Oedon and the Great Bridge later in the story; the game menu darkens the world again.
+- **Fixed**: the street smeared to the horizon after many lamp trips; video memory left over from earlier areas is freed when the card runs low.
+- **Fixed**: an NPC close to you (Eileen in the Crow set) no longer loses her mask or more in Hands only or Arms only.
+- Healing: a full vial from the pouch right after a heal, and a short wait before X raises the next one. Items show their pickup prompt 10% further away.
+- Even foveation at the top and bottom; AMD RX 400/500/5000 start in DIBR; Steam Frame d-pad works as X/Y; slightly lower CPU cost.
 
 ### 0.8.0
 
