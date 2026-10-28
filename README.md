@@ -259,6 +259,17 @@ For software licences, third-party notices and attribution, see [Notices](source
 
 ## Changelog
 
+### 0.8.3
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.3)
+
+- **Two-handed weapons rebuilt**: your right hand leads a grab (your left if it grabs in front), the other hand slides along the weapon, and the rear hand has a lighter say that fades as your hands come together, the same whichever hand leads. Big weapons no longer wobble or spin, and heavy ones feel heavy, each with its own heft.
+- **Slide mode**: hold B to slide both hands; the front hand takes the lead. On long handles, hold Y to push the weapon through your lead fist like a spear thrust.
+- **Experimental two-handed controls** (off by default): stick click transforms, left trigger grabs the handle, each grip slides its own hand.
+- **Viscerals no longer clip into your face**, the stagger lasts longer, and stabbing into a visceral is more forgiving.
+- **DLSS 5** (experimental, RTX 50-series): bring NVIDIA's own file; the launcher finds and checks it.
+- Weapon switching is at the shoulders only; the Toggle B option is gone (B is hold to slide). Torches hit walls, and the launcher has a Non-aggro mode.
+
 ### 0.8.2
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.2)
