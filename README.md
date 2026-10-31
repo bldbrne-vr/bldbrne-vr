@@ -4,6 +4,10 @@ SPDX-FileCopyrightText: 2026 BB-VR contributors
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
+<p align="center">
+  <img src="assets/icon.png" alt="Bldbrne-VR icon" width="180">
+</p>
+
 # Night of the Hunt VR
 
 An unofficial, independent VR mod for Bloodborne. No game files are included.
