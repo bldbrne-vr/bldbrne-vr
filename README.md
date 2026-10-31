@@ -259,7 +259,7 @@ For software licences, third-party notices and attribution, see [Notices](source
 
 ## Thanks
 
-Thanks to **Dirol** (dishisolo) for feedback and suggestions.
+Thanks to **Dirol** (dishisolo) for awesome feedback and suggestions.
 
 ## Changelog
 
