@@ -257,6 +257,10 @@ No game files are included. You must provide your own lawfully obtained copy of 
 
 For software licences, third-party notices and attribution, see [Notices](source/NOTICE.md), [Licence](source/LICENSE) and [Credits](source/CREDITS.md).
 
+## Thanks
+
+Thanks to **Dirol** (dishisolo) for feedback and suggestions.
+
 ## Changelog
 
 ### 0.8.5
