@@ -259,6 +259,18 @@ For software licences, third-party notices and attribution, see [Notices](source
 
 ## Changelog
 
+### 0.8.5
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.5)
+
+- **A simpler VR settings menu**: nine tabs, settings that were two rows are one choice, and a single Upscaler row (Off / DLSS / FSR 4 / FSR 3.1.5 / DLSS 5). A tab with more settings has a second page on the strip under its name.
+- **Soft save** (experimental): save the moment you are in, and after a death choose your soft save or the last lantern. It works on your own save once the launcher has backed it up, which it does at every launch.
+- **Monocular**: a true zoomed view in each eye, zoomed with the trigger or a turn of the wrist, and stabilized.
+- **Free camera**: fly the view while the hunter stays put and enemies ignore him; Y brings you back.
+- **Hand Lantern**: carried in your hand, it swings as you move and lights the world; stowed, it hangs from your belt.
+- **Launcher**: new players start with an upscaler picked for their graphics card, the resolution warning is hard to miss and offers a PERF SCAN, a Controls page covers Quest, PSVR and Frame, and Sharper skies makes AI-upscaled skies from your own game files.
+- Faster on 4-core CPUs and NVIDIA cards, the Mensis scripted lever is pulled by hand, and fixes for projectile aiming, blade sounds and the Mensis chest.
+
 ### 0.8.3
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.3)
