@@ -267,6 +267,16 @@ Thanks to **Dirol** (dishisolo) for awesome feedback and suggestions.
 
 ## Changelog
 
+### 0.8.6
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.6)
+
+- **Hunter tools**: grab a tool and use it with your hands. With no bullets, you can't pick it up.
+- **Block bullets** with your weapon and knock them back at the shooter.
+- **Stronger visceral effect** that lasts until you pull your hand out.
+- **Heavy attacks** need a big wind-up and work once every 4 seconds (or hold the trigger). Enemies take a few more hits.
+- Easier lean and duck dodges, better performance, FSR 4.1.2 for AMD cards, and fixes.
+
 ### 0.8.5
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.5)
