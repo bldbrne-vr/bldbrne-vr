@@ -267,6 +267,12 @@ Thanks to **Dirol** (dishisolo) for awesome feedback and suggestions.
 
 ## Changelog
 
+### 0.8.8
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.8)
+
+- **Fixed: "Choose a folder or file first."** The launcher no longer refuses to start the game over the optional DLC folder. It tells you if it found The Old Hunters, and the game always starts.
+
 ### 0.8.7
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.7)
