@@ -267,6 +267,12 @@ Thanks to **Dirol** (dishisolo) for awesome feedback and suggestions.
 
 ## Changelog
 
+### 0.8.81
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.81)
+
+- **DLC INCLUDED**: with the Game of the Year Edition, the launcher says so and no longer shows an empty DLC folder box. It checks that The Old Hunters is really in your game folder first.
+
 ### 0.8.8
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.8)
