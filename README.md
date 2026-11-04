@@ -267,6 +267,16 @@ Thanks to **Dirol** (dishisolo) for awesome feedback and suggestions.
 
 ## Changelog
 
+### 0.8.7
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.7)
+
+- **Tiny Tonitrus**: hold the trigger until it crackles, then strike. The lightning goes where you look, with a brand-new bolt and a thunder crack in your hand.
+- **New hunter tools**: the Augur, Beast Roar, A Call Beyond and the Executioner's Gloves have new animated models. Crush the Augur and its tentacles shoot from your fist. Hold Beast Roar and the claw clenches, then bursts open with a roar.
+- **Grab the dead**: unarmed, your fingers follow your controller. Push, lift and carry corpses with your bare hands.
+- **Smoother play**: much less stutter on your first hits, faster starts, and fewer drops on 6-8 GB graphics cards.
+- Pouches that stay put, PS VR2 vibration with feeling, a better launcher, and fixes.
+
 ### 0.8.6
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.6)
