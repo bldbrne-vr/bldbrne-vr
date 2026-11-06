@@ -116,6 +116,7 @@ Defaults below are for a fresh configuration of this version; existing saved set
 | **Hunter's body** | Full | See the hunter's whole body, only his hands and forearms, or only his hands. |
 | **World size (eye distance)** | Standard (64 mm) | A smaller eye distance makes the world look larger. |
 | **Scenes on a screen** | On | Show grabs, viscerals, doors and ladders on a virtual screen. |
+| **Skip ladder climbs** | Off | Long ladders go dark while you climb at speed, and you're back at the top or bottom in seconds. Needs **Scenes on a screen**. |
 
 </details>
 
@@ -266,6 +267,16 @@ For software licences, third-party notices and attribution, see [Notices](source
 Thanks to **Dirol** (dishisolo) for awesome feedback and suggestions.
 
 ## Changelog
+
+### 0.9.2
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.2)
+
+- **Smooth turning, smooth again**: no more stutter after travelling between lamps.
+- **Logarius' Wheel in both hands**: grab its far handle to transform it, then three quick pulls of the left trigger unleash its spin.
+- **Pull-start the Boom Hammer**: every right-grip squeeze is a pull until it roars to life.
+- **Skip ladder climbs**: a new Comfort option (off by default) that rushes you up or down long ladders behind a dark screen.
+- **Heavier cannon, Executioner's Gloves and more frames**: a bigger kick, gather-and-throw gloves, a lighter desktop window, and fixes.
 
 ### 0.9.1
 
