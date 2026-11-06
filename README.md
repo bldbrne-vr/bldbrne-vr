@@ -267,11 +267,12 @@ Thanks to **Dirol** (dishisolo) for awesome feedback and suggestions.
 
 ## Changelog
 
-### 0.9.0
+### 0.9.1
 
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.0)
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.1)
 
 - **A secret in the Hunter's Dream**: something waits there for inquisitive and caring hunters to discover.
+- **Easier flick to reload**: snap the muzzle up, then lower it a little.
 - **Blood Bullets by hand**: use your right hand to pull an empty syringe from your left shoulder, then stab it into your arm to turn blood into bullets.
 - **Meaner hunter tools**: new throws, embers, splatters and sounds, and poison or frenzy creeping in at the edges of your view.
 - **Chalice levers, sharper weapons, steady stairs**: pull dungeon levers by hand, upscale weapon textures 2x, no more bobbing on stairs or swinging god rays.
