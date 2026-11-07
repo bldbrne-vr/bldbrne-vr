@@ -116,7 +116,7 @@ Defaults below are for a fresh configuration of this version; existing saved set
 | **Hunter's body** | Full | See the hunter's whole body, only his hands and forearms, or only his hands. |
 | **World size (eye distance)** | Standard (64 mm) | A smaller eye distance makes the world look larger. |
 | **Scenes on a screen** | On | Show grabs, viscerals, doors and ladders on a virtual screen. |
-| **Skip ladder climbs** | Off | Long ladders go dark while you climb at speed, and you're back at the top or bottom in seconds. Needs **Scenes on a screen**. |
+| **Skip ladder climbs** | On | Long ladders go dark while you climb at speed, and you're back at the top or bottom in seconds. Needs **Scenes on a screen**. |
 
 </details>
 
@@ -214,9 +214,11 @@ Defaults below are for a fresh configuration of this version; existing saved set
 
 | Option | Default | What it does |
 | --- | --- | --- |
+| **VR interactions** | Immersive | Doors, gates, chests and coffins open, and lamps light, without pulling you out of your eyes. Flat: the hunter's own animations. |
 | **Physical levers** | On | Grip a lever with either hand and pull. Off: original interaction. |
 | **Lamp rest & travel** | On (experimental) | Rest, refill and travel between lit lamps. Offline only. Experimental. |
 | **VR Grab attacks** | Off | Stay in VR during enemy grabs. The view follows the hunter. Off: existing behavior. |
+| **Doll respec** | On | The Doll offers Rechannel Blood Echoes: move points between attributes for free at the same level, each down to the lowest any origin starts it (7/8/9/9/5/6). |
 
 </details>
 
@@ -240,6 +242,7 @@ Defaults below are for a fresh configuration of this version; existing saved set
 | **DLSS** | Off | NVIDIA RTX cards: renders smaller and reconstructs both eyes. Use **SAVE AND RESTART**: the change applies from the next start. |
 | **FSR** | Off | FSR 4 or FSR 3.1.5: renders smaller and reconstructs both eyes. Turns DLSS off. |
 | **Profile** | Balanced | Ultra Performance (33% of the output size), Performance (50%), Balanced (58%) or Quality (67%). DLSS and FSR remember their own profile. |
+| **Foveated upscale** | Medium | DLSS or FSR works only the middle of each eye (Quality 90%, Medium 85%, Performance 75% of each side) and a lighter pass smooths the edges, for more frames. Off: the whole eye. Applies at the next start. |
 | **Native stereo eyes** | Auto | Launcher only. Multiview: the graphics driver repeats each draw. Layers: each eye is drawn on its own, which fixes a white right eye on AMD RX 6000 cards. Auto uses layers on RX 6000 and multiview on all other cards. Applies at the next launch. |
 
 </details>
@@ -267,6 +270,16 @@ For software licences, third-party notices and attribution, see [Notices](source
 Thanks to **Dirol** (dishisolo) for awesome feedback and suggestions.
 
 ## Changelog
+
+### 0.9.3
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.3)
+
+- **The Amygdalan Arm, alive**: in whip form it lashes out to 3.5 m, grabs and hurls whatever it hits, and stabs straight ahead from a still hand.
+- **Stake Driver, kicked shut**: the charged blast slams the stake back into its normal form, with a second jolt in your hand as it locks.
+- **No more slowdown in long sessions**: the frame rate holds after hours and many areas.
+- **Foveated upscaling on by default**: DLSS or FSR on the middle of each eye, more frames everywhere else.
+- **Doors, chests and lamps in VR, and a Doll respec**: open and light them without leaving your eyes, move your stat points for free at the Doll, ladder skip on by default, a new launcher, and fixes.
 
 ### 0.9.2
 
