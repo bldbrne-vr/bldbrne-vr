@@ -271,6 +271,12 @@ Thanks to **Dirol** (dishisolo) for awesome feedback and suggestions.
 
 ## Changelog
 
+### 0.9.31
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.31)
+
+- **Ludwig's arena no longer crashes**: walking into the Ludwig fight could close the game.
+
 ### 0.9.3
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.3)
