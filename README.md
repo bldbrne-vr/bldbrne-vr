@@ -271,6 +271,15 @@ Thanks to **Dirol** (dishisolo) for awesome feedback and suggestions.
 
 ## Changelog
 
+### 0.9.32
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.32)
+
+- **VR menus hold steady on Virtual Desktop**: the settings and lamp menus no longer sway the world with your head.
+- **The Brain of Mensis lever works**: it uses the game's own prompt again.
+- **The Amygdalan Arm snaps back cleaner**: small swings pull it straight back in, no more flailing.
+- **Dodging explained** in the controls guide: lean, step aside or duck under a swing.
+
 ### 0.9.31
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.31)
