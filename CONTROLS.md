@@ -18,7 +18,7 @@ For your connected controllers and current settings, open **Show VR controls** o
 ## RIGHT CONTROLLER
 
 - **Swing your hand:** attack with your melee weapon.
-- **Trigger:** prepare a heavy attack; hold to charge, then swing.
+- **Trigger:** prepare a heavy attack; hold to charge, then swing. A short ring tells you a charged attack is ready (on weapons that have one).
 - **Grip:** transform or prepare the weapon for a physical action, depending on the weapon (see below). Hold to show the two-hand grip guide when **Grip guide** is enabled.
 - **Stick left/right:** turn using your chosen snap or smooth turning mode.
 - **Stick down:** cycle to the next quick item. **Hold up:** make blood bullets.
@@ -46,7 +46,7 @@ With **Shoulder weapon switch** enabled:
 
 - **Right-hand weapon:** reach over your **right shoulder** and tap **B** to switch weapons.
 - **Left-hand weapon:** reach over your **left shoulder** and tap **Y** to switch weapons.
-- **Go unarmed:** keep the hand at its shoulder and **hold B or Y for about 0.7 seconds** to put away that hand's weapon.
+- **Go unarmed:** keep the hand at its shoulder and **hold B or Y for about 0.4 seconds** to put away that hand's weapon.
 - **Draw again:** while unarmed, tap the same shoulder button to draw your weapon back.
 
 You can also switch weapons by holding the **right stick click** and pushing the stick left or right.
@@ -86,7 +86,11 @@ These apply to Motion controls with physical weapon transformations enabled:
 - **Beast Claw:** hold the right grip for two seconds to transform.
 - **Simon's Bowblade:** hold the right grip for half a second to open the bow; squeeze again to close it. With the bow in your right hand, bring the arrow in your left hand to the string, squeeze the left trigger, pull back, and release the trigger to shoot. Take subsequent arrows from over your shoulder with the left trigger. Let the string down before releasing to cancel a shot.
 - **Shield:** raise the shield in front of you to block.
-- **Wrist-flick reload, when enabled:** after a shot, release the trigger and flick your left wrist firmly in any direction to reload.
+- **Beast Cutter:** hold the right grip to turn it into the whip. The chain flies along your swing: big, wide swings throw it all the way out, a lazy one keeps it short. Stop and it reels back in; swing again and it stays out. The trigger or a flick back pulls it in at once.
+- **Amygdalan Arm:** hold the right grip to transform. Swing and the tentacle lashes out, then sags and comes back when you stop. Hold the trigger and it grabs what it hits: yank them, swing them round and hurl them. Press the trigger with your hand still to stab straight ahead.
+- **Logarius' Wheel:** grab its second handle with your left hand to transform it. Each quick pull of the left trigger spins the wheel a step further and stacks a stronger arcane buff.
+- **Stake Driver:** in its transformed form, hold the right trigger for about a second until the ready buzz, then release to fire the blast; it kicks the stake back into its normal form.
+- **Flick to reload, when enabled:** after a shot, release the trigger and snap the muzzle up (or flick it down sharply) to reload.
 
 ## Physical gestures
 

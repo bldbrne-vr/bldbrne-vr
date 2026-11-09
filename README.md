@@ -17,8 +17,6 @@ An unofficial, independent VR mod for Bloodborne. No game files are included.
 - [Portable (zip)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Portable.zip)
 - [Installer (Windows)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Setup.exe)
 
-Already on 0.2.6 or earlier? Let the launcher update, then choose **Install the new version** on the Play page once. Your settings and saves come with you.
-
 ## Supported game version
 
 Bloodborne for PS4, version 1.09. Tested with CUSA03173 and CUSA00900.
@@ -33,9 +31,9 @@ Bloodborne for PS4, version 1.09. Tested with CUSA03173 and CUSA00900.
 
 **No separate shadPS4 is needed.** The mod ships its own VR build of shadPS4 and always uses it; it is updated together with the launcher.
 
-Weaker graphics card, or the game crashes often? Tick **Use DIBR** on the Play page.
+Weaker graphics card, or the game crashes often? Tick **Simplified Rendering** on the Play page (some AMD cards start with it on).
 
-The first launch may stutter while shaders are built. Existing saves are used in place; use **Save backups** in the launcher to back them up before playing.
+The first start builds the game's shaders before you play (after an update, the VR ones once more); The Old Hunters' are included if you own it. Existing saves are used in place; use **Save backups** in the launcher to back them up before playing.
 
 ## Controls
 
@@ -53,7 +51,7 @@ These are the default **Motion** controls with **Move with: Left stick**, using 
 
 ### RIGHT CONTROLLER
 
-- **Attack:** swing your weapon. **Heavy attack:** hold the trigger to charge, then swing.
+- **Attack:** swing your weapon. **Heavy attack:** hold the trigger to charge, then swing. A short ring tells you a charged attack is ready.
 - **Grip:** transform or prepare a physical weapon action; see the examples below.
 - **Turn:** move the stick left/right. **Target / lock on:** click the stick.
 - **Switch weapons:** hold the stick click and push left/right for that hand's equipped weapons.
@@ -65,7 +63,7 @@ These are the default **Motion** controls with **Move with: Left stick**, using 
 ### Physical actions
 
 - **Soft dodge:** lean, step or duck to move the hunter out of a blow. A quick lean, or a quick duck of at least 18 cm, also gives a moment of invincibility. This physical evasion does not play a roll animation; the separate lean-to-roll option is off by default.
-- **Switch at the shoulder:** with **Shoulder weapon switch** enabled, tap **B at your right shoulder** or **Y at your left shoulder**. Hold there for about **0.7 seconds** to go unarmed; tap again to draw your weapon back.
+- **Switch at the shoulder:** with **Shoulder weapon switch** enabled, tap **B at your right shoulder** or **Y at your left shoulder**. Hold there for about **0.4 seconds** to go unarmed; tap again to draw your weapon back.
 - **Two-hand a weapon:** squeeze the right grip to free your left hand, bring the left hand to the handle, then squeeze the left grip. Release **both grips** to let go. The Whirligig Saw skips the initial right-grip squeeze.
 - **Split Blade of Mercy / Rakuyo:** squeeze the right grip, grip the hilt with your left hand, then pull apart. To rejoin, bring the blades together side by side and squeeze the left grip again.
 - **Physical gestures:** near the Doll, bow, point/wave, or raise a hand for rally/approval. Make Contact is also recognised; see the guide below for its pose and encounter. The corresponding gesture must be learned. Hold **Y**, then press **B** for the normal gesture menu.
@@ -75,22 +73,32 @@ These are the default **Motion** controls with **Move with: Left stick**, using 
 
 **Using different controls?** Hold both stick clicks for one second to switch Motion / Buttons. **Move with: Right stick** swaps sticks, stick clicks and face-button actions; triggers, grips and weapon hands stay in place.
 
+### Playing with a gamepad
+
+Choose **Play style: Gamepad, first person** or **Gamepad, third person** on the Play page. You play with the game's own buttons; the options that need tracked hands are set for you and locked, and your motion settings come back when you switch to Motion controls. Your VR controllers keep working alongside.
+
+- **Options:** tap for the game's menu (it also skips cutscenes). Hold 0.7 seconds to recenter; on the flat screen, hold 2.5 seconds to go back to VR.
+- **First person:** the right stick turns you; hold it back to turn around.
+- **Third person:** the right stick moves the camera; hold **L3** and push the right stick up or down to zoom.
+- **VR settings:** the **VR** tile in the game's menu opens them, and they work with the pad: L1/R1 change tabs, L2/R2 change values.
+- Xbox pads show Xbox button icons.
+
 ## Options
 
-The sections below explain the supported launcher options. Expand only the category you need. Choose **Save settings**, or launch to apply changes. Many options also appear in game; **Scenes on a screen** and **Camera** are launcher-only.
-
-Defaults below are for a fresh configuration of this version; existing saved settings take precedence. Advanced `vr.ini` tuning is outside this quick guide.
+The launcher's **VR settings** has the same tabs as the in-game VR page, plus Graphics and Extras. Choose **Save settings**, or launch to apply changes. Defaults are for a new setup; settings you changed are kept. **Play style** and **Simplified Rendering** are on the Play page.
 
 <details>
-<summary>General</summary>
+<summary>You</summary>
 
 | Option | Default | What it does |
 | --- | --- | --- |
 | **Height** | As the hunter | As the hunter: his eye height. As the player: your real height (from the headset's floor). |
 | **Adjust height** | 0 cm | Taller or shorter, from the choice above. Also corrects a floor that is a few cm off. |
-| **Move with** | Left stick | Choose the movement stick. Also swaps stick clicks and face-button actions; weapon hands stay the same. |
-| **Turning** | Snap 30° | Turn in fixed steps (snap) or continuously (smooth). |
-| **Vibration** | 7 / 10 | Strength of every vibration. 0 turns it off. |
+| **World size (eye distance)** | Headset | A smaller eye distance makes the world look larger. |
+| **Hunter's body** | Full | See the hunter's whole body, only his hands and forearms, or only his hands. |
+| **Body near your eyes** | Fade | Full body only: fade his coat where it comes close to your eyes. |
+| **Tracked posture** | Lean | Lean keeps the spine's length as you move your head. |
+| **Skip ladder climbs** | On | Long ladders: the screen goes dark while he climbs to the end. |
 
 </details>
 
@@ -99,30 +107,53 @@ Defaults below are for a fresh configuration of this version; existing saved set
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| **Play style** | Motion controls | On the launcher's Play page: motion controls, or a gamepad in first or third person. A gamepad style sets and locks the motion-only options; yours come back when you switch to Motion. |
+| **Move with** | Left stick | Which thumb walks. Also swaps stick clicks and face-button actions; your right hand still holds the blade. |
+| **Turning** | Snap 30° | Turn in fixed steps (snap) or continuously (smooth). |
 | **Control style** | Motion | Motion: swing to attack. Buttons: the classic layout. |
-| **Blood Vial** | Stab to inject | Stab the vial into your wrist, or use a button. |
-| **Gun laser** | Off | A thin line from the gun's barrel. |
-| **Grip adjust** | On | Stand still and hold A+B for about 1.2 seconds. Align your controller with the frozen weapon, then release to save the grip. |
 | **Stance** | Standing | Seated: smaller swings and throws, the lap counts for the vial. |
+| **Vibration** | 7 / 10 | Strength of every vibration. 0 turns it off. |
+| **Blood Vial** | Stab to inject | Stab the vial into your wrist, or use a button. |
+| **X button** | Fan menu | Fan menu: opens and closes your quick items. Vial: readies a Blood Vial to stab. |
+| **Gun laser** | Off | A thin line from the gun's barrel. |
+| **Grip adjust** | On | Stand still and hold A+B for about 1.2 seconds to set how the weapon sits in your hand. |
 
 </details>
 
 <details>
-<summary>Comfort</summary>
+<summary>Combat</summary>
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| **Body near your eyes** | Fade | Full body only: fade his coat where it comes close to your eyes. |
-| **Hunter's body** | Full | See the hunter's whole body, only his hands and forearms, or only his hands. |
-| **World size (eye distance)** | Standard (64 mm) | A smaller eye distance makes the world look larger. |
-| **Scenes on a screen** | On | Show grabs, viscerals, doors and ladders on a virtual screen. |
-| **Skip ladder climbs** | On | Long ladders go dark while you climb at speed, and you're back at the top or bottom in seconds. Needs **Scenes on a screen**. |
+| **Solid weapons** | On | Stop at walls and each other. Weapons only: just each other. |
+| **Blade sounds** | On | Your weapons ring when they meet; draw one along the other to sharpen it. |
+| **Riposte burst** | On | A visceral's rip flashes the view black, red and white with ink outlines, for under a second. |
+| **Ragdoll** | Normal | An enemy your blade kills goes limp at once, thrown by your swing. Off: its death animation. |
+| **Two-handed controls** | Original | Optimized: the stick transforms, the left trigger grabs (hold, or toggle). |
+| **Grip guide** | On | Hold the right grip to show where your left hand can grab. |
+| **Flick to reload** | Wrist flick | After a shot, release the trigger and flick the muzzle up (or down sharply) to reload. |
+| **VR Grab attacks** | Off | Stay in VR during enemy grabs. The view follows the hunter. |
 
 </details>
 
 <details>
-<summary>HUD</summary>
+<summary>Items & world</summary>
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| **Item access** | Grip + Body | No Grip: the left grip no longer opens the item menu (grabbing and holding still work). No Body: no body pouches. |
+| **Quick item menu** | Fan A | Fan A (gothic panes) or B (brass): reach toward an item from where the menu opened; pull away to close. Boxes: your fist on an item picks it. |
+| **Shoulder vial** | On | Reach over your right shoulder with the left hand and squeeze the grip to draw a vial. |
+| **Shoulder weapon switch** | On | B at the right shoulder / Y at the left: tap to switch, hold about 0.4 seconds for unarmed. |
+| **VR interactions** | Immersive | Doors and chests open, lamps light and knocks on doors are answered without pulling you out of your eyes. Flat: the hunter's own animations. |
+| **Physical levers** | On | Grip a lever with either hand and pull. |
+| **Lamp rest & travel** | On | Rest, refill and travel between lit lamps. Offline only. Experimental. |
+| **Physical summon bell** | On | First person: B draws the bell; shake it to summon. B again cancels. |
+| **Doll respec** | On | The Doll lets you move points between attributes for free at the same level (minimums 7/8/9/9/5/6). |
+
+</details>
+
+<details>
+<summary>HUD & feedback</summary>
 
 | Option | Default | What it does |
 | --- | --- | --- |
@@ -131,106 +162,35 @@ Defaults below are for a fresh configuration of this version; existing saved set
 | **Echoes & Insight** | Look down | Look down: they show when you look down at your feet. |
 | **Hit flash** | On | The edges of your view flash red when you are hit. |
 | **HUD size** | Medium | The size of the health bars, items and prompts. |
+| **Low-health edges** | Medium | A red edge below 30% health; it takes priority over the exhaustion color. |
+| **Exhaustion color** | On | Colors soften briefly at exhausted stamina, then fade back. |
+| **Health bars** | Bosses only | Bosses only: the boss's bar near the top. All: also over enemies you hit. |
 
 </details>
 
 <details>
-<summary>Assists</summary>
-
-| Option | Default | What it does |
-| --- | --- | --- |
-| **Extra health** | +10% | More maximum health for the hunter. |
-| **Longer dodge invincibility** | Off | Extra invincibility after a quickstep or roll, in 1/30-second increments. Does not apply to backsteps. |
-| **Instant ragdoll** | On | An enemy your blade kills goes limp at once. Off: its death animation. |
-| **Ragdoll push** | Normal | How hard your swing throws the body. None: it just falls. |
-| **Light attack stamina** | 80% | Light swing cost. Strong swings cost 100%; low stamina makes them light. |
-
-</details>
-
-<details>
-<summary>Display</summary>
+<summary>Picture</summary>
 
 | Option | Default | What it does |
 | --- | --- | --- |
 | **Anti-aliasing** | SMAA | Game FXAA, dual-eye SMAA, or None. |
-| **Distant detail** | Performance | Performance uses simpler distant models; Balanced adds detail; Quality keeps full models at a higher rendering cost. The in-game page indicates whether a change applies immediately or at the next start. |
-| **Show enemy health bars** | Off | The bars over enemies you hit or lock on to. Boss bars always show. |
-| **Camera** | First person | Choose the initial perspective. |
+| **Distant detail** | Performance | Performance uses the game's simpler distant models; Balanced adds detail; Quality keeps full models at a higher cost. |
+| **Contrast / Saturation / Gamma** | 0% | Light and dark separation, color intensity (-100 is monochrome) and midtone brightness. 0 is unchanged. |
+| **Foveated rendering** | Auto | Less detail toward the lens edges for more FPS. |
+| **Water reflections** | On | Off leaves out the scene mirrored in water for more FPS where there is water. |
+| **Far shadows** | Reduced | Reduced skips the farthest shadows for more FPS in big areas. |
 
 </details>
 
 <details>
-<summary>Body</summary>
+<summary>Difficulty</summary>
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| **Tracked posture** | Lean | Lean keeps the spine's length as you move your head. |
-| **Side lean limit** | 20° | How far the hunter leans sideways. More lean lets you move farther before he steps. |
-| **Extra clipping protection** | Off | Protect sideways leans and restore the body in stages after a roll or hit. |
-| **Posture smoothing** | 50 ms | Less smoothing follows faster; more softens small movements. |
-
-</details>
-
-<details>
-<summary>Inventory</summary>
-
-| Option | Default | What it does |
-| --- | --- | --- |
-| **Item access** | Menu | Choose the quick-item menu, body pouches, or both. Body pouches use the left grip; pocket/chest items follow equipped quick slots 1/2. |
-| **Pouch touch feedback** | On | A small vibration when your hand finds a pouch. |
-| **Shoulder vial** | On | Reach over your right shoulder with the left hand and squeeze the grip to draw a Blood Vial. Needs Item access: Body slots or Both. |
-| **Quick item menu** | Fan A | Fan A (gothic panes) or Fan B (engraved brass): move the hand a little toward an item from where the menu opened; pull it away to close. Boxes: the old arc of cards, your fist on an item. |
-
-</details>
-
-<details>
-<summary>Feedback</summary>
-
-| Option | Default | What it does |
-| --- | --- | --- |
-| **Low-health red edges** | On | A restrained red edge below 30% health. Takes priority over stamina color feedback. |
-| **Health intensity** | 50% | Strength of the low-health red edge. |
-| **Exhaustion desaturation** | On | Briefly soften colors at exhausted stamina, then fade back. Never full grayscale. |
-| **Stamina intensity** | 50% | Strength of the brief exhaustion effect. |
-| **Shoulder weapon switch** | On | B at right shoulder / Y at left: tap to switch, hold about 0.7 seconds for unarmed. Tap unarmed to restore the remembered weapon. |
-| **Riposte burst** | On | A visceral's rip flashes the view black, red and white with ink outlines, for under a second. |
-
-</details>
-
-<details>
-<summary>Weapons</summary>
-
-| Option | Default | What it does |
-| --- | --- | --- |
-| **Solid weapons** | On | Stop at walls and each other. Weapons only: just each other. |
-| **Grip guide** | On | Hold the right grip to show where your left hand can grab. |
-| **Swing feel** | 100% | Faint feedback during fast swings with both hands on one weapon. |
-| **Wrist-flick reload** | On | After a shot, release the trigger and flick your left wrist firmly in any direction to reload. |
-| **Blade sounds** | On | Your weapons ring when they meet; draw one along the other to sharpen it. |
-
-</details>
-
-<details>
-<summary>Interactions</summary>
-
-| Option | Default | What it does |
-| --- | --- | --- |
-| **VR interactions** | Immersive | Doors, gates, chests and coffins open, and lamps light, without pulling you out of your eyes. Flat: the hunter's own animations. |
-| **Physical levers** | On | Grip a lever with either hand and pull. Off: original interaction. |
-| **Lamp rest & travel** | On (experimental) | Rest, refill and travel between lit lamps. Offline only. Experimental. |
-| **VR Grab attacks** | Off | Stay in VR during enemy grabs. The view follows the hunter. Off: existing behavior. |
-| **Doll respec** | On | The Doll offers Rechannel Blood Echoes: move points between attributes for free at the same level, each down to the lowest any origin starts it (7/8/9/9/5/6). |
-
-</details>
-
-<details>
-<summary>Color</summary>
-
-| Option | Default | What it does |
-| --- | --- | --- |
-| **Contrast** | 0% | Light and dark separation. 0 is unchanged. |
-| **Saturation** | 0% | Color intensity. -100 is monochrome; 0 is unchanged. |
-| **Gamma** | 0% | Midtone brightness. Higher is brighter; 0 is unchanged. |
+| **Extra health** | +10% | More maximum health for the hunter. |
+| **Longer dodge invincibility** | Off | Extra invincibility after a quickstep or roll, in 1/30-second steps. Does not apply to backsteps. |
+| **Light attack stamina** | 80% | Light swing cost. Strong swings cost 100%; low stamina makes them light. |
+| **Damage dealt** | 0% | Your attack damage, from -60% to +30%. |
 
 </details>
 
@@ -239,16 +199,25 @@ Defaults below are for a fresh configuration of this version; existing saved set
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| **Scaling** | 0% (headset resolution) | Changes resolution relative to what the headset requests. Higher values give a sharper image at a higher rendering cost. |
-| **DLSS** | Off | NVIDIA RTX cards: renders smaller and reconstructs both eyes. Use **SAVE AND RESTART**: the change applies from the next start. |
-| **FSR** | Off | FSR 4 or FSR 3.1.5: renders smaller and reconstructs both eyes. Turns DLSS off. |
-| **Profile** | Balanced | Ultra Performance (33% of the output size), Performance (50%), Balanced (58%) or Quality (67%). DLSS and FSR remember their own profile. |
-| **Foveated upscale** | Medium | DLSS or FSR works only the middle of each eye (Quality 90%, Medium 85%, Performance 75% of each side) and a lighter pass smooths the edges, for more frames. Off: the whole eye. Applies at the next start. |
-| **Native stereo eyes** | Auto | Launcher only. Multiview: the graphics driver repeats each draw. Layers: each eye is drawn on its own, which fixes a white right eye on AMD RX 6000 cards. Auto uses layers on RX 6000 and multiview on all other cards. Applies at the next launch. |
+| **Scaling** | 0% (headset resolution) | Resolution relative to what the headset requests. Higher is sharper and costs more. |
+| **Upscaler** | Off | Renders smaller, then reconstructs both eyes: DLSS (NVIDIA RTX), FSR 4, FSR 4.1.2 (AMD RX 6000 and newer) or FSR 3.1.5. Applies at the next start. |
+| **Quality preset** | Balanced | How small it renders before upscaling, from Ultra Performance to Ultra Quality. |
+| **Foveated upscale** | Medium | DLSS or FSR works only the middle of each eye and a lighter pass smooths the edges, for more frames. Off: the whole eye. |
+| **Native stereo eyes** | Auto | Multiview: the driver repeats each draw. Layers: each eye on its own, which fixes a white right eye on AMD RX 6000 cards. Auto picks for your card. |
 
 </details>
 
-The in-game page also has **Show VR controls** and a read-only headset resolution display. Its **Smooth motion** option is inactive with the bundled launcher preset.
+<details>
+<summary>Extras</summary>
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| **Camera** | First person | The starting perspective. Third person turns the VR body off. |
+| **Scenes on a screen** | On | Viscerals, grabs, levers and ladders play from the game's camera on a virtual screen. Off: they stay in first person. |
+
+</details>
+
+The in-game VR page also has **Show VR controls**, a picture of what each button does on your controllers or gamepad.
 
 ---
 
@@ -309,186 +278,4 @@ Thanks to **[ID-Gamer](https://github.com/ID-Gamer)** for the third-person gamep
 - **Foveated upscaling on by default**: DLSS or FSR on the middle of each eye, more frames everywhere else.
 - **Doors, chests and lamps in VR, and a Doll respec**: open and light them without leaving your eyes, move your stat points for free at the Doll, ladder skip on by default, a new launcher, and fixes.
 
-### 0.9.2
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.2)
-
-- **Smooth turning, smooth again**: no more stutter after travelling between lamps.
-- **Logarius' Wheel in both hands**: grab its far handle to transform it, then three quick pulls of the left trigger unleash its spin.
-- **Pull-start the Boom Hammer**: every right-grip squeeze is a pull until it roars to life.
-- **Skip ladder climbs**: a new Comfort option (off by default) that rushes you up or down long ladders behind a dark screen.
-- **Heavier cannon, Executioner's Gloves and more frames**: a bigger kick, gather-and-throw gloves, a lighter desktop window, and fixes.
-
-### 0.9.1
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.1)
-
-- **A secret in the Hunter's Dream**: something waits there for inquisitive and caring hunters to discover.
-- **Easier flick to reload**: snap the muzzle up, then lower it a little.
-- **Blood Bullets by hand**: use your right hand to pull an empty syringe from your left shoulder, then stab it into your arm to turn blood into bullets.
-- **Meaner hunter tools**: new throws, embers, splatters and sounds, and poison or frenzy creeping in at the edges of your view.
-- **Chalice levers, sharper weapons, steady stairs**: pull dungeon levers by hand, upscale weapon textures 2x, no more bobbing on stairs or swinging god rays.
-- **Faster and smoother**: a new memory system that stays smooth when your graphics card fills up, and frames that reach your headset sooner.
-
-### 0.8.81
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.81)
-
-- **DLC INCLUDED**: with the Game of the Year Edition, the launcher says so and no longer shows an empty DLC folder box. It checks that The Old Hunters is really in your game folder first.
-
-### 0.8.8
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.8)
-
-- **Fixed: "Choose a folder or file first."** The launcher no longer refuses to start the game over the optional DLC folder. It tells you if it found The Old Hunters, and the game always starts.
-
-### 0.8.7
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.7)
-
-- **Tiny Tonitrus**: hold the trigger until it crackles, then strike. The lightning goes where you look, with a brand-new bolt and a thunder crack in your hand.
-- **New hunter tools**: the Augur, Beast Roar, A Call Beyond and the Executioner's Gloves have new animated models. Crush the Augur and its tentacles shoot from your fist. Hold Beast Roar and the claw clenches, then bursts open with a roar.
-- **Grab the dead**: unarmed, your fingers follow your controller. Push, lift and carry corpses with your bare hands.
-- **Smoother play**: much less stutter on your first hits, faster starts, and fewer drops on 6-8 GB graphics cards.
-- Pouches that stay put, PS VR2 vibration with feeling, a better launcher, and fixes.
-
-### 0.8.6
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.6)
-
-- **Hunter tools**: grab a tool and use it with your hands. With no bullets, you can't pick it up.
-- **Bullet deflection**: hit enemy bullets with your weapon to knock them away, or straight back at the shooter.
-- **Stronger visceral effect** that lasts until you pull your hand out.
-- **Heavy attacks** need a big wind-up and work once every 4 seconds (or hold the trigger). Enemies take a few more hits.
-- Easier lean and duck dodges, better performance, FSR 4.1.2 for AMD cards, and fixes.
-
-### 0.8.5
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.5)
-
-- **A simpler VR settings menu**: nine tabs, settings that were two rows are one choice, and a single Upscaler row (Off / DLSS / FSR 4 / FSR 3.1.5 / DLSS 5). A tab with more settings has a second page on the strip under its name.
-- **Soft save** (experimental): save the moment you are in, and after a death choose your soft save or the last lantern. It works on your own save once the launcher has backed it up, which it does at every launch.
-- **Monocular**: a true zoomed view in each eye, zoomed with the trigger or a turn of the wrist, and stabilized.
-- **Free camera**: fly the view while the hunter stays put and enemies ignore him; Y brings you back.
-- **Hand Lantern**: carried in your hand, it swings as you move and lights the world; stowed, it hangs from your belt.
-- **Launcher**: new players start with an upscaler picked for their graphics card, the resolution warning is hard to miss and offers a PERF SCAN, a Controls page covers Quest, PSVR and Frame, and Sharper skies makes AI-upscaled skies from your own game files.
-- Faster on 4-core CPUs and NVIDIA cards, the Mensis scripted lever is pulled by hand, and fixes for projectile aiming, blade sounds and the Mensis chest.
-
-### 0.8.3
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.3)
-
-- **Two-handed weapons rebuilt**: your right hand leads a grab (your left if it grabs in front), the other hand slides along the weapon, and the rear hand has a lighter say that fades as your hands come together, the same whichever hand leads. Big weapons no longer wobble or spin, and heavy ones feel heavy, each with its own heft.
-- **Slide mode**: hold B to slide both hands; the front hand takes the lead. On long handles, hold Y to push the weapon through your lead fist like a spear thrust.
-- **Experimental two-handed controls** (off by default): stick click transforms, left trigger grabs the handle, each grip slides its own hand.
-- **Viscerals no longer clip into your face**, the stagger lasts longer, and stabbing into a visceral is more forgiving.
-- **DLSS 5** (experimental, RTX 50-series): bring NVIDIA's own file; the launcher finds and checks it.
-- Weapon switching is at the shoulders only; the Toggle B option is gone (B is hold to slide). Torches hit walls, and the launcher has a Non-aggro mode.
-
-### 0.8.2
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.2)
-
-- **Accurate game timing**: the game measures every frame and moves by its real length (bbport's frame-rate hooks) instead of a fixed 60 FPS frame, so movement, dodges, attacks, camera smoothing, cloth and effects stay right through dips and frame-rate caps. On for everyone; same frame rate.
-- **FSR Balanced Plus** renders at 62% (it was the same as Balanced, 58%).
-- **DLSS** is a little lighter on the GPU (8-bit colour copies for the game's 8-bit picture).
-- **PERF SCAN** asks for 13.8% headroom (was 13.5%).
-
-### 0.8.1
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.1)
-
-- **New quick item menu**: your items on a fan round the left hand; Fan A is the new default (Fan B and the old Boxes in VR settings > Inventory and the launcher).
-- **Shoulder vial**: left hand over the right shoulder + grip draws a Blood Vial.
-- **Duck**: ducks like a crouch, and a quick duck (18 cm) gives 125 ms of invincibility. **Lean dodge** is a little easier (1.18 m/s).
-- **HUD in VR**: HP, items, echoes and insight in their own rows above the view; banners and the area name below it.
-- **Fixed**: missing prompts, item pop-ups, HUD and game menu in Central Yharnam, the Tomb of Oedon and the Great Bridge later in the story; the game menu darkens the world again.
-- **Fixed**: the street smeared to the horizon after many lamp trips; video memory left over from earlier areas is freed when the card runs low.
-- **Fixed**: an NPC close to you (Eileen in the Crow set) no longer loses her mask or more in Hands only or Arms only.
-- Healing: a full vial from the pouch right after a heal, and a short wait before X raises the next one. Items show their pickup prompt 10% further away.
-- Even foveation at the top and bottom; AMD RX 400/500/5000 start in DIBR; Steam Frame d-pad works as X/Y; slightly lower CPU cost.
-
-### 0.8.0
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.8.0)
-
-- **Riposte burst** (on by default): a parry riposte or a backstab flashes your view black, blood red and white with ink outlines.
-- **Weapons clash with their real shapes**: your two weapons meet where they really are (the folded Saw Cleaver's blade, an axe's head, the scythe's curve), not along a thin line. Walls still meet a line along the blade.
-- **DLSS and FSR in DIBR**: the upscalers now work with DIBR stereo too.
-- **AMD Radeon**: no more white right eye on RX 6000 cards (new **Native stereo eyes** option, Auto by default); with DLSS or FSR the HUD is no longer doubled and the wrist display shows; no shader recompiles when switching DIBR and native; FSR 3.1.5 is recommended on AMD.
-- **Lighter HUD**: much less copying for the HUD each frame, most noticeable on AMD cards.
-- **Lean dodge**: 250 ms of invincibility (was 200).
-- **Molotov fire** reaches 1.5 times as far.
-- **PERF SCAN**: clearer results with a big Apply button, and it now works on every supported game version, with or without The Old Hunters.
-- Choosing a PKG file as the game now explains that the extracted game folder is needed.
-
-### 0.7.0
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.7.0)
-
-- **Smooth busy areas**: Frame overlap (VR settings > Graphics, on by default) lets the game prepare its next frame while the current one is finished. The constant jitter when looking around in places like Old Yharnam and the Sewers is gone.
-- **Solid weapons hit walls**: your weapons stop at walls and level geometry, not only at each other (VR settings > Weapons > Solid weapons).
-- **Fewer shadows when busy** (VR settings > Graphics, off by default): in very busy views it also skips the next-farthest shadows.
-- **Quick items stay put**: the item cards no longer turn and roll with your head.
-- Upscaling (DLSS / FSR): every scene draw now gets the upscaler's jitter.
-
-### 0.5.6
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.5.6)
-
-- **Far shadows** in the VR settings (Graphics): Reduced, the new default, skips the farthest shadows for more FPS in big open areas; Full draws them all. It applies at once.
-- Sharper shadows with foveated rendering on.
-
-### 0.5.5
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.5.5)
-
-- **Fewer and shorter hitches:** smoother streaming into new areas, memory freed in the background, and no more full GPU flush from the game's copy shader.
-- **Sharp menus with foveated rendering:** the pause and equipment menus, echoes and insight are drawn at full detail; only the 3D world is foveated.
-- **More GPU headroom:** stronger foveated rendering by default, foveation in DIBR mode too, and a cheaper HUD.
-- **Upscaler presets:** Ultra Performance, Performance, Balanced, Balanced Plus, Quality and Ultra Quality, each with its own DLSS model.
-- **Less graphics memory:** about 1 GB less at 2000 x 2160 per eye with DLSS Quality.
-- **Faster on Intel CPUs:** no power-saving cores, and the missing SSE4a instructions are replaced in advance.
-- **Upscaler changes wait for a restart** instead of half-applying live.
-- **Slightly stronger aim help** for thrown items, and retuned melee charge timing.
-- **Launcher:** per-eye size, a graphics memory estimate and a headset list under Scaling.
-- Fixed: As the player height after a recenter from the headset's button (Meta Link), and disappearing body slots and wrist vitals at some per-eye sizes.
-
-### 0.5.0
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.5.0)
-
-- **Weighted weapons:** weapon-specific weight, balance and air resistance, with Off, Light and Regular settings.
-- **Steadier hands:** improved hand smoothing for steadier aiming and weapon movement.
-- **Physical summon bells:** take out the bell and shake it to summon an NPC.
-- **Quick 180° turn:** hold the right stick down briefly to turn around.
-- **Combat upgrades:** gun headshots, stronger knockback on heavy kills, charged Stake Driver punches, and shootable Molotovs for mid-air explosions.
-- **Adjustable outgoing damage:** -30% to +30%, in the VR menu.
-- **Performance scan** in the launcher, to help choose settings for your PC and headset.
-- **FSR 3.1.5**, and an **Ultra Performance** preset for DLSS and FSR.
-- **Use DIBR** on the Play page: a less demanding rendering option for weaker graphics cards, or if the game crashes often.
-- Smoother loading transitions, upscaler fixes, and protection of data written by the graphics card.
-
-### 0.3.6
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.3.6)
-
-- Fixed flip-ordering races that could cause an internal assertion during gameplay.
-- Made live SMAA, FXAA, and Off switching apply at completed frame boundaries.
-
-Optimized PGO/ThinLTO Release build with normal logging off. FOV settings are unchanged.
-
-### 0.3.5
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.3.5)
-
-- Fixed the reproduced stretched/ghost triangles after death or travel by keeping motion-index GPU readbacks out of newly loaded game memory.
-- Reduced rendering and synchronization work in equipment and weapon menus; menus stay in the normal stereo eye images.
-- Fixed an audio cancellation deadlock that could freeze cinematic skips and sound shutdown.
-- Prevented closing a menu with B from leaking into an unintended blood-vial action.
-- Enabled Windows guest red-zone protection for **all users**, including existing profiles, and cached its analysis to reduce repeat startup work.
-- Bounded texture cleanup during transitions while preserving healthy caches for same-area travel.
-- Improved DLSS reliability by ignoring empty geometry draws during temporal scene checks.
-- Added the hunter VR app icon to the launcher and installer.
-
-The bundled runtime is an optimized PGO/ThinLTO Release build with logging and memory-write tracing compiled out. The geometry fix passed the reproduced headset respawn, rest, and travel checks; it is a targeted fix, not a replacement of the whole memory system.
+Older versions: see the [releases](https://github.com/bldbrne-vr/bldbrne-vr/releases).
