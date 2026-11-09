@@ -237,11 +237,9 @@ For software licences, third-party notices and attribution, see [Notices](source
 
 ## Thanks
 
-Thanks to **Dirol** (dishisolo) for awesome feedback and suggestions.
+Thanks to **Dirol** (dishisolo), **BlizzardNight** and **Chip** for awesome feedback, suggestions and bug reports.
 
 Thanks to **[ID-Gamer](https://github.com/ID-Gamer)** for the third-person gamepad camera work behind the new Gamepad play styles.
-
-Thanks to **BlizzardNight** and **Chip** for their help and support.
 
 ## Changelog
 
