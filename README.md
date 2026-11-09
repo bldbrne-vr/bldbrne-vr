@@ -270,6 +270,8 @@ For software licences, third-party notices and attribution, see [Notices](source
 
 Thanks to **Dirol** (dishisolo) for awesome feedback and suggestions.
 
+Thanks to **[ID-Gamer](https://github.com/ID-Gamer)** for the third-person gamepad camera work behind the new Gamepad play styles.
+
 ## Changelog
 
 ### 0.9.4
