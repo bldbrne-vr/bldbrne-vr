@@ -99,6 +99,7 @@ Defaults below are for a fresh configuration of this version; existing saved set
 
 | Option | Default | What it does |
 | --- | --- | --- |
+| **Play style** | Motion controls | On the launcher's Play page: motion controls, or a gamepad in first or third person. A gamepad style sets and locks the motion-only options; yours come back when you switch to Motion. |
 | **Control style** | Motion | Motion: swing to attack. Buttons: the classic layout. |
 | **Blood Vial** | Stab to inject | Stab the vial into your wrist, or use a button. |
 | **Gun laser** | Off | A thin line from the gun's barrel. |
@@ -139,7 +140,7 @@ Defaults below are for a fresh configuration of this version; existing saved set
 | Option | Default | What it does |
 | --- | --- | --- |
 | **Extra health** | +10% | More maximum health for the hunter. |
-| **Longer dodge invincibility** | +1 frame | Extra invincibility after a quickstep or roll, in 1/30-second increments. Does not apply to backsteps. |
+| **Longer dodge invincibility** | Off | Extra invincibility after a quickstep or roll, in 1/30-second increments. Does not apply to backsteps. |
 | **Instant ragdoll** | On | An enemy your blade kills goes limp at once. Off: its death animation. |
 | **Ragdoll push** | Normal | How hard your swing throws the body. None: it just falls. |
 | **Light attack stamina** | 80% | Light swing cost. Strong swings cost 100%; low stamina makes them light. |
@@ -270,6 +271,16 @@ For software licences, third-party notices and attribution, see [Notices](source
 Thanks to **Dirol** (dishisolo) for awesome feedback and suggestions.
 
 ## Changelog
+
+### 0.9.4
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.4)
+
+- **Play with a gamepad**: a new Play style, first or third person; your motion settings come back when you switch back.
+- **The Beast Cutter swings like a heavy chain**: its reach follows your swing, and it no longer folds into your hand.
+- **Hear the full charge**: the game's own charge sound when a charged attack is ready.
+- **Knock on doors in VR** and **lean out of the way a little easier**.
+- **More frames, fewer hitches**: about 3% faster native stereo, no freeze on arrival, fewer stutters in The Old Hunters, and fixes.
 
 ### 0.9.32
 
