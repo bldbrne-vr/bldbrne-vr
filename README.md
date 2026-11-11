@@ -243,6 +243,16 @@ Thanks to **[ID-Gamer](https://github.com/ID-Gamer)** for the third-person gamep
 
 ## Changelog
 
+### 0.9.5
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.5)
+
+- **The Kos Parasite, reborn**: with the Milkweed rune, lash its tentacles, spit poison and perform the ritual; without it, punch.
+- **Weapons that answer your swing**: Tonitrus calls down lightning, the Moonlight Sword's wave hits what you swing at, split blades hone, the Amygdalan Arm slams, and the bow turns near misses into hits.
+- **Weapon switches that land**: a press at your shoulder counts the moment you reach it, even mid-swing.
+- **Smoother menus and a faster first start**: the game holds your headset's refresh rate, and shader preparation runs about twice as fast.
+- **GPU Tweak III crash fixed**, easier chest grabs, smoother levers and doors, and more fixes.
+
 ### 0.9.4
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.4)
