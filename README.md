@@ -243,6 +243,13 @@ Thanks to **[ID-Gamer](https://github.com/ID-Gamer)** for the third-person gamep
 
 ## Changelog
 
+### 0.9.61
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.61)
+
+- **The launcher's start-up file is replaced**: Windows Defender began to block it on 18 November in every version from 0.9.3 to 0.9.6. It is the packaging tool's own stub, unchanged since 0.9.3; this version ships it as a new file that Defender passes.
+- If Windows removed the file and the launcher no longer starts, install again from the new installer. Nothing else changes: the game is 0.9.6's.
+
 ### 0.9.6
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.6)
