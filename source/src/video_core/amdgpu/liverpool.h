@@ -109,6 +109,23 @@ public:
         return num_submits == 0;
     }
 
+    /// FAST_CPU_SUBMIT_AHEAD (gnmdriver.cpp): every submission so far, and a wait until `target`
+    /// of them have retired (as the GPU-idle wait counts them: replayed, signals written).
+    u64 SubmissionsQueued() noexcept {
+        std::scoped_lock lk{submit_mutex};
+        return total_submits;
+    }
+    void WaitRetired(u64 target) noexcept {
+        std::unique_lock lk{submit_mutex};
+        retire_cv.wait(lk, [this, target] { return total_submits - num_submits >= target; });
+    }
+    /// Waits until the command processor has decoded `target` submissions (its packets hold
+    /// copies of what they read from the command buffers and resource tables).
+    void WaitDecoded(u64 target) noexcept {
+        std::unique_lock lk{submit_mutex};
+        retire_cv.wait(lk, [this, target] { return total_decoded >= target; });
+    }
+
     void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
         vo_port = port;
     }
@@ -277,6 +294,10 @@ private:
     u64 scan_mismatches{}, scan_queued{}, scan_dropped{};
     u64 gfx_submits{}; // top-level GFX submissions; guarded by the GFX queue's m_access
     u64 clear_states{}, clear_state_resets{}, clear_state_log_states{}, clear_state_log_frames{};
+    // FAST_CLEARSTATE_TOUCHED: ClearStates that copied the defaults into the touched blocks only,
+    // those blocks, and FAST_CLEARSTATE_VERIFY_A checks / mismatches.
+    u64 clear_state_touched{}, clear_state_touched_blocks{}, clear_state_checks{},
+        clear_state_mismatches{};
     void SyncRecorder(const char* reason, bool submit = false);
     bool SyncGuestWrites(const char* reason);
     // FAST_CPU_ASYNC_IDLE (vk_scheduler.h): the ordered submission retirement and GPU-idle task
@@ -297,10 +318,18 @@ private:
     std::atomic<u32> verify_idle{};
     std::atomic<u64> verify_checks{}, verify_unwritten{}, verify_idles{}, verify_differ{};
     std::atomic<u32> num_submits{};        // Includes submissions still executing on B.
+    // Nested indirect-buffer coroutines that have finished (their final_suspend keeps the frame):
+    // destroyed with the next submission's ordered completion on B, after every packet of theirs
+    // (stage B may still read packet data held in a frame). Before 2026-10-23 they were never
+    // destroyed (DarkIzuku 195ab0b3d found the leak). Command-processor thread only.
+    std::vector<Task::Handle> finished_nested;
     std::atomic<u32> num_decode_submits{}; // Submissions still owned by the decoder.
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;
+    std::condition_variable retire_cv; // WaitRetired's: every retirement, never the GPU thread's
+    u64 total_submits{};               // FAST_CPU_SUBMIT_AHEAD (under submit_mutex)
+    u64 total_decoded{};               // FAST_CPU_SUBMIT_AHEAD=3 (under submit_mutex)
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};
     std::thread::id gpu_id;

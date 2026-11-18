@@ -20,6 +20,8 @@
 #include "common/thread.h"
 #include "core/vr/bb_weapons.h"
 #include "core/vr/bloodborne_givekit.h"
+#include "core/vr/cigarette.h"
+#include "core/vr/bloodborne_wheelchair.h"
 #include "core/vr/hook_util.h"
 #include "core/vr/test_stats.h"
 #include "core/vr/vr_session.h"
@@ -521,11 +523,12 @@ std::string QuickSlotsText(u8* egd) {
     return text;
 }
 
-void MenuEquip(s32 slot, s32 index, u32 item) {
+// `equip`: the action itself when the kit is off (Kos Lights' quick slot), else the kit's.
+void MenuEquip(s32 slot, s32 index, u32 item, MenuEquipFn equip = nullptr) {
     alignas(16) std::array<u8, 0x50> ref{};
     std::memcpy(ref.data() + 0x48, &index, sizeof(index));
     std::memcpy(ref.data() + 0x4C, &item, sizeof(item));
-    g.menu_equip(slot, ref.data());
+    (equip != nullptr ? equip : g.menu_equip)(slot, ref.data());
 }
 
 // ---- The kit -----------------------------------------------------------------------------------
@@ -626,6 +629,23 @@ void EquipHand(u8* egd, s32 hand, const std::array<s32, 2>& weapons) {
 void EquipWeapons(u8* egd) {
     EquipHand(egd, 1, RightWeapons);
     EquipHand(egd, 0, LeftWeapons);
+    // Tests (VR_KIT_LEFT=<weapon id>): that weapon (owned: give it in the kit) into the left
+    // hand's active slot, over what is there (a test save's copy; 2026-11-12: the Torch for the
+    // hunter's own shadow from a light in his hand).
+    if (const char* env = std::getenv("VR_KIT_LEFT"); env != nullptr && env[0] != '\0') {
+        const s32 weapon = static_cast<s32>(std::strtol(env, nullptr, 10));
+        const s32 index = weapon > 0 ? FindWeapon(egd, weapon) : -1;
+        if (index < 0) {
+            LOG_INFO(Core, "VR kit: VR_KIT_LEFT {} not owned", weapon);
+            return;
+        }
+        const s32 active = Read<s32>(egd + OffsetActiveLeft) == 1 ? 1 : 0;
+        const s32 slot = 2 * active;
+        const u32 item = ItemAt(egd, index);
+        MenuEquip(slot, index, item);
+        LOG_INFO(Core, "VR kit: VR_KIT_LEFT: slot {} now {} (inventory index {})", SlotName(slot),
+                 ItemName(static_cast<u32>(Read<s32>(egd + OffsetSlotId + 4 * slot))), index);
+    }
 }
 
 void FillQuickSlots(u8* egd) {
@@ -977,6 +997,17 @@ void MaxStatsTick(u8* module, u8* player) {
 }
 
 void Apply(u8* player, u8* egd) {
+    // VR_TEST_ECHOES=<n> (tests only): Blood Echoes topped up to n with the kit, e.g. a Chalice
+    // ritual's cost on a test save (PlayerGameData +0x94, the game's own cap 999999999).
+    if (const char* env = std::getenv("VR_TEST_ECHOES"); env != nullptr) {
+        u8* const pgd = Read<u8*>(player + OffsetPlayerGameData);
+        const s32 want = static_cast<s32>(std::clamp(std::strtol(env, nullptr, 10), 0L, 999999999L));
+        if (Plausible(pgd) && Read<s32>(pgd + 0x94) < want) {
+            const s32 before = Read<s32>(pgd + 0x94);
+            std::memcpy(pgd + 0x94, &want, sizeof(want));
+            LOG_WARNING(Core, "VR kit: TEST Blood Echoes {} -> {}", before, want);
+        }
+    }
     const u32 highest = Read<u32>(egd + OffsetInventory + OffsetInvHighest);
     LOG_WARNING(Core,
                 "VR kit: applying the TEST KIT on thread '{}' (main-player update {}, inventory "
@@ -1046,7 +1077,99 @@ void Check(u8* player, u8* egd) {
 
 } // Anonymous namespace
 
+// With the wheelchair on (the default) it takes a verified ride; VR_GEHRMAN_CHAIR=0: the old grant.
+// Independent of debug kits. At most once a second.
+// The ordinary AddItem routine owns capacity checks and save serialization.
+void CigaretteGiftWhy(const char* why) {
+    if constexpr (Common::Log::Enabled) {
+        static std::array<const char*, 12> reasons{};
+        static std::array<std::chrono::steady_clock::time_point, 12> next{};
+        const auto now = std::chrono::steady_clock::now();
+        size_t i = 0;
+        while (i < reasons.size() && reasons[i] && reasons[i] != why) ++i;
+        if (i == reasons.size() || (reasons[i] == why && now < next[i])) return;
+        reasons[i] = why;
+        next[i] = now + std::chrono::seconds(30);
+        LOG_INFO(Core, "VR cigarettes: Kos Lights not given now: {}", why);
+    }
+}
+
+void CigaretteGiftTick(u8* module, u8* player) {
+    if (!Plausible(module) || !Plausible(player)) return;
+    static auto next = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next) return;
+    next = now + std::chrono::seconds(1);
+    // The ride replaces the automatic grant while the wheelchair is on.
+    if (GehrmanChairEnabled() && !GehrmanChairGiftReady(player)) {
+        CigaretteGiftWhy("the wheelchair ride is not done (push Gehrman 10 m)");
+        return;
+    }
+    if (!VR::IsImmersive() || VR::CinematicActive()) {
+        CigaretteGiftWhy("not immersive, or a cutscene");
+        return;
+    }
+    const auto matches = [module](u64 offset, const auto& signature) {
+        return std::memcmp(module + offset, signature.data(), signature.size()) == 0;
+    };
+    // No pointer to game data is cached across loads or characters.
+    if (!matches(AddItemRva, AddItemSig) || !matches(RoomRva, RoomSig) ||
+        !matches(RoomLeaRva, RoomLeaSig) || !matches(FindRva, FindSig) ||
+        !matches(GoodsRowRva, GoodsRowSig)) {
+        CigaretteGiftWhy("an inventory function signature does not match");
+        return;
+    }
+    u8* egd = nullptr;
+    if (const char* wait = WaitReason(module, player, egd); wait != nullptr) {
+        CigaretteGiftWhy(wait);
+        return;
+    }
+    GoodsRowOut row{};
+    reinterpret_cast<GoodsRowFn>(module + GoodsRowRva)(&row, VR::Cigarette::Goods);
+    // Recognize our installed row, not a coincidentally occupied mod item ID.
+    if (!Plausible(row.row, 1) || Read<s32>(row.row) != -1 ||
+        (Read<u16>(row.row + 0x2C) != VR::Cigarette::Icon &&
+         Read<u16>(row.row + 0x2C) != VR::Cigarette::LegacyIcon) ||
+        Read<u8>(row.row + 0x60) != 0 ||
+        (Read<u8>(row.row + 0x44) & 0xC0) != 0x40) {
+        CigaretteGiftWhy(Plausible(row.row, 1)
+                             ? "goods 9000 is not the Kos Lights row (its fields differ)"
+                             : "no goods 9000 in the game (see the VR Kos Lights line at boot)");
+        return;
+    }
+    const u32 item = CategoryGoods | VR::Cigarette::Goods;
+    if (reinterpret_cast<FindFn>(module + FindRva)(egd + OffsetInventory, &item) >= 0) {
+        CigaretteGiftWhy("already owned");
+        return;
+    }
+    if (reinterpret_cast<RoomFn>(module + RoomRva)(&item) < 1) {
+        CigaretteGiftWhy("no room for it in the inventory");
+        return;
+    }
+    const s32 result = reinterpret_cast<AddItemFn>(module + AddItemRva)(
+        egd, CategoryGoods, VR::Cigarette::Goods, 1, 1, 0, 1);
+    if (result < 0) return;
+    LOG_INFO(Core, "VR cigarettes: Kos Lights added through the game's inventory");
+    // Never silent: the quick items thump both hands and show its card where you look.
+    VR::Cigarette::gift_serial.fetch_add(1, std::memory_order_relaxed);
+    // Onto the first empty quick slot, as the test kit does (the Equipment menu's own action):
+    // the packet is on the belt at once. Full slots are left as they are.
+    if (!matches(MenuEquipRva, MenuEquipSig) || !matches(MenuManMovRva, MenuManMovSig)) return;
+    const s32 index = reinterpret_cast<FindFn>(module + FindRva)(egd + OffsetInventory, &item);
+    for (s32 k = 0; index >= 0 && k < QuickSlots; ++k) {
+        if (Read<s32>(egd + OffsetQuick + 8 * k) != -1) continue;
+        MenuEquip(QuickSlotBase + k, index, item,
+                  reinterpret_cast<MenuEquipFn>(module + MenuEquipRva));
+        LOG_INFO(Core, "VR cigarettes: Kos Lights on quick slot {}{}", k + 1,
+                 Read<s32>(egd + OffsetQuick + 8 * k) == index ? ""
+                                                               : " UNEXPECTED: the slot did not change");
+        return;
+    }
+    LOG_INFO(Core, "VR cigarettes: quick slots full; Kos Lights left in the inventory");
+}
+
 void GiveKitSiteA(u8* module, u8* player) {
+    CigaretteGiftTick(module, player);
     MaxStatsTick(module, player);
     if (g.phase == Phase::Done && player != nullptr) {
         AttireTick(player);

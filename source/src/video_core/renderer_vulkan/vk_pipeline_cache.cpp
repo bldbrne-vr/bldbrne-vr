@@ -21,15 +21,33 @@
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
 #include "shader_recompiler/ir/passes/billboard_face_eye.h"
+#include "shader_recompiler/ir/passes/light_shadow.h"
+#include "shader_recompiler/ir/passes/ambient_occlusion.h"
+#include "shader_recompiler/ir/passes/moon_shadow.h"
+#include "shader_recompiler/ir/passes/reflections.h"
+#include "shader_recompiler/ir/passes/bounce_light.h"
+#include "shader_recompiler/ir/passes/fog_light.h"
+#include "shader_recompiler/ir/passes/cinematic_look.h"
+#include "shader_recompiler/ir/passes/parallax.h"
+#include "shader_recompiler/ir/passes/particle_air.h"
+#include "shader_recompiler/ir/passes/air_light.h"
+#include "shader_recompiler/ir/passes/fog_grid.h"
+#include "shader_recompiler/ir/passes/moon_shafts.h"
+#include "shader_recompiler/ir/passes/specular_aa.h"
+#include "shader_recompiler/ir/passes/wet_blood.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
+#include "video_core/startup_compile.h"
 #include "video_core/fast_render.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_compile_trace.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shader_record.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/vr_dibr_upscale.h"
+#include "video_core/renderer_vulkan/vr_merged_eyes.h"
 
 namespace Vulkan {
 namespace {
@@ -65,6 +83,39 @@ constexpr static std::array DescriptorHeapSizes = {
     vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, 1024},
     vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
 };
+
+bool VrLightShadowHigh() {
+    // Startup-only (getenv locks the environment; the menu's change applies at the next start).
+    static const bool high = Shader::Optimization::LightShadow::High(
+        VR::GetSettings().light_shadow_high, std::getenv("VR_LIGHT_SHADOW_DETAIL"));
+    return high;
+}
+
+u8 VrLightShadowLevel() {
+    // Read once, like the billboard rule (getenv locks the environment): the lamp shadows' row
+    // applies at the next start, and one rule for the whole session keeps the lamp programs, the
+    // AO pass's lamp work and the CPU's upkeep together (until 2026-11-17 the setting was read at
+    // every pipeline build).
+    static const u8 level = Shader::Optimization::LightShadow::Level(
+        Shader::Optimization::LightShadow::Enabled(VR::IsEnabled(), VR::GetSettings().light_shadows,
+                                                   VR::Graphics::Accepted().upscaler !=
+                                                       VR::Graphics::Upscaler::Off,
+                                                   std::getenv("VR_LIGHT_SHADOWS")),
+        VrLightShadowHigh());
+    return level;
+}
+
+bool VrLampShadowsOn() {
+    return VrLightShadowLevel() != 0;
+}
+
+bool VrSceneMapsOn() {
+    return Shader::Optimization::LightShadow::SceneMaps::Enabled() && VrLampShadowsOn();
+}
+
+bool VrSceneMaskOn() {
+    return Shader::Optimization::LightShadow::SceneMaps::Mask() && VrLampShadowsOn();
+}
 
 static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsOutputControl& ctl) {
     u32 num_outputs = 0;
@@ -171,6 +222,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
             NativeProjection::LightRectangleShader(selection.prepared_vertex_hash
                 ? *selection.prepared_vertex_hash : AmdGpu::GetParams(*vs).hash);
         if (!info.native_light_scissor) info.native_light_bounds={};
+        info.vr_light_shadows = info.native_light_scissor ? VrLightShadowLevel() : u8{0};
     } else info.native_light_bounds={};
     switch (stage) {
     case Stage::Local: {
@@ -261,6 +313,201 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
     }
     case Stage::Fragment: {
         BuildCommon(regs.ps_program);
+        // The new graphics' programs (2026-11-11: this runs twice a draw, so every other program
+        // is told apart by its hash alone, before any setting is read).
+        info.vr_ambient_occlusion = 0;
+        info.vr_composite_light = 0;
+        const auto* const ps = regs.ProgramForStage(u32(Stage::Fragment));
+        const u64 lighting_hash = ps && ps->Address<u32*>() ? AmdGpu::GetParams(*ps).hash : 0;
+        const bool lighting_program =
+            lighting_hash != 0 &&
+            (Shader::Optimization::AmbientOcclusion::IsAoProgram(lighting_hash) ||
+             Shader::Optimization::MoonShadow::IsShadowMaskProgram(lighting_hash) ||
+             Shader::Optimization::Reflections::IsTraceProgram(lighting_hash) ||
+             Shader::Optimization::Reflections::IsCompositeProgram(lighting_hash) ||
+             Shader::Optimization::BounceLight::IsCompositeProgram(lighting_hash));
+        // The game's AO pass computes ours (ambient_occlusion.h): only its programs.
+        if (lighting_program) {
+            static const char* const ao_override = std::getenv("VR_AMBIENT_OCCLUSION");
+            // ... and its moon-shadow mask ours (moon_shadow.h): only its programs too.
+            static const char* const moon_override = std::getenv("VR_MOON_SHADOWS");
+            const u64 ps_hash = lighting_hash;
+            const bool ps_upscaler =
+                VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off;
+            const bool ao_program = Shader::Optimization::AmbientOcclusion::IsAoProgram(ps_hash);
+            const bool ao_ours = ao_program && Shader::Optimization::AmbientOcclusion::Enabled(
+                                                   VR::IsEnabled(), VR::GetSettings().ambient_occlusion,
+                                                   ps_upscaler, ao_override);
+            // ... or, our AO off, the lamp shadows' mask alone (the game's AO kept).
+            const bool ao_mask_only =
+                ao_program && Shader::Optimization::AmbientOcclusion::MaskOnly(
+                                  ao_ours, VrLampShadowsOn(),
+                                  Shader::Optimization::LightShadow::SceneMaps::Mask());
+            // ... and with the lamp shadows on, their work in the same pass (RuntimeInfo::
+            // VrAoLampShadows: the scene maps, the mask).
+            const bool ao_lamps = (ao_ours || ao_mask_only) &&
+                                  Shader::Optimization::LightShadow::SceneMaps::Enabled() &&
+                                  VrLampShadowsOn();
+            info.vr_ambient_occlusion = u8(
+                (ao_ours ? Shader::RuntimeInfo::VrAmbientOcclusionBit
+                 : ao_mask_only
+                     ? (Shader::RuntimeInfo::VrAmbientOcclusionBit | Shader::RuntimeInfo::VrAoMaskOnly)
+                     : 0) |
+                (ao_lamps ? Shader::RuntimeInfo::VrAoLampShadows : 0) |
+                (Shader::Optimization::MoonShadow::IsShadowMaskProgram(ps_hash) &&
+                         Shader::Optimization::MoonShadow::Enabled(
+                             VR::IsEnabled(), VR::GetSettings().moon_shadows, ps_upscaler,
+                             moon_override)
+                     ? Shader::RuntimeInfo::VrMoonShadows
+                     : 0));
+            // Wet streets (reflections.h): the game's trace ours, its composite counting the
+            // reflection once; only their programs, only with wet_streets (the eboot switch is
+            // made at the start; without it the game's trace never runs).
+            static const char* const reflections_override = std::getenv("VR_REFLECTIONS_TRACE");
+            if (Shader::Optimization::Reflections::Enabled(
+                    VR::IsEnabled(), VR::GetSettings().wet_streets, reflections_override)) {
+                if (Shader::Optimization::Reflections::IsTraceProgram(ps_hash)) {
+                    info.vr_ambient_occlusion |=
+                        Shader::RuntimeInfo::VrReflections |
+                        (ps_upscaler ? Shader::RuntimeInfo::VrReflectionsJitter : 0);
+                } else if (Shader::Optimization::Reflections::IsCompositeProgram(ps_hash)) {
+                    // Blood on glossy floors (reflections.h Blood*): its own key bit.
+                    static const char* const blood_override = std::getenv("VR_BLOOD_REFLECTION");
+                    info.vr_ambient_occlusion |=
+                        Shader::RuntimeInfo::VrReflectionComposite |
+                        (Shader::Optimization::Reflections::BloodEnabled(
+                             VR::IsEnabled(), VR::GetSettings().wet_streets, blood_override)
+                             ? Shader::RuntimeInfo::VrBloodFloors
+                             : 0);
+                }
+            }
+            // With our AO, the same composite's shine by the specular occlusion
+            // (ambient_occlusion.h SpecOcclusion).
+            static const char* const spec_override = std::getenv("VR_SPEC_OCCLUSION");
+            if (Shader::Optimization::Reflections::IsCompositeProgram(ps_hash) &&
+                Shader::Optimization::AmbientOcclusion::SpecEnabled(
+                    Shader::Optimization::AmbientOcclusion::Enabled(
+                        VR::IsEnabled(), VR::GetSettings().ambient_occlusion, ps_upscaler,
+                        ao_override),
+                    spec_override)) {
+                info.vr_ambient_occlusion |= Shader::RuntimeInfo::VrSpecularOcclusion;
+            }
+            static const char* const bounce_override = std::getenv("VR_BOUNCE_LIGHT");
+            static const char* const fog_override = std::getenv("VR_FOG_LIGHT");
+            static const char* const shafts_override = std::getenv("VR_MOON_SHAFTS");
+            const bool composite = Shader::Optimization::BounceLight::IsCompositeProgram(ps_hash);
+            const bool upscaler = ps_upscaler;
+            info.vr_composite_light = u8(
+                (composite && Shader::Optimization::BounceLight::Enabled(
+                                  VR::IsEnabled(), VR::GetSettings().bounce_light, upscaler,
+                                  bounce_override)
+                     ? Shader::RuntimeInfo::VrCompositeBounce
+                     : 0) |
+                (composite && Shader::Optimization::FogLight::Enabled(
+                                  VR::IsEnabled(), VR::GetSettings().fog_light, upscaler,
+                                  fog_override)
+                     ? Shader::RuntimeInfo::VrCompositeFog
+                     : 0) |
+                (composite && Shader::Optimization::MoonShafts::Enabled(
+                                  VR::IsEnabled(), VR::MoonGlowOn(VR::GetSettings()), upscaler,
+                                  shafts_override)
+                     ? Shader::RuntimeInfo::VrCompositeShafts
+                     : 0));
+        }
+        // Less shimmer on shiny details (specular_aa.h): the light programs and the ambient
+        // composite read a widened gloss; in VR, with or without an upscaler. Wet, glistening
+        // blood (wet_blood.h): the _Bloody_ G-buffer programs. Told apart by hash first (a
+        // binary search each), then only the startup override and VR itself.
+        // The air pass (air_light.h): the shadow mask's blur computes the moonlight in the air,
+        // the scene's copy applies it (and the sky's halos). By hash first.
+        if (lighting_hash != 0 &&
+            (Shader::Optimization::AirLight::IsComputeProgram(lighting_hash) ||
+             Shader::Optimization::AirLight::IsHalfProgram(lighting_hash) ||
+             Shader::Optimization::AirLight::IsApplyProgram(lighting_hash))) {
+            static const char* const air_shafts = std::getenv("VR_MOON_SHAFTS");
+            static const char* const air_fog = std::getenv("VR_FOG_LIGHT");
+            const bool air_upscaler =
+                VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off;
+            const bool shafts = Shader::Optimization::MoonShafts::Enabled(
+                VR::IsEnabled(), VR::MoonGlowOn(VR::GetSettings()), air_upscaler, air_shafts);
+            const bool fog = Shader::Optimization::FogLight::Enabled(
+                VR::IsEnabled(), VR::GetSettings().fog_light, air_upscaler, air_fog);
+            if (Shader::Optimization::AirLight::Pass() &&
+                (Shader::Optimization::AirLight::IsApplyProgram(lighting_hash) ? shafts || fog : shafts)) {
+                info.vr_composite_light |= Shader::RuntimeInfo::VrAirPass;
+                // The mist from the fog grid (fog_grid.h, VR_FOG_GRID=1): its own key bit.
+                if (Shader::Optimization::FogGrid::Enabled()) {
+                    info.vr_composite_light |= Shader::RuntimeInfo::VrFogGrid;
+                }
+            }
+        }
+        if (lighting_hash != 0) {
+            static const char* const spec_aa_override = std::getenv("VR_SPEC_AA");
+            static const char* const wet_blood_override = std::getenv("VR_WET_BLOOD");
+            if (Shader::Optimization::SpecularAa::IsLightingProgram(lighting_hash) &&
+                Shader::Optimization::SpecularAa::Enabled(
+                    VR::IsEnabled(), VR::GetSettings().ambient_occlusion, spec_aa_override)) {
+                info.vr_ambient_occlusion |= Shader::RuntimeInfo::VrSpecularAa;
+            } else if (Shader::Optimization::WetBlood::IsBloodProgram(lighting_hash) &&
+                       Shader::Optimization::WetBlood::Enabled(
+                           VR::IsEnabled(), VR::GetSettings().ambient_occlusion,
+                           wet_blood_override)) {
+                info.vr_composite_light |= Shader::RuntimeInfo::VrWetBlood;
+            }
+            // Deeper stones (parallax.h): the three parallax programs, with Shading.
+            if (Shader::Optimization::Parallax::IsParallaxProgram(lighting_hash)) {
+                static const char* const parallax_override = std::getenv("VR_PARALLAX");
+                if (Shader::Optimization::Parallax::Enabled(
+                        VR::IsEnabled(), VR::GetSettings().ambient_occlusion, parallax_override)) {
+                    info.vr_composite_light |= Shader::RuntimeInfo::VrParallax;
+                }
+            } else {
+                // Raised brickwork (parallax.h BumpGaps; vr.ini raised_bricks): the map's G-buffer
+                // programs only (BumpGaps::MapPrograms: never a character's skin, hair or cloth),
+                // five or more colour targets (the pass checks the bump map's shape).
+                static const char* const gaps_override = std::getenv("VR_BUMP_GAPS");
+                if (Shader::Optimization::BumpGaps::IsMapProgram(lighting_hash) &&
+                    Shader::Optimization::BumpGaps::Enabled(
+                        VR::IsEnabled(), VR::GetSettings().raised_bricks, gaps_override)) {
+                    u32 targets = 0;
+                    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                        targets += regs.color_buffers[cb] && regs.color_target_mask.GetMask(cb);
+                    }
+                    if (targets >= 5) {
+                        info.vr_composite_light |= Shader::RuntimeInfo::VrBumpGaps;
+                    }
+                }
+            }
+            // Lit smoke (particle_air.h): the soft particle programs, alpha-blended draws only
+            // (straight or premultiplied; an additive fire is its own light), with the lights in
+            // the air (whose lights it reads).
+            if (Shader::Optimization::ParticleAir::IsParticleProgram(lighting_hash)) {
+                static const char* const air_override = std::getenv("VR_PARTICLE_AIR");
+                using Factor = AmdGpu::BlendControl::BlendFactor;
+                const auto& blend = regs.blend_control[0];
+                const bool straight = blend.color_src_factor == Factor::SrcAlpha;
+                const bool premul = blend.color_src_factor == Factor::One;
+                if (blend.enable && blend.color_dst_factor == Factor::OneMinusSrcAlpha &&
+                    (straight || premul) &&
+                    Shader::Optimization::ParticleAir::Enabled(
+                        VR::IsEnabled(), VR::GetSettings().fog_light,
+                        VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
+                        air_override)) {
+                    info.vr_composite_light |=
+                        Shader::RuntimeInfo::VrParticleAir |
+                        (premul ? Shader::RuntimeInfo::VrParticleAirPremul : 0);
+                }
+            }
+        }
+        // Eye adaptation (cinematic_look.h): the tone map's exposure follows the view's brightness.
+        if (lighting_hash != 0 &&
+            Shader::Optimization::CinematicLook::IsToneMapProgram(lighting_hash)) {
+            static const char* const adapt_override = std::getenv("VR_EYE_ADAPT");
+            if (Shader::Optimization::CinematicLook::AdaptEnabled(
+                    VR::IsEnabled(), VR::GetSettings().eye_adaptation, adapt_override)) {
+                info.vr_ambient_occlusion |= Shader::RuntimeInfo::VrEyeAdaptation;
+            }
+        }
         info.fs_info.en_flags = regs.ps_input_ena;
         info.fs_info.addr_flags = regs.ps_input_addr;
         info.fs_info.num_inputs = regs.num_interp;
@@ -309,7 +556,9 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
             profile.needs_clip_distance_emulation;
         // 0 except while GetVrCutPipeline builds a permutation; VrPushData: only its flag (the
         // draw pushes the radii).
-        info.fs_info.vr_cut = vr_push && selection.vr_fs_cut != 0 ? 1u : selection.vr_fs_cut;
+        info.fs_info.vr_cut = vr_push && selection.vr_fs_cut != 0 &&
+                                      Shader::VrCut::MonocularEye(selection.vr_fs_cut) < 0
+                                  ? 1u : selection.vr_fs_cut;
         break;
     }
     case Stage::Compute: {
@@ -333,6 +582,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
+    if (Shader::EyeSpec::Enabled() && NativeStereo::Enabled()) {
+        eye_spec_compiler = std::make_unique<EyeSpecVariants::Compiler>();
+        EyeSpecVariants::g_compiler.store(eye_spec_compiler.get(), std::memory_order_release);
+        LOG_INFO(Render_Vulkan, "VR eye spec: on (eye-shared buffer variants, VR_EYE_SPEC=1)");
+    }
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
@@ -378,6 +632,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_amd_shader_explicit_vertex_parameter =
             instance_.IsAmdShaderExplicitVertexParameterSupported(),
         .supports_fragment_shader_barycentric = instance_.IsFragmentShaderBarycentricSupported(),
+        .supports_fragment_shading_rate = instance_.IsFoveationEnabled(),
         .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
                                       instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
@@ -386,6 +641,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
+        .native_layer_draws = NativeStereo::LayerDrawsMode(),
     };
     if (NativeStereo::Enabled()) {
         if (UsesVrPushData()) {
@@ -402,12 +658,16 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                      profile.max_push_constant_size, Shader::VrPushData::End);
         }
     }
+    VideoCore::StartupCompile::Display startup_progress;
     WarmUp();
+    ShaderRecord::ReplayIfAsked(profile); // VR_SHADER_REPLAY (test tooling)
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+    PrebuildFromList(); // VR_SHADER_LIST: the startup shader build
+    Storage::DataBase::Instance().PackInBackground(); // the next start reads one pack file
     InitAsyncPipelines(); // bit 40: state only; the compile threads start on first use
     // The warm-up's pipelines: a later compile names what differs from them. And every module it
     // loaded, also one whose pipelines it did not load (a stale stage beside it, the other
@@ -591,13 +851,16 @@ const GraphicsPipeline* PipelineCache::GetVrMotionPipeline(const GraphicsPipelin
                                                           const Shader::VrMotion& motion,
                                                           bool wait, bool* deferred) {
     const auto selection_lock = LockSelection();
+    // Native stereo's multiview G-buffer passes; the DIBR upscaler's single-view ones
+    // (vr_dibr_upscale.h).
+    const u32 views = NativeStereo::Enabled() ? 3u : DibrUpscale::Requested() ? 0u : ~0u;
     if (!base || !motion.enabled || !motion.params_address || !motion.positions_address ||
-        base->GetGraphicsKey().probe_view_mask != 3 || !NativeStereo::Enabled())
+        base->GetGraphicsKey().probe_view_mask != views)
         return nullptr;
     const auto& key = base->GetGraphicsKey();
     const auto& regs = ScratchDraw::Registers(liverpool);
     // The spare varyings and MRT are available only on the ordinary VS/PS G-buffer path.
-    if (key.probe_view_mask != 3 || key.num_samples != 1 || key.num_color_attachments > 7 ||
+    if (key.num_samples != 1 || key.num_color_attachments > 7 ||
         std::popcount(key.mrt_mask) < 5 || (key.mrt_mask & (1u << 7)) ||
         regs.clipper_control.clip_disable ||
         key.prim_type == AmdGpu::PrimitiveType::RectList ||
@@ -663,6 +926,64 @@ const GraphicsPipeline* PipelineCache::GetVrMotionPipeline(const GraphicsPipelin
     return variant;
 }
 
+const GraphicsPipeline* PipelineCache::GetVrCapturePipeline(const GraphicsPipeline* base) {
+    const auto selection_lock = LockSelection();
+    if (!base || !UsesVrPushData() || base->HasVrMotion() || base->HasVrCapture()) {
+        return nullptr;
+    }
+    if (const auto it = vr_capture_pipelines.find(base); it != vr_capture_pipelines.end()) {
+        return it->second;
+    }
+    if (const auto it = vr_capture_pending.find(base); it != vr_capture_pending.end()) {
+        if (AsyncPending(it->second)) {
+            NoteVrVariantDeferred(true);
+            return nullptr;
+        }
+        vr_capture_pending.erase(it); // ready: installed below
+    }
+    const auto& key = base->GetGraphicsKey();
+    const auto& regs = ScratchDraw::Registers(liverpool);
+    const auto remember_none = [&] {
+        vr_capture_pipelines.emplace(base, nullptr);
+        return nullptr;
+    };
+    if (key.num_samples != 1 || regs.clipper_control.clip_disable ||
+        key.prim_type == AmdGpu::PrimitiveType::RectList ||
+        key.prim_type == AmdGpu::PrimitiveType::QuadList) {
+        return remember_none();
+    }
+    for (const auto* stage : base->GetStages()) {
+        if (!stage) continue;
+        const bool vertex = stage->stage == Stage::Vertex && stage->l_stage == LogicalStage::Vertex;
+        const bool fragment =
+            stage->stage == Stage::Fragment && stage->l_stage == LogicalStage::Fragment;
+        if (!vertex && !fragment) {
+            return remember_none();
+        }
+        if (vertex && stage->uses_reserved_motion_varyings) {
+            return remember_none();
+        }
+    }
+    selection.regs = &regs;
+    const auto saved_cut = selection.vr_fs_cut;
+    selection.vr_fs_cut = 0;
+    selection.vr_motion = Shader::VrMotion::CaptureVariant();
+    AsyncInFlight in_flight;
+    const auto* variant =
+        SelectGraphicsPipeline(key.probe_view_mask, AsyncWait::Never, &in_flight);
+    selection.vr_motion = {};
+    selection.vr_fs_cut = saved_cut;
+    if (in_flight) {
+        vr_capture_pending.insert_or_assign(base, std::move(in_flight));
+        return nullptr;
+    }
+    if (variant != nullptr && !variant->HasVrCapture()) {
+        variant = nullptr;
+    }
+    vr_capture_pipelines.insert_or_assign(base, variant);
+    return variant;
+}
+
 const ComputePipeline* PipelineCache::GetComputePipeline() {
     const auto selection_lock = LockSelection();
     selection.regs = &ScratchDraw::Registers(liverpool);
@@ -688,7 +1009,119 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             module_related_pipelines[m].emplace_back(compute_key);
         }
     }
-    return it->second.get();
+    const ComputePipeline* pipeline = it->second.get();
+    if (const auto* merged = pipeline->Merged();
+        merged && merged->state.load(std::memory_order_acquire) == MergedEyes::State::Wanted)
+        [[unlikely]] {
+        BuildMergedEyes(*pipeline);
+    }
+    return pipeline;
+}
+
+void PipelineCache::BuildMergedEyes(const ComputePipeline& pipeline) {
+    const auto& merged = pipeline.MergedShared();
+    auto expected = MergedEyes::State::Wanted;
+    if (!merged->state.compare_exchange_strong(expected, MergedEyes::State::Compiling,
+                                               std::memory_order_acq_rel)) {
+        return;
+    }
+    const auto owner_start = std::chrono::steady_clock::now();
+    const auto& base = pipeline.GetStage(LogicalStage::Compute);
+    const auto fail = [&](const char* why) {
+        LOG_INFO(Render_Vulkan, "VR merged eyes: cs {:08x} stays two launches: {}",
+                 base.pgm_hash, why);
+        MergedEyes::g_stats.failed.fetch_add(1, std::memory_order_relaxed);
+        merged->state.store(MergedEyes::State::Failed, std::memory_order_release);
+    };
+    if (EmulatorSettings.IsPatchShaders()) {
+        return fail("shader patches are on");
+    }
+    // This dispatch's program and registers: the ones the pipeline was selected for.
+    const auto params = AmdGpu::GetParams(*selection.compute);
+    if (params.hash != base.pgm_hash) {
+        return fail("another program");
+    }
+    const auto& runtime_info =
+        BuildRuntimeInfo(selection, Stage::Compute, LogicalStage::Compute, 0);
+    if (!runtime_info.native_stereo) {
+        return fail("not native stereo");
+    }
+    // The translation runs on the compile thread, where the guest may rewrite or unmap the program
+    // and the tables its user data point to, and the next dispatch replaces these registers: all
+    // it reads is copied here. The program's code. This dispatch's user data and flattened user
+    // data as the pipeline binds them (GetProgram has just walked them into the program's Info,
+    // `base`, or a recording packet owns them: UserData/FlatUserData give either): every sharp
+    // the translation reads is in them. The walker that flattened them: the translation's own is
+    // compared with it, never run (Shader::SrtSnapshot); equal, the variant's SPIR-V also reads
+    // the flat buffer this dispatch binds at the right offsets. The base address stays a number
+    // (inline constant buffers' fixup; nothing is read there while translating).
+    const auto user = base.UserData();
+    if (user.size() != Shader::ShaderParams::NumShaderUserData) {
+        return fail("no user data");
+    }
+    const auto flat = base.FlatUserData();
+    const auto* const walker = reinterpret_cast<const u8*>(base.srt_info.walker_func);
+    struct Inputs {
+        std::vector<u32> code;
+        std::array<u32, Shader::ShaderParams::NumShaderUserData> user;
+        std::vector<u32> flat;
+        std::vector<u8> walker;
+        VAddr program_base;
+        u64 hash;
+        Shader::RuntimeInfo runtime_info;
+        Shader::Profile profile;
+    };
+    Inputs inputs{
+        .code = std::vector<u32>(params.code.begin(), params.code.end()),
+        .flat = std::vector<u32>(flat.begin(), flat.end()),
+        .walker = std::vector<u8>(walker, walker + base.srt_info.walker_func_size),
+        .program_base = params.Base(),
+        .hash = params.hash,
+        .runtime_info = runtime_info,
+        .profile = profile,
+    };
+    std::ranges::copy(user, inputs.user.begin());
+    if (!merged_compiler) {
+        merged_compiler = std::make_unique<MergedEyes::Compiler>(instance.GetDevice());
+    }
+    auto translate = [in = std::move(inputs)](const MergedEyes::Variant& variant,
+                                              Shader::Pools& pools,
+                                              std::vector<u32>& spv) mutable -> const char* {
+        const Shader::ShaderParams params{.user_data = in.user, .code = in.code, .hash = in.hash};
+        Shader::Info info(Stage::Compute, LogicalStage::Compute, params);
+        info.pgm_base = in.program_base;
+        Shader::SrtSnapshot srt{.flat = in.flat, .walker = in.walker};
+        const auto program = Shader::TranslateProgram(params.code, pools, info, in.runtime_info,
+                                                      in.profile, &srt);
+        if (srt.differs) {
+            return "its flattened user data are laid out unlike the pipeline's";
+        }
+        const bool special_buffer = std::ranges::any_of(info.buffers, [](const auto& buffer) {
+            return buffer.buffer_type != Shader::BufferType::Guest &&
+                   buffer.buffer_type != Shader::BufferType::Flatbuf;
+        });
+        if (info.translation_failed) {
+            return "translation failed";
+        }
+        if (info.vr_screen_rect.Valid()) {
+            return "a screen-rect shader";
+        }
+        if (info.uses_dma || special_buffer) {
+            return "raw memory, emulated shared memory or a special buffer";
+        }
+        if (ComputePipeline::LayoutBindings(info) != variant.bindings) {
+            return "its translation's descriptor layout differs";
+        }
+        Shader::Backend::Bindings binding{};
+        spv = Shader::Backend::SPIRV::EmitSPIRV(in.profile, in.runtime_info, program, binding,
+                                                true);
+        return nullptr;
+    };
+    merged_compiler->Submit(merged, std::move(translate));
+    LOG_INFO(Render_Vulkan, "VR merged eyes: cs {:08x}: queued, owner {} us", base.pgm_hash,
+             std::chrono::duration_cast<std::chrono::microseconds>(
+                 std::chrono::steady_clock::now() - owner_start)
+                 .count());
 }
 
 bool PipelineCache::RefreshGraphicsKey(PipelineSelection& selection, u32 view_mask, PrepGraphicsContext* prep) {
@@ -791,7 +1224,7 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& selection, u32 view_ma
         }
     }
 
-    if (selection.vr_motion.enabled) {
+    if (selection.vr_motion.enabled && !selection.vr_motion.Capture()) {
         // The guest MRT mask stays unchanged: target 7 is host-owned, not a guest image.
         constexpr auto slot = Shader::VrMotion::Output;
         key.num_color_attachments = slot + 1;
@@ -1011,6 +1444,19 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
              compile_reasons.Module(existing, wanted, reason_hash));
     DumpShader(code, info.pgm_hash, info.stage, perm_idx, "bin");
 
+    // VR_SHADER_RECORD (vk_shader_record.h): the inputs before the translation changes them.
+    std::optional<ShaderRecord::Entry> record_entry;
+    if (ShaderRecord::RecordOn()) [[unlikely]] {
+        record_entry.emplace();
+        const auto user = info.UserData();
+        std::copy_n(user.begin(), std::min(user.size(), record_entry->user.size()),
+                    record_entry->user.begin());
+        record_entry->program_base = info.pgm_base;
+        record_entry->runtime_info = runtime_info;
+        record_entry->binding = binding;
+        Shader::g_translation_capture = &record_entry->capture;
+        Shader::Gcn::g_fetch_capture = &record_entry->fetch;
+    }
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     info.uses_reserved_motion_varyings = info.l_stage == LogicalStage::Vertex &&
         (info.stores.GetAny(Shader::IR::Attribute::Param0 + (Shader::VrMotion::CurrentLocation - 1)) ||
@@ -1018,6 +1464,11 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
          info.stores.GetAny(Shader::IR::Attribute::Param0 + Shader::VrMotion::PreviousLocation));
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.stage, perm_idx, "spv");
+    if (record_entry) [[unlikely]] {
+        Shader::g_translation_capture = nullptr;
+        Shader::Gcn::g_fetch_capture = nullptr;
+        ShaderRecord::Record(info, *record_entry, spv); // its caller names it (Commit)
+    }
 
     vk::ShaderModule module;
 
@@ -1057,6 +1508,116 @@ static u64 UniquePermutationId(const Program& program, u64 id, bool& cacheable) 
     return id;
 }
 
+bool SameResources(const Shader::Info& a, const Shader::Info& b) {
+    if (a.buffers.size() != b.buffers.size() || a.images.size() != b.images.size() ||
+        a.samplers.size() != b.samplers.size() || a.fmasks.size() != b.fmasks.size() ||
+        a.ud_mask.mask != b.ud_mask.mask ||
+        a.srt_info.flattened_bufsize_dw != b.srt_info.flattened_bufsize_dw) {
+        return false;
+    }
+    for (size_t i = 0; i < a.buffers.size(); ++i) {
+        const auto& x = a.buffers[i];
+        const auto& y = b.buffers[i];
+        if (x.sharp_idx != y.sharp_idx || x.used_types != y.used_types ||
+            x.buffer_type != y.buffer_type || x.instance_attrib != y.instance_attrib ||
+            x.is_written != y.is_written || x.is_formatted != y.is_formatted ||
+            std::memcmp(&x.inline_cbuf, &y.inline_cbuf, sizeof(x.inline_cbuf)) != 0) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < a.images.size(); ++i) {
+        const auto& x = a.images[i];
+        const auto& y = b.images[i];
+        if (x.sharp_idx != y.sharp_idx || x.is_depth != y.is_depth || x.is_atomic != y.is_atomic ||
+            x.is_array != y.is_array || x.is_written != y.is_written || x.is_r128 != y.is_r128 ||
+            x.mip_fallback_mode != y.mip_fallback_mode ||
+            x.constant_mip_index != y.constant_mip_index) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < a.samplers.size(); ++i) {
+        const auto& x = a.samplers[i];
+        const auto& y = b.samplers[i];
+        if (x.sharp_idx != y.sharp_idx || x.is_inline_sampler != y.is_inline_sampler ||
+            x.associated_image != y.associated_image || x.disable_aniso != y.disable_aniso ||
+            std::memcmp(&x.inline_sampler, &y.inline_sampler, sizeof(x.inline_sampler)) != 0) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < a.fmasks.size(); ++i) {
+        if (a.fmasks[i].sharp_idx != b.fmasks[i].sharp_idx) {
+            return false;
+        }
+    }
+    // ... and what the rasterizer reads from the stage per draw beside them: a parallax
+    // permutation took a first permutation's "no height image" (vr_bump_image) and drew flat
+    // (2026-11-13, a code review); the screen rectangle, the light shadows', the moon shadow's
+    // and the reflections' hookups the same way.
+    const auto& ra = a.vr_screen_rect;
+    const auto& rb = b.vr_screen_rect;
+    if (a.vr_bump_image != b.vr_bump_image || ra.binding != rb.binding || ra.image != rb.image ||
+        ra.dst != rb.dst || ra.src != rb.src || ra.end != rb.end) {
+        return false;
+    }
+    const auto& la = a.vr_light_shadow;
+    const auto& lb = b.vr_light_shadow;
+    if (la.on != lb.on || la.matrix_buffer != lb.matrix_buffer || la.light_buffer != lb.light_buffer ||
+        la.depth_image != lb.depth_image || la.game_shadowed != lb.game_shadowed ||
+        la.count != lb.count || la.stride != lb.stride) {
+        return false;
+    }
+    const auto& ma = a.vr_moon_shadow;
+    const auto& mb = b.vr_moon_shadow;
+    if (ma.on != mb.on || ma.reversed != mb.reversed || ma.cascades_buffer != mb.cascades_buffer ||
+        ma.params_buffer != mb.params_buffer || ma.depth_image != mb.depth_image ||
+        ma.shadow_compare != mb.shadow_compare || ma.shadow_raw != mb.shadow_raw) {
+        return false;
+    }
+    const auto& fa = a.vr_reflection;
+    const auto& fb = b.vr_reflection;
+    if (fa.on != fb.on || fa.jitter != fb.jitter || fa.buffer != fb.buffer ||
+        fa.depth_image != fb.depth_image || fa.normal_image != fb.normal_image ||
+        fa.colour_image != fb.colour_image) {
+        return false;
+    }
+    const auto& ua = a.vr_reflection_upsample;
+    const auto& ub = b.vr_reflection_upsample;
+    return ua.on == ub.on && ua.buffer == ub.buffer && ua.depth_image == ub.depth_image &&
+           ua.colour_image == ub.colour_image;
+}
+
+bool BindingsLineUp(std::span<const Shader::Info* const> infos,
+                    std::span<const Shader::Backend::Bindings> starts) {
+    Shader::Backend::Bindings at{};
+    for (size_t i = 0; i < infos.size() && i < starts.size(); ++i) {
+        if (infos[i] == nullptr) {
+            continue;
+        }
+        if (!infos[i]->MatchesBindingStart(starts[i], at)) {
+            return false;
+        }
+        infos[i]->AddBindings(at);
+    }
+    return true;
+}
+
+// A new permutation's translation: kept as its own Info when it declares other resources than the
+// program's (null: it shares the program's). Once per compile, never per draw.
+std::shared_ptr<Shader::Info> PipelineCache::OwnResources(Shader::Info&& translated,
+                                                          const Shader::Info& program_info,
+                                                          size_t perm_idx) {
+    if (SameResources(translated, program_info)) {
+        return {};
+    }
+    LOG_INFO(Render_Vulkan,
+             "Shader {} {:#x} permutation {}: resources of its own ({} buffers, {} images, {} "
+             "samplers; the program's first: {}, {}, {}): its pipelines take its own layout",
+             translated.stage, translated.pgm_hash, perm_idx, translated.buffers.size(),
+             translated.images.size(), translated.samplers.size(), program_info.buffers.size(),
+             program_info.images.size(), program_info.samplers.size());
+    return std::make_shared<Shader::Info>(std::move(translated));
+}
+
 PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& selection,
     Stage stage, LogicalStage l_stage, const Shader::ShaderParams& params,
     Shader::Backend::Bindings& binding, std::optional<Shader::Gcn::FetchShaderData>* spare_fetch,
@@ -1070,9 +1631,20 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& selection,
         const auto& module = program.modules[index];
         if (l_stage == LogicalStage::Vertex)
             selection.vertex_output_locations = module.vertex_output_locations;
+        // A permutation with resources of its own (Program::Module::info): its Info, with this
+        // draw's user data as the program's got (a recording packet's own copy aside).
+        Shader::Info* stage_info = &program.info;
+        if (module.info) [[unlikely]] {
+            stage_info = module.info.get();
+            if (!ScratchDraw::Find(stage_info)) {
+                stage_info->pgm_base = params.Base();
+                stage_info->user_data = params.user_data;
+                stage_info->RefreshFlatBuf();
+            }
+        }
         // The stage hash: the permutation's name (its id with FAST_CPU_PERM_IDS, else
         // HashCombine(program, index); pipeline_cache_policy.h), the disk cache's name.
-        return {&program.info, module.module,
+        return {stage_info, module.module,
                 ScratchOwned::CopyForReturn(module.spec.fetch_shader_data, spare_fetch), module.id};
     };
     auto it_pgm = program_cache.find(params.hash);
@@ -1093,6 +1665,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& selection,
         // The program's first permutation: no other to collide with.
         const u64 perm_id = PermutationIds() ? PermutationId(params.hash, spec)
                                              : HashCombine(params.hash, u64{0});
+        ShaderRecord::Commit(perm_id); // VR_SHADER_RECORD
         // Physical motion-buffer addresses are process/device allocations, never disk data: a
         // motion permutation is written only when the draw pushes them (VrPushData).
         if (!runtime_info.vr_motion.Baked()) {
@@ -1144,7 +1717,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& selection,
         if (memo_idx >= 0) {
             ++spec_counters.hits;
             if (!PerfMemo::CheckMode()) {
-                info.AddBindings(binding);
+                program->InfoOf(size_t(memo_idx)).AddBindings(binding);
                 return finish(*program, memo_idx);
             }
         } else {
@@ -1192,14 +1765,18 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& selection,
         std::vector<u32> spv;
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, perm_id, binding,
                                spv, &program->modules, &spec);
+        ShaderRecord::Commit(perm_id); // VR_SHADER_RECORD
+        const u64 outputs = new_info.vertex_output_locations;
+        auto own = OwnResources(std::move(new_info), info, perm_idx);
 
         if (cacheable && !runtime_info.vr_motion.Baked()) {
             RegisterShaderBinary(std::move(spv), perm_id, params.hash, perm_idx);
-            RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_id, perm_idx,
-                               new_info.vertex_output_locations);
+            // The meta holds the permutation's own resources (a cached one loads with them).
+            RegisterShaderMeta(own ? *own : info, spec.fetch_shader_data, spec, perm_id, perm_idx,
+                               outputs);
         }
         std::unique_lock lock(programs_mutex);
-        program->AddPermut(module, std::move(spec), perm_id, new_info.vertex_output_locations);
+        program->AddPermut(module, std::move(spec), perm_id, outputs, std::move(own));
     } else if (!it->module) {
         // Bit 40 warm-up (vk_pipeline_serialization.cpp): the driver rejected a cached pipeline
         // built from this permutation, so its cached module was dropped. Compile it again at its
@@ -1211,19 +1788,21 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& selection,
         std::vector<u32> spv;
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, perm_id, binding,
                                spv, &program->modules, &spec);
+        ShaderRecord::Commit(perm_id); // VR_SHADER_RECORD
+        const u64 outputs = new_info.vertex_output_locations;
+        auto own = OwnResources(std::move(new_info), info, perm_idx);
         if (!runtime_info.vr_motion.Baked()) {
             RegisterShaderBinary(std::move(spv), perm_id, params.hash, perm_idx);
-            RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_id, perm_idx,
-                               new_info.vertex_output_locations);
+            RegisterShaderMeta(own ? *own : info, spec.fetch_shader_data, spec, perm_id, perm_idx,
+                               outputs);
         }
         std::unique_lock lock(programs_mutex);
         ++programs_generation;
-        program->InsertPermut(module, std::move(spec), perm_idx, perm_id,
-                              new_info.vertex_output_locations);
+        program->InsertPermut(module, std::move(spec), perm_idx, perm_id, outputs, std::move(own));
     } else {
-        info.AddBindings(binding);
         module = it->module;
         perm_idx = std::distance(program->modules.begin(), it);
+        program->InfoOf(perm_idx).AddBindings(binding);
     }
     if (memo) {
         StoreSpecMemo(selection, *program, stage, l_stage, start, memo_fs, proj, proj_valid, u32(perm_idx));
@@ -1344,6 +1923,9 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
     // Bit 40: no compile thread may still use a module destroyed below (the generation bump
     // above makes every job that has not started yet stale).
     DrainAsyncPipelines();
+    if (eye_spec_compiler) {
+        eye_spec_compiler->Drain(); // VR_EYE_SPEC: recipes name the modules too
+    }
     vr_cut_pending.clear(); // their jobs are stale now, and their bases may go below
     vr_motion_pending.clear();
     std::optional<vk::ShaderModule> new_module{};

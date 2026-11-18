@@ -16,6 +16,7 @@
 #include "common/io_file.h"
 #include "common/logging/formatter.h"
 #include "common/scope_exit.h"
+#include "common/scm_rev.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
@@ -100,7 +101,7 @@ static Uint32 SDLCALL PollControllerLightColour(void* userdata, SDL_TimerID time
 WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controllers_,
                      std::string_view window_title)
     : width{width_}, height{height_}, controllers{*controllers_} {
-    if (!SDL_SetHint(SDL_HINT_APP_NAME, "shadPS4")) {
+    if (!SDL_SetHint(SDL_HINT_APP_NAME, Common::g_application_name)) {
         UNREACHABLE_MSG("Failed to set SDL window hint: {}", SDL_GetError());
     }
     if (!SDL_Init(SDL_INIT_VIDEO)) {
@@ -129,11 +130,18 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // width/height as the windowed size to restore when leaving fullscreen.
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN,
                            EmulatorSettings.IsFullScreen());
+    // Created hidden, shown once it exists (2026-11-15): a window that takes the focus while SDL
+    // is still filling in its own record of it crashed at startup (SDL's WIN_UpdateFocus read the
+    // record's video data before SetupWindowData had set it: an access violation at address 8 in
+    // WIN_CheckClipboardUpdate, the main thread, four seconds in; seen once in a headset launch).
+    // Hidden, it gets no focus or activation message until SDL_ShowWindow below.
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_HIDDEN_BOOLEAN, true);
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     if (window == nullptr) {
         UNREACHABLE_MSG("Failed to create window handle: {}", SDL_GetError());
     }
+    SDL_ShowWindow(window);
 
     SDL_SetWindowMinimumSize(window, 640, 360);
 

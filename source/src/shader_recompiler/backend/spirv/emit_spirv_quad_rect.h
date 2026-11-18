@@ -14,6 +14,8 @@ enum class AuxShaderType : u32 {
     PassthroughTES,
 };
 
-[[nodiscard]] std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type, u64 location_mask);
+// `layer_from_hud` (PassthroughTES, NativeStereo::LayerDraws): gl_Layer from vr_hud's sign bit.
+[[nodiscard]] std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type, u64 location_mask,
+                                                      bool layer_from_hud = false);
 
 } // namespace Shader::Backend::SPIRV

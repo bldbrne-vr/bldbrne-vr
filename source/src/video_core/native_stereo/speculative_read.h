@@ -5,7 +5,7 @@
 // You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
-// Scratch Windows prerequisite for speculative resource-table reads.
+// Windows prerequisite for speculative resource-table reads.
 #pragma once
 #ifdef _WIN32
 #include <windows.h>

@@ -18,6 +18,8 @@
 #include <string_view>
 #include <vector>
 
+#include "core/vr/headset_panels.h"
+#include "core/vr/page_pad.h"
 #include "core/vr/thumb_layout.h"
 #include "core/vr/vr_page.h"
 #include "core/vr/xr_bindings.h"
@@ -49,7 +51,14 @@ struct Config {
     bool quick_arc{true};       // quick_items=1 and quick_arc=1: the arc exists
     bool arc_l3{true};          // quick_arc_l3: the move stick's click taps the arc (scheme 1)
     bool belt_vial{true};       // left_scheme=2: the left grip at the hip draws a Blood Vial
+    // quick_grip_hold (left_scheme=2): the grip on an item takes it and holds it, the trigger uses
+    // it, letting go throws or puts it back. (left_scheme=2 with inject=1: X opens the arc as Y's
+    // tap, x_fan; the vial is the body's.)
+    bool grip_hold{true};
+    bool x_fan{true}; // x_button=fan: X opens the arc there (vial: X arms a vial, as before)
     bool right_grip_draw{false}; // right_grip=draw: the old clutch (draw on the right grip)
+    bool optimized_two_hand{false}; // opt-in motion scheme
+    bool trigger_hold{true};
     bool swings{true};          // gestures=1: swings attack (motion layout)
     bool melee_physical{true};  // melee=physical: the swing is the attack
     bool menu_hold_screen{false}; // menu_hold=screen: the hold toggles the flat screen
@@ -58,15 +67,28 @@ struct Config {
     bool grip_adjust{true};
     float snap_turn_deg{30.0f}; // 0 = smooth turning
     bool seated{false};
+    // A gamepad play style (core/vr/play_style.h) with a gamepad connected: the view shows the
+    // gamepad (its Xbox names, or the game's own PlayStation ones) and, on its third tab, the VR
+    // controllers as that style plays them. `third_person`: the right stick's jobs.
+    bool gamepad{false};
+    bool gamepad_xbox{false};
+    bool third_person{false};
 };
 
 enum class Tab : std::uint8_t { Gameplay, Menus, Gestures };
 inline constexpr int TabCount = 3;
 inline constexpr std::array<const char*, TabCount> TabNames{"Gameplay", "Menus", "Gestures"};
+// The gamepad's tabs (Config::gamepad): its own two, then the VR controllers' gameplay.
+inline constexpr std::array<const char*, TabCount> PadTabNames{"Gameplay", "Menus",
+                                                               "Motion controllers"};
 
 // ---- The controller in your hands ---------------------------------------------------------------
 
-enum class Family : std::uint8_t { Touch, Index, Vive, Wmr, Simple, Frame };
+// Sense: the PS VR2 Sense controllers, which OpenXR has no profile for: SteamVR hands them to the
+// game as Touch (Cross where A is, Circle B, Square X, Triangle Y; L1 / R1 the grips, L2 / R2 the
+// triggers) and keeps Create, Options and the PS button to itself.
+// Gamepad: a gamepad in a gamepad play style (never an interaction profile: GamepadParts).
+enum class Family : std::uint8_t { Touch, Index, Vive, Wmr, Simple, Frame, Sense, Gamepad };
 
 // The family drawn for a bound interaction profile (unknown or none: Touch, the Quest's).
 inline Family FamilyOf(std::string_view profile) {
@@ -87,11 +109,20 @@ inline Family FamilyOf(std::string_view profile) {
     }
     return Family::Touch; // Quest Touch / Touch Plus, HP Reverb G2, PICO: Touch's buttons
 }
+// The same on this headset (XrSystemProperties::systemName): Touch on a PS VR2 is its Sense
+// controllers.
+inline Family FamilyOf(std::string_view profile, std::string_view system_name) {
+    const Family f = FamilyOf(profile);
+    const Headsets::Headset* headset = Headsets::FromSystemName(system_name);
+    return f == Family::Touch && headset != nullptr && headset->id == "psvr2" ? Family::Sense : f;
+}
 
 inline const char* FamilyName(Family f) {
     switch (f) {
     case Family::Frame:
         return "Steam Frame";
+    case Family::Sense:
+        return "PS VR2 Sense";
     case Family::Touch:
         return "Touch";
     case Family::Index:
@@ -102,6 +133,8 @@ inline const char* FamilyName(Family f) {
         return "Windows MR";
     case Family::Simple:
         return "simple";
+    case Family::Gamepad:
+        return "gamepad";
     }
     return "";
 }
@@ -120,13 +153,28 @@ inline const char* DefaultProfile(Family f) {
     case Family::Simple:
         return "/interaction_profiles/khr/simple_controller";
     case Family::Touch:
+    case Family::Sense: // SteamVR's Touch
+    case Family::Gamepad: // (never bound: GamepadParts)
         break;
     }
     return "/interaction_profiles/oculus/touch_controller";
 }
 
-// A part drawn on a controller.
-enum class Part : std::uint8_t { ButtonHigh, ButtonLow, Stick, Pad, Menu, Trigger, Grip };
+// A part drawn on a controller. A gamepad's: its triggers, bumpers (Grip), the touchpad or View
+// and Options or Menu (Menu), its D-pad (Pad), sticks and face buttons (top ButtonHigh, bottom
+// ButtonLow, FaceLeft, FaceRight).
+enum class Part : std::uint8_t {
+    ButtonHigh,
+    ButtonLow,
+    Stick,
+    Pad,
+    Menu,
+    Trigger,
+    Grip,
+    FaceLeft,
+    FaceRight,
+};
+inline constexpr std::size_t PartCount = 9;
 
 // How a binding sits on its part.
 enum class Manner : std::uint8_t { Main, Click, Force, Up, Down, Centre, Left, Right };
@@ -249,6 +297,7 @@ struct DrawnPart {
     Part part{Part::Menu};
     std::string name; // "Y", "left stick", "left trackpad", "right menu button"
     std::vector<PartBinding> binds;
+    std::string click; // a stick's click by its own name ("L3"); empty: "<name> click"
 };
 
 // The parts each family draws, per hand, top to bottom (the callouts' order).
@@ -260,6 +309,8 @@ inline std::vector<Part> DrawingOrder(Family f, bool right) {
                                          Part::Trigger, Part::Grip}
                      : std::vector<Part>{Part::ButtonHigh, Part::ButtonLow, Part::Stick, Part::Menu,
                                          Part::Trigger, Part::Grip};
+    case Family::Sense: // no Menu: Create and Options are SteamVR's
+        return {Part::ButtonHigh, Part::ButtonLow, Part::Stick, Part::Trigger, Part::Grip};
     case Family::Index:
         return {Part::ButtonHigh, Part::ButtonLow, Part::Stick, Part::Pad, Part::Trigger,
                 Part::Grip};
@@ -269,6 +320,12 @@ inline std::vector<Part> DrawingOrder(Family f, bool right) {
         return {Part::Menu, Part::Stick, Part::Pad, Part::Trigger, Part::Grip};
     case Family::Simple:
         return {Part::Menu, Part::Trigger};
+    case Family::Gamepad: // (GamepadParts orders its own by the drawing)
+        return right ? std::vector<Part>{Part::Trigger, Part::Grip, Part::Menu, Part::ButtonHigh,
+                                         Part::FaceRight, Part::FaceLeft, Part::ButtonLow,
+                                         Part::Stick}
+                     : std::vector<Part>{Part::Trigger, Part::Grip, Part::Menu, Part::Pad,
+                                         Part::Stick};
     }
     return {};
 }
@@ -276,14 +333,32 @@ inline std::vector<Part> DrawingOrder(Family f, bool right) {
 inline std::string PartName(Family f, bool right, Part p) {
     const std::string side = right ? "right " : "left ";
     if (f == Family::Frame && !right) {
+        // Each is a pair (core/vr/xr_bindings.h Frame): Y is up or left, X down or right.
         if (p == Part::ButtonHigh) {
-            return "D-pad up";
+            return "D-pad up/left";
         }
         if (p == Part::ButtonLow) {
-            return "D-pad down";
+            return "D-pad down/right";
         }
         if (p == Part::Menu) {
             return "View";
+        }
+    }
+    if (f == Family::Sense) {
+        // The PlayStation names: the upper face button Triangle / Circle, the lower Square / Cross.
+        switch (p) {
+        case Part::ButtonHigh:
+            return right ? "Circle" : "Triangle";
+        case Part::ButtonLow:
+            return right ? "Cross" : "Square";
+        case Part::Menu:
+            return right ? "Options" : "Create";
+        case Part::Trigger:
+            return right ? "R2" : "L2";
+        case Part::Grip:
+            return right ? "R1" : "L1";
+        default:
+            break;
         }
     }
     switch (p) {
@@ -301,6 +376,9 @@ inline std::string PartName(Family f, bool right, Part p) {
         return f == Family::Simple ? side + "select" : side + "trigger";
     case Part::Grip:
         return f == Family::Vive || f == Family::Wmr ? side + "grip button" : side + "grip";
+    case Part::FaceLeft:
+    case Part::FaceRight: // a gamepad's (GamepadParts names them)
+        return side + "button";
     }
     return {};
 }
@@ -310,7 +388,10 @@ inline std::vector<DrawnPart> PartsOf(Family family, std::string_view profile, b
     std::vector<DrawnPart> out;
     for (const bool right : {false, true}) {
         for (const Part part : DrawingOrder(family, right)) {
-            DrawnPart d{right, part, PartName(family, right, part), {}};
+            DrawnPart d{right, part, PartName(family, right, part), {}, {}};
+            if (family == Family::Sense && part == Part::Stick) {
+                d.click = right ? "R3" : "L3";
+            }
             for (const XrBindings::Binding& b : bindings) {
                 const Control c = ControlOfAct(b.act);
                 const auto place = SpotOf(b.path);
@@ -340,7 +421,10 @@ inline std::string NameOf(const std::vector<DrawnPart>& parts, Control physical)
             continue;
         }
         if (found > 1 || manner == Manner::Click) {
-            return p.part == Part::Stick || p.part == Part::Pad ? p.name + " click" : p.name;
+            if (p.part != Part::Stick && p.part != Part::Pad) {
+                return p.name;
+            }
+            return p.click.empty() ? p.name + " click" : p.click;
         }
         switch (manner) {
         case Manner::Force:
@@ -420,6 +504,19 @@ inline Words EntryWords(const Thumbs::Entry& e, const Config& c,
     const bool classic = c.layout.classic;
     const bool scheme2 = !classic && c.layout.left_scheme == 2;
     const bool motion = !classic;
+    const bool optimized = motion && !c.right_grip_draw && c.optimized_two_hand;
+    if (optimized) {
+        if (id == "lock_on")
+            return {"Transform", "tap and release", "Tap: transform. Weapons switch at the shoulders; held + up/down keeps item/bullet shortcuts."};
+        if (id == "gun")
+            return {"Attach / detach", c.trigger_hold ? "hold near handle; release to let go" : "press to grab; again to let go", "Near a transformed handle: grab using Hold or Toggle. Otherwise gun / items. Bow string unchanged."};
+        if (id == "heavy")
+            return {"Heavy / special", "bow string unchanged", "Heavy attack; Bloodletter / Kos special or Whirligig spin. Bow: nock, draw, release."};
+        if (id == "transform")
+            return {"Slide right hand", "hold grip; release to catch", "While two-handing, hold to slide the right hand. Stick tap transforms."};
+        if (id == "take")
+            return {"Slide left hand / items", "hold grip; release to catch", "While two-handing, hold to slide the left hand. Detach with left trigger to use items."};
+    }
     const auto name = [&](Control logical) {
         return NameOf(parts, Thumbs::Physical(logical, c.layout.swap));
     };
@@ -448,6 +545,10 @@ inline Words EntryWords(const Thumbs::Entry& e, const Config& c,
         return {"Interact", {}, "Talk, open doors and gates, pick up items at once."};
     }
     if (id == "vial") {
+        if (scheme2 && c.quick_arc && c.layout.inject && c.x_fan) {
+            return {"Item arc", "again: close it",
+                    "Opens your quick items at your hand; again: closes it."};
+        }
         if (motion && c.layout.inject) {
             return {"Blood Vial", "then stab your wrist",
                     std::string{"Arms a vial: stab your wrist or body"} +
@@ -464,18 +565,22 @@ inline Words EntryWords(const Thumbs::Entry& e, const Config& c,
     if (id == "lock_on") {
         return {"Lock on", {},
                 classic   ? "Held: lock on (the game's R3)."
-                : scheme2 ? "Click: lock on. Held + left / right: switch weapons; + up: blood "
+                : scheme2 ? "Click: lock on. Weapons switch at the shoulders. Held + up: blood "
                             "bullets; + down: next item."
-                          : "Click: lock on. Held + left / right: switch weapons."};
+                          : "Click: lock on. Weapons switch at the shoulders."};
     }
     if (id == "gun") {
         if (classic) {
             return {"Fire gun \xC2\xB7 Parry", "the game's L2",
                     "Fires the gun (the game's L2). In menus: previous tab."};
         }
+        if (scheme2 && c.grip_hold) {
+            return {"Fire gun \xC2\xB7 Parry", "holding an item: use it",
+                    "Shoots where the gun points. Holding an item: uses it."};
+        }
         if (scheme2) {
-            return {"Fire gun \xC2\xB7 Parry", "on an item card: take it",
-                    "Shoots where the gun points. On an item card: takes or uses it."};
+            return {"Fire gun \xC2\xB7 Parry", "on an item: take it",
+                    "Shoots where the gun points. On an item: takes or uses it."};
         }
         return {"Fire gun \xC2\xB7 Parry", "holding an item: use it",
                 "Shoots where the gun points. In menus: previous tab."};
@@ -493,7 +598,7 @@ inline Words EntryWords(const Thumbs::Entry& e, const Config& c,
         }
         if (c.melee_physical && c.swings) {
             return {"Heavy attack", "hold, then swing",
-                    "Held 0.35 s: the next swing is heavy. Held 1 s: fully charged."};
+                    "Held 0.36 s: the next swing is heavy. Held 1.25 s: fully charged."};
         }
         return {"Heavy attack", "hold: charge", "Tap: a heavy attack. Hold to charge, then swing."};
     }
@@ -539,6 +644,13 @@ inline Words EntryWords(const Thumbs::Entry& e, const Config& c,
         if (!c.quick_arc) {
             return {"Grip", {}, "Nothing in gameplay; in the game's menus: \xE2\x96\xA1."};
         }
+        if (scheme2 && c.grip_hold) {
+            const bool belt = c.belt_vial && c.layout.inject;
+            return {"Item arc", "on an item: take it",
+                    std::string{"Hold: opens your items at your hand. On an item: takes it while "
+                                "squeezed; let go to throw it or put it back."} +
+                        (belt ? " At your left hip: a Blood Vial." : "")};
+        }
         if (scheme2) {
             const bool belt = c.belt_vial && c.layout.inject;
             return {"Item arc", belt ? "at your hip: Blood Vial" : "again: close it",
@@ -546,7 +658,7 @@ inline Words EntryWords(const Thumbs::Entry& e, const Config& c,
                          : "Opens the item arc at your hand; again: closes it."};
         }
         return {"Take item", "from the arc",
-                "Squeeze on a card to take it; let go mid-swing to throw it."};
+                "Squeeze on an item to take it; let go mid-swing to throw it."};
     }
     if (id == "menu") {
         // y_menu (SteamVR by default: its dashboard owns Menu): Y is the menu button. Its held
@@ -559,13 +671,13 @@ inline Words EntryWords(const Thumbs::Entry& e, const Config& c,
         // Y is the menu only with y_menu (the motion layout's left_scheme=2 and a Y button);
         // otherwise nothing opens the game's menu on this runtime (the presenter's log says so).
         if (c.layout.y_menu && scheme2) {
-            return {"SteamVR", "its dashboard",
-                    "The runtime's own button (SteamVR's dashboard): " + name(Control::Y) +
+            return {"Runtime menu", "its dashboard",
+                    "The runtime's dashboard button: " + name(Control::Y) +
                         " opens the game's menu."};
         }
-        return {"SteamVR", "its dashboard",
-                "The runtime's own button (SteamVR's dashboard). No controller button opens the "
-                "game's menu on this runtime: y_menu (vr.ini, with the motion layout's "
+        return {"Runtime menu", "its dashboard",
+                "The runtime uses this button for its dashboard. For the game's menu, "
+                "y_menu (vr.ini, with the motion layout's "
                 "left_scheme=2) makes Y the menu button."};
     }
     if (id == "options") {
@@ -576,7 +688,7 @@ inline Words EntryWords(const Thumbs::Entry& e, const Config& c,
     // Combos and chords: on the help lines of their controls.
     if (e.how != Thumbs::How::Press) {
         if (id == "dpad") {
-            return {"D-pad", {}, {}};
+            return {classic ? "D-pad" : "items / blood bullets (up / down)", {}, {}};
         }
         if (id == "gestures") {
             return {"gestures", {}, {}};
@@ -630,6 +742,11 @@ struct Callout {
     bool chord{false};      // lit (pressed) only with all of `controls` held (A + B)
     Picto picto{Picto::None};
     Motion motion{Motion::None};
+    // A gamepad's (Config::gamepad): the buttons that light it (PagePad::Bit), its stick pushed
+    // (1 left, 2 right), and a second part it lights too (R1 with R2: one callout).
+    std::uint32_t pad{0};
+    std::uint8_t pad_stick{0};
+    int part2{-1};
 };
 
 // The help of a control that is also a modifier: its held combos ("Held + right stick: D-pad").
@@ -789,18 +906,27 @@ inline Callout GameplayCallout(const DrawnPart& d, int index, const Config& c,
 }
 
 // The game's own menus (and these VR pages): one layout for every scheme, never swapped (the
-// presenter's menu branch).
-inline Words MenuWords(Control physical, const Config& c) {
+// presenter's menu branch). The help names the other buttons as this family does (Frame's X and
+// Y are its d-pad).
+inline Words MenuWords(Control physical, const Config& c, const std::vector<DrawnPart>& parts) {
+    const std::string a = NameOf(parts, Control::A), b = NameOf(parts, Control::B),
+                      y = NameOf(parts, Control::Y);
     switch (physical) {
     case Control::A:
-        return {"Confirm", "the game's \xC3\x97", "Confirms (the game's \xC3\x97). X does the same."};
+        return {"Confirm", "selected option", "Confirms the selected option."};
+    // X is the game's touchpad in a game menu (the presenter's menu branch, 2026-11-12: tapped its
+    // left half, the inventory's Controls help; held its right half, Sort; it confirmed, as A,
+    // before). Its key guide shows a round X for the tap and a long one for the hold. On the VR
+    // page it still confirms, as A (UpdatePage).
     case Control::X:
-        return {"Confirm", "as A", "Confirms, as A (the game's \xC3\x97)."};
+        return {"Touchpad", "Controls \xC2\xB7 hold: Sort",
+                "Tap: the game's touchpad, its left half (the inventory's Controls help). Hold "
+                "0.6 s: its right half (Sort). On the VR page: confirms, as " + a + "."};
     case Control::B:
         if (c.layout.y_menu) {
-            return {"Back", "the game's \xE2\x97\x8B", "Goes back (the game's \xE2\x97\x8B)."};
+            return {"Back", "previous menu", "Goes back or cancels."};
         }
-        return {"Back", "the game's \xE2\x97\x8B", "Goes back (the game's \xE2\x97\x8B). Y does the same."};
+        return {"Back", "previous menu", "Goes back or cancels. " + y + " does the same."};
     case Control::Y:
         if (c.layout.y_menu) {
             // y_menu: Menu's jobs (the presenter's UpdateYGesture); B alone goes back.
@@ -808,14 +934,22 @@ inline Words MenuWords(Control physical, const Config& c) {
                     "Tap: the game's Options (closes these menus; a cutscene's skip prompt). "
                     "Hold 0.7 s: recenter; 2.5 s on Tab's screen: back to VR."};
         }
-        return {"Back", "as B", "Goes back, as B (the game's \xE2\x97\x8B)."};
+        return {"Back", "as " + b, "Goes back or cancels, as " + b + "."};
     case Control::StickL:
     case Control::StickR:
         return {"Select", {}, "Either stick steps through the menu; held, it repeats."};
+    // In a game menu a stick click tapped is L3 / R3 and held half a second L2 / R2 (the
+    // presenter's menu branch, 2026-11-12: the storage box's L2 / R2 could not be pressed before;
+    // the inventory's Help is R3). Its key guide: a round LS / RS for the tap, a long one for the
+    // hold.
     case Control::ClickL:
-        return {"L3", {}, "The game's L3."};
+        return {"L3 \xC2\xB7 hold: L2", {},
+                "Click: the game's L3. Hold the click half a second: the game's L2, as in the "
+                "storage box."};
     case Control::ClickR:
-        return {"R3", {}, "The game's R3."};
+        return {"R3 \xC2\xB7 hold: R2", {},
+                "Click: the game's R3 (the inventory's Help). Hold the click half a second: the "
+                "game's R2, as in the storage box."};
     // The VR page differs: its grips switch tabs and its triggers change the highlighted value.
     case Control::TriggerL:
         return {"Previous tab", "VR page: previous value",
@@ -833,12 +967,12 @@ inline Words MenuWords(Control physical, const Config& c) {
                 "The game's \xE2\x96\xB3 (RG in its key guide). On the VR page: the next tab."};
     case Control::Menu:
         if (c.layout.menu_runtime) {
-            return {"SteamVR", "its dashboard",
+            return {"Runtime menu", "its dashboard",
                     c.layout.y_menu
-                        ? "The runtime's own button (SteamVR's dashboard). Y opens and closes the "
-                          "game's menu, B goes back."
-                        : "The runtime's own button (SteamVR's dashboard). B or Y goes back out "
-                          "of the game's menus."};
+                        ? "The runtime's dashboard button. " + y +
+                              " opens and closes the game's menu, " + b + " goes back."
+                        : "The runtime's dashboard button. " + b + " or " + y +
+                              " goes back out of the game's menus."};
         }
         return {"Close", c.menu_hold_screen ? "hold: flat screen" : "hold: recenter",
                 "Tap: closes the game's menus and these pages. Hold: recenter."};
@@ -848,7 +982,8 @@ inline Words MenuWords(Control physical, const Config& c) {
     return {};
 }
 
-inline Callout MenuCallout(const DrawnPart& d, int index, const Config& c) {
+inline Callout MenuCallout(const DrawnPart& d, int index, const Config& c,
+                           const std::vector<DrawnPart>& parts) {
     Callout out;
     out.right = d.right;
     out.part = index;
@@ -863,7 +998,7 @@ inline Callout MenuCallout(const DrawnPart& d, int index, const Config& c) {
                 out.controls.end()) {
                 out.controls.push_back(b.control);
             }
-            const Words w = MenuWords(b.control, c);
+            const Words w = MenuWords(b.control, c, parts);
             if (w.title.empty()) {
                 continue;
             }
@@ -877,7 +1012,10 @@ inline Callout MenuCallout(const DrawnPart& d, int index, const Config& c) {
                 continue;
             }
             if (d.part == Part::Stick && b.manner == Manner::Click) {
-                continue; // the stick clicks: on the help line only
+                // The stick's click: on the sub-line ("click: L2") and after the stick's help.
+                extras = std::string{MannerWord(b.manner)} + ": " + w.title;
+                out.help += " " + w.help;
+                continue;
             }
             const std::string piece = std::string{MannerWord(b.manner)} + ": " + LowerFirst(w.title);
             if (extras.size() + piece.size() < 30) {
@@ -929,12 +1067,30 @@ inline std::vector<Callout> GestureCallouts(const Config& c, const std::vector<D
         s.picto = Picto::Gun;
         g.push_back(s);
     }
-    if (motion && c.layout.inject && IsBound(parts, phys(Control::X))) {
+    // left_scheme=2 with the arc (the tester's 2026-11-01 layout): X opens the arc, the vial is the
+    // body's (the pouch, the right shoulder): one card for it, the belt's too. x_button=vial: X
+    // arms it as before, the pouch and the shoulder still draw one.
+    const bool vial_by_grip = scheme2 && c.quick_arc && c.layout.inject;
+    const bool x_arc = vial_by_grip && c.x_fan;
+    if (motion && c.layout.inject && x_arc && IsBound(parts, Control::GripL)) {
+        Callout s;
+        s.title = "Blood Vial";
+        s.sub = "left grip at your belt or shoulder";
+        s.help = std::string{"Squeeze the left grip at your vial pouch or over your right shoulder, "
+                             "then stab your wrist, chest, belly or thigh"} +
+                 (c.seated ? " or lap" : "") + " to inject it.";
+        s.controls = {Control::GripL};
+        s.picto = Picto::Vial;
+        g.push_back(s);
+    } else if (motion && c.layout.inject && !x_arc && IsBound(parts, phys(Control::X))) {
         Callout s;
         s.title = "Blood Vial";
         s.sub = name(Control::X) + ", then stab";
         s.help = std::string{"With a vial armed, stab your wrist, chest, belly or thigh"} +
-                 (c.seated ? " or lap" : "") + " to inject it.";
+                 (c.seated ? " or lap" : "") + " to inject it." +
+                 (vial_by_grip ? " The left grip at your vial pouch or over your right shoulder "
+                                 "draws one too."
+                               : "");
         s.controls = {phys(Control::X)};
         s.picto = Picto::Vial;
         g.push_back(s);
@@ -943,14 +1099,21 @@ inline std::vector<Callout> GestureCallouts(const Config& c, const std::vector<D
         IsBound(parts, scheme2 ? Control::GripL : phys(Control::Y))) {
         Callout a;
         a.title = "Item arc";
-        if (scheme2) {
+        if (scheme2 && c.grip_hold) {
+            a.sub = NameOf(parts, Control::GripL) + ", reach, squeeze";
+            a.help = "Hold the left grip" +
+                     (x_arc ? " (or press " + name(Control::X) + ")" : std::string{}) +
+                     " to open your items at your hand; squeeze it on an item to take it, the "
+                     "trigger uses it.";
+            a.controls = {Control::GripL};
+        } else if (scheme2) {
             a.sub = NameOf(parts, Control::GripL) + ", reach, trigger";
-            a.help = "The left grip opens your items at your hand; the trigger on a card takes it.";
+            a.help = "The left grip opens your items at your hand; the trigger on an item takes it.";
             a.controls = {Control::GripL};
         } else {
             const std::string y = name(Control::Y);
-            a.sub = y + (y.size() <= 6 ? ", then reach a card" : ", reach a card");
-            a.help = Capital(y) + " opens your items above your hand; reach a card, squeeze "
+            a.sub = y + (y.size() <= 6 ? ", then reach an item" : ", reach an item");
+            a.help = Capital(y) + " opens your items above your hand; reach an item, squeeze "
                                   "the grip.";
             a.controls = {phys(Control::Y)};
         }
@@ -958,15 +1121,17 @@ inline std::vector<Callout> GestureCallouts(const Config& c, const std::vector<D
         g.push_back(a);
         Callout t;
         t.title = "Throw";
-        t.sub = scheme2 ? "swing, let go of the trigger" : "swing, let go of the grip";
-        t.help = scheme2 ? "Hold the item with the trigger, swing, and let go of it to throw."
-                         : "Hold the item with the grip, swing, and let go of it to throw.";
-        t.controls = {scheme2 ? Control::TriggerL : Control::GripL};
+        const bool by_trigger = scheme2 && !c.grip_hold;
+        t.sub = by_trigger ? "swing, let go of the trigger" : "swing, let go of the grip";
+        t.help = by_trigger ? "Hold the item with the trigger, swing, and let go of it to throw."
+                            : "Hold the item with the grip, swing, and let go of it to throw.";
+        t.controls = {by_trigger ? Control::TriggerL : Control::GripL};
         t.picto = Picto::Throw;
         t.motion = Motion::LeftThrow;
         g.push_back(t);
     }
-    if (scheme2 && c.belt_vial && c.layout.inject && IsBound(parts, Control::GripL)) {
+    if (scheme2 && c.belt_vial && c.layout.inject && !vial_by_grip &&
+        IsBound(parts, Control::GripL)) {
         Callout b;
         b.title = "Belt vial";
         b.sub = "left grip at your hip";
@@ -980,12 +1145,14 @@ inline std::vector<Callout> GestureCallouts(const Config& c, const std::vector<D
         Callout e;
         if (c.physical_evasion) {
             e.title = "Lean & duck";
-            e.sub = "your body dodges";
-            e.help = "Lean, step or duck: the hunter's body follows yours out of a blow.";
+            e.sub = "slip the blow";
+            e.help = "Lean left, right or back, or bend your knees to duck. In standing Motion "
+                     "controls, a quick lean or duck just before impact can make you briefly "
+                     "invulnerable.";
         } else {
             e.title = "Lean to dodge";
-            e.sub = "a quick lean rolls";
-            e.help = "A quick sideways or backward lean of your head dodges that way.";
+            e.sub = "a quick lean dodges";
+            e.help = "Quickly lean left, right or back to dodge in that direction.";
         }
         e.picto = Picto::Evade;
         g.push_back(e);
@@ -993,10 +1160,10 @@ inline std::vector<Callout> GestureCallouts(const Config& c, const std::vector<D
     if (c.grip_adjust && IsBound(parts, phys(Control::A)) && IsBound(parts, phys(Control::B))) {
         Callout a;
         a.title = "Grip adjust";
-        const std::string ab = name(Control::A) + "+" + name(Control::B);
+        const std::string ab = Thumbs::Chord(name(Control::A), name(Control::B));
         a.sub = ab.size() <= 8 ? "hold " + ab + ", then let go" : "hold both, then let go";
-        a.help = "Hold " + name(Control::A) + "+" + name(Control::B) +
-                 " 1 s, hold the weapon as you like, and let go to keep it.";
+        a.help = "Hold " + ab + " 1.2 s standing still, hold the weapon as you like, and let go "
+                 "to keep it.";
         a.controls = {phys(Control::A), phys(Control::B)};
         a.chord = true;
         a.picto = Picto::GripAdjust;
@@ -1021,7 +1188,7 @@ inline std::vector<Callout> Build(Tab tab, const Config& c, const std::vector<Dr
             continue; // drawn, but nothing is bound to it (the Index's right trackpad)
         }
         out.push_back(tab == Tab::Gameplay ? GameplayCallout(parts[i], static_cast<int>(i), c, parts)
-                                           : MenuCallout(parts[i], static_cast<int>(i), c));
+                                           : MenuCallout(parts[i], static_cast<int>(i), c, parts));
     }
     if (tab == Tab::Gameplay && !c.layout.classic && c.swings) {
         Callout s;
@@ -1062,6 +1229,170 @@ inline std::string Note(Tab tab, const Config& c, Family f) {
                : "Press any control to find it here.";
 }
 
+// ---- A gamepad (a gamepad play style, core/vr/play_style.h) --------------------------------------
+
+// Its buttons' names: an Xbox (or generic) pad's, or the game's own PlayStation ones (also a
+// Nintendo pad's, whose letters sit elsewhere: Input::UsesXboxNames).
+struct PadNames {
+    const char* top;    // the game's triangle
+    const char* right;  // circle
+    const char* bottom; // cross
+    const char* left;   // square
+    const char* l1;
+    const char* r1;
+    const char* l2;
+    const char* r2;
+    const char* l3;
+    const char* r3;
+    const char* view; // the touchpad (the gestures)
+    const char* menu; // Options
+};
+inline constexpr PadNames XboxPadNames{"Y",  "B",  "A",  "X",  "LB",   "RB",
+                                       "LT", "RT", "LS", "RS", "View", "Menu"};
+inline constexpr PadNames PlayStationPadNames{
+    "\xE2\x96\xB3", "\xE2\x97\x8B", "\xC3\x97", "\xE2\x96\xA1", "L1",       "R1",
+    "L2",           "R2",           "L3",       "R3",           "touchpad", "Options"};
+inline const PadNames& NamesOf(bool xbox) {
+    return xbox ? XboxPadNames : PlayStationPadNames;
+}
+
+// The gamepad's parts, each side top to bottom as drawn (controls_render.cpp DrawGamepad): an
+// Xbox pad's left stick sits above its D-pad, a PlayStation one's below it.
+inline std::vector<DrawnPart> GamepadParts(bool xbox) {
+    const PadNames& n = NamesOf(xbox);
+    std::vector<DrawnPart> out;
+    out.reserve(13);
+    const auto add = [&out](bool right, Part p, std::string name, std::string click = {}) {
+        out.push_back(DrawnPart{right, p, std::move(name), {}, std::move(click)});
+    };
+    add(false, Part::Trigger, n.l2);
+    add(false, Part::Grip, n.l1);
+    add(false, Part::Menu, n.view);
+    if (xbox) {
+        add(false, Part::Stick, "left stick", n.l3);
+        add(false, Part::Pad, "D-pad");
+    } else {
+        add(false, Part::Pad, "D-pad");
+        add(false, Part::Stick, "left stick", n.l3);
+    }
+    add(true, Part::Trigger, n.r2);
+    add(true, Part::Grip, n.r1);
+    add(true, Part::Menu, n.menu);
+    add(true, Part::ButtonHigh, n.top);
+    add(true, Part::FaceRight, n.right);
+    add(true, Part::FaceLeft, n.left);
+    add(true, Part::ButtonLow, n.bottom);
+    add(true, Part::Stick, "right stick", n.r3);
+    return out;
+}
+
+// The index of a side's part in `parts` (-1: none).
+inline int PartIndex(const std::vector<DrawnPart>& parts, bool right, Part p) {
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (parts[i].right == right && parts[i].part == p) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+// The gamepad's callouts of a tab (Gameplay, Menus): left column first, each column top to
+// bottom as its parts are drawn. The game's own buttons, and what a gamepad play style adds:
+// Options' hold (the recenter), the right stick's turn (first person: held back, the turnaround;
+// third person: the camera's height) and, in third person, L3 + right stick the zoom.
+inline std::vector<Callout> GamepadCallouts(Tab tab, const Config& c,
+                                            const std::vector<DrawnPart>& parts) {
+    namespace Bit = PagePad::Bit;
+    const PadNames& n = NamesOf(c.gamepad_xbox);
+    const std::string l1 = n.l1, r1 = n.r1, l2 = n.l2, r2 = n.r2, l3 = n.l3, r3 = n.r3;
+    std::vector<Callout> out;
+    out.reserve(12);
+    // (Returns its index: a reference into `out` would dangle when it grows.)
+    const auto add = [&](bool right, Part p, std::string title, std::string sub, std::string help,
+                         std::uint32_t pad, std::uint8_t stick = 0) {
+        Callout k;
+        k.right = right;
+        k.part = PartIndex(parts, right, p);
+        k.title = std::move(title);
+        k.sub = std::move(sub);
+        k.help = std::move(help);
+        k.pad = pad;
+        k.pad_stick = stick;
+        out.push_back(std::move(k));
+        return out.size() - 1;
+    };
+    constexpr std::uint32_t Dpad = Bit::Up | Bit::Down | Bit::Left | Bit::Right;
+    const bool stick_first = c.gamepad_xbox; // the left column's order (GamepadParts)
+    if (tab == Tab::Menus) {
+        add(false, Part::Trigger, "Previous value", "VR page",
+            "On the VR page: the highlighted row's previous value.", Bit::L2);
+        add(false, Part::Grip, "Previous tab", l1, "The previous tab or page.", Bit::L1);
+        const size_t select =
+            add(false, stick_first ? Part::Stick : Part::Pad, "Select", "D-pad or left stick",
+                "The D-pad or the left stick steps through the menu.", Dpad, 1);
+        out[select].part2 = PartIndex(parts, false, stick_first ? Part::Pad : Part::Stick);
+        add(true, Part::Trigger, "Next value", "VR page",
+            "On the VR page: the highlighted row's next value.", Bit::R2);
+        add(true, Part::Grip, "Next tab", r1, "The next tab or page.", Bit::R1);
+        add(true, Part::Menu, "Close", "hold: recenter",
+            "Tap: closes the game's menus and the VR page. Hold 0.7 s: recenter.", Bit::Options);
+        add(true, Part::FaceRight, "Back", n.right, "Goes back.", Bit::Circle);
+        add(true, Part::ButtonLow, "Confirm", n.bottom, "Confirms.", Bit::Cross);
+        return out;
+    }
+    add(false, Part::Trigger, "Fire gun \xC2\xB7 parry", l2,
+        "Fires the gun in your left hand; just before an enemy's blow lands, it parries.", Bit::L2);
+    add(false, Part::Grip, "Transform", l1, "Transforms the weapon in your right hand.", Bit::L1);
+    add(false, Part::Menu, "Gestures", n.view, "Opens the gestures.", Bit::TouchPad);
+    const bool zoom = c.third_person;
+    const auto move = [&] {
+        add(false, Part::Stick, "Move", zoom ? l3 + " + right stick: zoom" : std::string{},
+            zoom ? "Moves the hunter. Hold " + l3 +
+                       " and push the right stick up or down: the camera closer or back."
+                 : std::string{"Moves the hunter."},
+            Bit::L3, 1);
+    };
+    const auto dpad = [&] {
+        add(false, Part::Pad, "Weapons \xC2\xB7 items", "left / right: weapons",
+            "Left and right switch the weapon in each hand; down: the next quick item; up: blood "
+            "bullets.",
+            Dpad);
+    };
+    if (stick_first) {
+        move();
+        dpad();
+    } else {
+        dpad();
+        move();
+    }
+    const size_t attack =
+        add(true, Part::Grip, "Attack", r1 + " light \xC2\xB7 " + r2 + " heavy",
+            r1 + ": a light attack. " + r2 + ": a heavy one; held, a charged one.",
+            Bit::R1 | Bit::R2);
+    out[attack].part2 = PartIndex(parts, true, Part::Trigger);
+    add(true, Part::Menu, "Menu", "hold: recenter",
+        "Tap: the game's menu (it skips a cutscene too). Hold 0.7 s: recenter; 2.5 s on a flat "
+        "screen: back to VR.",
+        Bit::Options);
+    add(true, Part::ButtonHigh, "Blood Vial", n.top, "Uses a Blood Vial.", Bit::Triangle);
+    add(true, Part::FaceRight, "Dodge \xC2\xB7 sprint", std::string{n.right} + ", hold: sprint",
+        "Tap: dodge. Hold: sprint; tapped right after a sprint: a jump.", Bit::Circle);
+    add(true, Part::FaceLeft, "Use item", n.left, "Uses the quick item.", Bit::Square);
+    add(true, Part::ButtonLow, "Interact", n.bottom,
+        "Talks, opens doors and chests, picks things up, climbs ladders.", Bit::Cross);
+    const std::string turn = c.snap_turn_deg > 0.0f ? "snap" : "smooth";
+    add(true, Part::Stick, zoom ? "Camera" : "Turn", r3 + ": lock on",
+        zoom ? "Left and right swing the camera round the hunter; up and down raise or lower it. " +
+                   r3 + ": lock on; locked on, flick it to switch targets."
+             : "Left and right turn your view (" + turn + "); held back: a quick turn around. " +
+                   r3 + ": lock on; locked on, flick it to switch targets.",
+        Bit::R3, 2);
+    return out;
+}
+
+// The note under a gamepad tab (the gamepad's own two).
+inline constexpr const char* PadNote = "Press any gamepad button to find it here.";
+
 // ---- The live model -----------------------------------------------------------------------------
 
 // One frame of the controllers in your hands (physical, Quest Touch names, before any swap).
@@ -1071,6 +1402,11 @@ struct Live {
     float right_speed{0.0f};                  // the right hand's speed, m/s
     float left_speed{0.0f};
     float dt{0.0f};                           // seconds since the last frame
+    // The gamepad (Config::gamepad): its own buttons held (PagePad::Bit), its sticks pushed past
+    // half way.
+    std::uint32_t pad{0};
+    bool pad_stick_l{false};
+    bool pad_stick_r{false};
 };
 
 // How lit a callout is: Touched (a soft gilt edge) or Pressed (gold, with its glow).
@@ -1086,6 +1422,7 @@ public:
         config = c;
         fam = family;
         parts = PartsOf(family, profile, dpad);
+        pad_parts = c.gamepad ? GamepadParts(c.gamepad_xbox) : std::vector<DrawnPart>{};
         tab = Tab::Gameplay;
         hover = -1;
         Rebuild();
@@ -1099,14 +1436,37 @@ public:
     Tab GetTab() const {
         return tab;
     }
+    // A gamepad's own tab (Gameplay, Menus with Config::gamepad): the gamepad drawn. Its third
+    // tab is the VR controllers' gameplay as the style plays them.
+    bool PadTab() const {
+        return config.gamepad && tab != Tab::Gestures;
+    }
+    // The pictograms' tab (the VR controllers' Gestures).
+    bool ShowsGestures() const {
+        return !config.gamepad && tab == Tab::Gestures;
+    }
+    // The family drawn now.
     Family GetFamily() const {
-        return fam;
+        return PadTab() ? Family::Gamepad : fam;
+    }
+    const char* TabName() const {
+        return (config.gamepad ? PadTabNames : TabNames)[static_cast<size_t>(tab)];
+    }
+    const std::array<const char*, TabCount>& TabNamesNow() const {
+        return config.gamepad ? PadTabNames : TabNames;
+    }
+    // The quiet line above the help.
+    std::string NoteNow() const {
+        if (PadTab()) {
+            return PadNote;
+        }
+        return Note(config.gamepad ? Tab::Gameplay : tab, config, fam);
     }
     const Config& GetConfig() const {
         return config;
     }
     const std::vector<DrawnPart>& Parts() const {
-        return parts;
+        return PadTab() ? pad_parts : parts;
     }
     const std::vector<Callout>& Callouts() const {
         return callouts;
@@ -1158,6 +1518,18 @@ public:
                 }
             }
         }
+        // A gamepad's press selects its callout too. Its D-pad and sticks only light (they are
+        // the page's D-pad: Move), as the VR sticks.
+        constexpr std::uint32_t PadNavigation =
+            PagePad::Bit::Up | PagePad::Bit::Down | PagePad::Bit::Left | PagePad::Bit::Right;
+        if (const std::uint32_t pad_pressed = in.pad & ~prev.pad & ~PadNavigation;
+            pad_pressed != 0) {
+            for (size_t k = 0; k < callouts.size(); ++k) {
+                if ((callouts[k].pad & pad_pressed) != 0) {
+                    newly = static_cast<int>(k);
+                }
+            }
+        }
         const bool swing = in.right_speed >= SwingLightSpeed;
         const bool thrown = in.left_speed >= SwingLightSpeed;
         // A swing lasts a fifth of a second: it stays lit a moment after, to be seen.
@@ -1180,7 +1552,9 @@ public:
             focus = newly;
             dirty = true;
         }
-        std::vector<Lit> lit(callouts.size(), Lit::Off);
+        // (Into a kept buffer: no allocation a frame once the tab is built.)
+        std::vector<Lit>& lit = lit_scratch;
+        lit.assign(callouts.size(), Lit::Off);
         for (size_t k = 0; k < callouts.size(); ++k) {
             const Callout& c = callouts[k];
             bool pressed = !c.controls.empty() && c.chord;
@@ -1198,10 +1572,14 @@ public:
                 (c.motion == Motion::LeftThrow && throw_lit > 0.0f)) {
                 pressed = true;
             }
+            if ((c.pad & in.pad) != 0 || (c.pad_stick == 1 && in.pad_stick_l) ||
+                (c.pad_stick == 2 && in.pad_stick_r)) {
+                pressed = true;
+            }
             lit[k] = pressed ? Lit::Pressed : touched ? Lit::Touched : Lit::Off;
         }
         if (lit != lights) {
-            lights = std::move(lit);
+            lights.swap(lit);
             dirty = true;
         }
     }
@@ -1277,13 +1655,17 @@ public:
 
 private:
     void Rebuild() {
-        callouts = Build(tab, config, parts);
+        callouts = PadTab()          ? GamepadCallouts(tab, config, pad_parts)
+                   : config.gamepad ? Build(Tab::Gameplay, config, parts) // its third tab
+                                    : Build(tab, config, parts);
         lights.assign(callouts.size(), Lit::Off);
     }
 
     Config config{};
-    Family fam{Family::Touch};
+    Family fam{Family::Touch}; // the VR controllers' (GetFamily: the one drawn now)
     std::vector<DrawnPart> parts;
+    std::vector<DrawnPart> pad_parts; // the gamepad's (Config::gamepad)
+    std::vector<Lit> lit_scratch;     // Update's
     Tab tab{Tab::Gameplay};
     std::vector<Callout> callouts;
     std::vector<Lit> lights;

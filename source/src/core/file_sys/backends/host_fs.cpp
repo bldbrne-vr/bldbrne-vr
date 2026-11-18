@@ -66,9 +66,13 @@ bool HostFile::IsOpen() const {
 void HostFile::Stat(FileStat& out) {
     out.size = Size();
     out.is_directory = false;
+    StatTimes(m_path, out);
+}
+
+void HostFile::StatTimes(const std::filesystem::path& path, FileStat& out) {
 #if defined(__linux__) || defined(__FreeBSD__)
     struct stat st = {};
-    if (::stat(m_path.string().c_str(), &st) == 0) {
+    if (::stat(path.string().c_str(), &st) == 0) {
         out.mtime_sec = static_cast<s64>(st.st_mtim.tv_sec);
         out.mtime_nsec = static_cast<s64>(st.st_mtim.tv_nsec);
         out.atime_sec = static_cast<s64>(st.st_atim.tv_sec);
@@ -78,7 +82,7 @@ void HostFile::Stat(FileStat& out) {
     }
 #elif defined(__APPLE__)
     struct stat st = {};
-    if (::stat(m_path.string().c_str(), &st) == 0) {
+    if (::stat(path.string().c_str(), &st) == 0) {
         out.mtime_sec = static_cast<s64>(st.st_mtimespec.tv_sec);
         out.mtime_nsec = static_cast<s64>(st.st_mtimespec.tv_nsec);
         out.atime_sec = static_cast<s64>(st.st_atimespec.tv_sec);
@@ -88,7 +92,7 @@ void HostFile::Stat(FileStat& out) {
     }
 #else
     std::error_code ec;
-    const auto ft = std::filesystem::last_write_time(m_path, ec);
+    const auto ft = std::filesystem::last_write_time(path, ec);
     if (!ec) {
         const auto sctp = std::chrono::time_point_cast<std::chrono::nanoseconds>(
             ft - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());

@@ -26,8 +26,15 @@
 #include "core/vr/whip_audio.h"
 #include "core/vr/gun_reload_audio.h"
 #include "core/vr/lever_audio.h"
+#include "core/vr/monocular_audio.h"
+#include "core/vr/whistle_audio.h"
 #include "core/vr/quick_use_audio.h"
+#include "core/vr/tool_empty_audio.h"
+#include "core/vr/item_audio.h"
+#include "core/vr/furnace_audio.h"
 #include "core/vr/bell_audio.h"
+#include "core/vr/charge_audio.h"
+#include "core/vr/thunder_audio.h"
 #include "core/vr/vr_session.h"
 
 namespace Libraries::AudioOut {
@@ -186,16 +193,35 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
                                           0.48f, VR::Whip::CutterReelGain);
     bool whip_close = false;
     VR::Quick::UseAudioMixer use_audio;
+    VR::ToolEmptyAudio::Mixer tool_empty_audio;
+    tool_empty_audio.SetPcm(VR::ToolEmptyAudio::Pcm()); // once, before the buffer loop
     VR::Quick::BellAudioMixer bell_audio;
     VR::Gun::ReloadAudioMixer reload_audio(VR::Gun::ReloadPcm(), VR::Gun::EmptyPcm());
     VR::Grind::GrindMixer grind_audio; // the blades' grind (its loop decoded at startup)
-    VR::LeverAudio::Mixer lever_audio; // a lever pulled by hand: its clunk (decoded at startup)
+    // The short ones, mixed as one: a lever pulled by hand (its clunk), the Monocular's lens
+    // ticks (synthesized; the recall mixer with no loop) and the Madaras Whistle's call while it
+    // is blown (the lever and the whistle: the shared clip player, core/vr/clip_audio.h).
+    VR::LeverAudio::Mixer lever_audio;
+    VR::Whip::RecallAudioMixer lens_audio({}, VR::Monocular::LensTickPcm(),
+                                          VR::Monocular::TickGain);
+    VR::WhistleAudio::Mixer whistle_audio;
+    // An item used at once: the squeezed Augur's short splash, a swallow (core/vr/item_audio.h).
+    VR::ItemAudio::Mixer splash_audio(VR::ItemAudio::Splash);
+    VR::ItemAudio::Mixer gulp_audio(VR::ItemAudio::Gulp);
+    VR::ChargeAudio::Mixer charge_audio;
+    VR::ThunderAudio::Mixer thunder_audio; // Tonitrus charged (core/vr/tonitrus_charge.h)
+    // The Boom Hammer's furnace started by hand: its snap, its whoomph and its growl
+    // (core/vr/furnace_audio.h).
+    VR::FurnaceAudio::Mixer snap_audio(VR::FurnaceAudio::Snap);
+    VR::FurnaceAudio::Mixer whoomph_audio(VR::FurnaceAudio::Whoomph);
+    VR::Grind::GrindMixer growl_audio;
     // Audio hunt (2026-10-18, logs-on builds): which of our mixers added sound to each buffer; one
     // that keeps adding for 3 s is logged (a stuck loop: "gr gr gr" after poison), and its end.
     std::vector<u8> before;
-    std::array<s64, 5> active_since{}, logged_since{};
-    static constexpr std::array<const char*, 5> MixerNames{"whip reel/clink", "gun reload",
-                                                           "item use", "blade grind", "lever"};
+    std::array<s64, 6> active_since{}, logged_since{};
+    static constexpr std::array<const char*, 6> MixerNames{
+        "whip reel/clink", "gun reload", "item use", "blade grind",
+        "one-shot (lever, lens tick, whistle, splash, gulp)", "Boom Hammer furnace"};
     const auto track = [&](u32 index, s64 now, auto&& mix) {
         if constexpr (!Common::Log::Enabled) {
             mix();
@@ -241,6 +267,9 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
                         whip_close = whip_audio.SetClink(VR::GameSounds::CutterClose(),
                                                          VR::Whip::CutterCloseGain);
                     }
+                    if (!use_audio.HasCallPcm()) { // A Call Beyond's call, once decoded
+                        use_audio.SetCallPcm(VR::GameSounds::BeyondCall());
+                    }
                     track(0, now, [&] {
                         whip_audio.Mix(port->output_buffer, port->buffer_frames,
                                        port->format_info.num_channels, port->sample_rate,
@@ -254,6 +283,10 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
                                          now);
                     });
                     track(2, now, [&] {
+                        tool_empty_audio.Mix(port->output_buffer, port->buffer_frames,
+                                            port->format_info.num_channels, port->sample_rate,
+                                            port->format_info.is_float,
+                                            VR::ToolEmptyAudio::Latest(), now);
                         use_audio.Mix(port->output_buffer, port->buffer_frames,
                                       port->format_info.num_channels, port->sample_rate,
                                       port->format_info.is_float, VR::Quick::LatestUseAudio(), now);
@@ -272,10 +305,73 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
                     if (!lever_audio.HasPcm()) {
                         lever_audio.SetPcm(VR::GameSounds::LeverClunk());
                     }
+                    if (!whistle_audio.HasPcm()) {
+                        whistle_audio.SetPcm(VR::GameSounds::WhistleCall());
+                    }
+                    if (!splash_audio.HasPcm()) {
+                        splash_audio.SetPcm(VR::GameSounds::AugurSplash());
+                    }
+                    if (!gulp_audio.HasPcm()) {
+                        gulp_audio.SetPcm(VR::GameSounds::Gulp());
+                    }
+                    if (!charge_audio.HasPcm()) {
+                        charge_audio.SetPcm(VR::GameSounds::ChargeReady());
+                    }
+                    if (!thunder_audio.HasPcm()) {
+                        thunder_audio.SetPcm(VR::GameSounds::ThunderClap());
+                    }
                     track(4, now, [&] {
                         lever_audio.Mix(port->output_buffer, port->buffer_frames,
                                         port->format_info.num_channels, port->sample_rate,
                                         port->format_info.is_float, VR::LeverAudio::Latest(), now);
+                        lens_audio.Mix(port->output_buffer, port->buffer_frames,
+                                       port->format_info.num_channels, port->sample_rate,
+                                       port->format_info.is_float,
+                                       VR::Monocular::LatestLensAudio(), now);
+                        whistle_audio.Mix(port->output_buffer, port->buffer_frames,
+                                          port->format_info.num_channels, port->sample_rate,
+                                          port->format_info.is_float, VR::WhistleAudio::Latest(),
+                                          now);
+                        splash_audio.Mix(port->output_buffer, port->buffer_frames,
+                                         port->format_info.num_channels, port->sample_rate,
+                                         port->format_info.is_float,
+                                         VR::ItemAudio::Latest(VR::ItemAudio::Splash), now);
+                        gulp_audio.Mix(port->output_buffer, port->buffer_frames,
+                                       port->format_info.num_channels, port->sample_rate,
+                                       port->format_info.is_float,
+                                       VR::ItemAudio::Latest(VR::ItemAudio::Gulp), now);
+                        charge_audio.Mix(port->output_buffer, port->buffer_frames,
+                                         port->format_info.num_channels, port->sample_rate,
+                                         port->format_info.is_float, VR::ChargeAudio::Latest(),
+                                         now);
+                        thunder_audio.Mix(port->output_buffer, port->buffer_frames,
+                                          port->format_info.num_channels, port->sample_rate,
+                                          port->format_info.is_float, VR::ThunderAudio::Latest(),
+                                          now);
+                    });
+                    if (!snap_audio.HasPcm()) {
+                        snap_audio.SetPcm(VR::GameSounds::FurnaceSnap());
+                    }
+                    if (!whoomph_audio.HasPcm()) {
+                        whoomph_audio.SetPcm(VR::GameSounds::FurnaceWhoomph());
+                    }
+                    if (!growl_audio.HasPcm()) {
+                        growl_audio.SetPcm(VR::GameSounds::FurnaceGrowl());
+                    }
+                    track(5, now, [&] {
+                        snap_audio.Mix(port->output_buffer, port->buffer_frames,
+                                       port->format_info.num_channels, port->sample_rate,
+                                       port->format_info.is_float,
+                                       VR::FurnaceAudio::Latest(VR::FurnaceAudio::Snap), now);
+                        whoomph_audio.Mix(port->output_buffer, port->buffer_frames,
+                                          port->format_info.num_channels, port->sample_rate,
+                                          port->format_info.is_float,
+                                          VR::FurnaceAudio::Latest(VR::FurnaceAudio::Whoomph),
+                                          now);
+                        growl_audio.Mix(port->output_buffer, port->buffer_frames,
+                                        port->format_info.num_channels, port->sample_rate,
+                                        port->format_info.is_float,
+                                        VR::FurnaceAudio::LatestGrowl(), now);
                     });
                 }
                 port->impl->Output(port->output_buffer);

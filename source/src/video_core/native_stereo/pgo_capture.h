@@ -25,7 +25,7 @@ __attribute__((no_profile_instrument_function)) inline void Tick() {
     attempted = true;
     const int status = __llvm_profile_write_file();
     if (status == 0) __llvm_profile_set_dumped();
-    LOG_INFO(Render_Vulkan, "VR PGO: explicit profile dump result {}", status);
+    LOG_BENCHMARK_INFO(Render_Vulkan, "VR PGO: explicit profile dump result {}", status);
 }
 }
 #endif

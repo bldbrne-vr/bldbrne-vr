@@ -49,9 +49,10 @@ constexpr float FreehandRate = 4.0f;       // bounded catch-up; never seek past 
 constexpr float ImpactRate = 0.2f;          // the rip's slow-motion beat
 constexpr float FreehandTimeoutS = 20.0f;   // freehand's catch: a safety, not a deadline
 // While a visceral is open its staggered target runs this much slower (unseen): the gun parry's
-// 3.6 s stagger, and the visceral window with it, lasts about 0.40 s longer (2026-10-14:
-// another 250 ms on top of the existing 150 ms). Only the enemy takes this factor.
-constexpr float StaggerStretchRate = 3.6f / 4.0f;
+// 3.6 s stagger, and the visceral window with it, lasts about 0.60 s longer (2026-10-14:
+// another 250 ms on top of the existing 150 ms; 2026-10-27: 100 ms more, then 100 ms more again). Only the enemy takes
+// this factor.
+constexpr float StaggerStretchRate = 3.6f / 4.2f;
 
 struct Config {
     bool enabled{true};

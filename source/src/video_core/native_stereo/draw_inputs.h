@@ -5,7 +5,7 @@
 // You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
-// Scratch prerequisite for ordered draw recording on a separate thread.
+// Prerequisite for ordered draw recording on a separate thread.
 #pragma once
 #include "input_scope_gate.h"
 #include <array>

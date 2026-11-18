@@ -4,6 +4,7 @@
 #pragma once
 
 #include <bitset>
+#include <type_traits>
 
 #include "common/types.h"
 #include "shader_recompiler/backend/bindings.h"
@@ -179,6 +180,21 @@ struct StageSpecialization {
     void ForEachSharp(u32& binding, auto& spec_list, auto& desc_list, auto&& func) {
         for (const auto& desc : desc_list) {
             auto& spec = spec_list.emplace_back();
+            // A VR host image or buffer (resource.h) specializes as bound, from a null sharp,
+            // whatever was captured: one permutation before and after its capture.
+            if constexpr (std::is_same_v<std::decay_t<decltype(desc)>, ImageResource>) {
+                if (desc.IsVrHost()) {
+                    bitset.set(binding++);
+                    func(spec, desc, AmdGpu::Image::Null(desc.is_depth));
+                    continue;
+                }
+            } else if constexpr (std::is_same_v<std::decay_t<decltype(desc)>, BufferResource>) {
+                if (desc.IsVrHost()) {
+                    bitset.set(binding++);
+                    func(spec, desc, AmdGpu::Buffer::Null());
+                    continue;
+                }
+            }
             const auto sharp = desc.GetSharp(*info);
             if (!sharp) {
                 binding++;
@@ -214,12 +230,8 @@ struct StageSpecialization {
             return false;
         }
 
-        // For VS which only generates geometry and doesn't have any inputs, its start
-        // bindings still may change as they depend on previously processed FS. The check below
-        // handles this case and prevents generation of redundant permutations. This is also safe
-        // for other types of shaders with no bindings.
         if (bitset.none() && other.bitset.none()) {
-            return true;
+            return info->MatchesBindingStart(start, other.start);
         }
 
         if (start != other.start) {

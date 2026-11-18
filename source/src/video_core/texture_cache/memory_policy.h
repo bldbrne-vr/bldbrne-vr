@@ -73,6 +73,131 @@ inline u64 IdleSeconds(bool pressured, bool aggressive) {
     return aggressive ? 1 : pressured ? 5 : 24;
 }
 
+// The critical mark (2026-11-03): within a small margin of the budget (5%, at least 256 MiB),
+// never below `floor` (the pressure mark). Upstream's, 20% of it below, sat where VR play is on
+// 6-8 GB cards: most of the memory is not the caches' to free (the buffers the GPU wrote, the
+// driver's, the VR images), so the critical passes ran every frame and only uploaded again what
+// had just been on screen (the stress test at the Old Yharnam horizon on a 6 GB card's budget:
+// 41,000 textures evicted in 5 minutes, 9% of the frame rate). Both caches use it.
+constexpr s64 CriticalMark(s64 budget, s64 floor) {
+    const s64 margin = std::max<s64>(s64{256} << 20, budget / 20);
+    return std::max(budget - margin, floor);
+}
+
+// A load's revision of the budget the marks come from (2026-11-03): Windows' budget for the game
+// moves as other programs take or give back memory (the VR runtime settling in after the start,
+// a recording started). That budget is what the game may use in all, its own use included: the
+// marks compare the game's use with it, so it is never reduced by that use. A change under 5% (at
+// least 256 MiB) is noise and leaves the marks; the revised budget stays within half the start's
+// (a passing dip, the window out of focus) and the card's size (`card`). Nothing when the marks
+// stay, or when the budget is not known (0).
+constexpr std::optional<s64> RevisedBudget(s64 current, s64 start, s64 live, s64 card) {
+    if (live <= 0 || start <= 0 || current <= 0) {
+        return std::nullopt;
+    }
+    const s64 revised = std::clamp(live, start / 2, std::max(card, start));
+    const s64 change = revised > current ? revised - current : current - revised;
+    if (change < std::max<s64>(s64{256} << 20, current / 20)) {
+        return std::nullopt;
+    }
+    return revised;
+}
+
+// The critical passes rest only when they cannot win (2026-11-03). Each eviction of theirs belongs
+// to the WindowSeconds window it happened in (its cohort); an image created again at its address
+// within RefaultWindows windows came back to its cohort (uploaded again: nothing was freed). As a
+// window closes, with the passes having run in every second of it and of the one before: they
+// rest BackoffSeconds when, of the bytes those two cohorts evicted, at least half came back and
+// the newer cohort is not clearly winning (a quarter back at least), or when they evicted nothing.
+// The gentle passes go on meanwhile. While what they evict stays gone (an area left behind) they
+// never rest: over the budget a real card pages, worse than any upload (a rest after any 3 s over
+// the mark let the sprint between lamps on a 6 GB card's budget climb to 4.8 GB, the old build
+// 4.2). An allocation that fails still reclaims (Recover). Caller holds the cache's lock; each
+// pass calls Advance before its evictions (a code review: a pass in a window's first frame, where
+// the 1 s cutoff moves, was counted in the window before) and Ran after its critical passes.
+class CriticalBackoff {
+public:
+    static constexpr u64 WindowSeconds = 3;
+    static constexpr u64 RefaultWindows = 2;
+    static constexpr u64 BackoffSeconds = 10;
+    // At the start of each pass, in `second`. True when this starts a rest.
+    bool Advance(u64 second) {
+        const u64 now = second / WindowSeconds;
+        if (now == window) {
+            return false;
+        }
+        const bool consecutive = now == window + 1;
+        full_windows = consecutive && ran_seconds == WindowSeconds ? full_windows + 1 : 0;
+        const Cohort& newer = cohorts[window % Cohorts];
+        const Cohort& older = cohorts[(window + Cohorts - 1) % Cohorts];
+        last_evicted = newer.evicted + older.evicted;
+        last_returned = newer.returned + older.returned;
+        const bool rest = full_windows >= 2 &&
+                          (last_evicted == 0 || (last_returned * 2 >= last_evicted &&
+                                                 newer.returned * 4 >= newer.evicted));
+        if (rest) {
+            backoff_until = second + BackoffSeconds;
+            full_windows = 0;
+        }
+        if (consecutive) {
+            cohorts[now % Cohorts] = {}; // the slot of the cohort past RefaultWindows
+        } else {
+            cohorts = {};
+        }
+        window = now;
+        ran_seconds = 0;
+        return rest;
+    }
+    // May the critical passes run in this second?
+    bool Allowed(u64 second) const {
+        return second >= backoff_until;
+    }
+    // A critical pass evicted an image of `bytes` at `address`.
+    void Evicted(u64 address, u64 bytes) {
+        ghosts[Slot(address)] = {address, bytes, window};
+        cohorts[window % Cohorts].evicted += bytes;
+    }
+    // An image is created at `address`: one the critical passes evicted lately came back.
+    void Created(u64 address) {
+        Ghost& ghost = ghosts[Slot(address)];
+        if (ghost.bytes != 0 && ghost.address == address && ghost.window + RefaultWindows >= window) {
+            cohorts[ghost.window % Cohorts].returned += ghost.bytes;
+            ghost.bytes = 0;
+        }
+    }
+    // After the pass, when its critical passes ran in `second`.
+    void Ran(u64 second) {
+        if (second != ran_second) {
+            ran_second = second;
+            ++ran_seconds;
+        }
+    }
+    // The two cohorts Advance last judged: what they evicted, and what of it came back.
+    u64 LastEvicted() const {
+        return last_evicted;
+    }
+    u64 LastReturned() const {
+        return last_returned;
+    }
+
+private:
+    struct Ghost {
+        u64 address{}, bytes{}, window{};
+    };
+    struct Cohort {
+        u64 evicted{}, returned{};
+    };
+    static constexpr size_t Ghosts = 4096;
+    static constexpr size_t Cohorts = RefaultWindows + 1;
+    static size_t Slot(u64 address) {
+        return static_cast<size_t>(((address >> 8) * 0x9E3779B97F4A7C15ull) >> 52) & (Ghosts - 1);
+    }
+    std::array<Ghost, Ghosts> ghosts{};
+    std::array<Cohort, Cohorts> cohorts{};
+    u64 window{}, ran_second{~u64{0}}, ran_seconds{}, full_windows{};
+    u64 last_evicted{}, last_returned{}, backoff_until{};
+};
+
 // A transition requests four passes, two seconds apart. Only a confirmed map change bypasses
 // the pressure threshold; death, same-map travel and unknown destinations never do.
 // Freeze the LRU cutoff at the request: textures touched in the destination survive even if
@@ -135,5 +260,110 @@ bool Recover(u64 request_bytes, Reclaim&& reclaim, Retry&& retry) {
     }
     return false;
 }
+
+// The marks follow Windows' budget during play too (2026-11-05), not only at a load: another
+// program taking VRAM mid-play (the VR runtime, a browser, a recording) lowered the game's budget
+// and Windows paged the game into system memory while the marks, set at the last load, saw no
+// pressure. A reading every PeriodSeconds; a change RevisedBudget accepts applies when the next
+// reading gives the same one (within its dead zone), so a passing dip moves nothing.
+class LiveBudget {
+public:
+    static constexpr u64 PeriodSeconds = 2;
+
+    // Is a reading due this second?
+    bool Due(u64 second) {
+        if (second < next) {
+            return false;
+        }
+        next = second + PeriodSeconds;
+        return true;
+    }
+
+    // RevisedBudget's answer for this reading: the change to apply now, when the last reading
+    // gave the same answer.
+    std::optional<s64> Confirm(std::optional<s64> revised) {
+        if (!revised) {
+            pending.reset();
+            return std::nullopt;
+        }
+        if (pending) {
+            const s64 change = *pending > *revised ? *pending - *revised : *revised - *pending;
+            if (change < std::max<s64>(s64{256} << 20, *pending / 20)) {
+                pending.reset();
+                return revised;
+            }
+        }
+        pending = revised;
+        return std::nullopt;
+    }
+
+private:
+    u64 next{};
+    std::optional<s64> pending;
+};
+
+// Windows can move part of the game's VRAM into system memory while the budget it reports stays
+// high (2026-11-05: another program held 12.5 GB of a 16 GB card at top residency priority; the
+// game's budget read 12.2 GB throughout, 0.5-0.9 GB of it went to system memory, fps fell to 58-64
+// and no cleanup ran). The spill (Instance::QueryMemoryBudget, from Windows' counters): about 0
+// normally. Spilled EnterBytes or more in
+// ConfirmReadings readings in a row: the marks drop to what Windows keeps resident (the cleanup
+// then frees the spilled amount and the critical margin, and Windows can bring the rest back);
+// lower again as the spill grows; held until ReleaseReadings in a row stay under LeaveBytes, then
+// Windows' budget sets them again. Never under FloorBytes (render targets and the VR images
+// cannot go).
+class SpillWatch {
+public:
+    static constexpr s64 EnterBytes = s64{192} << 20;
+    static constexpr s64 LeaveBytes = s64{96} << 20;
+    static constexpr s64 StepBytes = s64{64} << 20;
+    static constexpr s64 FloorBytes = s64{2048} << 20;
+    static constexpr u32 ConfirmReadings = 2;
+    static constexpr u32 ReleaseReadings = 30; // a minute of LiveBudget readings
+
+    struct Answer {
+        bool hold{};               // the marks stay where the spill put them (LiveBudget waits)
+        std::optional<s64> budget; // the marks' budget to apply now
+    };
+
+    // One reading: the game's VRAM use as Vulkan counts it, of it what Windows moved to system
+    // memory, the marks' budget now.
+    Answer Step(s64 usage, s64 spilled, s64 current) {
+        const s64 resident = usage - spilled;
+        if (spilled >= EnterBytes) {
+            quiet = 0;
+            if (!active && ++over < ConfirmReadings) {
+                return {};
+            }
+            active = true;
+            const s64 target = std::max(FloorBytes, resident);
+            if (target + StepBytes <= current) {
+                return {true, target};
+            }
+            return {true, std::nullopt};
+        }
+        over = 0;
+        if (!active) {
+            return {};
+        }
+        if (spilled >= LeaveBytes) {
+            quiet = 0; // the release needs ReleaseReadings in a row under LeaveBytes
+        } else if (++quiet >= ReleaseReadings) {
+            active = false;
+            quiet = 0;
+            return {};
+        }
+        return {true, std::nullopt};
+    }
+
+    [[nodiscard]] bool Active() const noexcept {
+        return active;
+    }
+
+private:
+    u32 over{};
+    u32 quiet{};
+    bool active{};
+};
 
 } // namespace VideoCore::TextureMemory

@@ -1,13 +1,36 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
 
+// NoContraction keeps the GCN rounding of each multiply and add. A fragment shader that writes no
+// depth goes without it: the driver may then fuse a multiply and an add (one rounding instead of
+// two, a difference in the last bit), about a tenth of the game's fragment work. Measured
+// 2026-11-16 on the shipping FAST mask: GPU busy -0.26 ms (-3.7%) at the Oedon Chapel lamp,
+// -0.15 ms (-2.2%) in Central Yharnam. Vertex and compute stages, and fragment shaders that write
+// depth, keep it, so positions and depths stay the same in every pass. So do fragment shaders that
+// can discard (2026-11-16 review): an alpha test drawn in two passes (a depth pass, then its colour
+// twin testing EQUAL) must cut the same pixels in both, which two programs fused differently need
+// not. VR_FS_EXACT_MATH=1 (tests; the shader cache does not key it, so a fresh cache): every stage
+// keeps it.
+static bool FragmentFuses(const EmitContext& ctx) {
+    static const bool exact = [] {
+        const char* const env = std::getenv("VR_FS_EXACT_MATH");
+        return env != nullptr && env[0] == '1';
+    }();
+    return !exact && ctx.l_stage == LogicalStage::Fragment &&
+           !ctx.info.stores.GetAny(IR::Attribute::Depth) && !ctx.info.has_discard;
+}
+
 Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
-    ctx.Decorate(op, spv::Decoration::NoContraction);
+    if (!FragmentFuses(ctx)) {
+        ctx.Decorate(op, spv::Decoration::NoContraction);
+    }
     return op;
 }
 

@@ -19,6 +19,7 @@
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/process.h"
 #include "core/memory.h"
+#include "video_core/fast_render.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace Core {
@@ -47,6 +48,13 @@ const bool g_sparse_fast_copy = [] {
 }();
 // The fast path's areas, per thread (constant-initialized: no guard on access).
 constinit thread_local ScratchSparse::RangeCache t_sparse_ranges;
+// FAST_CPU_SPARSE_HOLD (on unless '0'): the memory manager whose mapping lock this thread holds
+// shared through a SparseReadHold; its CopySparseMemory takes no lock of its own then.
+const bool g_sparse_hold = [] {
+    const char* value = std::getenv("FAST_CPU_SPARSE_HOLD");
+    return !(value && value[0] == '0');
+}();
+constinit thread_local const MemoryManager* t_sparse_hold = nullptr;
 
 // FAST_CPU_SPARSE_FAST_VERIFY counters (any thread).
 struct SparseVerifyStats {
@@ -244,10 +252,30 @@ void MemoryManager::QueueSparseMemory(VAddr address, u8* dest, u64 size) {
     }
 }
 
+MemoryManager::SparseReadHold::SparseReadHold(MemoryManager& memory) {
+    if (!g_sparse_hold || !FastRender::AbOn(1) || t_sparse_hold != nullptr) {
+        return; // off (FAST_CPU_SPARSE_HOLD=0, or A/B switch 1 cleared), or inside a hold already
+    }
+    memory.mutex.lock_shared();
+    held = &memory;
+    t_sparse_hold = &memory;
+}
+
+MemoryManager::SparseReadHold::~SparseReadHold() {
+    if (held) {
+        t_sparse_hold = nullptr;
+        held->mutex.unlock_shared();
+    }
+}
+
 void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     FastRender::BProfile::Scope b_profile{FastRender::BProfile::UploadCopy};
     ScratchProfile::Cpu scratch_copy(23,"Memory::CopySparseMemory");
-    std::shared_lock lk{mutex};
+    // FAST_CPU_SPARSE_HOLD: this thread's SparseReadHold holds the lock shared already.
+    std::shared_lock lk{mutex, std::defer_lock};
+    if (t_sparse_hold != this) {
+        lk.lock();
+    }
     ASSERT_MSG(IsValidMapping(virtual_addr), "Attempted to access invalid address {:#x}",
                virtual_addr);
 
@@ -357,7 +385,7 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     }
 }
 
-// Scratch batch path. Intentionally separate from CopySparseMemory to retain its
+// Batch path. Intentionally separate from CopySparseMemory to retain its
 // trained PGO and a reference implementation for byte checks. No per-element
 // profiling clocks: measure this experiment with passive thread CPU sampling.
 void MemoryManager::CopySparseMemoryBatch(std::span<const ScratchBatch::Range> ranges,
@@ -1722,6 +1750,12 @@ void MemoryManager::InvalidateMemory(const VAddr addr, const u64 size) const {
     Common::MemoryWriteTrace::Event("cpu.invalidate", addr, size);
     if (rasterizer) {
         rasterizer->InvalidateMemory(addr, size, true); // the emulator's own write
+    }
+}
+
+void MemoryManager::NoteFreshGpuRange(const VAddr addr, const u64 size) const {
+    if (rasterizer) {
+        rasterizer->NoteFreshRange(addr, size);
     }
 }
 

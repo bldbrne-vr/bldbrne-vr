@@ -5,7 +5,7 @@
 // You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
-// Scratch prerequisite: recording reads a packet's state, never the decoder's
+// Prerequisite: recording reads a packet's state, never the decoder's
 // live state.
 #pragma once
 #include "video_core/amdgpu/liverpool.h"

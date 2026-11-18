@@ -110,7 +110,28 @@ Releases carry `runtime/dlss/`:
   (`LICENSES/DLSS-bridge-MIT.txt`); source in `tools/upscalers/adapted/dlss_bridge`.
   This software contains source code provided by NVIDIA Corporation.
 
-DLSS 5 (`nvngx_dlssnr.dll`) is not shipped.
+- `nvngx.dll_dlssnr.dll` and the DLSS 5 chain inside `vr_dlss_stereo.dll`
+  (`tools/upscalers/adapted/dlss5_bridge`): derived from OptiScaler-DLSSNR
+  (https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass), GPL-3.0
+  (`LICENSES/DLSS5-bridge-GPL-3.0.txt`), with RenoDX's attribution
+  (`LICENSES/DLSS5-RenoDX-attribution.txt`). With that chain the bridge as a whole is GPL-3.0.
+
+NVIDIA's DLSS 5 runtime (`nvngx_dlssnr.dll`) is not shipped and is never downloaded by the
+launcher. A player with an RTX 50-series card may add their own copy in the launcher's DLSS 5 tab
+(found on their PC or picked by hand); only NVIDIA's signed, unmodified file is accepted, and it is
+copied to the player's data folder (`user/dlss5`).
+
+## Real-ESRGAN (the launcher's sharper skies)
+
+Releases carry `realesrgan/` next to the launcher: `realesrgan-ncnn-vulkan.exe`, its OpenMP
+runtime (`vcomp140.dll`, Microsoft's redistributable) and the `realesrgan-x4plus` model, exactly as
+in the official Real-ESRGAN v0.2.5.0 Windows release (pinned by SHA-256 in
+`launcher/CMakeLists.txt`). Real-ESRGAN and its models: Copyright (c) 2021 Xintao Wang,
+BSD-3-Clause (`LICENSES/Real-ESRGAN-BSD-3-Clause.txt`); realesrgan-ncnn-vulkan: MIT
+(`LICENSES/Real-ESRGAN-ncnn-vulkan-MIT.txt`); ncnn: Tencent, BSD-3-Clause
+(`LICENSES/ncnn-BSD-3-Clause.txt`). It is a separate program the launcher runs only when the
+player asks for sharper skies; it upscales textures from the player's own game folder, and the
+images it makes stay on the player's PC (`user/sky_detail`). Nothing derived from the game ships.
 
 ## AMD FSR 4 (optional runtime)
 
@@ -124,6 +145,18 @@ The v07 model assets retain AMD's MIT notice in
 asset manifest and hashes, guarded pass-11 shaders and optimized post/SPD shaders.
 FSR is loaded only when selected; it remains off by default. AMD and FidelityFX
 are trademarks of Advanced Micro Devices, Inc.
+
+## AMD FSR Upscaling 4.1 (optional runtime, AMD cards)
+
+FSR 4.1 releases carry `runtime/fsr41/`: our GPL-2.0-or-later bridge
+`vr_fsr41_stereo.dll` (`tools/upscalers/adapted/fsr41_bridge`) and AMD's own
+signed `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll`, unmodified, from
+AMD FSR SDK v2.4.0 (GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, commit
+`7539ae8b6568ad29ed78a753404351daf3b5cca7`). The SDK's license lists those DLLs under its
+permissive MIT-style terms; it ships as `runtime/fsr41/LICENSE-AMD-FSR-SDK.md`, and
+`package.json` records each file's SHA-256. The bridge is built against the SDK's MIT-licensed
+API headers only and loads AMD's DLLs at run time. It is offered on AMD cards only and loaded
+only when selected.
 
 ## Optional benchmark runtime
 

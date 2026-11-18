@@ -74,6 +74,15 @@ typedef struct VrFsr4Api {
     const char* (*Problem)(void*);
 } VrFsr4Api;
 typedef const VrFsr4Api* (*VrFsr4GetApiFn)(void);
+// FSR 4.1 only: choose AMD or the 3.1.5 fallback for all views before Evaluate can record any
+// GPU work. Called once after Create (including a diagnostic twin), with the actual input sizes.
+// 1 ready, 0 failed; no command buffer, submits or waits. Other bridges need no preparation.
+#define VR_FSR41_PREPARE_EXPORT "VrFsr41PrepareViews"
+typedef struct VrFsr41PrepareView {
+    void* context;
+    uint32_t width, height;
+} VrFsr41PrepareView;
+typedef int32_t (*VrFsr41PrepareViewsFn)(const VrFsr41PrepareView* views, uint32_t count);
 // Optional export "VrFsr4GetStereoFlags": every VR_FSR4_FLAG_* the bridge accepts.
 typedef uint32_t (*VrFsr4GetFlagsFn)(void);
 // FAST bit 45: the lockstep pair entry is a separate, optional export (VR_FSR4_PAIR_EXPORT), so

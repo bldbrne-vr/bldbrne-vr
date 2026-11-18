@@ -1,0 +1,73 @@
+Beast Roar replacement, revision 18 art / revision 19 idle / revision 20 activation / optimized runtime v2
+
+Original mesh, rig, albedo, normal and roughness maps authored for this mod.
+No extracted Bloodborne mesh, texture, skeleton or animation is in this resource.
+The separate local hunter-body placement previews use game data and are not shipped.
+
+Source and exporter (kept with the project):
+  original-beast-hand.three.json, preview.js, weathering.js, refine.js
+  export-runtime.cjs -> runtime/export.json and material PNGs
+  optimize-mesh.cjs -> runtime/optimized-export.json (offline meshoptimizer v0.25)
+  pack-runtime.py -> this directory's beast_roar.brb
+
+The export preserves the approved motion, thumb-heel weights and worn materials.
+The root is fixed; the wrapped wrist attaches to the existing hunter grip.
+16 bones, 5,430 vertices, 6,968 triangles, one indexed draw per visible instance.
+Simplification retains original surviving vertices/UVs/colors/skin weights, pins the thumb heel,
+and preserves borders. Indices and vertex order are optimized for the GPU vertex cache.
+16-bit GPU indices; 32-bit indices in the validated CPU payload.
+255 immutable palette frames, sampled at 30 Hz and interpolated on the GPU:
+  0: stored/rest
+  1..46: normal activation (1.5 s sampled motion, 1.65 s playback with 150 ms open hold)
+  47..109: every fourth successful activation (2.05 s)
+  110..254: staggered held finger extensions/tremor (4.8 s, eased loop seam)
+Stored items use frame zero. Item use, movement and controller tracking are unchanged.
+
+BRZ1 + little-endian u32 decompressed size + zlib payload (version 2).
+Payload: 64-byte header; 32-byte position/normal/UV vertices; u32 triangle indices;
+vec4 animation metadata (joint0/joint1/weight0/weight1, then colorRGB/normalStrength),
+16 x 3 vec4 matrix rows per frame; albedo and surface BC3 mip chains.
+Each atlas is 512 square, four 224-pixel tiles with 16-pixel wrapped gutters,
+five mip levels. Surface stores tangent-space normal RGB and roughness alpha, sampled linear;
+albedo is sampled sRGB. Compression and mip generation happen offline only.
+Both mip chains together: 698,368 bytes. Mesh, indices, animation and textures: 1,283,536 GPU
+payload bytes, excluding driver allocation granularity. Packed resource: 522,295 bytes.
+The parser checks version, exact length, counts, indices, finite values, material tiles, bone
+indices, weights, palette bounds and mip sizes before publication. Decompression is capped at
+2 MiB; at most 8,192 vertices / 36,000 indices are accepted. Upload failures release partial
+resources and are cached rather than retried every frame. GPU destruction is deferred until safe.
+Stored copies skip palette interpolation; single-joint vertices skip the second joint fetch.
+Animation descriptors share the existing draw descriptor command; no added descriptor command.
+
+Regression checks: tests/test_beast_roar.cpp (standalone, asserts enabled).
+Pass it the decompressed payload as argv[1]; see test_beast_roar.py for the runner.
+Timing, bounds, fixed wrist, idle seam, invalid inputs and 400 deterministic semantic-payload
+mutations passed both normally and under Clang AddressSanitizer. Both GLSL shaders compiled and
+passed spirv-val. Release shadps4 build passed. Eight packed-asset before/after views checked;
+actual headset frame-time impact remains unmeasured.
+
+Revision 17: shallow baked tendon/knuckle relief, broader scars and cloth wear that survive
+the small atlas tiles; held scale .72 (previously .55), same orientation and fixed wrist.
+Storage still fits the existing chest/waist envelopes. Current packed asset passed the
+timing/validation/idle-seam runner and Release build. The ASan run above was revision 16;
+revision 17 has offline real-hunter placement review, not new headset/performance measurements.
+
+Revision 18: flatter dried palm, defined tendon channels and tapered phalanges between
+joints. Changes are baked offline, with the same bones, clips and atlas dimensions.
+Current asset validation/idle seam checks and Release build pass. Real-hunter held,
+stored and glove motion previews refreshed; no new headset or GPU timing measurement.
+
+Revision 19: stronger staggered idle extensions and brief fingertip tremor, rebaked offline.
+Only palette frames 110..254 changed; mesh, textures, root and activation clips preserved.
+At .72 held scale peak movement is 24.89 mm (previously 1.85 mm), with 2.42 mm median
+frame maximum. Same GPU payload size, frame count, bones and draw workload. The idle
+regression check now rejects an effectively invisible motion as well as a broken loop seam.
+
+Revision 20: normal activation straightens the finger joints an additional 1.4 / 3.7 /
+6.0 degrees at full extension, with 10% more root spread and smaller thumb adjustments.
+Playback pauses at the fully open 500 ms pose for another 150 ms, then resumes the original
+relaxation speed; idle starts at 1.65 s. Victory timing is unchanged.
+Only normal palette frames 1..46 changed. Mesh, textures, root, rest, victory and idle
+bytes are preserved by rebake-normal.py. Decoded/GPU size and palette count are unchanged.
+The Blender v6 animation preview uses the art candidate with the new shipping palette.
+New art/materials remain unintegrated; headset verification is still required.

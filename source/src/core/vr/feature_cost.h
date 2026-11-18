@@ -33,12 +33,16 @@ enum Slot : std::uint32_t {
     HitVignette,    // presenter frame: UpdateHitVignette + the flash's wedge
     HitHaptics,     // presenter frame: UpdateHitHaptics + the rumble's weighting
     QuickUpdate,    // presenter input: the mouth point + the quick items' whole update
+    SolidWeapons,   // pose copy (game side): SolidWeapons, both weapons against the walls (weapon_wall)
+    QuickRender,    // render-camera hook (game side): QuickItemsRenderTick, the pouches' mounts,
+                    // the arc and the held items' list
     Count
 };
 
 constexpr std::array<const char*, Count> Names = {
     "twohand.update", "twohand.apply", "twohand.observe", "thrust.update",
-    "visceral.open",  "hit.vignette",  "hit.haptics",     "quick.update(mouth)"};
+    "visceral.open",  "hit.vignette",  "hit.haptics",     "quick.update(mouth)",
+    "solid.weapons",  "quick.render"};
 
 inline bool Enabled() {
     static const bool on = std::getenv("VR_FEATURE_COST") != nullptr;

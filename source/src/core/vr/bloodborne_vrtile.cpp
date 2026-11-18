@@ -28,7 +28,10 @@
 #include "core/file_sys/fs.h"
 #include "core/vr/bloodborne_vrtile.h"
 #include "core/vr/gfx_area_name.h"
+#include "core/vr/gfx_hud_slots.h"
 #include "core/vr/gfx_talk_window.h"
+#include "core/vr/graphics_settings.h"
+#include "core/vr/ui_slots.h"
 #include "core/vr/gfx_tile.h"
 #include "core/vr/gfx_title.h"
 #include "core/vr/hook_util.h"
@@ -39,6 +42,7 @@
 #include "core/vr/vr_page_runtime.h"
 #include "core/vr/vr_session.h"
 #include "core/vr/vr_tile_patch.h"
+#include "input/controller.h"
 
 namespace VR::Bloodborne {
 
@@ -211,10 +215,33 @@ void** PS4_SYSV_ABI VrTileHandler(void** out, void* arg, u8* functor_return, u8*
 // The retail atlas file (core/vr/tpf_patch.h AtlasFileSize): its FNV-1a 64.
 constexpr u64 AtlasFnv = 0xcdea18d6035a2403ull;
 
-// The atlas's override is registered (by PrepareAtlas), and whether it holds the VR controllers'
-// button icons (then it stays even when the tile that shows the goggles does not come up).
+// The atlas's override is registered (by PrepareAtlas), and whether it holds our button icons
+// (then it stays even when the tile that shows the goggles does not come up).
 bool g_atlas_served = false;
 bool g_atlas_buttons = false;
+
+// Which buttons the game's icons show: its own, the VR controllers' (ui_vr_buttons), or an Xbox
+// pad's (a gamepad play style with an Xbox or generic pad connected at the start; a PlayStation or
+// Nintendo pad, or none, keeps the game's own: Input::UsesXboxNames). Decided once, before the
+// game opens the atlas: a pad plugged in later shows them from the next start. VR_BUTTONS_PAD=xbox
+// (tests: the mock runtime has no gamepad): as if an Xbox pad were connected.
+enum class Buttons { Game, Vr, Xbox };
+Buttons WantedButtons() {
+    if (VR::CurrentPlayStyle() != VR::PlayStyle::Style::Motion) {
+        const char* forced = std::getenv("VR_BUTTONS_PAD");
+        const bool test_xbox = forced != nullptr && std::string_view{forced} == "xbox";
+        const SDL_GamepadType type =
+            test_xbox ? SDL_GAMEPAD_TYPE_XBOXONE : Input::FirstGamepadType();
+        const bool xbox = Input::UsesXboxNames(type);
+        LOG_INFO(Core, "VR buttons: play style {}, gamepad {}{}: {}",
+                 VR::PlayStyle::Name(VR::CurrentPlayStyle()),
+                 type == SDL_GAMEPAD_TYPE_UNKNOWN ? "none" : SDL_GetGamepadStringForType(type),
+                 test_xbox ? " (VR_BUTTONS_PAD)" : "",
+                 xbox ? "the Xbox pad's icons" : "the game's own icons");
+        return xbox ? Buttons::Xbox : Buttons::Game;
+    }
+    return VR::GetSettings().ui_vr_buttons ? Buttons::Vr : Buttons::Game;
+}
 
 // The game's font for the button icons' letters (the English menu font: the letters are Latin in
 // every language), read through the mount now, or nullptr (logged).
@@ -234,16 +261,16 @@ std::unique_ptr<VR::GameText::GameFont> ReadButtonFont() {
 
 // The game's icon atlas menu/common.tpf.dcx (core/vr/tpf_patch.h), changed in one pass: the retail
 // file is read and unpacked now (~0.1 s), then
-//  - with `buttons` (ui_vr_buttons): the button icons redrawn as the VR controllers' buttons
-//    (core/vr/key_glyphs.h: our badges, their letters in the game's font);
+//  - with `buttons` (WantedButtons): the button icons redrawn as the VR controllers' buttons or an
+//    Xbox pad's (core/vr/key_glyphs.h: our badges, their letters in the game's font);
 //  - with `icon_wanted` (the VR tile): the goggles composited from our goggles layer over the
 //    atlas's own empty parchment cell (core/vr/tile_icon_compose.h: no game pixel in the source)
 //    and written into a free cell;
 // and the file is packed again (~0.4 s) on the file override's worker before the game opens it.
 // True when the goggles went in (else, logged, the tile shows the parchment).
-bool PrepareAtlas(bool icon_wanted, bool buttons) {
+bool PrepareAtlas(bool icon_wanted, Buttons buttons) {
     using namespace VR::TpfPatch;
-    if (!icon_wanted && !buttons) {
+    if (!icon_wanted && buttons == Buttons::Game) {
         return false;
     }
     const char* const no_icon = icon_wanted ? "; the icon is the game's parchment" : "";
@@ -280,7 +307,25 @@ bool PrepareAtlas(bool icon_wanted, bool buttons) {
     };
 
     int written = 0;
-    if (buttons) {
+    if (buttons == Buttons::Xbox) {
+        const auto drawing = std::chrono::steady_clock::now();
+        const auto font = ReadButtonFont();
+        const std::string refused =
+            VR::KeyGlyphs::Apply(*tpf, font.get(), written, VR::KeyGlyphs::XboxGlyphs);
+        int hud = 0;
+        const std::string hud_refused =
+            VR::KeyGlyphs::ApplyHud(*tpf, font.get(), false, hud, true);
+        written += hud;
+        LOG_INFO(Core,
+                 "VR buttons: {} of {} menu button icons are the Xbox pad's (cross A, circle B, "
+                 "square X, triangle Y, L1 LB, R1 RB, L2 LT, R2 RT, L3 LS, R3 RS, OPTIONS Menu, "
+                 "touchpad View){}{}; {} of {} HUD ones (cross A, circle B, triangle Y){}{}; in "
+                 "{:.1f} ms",
+                 written - hud, VR::KeyGlyphs::XboxGlyphs.size(),
+                 refused.empty() ? "" : "; kept the game's: ", refused, hud,
+                 VR::KeyGlyphs::HudGlyphs.size(), hud_refused.empty() ? "" : "; kept the game's: ",
+                 hud_refused, ms_since(drawing));
+    } else if (buttons == Buttons::Vr) {
         const auto drawing = std::chrono::steady_clock::now();
         const auto font = ReadButtonFont();
         const std::string refused = VR::KeyGlyphs::Apply(*tpf, font.get(), written);
@@ -291,8 +336,9 @@ bool PrepareAtlas(bool icon_wanted, bool buttons) {
         written += hud;
         LOG_INFO(Core,
                  "VR buttons: {} of {} menu button icons are the VR controllers' (cross A, circle "
-                 "B, square LG, triangle RG, L1 LT, R1 RT, OPTIONS Menu){}{}; {} of {} HUD ones "
-                 "(the action prompts: cross {}, circle {}, triangle {}){}{}; in {:.1f} ms",
+                 "B, square LG, triangle RG, L1 LT, R1 RT, L3 / R3 round LS / RS, L2 / R2 long "
+                 "LS / RS, touchpad round / long X, OPTIONS Menu){}{}; {} of {} HUD ones (the "
+                 "action prompts: cross {}, circle {}, triangle {}){}{}; in {:.1f} ms",
                  written - hud, VR::KeyGlyphs::Glyphs.size(),
                  refused.empty() ? "" : "; kept the game's: ", refused, hud,
                  VR::KeyGlyphs::HudGlyphs.size(), VR::Thumbs::LabelFor(VR::Thumbs::Control::B, swap),
@@ -415,7 +461,7 @@ std::vector<u8> BuildMovie() {
     const std::string_view choice = env != nullptr ? std::string_view{env} : std::string_view{};
     GfxTile::Icon icon{};
     std::string what;
-    if (choice != "parchment" && PrepareAtlas(true, VR::GetSettings().ui_vr_buttons)) {
+    if (choice != "parchment" && PrepareAtlas(true, WantedButtons())) {
         icon.atlas = true;
         icon.atlas_x = static_cast<u16>(VR::TpfPatch::CellX);
         icon.atlas_y = static_cast<u16>(VR::TpfPatch::CellY);
@@ -512,6 +558,92 @@ void InstallAreaNameDim() {
     } else {
         LOG_INFO(Core, "VR subtitles: the box stays ({})", talk.why);
     }
+    // The widgets into their own slots above and below the band (core/vr/ui_slots.h), for this
+    // render's shape. All or nothing: a movie not as expected keeps every widget home.
+    VR::Ui::Slots::SetActive({});
+    if (const auto extent = VR::Graphics::GameExtent();
+        VR::GetSettings().ui_hud_slots && extent.width != 0 && extent.height != 0) {
+        namespace S = VR::Ui::Slots;
+        const S::Layout layout = S::Compute(extent.width, extent.height, !area_done);
+        const auto twips = [](float px) { return static_cast<s32>(std::lround(px * 20.0f)); };
+        std::vector<VR::GfxHudSlots::Move> moves;
+        if (layout.status.on) {
+            moves.push_back({"PlayerHUD", 0, twips(layout.status.dy)});
+            moves.push_back({"AutoSaveIcon", 0, twips(layout.status.dy)});
+        }
+        if (layout.gauge.on) {
+            moves.push_back(
+                {"ConditionGaugeList", twips(layout.gauge.dx), twips(layout.gauge.dy)});
+        }
+        if (layout.banner.on) {
+            for (const char* name : S::BannerWidgets) {
+                moves.push_back({name, 0, twips(layout.banner.dy), S::BannerWordDepths});
+            }
+        }
+        if (layout.area.on) {
+            moves.push_back({"MapName", 0, twips(layout.area.dy)});
+        }
+        auto moved = VR::GfxHudSlots::MoveRootClips(
+            movie.empty() ? std::span<const u8>{*original} : std::span<const u8>{movie}, moves);
+        if (!moves.empty() && !moved.movie.empty()) {
+            movie = std::move(moved.movie);
+            S::SetActive(layout);
+        }
+        LOG_INFO(Core,
+                 "VR HUD slots: render {}x{}, {:.0f} stage px above and below the band; {} "
+                 "({} placements): clusters {}, meter {}, banners {}, area name {}",
+                 extent.width, extent.height, layout.margin,
+                 moves.empty() ? "no room for any" : moved.why, moved.moved,
+                 layout.status.on ? "above" : "home", layout.gauge.on ? "above" : "home",
+                 layout.banner.on ? "below" : "home", layout.area.on ? "below" : "home");
+    }
+    // VR_HUD_MOVE (diagnostic): "Name:dx,dy;Name/1,3:dx,dy;..." moves those root widgets (or
+    // those depths inside one) by stage px.
+    if (const char* spec = std::getenv("VR_HUD_MOVE"); spec != nullptr && spec[0] != '\0') {
+        constexpr std::size_t MaxMoves = 16;
+        std::vector<std::string> names;
+        std::vector<std::vector<u16>> depths;
+        std::vector<VR::GfxHudSlots::Move> moves;
+        names.reserve(MaxMoves); // the moves keep views of these
+        depths.reserve(MaxMoves);
+        for (std::string_view rest{spec}; !rest.empty() && names.size() < MaxMoves;) {
+            const auto end = rest.find(';');
+            const std::string_view item = rest.substr(0, end);
+            rest = end == std::string_view::npos ? std::string_view{} : rest.substr(end + 1);
+            float dx = 0.0f;
+            float dy = 0.0f;
+            const auto colon = item.find(':');
+            if (colon == std::string_view::npos ||
+                std::sscanf(std::string{item.substr(colon + 1)}.c_str(), "%f,%f", &dx, &dy) != 2) {
+                continue;
+            }
+            const std::string_view target = item.substr(0, colon);
+            const auto slash = target.find('/');
+            names.emplace_back(target.substr(0, slash));
+            depths.emplace_back();
+            if (slash != std::string_view::npos) {
+                std::string list{target.substr(slash + 1)};
+                for (char* p = list.data(); *p != '\0';) {
+                    char* next = nullptr;
+                    const long depth = std::strtol(p, &next, 10);
+                    if (next == p) {
+                        break;
+                    }
+                    depths.back().push_back(static_cast<u16>(depth));
+                    p = *next == ',' ? next + 1 : next;
+                }
+            }
+            moves.push_back({names.back(), static_cast<s32>(std::lround(dx * 20.0f)),
+                             static_cast<s32>(std::lround(dy * 20.0f)), depths.back()});
+        }
+        auto moved = VR::GfxHudSlots::MoveRootClips(
+            movie.empty() ? std::span<const u8>{*original} : std::span<const u8>{movie}, moves);
+        LOG_INFO(Core, "VR HUD move (VR_HUD_MOVE={}): {} ({} placements)", spec, moved.why,
+                 moved.moved);
+        if (!moved.movie.empty()) {
+            movie = std::move(moved.movie);
+        }
+    }
     if (movie.empty()) {
         return;
     }
@@ -595,13 +727,13 @@ void VrTileEbootLoaded(VAddr base, u64 size) {
         LOG_INFO(Core, "VR tile: off (vr_menu=0): the Options grid is the game's own; sites {}",
                  mismatch.empty() ? std::string{"retail"} : "differ at " + mismatch);
         // The button icons need no tile: the atlas pass on its own.
-        PrepareAtlas(false, VR::GetSettings().ui_vr_buttons);
+        PrepareAtlas(false, WantedButtons());
         return;
     }
     InstallProbe();
     InstallTile(); // the atlas pass with the goggles and the button icons, when it gets that far
     if (!g_atlas_served) {
-        PrepareAtlas(false, VR::GetSettings().ui_vr_buttons);
+        PrepareAtlas(false, WantedButtons());
     }
     if (IsVrTileInstalled()) {
         // The VR page's art and font, decoded in the background now (the first open shows it).

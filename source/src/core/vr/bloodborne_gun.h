@@ -77,7 +77,6 @@ void BladeShotTick(u8* chr, const BladeBody& body);
 [[nodiscard]] s32 GunBehaviorRefType(s32 bid);
 
 // bow_direct (core/vr/bow.h): the fire hook is ready and arrow rows were not missing.
-// An unknown twang uses the release whoosh; it does not delay direct shots.
 [[nodiscard]] bool GunBowDirectOk();
 
 // The projectile launch tail (core/vr/bloodborne_quickitems.cpp, 0x19F7835, same thread as the
@@ -105,5 +104,26 @@ void StakeDischarge(u8* chr, s64 now_ns);
 // gun_aim.h BarrelInWeaponBone(`attach`)), from `back` to `front` along it from the left hand's
 // grip (world units); false with no gun in the left hand (or not measured yet). Game:Main.
 bool GunBarrelReach(s32& attach, float& back, float& front);
+
+// quick_tool_direct (core/vr/quick_items.h ToolUseOf): `goods`, a hunter tool, is about to be used
+// with no animation (UseGoods at once); tool_aim aims its first launch: `aim` (Quick::ToolAimBy)
+// 0 as its ToolAims row says, 1 where you look (the Blacksky Eye held to your eye). Game:Main.
+bool NoteDirectTool(s32 goods, u8 aim = 0, const std::array<float,3>& direction = {},
+                    const std::array<float,3>& origin = {});
+void CancelDirectTool(); // a refused UseGoods must not leave a later launch armed
+
+// Copied world position of the first native Tonitrus chain child. No retained guest
+// pointer, raycast, or changes to the projectile simulation; used by the brief visual bridge.
+struct TonitrusContact {
+    s64 cast_ns{}, ns{};
+    std::array<float,3> point{};
+};
+bool LatestTonitrusContact(TonitrusContact& contact);
+
+// quick_tool_direct: the use clip's own event 96 effect the skipped animation would have spawned
+// (Beast Roar's roar, 202002 at the hunter's dummy 220, its sound with it), once on the character
+// `chr`, as the event asks for it (no slot: a node of its own). False: the effect call did not
+// match this eboot (then nothing is spawned).
+bool SpawnClipEffect(u8* chr, s32 ffx, s32 dummy);
 
 } // namespace VR::Bloodborne

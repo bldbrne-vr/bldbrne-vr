@@ -10,7 +10,9 @@
 
 namespace VR::Graphics {
 // One atomic snapshot: no locks, allocations or UI calls on the rendering thread.
-// Dimensions use 14 bits each (the runtime caps targets at 8192).
+// Dimensions use 14 bits each (the runtime caps targets at 8192). The provider (DLSS 5 counted
+// as a fifth) and the preset (six since Balanced Plus) share one 5-bit code: provider * 6 +
+// preset (at most 29).
 enum class RunState : uint64_t { Waiting, Active, Retrying, Unavailable, Unsupported, Preparing };
 struct RunStatus {
     Extent input{}, output{};
@@ -20,18 +22,20 @@ struct RunStatus {
     bool neural{};
 };
 inline constexpr uint64_t PackStatus(RunStatus s) {
+    const uint64_t provider = s.neural ? 4 : uint64_t(s.provider);
     return (uint64_t(s.input.width) & 16383) | ((uint64_t(s.input.height) & 16383) << 14) |
            ((uint64_t(s.output.width) & 16383) << 28) |
            ((uint64_t(s.output.height) & 16383) << 42) | (uint64_t(s.state) << 56) |
-           (uint64_t(s.provider) << 59) | (uint64_t(s.profile) << 61) | (uint64_t(s.neural) << 63);
+           ((provider * ProfileCount + uint64_t(s.profile)) << 59);
 }
 inline constexpr RunStatus UnpackStatus(uint64_t v) {
+    const uint64_t code = v >> 59, provider = code / ProfileCount;
     return {{uint32_t(v & 16383), uint32_t((v >> 14) & 16383)},
             {uint32_t((v >> 28) & 16383), uint32_t((v >> 42) & 16383)},
             RunState((v >> 56) & 7),
-            Upscaler((v >> 59) & 3),
-            Profile((v >> 61) & 3),
-            bool(v >> 63)};
+            provider == 4 ? Upscaler::Dlss : Upscaler(provider),
+            Profile(code % ProfileCount),
+            provider == 4};
 }
 inline std::atomic<uint64_t> run_status{PackStatus({})};
 static_assert(std::atomic<uint64_t>::is_always_lock_free);
@@ -74,10 +78,9 @@ inline std::string StatusText(Config c, RunStatus s, Extent applied, bool restar
     if (s.state == RunState::Active) {
         auto text = name + " active | " + SizeText(s.input) + " -> " + SizeText(s.output) + " / eye";
         if (c.dlss5 && c.upscaler == Upscaler::Dlss) {
-            const float scale = NeuralProfiles[unsigned(NeuralPreset(c.neural))].working_scale;
-            const Extent neural{uint32_t(std::lround(s.output.width * scale)),
-                                uint32_t(std::lround(s.output.height * scale))};
-            text += " | Neural " + SizeText(neural) + " / eye";
+            // The model's centre region of the render (NeuralCentre).
+            const Extent neural{NeuralCentreSide(s.input.width), NeuralCentreSide(s.input.height)};
+            text += " | Neural centre " + SizeText(neural) + " / eye";
         }
         return text;
     }

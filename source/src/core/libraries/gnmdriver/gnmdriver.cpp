@@ -1,3 +1,7 @@
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdlib>
 #include "video_core/native_stereo/pacing_audit.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
@@ -23,6 +27,7 @@
 #include "core/memory.h"
 #include "core/platform.h"
 #include "core/vr/session_pause.h"
+#include "core/vr/vr_session.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -86,9 +91,52 @@ static void ResetSubmissionLock(Platform::InterruptId irq) {
     cv_lock.notify_all();
 }
 
+// Frame overlap (vr.ini frame_overlap, on by default; the VR page's Graphics > Frame overlap,
+// applies at the next start; FAST_CPU_SUBMIT_AHEAD=0..3 overrides it for tests). Decided once, at
+// the game's first wait: the off path's submission_lock carries state between frames. VR runs
+// only (2026-11-02): a flat run (no OpenXR presenter) keeps the idle wait, which its uncapped
+// frame rate prefers (320x240 Old Yharnam, release builds: +4.8% standing, +7.5% panning).
+// - 0, off: every frame waits for the whole pipeline to go idle (2026-10-24: the game's render
+//   thread waited 90% of its time here, stage B and the GPU both partly idle);
+// - 3, on: a frame waits only until the command processor has decoded every submission so far,
+//   so the game prepares the next frame while stage B and the GPU finish this one (the user's
+//   headset sessions of 2026-10-24: the Sewers' and Old Yharnam's look-around hitches gone);
+// - 1, 2: until the frame `ahead` frames before the previous one has retired (tests only: the
+//   game rewrites memory those frames still read).
+// The game's own labels and fences, written in order by the replay, still order everything it
+// reads back.
+static u32 SubmitAhead() {
+    static const u32 ahead = [] {
+        u32 value = VR::GetSettings().frame_overlap && VR::XrPresenterActive() ? 3u : 0u;
+        if (const char* env = std::getenv("FAST_CPU_SUBMIT_AHEAD")) {
+            value = std::clamp<u32>(u32(std::atoi(env)), 0u, 3u);
+        }
+        LOG_INFO(Lib_GnmDriver, "Frame overlap: {} (submit ahead {})", value ? "on" : "off",
+                 value);
+        return value;
+    }();
+    return ahead;
+}
+static std::array<u64, 4> g_frame_submissions{}; // the submission count at each SubmitDone
+static std::atomic<u64> g_frames_done{};         // SubmitDone calls so far
+
 static void WaitGpuIdle() {
     ScratchPacing::Wait pacing_wait{4};
     HLE_TRACE;
+    if (const u32 ahead = SubmitAhead()) {
+        const u64 done = g_frames_done.load(std::memory_order_acquire);
+        if (ahead == 3) {
+            // 3: every submission so far decoded by the command processor (not replayed yet), at
+            // every submit as the idle wait was: the game frees or rewrites what an earlier
+            // submission referenced once its submit returns, and the decoder reads it directly.
+            liverpool->WaitDecoded(liverpool->SubmissionsQueued());
+            return;
+        }
+        if (done > ahead)
+            liverpool->WaitRetired(
+                g_frame_submissions[(done - 1 - ahead) % g_frame_submissions.size()]);
+        return;
+    }
     std::unique_lock lock{m_submission};
     cv_lock.wait(lock, [] { return submission_lock == 0; });
 }
@@ -2303,7 +2351,11 @@ int PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
     WaitGpuIdle();
-    if (!liverpool->IsGpuIdle()) {
+    if (SubmitAhead()) {
+        const u64 done = g_frames_done.load(std::memory_order_relaxed);
+        g_frame_submissions[done % g_frame_submissions.size()] = liverpool->SubmissionsQueued();
+        g_frames_done.store(done + 1, std::memory_order_release);
+    } else if (!liverpool->IsGpuIdle()) {
         submission_lock = true;
     }
     liverpool->SubmitDone();

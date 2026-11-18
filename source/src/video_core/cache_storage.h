@@ -55,6 +55,11 @@ public:
     // another GPU / driver profile starts over instead of being ignored for good.
     bool Clear();
 
+    // The folder cache (video_core/cache_pack.h): once the start's work is queued, folds the
+    // blobs' own files into a new pack on a background thread, which the next start reads in
+    // one go. Nothing when there are few own files.
+    void PackInBackground();
+
 private:
     std::jthread io_worker{};
     std::filesystem::path cache_path{};

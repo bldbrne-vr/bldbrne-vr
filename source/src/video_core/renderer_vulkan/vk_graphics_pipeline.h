@@ -12,6 +12,7 @@
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
+#include "video_core/renderer_vulkan/vr_eye_spec_variants.h"
 
 namespace VideoCore {
 class BufferCache;
@@ -59,6 +60,31 @@ struct VertexView {
           bindings(prepared.bindings.data(), prepared.bindings.size()),
           guest_buffers(prepared.guest_buffers.data(), prepared.guest_buffers.size()),
           ranges(prepared.ranges.data(), prepared.ranges.size()), geometry(prepared.geometry) {}
+};
+
+// FAST_CPU_STAGEB_SPLIT (stage 2): the vertex input and
+// the vertex and index binds a draw encodes, as BufferCache::BindVertexBuffers / BindIndexBuffer
+// resolved them (buffers obtained, barriers added): owned values, encoded by EncodeVertexBinds.
+struct VertexBinds {
+    bool vertex_input{}; // setVertexInputEXT (dynamic vertex input)
+    VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    bool two{}; // bindVertexBuffers2 (sizes and strides) instead of bindVertexBuffers
+    VertexInputs<vk::Buffer> buffers;
+    VertexInputs<vk::DeviceSize> offsets, sizes, strides;
+    bool index{};
+    vk::Buffer index_buffer{};
+    vk::DeviceSize index_offset{};
+    vk::IndexType index_type{};
+    void Clear() {
+        vertex_input = two = index = false;
+        bindings.clear();
+        attributes.clear();
+        buffers.clear();
+        offsets.clear();
+        sizes.clear();
+        strides.clear();
+    }
 };
 
 struct GraphicsPipelineKey {
@@ -135,6 +161,21 @@ public:
     }
 
     bool HasVrMotion() const { return vr_motion; }
+    // A body-map capture variant (Shader::VrMotion::Capture, vr_body_maps.h).
+    bool HasVrCapture() const { return vr_capture; }
+
+    /// VR_EYE_SPEC (vr_eye_spec_variants.h), from Pipeline::BindResources after the draw's
+    /// pairing and before its descriptors are recorded: sets drawn.handle to the eye-shared
+    /// variant when it is built and the draw shares every binding it shares (equal descriptors,
+    /// or the same stride and size), widening each strided binding's left descriptor to cover
+    /// both copies; else leaves it null (the base pipeline). Learns over the pipeline's first
+    /// draws and asks for the variant. Recording owner only.
+    void EyeSelect(EyeSpecVariants::DrawMask& drawn) const;
+
+    /// VR_EYE_SPEC: forgets the variant's recipe when it builds from one of `gone` (modules the
+    /// warm-up destroyed with a cached pipeline the driver rejected; the recipe holds their
+    /// handles). This pipeline draws on as it is, without a variant. Before its first draw only.
+    bool DropEyeSpecRecipe(std::span<const vk::ShaderModule> gone);
 
     /// Gets the attributes and bindings for vertex inputs.
     template <typename Attribute, typename Binding>
@@ -149,7 +190,20 @@ private:
 private:
     GraphicsPipelineKey key;
     bool vr_motion{};
+    bool vr_capture{};
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader{};
+    // VR_EYE_SPEC: the layout's storage buffer bindings (below EyeSpec::MaxBindings), the copy of
+    // the create info variants are built from (null: no variants), what the first draws shared,
+    // and the variant.
+    u64 eye_spec_buffers{};
+    // VR_EYE_SPEC=2: the bindings whose modules get a stride and a size (read-only game buffers,
+    // as EmitContext::DefineBuffers makes them); only these may share a strided pair. Sharing one
+    // without them would read the left eye's copy in both eyes.
+    u64 eye_spec_strides{};
+    std::shared_ptr<const EyeSpecVariants::Recipe> eye_spec_recipe;
+    mutable u32 eye_spec_draws{};
+    mutable std::unique_ptr<EyeSpecVariants::Learn> eye_spec_learn;
+    mutable std::shared_ptr<EyeSpecVariants::Slot> eye_spec_slot;
 };
 
 struct ClipDistanceShaderKey {

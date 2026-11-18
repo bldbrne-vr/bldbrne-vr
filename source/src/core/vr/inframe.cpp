@@ -48,15 +48,27 @@ SeqLock<ProbeResult> g_probe;
 
 // Appends `from`'s items and labels to `out` (its label indices moved past out's own; an item
 // whose label did not fit is left out).
-void Append(List& out, const List& from) {
+template <std::size_t Capacity>
+void Append(ItemList<Capacity>& out, const List& from, std::uint32_t limit) {
     const std::uint32_t base = out.label_count;
     std::uint32_t labels = 0;
     for (std::uint32_t i = 0; i < from.label_count && out.label_count < MaxLabels; ++i) {
         out.labels[out.label_count++] = from.labels[i];
         ++labels;
     }
-    for (std::uint32_t i = 0; i < from.count && out.count < MaxItems; ++i) {
+    for (std::uint32_t i = 0; i < from.count && out.count < limit; ++i) {
         Item item = from.items[i];
+        if (item.group != 0 && (i == 0 || from.items[i - 1].group != item.group)) {
+            // A group (a severed piece's models) goes in whole or not at all.
+            std::uint32_t n = 1;
+            while (i + n < from.count && from.items[i + n].group == item.group) {
+                ++n;
+            }
+            if (out.count + n > limit) {
+                i += n - 1;
+                continue;
+            }
+        }
         if (item.tex == Tex::Label) {
             if (item.tex_key >= labels) {
                 continue;
@@ -139,7 +151,8 @@ std::uint32_t Carry(std::uint64_t record, const ReView& rv) {
     return moved;
 }
 
-bool Take(std::uint64_t record, List& out) {
+template <std::size_t Capacity>
+static bool TakeList(std::uint64_t record, ItemList<Capacity>& out) {
     auto& r = R();
     if (record == 0) {
         return false;
@@ -154,24 +167,40 @@ bool Take(std::uint64_t record, List& out) {
     }
     const List* quick = parts[static_cast<std::size_t>(Producer::Quick)];
     const List* vitals = parts[static_cast<std::size_t>(Producer::Vitals)];
-    if (quick == nullptr && vitals == nullptr) {
+    const List* sever = parts[static_cast<std::size_t>(Producer::Sever)];
+    if (quick == nullptr && vitals == nullptr && sever == nullptr) {
         return false;
     }
-    if (vitals == nullptr) {
-        out = *quick;
-    } else {
-        // The gauge first (under any card of the arc), then the quick items.
-        out = *vitals;
-        out.producer = Producer::Quick;
-        if (quick != nullptr) {
-            out.exposure = quick->exposure;
-            out.steady_ns = std::max(out.steady_ns, quick->steady_ns);
-            Append(out, *quick);
+    // The gauge first (under any card of the arc), then the quick items (whose list carries the
+    // frame's world effects). Preserve their existing combined budget. The renderer's
+    // additional capacity holds the sever list in full, even after the UI fills up.
+    bool first = true;
+    for (const List* part : {vitals, quick, sever}) {
+        if (part == nullptr) {
+            continue;
         }
+        if (first) {
+            out.CopyFrom(*part);
+            out.producer = Producer::Quick;
+            first = false;
+            continue;
+        }
+        out.steady_ns = std::max(out.steady_ns, part->steady_ns);
+        Append(out, *part, part == sever ? Capacity : MaxItems);
+    }
+    if (quick != nullptr) {
+        out.exposure = quick->exposure;
+        out.world_gray = quick->world_gray;
+        out.world_bright = quick->world_bright;
+        out.world_flash = quick->world_flash;
+        out.world_storm = quick->world_storm;
     }
     r.taken.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
+
+bool Take(std::uint64_t record, List& out) { return TakeList(record, out); }
+bool Take(std::uint64_t record, RenderList& out) { return TakeList(record, out); }
 
 void PublishProbe(const ProbeResult& result) {
     g_probe.Store(result);
@@ -193,6 +222,20 @@ bool Has(std::uint64_t record) {
         }
     }
     return false;
+}
+
+float StormFor(std::uint64_t record) {
+    auto& r = R();
+    if (record == 0) {
+        return 0.0f;
+    }
+    std::scoped_lock lock{r.mutex};
+    for (const auto& list : r.lists) {
+        if (list.record == record && list.producer == Producer::Quick) {
+            return list.world_storm;
+        }
+    }
+    return 0.0f;
 }
 
 std::uint64_t NewestRecord() {
@@ -222,6 +265,12 @@ void NoteDrawn() {
 
 void NoteDisabled() {
     R().disabled.store(true, std::memory_order_relaxed);
+}
+
+void NoteNothingInView() {
+    // The frame passed every check that can refuse our items: the streak starts again, as after
+    // a drawn list (a frame takes both producers' lists, and one may have come twice).
+    NoteDrawn();
 }
 
 bool Available() {

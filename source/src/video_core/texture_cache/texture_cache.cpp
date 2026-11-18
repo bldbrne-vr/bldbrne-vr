@@ -5,9 +5,11 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <xxhash.h>
 
 #include "common/assert.h"
+#include "video_core/ds_ab.h"
 #include "common/slow_scope.h"
 #include "common/crash_record.h"
 #include "common/debug.h"
@@ -23,6 +25,8 @@
 #include "video_core/texture_cache/download_log.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/vram_report.h"
+#include <array>
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
@@ -57,7 +61,7 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       buffer_cache{buffer_cache_}, tracker{tracker_}, blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)},
-      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
+      sky_detail{instance, scheduler}, readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -72,19 +76,79 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         return;
     }
 
-    const s64 device_local_memory = static_cast<s64>(instance.GetTotalMemoryBudget());
-    const s64 min_spacing_expected = device_local_memory - 1_GB;
-    const s64 min_spacing_critical = device_local_memory - 512_MB;
-    const s64 mem_threshold = std::min<s64>(device_local_memory, TARGET_GC_THRESHOLD);
+    start_budget = static_cast<s64>(instance.GetTotalMemoryBudget());
+    SetMemoryMarks(start_budget);
+}
+
+void TextureCache::SetMemoryMarks(s64 budget) {
+    const s64 min_spacing_expected = budget - 1_GB;
+    const s64 mem_threshold = std::min<s64>(budget, TARGET_GC_THRESHOLD);
     const s64 min_vacancy_expected = (6 * mem_threshold) / 10;
-    const s64 min_vacancy_critical = (2 * mem_threshold) / 10;
-    pressure_gc_memory = static_cast<u64>(
-        std::max<u64>(std::min(device_local_memory - min_vacancy_expected, min_spacing_expected),
-                      DEFAULT_PRESSURE_GC_MEMORY));
+    pressure_gc_memory = static_cast<u64>(std::max<u64>(
+        std::min(budget - min_vacancy_expected, min_spacing_expected), DEFAULT_PRESSURE_GC_MEMORY));
+    // Within a small margin of the budget (TextureMemory::CriticalMark).
     critical_gc_memory = static_cast<u64>(
-        std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
-                      DEFAULT_CRITICAL_GC_MEMORY));
-    trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
+        TextureMemory::CriticalMark(budget, static_cast<s64>(pressure_gc_memory)));
+    trigger_gc_memory = static_cast<u64>((budget - mem_threshold) / 2);
+    marks_budget = budget;
+    LOG_INFO(Render_Vulkan,
+             "Texture cache: VRAM budget {} MiB, eviction from {} MiB, under pressure from {} "
+             "MiB, critical from {} MiB",
+             budget >> 20, trigger_gc_memory >> 20, pressure_gc_memory >> 20,
+             critical_gc_memory >> 20);
+}
+
+void TextureCache::ReviseMemoryMarks(bool live) {
+    if (start_budget <= 0) {
+        return;
+    }
+    const auto now = instance.QueryMemoryBudget();
+    auto revised = TextureMemory::RevisedBudget(marks_budget, start_budget,
+                                                static_cast<s64>(now.budget),
+                                                static_cast<s64>(instance.GetDeviceLocalCap()));
+    if (live) {
+        revised = live_budget.Confirm(revised);
+        // Windows moving the game's memory to system memory counts, whatever its budget reads.
+        // Once per new Windows reading. None (the counters unavailable or stale) or the same one
+        // again: the watch keeps its state, holding the marks while active, counting nothing.
+        auto spill = TextureMemory::SpillWatch::Answer{spill_watch.Active(), std::nullopt};
+        if (now.residency_sample != 0 && now.residency_sample != spill_sample) {
+            spill_sample = now.residency_sample;
+            spill = spill_watch.Step(static_cast<s64>(now.usage), static_cast<s64>(now.spilled),
+                                     marks_budget);
+        }
+        if (Common::Log::Enabled && ++spill_readings % 15 == 0) {
+            LOG_INFO(Render_Vulkan, "{}: residency: Vulkan's VRAM use {} MiB, resident {} MiB, "
+                     "system memory {} MiB (its own {} MiB): spilled {} MiB",
+                     "Texture cache", now.usage >> 20, now.resident >> 20, now.non_local >> 20,
+                     now.host >> 20, now.spilled >> 20);
+        }
+        if (spill.hold) {
+            revised = spill.budget;
+            if (spill.budget) {
+                LOG_WARNING(Render_Vulkan,
+                            "{}: Windows keeps {} MiB of the game's {} MiB in VRAM (the rest is "
+                            "in system memory) while its budget reads {} MiB: the marks drop to "
+                            "{} MiB",
+                            "Texture cache", now.resident >> 20, now.usage >> 20, now.budget >> 20,
+                            *spill.budget >> 20);
+            }
+        } else if (spill_was_active) {
+            LOG_INFO(Render_Vulkan, "{}: the game is all in VRAM again: Windows' budget sets "
+                     "the marks again", "Texture cache");
+        }
+        spill_was_active = spill_watch.Active();
+    }
+    if (!revised) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    LOG_INFO(Render_Vulkan,
+             "Texture cache: {} Windows' budget for the game is {} MiB (its use {} MiB): "
+             "the marks follow it, {} -> {} MiB",
+             live ? "during play" : "at a load", now.budget >> 20, now.usage >> 20,
+             marks_budget >> 20, *revised >> 20);
+    SetMemoryMarks(*revised);
 }
 
 TextureCache::~TextureCache() = default;
@@ -694,6 +758,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
+        ++image.write_serial;
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
             std::unique_lock lk{download_images_mutex};
@@ -701,12 +766,20 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
         }
     }
     UpdateImage(image_id);
+    // Sky detail: a sky or moon texture sampled as the game samples it, through its sharper copy.
+    if (image.sky_twin && desc.type == BindingType::Texture && !image.binding.force_general &&
+        !image.binding.is_target) {
+        if (ImageView* view = image.sky_twin->View(desc.view_info)) {
+            return *view;
+        }
+    }
     return image.FindView(desc.view_info);
 }
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
+    ++image.write_serial;
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
@@ -739,6 +812,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
+    ++image.write_serial;
     image.usage.depth_target = 1u;
     UpdateImage(image_id);
 
@@ -782,10 +856,19 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 }
 
 void TextureCache::RefreshImage(Image& image) {
-    Common::Slow::Scope slow{Common::Slow::RefreshImage, image.info.guest_size};
+    // Timed after the clean return: the "texture upload" totals count real refreshes only
+    // (VR_DS_AB=a's off windows: timed before it, as before).
+    std::optional<Common::Slow::Scope> slow;
+    if (!DsAb::FixesOn()) [[unlikely]] {
+        slow.emplace(Common::Slow::RefreshImage, image.info.guest_size);
+    }
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
+    if (!slow) {
+        slow.emplace(Common::Slow::RefreshImage, image.info.guest_size);
+    }
+    ++image.write_serial; // the guest memory's bytes replace the image's
 
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
@@ -863,8 +946,20 @@ void TextureCache::RefreshImage(Image& image) {
 
     scheduler.EndRendering();
 
-    const auto [in_buffer, in_offset] =
-        buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
+    // A bump map with a height made for it (bump_height.h): its own bytes with that height in
+    // blue, while the guest's are still the ones it was made from.
+    const u8* const bump_bytes =
+        bump_heights.Bytes(image.info.guest_address, image.info.guest_size,
+                           std::bit_cast<const u8*>(image.info.guest_address));
+    const auto [in_buffer, in_offset, staging] =
+        bump_bytes != nullptr
+            ? buffer_cache.ObtainBufferForBytes(bump_bytes, image.info.guest_size)
+            : buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
+    SCOPE_EXIT {
+        if (staging) {
+            staging->Retire();
+        }
+    };
     if (auto barrier = in_buffer->GetBarrier(vk::AccessFlagBits2::eTransferRead,
                                              vk::PipelineStageFlagBits2::eTransfer)) {
         scheduler.Commands().pipelineBarrier2(vk::DependencyInfo{
@@ -876,11 +971,20 @@ void TextureCache::RefreshImage(Image& image) {
 
     // FAST bit 61 (TileManager::UploadDetile): a tiled colour image is detiled straight into its
     // layers, with Upload's final state; nothing was recorded when it returns false.
+    // Sky detail: after the upload, a sky or moon gets its sharper copy (another texture loses
+    // one). Views bound through the old state are looked up again: the bind memo keeps views per
+    // registry epoch.
+    const auto sky = [&] {
+        if (sky_detail.AfterUpload(image)) {
+            ++registry_epoch;
+        }
+    };
     if (FastRender::On(TileManager::UploadDetile) &&
         tile_manager.DetileIntoImage(
             image, std::span<const vk::BufferImageCopy>{image_copies.data(), image_copies.size()},
             in_buffer->Handle(), in_offset)) {
         image.flags &= ~ImageFlagBits::Dirty;
+        sky();
         return;
     }
 
@@ -891,6 +995,7 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     image.Upload(image_copies, buffer, offset);
+    sky();
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
@@ -946,6 +1051,8 @@ void TextureCache::RegisterImage(ImageId image_id) {
 }
 
 void TextureCache::UnregisterImage(ImageId image_id) {
+    // VR_RETILE_DEFER: a pending re-tile of this image is recorded while it still exists.
+    buffer_cache.MaterializeRetilesFrom(image_id);
     Image& image = slot_images[image_id];
     image.InvalidateFastUpdate();
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
@@ -1152,8 +1259,11 @@ void TextureCache::GarbageCollectImages() {
         const auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         // As in bbport: skipped images neither spend the budget nor stay first in line.
-        // Keep GPU-written tiled images: this branch cannot download them correctly.
-        if ((image.info.IsTiled() && download) || (download && !pressured)) {
+        // Keep GPU-written tiled images: this branch cannot download them correctly. Keep
+        // GPU-written two-eye images too: the write-back carries the left eye only, so the image
+        // made again from the game's memory would show the left eye's picture to the right eye.
+        if (((image.info.IsTiled() || image.native_stereo) && download) ||
+            (download && !pressured)) {
             lru_cache.Touch(image.lru_id, gc_tick);
             return false;
         }
@@ -1162,8 +1272,13 @@ void TextureCache::GarbageCollectImages() {
         }
         return true;
     };
+    bool critical_ran = false;
     const auto clean_up = [&](ImageId image_id) {
         const bool download = slot_images[image_id].SafeToDownload();
+        if (critical_ran) {
+            critical_backoff.Evicted(slot_images[image_id].info.guest_address,
+                                     slot_images[image_id].info.guest_size);
+        }
         if (download) {
             ++sync_writebacks;
             // bbport: finish the write-back while the image still protects its guest pages.
@@ -1196,15 +1311,31 @@ void TextureCache::GarbageCollectImages() {
     configure(false);
     TextureMemory::Collect(lru_cache, below_tick, num_deletions, can_evict, clean_up);
 
-    if (total_used_memory >= critical_gc_memory) {
+    // Over the critical mark the passes below go further; resting when what they evict comes
+    // straight back (TextureMemory::CriticalBackoff: the gentle pass above still runs).
+    if (critical_backoff.Advance(second)) {
+        LOG_INFO(Render_Vulkan,
+                 "Texture GC: over the critical mark ({} of {} MiB) {} s running, {} of the {} "
+                 "MiB its passes evicted came straight back: they rest {} s",
+                 total_used_memory >> 20, critical_gc_memory >> 20,
+                 2 * TextureMemory::CriticalBackoff::WindowSeconds,
+                 critical_backoff.LastReturned() >> 20, critical_backoff.LastEvicted() >> 20,
+                 TextureMemory::CriticalBackoff::BackoffSeconds);
+    }
+    const bool critical_allowed = critical_backoff.Allowed(second);
+    if (critical_allowed && total_used_memory >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
+        critical_ran = true;
         configure(true);
         TextureMemory::Collect(lru_cache, below_tick, num_deletions, can_evict, clean_up);
     }
-    if (total_used_memory >= critical_gc_memory) {
+    if (critical_allowed && total_used_memory >= critical_gc_memory) {
         // Still over it: what was used a moment ago goes too (out of memory otherwise).
         configure(true, true);
         TextureMemory::Collect(lru_cache, below_tick, num_deletions, can_evict, clean_up);
+    }
+    if (critical_ran) {
+        critical_backoff.Ran(second);
     }
     if constexpr (Common::Log::Enabled) {
         if (evictions != 0) {
@@ -1277,7 +1408,60 @@ void TextureCache::RunGarbageCollector(u64 transition_request) {
     SCOPE_EXIT {
         ++gc_tick;
     };
+    // Sky detail: your images read since the last frame replace their filtered copies.
+    if (sky_detail.Poll()) {
+        bool changed = false;
+        for (auto& image : slot_images) {
+            changed |= sky_detail.Upgrade(image);
+        }
+        sky_detail.EndUpgrades();
+        if (changed) {
+            ++registry_epoch; // bound views are looked up again
+        }
+    }
+    // VR_VRAM_REPORT: every 10 s, the cache's memory by time since last use and kind, to size
+    // what evicting GPU-written tiled images (never collected, see can_evict) would free.
+    if (VramReport::Enabled()) {
+        static u64 reported_second = 0;
+        if (static_cast<u64>(second) >= reported_second + 10) {
+            reported_second = static_cast<u64>(second);
+            std::scoped_lock lock{mutex};
+            const u64 t10 = reclaim_age.Before(second, 10), t60 = reclaim_age.Before(second, 60);
+            // [kind][age]: kind 0 GPU-written tiled, 1 GPU-written linear, 2 other; age 0 <10 s,
+            // 1 10-60 s, 2 over 60 s.
+            std::array<std::array<std::pair<u64, u32>, 3>, 3> bytes{};
+            for (const auto& image : slot_images) {
+                if (!image.backing || False(image.flags & ImageFlagBits::Registered))
+                    continue;
+                const u64 tick = lru_cache.TickOf(image.lru_id);
+                const u32 age = tick >= t10 ? 0 : (t60 && tick < t60) ? 2 : 1;
+                const u32 kind = True(image.flags & ImageFlagBits::GpuModified)
+                                     ? (image.info.IsTiled() ? 0 : 1)
+                                     : 2;
+                bytes[kind][age].first += image.backing->image.SizeBytes();
+                ++bytes[kind][age].second;
+            }
+            const auto text = [&](u32 kind) {
+                return fmt::format("<10 s {} MiB ({}), 10-60 s {} MiB ({}), >60 s {} MiB ({})",
+                                   bytes[kind][0].first >> 20, bytes[kind][0].second,
+                                   bytes[kind][1].first >> 20, bytes[kind][1].second,
+                                   bytes[kind][2].first >> 20, bytes[kind][2].second);
+            };
+            LOG_INFO(Render_Vulkan,
+                     "VR VRAM report: texture cache by last use: GPU-written tiled {}; GPU-written "
+                     "linear {}; other {}",
+                     text(0), text(1), text(2));
+        }
+    }
 
+    // A load (a warp, a death, a new map): the marks follow Windows' budget for the game now,
+    // which other programs move (ReviseMemoryMarks). Once per request, as TransitionCleanup.
+    if (const u64 sequence = transition_request >> 1; sequence != revised_sequence) {
+        revised_sequence = sequence;
+        ReviseMemoryMarks();
+    } else if (live_budget.Due(static_cast<u64>(second))) {
+        ReviseMemoryMarks(true); // during play too (TextureMemory::LiveBudget)
+    }
     if (const auto cutoff = transition_cleanup.Step(second, transition_request, gc_tick, [&] {
             // Same threshold and accounting as normal GC. Query only when a pass is due.
             const u64 usage = instance.CanReportMemoryUsage() ? instance.GetDeviceMemoryUsage()
@@ -1380,6 +1564,7 @@ void TextureCache::NoteTargetFreed(ImageId image_id, u32 line) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+    critical_backoff.Created(info.guest_address); // under FindImage's lock, as the GC's
     const auto image_id =
         slot_images.insert(instance, scheduler, blit_helper, slot_image_views, info);
     if (!slot_images[image_id].allocation_failed) {
@@ -1388,7 +1573,9 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
     u64 freed = 0;
     const bool recovered = TextureMemory::Recover(
         info.guest_size,
-        [&](u64 bytes) { freed += ReclaimMemoryFor(info.guest_address, info.guest_size, bytes); },
+        [&](u64 bytes) {
+            freed += ReclaimMemoryFor<true>(info.guest_address, info.guest_size, bytes);
+        },
         [&] { return slot_images[image_id].RetryAllocation(); });
     LOG_WARNING(Render_Vulkan, "Texture allocation recovery: {} MiB released, recovered={}",
                 freed >> 20, recovered);
@@ -1401,9 +1588,10 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 
 u64 TextureCache::ReclaimMemory(u64 bytes) {
     std::scoped_lock lock{mutex};
-    return ReclaimMemoryFor(0, 0, bytes);
+    return ReclaimMemoryFor<true>(0, 0, bytes);
 }
 
+template <bool FreeNow>
 u64 TextureCache::ReclaimMemoryFor(VAddr addr, size_t size, u64 bytes, u64 max_tick,
                                  size_t image_limit) {
     const auto second = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1418,6 +1606,9 @@ u64 TextureCache::ReclaimMemoryFor(VAddr addr, size_t size, u64 bytes, u64 max_t
             return true;
         }
         const auto& image = slot_images[id];
+        if (buffer_cache.IsRetileSource(id)) {
+            return false; // VR_RETILE_DEFER: deleted at once below, before its re-tile ran
+        }
         const TextureMemory::Candidate candidate{
             .lru_tick = lru_cache.TickOf(image.lru_id),
             .submission_tick = image.tick_accessed_last,
@@ -1442,10 +1633,30 @@ u64 TextureCache::ReclaimMemoryFor(VAddr addr, size_t size, u64 bytes, u64 max_t
     // Never submit the partially prepared draw: only wait for earlier, already submitted ticks.
     // All unsubmitted uses are protected by the LRU/current-tick and binding checks above.
     scheduler.WaitSubmitted();
-    for (const auto id : victims) {
-        UntrackImage(id);
-        UnregisterImage(id);
-        DeleteImage(id, true);
+    if constexpr (FreeNow) {
+        // The retry needs the memory now: taken out before DeleteImage (so the background free
+        // has none to defer past the current tick) and freed once the views are gone. The GPU is
+        // done with these images (the wait above); a hitch here beats the crash a failed retry is.
+        boost::container::small_vector<UniqueImage::Released, 16> memory;
+        for (const auto id : victims) {
+            UntrackImage(id);
+            UnregisterImage(id);
+            for (auto& backing : slot_images[id].backing_images) {
+                if (backing.image) {
+                    memory.push_back(backing.image.Release());
+                }
+            }
+            DeleteImage(id, true);
+        }
+        for (const auto& released : memory) {
+            UniqueImage::DestroyReleased(released);
+        }
+    } else {
+        for (const auto id : victims) {
+            UntrackImage(id);
+            UnregisterImage(id);
+            DeleteImage(id, true);
+        }
     }
     return freed;
 }
@@ -1482,11 +1693,38 @@ void TextureCache::DeleteImage(ImageId image_id, bool immediate) {
     }
 }
 
+// FAST_BACKGROUND_FREE ('1' on, off by default; read once at start-up. 2026-10-24: no hitch
+// it removes measured yet, ~2-3% fps at the sewers spot): an erased image's memory is
+// freed on the scheduler's background thread once the GPU has passed the current tick, not here.
+// vmaDestroyImage of a dedicated allocation is a ~1 ms driver call: a texture GC pass's 237
+// evictions freed here, in one deferred-operations call inside a submission, stopped the recorder
+// for 238 ms with stage B and the GPU thread waiting behind it (2026-10-24). The views (their
+// native stereo registry) and the slots are still released here, on the recording thread.
+static const bool g_background_free = [] {
+    const char* value = std::getenv("FAST_BACKGROUND_FREE");
+    return value && value[0] == '1';
+}();
+
 void TextureCache::EraseImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     for (auto& backing : image.backing_images) {
         for (const ImageViewId image_view_id : backing.image_view_ids) {
             slot_image_views.erase(image_view_id);
+        }
+    }
+    if (g_background_free || FastRender::On(FastRender::BackgroundFree)) {
+        boost::container::small_vector<UniqueImage::Released, 2> memory;
+        for (auto& backing : image.backing_images) {
+            if (backing.image) {
+                memory.push_back(backing.image.Release());
+            }
+        }
+        if (!memory.empty()) {
+            scheduler.DeferPriorityOperation([memory] {
+                for (const auto& released : memory) {
+                    UniqueImage::DestroyReleased(released);
+                }
+            });
         }
     }
     slot_images.erase(image_id);

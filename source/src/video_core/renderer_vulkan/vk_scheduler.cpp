@@ -1,5 +1,6 @@
 #include "video_core/host_copies.h"
 #include "video_core/flip_order_trace.h"
+#include "video_core/native_stereo/native_stereo.h"
 #include "video_core/native_stereo/pgo_capture.h"
 #include "video_core/native_stereo/profile_scopes.h"
 #include "video_core/native_stereo/push_state_memo.h"
@@ -13,9 +14,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <future>
+#include <thread>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
+#include <mutex>
 #include <source_location>
 #include <string>
 #include <unordered_map>
@@ -26,31 +30,56 @@
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "core/memory.h"
+#include "video_core/renderer_vulkan/vk_gpu_crash.h"
 #include "core/platform.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_gpu_frame_timer.h"
 #include "video_core/renderer_vulkan/vk_gpu_pass_profiler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vr_foveation.h"
+#include "video_core/renderer_vulkan/vr_eye_axes.h"
+#include "core/vr/eye_cant.h"
+#include "core/vr/eye_fov_cache.h"
+#include "core/vr/graphics_settings.h"
+#include "core/vr/vr_session.h"
+#include <vk_mem_alloc.h>
 #include "video_core/renderer_vulkan/vk_pass_breaks.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_submit_lock_trace.h"
 #include "video_core/renderer_vulkan/vr_perf.h"
+#include "shader_recompiler/ir/passes/light_shadow.h"
 
 namespace Vulkan {
+
+bool VrSceneMaskOn(); // (vk_pipeline_cache.h: the mask's switch and the session's lamp shadows)
 
 std::mutex Scheduler::submit_mutex;
 
 namespace {
 
 // VR_GPU_TIMING=1: the game's GPU time per frame (vk_gpu_frame_timer.h).
-bool GpuTimingWanted() {
+bool GpuTimingAsked() {
     static const bool wanted = [] {
         const char* value = std::getenv("VR_GPU_TIMING");
         return value != nullptr && *value != '\0' && *value != '0';
     }();
     return wanted;
 }
+// ... or the lamp shadows' trace dial, which reads LastGpuFrameMs (light_shadow.h SceneMaps::Dial),
+// only with the lamp shadows on (VrSceneMaskOn; read at the first frame mark, after the start).
+bool GpuTimingWanted() {
+    static const bool wanted = [] {
+        namespace Scene = Shader::Optimization::LightShadow::SceneMaps;
+        return GpuTimingAsked() || (VrSceneMaskOn() && Scene::TraceAll() && Scene::Dial() &&
+                                    Scene::TraceFarPinned() < 0.0f) ||
+               (VrSceneMaskOn() && Scene::StepDial());
+    }();
+    return wanted;
+}
+// LastGpuFrameMs: the last frame read back, and the frames read so far.
+std::atomic<float> g_last_gpu_ms{-1.0f};
+std::atomic<unsigned> g_gpu_frames{0};
 
 // VR_GPU_TIMING_WINDOW_S=<s> (the launcher's performance scan): a `VR gpu frame:` window closes
 // after this much time instead of after 300 frames, so a slow PC reaches the scan's warm-up and
@@ -342,6 +371,14 @@ void GpuTimerFinishFrame(GpuFrameTimer& t) {
     busy += end - start;
     const u64 first = t.spans.front().first;
     const double to_ms = t.tick_ns * 1e-6;
+    g_last_gpu_ms.store(static_cast<float>(static_cast<double>(busy) * to_ms), std::memory_order_relaxed);
+    g_gpu_frames.fetch_add(1, std::memory_order_release);
+    if (!GpuTimingAsked()) {
+        // (The trace dial's only: no windows, no `VR gpu frame:` lines.)
+        t.prev_end = last;
+        t.spans.clear();
+        return;
+    }
     const auto now = std::chrono::steady_clock::now();
     if (t.busy_ms.empty()) {
         t.window_start = now;
@@ -475,7 +512,7 @@ static void GpuFrameTimerMarkNow(Scheduler& scheduler, const Instance& instance)
 }
 
 namespace {
-enum RecorderControl : u32 { SubmitCommands, FrameMarker, GuestSignal, ReplayTask };
+enum RecorderControl : u32 { SubmitCommands, FrameMarker, GuestSignal, ReplayTask, Checkpoint };
 // FAST_SKIP_EMPTY_FINISH_VERIFY: RecorderSubmit::expect_commands of an unchecked submission.
 constexpr u64 NoEmptyCheck = ~u64{0};
 struct RecorderSubmit {
@@ -492,13 +529,14 @@ struct ReplayTaskPacket {
     u64 argument;
 };
 static_assert(std::is_trivially_copyable_v<ReplayTaskPacket>);
-// FAST_CPU_SIGNAL_AT_REPLAY: FlushGuestSignals spins this many pauses (about 70 us on a 5800X3D,
-// as the recorder's drain spin) for the replay to write the signals before it drains.
-constexpr u32 SignalSpinPauses = 4096;
+// FAST_CPU_SIGNAL_AT_REPLAY: FlushGuestSignals spins up to this long (as the recorder's drain
+// spin; 4096 pauses on a 5800X3D) for the replay to write the signals before it drains. A time,
+// not a pause count: an Intel PAUSE lasts several times a Zen one.
+constexpr auto SignalSpin = std::chrono::microseconds(70);
 // FAST_CPU_SIGNAL_AT_REPLAY_VERIFY's counts: `verified` and the rest by the replay, `flushes`
 // and `unwritten` by the producer (A or B, whichever owns the scheduler).
 struct SignalReplayVerify {
-    std::atomic<u64> verified{}, mismatches{}, window_ns{}, skipped{};
+    std::atomic<u64> verified{}, mismatches{}, own{}, window_ns{}, skipped{};
     std::atomic<u64> flushes{}, unwritten{};
 };
 SignalReplayVerify g_signal_replay_verify;
@@ -514,11 +552,164 @@ void GpuFrameTimerMark(Scheduler& scheduler, const Instance&) {
     if (GpuTimingWanted())
         scheduler.RecordFrameMark();
 }
+float LastGpuFrameMs(unsigned* frames) {
+    if (frames != nullptr) {
+        *frames = g_gpu_frames.load(std::memory_order_acquire);
+    }
+    return g_last_gpu_ms.load(std::memory_order_relaxed);
+}
+// FAST_CPU_STAGEB_SPLIT (vk_scheduler.h OpenResolveBlob), read once at start-up: '1' the blob
+// and the split halves on stage B alone, '2' also the encode half on fast:StageB2.
+static const char g_stageb_split_mode = [] {
+    const char* value = std::getenv("FAST_CPU_STAGEB_SPLIT");
+    return value && (value[0] == '1' || value[0] == '2') ? value[0] : '0';
+}();
+static const bool g_stageb_split = g_stageb_split_mode != '0';
+bool StageBSplitThreadRequested() {
+    return g_stageb_split_mode == '2';
+}
+
+vk::CommandBuffer Scheduler::FlushBlob(void* context, std::string_view reason,
+                                       std::source_location site, u32 mode) {
+    auto& self = *static_cast<Scheduler*>(context);
+    self.SplitSync("blob_flush");
+    self.recorder.AppendBlob(*self.blob);
+    if (mode == 2)
+        return self.recorder.Raw(reason, site);
+    if (mode == 1)
+        self.recorder.Drain(reason, site);
+    return {};
+}
+
+void Scheduler::StartSplitThread(SplitEncode encode, void* context) {
+    if (!blob_recorder || split_threaded)
+        return;
+    for (auto& job : split_jobs)
+        job.blob = std::make_unique<CommandRecorder>(current_cmdbuf, CommandRecorder::Blob{}, this,
+                                                     FlushBlob);
+    split_encode = encode;
+    split_context = context;
+    split_threaded = true;
+    split_thread = std::jthread([this](std::stop_token stop) {
+        t_on_stageb2 = true;
+        FastRender::g_on_stage_b = true; // the recording checks treat it as stage B
+        Common::SetCurrentThreadName("fast:StageB2");
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+        Common::PreferPerformanceCores();
+        u64 tail = 0;
+        while (!stop.stop_requested()) {
+            u64 head = split_head.load(std::memory_order_acquire);
+            // Jobs come every few microseconds in a pass: spin a little before sleeping.
+            for (u32 spin = 0; head == tail && spin < 4096; ++spin) {
+                SplitPause();
+                head = split_head.load(std::memory_order_acquire);
+            }
+            if (head == tail) {
+                std::unique_lock lock{split_mutex};
+                split_b2_sleeping.store(true, std::memory_order_seq_cst);
+                while ((head = split_head.load(std::memory_order_seq_cst)) == tail &&
+                       !stop.stop_requested()) {
+                    split_b2_cv.wait_for(lock, std::chrono::milliseconds(2));
+                }
+                split_b2_sleeping.store(false, std::memory_order_relaxed);
+                if (head == tail)
+                    continue;
+            }
+            for (; tail != head; ++tail) {
+                const u32 slot = u32(tail % SplitSlots);
+                auto& job = split_jobs[slot];
+                const u64 controls = job.blob->BlobEmpty() ? 0 : recorder.AppendBlob(*job.blob);
+                if (job.draw)
+                    split_encode(split_context, slot);
+                // Guest signals reach the replay as soon as they would on one thread. Before the
+                // tail moves: from then on the ring may be B1's.
+                if (controls)
+                    recorder.Publish();
+                split_tail.store(tail + 1, std::memory_order_seq_cst);
+                if (split_b1_waiting.load(std::memory_order_seq_cst)) {
+                    std::scoped_lock lock{split_mutex};
+                    split_b1_cv.notify_all();
+                }
+            }
+        }
+    });
+    LOG_INFO(Render_Vulkan,
+             "FAST_CPU_STAGEB_SPLIT=2: the draws' encode half on fast:StageB2 ({} job slots)",
+             SplitSlots);
+}
+
+void Scheduler::SplitAcquire() {
+    const u64 head = split_head.load(std::memory_order_relaxed);
+    if (head - split_tail.load(std::memory_order_acquire) >= SplitSlots) {
+        FastRender::BProfile::Scope b_wait{FastRender::BProfile::SplitWait};
+        // Every slot queued: B1 waits for the oldest.
+        const u64 want = head - SplitSlots + 1;
+        for (u32 spin = 0; split_tail.load(std::memory_order_acquire) < want && spin < 8192;
+             ++spin)
+            SplitPause();
+        if (split_tail.load(std::memory_order_acquire) < want) {
+            std::unique_lock lock{split_mutex};
+            split_b1_waiting.store(true, std::memory_order_seq_cst);
+            while (split_tail.load(std::memory_order_seq_cst) < want)
+                split_b1_cv.wait_for(lock, std::chrono::milliseconds(2));
+            split_b1_waiting.store(false, std::memory_order_relaxed);
+        }
+        ++split_full_waits;
+    }
+    blob = split_jobs[head % SplitSlots].blob.get();
+}
+
+void Scheduler::SplitSubmit(bool draw) {
+    ASSERT(blob_open && split_threaded);
+    blob_open = false;
+    const u64 head = split_head.load(std::memory_order_relaxed);
+    auto& job = split_jobs[head % SplitSlots];
+    if (!draw && job.blob->BlobEmpty())
+        return; // nothing to hand over: the slot stays B1's for the next draw
+    job.draw = draw;
+    ++(draw ? split_jobs_drawn : split_jobs_blob);
+    if constexpr (Common::Log::Enabled) {
+        if (draw && (split_jobs_drawn & 0x7FFFF) == 0)
+            SplitReport(); // every ~524k draws: a few seconds
+    }
+    split_head.store(head + 1, std::memory_order_seq_cst);
+    if (split_b2_sleeping.load(std::memory_order_seq_cst)) {
+        std::scoped_lock lock{split_mutex};
+        split_b2_cv.notify_one();
+    }
+}
+
+void Scheduler::SplitWait(std::string_view reason) {
+    FastRender::BProfile::Scope b_wait{FastRender::BProfile::SplitWait};
+    const u64 want = split_head.load(std::memory_order_relaxed);
+    for (u32 spin = 0; split_tail.load(std::memory_order_acquire) != want && spin < 16384; ++spin)
+        SplitPause();
+    if (split_tail.load(std::memory_order_acquire) != want) {
+        std::unique_lock lock{split_mutex};
+        split_b1_waiting.store(true, std::memory_order_seq_cst);
+        while (split_tail.load(std::memory_order_seq_cst) != want)
+            split_b1_cv.wait_for(lock, std::chrono::milliseconds(2));
+        split_b1_waiting.store(false, std::memory_order_relaxed);
+    }
+    ++split_waits;
+    if constexpr (Common::Log::Enabled) {
+        ++split_reasons[reason];
+    }
+}
+
+void Scheduler::SplitReport() {
+    std::string text;
+    for (const auto& [name, count] : split_reasons)
+        text += fmt::format(" {}={}", name, count);
+    LOG_INFO(Render_Vulkan, "FAST_CPU_STAGEB_SPLIT=2: draws {} blob jobs {} full waits {} syncs {}:{}",
+             split_jobs_drawn, split_jobs_blob, split_full_waits, split_waits, text);
+}
+
 void Scheduler::RecordFrameMark() {
-    if (recorder.Threaded())
-        recorder.QueueControl(FrameMarker, nullptr, 0);
+    if (Main().Threaded())
+        Main().QueueControl(FrameMarker, nullptr, 0);
     else {
-        recorder.Drain("frame_marker");
+        Main().Drain("frame_marker");
         GpuFrameTimerMarkNow(*this, instance);
     }
 }
@@ -557,6 +748,12 @@ void Scheduler::ReplayRecorderControl(void* context, u32 kind, const std::byte* 
         packet.task(packet.context, packet.argument);
         break;
     }
+    case Checkpoint: {
+        u64 id;
+        std::memcpy(&id, payload, sizeof(id));
+        self.current_cmdbuf.setCheckpointNV(reinterpret_cast<const void*>(static_cast<uintptr_t>(id)));
+        break;
+    }
     default:
         UNREACHABLE();
     }
@@ -565,19 +762,31 @@ void Scheduler::CompleteGuestSignals() {
     // These writes become guest-visible only AFTER vkQueueSubmit of all preceding
     // work. Several internal fences can share that submission; their writes/IRQs
     // remain ordered. No render-thread pointer/callback is retained.
-    for (const auto& p : deferred_signals) {
-        if (g_signal_at_replay_verify) [[unlikely]]
-            CheckSignalReplayed(p);
-        WriteGuestSignal(p);
+    for (size_t i = 0; i < deferred_signals.size(); ++i) {
+        const auto& p = deferred_signals[i];
+        if (g_signal_at_replay_verify) [[unlikely]] {
+            // The latest earlier signal of this submission to the same bytes, written just now.
+            std::optional<u64> own;
+            for (size_t j = i; j-- > 0;) {
+                const auto& q = deferred_signals[j];
+                if (q.bytes && q.address == p.address && q.bytes == p.bytes) {
+                    own = q.written;
+                    break;
+                }
+            }
+            CheckSignalReplayed(p, own);
+        }
+        deferred_signals[i].written = WriteGuestSignal(p);
     }
     deferred_signals.clear();
 }
-void Scheduler::WriteGuestSignal(const DeferredGuestSignal& p) {
+u64 Scheduler::WriteGuestSignal(const DeferredGuestSignal& p) {
+    u64 value = 0;
     if (p.bytes) {
         void* address = reinterpret_cast<void*>(p.address);
-        const u64 value = p.source == GuestSignalValue::GpuClock      ? AmdGpu::GetGpuClock64()
-                          : p.source == GuestSignalValue::PerfCounter ? AmdGpu::GetGpuPerfCounter()
-                                                                      : p.value;
+        value = p.source == GuestSignalValue::GpuClock      ? AmdGpu::GetGpuClock64()
+                : p.source == GuestSignalValue::PerfCounter ? AmdGpu::GetGpuPerfCounter()
+                                                            : p.value;
         FlipOrderTrace::Write("deferred_begin", p.address, value, p.bytes, p.sequence);
         if (!Core::Memory::Instance()->TryWriteBacking(address, &value, p.bytes))
             std::memcpy(address, &value, p.bytes);
@@ -586,6 +795,7 @@ void Scheduler::WriteGuestSignal(const DeferredGuestSignal& p) {
     if (p.interrupt != ~u32{0})
         Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(p.interrupt));
     signals_completed.store(p.sequence, std::memory_order_release);
+    return value;
 }
 // FAST_CPU_SIGNAL_AT_REPLAY_VERIFY, when the replay reaches the GuestSignal packet: the target's
 // bytes now are what the switch's write would replace here.
@@ -604,7 +814,7 @@ void Scheduler::NoteSignalReplayed(DeferredGuestSignal& p) {
 // switch's earlier write would have come before it and been overwritten, where the deferred one
 // comes after it: the final bytes would differ. A guest read in between (the label seen sooner) is
 // the switch's intended change and cannot be seen from here.
-void Scheduler::CheckSignalReplayed(const DeferredGuestSignal& p) {
+void Scheduler::CheckSignalReplayed(const DeferredGuestSignal& p, std::optional<u64> own) {
     auto& v = g_signal_replay_verify;
     if (!p.replayed) {
         v.skipped.fetch_add(1, std::memory_order_relaxed); // an interrupt alone
@@ -616,7 +826,11 @@ void Scheduler::CheckSignalReplayed(const DeferredGuestSignal& p) {
     const u64 window = NowNs() - p.replayed_ns;
     v.window_ns.fetch_add(window, std::memory_order_relaxed);
     const u64 verified = v.verified.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (now_bytes != p.replayed_bytes) {
+    const u64 mask = p.bytes == 8 ? ~u64{0} : (u64{1} << (8 * p.bytes)) - 1;
+    if (now_bytes != p.replayed_bytes && own && now_bytes == (*own & mask)) {
+        // An earlier signal of this submission wrote them; at replay it comes first as well.
+        v.own.fetch_add(1, std::memory_order_relaxed);
+    } else if (now_bytes != p.replayed_bytes) {
         const u64 mismatches = v.mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
         if (mismatches <= 32 || (mismatches & 1023) == 0)
             LOG_ERROR(Render_Vulkan,
@@ -629,11 +843,11 @@ void Scheduler::CheckSignalReplayed(const DeferredGuestSignal& p) {
     }
     if ((verified & 4095) == 0)
         LOG_INFO(Render_Vulkan,
-                 "FAST_CPU_SIGNAL_AT_REPLAY verify: signals={} mismatches={} interrupt_only={} "
-                 "earlier_by_us_avg={:.1f}; guest-write orderings={} of which the switch would "
+                 "FAST_CPU_SIGNAL_AT_REPLAY verify: signals={} mismatches={} same_stream={} "
+                 "interrupt_only={} earlier_by_us_avg={:.1f}; guest-write orderings={} of which the switch would "
                  "still wait for {} (the others neither submit nor wait)",
                  verified, v.mismatches.load(std::memory_order_relaxed),
-                 v.skipped.load(std::memory_order_relaxed),
+                 v.own.load(std::memory_order_relaxed), v.skipped.load(std::memory_order_relaxed),
                  double(v.window_ns.load(std::memory_order_relaxed)) / 1000.0 / double(verified),
                  v.flushes.load(std::memory_order_relaxed),
                  v.unwritten.load(std::memory_order_relaxed));
@@ -668,7 +882,7 @@ void Scheduler::QueueReplayTask(void (*task)(void* context, u64 argument), void*
                                 u64 argument) {
     const ReplayTaskPacket packet{task, context, argument};
     // Its replay records nothing: FAST_CPU_PUSH_SPLIT keeps the held push constants across it.
-    recorder.QueueControl(ReplayTask, &packet, sizeof(packet), true, false);
+    Main().QueueControl(ReplayTask, &packet, sizeof(packet), true, false);
 }
 void Scheduler::SignalGuest(u64 address, u64 value, u32 bytes, u32 interrupt,
                             GuestSignalValue source) {
@@ -701,12 +915,12 @@ void Scheduler::SignalGuest(u64 address, u64 value, u32 bytes, u32 interrupt,
     // buffer, so FAST_CPU_PUSH_SPLIT keeps the held push constants across it.
     // FAST_CPU_SIGNAL_AT_REPLAY: published at once, so the replay writes it as soon as it gets
     // there and a later guest write on the producer rarely finds it unwritten.
-    recorder.QueueControl(GuestSignal, &signal, sizeof(signal), g_signal_at_replay, false);
+    Main().QueueControl(GuestSignal, &signal, sizeof(signal), g_signal_at_replay, false);
     // Bound the separate deferred-signal queue even for a command stream with no draws.
     if (signals_encoded - signals_completed.load(std::memory_order_acquire) >= 2048) {
         if (!g_signal_at_replay) // written at replay: the drain alone writes them
             Flush();
-        recorder.Drain("signal_capacity");
+        Main().Drain("signal_capacity");
     }
 }
 void Scheduler::FlushGuestSignals(std::string_view reason) {
@@ -729,35 +943,38 @@ void Scheduler::FlushGuestSignals(std::string_view reason) {
     // replay writes them before the drain returns.
     if (SignalsNeedFlush() || g_signal_mode == SignalPolicy::Mode::Old) {
         if (g_task_publish)
-            recorder.Publish(); // FAST_CPU_TASK_PUBLISH: replay while the submission is encoded
+            Main().Publish(); // FAST_CPU_TASK_PUBLISH: replay while the submission is encoded
         Flush();
     }
-    recorder.Drain(reason);
+    Main().Drain(reason);
 }
 // FAST_CPU_SIGNAL_AT_REPLAY: the replay writes each signal when it reaches its packet, so a guest
 // write that must follow them waits for that and nothing else: no submission, and not for the
 // commands encoded after the newest signal.
 void Scheduler::WaitGuestSignals(std::string_view reason) {
     if (!recorder.Threaded()) {
-        recorder.Drain(reason); // inline replay writes them
+        Main().Drain(reason); // inline replay writes them
         return;
     }
     const u64 target = signals_encoded;
-    recorder.Publish(); // already published by SignalGuest; cheap when nothing is new
+    Main().Publish(); // already published by SignalGuest; cheap when nothing is new
     ++at_replay_flushes;
     bool written = false;
-    for (u32 pause = 0; pause < SignalSpinPauses; ++pause) {
+    const auto until = std::chrono::steady_clock::now() + SignalSpin;
+    for (u32 pause = 1;; ++pause) {
         if (signals_completed.load(std::memory_order_acquire) >= target) {
             written = true;
             break;
         }
         _mm_pause();
+        if ((pause & 63) == 0 && std::chrono::steady_clock::now() >= until)
+            break;
     }
     if (written) {
         ++at_replay_spun;
     } else {
         ++at_replay_drained;
-        recorder.Drain(reason);
+        Main().Drain(reason);
     }
     if ((at_replay_flushes & 2047) == 0)
         LOG_INFO(Render_Vulkan,
@@ -1075,10 +1292,20 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recorder)
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
     unused_attachments = instance.IsDynamicRenderingUnusedAttachmentsSupported();
+    crash_source = static_cast<u8>(allow_recorder ? GpuCrash::Source::Game
+                                                  : GpuCrash::Source::Presenter);
+    if (allow_recorder) {
+        GpuCrash::WatchTimeline(master_semaphore.Handle()); // the game's ticks, for the reports
+    }
     if (allow_recorder && PassBreaks::StatsEnabled()) {
         pass_stats = std::make_unique<PassBreakStats>();
     }
     recorder.SetControlHandler(this, ReplayRecorderControl);
+    if (allow_recorder && g_stageb_split) {
+        blob_recorder = std::make_unique<CommandRecorder>(current_cmdbuf, CommandRecorder::Blob{},
+                                                          this, FlushBlob);
+        blob = blob_recorder.get();
+    }
     AllocateWorkerCommandBuffers(master_semaphore.CurrentTick());
     ResetProducerState();
     priority_pending_ops_thread =
@@ -1086,6 +1313,14 @@ Scheduler::Scheduler(const Instance& instance, bool allow_recorder)
 }
 
 Scheduler::~Scheduler() {
+    if (split_thread.joinable()) {
+        split_thread.request_stop();
+        {
+            std::scoped_lock lock{split_mutex};
+            split_b2_cv.notify_all();
+        }
+        split_thread.join();
+    }
     recorder.Stop();
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
@@ -1108,29 +1343,55 @@ bool Scheduler::GpuCategoryBegin(u64 key) {
     auto& t = gpu_timer;
     if (pass_target.load(std::memory_order_acquire) != this)
         return false;
-    recorder.Raw("gpu_pass_profile", std::source_location::current());
+    Main().Raw("gpu_pass_profile", std::source_location::current());
     if (t.open < 0 || t.pass_open || is_rendering)
         return false;
     GpuRecBegin(current_cmdbuf, {key, 0, 0, 0, 254, 0, 0});
     return true;
 }
 
+void Scheduler::GpuCheckpoint(u8 kind, u64 a, u32 x, u32 y, u32 extra) {
+    const u64 id = GpuCrash::Mark(static_cast<GpuCrash::Kind>(kind), CurrentTick(), a, x, y, extra,
+                                  static_cast<GpuCrash::Source>(crash_source));
+    if (id == 0) {
+        return;
+    }
+    // The recorder Commands() would give (so the marker keeps its place among the commands).
+    CommandRecorder* rec = &recorder;
+    if (split_threaded && t_on_stageb2) {
+        rec = &recorder;
+    } else if (blob_open) {
+        rec = blob;
+    } else {
+        SplitSync("gpu_checkpoint");
+    }
+    if (rec->IsBlob() || rec->Enabled()) {
+        // Its replay records only the checkpoint: held push constants stay held.
+        rec->QueueControl(Checkpoint, &id, sizeof(id), false, false);
+    } else {
+        rec->Direct().setCheckpointNV(reinterpret_cast<const void*>(static_cast<uintptr_t>(id)));
+    }
+}
+
 void Scheduler::GpuWorkBegin(u64 key, u32 x, u32 y) {
+    if (GpuCrash::CheckpointsOn()) [[unlikely]] {
+        GpuCheckpoint(static_cast<u8>(GpuCrash::Kind::Work), key, x, y);
+    }
     auto& t = gpu_timer;
     if (pass_target.load(std::memory_order_acquire) != this)
         return;
-    recorder.Raw("gpu_pass_profile", std::source_location::current());
+    Main().Raw("gpu_pass_profile", std::source_location::current());
     if (t.open < 0 || t.pass_open || is_rendering) {
         return;
     }
-    recorder.Drain("gpu_pass_profile");
+    Main().Drain("gpu_pass_profile");
     GpuRecBegin(current_cmdbuf, {key, 0, static_cast<u16>(std::min<u32>(x, 65535)),
                                  static_cast<u16>(std::min<u32>(y, 65535)), 255, 0, 0});
 }
 
 void Scheduler::GpuWorkEnd() {
     if (pass_target.load(std::memory_order_acquire) == this) {
-        recorder.Raw("gpu_pass_profile", std::source_location::current());
+        Main().Raw("gpu_pass_profile", std::source_location::current());
         GpuPassEnd(this, current_cmdbuf);
     }
 }
@@ -1248,6 +1509,216 @@ void Scheduler::ReportPassContinue() {
              PassBreaks::g_barriers.broadened.load(std::memory_order_relaxed));
 }
 
+namespace {
+// VR_FOVEATION_STEPS="<mode>@<s>,..." (tests only): vr.ini foveation set to <mode> <s> seconds
+// after the first foveated pass, as the VR page sets it ("0@0,1@20,3@40": off, on, light).
+void FoveationSteps() {
+    struct Step {
+        int mode;
+        double at_s;
+    };
+    static const std::vector<Step> steps = [] {
+        std::vector<Step> out;
+        const char* p = std::getenv("VR_FOVEATION_STEPS");
+        while (p != nullptr && *p != 0) {
+            char* end{};
+            const long mode = std::strtol(p, &end, 10);
+            if (end == p || *end != '@')
+                break;
+            const char* at = end + 1;
+            const double s = std::strtod(at, &end);
+            if (end == at)
+                break;
+            out.push_back({int(mode), s});
+            p = *end == ',' ? end + 1 : end;
+        }
+        return out;
+    }();
+    if (steps.empty())
+        return;
+    static const auto start = std::chrono::steady_clock::now();
+    static size_t next = 0;
+    const double now_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    for (; next < steps.size() && now_s >= steps[next].at_s; ++next) {
+        VR::Graphics::foveation.store(steps[next].mode, std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan, "VR foveation: VR_FOVEATION_STEPS set foveation={} at {:.1f} s",
+                 steps[next].mode, now_s);
+    }
+}
+
+// The zones of the next eye-sized pass: the live vr.ini foveation (the VR page sets it), or the
+// run's VR_FOVEATED. Off: no attachment, full rate.
+Foveation::Settings FoveationNow(const Instance& instance) {
+    if (instance.IsFoveationFixed())
+        return instance.GetFoveationSettings();
+    static const bool stepped = std::getenv("VR_FOVEATION_STEPS") != nullptr;
+    if (stepped)
+        FoveationSteps();
+    return Foveation::Choose(nullptr, VR::Graphics::foveation.load(std::memory_order_relaxed));
+}
+
+// Fixed foveated rendering (vr_foveation.h): one rate map per eye-sized pass extent and level,
+// built on the recording thread from each eye's optical axis (the image centre until the
+// headset's angles are known, then built again once). A few KB each, kept for the process: a
+// level chosen again on the VR page finds its map. `mono`: DIBR's one view, a single layer
+// centred on the image (the mono camera's axis; both eyes are warped from it).
+struct FoveationMap {
+    u32 width{}, height{};
+    bool mono{};
+    Foveation::Settings zones{};
+    bool from_fov{};
+    vk::ImageView view{};
+};
+vk::ImageView FoveationView(const Instance& instance, CommandRecorder& recorder, u32 width,
+                            u32 height, bool mono, const Foveation::Settings& zones) {
+    static std::vector<FoveationMap> maps;
+    FoveationMap* existing = nullptr;
+    for (auto& m : maps) {
+        if (m.width == width && m.height == height && m.mono == mono &&
+            m.zones.inner == zones.inner && m.zones.outer == zones.outer &&
+            m.zones.ring == zones.ring) {
+            existing = &m;
+            break;
+        }
+    }
+    // The usual case, every eye-sized pass: the map is final. No head read (GetHead locks the
+    // head state the OpenXR thread writes; read per pass, it cost the recording thread ~1 ms a
+    // frame).
+    if (existing && existing->from_fov) {
+        return existing->view;
+    }
+    const auto head = VR::GetHead();
+    const bool fov =
+        mono || (VR::EyeFov::Valid(head.eye_fov[0]) && VR::EyeFov::Valid(head.eye_fov[1]));
+    if (existing && !fov) {
+        return existing->view;
+    }
+    if (!existing && maps.size() >= 24) {
+        return {};
+    }
+    const auto texel = instance.GetFoveationTexel();
+    const u32 layers = !mono && instance.IsFoveationLayered() ? 2 : 1;
+    const u32 nx = (width + texel.width - 1) / texel.width;
+    const u32 ny = (height + texel.height - 1) / texel.height;
+    std::array<float, 2> cx{0.5f, 0.5f}, cy{0.5f, 0.5f};
+    if (fov && !mono)
+        EyeAxes(head, cx, cy); // the lens centres (vr_eye_axes.h)
+    if (layers == 1 && !mono) { // one map for both eyes: between the two axes
+        cx[0] = 0.5f * (cx[0] + cx[1]);
+        cy[0] = 0.5f * (cy[0] + cy[1]);
+    }
+    std::vector<u8> bytes;
+    for (u32 layer = 0; layer < layers; ++layer) {
+        const auto map = Foveation::Map(width, height, texel.width, texel.height, cx[layer],
+                                        cy[layer], zones, instance.HasFoveation4x4());
+        bytes.insert(bytes.end(), map.begin(), map.end());
+    }
+    const VmaAllocator allocator = instance.GetAllocator();
+    const vk::ImageCreateInfo image_ci{
+        .imageType = vk::ImageType::e2D,
+        .format = vk::Format::eR8Uint,
+        .extent = {nx, ny, 1},
+        .mipLevels = 1,
+        .arrayLayers = layers,
+        .samples = vk::SampleCountFlagBits::e1,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = vk::ImageUsageFlagBits::eFragmentShadingRateAttachmentKHR |
+                 vk::ImageUsageFlagBits::eTransferDst,
+    };
+    const VmaAllocationCreateInfo image_alloc{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VkImage image{};
+    VmaAllocation image_allocation{};
+    if (vmaCreateImage(allocator, reinterpret_cast<const VkImageCreateInfo*>(&image_ci),
+                       &image_alloc, &image, &image_allocation, nullptr) != VK_SUCCESS) {
+        return existing ? existing->view : vk::ImageView{};
+    }
+    const VkBufferCreateInfo buffer_ci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                       .size = bytes.size(),
+                                       .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
+    const VmaAllocationCreateInfo buffer_alloc{
+        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                 VMA_ALLOCATION_CREATE_MAPPED_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO};
+    VkBuffer buffer{};
+    VmaAllocation buffer_allocation{};
+    VmaAllocationInfo buffer_info{};
+    if (vmaCreateBuffer(allocator, &buffer_ci, &buffer_alloc, &buffer, &buffer_allocation,
+                        &buffer_info) != VK_SUCCESS) {
+        return existing ? existing->view : vk::ImageView{};
+    }
+    std::memcpy(buffer_info.pMappedData, bytes.data(), bytes.size());
+    vmaFlushAllocation(allocator, buffer_allocation, 0, VK_WHOLE_SIZE);
+    auto [view_result, view] = instance.GetDevice().createImageView({
+        .image = image,
+        .viewType = vk::ImageViewType::e2DArray,
+        .format = vk::Format::eR8Uint,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, layers},
+    });
+    if (view_result != vk::Result::eSuccess) {
+        return existing ? existing->view : vk::ImageView{};
+    }
+    const vk::CommandBuffer cmd = recorder.Raw("foveation_map", std::source_location::current());
+    vk::ImageMemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eNone,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eTransferDstOptimal,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, layers},
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                            .pImageMemoryBarriers = &barrier});
+    std::array<vk::BufferImageCopy, 2> regions{};
+    for (u32 layer = 0; layer < layers; ++layer) {
+        regions[layer] = vk::BufferImageCopy{
+            .bufferOffset = vk::DeviceSize(layer) * nx * ny,
+            .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, layer, 1},
+            .imageExtent = {nx, ny, 1},
+        };
+    }
+    cmd.copyBufferToImage(buffer, image, vk::ImageLayout::eTransferDstOptimal, layers,
+                          regions.data());
+    barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+    barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+    barrier.dstStageMask = vk::PipelineStageFlagBits2::eFragmentShadingRateAttachmentKHR;
+    barrier.dstAccessMask = vk::AccessFlagBits2::eFragmentShadingRateAttachmentReadKHR;
+    barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+    barrier.newLayout = vk::ImageLayout::eFragmentShadingRateAttachmentOptimalKHR;
+    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                            .pImageMemoryBarriers = &barrier});
+    LOG_INFO(Render_Vulkan,
+             "VR foveation: rate map {}x{} ({} layer(s)) for {}x{} {}passes, inner {:.2f}, outer "
+             "{:.2f}, axes L ({:.3f}, {:.3f}) R ({:.3f}, {:.3f}){}",
+             nx, ny, layers, width, height, mono ? "DIBR (mono) " : "", zones.inner, zones.outer,
+             cx[0], cy[0], cx[1], cy[1],
+             fov ? "" : " (image centre until the headset's angles are known)");
+    if (existing) {
+        existing->view = view; // the old map stays alive: earlier passes may still use it
+        existing->from_fov = fov;
+        return view;
+    }
+    maps.push_back({width, height, mono, zones, fov, view});
+    return view;
+}
+
+// VR_FOVEATED_DIBR ('0' off, on by default; read once): foveation for DIBR's mono scene passes
+// too (SetMonoFoveation), with the same card checks and per-pipeline gating as native stereo.
+const bool g_foveated_dibr = [] {
+    const char* value = std::getenv("VR_FOVEATED_DIBR");
+    return !(value && value[0] == '0');
+}();
+} // namespace
+
+void Scheduler::SetMonoFoveation(vk::Extent2D extent) {
+    if (g_foveated_dibr) {
+        mono_foveation = extent;
+    }
+}
+
 void Scheduler::BeginRendering(const RenderState& new_state) {
     FastRender::BProfile::Scope b_profile{FastRender::BProfile::BeginRendering};
     if (is_rendering && render_state == new_state) {
@@ -1320,25 +1791,78 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
                                          vk::ClearDepthStencilValue{.stencil = db.clear_value[1]}},
     };
 
-    const vk::RenderingInfo rendering_info = {
+    // Layer draws (NativeStereo::LayerDraws): a both-eye pass renders the two layers of its
+    // attachments' array views without multiview; each draw is recorded once per eye.
+    const bool layer_draws = render_state.probe_view_mask == 3 && NativeStereo::LayerDraws();
+    vk::RenderingInfo rendering_info = {
         .renderArea =
             {
                 .offset = {0, 0},
                 .extent = {render_state.width, render_state.height},
             },
-        .layerCount = render_state.num_layers,
-        .viewMask = render_state.probe_view_mask,
+        .layerCount = layer_draws ? 2u : render_state.num_layers,
+        .viewMask = layer_draws ? 0u : render_state.probe_view_mask,
         .colorAttachmentCount = render_state.num_color_attachments,
         .pColorAttachments = color_attachments.data(),
         .pDepthAttachment = db.has_depth ? &depth_attachment : nullptr,
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
+    // Fixed foveated rendering (vr_foveation.h): the game's eye-sized passes that draw both eyes,
+    // or under DIBR the single-view passes of its scene's size (SetMonoFoveation). VR host draws
+    // record their own passes and never get here with both views. Only while the world is around
+    // the player: the title, menus and cinematics on the virtual screen are seen flat, so the left
+    // eye's coarse outer corner showed as their bottom-left corner (2026-10-23).
+    vk::RenderingFragmentShadingRateAttachmentInfoKHR foveation{};
+    pass_foveated = false;
+    const bool mono_pass = render_state.probe_view_mask == 0 && render_state.num_layers <= 1 &&
+                           mono_foveation.width != 0 &&
+                           render_state.width == mono_foveation.width &&
+                           render_state.height == mono_foveation.height;
+    // SetFoveationEye: once the eye's size is known, a both-eye pass of any other size (a shadow
+    // atlas) is drawn at full rate.
+    const auto eye_sized = [&](u32 w, u32 h) {
+        const auto& e = foveation_eye;
+        return e.width == 0 || (w == e.width && h == e.height) ||
+               (w == (e.width + 1) / 2 && h == (e.height + 1) / 2);
+    };
+    const bool stereo_pass = render_state.probe_view_mask == 3 &&
+                             eye_sized(render_state.width, render_state.height);
+    if (instance.IsFoveationEnabled() && !foveation_blocked && (stereo_pass || mono_pass) &&
+        render_state.width >= 256 && render_state.height >= 256 && VR::IsImmersive()) {
+        auto zones = FoveationNow(instance);
+        // (The pass about to begin asked for a wider full-rate zone: the lamp shadows' mask,
+        // light_shadow.h MaskFoveaInner. Its own map, kept like the others.)
+        if (zones.on && foveation_inner_floor > zones.inner) {
+            zones.inner = foveation_inner_floor;
+            zones.outer = std::max(zones.outer, zones.inner);
+        }
+        if (const vk::ImageView view =
+                zones.on ? FoveationView(instance, blob_open ? *blob : Main(), render_state.width,
+                                         render_state.height, render_state.probe_view_mask != 3,
+                                         zones)
+                         : vk::ImageView{}) {
+            foveation = vk::RenderingFragmentShadingRateAttachmentInfoKHR{
+                .imageView = view,
+                .imageLayout = vk::ImageLayout::eFragmentShadingRateAttachmentOptimalKHR,
+                .shadingRateAttachmentTexelSize = instance.GetFoveationTexel(),
+            };
+            rendering_info.pNext = &foveation;
+            pass_foveated = true;
+        }
+    }
     if (pass_target.load(std::memory_order_acquire) == this) {
-        recorder.Raw("gpu_pass_profile", std::source_location::current());
+        Main().Raw("gpu_pass_profile", std::source_location::current());
         GpuPassBegin(this, current_cmdbuf, render_state);
     }
     Commands().beginRendering(rendering_info);
+    if (GpuCrash::CheckpointsOn()) [[unlikely]] {
+        GpuCheckpoint(static_cast<u8>(GpuCrash::Kind::RenderPass),
+                      (render_state.probe_view_mask & 0xff) |
+                          (render_state.depth_stencil_attachment.image_view ? 0x100u : 0u),
+                      render_state.width, render_state.height,
+                      render_state.num_layers | (u32{render_state.num_color_attachments} << 16));
+    }
 }
 
 void Scheduler::EndRendering(std::source_location site) {
@@ -1363,6 +1887,13 @@ void Scheduler::NoteBarrierBreak(bool read_after_read) {
     }
 }
 
+void Scheduler::BlockFoveation(bool blocked) {
+    foveation_blocked = blocked;
+    if (blocked && is_rendering && pass_foveated) {
+        EndRendering();
+    }
+}
+
 void Scheduler::EndRenderingNow() {
     if (!is_rendering) {
         return;
@@ -1372,9 +1903,12 @@ void Scheduler::EndRenderingNow() {
     is_rendering = false;
     Commands().endRendering();
     if (pass_target.load(std::memory_order_acquire) == this) {
-        recorder.Raw("gpu_pass_profile", std::source_location::current());
+        Main().Raw("gpu_pass_profile", std::source_location::current());
         GpuPassEnd(this, current_cmdbuf);
     } // VR_GPU_PASSES only
+    if (pass_end_hook) [[unlikely]] {
+        pass_end_hook(*this); // the copy sink's waiting copies
+    }
 }
 
 void Scheduler::Flush(SubmitInfo& info) {
@@ -1412,6 +1946,7 @@ u64 SkipEmptyFinishVerifyEvery() {
 } // namespace
 
 Scheduler::EmptyCheck Scheduler::CheckEmpty() const {
+    const_cast<Scheduler*>(this)->SplitSync("empty_check"); // B2's packets counted
     if (recorder.RawBorrows() != empty_mark.raws)
         return EmptyCheck::Raw;
     if (!recorder.Enabled())
@@ -1510,7 +2045,7 @@ void Scheduler::Finish() {
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
-    recorder.Drain("finish");
+    Main().Drain("finish");
     Wait(presubmit_tick);
 }
 
@@ -1538,11 +2073,23 @@ void Scheduler::Wait(u64 tick) {
         SubmitInfo info{};
         Flush(info);
     }
-    recorder.Drain("tick_wait");
+    Main().Drain("tick_wait");
     master_semaphore.Wait(tick);
 }
 
-void Scheduler::PopPendingOperations(bool force_poll) {
+// FAST_PENDING_OPS_BUDGET_US (default 1000, 0 = no limit; read once at start-up): how long one
+// call runs the finished deferred operations before leaving the rest to the next call (the next
+// draw, dispatch or submission, microseconds later). A texture GC that evicted 237 images had
+// them all freed in one call, each a dedicated allocation's vkFreeMemory of ~1 ms, inside a
+// submission: the recorder stopped for 238 ms with stage B and the GPU thread waiting behind it
+// (2026-10-24). The operations only free what the GPU has finished with, so a later turn costs
+// nothing but memory held a frame longer.
+static const s64 g_pending_ops_budget_ns = [] {
+    const char* value = std::getenv("FAST_PENDING_OPS_BUDGET_US");
+    return (value ? std::strtoll(value, nullptr, 10) : 1000LL) * 1000LL;
+}();
+
+void Scheduler::PopPendingOperations(bool force_poll, bool all) {
     const bool limit = FastRender::On(FastRender::PendingPollLimit);
     if (limit && !has_pending_ops.load(std::memory_order_acquire)) {
         return;
@@ -1563,10 +2110,17 @@ void Scheduler::PopPendingOperations(bool force_poll) {
         master_semaphore.Refresh();
     }
     LockTrace::Phase phase{"deferred operations"}; // VR_LOCK_TRACE (in a submit's hold)
+    const bool budgeted = !all && g_pending_ops_budget_ns > 0;
+    const auto start = budgeted ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
     while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
         phase.Count(1);
+        if (budgeted && std::chrono::steady_clock::now() - start >=
+                            std::chrono::nanoseconds{g_pending_ops_budget_ns}) {
+            break;
+        }
     }
     // DeferOperation uses this same mutex: an enqueue cannot lose its publication.
     has_pending_ops.store(!pending_ops.empty(), std::memory_order_release);
@@ -1580,6 +2134,12 @@ void Scheduler::AllocateWorkerCommandBuffers(u64 tick) {
     current_cmdbuf = command_pool.Commit(tick);
     Check(current_cmdbuf.begin(begin_info));
     GpuTimerBegin(this, current_cmdbuf); // VR_GPU_TIMING only
+    if (GpuCrash::CheckpointsOn()) [[unlikely]] {
+        if (const u64 id = GpuCrash::Mark(GpuCrash::Kind::CommandsBegin, tick, tick, 0, 0, 0,
+                                          static_cast<GpuCrash::Source>(crash_source))) {
+            current_cmdbuf.setCheckpointNV(reinterpret_cast<const void*>(static_cast<uintptr_t>(id)));
+        }
+    }
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
@@ -1597,8 +2157,73 @@ void Scheduler::ResetProducerState() {
     cmdbuf_begin_time = std::chrono::steady_clock::now();
 }
 
+// VR_SUBMIT_CENSUS=1 (diagnostics, logged builds): where the submissions come from. Each one's
+// return addresses above SubmitExecution, as offsets into the executable, are counted per chain;
+// every 4000 submissions the busiest chains are logged ("VR submit census:"), named afterwards
+// with the build's .map. A GPU-bound frame pays 20-50 us of GPU idle per queue boundary.
+#if defined(_WIN32) && !defined(BBVR_NO_LOGS)
+extern "C" char __ImageBase;
+extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(
+    unsigned long frames_to_skip, unsigned long frames_to_capture, void** back_trace,
+    unsigned long* back_trace_hash);
+namespace {
+bool SubmitCensusOn() {
+    static const bool on = [] {
+        const char* value = std::getenv("VR_SUBMIT_CENSUS");
+        return value && *value == '1';
+    }();
+    return on;
+}
+[[gnu::noinline]] void CountSubmission(const void* scheduler) {
+    constexpr u32 Depth = 10;
+    struct Chain {
+        u64 count{};
+        const void* scheduler{};
+        std::array<u32, Depth> offsets{};
+    };
+    static std::mutex mutex;
+    static std::unordered_map<u64, Chain> chains;
+    static u64 total{};
+    void* frames[Depth]{};
+    const u32 n = RtlCaptureStackBackTrace(1, Depth, frames, nullptr); // from SubmitExecution up
+    const auto base = reinterpret_cast<uintptr_t>(&__ImageBase);
+    std::array<u32, Depth> offsets{};
+    u64 hash = reinterpret_cast<uintptr_t>(scheduler);
+    for (u32 i = 0; i < n; ++i) {
+        const auto address = reinterpret_cast<uintptr_t>(frames[i]);
+        offsets[i] = address >= base && address - base < 0xffffffffu ? u32(address - base) : 0;
+        hash = (hash ^ offsets[i]) * 0x100000001b3ull;
+    }
+    std::scoped_lock lock{mutex};
+    auto& chain = chains[hash];
+    ++chain.count;
+    chain.scheduler = scheduler;
+    chain.offsets = offsets;
+    if (++total % 4000 != 0)
+        return;
+    std::vector<const Chain*> top;
+    for (const auto& [key, c] : chains)
+        top.push_back(&c);
+    std::sort(top.begin(), top.end(), [](auto* a, auto* b) { return a->count > b->count; });
+    top.resize(std::min<size_t>(top.size(), 16));
+    for (const Chain* c : top) {
+        std::string text;
+        for (const u32 offset : c->offsets)
+            text += fmt::format(" {:x}", offset);
+        LOG_INFO(Render_Vulkan, "VR submit census: {} of {} sched={} chain{}", c->count, total,
+                 fmt::ptr(c->scheduler), text);
+    }
+}
+} // namespace
+#endif // _WIN32 && !BBVR_NO_LOGS
+
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     ScratchProfile::Cpu scratch_cpu(14, "Scheduler::SubmitExecution");
+#if defined(_WIN32) && !defined(BBVR_NO_LOGS)
+    if (SubmitCensusOn()) [[unlikely]] {
+        CountSubmission(this);
+    }
+#endif
     if (pre_submit_hook) {
         pre_submit_hook(); // before the submit: the GPU reads what it wrote
     }
@@ -1612,7 +2237,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     u64 expect_commands = NoEmptyCheck;
     if (verify_empty_submit) [[unlikely]] {
         verify_empty_submit = false;
-        expect_commands = recorder.CommandPackets() - buffer_commands;
+        expect_commands = Main().CommandPackets() - buffer_commands;
     }
     // Allocate the logical tick on the producer; resource retirement and stream watches
     // must refer to encoded work even while Vulkan recording is behind it.
@@ -1622,21 +2247,21 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     ++submit_count;
     if (recorder.Threaded()) {
         const RecorderSubmit submit{info, tick, FastRender::FlushHostCopies(), expect_commands};
-        recorder.QueueControl(SubmitCommands, &submit, sizeof(submit));
+        Main().QueueControl(SubmitCommands, &submit, sizeof(submit));
     } else {
-        recorder.Drain("submit");
+        Main().Drain("submit");
         FastRender::WaitHostCopies(FastRender::CopyWait::Submit);
         CheckEmptySubmit(expect_commands);
         SubmitLocked(info, tick);
     }
     ResetProducerState();
-    recorder.Configure();
-    buffer_commands = recorder.CommandPackets(); // FAST bit 56: the new command buffer
+    Main().Configure();
+    buffer_commands = Main().CommandPackets(); // FAST bit 56: the new command buffer
     if (pass_profiler != nullptr) [[unlikely]] {
         pass_profiler->Resume(pass_resume);
     }
     // FAST bit 56: the profiler's resume stamps do not make the command buffer non-empty.
-    empty_mark = {recorder.CommandPackets(), recorder.RawBorrows()};
+    empty_mark = {Main().CommandPackets(), recorder.RawBorrows()};
 
     // Apply pending operations, once the queue lock is released: they free what the GPU has
     // finished with (images, buffers, views, staging memory: 2-4 ms during an area load, which the
@@ -1664,6 +2289,14 @@ void Scheduler::SubmitLocked(SubmitInfo info, u64 signal_value) {
     {
         LockTrace::Phase phase{"end command buffer"};
         GpuTimerEnd(this, current_cmdbuf, signal_value); // VR_GPU_TIMING only
+        if (GpuCrash::CheckpointsOn()) [[unlikely]] {
+            if (const u64 id = GpuCrash::Mark(GpuCrash::Kind::CommandsEnd, signal_value,
+                                              signal_value, 0, 0, 0,
+                                              static_cast<GpuCrash::Source>(crash_source))) {
+                current_cmdbuf.setCheckpointNV(
+                    reinterpret_cast<const void*>(static_cast<uintptr_t>(id)));
+            }
+        }
         Check(current_cmdbuf.end());
         recorder.ResetReplayedCommands(); // FAST bit 56 verify: the census is per command buffer
     }
@@ -1671,11 +2304,25 @@ void Scheduler::SubmitLocked(SubmitInfo info, u64 signal_value) {
     const vk::Semaphore timeline = master_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
-    static constexpr std::array<vk::PipelineStageFlags, 3> wait_stage_masks = {
+    std::array<vk::PipelineStageFlags, 4> wait_stage_masks = {
         vk::PipelineStageFlagBits::eAllCommands,
         vk::PipelineStageFlagBits::eColorAttachmentOutput,
         vk::PipelineStageFlagBits::eAllCommands,
+        vk::PipelineStageFlagBits::eAllCommands,
     };
+    // Sparse buffers: the binds queued so far go out first, and this submit waits for the newest
+    // (one already signalled costs nothing), at every stage whichever slot it takes.
+    u64 sparse_wait = 0; // GpuCrash::NoteSubmit
+    if (sparse_binds) {
+        LockTrace::Phase phase{"sparse binds"};
+        const u64 wait = sparse_binds(instance.GetGraphicsQueue());
+        sparse_wait = wait;
+        if (wait != 0) {
+            ASSERT(info.num_wait_semas < info.wait_semas.size());
+            wait_stage_masks[info.num_wait_semas] = vk::PipelineStageFlagBits::eAllCommands;
+            info.AddWait(sparse_timeline, wait);
+        }
+    }
 
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
         .waitSemaphoreValueCount = info.num_wait_semas,
@@ -1704,6 +2351,13 @@ void Scheduler::SubmitLocked(SubmitInfo info, u64 signal_value) {
         LockTrace::Phase phase{"vkQueueSubmit"};
         submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
     }
+    GpuCrash::NoteSubmit(signal_value, info.num_wait_semas, sparse_wait,
+                         static_cast<GpuCrash::Source>(crash_source));
+    // A lost device: gpu-crash.txt says what the GPU was doing (written before the check ends
+    // the process).
+    if (submit_result == vk::Result::eErrorDeviceLost) [[unlikely]] {
+        GpuCrash::Report(submit_result, fmt::format("the game's submit of tick {}", signal_value));
+    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     {
@@ -1713,6 +2367,46 @@ void Scheduler::SubmitLocked(SubmitInfo info, u64 signal_value) {
     {
         LockTrace::Phase phase{"next command buffer"};
         AllocateWorkerCommandBuffers(signal_value + 1); // replay owns pool/timestamps
+    }
+}
+
+void Scheduler::DrainDeferredOperations() {
+    // Rounds until both queues are empty and every priority operation queued has finished. A
+    // cleanup may queue more: a normal one a priority one with the tick current then (DeleteBuffer
+    // under BackgroundFree). So each round makes every tick recorded so far complete (Finish),
+    // runs every normal operation (their ticks complete now), makes the ticks those queued work
+    // with complete, then waits for the priority operations counted so far.
+    const bool priority_thread = priority_pending_ops_thread.joinable();
+    for (u64 round = 1;; ++round) {
+        Finish();
+        PopPendingOperations(true, true);
+        Finish();
+        const u64 queued = priority_ops_queued.load(std::memory_order_acquire);
+        auto waited_since = std::chrono::steady_clock::now();
+        while (priority_thread && priority_ops_done.load(std::memory_order_acquire) < queued) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (std::chrono::steady_clock::now() - waited_since >= std::chrono::seconds(1)) {
+                // Queued since by another thread with a tick not submitted: submit it.
+                LOG_WARNING(Render_Vulkan, "Teardown: {} priority operations still running",
+                            queued - priority_ops_done.load(std::memory_order_acquire));
+                Flush();
+                waited_since = std::chrono::steady_clock::now();
+            }
+        }
+        bool settled;
+        {
+            std::scoped_lock lk{pending_ops_mutex, priority_pending_ops_mutex};
+            settled = pending_ops.empty() &&
+                      (!priority_thread || priority_ops_done.load(std::memory_order_acquire) ==
+                                               priority_ops_queued.load(std::memory_order_acquire));
+        }
+        if (settled) {
+            return;
+        }
+        if (round % 16 == 0) {
+            LOG_WARNING(Render_Vulkan, "Teardown: deferred operations still queued after {} rounds",
+                        round);
+        }
     }
 }
 
@@ -1739,6 +2433,7 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
         }
 
         op.callback();
+        priority_ops_done.fetch_add(1, std::memory_order_release); // DrainDeferredOperations
     }
 }
 

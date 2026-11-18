@@ -27,8 +27,9 @@
 //    hunter's (c0000) stays as the game plays it;
 //  - what to do on each of the enemy's updates after the kill (wait for its death animation, cut
 //    it, or keep it);
-//  - the chance (melee_ragdoll_vanilla_pct, 22% by default) that a kill which would go limp keeps
-//    the game's own death animation and ragdoll anyway: one roll per kill;
+//  - the chance (melee_ragdoll_vanilla_pct, 18% by default) that a kill which would go limp keeps
+//    the game's own death animation and ragdoll anyway: one roll per kill (never for a charged
+//    attack's kill nor the Stake Driver's blast: those always go limp where the death can);
 //  - the push: the blade's velocity at the hit, as momentum, spread over the ragdoll's bodies by
 //    their real masses (half on the whole body, half on the part struck), clamped, never toward
 //    the hunter (at most 60 deg off "away" from him, 35 deg at arm's length); then for 0.6 s no
@@ -248,9 +249,10 @@ inline const char* StepName(Step s) {
 // this chance instead: its death animation plays to its end and the game's own ragdoll takes over
 // there (event 228), nothing switched, no push. One roll per kill: drawn the first time the kill
 // would go limp and kept for it (a second blow of a multi-hit attack on the same enemy, or another
-// of its updates, never rolls again). 0 = always at once, 100 = never. 22 by default (about one
-// kill in five; 15 from 2026-10-08, 22 since 2026-10-09).
-constexpr std::int32_t DefaultVanillaPct = 22;
+// of its updates, never rolls again). 0 = always at once, 100 = never. 18 by default (about one
+// kill in five or six; 15 from 2026-10-08, 22 from 2026-10-09, 18 since 2026-11-09). A charged
+// attack's kill and the Stake Driver's blast never roll (2026-11-09).
+constexpr std::int32_t DefaultVanillaPct = 18;
 
 // splitmix64: small, fast, good enough for a die (every seed, 0 too, gives a full-period stream).
 // The game side seeds one once at install; the tests seed their own.
@@ -333,13 +335,14 @@ inline float HitSpeed(float game_hit, float game_tip, float presenter_tip) {
 
 // A conservative heavy-weapon bonus, captured at the killing hit. Transform attacks
 // may strike with the previous form, so they deliberately keep ordinary momentum.
+inline constexpr float HeavyMomentumFactor = 1.56f;
 inline float HeavyTwoHandMomentum(int variation, bool form_b, bool two_handed, bool transform) {
     if (!form_b || !two_handed || transform) return 1.0f;
     switch (variation) {
     case 500: // Hunter Axe
     case 800: // Kirkhammer
     case 810: // Ludwig's Holy Blade
-        return 1.5f;
+        return HeavyMomentumFactor;
     default: return 1.0f;
     }
 }
@@ -362,6 +365,7 @@ struct PushConfig {
     float inherit_max{5.0f};
     float cancel_max{5.0f};
     float fallback_lift{0.25f};  // the fallback direction's upward part (hunter -> enemy, a bit up)
+    float lift{0.0f};            // the blade's direction raised by this much (unit vector's y)
     float down_max{0.6f};        // the direction's downward part at most (a chop into the floor)
     float up_max{0.8f};          // ... its upward part at most
     // The direction's horizontal part at most this far off "away from the hunter": a swing across
@@ -374,20 +378,46 @@ struct PushConfig {
     float close_near_m{0.8f};
 };
 
-enum class PushAttack { Normal, HeavyTwoHand, StakeBlast };
+enum class PushAttack { Normal, HeavyTwoHand, Charged, StakeBlast };
 
-// These exceptions raise only the added-velocity caps. Direction, lift, inherited
-// motion limits and the post-push player guard retain the normal rules.
+constexpr const char* PushAttackName(PushAttack a) {
+    return a == PushAttack::HeavyTwoHand ? "a two-handed heavy's"
+           : a == PushAttack::Charged    ? "a charged attack's"
+           : a == PushAttack::StakeBlast ? "the stake's blast"
+                                         : "a swing's";
+}
+
+// A charged attack's kill (2026-11-09: a bonus, softer than 1.75x / 1.5x, and the
+// stronger one when it is also a two-handed heavy): a little more than a two-handed heavy's
+// momentum and caps, well under the stake's blast; sent out more than down (a charged overhead
+// chop no more than ChargedDownMax into the floor) and lifted a little (ChargedLift: the body
+// rises as it flies), within the same limits off "away" and never toward the hunter.
+inline constexpr float ChargedMomentumFactor = 1.7f;
+inline constexpr float ChargedCap = 1.35f;
+inline constexpr float ChargedLift = 0.15f;
+inline constexpr float ChargedDownMax = 0.3f;
+
+// These exceptions raise the momentum and the added-velocity caps (the stake's blast a little more
+// lift too: the tester, 2026-11-02, "bump the kickback the stakedriver has when we kill an enemy",
+// 1.75x / 1.5x / lift 0.25 -> 2.5x / 2.25x / 0.4). The direction's limits, inherited motion limits
+// and the post-push player guard retain the normal rules.
 inline PushConfig AttackPushConfig(float scale, PushAttack attack) {
     PushConfig cfg{};
     cfg.scale = scale;
     float cap = 1.0f;
     if (attack == PushAttack::HeavyTwoHand) {
-        cfg.momentum_kg *= 1.5f;
+        cfg.momentum_kg *= HeavyMomentumFactor;
         cap = 1.25f;
+    } else if (attack == PushAttack::Charged) {
+        cfg.momentum_kg *= ChargedMomentumFactor;
+        cap = ChargedCap;
+        cfg.fallback_lift = 0.3f;
+        cfg.lift = ChargedLift;
+        cfg.down_max = ChargedDownMax;
     } else if (attack == PushAttack::StakeBlast) {
-        cfg.momentum_kg *= 1.75f;
-        cap = 1.5f;
+        cfg.momentum_kg *= 2.5f;
+        cap = 2.25f;
+        cfg.fallback_lift = 0.4f;
     }
     cfg.dv_all_max *= cap;
     cfg.dv_local_max *= cap;
@@ -479,7 +509,7 @@ inline Vec3 LimitOffAway(Vec3 h, Vec3 away, float max_deg) {
 
 // The push's direction: along the blade's velocity at the hit (else away from the hunter, a little
 // up), never toward the hunter (that horizontal part is taken out) and at most AwayLimitDeg off
-// "away", its downward / upward part limited.
+// "away", raised by PushConfig::lift (the blade's only), its downward / upward part limited.
 inline Vec3 PushDirection(const PushIn& in, const PushConfig& c, Vec3 away, bool& from_blade,
                           float away_max_deg = 180.0f) {
     from_blade = in.blade_ok && VR::Body::IsFinite(in.blade_vel) &&
@@ -496,7 +526,7 @@ inline Vec3 PushDirection(const PushIn& in, const PushConfig& c, Vec3 away, bool
     if (n < 1e-3f) {
         return away; // the blade moved straight at the hunter
     }
-    const float y = std::clamp(d.y / n, -c.down_max, c.up_max);
+    const float y = std::clamp(d.y / n + (from_blade ? c.lift : 0.0f), -c.down_max, c.up_max);
     const Vec3 hn = LimitOffAway(hl > 1e-3f ? h * (1.0f / hl) : away, away, away_max_deg);
     return hn * std::sqrt(std::max(0.0f, 1.0f - y * y)) + Vec3{0.0f, y, 0.0f};
 }
@@ -516,7 +546,9 @@ inline PushPlan PlanPush(const PushIn& in, const PushBody* bodies, int count, co
     p.speed = std::clamp(std::isfinite(raw_speed) ? raw_speed : c.default_speed, c.speed_min,
                          c.speed_max);
     const float scale = std::isfinite(c.scale) ? std::max(c.scale, 0.0f) : 0.0f;
-    p.momentum = c.momentum_kg * p.speed * scale;
+    // A little extra momentum on the fastest tracked hits, within the same velocity caps.
+    const float fast_share = p.from_blade ? std::clamp((p.speed - 9.0f) / 3.0f, 0.0f, 1.0f) : 0.0f;
+    p.momentum = c.momentum_kg * p.speed * scale * (1.0f + 0.05f * fast_share);
     float nearest_d2 = 1e30f;
     for (int i = 0; i < count; ++i) {
         const PushBody& b = bodies[i];

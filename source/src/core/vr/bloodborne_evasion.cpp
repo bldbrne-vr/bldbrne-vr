@@ -1512,32 +1512,74 @@ bool CastMapSphere(const float from[3], const float to[3], float radius, float h
     return true;
 }
 
+MapSweep SweepMapSphere(Body::Vec3 from, Body::Vec3 to, float radius,
+                        Body::Vec3& normal, float& fraction) {
+    normal={};fraction=0;
+    if(!g_map_cast || !g_map_base || !Body::IsFinite(from) || !Body::IsFinite(to) ||
+       !std::isfinite(radius) || radius<=0 || radius>100)return MapSweep::Unavailable;
+    const auto delta=to-from;const float length=Body::LengthSq(delta);
+    if(!std::isfinite(length)||length<=1e-12f||length>1e8f)return MapSweep::Unavailable;
+    u8* const mgr=Read<u8*>(g_map_base+PhysWorldRva);
+    u8* const world=Plausible(mgr)?Read<u8*>(mgr+OffsetPhysWorldWrapper):nullptr;
+    if(!Plausible(world)||!Plausible(Read<u8*>(world+0x08)))return MapSweep::Unavailable;
+    alignas(16) float a[4]{from.x,from.y,from.z,1},d[4]{delta.x,delta.y,delta.z,0};
+    alignas(16) float h[4]{},n[4]{},f[4]{1};
+    if(!g_map_cast(world,LayerRagdollLandscape,a,d,h,n,f,radius))return MapSweep::Clear;
+    normal={n[0],n[1],n[2]};fraction=f[0];
+    if(!Body::IsFinite(normal)||!std::isfinite(fraction)||fraction<0||fraction>1)
+        return MapSweep::Unavailable;
+    return MapSweep::Hit;
+}
+
+bool MapSpherePathClear(Body::Vec3 from, Body::Vec3 to, float radius) {
+    if (!g_map_cast || !g_map_base || !Body::IsFinite(from) || !Body::IsFinite(to) ||
+        !std::isfinite(radius) || radius <= 0 || radius > 100.0f ||
+        !Body::IsFinite(to-from)) return false;
+    const float distance_sq=Body::LengthSq(to-from);
+    if (!std::isfinite(distance_sq) || distance_sq<=1e-10f || distance_sq>1e8f) return false;
+    u8* const mgr = Read<u8*>(g_map_base + PhysWorldRva);
+    u8* const world = Plausible(mgr) ? Read<u8*>(mgr + OffsetPhysWorldWrapper) : nullptr;
+    if (!Plausible(world) || !Plausible(Read<u8*>(world + 0x08))) return false;
+    alignas(16) float a[4]{from.x,from.y,from.z,1};
+    alignas(16) float d[4]{to.x-from.x,to.y-from.y,to.z-from.z,0};
+    alignas(16) float hit[4]{}, normal[4]{}, fraction[4]{1};
+    // A zero-fraction hit (starting inside scenery) is an obstruction here too.
+    return g_map_cast(world, LayerRagdollLandscape, a,d,hit,normal,fraction,radius) == 0;
+}
+
 // The render-camera hook reads the same live Havok bodies as physical evasion.
 // Restrict the query to the verified victim's ragdoll; a camera-layer world cast
 // cannot distinguish the hunter, another enemy, and the intended victim.
-GrabCamera::SurfaceRay CastVisceralSurface(const u8* victim, Body::Vec3 eye,
-                                           Body::Vec3 root, Body::Vec3 facing, float scale) {
-    if (!g_map_base || !Plausible(victim)) return {};
+size_t VictimCapsules(const u8* victim, Body::Vec3 root, float scale,
+                      std::span<GrabCamera::CollisionCapsule> out) {
+    if (!g_map_base || !Plausible(victim)) return 0;
     u8* const ctrl = Read<u8*>(victim + OffsetChrCtrl);
-    if (!Plausible(ctrl) || Read<const u8*>(ctrl + OffsetCtrlOwner) != victim) return {};
+    if (!Plausible(ctrl) || Read<const u8*>(ctrl + OffsetCtrlOwner) != victim) return 0;
     u8* const ragdoll = Read<u8*>(ctrl + OffsetRagdoll);
     if (!Plausible(ragdoll) || Read<u8*>(ragdoll) != g_map_base + RagdollVtableRva ||
-        Read<const u8*>(ragdoll + OffsetRagdollOwner) != victim) return {};
+        Read<const u8*>(ragdoll + OffsetRagdollOwner) != victim) return 0;
     u8* const system = Read<u8*>(ragdoll + OffsetRagdollSystem);
-    if (!Plausible(system)) return {};
+    if (!Plausible(system)) return 0;
     const s32 count = Read<s32>(system + OffsetSystemBodyCount);
-    if (count <= 0 || count > 128) return {};
-    std::array<GrabCamera::CollisionCapsule, 128> shapes{};
+    if (count <= 0 || count > 128) return 0;
     size_t used = 0;
-    for (s32 i = 0; i < count; ++i) {
+    for (s32 i = 0; i < count && used < out.size(); ++i) {
         Capsule c{};
         if (!ReadCapsule(ragdoll, i, c, g_map_base)) continue;
         const Body::Vec3 a{c.a[0], c.a[1], c.a[2]}, b{c.b[0], c.b[1], c.b[2]};
         // Reject stale/reused body IDs and obviously unrelated transforms.
         if (Body::Length(a - root) > 6.0f * scale ||
             Body::Length(b - root) > 6.0f * scale) continue;
-        shapes[used++] = {a, b, c.r};
+        out[used++] = {a, b, c.r};
     }
+    return used;
+}
+
+GrabCamera::SurfaceRay CastVisceralSurface(const u8* victim, Body::Vec3 eye,
+                                           Body::Vec3 root, Body::Vec3 facing, float scale) {
+    std::array<GrabCamera::CollisionCapsule, 128> shapes{};
+    const size_t used = VictimCapsules(victim, root, scale, shapes);
+    if (used == 0) return {};
     return GrabCamera::CastVictimSurface(eye, root, facing, scale,
                                         std::span{shapes.data(), used});
 }

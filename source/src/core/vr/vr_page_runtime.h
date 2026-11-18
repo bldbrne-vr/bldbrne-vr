@@ -9,8 +9,10 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include "common/types.h"
 #include "core/vr/thumb_layout.h"
@@ -22,6 +24,15 @@
 // on its own layer at the menu canvas (renderer_vulkan/vr_page_layer.h). Values: the live settings
 // (applied at once) and vr.ini (VR::SaveSetting / RemoveSetting, the safe writer).
 namespace VR::Page {
+
+// The death choice's input (Runtime::HandleInput): only on a view already shown (`shown_now`: the
+// newest drawn view is on screen). Back (Last lantern, which ends the soft save) once the page has
+// been seen at all (`shown_ever`): a dodge mashed as the hunter dies is no choice. It still escapes
+// a page left unseen DeathBackStallNs after its offer (a stalled redraw), as the lamp page's back.
+inline constexpr s64 DeathBackStallNs = 2'000'000'000;
+constexpr bool DeathInputTaken(bool back, bool shown_now, bool shown_ever, s64 since_offer_ns) {
+    return back ? shown_ever || since_offer_ns >= DeathBackStallNs : shown_now;
+}
 
 // One input frame of the page (frame thread): presses as edges, the D-pad with its repeat.
 struct Input {
@@ -54,6 +65,12 @@ struct Input {
     float right_speed{0.0f};
     float left_speed{0.0f};
     float dt{0.0f}; // seconds since the last input frame
+    // The gamepad (a gamepad play style's controls view): its own buttons held (PagePad::Bit),
+    // its sticks pushed past half way, and its back press (Circle) this frame.
+    std::uint32_t pad_held{0};
+    bool pad_stick_l{false};
+    bool pad_stick_r{false};
+    bool pad_back{false};
 };
 
 enum class Event : unsigned char {
@@ -74,9 +91,12 @@ public:
     [[nodiscard]] double SecondsSinceRequest() const;
     // Frame thread, every XR frame: takes a pending request (opens the page; true then).
     bool PollOpen();
+    // Any thread (the game's pad reads keep the gamepad from the game while it is open).
     [[nodiscard]] bool IsOpen() const;
     // The page's layer is up (open, or fading out after a close).
     [[nodiscard]] bool Visible() const;
+    // Frame thread: this page pauses game frames; present it independently through fade-out.
+    [[nodiscard]] bool RequiresLivePresentation() const;
     void Close(const char* why);
     // Frame thread: the page's input (only while open). Returns what the presenter must do.
     Event HandleInput(const Input& in);
@@ -91,8 +111,9 @@ public:
     // The controller's own names for the buttons (the presenter, from the interaction profile).
     void SetGlyphs(const Glyphs& glyphs);
     // The interaction profile bound for the controllers in your hands (and whether its trackpad
-    // d-pad map was taken): the controls view draws that family and its buttons.
-    void SetController(const std::string& profile, bool dpad);
+    // d-pad map was taken): the controls view draws that family and its buttons. `system`: the
+    // headset's XrSystemProperties::systemName (a PS VR2's Touch profile is its Sense controllers).
+    void SetController(const std::string& profile, bool dpad, std::string_view system = {});
     // Show VR controls is up (over the page; B returns to the page).
     [[nodiscard]] bool ControlsOpen() const;
     // A newer finished image than `serial` (the presenter uploads it).

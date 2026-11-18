@@ -27,6 +27,12 @@
 // logged ("VR pickup: ..."): the lot, the inventory counts before and after, the glow removed, and
 // instant or why the animation played. Signature-checked; a mismatch leaves the game's own pickup.
 //
+// vr.ini pickup_reach (default 1.1, the tester's 2026-10-26 "+10%"): the prompt reaches that much
+// further from an item on the ground. At the checker's entry, twice a second, the radius of the
+// ActionButtonParam rows items use (4000 world items, 4100 / 4110 enemy drops, 4200 / 4300 the
+// treasure without a row of its own, each treasure's own) is scaled once in place (cylinder rows
+// only; logged "VR pickup: reach row ...").
+//
 // VR_PICKUP_SCAN=1 (tests only): also logs the active item glows near the hunter (the checker's
 // own lists, read on its thread) when they change, to find items to test with.
 namespace VR::Bloodborne {

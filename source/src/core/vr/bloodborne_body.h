@@ -64,4 +64,9 @@ void OnEbootRelocated(VAddr base, u64 size);
 // cinematic flat mode) pass nullptr. Publishes the anchor; W-drift and FK checks in log mode.
 void BodyRenderTick(const VR::CameraOverride* result, const float* position, bool fp_follow);
 
+// Render-camera hook, before anything reads his hands this frame: the root's move after the pose
+// copy that the arms' solve did not predict (a step on stairs) is taken back out of his render, so
+// his hands and weapons stay where you hold them against the view (undone before the next copy).
+void BodyLateRootFix(const VR::CameraOverride& result, const float* position);
+
 } // namespace VR::Bloodborne

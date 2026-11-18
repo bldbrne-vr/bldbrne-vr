@@ -17,14 +17,16 @@
 namespace Vulkan::HostPasses {
 
 void PostProcessingPass::Create(vk::Device device, const vk::Format surface_format,
-                                bool native_color) {
+                                bool native_color, VmaAllocator allocator) {
+    kos_iris.Shutdown();
+    if (native_color && allocator) kos_iris.Init(device, allocator);
     load_op = native_color ? vk::AttachmentLoadOp::eDontCare : vk::AttachmentLoadOp::eClear;
     static const std::array pp_shaders{
         HostShaders::FS_TRI_VERT,
         HostShaders::POST_PROCESS_FRAG,
     };
 
-    boost::container::static_vector<vk::DescriptorSetLayoutBinding, 2> bindings{
+    boost::container::static_vector<vk::DescriptorSetLayoutBinding, 3> bindings{
         {
             .binding = 0,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -32,7 +34,21 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
             .stageFlags = vk::ShaderStageFlagBits::eFragment,
         },
     };
+    if (native_color) {
+        // The burst variant's brightness meter (VrRiposteMeter).
+        bindings.push_back({
+            .binding = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        });
+    }
 
+    if (kos_iris.Ready()) {
+        bindings.push_back({.binding = 2,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment});
+    }
     const vk::DescriptorSetLayoutCreateInfo desc_layout_ci{
         .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
         .bindingCount = static_cast<u32>(bindings.size()),
@@ -52,11 +68,21 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
     ASSERT(vs_module);
     SetObjectName(device, vs_module, "fs_tri.vert");
 
-    const auto& fs_module = Compile(
-        pp_shaders[1], vk::ShaderStageFlagBits::eFragment, device,
-        native_color ? std::vector<std::string>{"VR_NATIVE_COLOR"} : std::vector<std::string>{});
+    std::vector<std::string> defines;
+    if (native_color) defines.emplace_back("VR_NATIVE_COLOR");
+    if (kos_iris.Ready()) defines.emplace_back("VR_KOS_IRIS");
+    const auto& fs_module = Compile(pp_shaders[1], vk::ShaderStageFlagBits::eFragment, device, defines);
     ASSERT(fs_module);
     SetObjectName(device, fs_module, "post_process.frag");
+    // The native eyes' burst variant (vr.ini riposte_style): its own module, so the passes the
+    // rest of the time run without its code.
+    vk::ShaderModule riposte_module{};
+    if (native_color) {
+        defines.emplace_back("VR_RIPOSTE");
+        riposte_module = Compile(pp_shaders[1], vk::ShaderStageFlagBits::eFragment, device, defines);
+        ASSERT(riposte_module);
+        SetObjectName(device, riposte_module, "post_process.frag (riposte)");
+    }
 
     const vk::SpecializationMapEntry color_entry{.constantID = 0, .offset = 0, .size = sizeof(u32)};
     u32 color_enabled = 0;
@@ -66,7 +92,7 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
         .dataSize = sizeof(color_enabled),
         .pData = &color_enabled,
     };
-    const std::array shaders_ci{
+    std::array shaders_ci{
         vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eVertex,
             .module = vs_module,
@@ -182,14 +208,20 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
         .layout = *pipeline_layout,
     };
 
-    for (color_enabled = 0; color_enabled < pipelines.size(); ++color_enabled) {
-        pipelines[color_enabled] = Check<"create post process pipeline">(
-            device.createGraphicsPipelineUnique({}, pipeline_info));
+    for (u32 riposte = 0; riposte < (native_color ? 2u : 1u); ++riposte) {
+        shaders_ci[1].module = riposte != 0 ? riposte_module : fs_module;
+        for (color_enabled = 0; color_enabled < 2; ++color_enabled) {
+            pipelines[color_enabled + 2 * riposte] = Check<"create post process pipeline">(
+                device.createGraphicsPipelineUnique({}, pipeline_info));
+        }
     }
 
     // Once pipeline is compiled, we don't need the shader module anymore
     device.destroyShaderModule(vs_module);
     device.destroyShaderModule(fs_module);
+    if (riposte_module) {
+        device.destroyShaderModule(riposte_module);
+    }
 
     // Create sampler resource
     const vk::SamplerCreateInfo sampler_ci{
@@ -203,13 +235,15 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
 }
 
 void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
-                                vk::Extent2D input_size, Frame& frame, Settings settings) {
+                                vk::Extent2D input_size, Frame& frame, Settings settings,
+                                vk::Buffer riposte_meter) {
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
         });
     }
 
+    kos_iris.Upload(cmdbuf, vk::PipelineStageFlagBits2::eFragmentShader);
     constexpr vk::ImageSubresourceRange simple_subresource = {
         .aspectMask = vk::ImageAspectFlagBits::eColor,
         .levelCount = 1,
@@ -241,7 +275,14 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
     };
 
-    const std::array set_writes{
+    // The burst variant (native_color only) while the burst shows; the meter is its only reader.
+    const bool riposte = settings.riposte > 0.0001f && riposte_meter && pipelines[2];
+    const vk::DescriptorBufferInfo meter_info{
+        .buffer = riposte_meter,
+        .offset = 0,
+        .range = VK_WHOLE_SIZE,
+    };
+    std::array<vk::WriteDescriptorSet, 3> set_writes{
         vk::WriteDescriptorSet{
             .dstSet = VK_NULL_HANDLE,
             .dstBinding = 0,
@@ -250,12 +291,21 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
             .pImageInfo = &image_info,
         },
+        vk::WriteDescriptorSet{
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 1,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &meter_info,
+        },
     };
 
     const bool color_active = settings.color_adjust[0] != 1.0f ||
                               settings.color_adjust[1] != 1.0f ||
                               settings.color_adjust[2] != 1.0f;
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipelines[color_active]);
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics,
+                        *pipelines[(color_active ? 1 : 0) + (riposte ? 2 : 0)]);
 
     const std::array viewports = {
         vk::Viewport{
@@ -274,7 +324,14 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                              },
                          });
 
-    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, set_writes);
+    u32 write_count = riposte ? 2u : 1u;
+    const auto iris_info = kos_iris.Descriptor();
+    if (kos_iris.Ready()) {
+        set_writes[write_count++] = {.dstBinding = 2, .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &iris_info};
+    }
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0,
+                                write_count, set_writes.data());
     ScratchPush::Invalidate();
     cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(Settings),
                          &settings);

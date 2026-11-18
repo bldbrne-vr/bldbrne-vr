@@ -117,6 +117,23 @@ constexpr float LongStroke = 1.5f;  // bounds the accumulators
 constexpr float KeepEnded = 0.10f;  // a commit just after a stroke ended still uses it
 // Wound-up start.
 constexpr float WindupPoseAngle = 75.0f * Deg; // with the hand high or out wide
+// A heavy's wound-up pose with the hand high (the stroke's cocked start, the ready click; out wide
+// it stays WindupPoseAngle: a wide, large sweep is a heavy): past upright, the blade tipped back.
+// WindupPoseAngle until 2026-11-01, when a plain overhead chop started cocked and most swings were
+// heavies (the user: heavies "special, not easy to trigger"; "ok for wide large arc swings to
+// count as heavy").
+constexpr float HeavyPoseAngle = 100.0f * Deg;
+// The enemies' warning of a raised blade (Classifier::RaisedPose) keeps the old wind-up: the
+// default 130 deg less this is the 110 it was.
+constexpr float RaisedWindupDrop = 20.0f * Deg;
+
+// The heavy's wound-up pose: the blade `alpha` from horizontal-forward, the hand `h` (head
+// relative; `pos`: tracked) and `cfg`'s windup, hand_up and hand_side (Config, below).
+inline bool WoundUpPoseAt(float alpha, bool pos, float hand_y, float hand_x, float windup,
+                          float hand_up, float hand_side) {
+    return alpha >= windup || (alpha >= HeavyPoseAngle && (!pos || hand_y >= hand_up)) ||
+           (alpha >= WindupPoseAngle && pos && std::abs(hand_x) >= hand_side);
+}
 constexpr float ChordMin = 0.20f;              // ~11.5 deg of blade chord before a verdict
 // Arbiter.
 constexpr float ThrustArc = 25.0f * Deg; // smaller arc and slower blade = a stab
@@ -186,6 +203,27 @@ inline bool HandAtFace(bool was, float ahead, float distance, float speed, const
     return inside && (was || r.enter_speed <= 0.0f || speed < r.enter_speed);
 }
 
+// Head-relative outward speed, shared by both hands when leaving face protection.
+// A sideways motion or lowering the controller is not automatically a strike.
+inline float SpeedAwayFromHead(V3 hand_from_head, V3 relative_velocity) {
+    const float distance = Length(hand_from_head);
+    const float projected = Dot(relative_velocity, hand_from_head);
+    return std::isfinite(distance) && std::isfinite(projected) && distance > 1e-4f
+               ? projected / distance : 0.0f;
+}
+
+// A gun leaving face protection must punch forward, not simply drop from the
+// headset. Keep this stricter than the right weapon's overhead-strike escape.
+inline bool PunchLeavesFace(V3 hand_from_head, V3 relative_velocity, V3 head_forward,
+                            float min_speed) {
+    const float flat = std::hypot(head_forward.x, head_forward.z);
+    if (!std::isfinite(flat) || flat < 0.2f) return false;
+    const float forward = (relative_velocity.x * head_forward.x +
+                           relative_velocity.z * head_forward.z) / flat;
+    return std::isfinite(forward) && forward >= min_speed &&
+           SpeedAwayFromHead(hand_from_head, relative_velocity) >= min_speed;
+}
+
 // Rebuilt every frame from the settings.
 struct Config {
     bool arc_enabled{false};           // heavy_arc setting && the grip pose exists
@@ -203,6 +241,9 @@ struct Config {
     // m/s: the stab's speed that commits a clutchless stroke whose blade hardly turns (StabSpeed;
     // the left hand with a gun: GunPunchSpeed, 2026-10-18). Set after Make.
     float stab_speed{StabSpeed};
+    // m: the travel above FireSpeed a commit needs (SwingDetector::MinTravel; a two-handed push
+    // through the lead fist only has the hands' spacing, two_hand_grip.h PushMinTravelM).
+    float min_travel{0.15f};
     // swing_windup_turn_deg: the blade back toward the front this far from a wind-up's furthest
     // point starts the strike as a stroke of its own (ApexMin / ApexAway; 0 = off: a wind-up
     // looped into its strike stays one stroke). Set after Make.
@@ -215,6 +256,13 @@ struct Config {
     // swing_windup_rejudge: a stroke ignored as a wind-up is judged again while it lasts
     // (SwingDetector::rejudge; false: it never commits). Set after Make.
     bool rejudge{true};
+    // The wind-up rule (Chord): a stroke whose blade went this share of its chord up, back or out
+    // wide is a wind-up, never an attack (WindupFor: swing_windup_share, softer for the Amygdalan
+    // Arm's lash); `windups` false: no stroke is (the whips). 0.5 until 2026-11-11, when the user
+    // asked it softer: a miss now gives its charges back (melee_budget_miss_refund), so a swing
+    // misread as one costs less. Set after Make.
+    float windup_share{0.5f};
+    bool windups{true};
 
     static Config Make(bool arc_enabled, bool ready_tick, float heavy_arc_deg,
                        float heavy_windup_deg, bool seated, float blade_pitch_deg) {
@@ -232,6 +280,23 @@ struct Config {
         return c;
     }
 };
+
+// The wind-up rule for the weapon in hand (2026-11-11): `share`
+// (swing_windup_share) for every weapon, ArmWindupExtra more for the Amygdalan Arm's lash (its
+// form B: softer still), none for the whips (the Threaded Cane's and the Beast Cutter's whip forms,
+// the Kos Parasite's tendrils: a whip's wind-up is part of its lash).
+inline constexpr float ArmWindupExtra = 0.1f;
+struct WindupRule {
+    bool on{true};
+    float share{0.5f};
+};
+constexpr WindupRule WindupFor(bool whip, bool arm_lash_form, float share) {
+    if (whip) {
+        return {false, share};
+    }
+    const float s = arm_lash_form ? share + ArmWindupExtra : share;
+    return {true, s < 0.95f ? s : 0.95f};
+}
 
 struct Input {
     double t{};                // seconds (XrTime * 1e-9) these poses were predicted for
@@ -367,7 +432,7 @@ struct SwingDetector {
     template <typename ChordFn>
     Result Update(bool valid, V3 v, float own_speed, float world_speed, V3 p, V3 fwd_flat, float dt,
                   const Stroke* cur, ChordFn&& chord, bool clutchless = false,
-                  float stab_speed = StabSpeed) {
+                  float stab_speed = StabSpeed, float min_travel = MinTravel) {
         // A recovery stroke (Stroke::recovery) is not yet a swing: keep measuring while the hand
         // stays fast; it may still speed up to a strike.
         const bool recovery = cur != nullptr && cur->recovery;
@@ -421,7 +486,7 @@ struct SwingDetector {
         above_time += dt;
         travel += speed * dt;
         peak = std::max(peak, speed);
-        if (above_time < MinTime || travel < MinTravel) {
+        if (above_time < MinTime || travel < min_travel) {
             return Result::None;
         }
         if (Length(p - p_start) < PathFrac * travel) {
@@ -496,6 +561,8 @@ public:
         t_prev = in.t;
         have_t = true;
         toward_front = cfg.toward_front; // Chord()
+        windup_share = cfg.windup_share;
+        windups = cfg.windups;
 
         // Head yaw (+ = turned left); kept while looking straight up or down.
         const float yaw_before = yaw;
@@ -523,8 +590,7 @@ public:
         if (in.active && in.immersive && in.heavy_idle && cfg.arc_enabled && cfg.ready_tick &&
             have_prev && pos_ok && Length(v_rel) < ClickHandSpeed) {
             const bool pose =
-                alpha >= cfg.windup || (alpha >= WindupPoseAngle &&
-                                        (h.y >= cfg.hand_up || std::abs(h.x) >= cfg.hand_side));
+                WoundUpPoseAt(alpha, true, h.y, h.x, cfg.windup, cfg.hand_up, cfg.hand_side);
             if (pose && !in_zone && since_click >= ClickRefractory) {
                 out.ready_click = true;
                 since_click = 0.0f;
@@ -561,7 +627,7 @@ public:
         det.rejudge = cfg.rejudge;
         const auto result = det.Update(
             pos_ok, v_rel, Length(v_own), Length(in.v), p_rel, fwd_flat, dtx, cur_ptr,
-            [this] { return Chord(); }, cfg.clutchless, cfg.stab_speed);
+            [this] { return Chord(); }, cfg.clutchless, cfg.stab_speed, cfg.min_travel);
 
         // C. Arbiter.
         const Stroke* decided = nullptr;
@@ -709,9 +775,12 @@ public:
     }
     // Physical melee's telegraph (core/vr/melee_window.h TelegraphTracker): the current stroke's
     // wind-up direction ("raising", "cocking", "outward"; null: none, or not a stroke), how long it
-    // has lasted (s), and whether the weapon is held wound up now (the ready click's pose).
+    // has lasted (s), and whether the weapon is held wound up now (the ready click's pose). What
+    // the enemies may read keeps the original rule (TelegraphWindupShare, every weapon, whips too),
+    // whatever the gate's softer one (the review, 2026-11-11).
+    static constexpr float TelegraphWindupShare = 0.5f;
     const char* CurrentWindup() const {
-        return Chord().windup;
+        return Chord(TelegraphWindupShare, true).windup;
     }
     float CurrentStrokeSeconds() const {
         return has_cur ? cur.T : 0.0f;
@@ -721,8 +790,17 @@ public:
     }
     bool WoundUpPose(const Config& cfg) const {
         return have_prev && (alpha >= cfg.windup ||
-                             (alpha >= WindupPoseAngle && pos_now &&
-                              (h_now.y >= cfg.hand_up || std::abs(h_now.x) >= cfg.hand_side)));
+                             (pos_now && WoundUpPoseAt(alpha, true, h_now.y, h_now.x, cfg.windup,
+                                                       cfg.hand_up, cfg.hand_side)));
+    }
+    // The raised pose the enemies are warned of (melee_window.h Telegraph): the wind-up as it was
+    // before the heavy became special (2026-11-01: 20 deg less than now, 75 with the hand high or
+    // out wide), so they read a raised blade as before.
+    bool RaisedPose(const Config& cfg) const {
+        return have_prev &&
+               (alpha >= cfg.windup - RaisedWindupDrop ||
+                (alpha >= WindupPoseAngle && pos_now &&
+                 (h_now.y >= cfg.hand_up || std::abs(h_now.x) >= cfg.hand_side)));
     }
 
 private:
@@ -755,9 +833,8 @@ private:
         cur.pos_lost = !pos0;
         cur.amin = cur.alpha0;
         // Out wide to either side: a backhand from far left is wound up like a forehand.
-        cur.cocked = cur.alpha0 >= cfg.windup ||
-                     (cur.alpha0 >= WindupPoseAngle &&
-                      (!pos0 || h0.y >= cfg.hand_up || std::abs(h0.x) >= cfg.hand_side));
+        cur.cocked =
+            WoundUpPoseAt(cur.alpha0, pos0, h0.y, h0.x, cfg.windup, cfg.hand_up, cfg.hand_side);
         cur.apex = cur.alpha0;
         cur.apex_b = b0;
         cur.apex_h = h0;
@@ -964,8 +1041,13 @@ private:
     }
 
     // Blade chord since the stroke started, in the current head-yaw frame: a wind-up moves
-    // the blade away from the front (up, back or out to the side), a strike toward it.
+    // the blade away from the front (up, back or out to the side), a strike toward it. The swing
+    // gate's rule (Config::windup_share, windups).
     ChordResult Chord() const {
+        return Chord(windup_share, windups);
+    }
+    // ... with a wind-up being `share` of the chord up, back or out wide (`on` false: never).
+    ChordResult Chord(float share_of_chord, bool on) const {
         ChordResult r{};
         if (!has_cur) {
             return r;
@@ -986,16 +1068,17 @@ private:
         const bool toward =
             toward_front > 0.0f && a0 >= ApexMin && Angle(bh, front) <= a0 - toward_front;
         const bool forward = db.z < -0.2f * L || toward;
-        if (!forward) {
-            if (db.y >= 0.5f * L) {
+        const float share = share_of_chord * L;
+        if (!forward && on) {
+            if (db.y >= share) {
                 r.windup = "raising";
                 return r;
             }
-            if (db.z >= 0.5f * L && db.y >= -0.2f * L) {
+            if (db.z >= share && db.y >= -0.2f * L) {
                 r.windup = "cocking";
                 return r;
             }
-            if (std::abs(bh.x) - std::abs(b0h.x) >= 0.5f * L && db.y > -0.5f * L) {
+            if (std::abs(bh.x) - std::abs(b0h.x) >= share && db.y > -0.5f * L) {
                 r.windup = "outward";
                 return r;
             }
@@ -1076,6 +1159,8 @@ private:
 
     // Time and head.
     float toward_front{10.0f * Deg}; // Config::toward_front, for Chord()
+    float windup_share{0.5f};        // Config::windup_share, for Chord()
+    bool windups{true};              // Config::windups, for Chord()
     bool have_t{false};
     double t_prev{};
     float yaw{};

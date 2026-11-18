@@ -146,6 +146,40 @@ constexpr bool IsPlayersObject(float rx, float ry, float rz, bool upright) {
     return !upright && d2 <= 2.5f * 2.5f;
 }
 
+// Whose rigid piece (a hat or a mask on Head, a bandage on L_Forearm) is a tilted piece
+// IsPlayersObject took for his? Its transform is the bone's world transform times the bone's
+// inverse bind pose, so it carries the bone's bind point onto that bone wherever the bone is: a
+// piece of his puts some bone's bind point on that same bone of his. Its translation alone swings
+// up to 1.6 m with the bone (a nod, a raised arm), so another character's piece can stand nearer
+// to him than to its owner (Eileen's Crow mask, or her whole body in hands_only, 2026-10-27).
+// `rot`: the piece's rotation, row-major 3x3; `rel`: its translation minus his origin; `bind`: the
+// bind points (model space); `bones`: his bones this tick minus his origin (the same bone order
+// and units as `rel`). The bone it sits on, or -1; `nearest` (optional): the closest miss,
+// squared.
+inline constexpr float BoneMatchM = 0.20f;
+constexpr int OnPlayersBone(const float rot[9], const float rel[3], const float (*bind)[3],
+                            const float (*bones)[3], int count, float match,
+                            float* nearest = nullptr) {
+    float best = -1.0f;
+    for (int b = 0; b < count; ++b) {
+        const float* p = bind[b];
+        const float dx = rot[0] * p[0] + rot[1] * p[1] + rot[2] * p[2] + rel[0] - bones[b][0];
+        const float dy = rot[3] * p[0] + rot[4] * p[1] + rot[5] * p[2] + rel[1] - bones[b][1];
+        const float dz = rot[6] * p[0] + rot[7] * p[1] + rot[8] * p[2] + rel[2] - bones[b][2];
+        const float d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 <= match * match) {
+            return b;
+        }
+        if (best < 0.0f || d2 < best) {
+            best = d2;
+        }
+    }
+    if (nearest != nullptr) {
+        *nearest = best;
+    }
+    return -1;
+}
+
 // body_mode=arms_only / hands_only (the renderer shows only the hunter's hands and forearms / his
 // hands): what a draw of one of his face sets with a VrHandsTable key does in a pass. `on`: this
 // frame is a first-person frame in such a mode; `colour`: HeadHiddenPass (the camera's G-buffer:

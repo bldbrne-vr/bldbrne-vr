@@ -362,6 +362,34 @@ public:
                   Match match = Match::Bytes) {
     return Check(address, bytes, progress, match) != Hit::None;
   }
+  // FAST_CPU_CE_TICKET: after a Write/Page/Big/Unknown hit, the newest still-queued ticket the
+  // query depends on (every overlapping write's and `unknown`): waiting for it orders the query
+  // after them as a full drain would. Signals are not looked at (the caller drains for those).
+  template <class Progress>
+  uint64_t NewestPending(uint64_t address, uint64_t bytes, Progress &progress,
+                         Match match = Match::Bytes) {
+    uint64_t newest_ticket = unknown && progress.Pending(unknown) ? unknown : 0;
+    if (!bytes || address > UINT64_MAX - bytes)
+      return UINT64_MAX;
+    const uint64_t end = address + bytes;
+    const bool pages = match == Match::Pages;
+    const uint64_t first = pages ? address & ~(PageBytes - 1) : address;
+    const uint64_t last = !pages                              ? end
+                          : end > UINT64_MAX - (PageBytes - 1) ? UINT64_MAX
+                                                               : (end + PageBytes - 1) & ~(PageBytes - 1);
+    for (uint32_t c = 0; c <= Classes; ++c) {
+      const auto &list = lists[c];
+      auto it = list.begin();
+      if (c < Classes)
+        it = std::lower_bound(list.begin(), list.end(),
+                              first > Limits[c] ? first - Limits[c] : 0,
+                              [](const Write &w, uint64_t at) { return w.begin < at; });
+      for (; it != list.end() && (c == Classes || it->begin < last); ++it)
+        if (it->begin < last && first < it->end && progress.Pending(it->ticket))
+          newest_ticket = std::max(newest_ticket, it->ticket);
+    }
+    return newest_ticket;
+  }
   size_t Count() const {
     size_t count = signals.size();
     for (const auto &list : lists)

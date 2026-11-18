@@ -11,8 +11,10 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
 
+#include <source_location>
 #include <atomic>
 #include <deque>
+#include <memory>
 #include <optional>
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -27,6 +29,10 @@ VK_DEFINE_HANDLE(VmaAllocation)
 VK_DEFINE_HANDLE(VmaAllocator)
 
 namespace VideoCore {
+
+namespace SkyDetail {
+struct Twin;
+}
 
 enum ImageFlagBits : u32 {
     Empty = 0,
@@ -49,23 +55,48 @@ struct UniqueImage {
     UniqueImage(const UniqueImage&) = delete;
     UniqueImage& operator=(const UniqueImage&) = delete;
 
+    // The device moves too: the texture cache assigns a fresh UniqueImage{device, allocator}
+    // before TryCreate, which needs it (the dedicated-memory size query).
     UniqueImage(UniqueImage&& other)
-        : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
+        : device{other.device}, allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
-          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)} {}
+          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)},
+          dedicated{std::exchange(other.dedicated, false)} {}
     UniqueImage& operator=(UniqueImage&& other) {
+        device = other.device;
         image = std::exchange(other.image, VK_NULL_HANDLE);
         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
         image_ci = std::move(other.image_ci);
+        dedicated = std::exchange(other.dedicated, false);
         return *this;
     }
 
-    void Create(const vk::ImageCreateInfo& image_ci);
-    bool TryCreate(const vk::ImageCreateInfo& image_ci);
+    // `where`: the caller, for VR_VRAM_REPORT's allocation names.
+    void Create(const vk::ImageCreateInfo& image_ci,
+                std::source_location where = std::source_location::current());
+    bool TryCreate(const vk::ImageCreateInfo& image_ci,
+                   std::source_location where = std::source_location::current());
     u64 SizeBytes() const;
 
     void Destroy();
+
+    // The image and its memory taken out without destroying them, for DestroyReleased on another
+    // thread (FAST_BACKGROUND_FREE): this object is empty afterwards. VMA locks internally.
+    struct Released {
+        VmaAllocator allocator{};
+        vk::Image image{};
+        VmaAllocation allocation{};
+        bool dedicated{};
+    };
+    Released Release() {
+        Released out{allocator, image, allocation, dedicated};
+        image = vk::Image{};
+        allocation = {};
+        dedicated = false;
+        return out;
+    }
+    static void DestroyReleased(const Released& released);
 
     operator vk::Image() const {
         return image;
@@ -81,7 +112,11 @@ public:
     VmaAllocation allocation{};
     vk::Image image{};
     vk::ImageCreateInfo image_ci{};
+    bool dedicated{}; // TryCreate gave it memory of its own (counted in DedicatedImages)
 };
+
+// The images living in memory of their own (UniqueImage::TryCreate, VR_VMA_DEDICATED_MB).
+u32 DedicatedImages();
 
 class BlitHelper;
 
@@ -137,6 +172,11 @@ struct Image {
                          std::optional<SubresourceRange> subres_range);
     void Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                  std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf = {});
+    // FAST_CPU_TRANSIT_NOOP (image.cpp): Transit to the state the whole image already holds.
+    bool TransitIsNoop(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                       const std::optional<SubresourceRange>& range) const;
+    void TransitFull(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                     std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf);
     void Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffer buffer, u64 offset);
     void Download(std::span<const vk::BufferImageCopy> download_copies, vk::Buffer buffer,
                   u64 offset, u64 download_size);
@@ -185,6 +225,9 @@ public:
     BackingImage* backing{};
     boost::container::static_vector<u64, 16> mip_hashes{};
     u64 image_uid{};
+    // VR_RETILE_DEFER: bumped by every draw, storage, copy, resolve or upload write (whether a
+    // deferred re-tile was recorded before the image changed).
+    u64 write_serial{};
     u64 lru_id{};
     // Published only after UpdateImage checked flags/tracking under the cache lock.
     // Fault handlers invalidate before changing either field. The unlocked path reads
@@ -205,6 +248,9 @@ public:
     // guest thread's RegisterVideoOutSurface: the period it read once and touched at).
     u64 lru_touched_tick{~u64{0}};
     u64 hash{};
+    // Sky detail (texture_cache/sky_detail.h): the sharper copy a sky or moon texture is sampled
+    // through (FindTexture), made after its upload.
+    std::shared_ptr<SkyDetail::Twin> sky_twin;
 
     // GPU-pass optimizations (vr_perf.h): this image's write counter (every transition that may
     // write it, GetBarriers), the draw whose bindings made the last one, the shader then

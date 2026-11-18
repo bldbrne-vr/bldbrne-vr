@@ -38,15 +38,21 @@
 // parents, mesh mapping and rest pose all match one of these, and only for the ObjActParam
 // rows listed with it. A row id alone never hides a prompt: rows such as 100 (the generic
 // lever) are shared by models without a rig, so the normal prompt is replaced only for the
-// exact lever instance whose rig binds (core/vr/lever_prompt.h).
+// exact lever instance whose rig binds (core/vr/lever_prompt.h). A scripted lever (`button`:
+// o260042) has no ObjActParam row at all: the map's event script waits on an action button at it,
+// so it binds by its own bone names, and its pull answers that button (the script-prompt gate).
 // The rigs added on 2026-10-14 take their rest from the Havok reference pose (the FLVER bind
 // pose), which is what a lever shows before any clip has played on it: o260041's pull clip starts
 // and ends 5 degrees off it (it binds there too: rest_alt_deg). Where the clip's own first frame
 // differs, the difference is noted.
-// Main game only: the Chalice Dungeon levers (o290010 / 12 / 14, o290020 / 22 / 24, o293110 /
-// 12 / 14 and the static o299902; rows 9902, 320, 2902000, 2931100) are deliberately not listed and
-// keep the game's own prompt (o290020's skeleton shares o250010's bone names: it is told apart by
-// its four-bone mesh table, its turned root and its hinge height).
+// The Chalice Dungeon levers (2026-11-04, the user: "Chalice dungeon levers should become
+// interactable by hand (especially pthumerian ones)"; left out on 2026-10-14): the lift-call and
+// gate levers o290010 / 12 / 14 (Cainhurst's mechanism under their own names), the door levers
+// o290020 / 22 / 24 (o250010's bone names, its lever bone's rotation and scale: told apart by
+// their four-bone mesh table, their turned root and their hinge 0.414 m up) and the turning levers
+// o293110 / 12 / 14 (the Research Hall capstan's clip on a two-bone skeleton: its bar walked round
+// a quarter turn), measured from the user's dump as the others were; the static o299902 keeps its
+// prompt (no rig binds it, so its row 9902 hides nothing of it).
 namespace VR::Lever {
 
 // Havok bones of a lever skeleton (the live reader's bound), and FLVER bones: the entries of the
@@ -107,6 +113,13 @@ struct Model {
     // let go and, completed, at its stop (end_deg = sweep_deg: its own clip ends turned).
     Motion motion{Motion::Pull};
     std::array<std::int32_t, 3> actions{}; // the ObjActParam rows placed with it (0: none)
+    // A scripted lever instead: the ActionButtonParam row its map's event script waits on at it
+    // (EMEVD IfActionButtonInArea), where the game places no ObjActParam row (o260042: 7100). Its
+    // root bone name must fit the script-prompt gate's one 8-byte compare (7 characters).
+    std::int32_t button{};
+    // The game's own prompt and button, untouched: the lever is not pulled by hand (Scripted is
+    // false, so the script-prompt gate never takes it over).
+    bool game_prompt{};
 };
 
 // The lever bone's ancestors, root first: Havok indices, and how many (0: not a chain of 1 to
@@ -135,9 +148,16 @@ constexpr ChainIdx Chain(const Model& m) {
     return out;
 }
 
+constexpr std::size_t NameLength(const char* s) {
+    std::size_t n = 0;
+    while (s[n] != '\0')
+        ++n;
+    return n;
+}
+
 // What any entry must be: the live checks (Match, the reader's bounds) rely on it.
 constexpr bool WellFormed(const Model& m) {
-    if (!m.name || m.count < 3 || m.count > MaxBones || m.mesh_count < 1 ||
+    if (!m.name || m.count < 2 || m.count > MaxBones || m.mesh_count < 1 ||
         m.mesh_count > MaxMeshBones || m.parents[0] != -1 || m.lever < 1 || m.lever >= m.count)
         return false;
     for (std::size_t i = 0; i < MaxBones; ++i) {
@@ -181,11 +201,14 @@ constexpr bool WellFormed(const Model& m) {
                      m.rest_q.z * m.rest_q.z + m.rest_q.w * m.rest_q.w;
     return drawn && axis2 > 0.998f && axis2 < 1.002f && q2 > 0.998f && q2 < 1.002f &&
            m.rest_s.x > 0.05f && m.rest_s.y > 0.05f && m.rest_s.z > 0.05f && m.sweep_deg > 0 &&
-           m.sweep_deg < 180 && m.end_deg >= 0 && m.end_deg <= m.sweep_deg && m.actions[0] != 0;
+           m.sweep_deg < 180 && m.end_deg >= 0 && m.end_deg <= m.sweep_deg &&
+           // Either rows or an action button, never both; a scripted lever is a lever stick.
+           (m.actions[0] != 0) != (m.button != 0) &&
+           (m.button == 0 || (m.motion == Motion::Pull && NameLength(m.bones[0]) <= 7));
 }
 
-inline constexpr std::array<Model, 15> Models{{
-    // Yharnam (m24_00 / 01 / 02): the first physical lever, measured 2026-10-12.
+inline constexpr std::array<Model, 19> Models{{
+    // Yharnam (m24_00 / 01 / 02): the first physical lever, measured (2026-10-12).
     {.name = "o240001",
      .count = 4,
      .bones = {"o240001", "o240001_00", "o240001_01", "o240001_02"},
@@ -421,6 +444,29 @@ inline constexpr std::array<Model, 15> Models{{
      .handle = {0.0009f, 0.885f, -0.6893f},
      .shaft_start = {0.0f, 0.42f, -0.33f},
      .actions = {2600000, 0, 0}},
+    // Nightmare of Mensis (m26_00): the lever whose pull plays cutscene 26000040 (entity 2601271).
+    // No ObjActParam row: event 12600026 waits on action button 7100 at it, so it binds by its own
+    // bone names alone and its pull answers that button. Its skeleton and idle clip are
+    // o260040's and o260041's under its own names, its mesh o260040's (two FLVER bones), its pull
+    // clip o260041's (starts and ends -4.99 degrees off rest: it binds there too).
+    // The user, 2026-11-07: this lever shows the game's own prompt and button (game_prompt). Its
+    // button zone does not reach the handle, so with the prompt hidden a player could neither pull
+    // it nor press B (0.9.3 report). Every other lever is pulled by hand as before.
+    {.name = "o260042",
+     .count = 4,
+     .bones = {"o260042", "o260042_00", "o260042_01", "o260042_02"},
+     .parents = {-1, 0, 0, 0},
+     .mesh_count = 2,
+     .mesh_map = {0, 1, 0, 0},
+     .rest_t = {0.0f, 0.2144193f, 0.0484846f},
+     .rest_q = {0, 0, 0, 1},
+     .rest_alt_deg = -4.9893f,
+     .axis = {1, 0, 0},
+     .sweep_deg = 75.7855f,
+     .handle = {0.0009f, 0.885f, -0.6893f},
+     .shaft_start = {0.0f, 0.42f, -0.33f},
+     .button = 7100,
+     .game_prompt = true},
     // Byrgenwerth (m32_00): the Lecture Building courtyard lever, the generic row 100 (a one-shot:
     // its script disables the action once used). Three Havok bones under four FLVER bones (the
     // fourth, the mechanism block behind it, has no Havok bone). The lever rests tilted -5 degrees,
@@ -468,6 +514,62 @@ inline constexpr std::array<Model, 15> Models{{
      .end_deg = 90.3353f,
      .motion = Motion::Capstan,
      .actions = {3500110, 0, 0}},
+    // The Chalice Dungeons (2026-11-04), from the user's dump: o290010's pull clip a000_000001
+    // (106 frames) turns the lever bone 82.11 degrees about its own -Y by frame 72 and back to
+    // rest, as o250010's; the grip is the knob's centre on the stem, 1.445 m out (bone-local,
+    // before its scale), the stem above the hinge wheel at 0.745.
+    {.name = "o290010",
+     .count = 3,
+     .bones = {"o9902", "o9902_00", "o9902_01", nullptr},
+     .parents = {-1, 0, 0, 0},
+     .mesh_count = 3,
+     .mesh_map = {0, 1, 2, 0},
+     .rest_t = {0.0f, 0.2144193f, 0.0484846f},
+     .rest_q = {0.6432018f, -0.6439532f, -0.2929297f, -0.2929297f},
+     .rest_s = {0.807792f, 0.456584f, 0.807792f},
+     .axis = {0, -1, 0},
+     .sweep_deg = 82.1077f,
+     .handle = {0.0f, 0.0017f, 1.445f},
+     .shaft_start = {0.0067f, 0.0009f, 0.745f},
+     .end_deg = 0.0f,
+     .actions = {9902, 0, 0}},
+    // The door levers: the same clip and pull, twice the size (the T-handle's centre 2.555 m out,
+    // the stem at 1.541), under a root turned -90 degrees about Y, four FLVER bones (two drawn
+    // from another provider).
+    {.name = "o290020",
+     .count = 3,
+     .bones = {"lever", "lever_01", "lever_02", nullptr},
+     .parents = {-1, 0, 0, 0},
+     .mesh_count = 4,
+     .mesh_map = {0, 1, -1, -1},
+     .chain_rest = {{{{0.0f, 0.0f, 0.0f}, {0.0f, -0.7074513f, 0.0f, 0.7067621f}}}},
+     .rest_t = {0.0f, 0.4144199f, 0.0484846f},
+     .rest_q = {-0.6439532f, 0.6432018f, 0.2929297f, 0.2929297f},
+     .rest_s = {0.807792f, 0.456584f, 0.807792f},
+     .axis = {0, -1, 0},
+     .sweep_deg = 82.1077f,
+     .handle = {-0.0471f, 0.0209f, 2.5548f},
+     .shaft_start = {-0.0202f, 0.0209f, 1.5411f},
+     .end_deg = 0.0f,
+     .actions = {2902000, 9902, 320}},
+    // The turning levers: the Research Hall capstan's clip (131 frames, 90.34 degrees about +Y by
+    // frame 128, kept there) on the root's one child, the bar's grip 2.833 m from the hub at
+    // 1.31 m up, the bar's inner end 1.469 m out.
+    {.name = "o293110",
+     .count = 2,
+     .bones = {"o293110", "_01", nullptr, nullptr},
+     .parents = {-1, 0, 0, 0},
+     .mesh_count = 2,
+     .mesh_map = {0, 1, 0, 0},
+     .rest_t = {0.0f, 0.0f, 0.0f},
+     .rest_q = {0.0f, 0.0f, 0.0f, 1.0f},
+     .axis = {0, 1, 0},
+     .sweep_deg = 90.3353f,
+     .handle = {2.833f, 1.3098f, -0.0028f},
+     .shaft_start = {1.469f, 1.3098f, -0.0028f},
+     .end_deg = 90.3353f,
+     .motion = Motion::Capstan,
+     .actions = {2931100, 9902, 0}},
 }};
 static_assert(std::ranges::all_of(Models, WellFormed), "every lever model must be well formed");
 
@@ -539,6 +641,11 @@ inline bool SameLayout(const Model& m, const Skeleton& s) {
             return false;
     }
     return true;
+}
+
+// A scripted lever: pulled through its map's action button (`button`), no ObjActParam row.
+constexpr bool Scripted(const Model& m) {
+    return m.button != 0 && !m.game_prompt;
 }
 
 inline bool ListedWith(const Model& m, std::int32_t action) {

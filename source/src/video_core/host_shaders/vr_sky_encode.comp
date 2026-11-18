@@ -1,0 +1,175 @@
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+#version 450
+
+// Sky detail (texture_cache/sky_detail.h): one 4 x 4 block of one level of the copy made from
+// your image per invocation, BC7 mode 6 (one line of 16 colours per block between two RGBA
+// endpoints of 7 bits each plus a shared low bit). Each level is your image's level as it is (no
+// resampling here); values stay sRGB-encoded, which is where BC7 interpolates.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D clean; // straight RGBA, encoded values, its mips
+layout(set = 0, binding = 1, std430) writeonly buffer Blocks {
+    uvec4 blocks[];
+};
+
+layout(push_constant) uniform Push {
+    ivec2 src_size;   // the level read (the same size as this level)
+    ivec2 dst_size;   // this level of the copy
+    uint src_level;
+    uint first_block; // this level's first block in `blocks`
+    uint blocks_x;
+    uint blocks_y;
+} pc;
+
+vec4 Texel(ivec2 q) {
+    return texelFetch(clean, clamp(q, ivec2(0), pc.src_size - 1), int(pc.src_level));
+}
+
+// BC7's 4-bit index weights (of 64).
+const float Weights[16] = float[16](0.0, 4.0, 9.0, 13.0, 17.0, 21.0, 26.0, 30.0, 34.0, 38.0,
+                                    43.0, 47.0, 51.0, 55.0, 60.0, 64.0);
+
+uvec4 bits;
+uint pos;
+
+void Put(uint value, uint count) {
+    const uint word = pos >> 5u, offset = pos & 31u;
+    bits[word] |= value << offset;
+    if (offset + count > 32u) {
+        bits[word + 1u] |= value >> (32u - offset);
+    }
+    pos += count;
+}
+
+// An endpoint (0..255) as 7 bits per channel plus its low bit, the nearer of the two low bits
+// (an opaque block keeps alpha 255: low bit 1, alpha 127).
+void Quantize(vec4 e, bool opaque, out uvec4 q, out uint p) {
+    float best = 1e30;
+    q = uvec4(0u);
+    p = 1u;
+    for (uint bit = opaque ? 1u : 0u; bit < 2u; ++bit) {
+        uvec4 c = uvec4(clamp(round((e - float(bit)) * 0.5), 0.0, 127.0));
+        if (opaque) {
+            c.a = 127u;
+        }
+        const vec4 v = vec4(c) * 2.0 + float(bit);
+        const float err = dot(v - e, v - e);
+        if (err < best) {
+            best = err;
+            q = c;
+            p = bit;
+        }
+    }
+}
+
+void main() {
+    const uvec2 b = gl_GlobalInvocationID.xy;
+    if (b.x >= pc.blocks_x || b.y >= pc.blocks_y) {
+        return;
+    }
+    vec4 px[16];
+    vec4 mean = vec4(0.0), lo = vec4(255.0), hi = vec4(0.0);
+    bool opaque = true;
+    for (int k = 0; k < 16; ++k) {
+        const ivec2 d = min(ivec2(b) * 4 + ivec2(k & 3, k >> 2), pc.dst_size - 1);
+        px[k] = clamp(Texel(d), 0.0, 1.0) * 255.0;
+        mean += px[k];
+        lo = min(lo, px[k]);
+        hi = max(hi, px[k]);
+        opaque = opaque && px[k].a >= 254.5;
+    }
+    mean *= 1.0 / 16.0;
+
+    // The block's main direction (power iteration on its covariance), its extent along it.
+    mat4 cov = mat4(0.0);
+    for (int k = 0; k < 16; ++k) {
+        const vec4 d = px[k] - mean;
+        cov += outerProduct(d, d);
+    }
+    vec4 axis = hi - lo;
+    if (opaque) {
+        cov[3] = vec4(0.0);
+        cov[0].w = cov[1].w = cov[2].w = 0.0;
+        axis.a = 0.0;
+    }
+    const float extent = dot(axis, axis);
+    if (extent > 1e-6) {
+        axis *= inversesqrt(extent);
+        for (int it = 0; it < 8; ++it) {
+            const vec4 next = cov * axis;
+            const float len = dot(next, next);
+            if (len < 1e-12) {
+                break;
+            }
+            axis = next * inversesqrt(len);
+        }
+    }
+    float tmin = 0.0, tmax = 0.0;
+    for (int k = 0; k < 16; ++k) {
+        const float t = dot(px[k] - mean, axis);
+        tmin = min(tmin, t);
+        tmax = max(tmax, t);
+    }
+    vec4 e0 = clamp(mean + axis * tmin, 0.0, 255.0);
+    vec4 e1 = clamp(mean + axis * tmax, 0.0, 255.0);
+    if (opaque) {
+        e0.a = e1.a = 255.0;
+    }
+    uvec4 q0, q1;
+    uint p0, p1;
+    Quantize(e0, opaque, q0, p0);
+    Quantize(e1, opaque, q1, p1);
+    const vec4 v0 = vec4(q0) * 2.0 + float(p0);
+    const vec4 v1 = vec4(q1) * 2.0 + float(p1);
+
+    // Each texel's nearest of the 16 colours between the stored endpoints.
+    const vec4 dir = v1 - v0;
+    const float dd = dot(dir, dir);
+    uint idx[16];
+    for (int k = 0; k < 16; ++k) {
+        const float t = dd > 0.0 ? clamp(dot(px[k] - v0, dir) / dd, 0.0, 1.0) * 64.0 : 0.0;
+        uint best = 0u;
+        float best_err = 1e30;
+        for (uint i = 0u; i < 16u; ++i) {
+            const float err = abs(Weights[i] - t);
+            if (err < best_err) {
+                best_err = err;
+                best = i;
+            }
+        }
+        idx[k] = best;
+    }
+    // The first texel's index has an implicit top bit of 0: swap the endpoints when it is set.
+    if (idx[0] >= 8u) {
+        const uvec4 tq = q0;
+        q0 = q1;
+        q1 = tq;
+        const uint tp = p0;
+        p0 = p1;
+        p1 = tp;
+        for (int k = 0; k < 16; ++k) {
+            idx[k] = 15u - idx[k];
+        }
+    }
+
+    bits = uvec4(0u);
+    pos = 0u;
+    Put(1u << 6u, 7u); // mode 6
+    Put(q0.r, 7u);
+    Put(q1.r, 7u);
+    Put(q0.g, 7u);
+    Put(q1.g, 7u);
+    Put(q0.b, 7u);
+    Put(q1.b, 7u);
+    Put(q0.a, 7u);
+    Put(q1.a, 7u);
+    Put(p0, 1u);
+    Put(p1, 1u);
+    Put(idx[0], 3u);
+    for (int k = 1; k < 16; ++k) {
+        Put(idx[k], 4u);
+    }
+    blocks[pc.first_block + b.y * pc.blocks_x + b.x] = bits;
+}

@@ -18,6 +18,7 @@
 #include <xbyak/xbyak.h>
 
 #include "common/logging/log.h"
+#include "core/vr/bloodborne_deflect.h"
 #include "core/vr/bloodborne_melee.h"
 #include "core/vr/bloodborne_headshot.h"
 #include "core/vr/bloodborne_ragdoll.h"
@@ -25,6 +26,7 @@
 #include "core/vr/bloodborne_visceral_pull.h"
 #include "core/vr/visceral_pull.h"
 #include "core/vr/body_channel.h"
+#include "core/vr/bow.h"
 #include "core/vr/health_bonus.h"
 #include "core/vr/outgoing_damage.h"
 #include "core/vr/hit_direction.h"
@@ -342,8 +344,9 @@ void PS4_SYSV_ABI OffhandDamageHook(u8* res, u8* saved_ymm, u8* attacker) {
         }
     }
     // The interactive visceral (core/vr/bloodborne_visceral_pull.h): a throw's first damage
-    // teaches its rip time.
+    // teaches its rip time; any visceral's rip starts riposte_style's burst.
     if (target != player && std::isfinite(*damage) && *damage > 0.0f) {
+        RiposteOnDamage(player, target, Read<s32>(res + ResBullet));
         if (VisceralPullOnDamage(player, target, Read<s32>(res + ResBullet))) {
             *damage *= VR::Melee::Pull::MistimedDamageScale;
         }
@@ -358,6 +361,13 @@ void PS4_SYSV_ABI OffhandDamageHook(u8* res, u8* saved_ymm, u8* attacker) {
     *damage = OutgoingDamage::Scale(*damage,
         OutgoingDamage::live_percent.load(std::memory_order_relaxed),
         attacker == player, Plausible(target) && target != player);
+    // The Bowblade's arrows (bow_damage_pct, core/vr/bow.h ArrowDamageScale: 105%).
+    if (std::isfinite(*damage) && *damage > 0.0f) {
+        *damage *= VR::Bow::ArrowDamageScale(Read<s32>(res + ResBehaviorId),
+                                             Read<s32>(res + ResBullet) != -1, attacker == player,
+                                             Plausible(target) && target != player,
+                                             VR::Bow::GetBowSettings());
+    }
     const float raw = *damage;
     const bool swing = MeleeDamage(res, target, damage);
     // melee_kill_ragdoll (core/vr/bloodborne_ragdoll.h): a lethal right-hand weapon attack arms
@@ -392,6 +402,16 @@ void PS4_SYSV_ABI OffhandDamageHook(u8* res, u8* saved_ymm, u8* attacker) {
     if (other && !g_offhand_dry) {
         *damage = GunHeadshotDamage(res, target, *damage);
         after = *damage;
+    }
+    // Beast Claw dismemberment (core/vr/sever_policy.h): the final damage decides a kill; it is
+    // cut by chance, the stronger the swing the surer (core/vr/bloodborne_sever.cpp; VR_SEVER=0:
+    // never).
+    if (other) {
+        SeverOnPlayerHit(res, player, *damage);
+    }
+    // A blast the blade sent back hitting its shooter (bloodborne_deflect.cpp): felt in the hand.
+    if (other && Read<s32>(res + ResBullet) != -1 && std::isfinite(*damage) && *damage > 0.0f) {
+        DeflectOnDamage(target, Read<s32>(res + ResBullet), *damage);
     }
     if (g_offhand_log == 0) {
         return;

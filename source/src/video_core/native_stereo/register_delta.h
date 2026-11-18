@@ -26,6 +26,10 @@ class RegisterDeltaTracker {
     std::bitset<Blocks> dirty;
     std::vector<uint16_t> pending;
     bool reset{};
+    // Blocks marked since the last ClearSinceReset, independent of Capture: the producer's
+    // ClearState copies the defaults into these only (bbport 0.7 regs.cpp touched reset).
+    std::bitset<Blocks> since_reset;
+    std::vector<uint16_t> since_reset_list;
     struct Checksums {
         std::array<uint64_t, Blocks> blocks{};
         std::bitset<Blocks> dirty;
@@ -56,7 +60,17 @@ public:
     using Packet = std::vector<Block>;
     static constexpr size_t NumBlocks = Blocks;
     static constexpr size_t WordsPerBlock = BlockWords;
-    RegisterDeltaTracker() { pending.reserve(Blocks); MarkAll(); }
+    RegisterDeltaTracker() {
+        pending.reserve(Blocks);
+        since_reset_list.reserve(Blocks);
+        MarkAll();
+    }
+    // Every block written since the last ClearSinceReset (all of them before the first).
+    std::span<const uint16_t> SinceReset() const { return since_reset_list; }
+    void ClearSinceReset() {
+        since_reset.reset();
+        since_reset_list.clear();
+    }
     void MarkAll() { Mark(0, WordCount); }
     // Block checksums of one fixed state (ClearState defaults): adopting them replaces
     // rehashing every block (bbport regs_reset). Only valid while the registers equal it.
@@ -118,6 +132,10 @@ public:
             if (!dirty.test(block)) {
                 pending.push_back(static_cast<uint16_t>(block));
                 dirty.set(block);
+            }
+            if (!since_reset.test(block)) {
+                since_reset_list.push_back(static_cast<uint16_t>(block));
+                since_reset.set(block);
             }
         }
     }

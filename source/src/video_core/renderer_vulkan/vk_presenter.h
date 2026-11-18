@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/renderer_vulkan/vr_eye_upscale.h"
+#include "video_core/renderer_vulkan/vr_riposte_meter.h"
 #include "video_core/renderer_vulkan/vr_native_fsr1_probe.h"
 #include "video_core/renderer_vulkan/vr_stereo_warp.h"
 #include "video_core/renderer_vulkan/vr_ui_layer.h"
@@ -53,6 +54,9 @@ struct Frame {
     // (crop-sized, eTransferSrcOptimal, swapchain byte order; owned by the presenter).
     bool vr_stereo{false};
     std::array<std::unique_ptr<VideoCore::UniqueImage>,2> native_eyes;
+    // Native eyes larger than the runtime takes per eye, scaled down to fit (FitEye; made only
+    // for those frames, dropped once the eyes fit). Owned like native_eyes.
+    std::array<std::unique_ptr<VideoCore::UniqueImage>,2> native_fit_eyes;
     std::array<vk::UniqueImageView, 2> native_eye_views;
     std::array<vk::Image, 2> vr_eye_image{};
     std::array<vk::Extent2D, 2> vr_eye_extent{};
@@ -140,8 +144,15 @@ public:
     void Present(Frame* frame, bool is_reusing_frame = false);
     Frame* PrepareLastFrame();
 
+    /// VR, the GPU command thread, once a flip is handed to the present thread: takes the output
+    /// frame the next flip will use now (VR_FRAME_PREACQUIRE=0: not; Presenter.cpp).
+    void ReserveRenderFrame();
+
 private:
     Frame* GetRenderFrame();
+    /// The GPU command thread's flips: the reserved frame (resized if the game's size changed),
+    /// else a free one.
+    Frame* TakeRenderFrame();
 
     void RecreateFrame(Frame* frame, u32 width, u32 height);
 
@@ -181,6 +192,9 @@ private:
     HostPasses::PostProcessingPass pp_pass;
     std::unique_ptr<HostPasses::PostProcessingPass> native_feedback_pass;
     vk::Format native_feedback_format{};
+    // vr.ini riposte_style: the native eyes' burst brightness (made with native_feedback_pass).
+    VrRiposteMeter native_riposte_meter;
+    bool native_riposte_meter_failed{false};
     VR::VitalColor::State native_feedback_state;
     s64 native_feedback_ns{};
     AmdGpu::Liverpool* liverpool;
@@ -265,6 +279,7 @@ private:
     // headset so far (the every-Nth count) and the eye blit's intermediate (the window's size;
     // RecordMirrorEye).
     u64 mirror_published{0};
+    s64 mirror_last_shown_ns{0}; // DesktopMirror::PresentsAt: the last frame the window showed
     u64 mirror_skipped{0};
     u64 mirror_eye_shown{0};
     VideoCore::UniqueImage mirror_image;
@@ -274,6 +289,7 @@ private:
     vk::UniqueCommandPool command_pool;
     std::vector<Frame> present_frames;
     std::queue<Frame*> free_queue;
+    Frame* reserved_frame{}; // ReserveRenderFrame (the GPU command thread only)
     Frame* last_submit_frame;
     std::mutex free_mutex;
     std::condition_variable free_cv;

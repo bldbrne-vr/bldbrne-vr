@@ -46,5 +46,9 @@ std::unique_ptr<IFile> OpenFileOverride(std::string_view guest_path);
 void NoteGuestOpen(std::string_view guest_path);
 // steady_clock nanoseconds of the last cutscene file opened (0: none yet). Any thread.
 s64 LastCutsceneOpenNs();
+// Optional process-lifetime observer, called before opening cutscene assets. It
+// must not retain guest_path, open files recursively, or alter the file itself.
+using CutsceneOpenObserver = void (*)(std::string_view guest_path);
+void SetCutsceneOpenObserver(CutsceneOpenObserver observer);
 
 } // namespace Core::FileSys

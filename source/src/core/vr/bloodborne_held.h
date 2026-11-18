@@ -35,12 +35,21 @@ namespace VR::Bloodborne {
 // OnEbootLoaded (VR enabled): checks the sites. Logs one line either way.
 void InstallHeld(VAddr base, u64 size);
 
+// OnEbootLoaded, before the game's params are prepared (VR or not; nothing without VR): checks the
+// effect sites alone, which the torch, the Boom Hammer and the Tonitrus use whatever the vial's
+// settings. TonitrusEffectsReady: they matched, so the Tonitrus' charge is followed every update
+// and its idle crackle can be hidden (core/vr/tonitrus_charge.h): the charge's own is then ended
+// here.
+void PrepareHeldEffects(VAddr base, u64 size);
+[[nodiscard]] bool TonitrusEffectsReady();
+
 // The arm gate of this update, from the body (core/vr/anim_classes.h).
 struct HeldGate {
     bool valid{false};
     VR::Body::GateReason reason{VR::Body::GateReason::None};
     VR::Body::AnimClass owner{VR::Body::AnimClass::Unknown};
     bool held{false};
+    bool blood_bullet_vial{false}; // exact 100141 clip, its native item window open
 };
 
 // The body's pose-copy wrapper, main player only (loop thread), every update.

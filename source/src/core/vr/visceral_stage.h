@@ -7,7 +7,9 @@
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #pragma once
 
+#include <span>
 #include "core/vr/body_frame.h"
+#include "core/vr/visceral_clearance.h"
 
 namespace VR::VisceralStage {
 using Body::Vec3;
@@ -117,6 +119,11 @@ inline bool Valid(const Entry& e) {
 
 // The native destination can contain a sentinel meaning "no translation".
 // Preserve those values and the native vertical placement on slopes/stairs.
+// The victim's root is kept at least `minimum_root_m` from the eyes, level: pushed out along the
+// line from the eyes to where the game puts it, never through the hunter. (The entry's view yaw
+// is the camera's, which points the other way for the game's own facing: pushing along it put the
+// victim behind the hunter and the game dropped the throw, 2026-10-27 mock trace.) A destination
+// at the eyes falls back to the line from the hunter's root, else it is left alone.
 inline bool Constrain(const Entry& e, bool hunter, Vec3& destination,
                       float minimum_root_m = 1.25f) {
     if (!Valid(e) || !Body::IsFinite(destination) ||
@@ -127,11 +134,42 @@ inline bool Constrain(const Entry& e, bool hunter, Vec3& destination,
         destination.x = e.physics_root.x;
         destination.z = e.physics_root.z;
     } else {
-        const float gap = Body::Dot(destination - e.eye, e.forward);
-        destination = destination + e.forward *
-            std::max(0.0f, minimum_root_m * e.scale - gap);
+        const float need = minimum_root_m * e.scale;
+        Vec3 away{destination.x - e.eye.x, 0.0f, destination.z - e.eye.z};
+        float gap = Body::Length(away);
+        if (gap < 1e-3f) {
+            away = {destination.x - e.physics_root.x, 0.0f, destination.z - e.physics_root.z};
+            if (Body::Length(away) < 1e-3f) return true;
+        }
+        away = away * (1.0f / Body::Length(away));
+        if (gap < need) {
+            destination.x = e.eye.x + away.x * need;
+            destination.z = e.eye.z + away.z * need;
+        }
     }
     return true;
+}
+
+// The size-aware hold: how far (world units, at most `max_push`) the victim moves past where the
+// game puts it, straight away from the eyes (`away`, level, unit), so that no part of its body
+// (its capsules now, moved by `to_destination` = the game's destination - its root now) comes
+// nearer the eyes than `keep`. 0 when none does: an enemy that would not clip stays where the
+// game puts it, a big one goes back only as far as its body needs.
+inline float BodyPush(Vec3 eye, Vec3 away, std::span<const GrabCamera::CollisionCapsule> body,
+                      Vec3 to_destination, float keep, float max_push) {
+    if (body.empty() || !Body::IsFinite(eye) || !Body::IsFinite(away) ||
+        !Body::IsFinite(to_destination) || !std::isfinite(keep) || !std::isfinite(max_push) ||
+        std::abs(Body::LengthSq(away) - 1.0f) > 0.001f || std::abs(away.y) > 1e-5f)
+        return 0.0f;
+    float push = 0.0f;
+    // Moving away by d opens the nearest gap by at most d: a few steps reach it.
+    for (int i = 0; i < 8; ++i) {
+        const float gap = GrabCamera::NearestGap(eye, body, to_destination + away * push);
+        if (!std::isfinite(gap) || gap >= keep - 1e-4f) break;
+        push = std::min(max_push, push + (keep - gap));
+        if (push >= max_push) break;
+    }
+    return push;
 }
 
 class Lifetime {

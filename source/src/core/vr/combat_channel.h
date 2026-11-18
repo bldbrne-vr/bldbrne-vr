@@ -35,6 +35,17 @@ struct SawRequest {
 void PublishSawRequest(const SawRequest& request);
 bool LatestSawRequest(SawRequest& out);
 
+// Logarius' Wheel's spin (core/vr/wheel_rev.h): a step the left trigger started, played on the
+// weapon only by the game's update (core/vr/bloodborne_transform.cpp). Seqlock (the serial tells
+// a new one).
+struct WheelSpin {
+    std::uint32_t serial{0}; // +1 per step
+    std::int32_t step{0};    // 1..WheelRev::Steps
+    std::int64_t ns{0};      // steady clock
+};
+void PublishWheelSpin(const WheelSpin& spin);
+bool LatestWheelSpin(WheelSpin& out);
+
 struct GunPull {
     std::uint32_t serial{0};  // +1 per edge
     bool direct{false};       // the game fires it (else the game's own L2 path)
@@ -117,6 +128,8 @@ struct MeleeWindow {
     std::uint8_t verdict{0};      // ... (MoveKind)
     float tip_speed{0.0f};        // m/s, the blade's far end now
     float tip_peak{0.0f};         // ... the window's peak so far
+    float hand_peak{0.0f};        // m/s, the weapon hand's peak (head-relative): the bonus's arm
+    float arc_peak{0.0f};         // rad, the widest its stroke swept (a Beast Claw cut's "wide")
     float since_counted_s{10.0f}; // from the last window that counted to this one's opening
     std::int64_t open_ns{0};      // steady clock
     std::int64_t close_ns{0};     // 0 while open
@@ -139,7 +152,14 @@ struct MeleeWindow {
     // A two-handed swing (core/vr/two_hand_grip.h SwingMark: the left grip held the handle and
     // the left hand moved with it): its hits x this (two_hand_damage); 1 = one-handed.
     float two_hand{1.0f};
+    bool two_handed{false}; // both hands moved; independent of the configured damage bonus
+    // Optimized controls: unsupported shared-handle form. -1 means no penalty.
+    std::int32_t unsupported_family{-1};
     bool powered{false}; // released Stake Driver charge; the mechanism supplies the impact
+    bool contact_hold{false}; // Cane/Cutter whip sweep: pace from first damaging contact
+    // Its hits x this (core/vr/dual_blades.h DamageScale: the split blades', a honed one's), taken
+    // when its attack starts; 1: untouched.
+    float damage_scale{1.0f};
 };
 
 struct MeleeStatus {
@@ -199,6 +219,33 @@ enum class MeleeEventKind : std::uint8_t {
     // A left window the game refused (melee_left; serial: its left window; why): its charges come
     // back, the left hand gets the deny tick.
     LeftDenied,
+    // A bullet sent back at its shooter (bullet deflection, core/vr/bloodborne_deflect.cpp): a = 0
+    // as the blade sends its blast back (b = a swing's return's chance, 1 for straight back), 1
+    // when the blast first hits him (b = that hit's damage).
+    Ricochet,
+    // A bare hand on a corpse (core/vr/bloodborne_corpse.cpp; serial: the hand, 0 left, 1 right):
+    // a = 0 it touched one (b = how fast it moved into it, m/s), 1 it took hold (b = the corpse's
+    // mass, kg), 2 the corpse slipped out, 3 still holding (b = the share of its strength used, every
+    // 0.1 s), 4 it let go.
+    Corpse,
+    // A contact-held sweep's attack (Cane/Cutter whip) ended (why): its window closes too.
+    Ended,
+    // The lit Boom Hammer exploded (core/vr/boom_blast.h; serial: its swing): its fire is spent,
+    // whatever the blast hit (an enemy, a wall, the ground). a = 1 for the charged's.
+    Blast,
+    // A cut came off (core/vr/bloodborne_sever.cpp, as its piece is first drawn): the weapon hand
+    // feels the tear and the weight leaving it (sever_feel.h SeverTear), after its bite's blow,
+    // never over a newer hit. serial: the cut's (its SeverBite's); a = 1 for a charged cut's;
+    // b = the same striking hands as SeverBite (sever_feel.h StrikeHands).
+    Sever,
+    // A killing blow that cuts (bloodborne_sever.cpp SeverKill, at the hit): its bite, the hit's
+    // own impact made sharper and fuller (sever_feel.h SeverBite). serial: the cut's (never 0);
+    // a = 1 for a charged cut's; b = 1 the left claw's (the left hand), 2 a two-handed swing's
+    // (both hands, as its hit's impact).
+    SeverBite,
+    // The game confirmed an object broke. serial = matched attack; a = hand (0 left / 1
+    // right), b = the right attack's shared-grip flag. Feedback only, never an enemy hit.
+    ObjectBreak,
 };
 
 // A shot refused for want of stamina (Shot's why): no arrow, and no game shot in its place.
@@ -211,6 +258,9 @@ struct MeleeEvent {
     float b{0.0f};
     std::int64_t ns{0};
     const char* why{""}; // a static string
+    // Hit / LeftHit: the damage scale its attack took when it started (MeleeWindow::damage_scale:
+    // the split blades', a honed one's), so a hone is spent only by a hit that carried it.
+    float scale{1.0f};
 };
 
 // The telegraph (presenter -> game; core/vr/melee_window.h TelegraphTracker): a swing the enemies
@@ -261,6 +311,7 @@ struct BladeShot {
     Body::Vec3 dir{};
     std::uint32_t space_serial{0}; // the tracking space `dir` is in (recenters)
     std::uint32_t window{0};       // the swing it belongs to (0: the trigger's)
+    Body::Vec3 slash{}; // MoonWave only: blade travel at peak speed, in dir's tracking space
 };
 
 // Presenter (one writer).
@@ -288,9 +339,21 @@ struct TransformPull {
     bool no_join{false};
 };
 
+// The Boom Hammer's fire spent (the presenter: boom_fire_hits landed while lit; the user,
+// 2026-11-06: "can we have the fire go out after doing a hit?", as the base game's one-hit
+// buff): back to form A, the weapon only, once the swing that spent it lets go of the arm
+// (core/vr/bloodborne_transform.cpp).
+struct FurnaceQuench {
+    std::uint32_t serial{0}; // +1 per spent fire
+    std::int64_t ns{0};      // steady clock (the hit)
+};
+
 struct TransformStatus {
     std::int64_t ns{0};
     bool installed{false}; // the hook and the form switch matched
+    // The weapon-only transform runs (installed, transform=native): a FurnaceQuench is carried
+    // out (else it is dropped, and the lit Boom Hammer's squeeze stays the game's L1).
+    bool native{false};
     bool ok{false};        // a squeeze now goes native (else: L1)
     bool busy{false};      // a transform is running
     std::int32_t weapon_id{-1};
@@ -322,6 +385,9 @@ struct TransformEvent {
 void PublishTransformPull(const TransformPull& pull);
 // Any thread. False before the first squeeze.
 bool LatestTransformPull(TransformPull& out);
+// Presenter (one writer); any thread. False before the first.
+void PublishFurnaceQuench(const FurnaceQuench& quench);
+bool LatestFurnaceQuench(FurnaceQuench& out);
 
 // The pose-copy wrapper (one writer).
 void PublishTransformStatus(const TransformStatus& status);

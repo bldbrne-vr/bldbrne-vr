@@ -221,4 +221,131 @@ private:
     double last_fire{-1e9};
 };
 
+// A quick duck (vr.ini duck_iframes_ms, the tester 2026-10-26): the neck pivot (the eyes less the
+// head's turn about the neck, core/vr/vial_zones.h NeckFromEye, so looking down at the belt or the
+// floor moves nothing) comes down at least `speed` on average over the last `hold_s` and at least
+// `dist_m` below its highest point within `window_s`, with no swing in progress. One per drop: the
+// next waits until this one has ended (the average speed under half of `speed`). The caller's
+// cooldown is the lean i-frames' own (lean_iframes_cooldown_ms), shared by both.
+struct DuckConfig {
+    // m/s down, on average over ... (1.0 until 2026-10-27: bending to look low fired it, the
+    // user's "fires too easily"; vr.ini duck_speed)
+    float speed{1.3f};
+    float hold_s{0.060f};   // ... this long
+    float dist_m{0.18f};    // below the highest point ... (15 cm until 2026-10-26: the user's 18)
+    float window_s{0.250f}; // ... within this window
+    // A jump this big in one frame is a tracking glitch: start again (a fast duck moves the neck
+    // about 2 cm a frame at 90 Hz, 7 cm in a 33 ms hitch).
+    float glitch_m{0.12f};
+};
+
+struct DuckInput {
+    double t{};          // seconds
+    bool enabled{false}; // duck i-frames on, standing, gameplay shown in VR
+    bool neck_ok{false}; // headset position and orientation tracked
+    float neck_y{};      // the neck pivot's height (LOCAL, m)
+    bool swing{false};   // a swing is in progress (weapon hand)
+};
+
+struct DuckOutput {
+    bool fire{false};
+    float speed{};             // m/s down, over hold_s (fire and rejections)
+    float drop{};              // m below the window's highest point
+    const char* rejected{""};  // a fast drop refused, once per drop ("swing"; "" none)
+};
+
+class DuckDetector {
+public:
+    static constexpr size_t Capacity = 128;
+
+    DuckOutput Update(const DuckInput& in, const DuckConfig& cfg) {
+        DuckOutput out{};
+        if (!in.enabled || !in.neck_ok || !std::isfinite(in.neck_y)) {
+            Reset();
+            return out;
+        }
+        if (count > 0) {
+            const Sample& last = samples[count - 1];
+            if (in.t < last.t || std::abs(in.neck_y - last.y) > cfg.glitch_m) {
+                Reset();
+            } else if (in.t == last.t) {
+                return out; // the same pose again
+            }
+        }
+        if (count == Capacity) {
+            std::move(samples.begin() + 1, samples.end(), samples.begin());
+            --count;
+        }
+        samples[count++] = {in.t, in.neck_y};
+        size_t old = 0;
+        while (old + 1 < count && in.t - samples[old].t > cfg.window_s + 0.05) {
+            ++old;
+        }
+        if (old > 0) {
+            std::move(samples.begin() + old, samples.begin() + count, samples.begin());
+            count -= old;
+        }
+        // The average speed down over hold_s: from the newest sample at least that old.
+        const Sample* then = nullptr;
+        for (size_t i = count; i-- > 0;) {
+            if (in.t - samples[i].t >= cfg.hold_s) {
+                then = &samples[i];
+                break;
+            }
+        }
+        if (then == nullptr) {
+            return out; // not hold_s of history yet
+        }
+        const float speed = (then->y - in.neck_y) / static_cast<float>(in.t - then->t);
+        float high = in.neck_y;
+        for (size_t i = 0; i < count; ++i) {
+            if (in.t - samples[i].t <= cfg.window_s) {
+                high = std::max(high, samples[i].y);
+            }
+        }
+        out.speed = speed;
+        out.drop = high - in.neck_y;
+        if (fired) {
+            if (speed < 0.5f * cfg.speed) {
+                fired = false; // the drop has ended
+                refused = false;
+            }
+            return out;
+        }
+        if (speed < cfg.speed || out.drop < cfg.dist_m) {
+            if (speed < 0.5f * cfg.speed) {
+                refused = false;
+            }
+            return out;
+        }
+        if (in.swing) {
+            if (!refused) {
+                refused = true;
+                out.rejected = "swing"; // still dropping: a later frame may pass
+            }
+            return out;
+        }
+        fired = true;
+        refused = false;
+        out.fire = true;
+        return out;
+    }
+
+    void Reset() {
+        count = 0;
+        fired = false;
+        refused = false;
+    }
+
+private:
+    struct Sample {
+        double t;
+        float y;
+    };
+    std::array<Sample, Capacity> samples{};
+    size_t count{0};
+    bool fired{false};
+    bool refused{false};
+};
+
 } // namespace VR::Lean

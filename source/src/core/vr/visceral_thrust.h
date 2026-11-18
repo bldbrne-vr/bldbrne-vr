@@ -47,6 +47,15 @@
 // Conventions: OpenXR LOCAL space (+x right, +y up, +z back), meters, seconds.
 namespace VR::Melee::Thrust {
 
+// These grips can point the controller's sword axis away from a deliberate forward shove.
+// Behaviour variations, not model ids. Dual blades qualify only while split. This policy is
+// for visceral intent only: it never changes the ordinary swing/punch classifier or hit range.
+inline constexpr bool ForwardAssistWeapon(std::int32_t variation, bool form_b) {
+    return variation == 900 || variation == 1200 || // Beast Claw, Logarius' Wheel
+           variation == 1000 || variation == 710 || // Rifle Spear, Saw Spear
+           (form_b && (variation == 400 || variation == 2700)); // Blade of Mercy, Rakuyo
+}
+
 enum class Verdict : std::uint8_t { None, Pending, Thrust, Swing };
 
 inline const char* VerdictName(Verdict v) {
@@ -64,7 +73,14 @@ inline const char* VerdictName(Verdict v) {
 }
 
 struct Config {
-    // The feel review (offline analysis):
+    // Selected grips at an open visceral: an additional straight-punch route, independent
+    // of the controller's sword axis. Ordinary thrust recognition stays unchanged.
+    bool hand_path{false};
+    // The hand drawn back, up or aside before the stab is not judged (MotionDetector's CockMaxM).
+    bool draw_free{false};
+    float punch_travel{0.12f};
+    float punch_bend{8.0f * Deg};
+    // The feel review (2026-10-06, minimum-jerk human thrusts):
     // 1.8 m/s / 12 cm / 37 deg missed a tentative 25 cm stab in 0.3 s (1.56 m/s peak), a seated
     // 18 cm jab (1.53) and a lunge (the head's 15-20 cm taken out: 1.56), and a stab with the blade
     // held 40 deg above the motion; a reach (1.25 m/s) and a slow push (1.2) stay no thrust at 1.5.
@@ -85,6 +101,8 @@ struct Config {
     float path_fwd_cos{0.8660f};  // the hand's path: within 30 degrees of the head's facing
     float max_path_bend{8.0f * Deg};  // ... the hand's direction this close to its start
     float path_blade_max{60.0f * Deg}; // ... and the blade within this of the path
+    float rise_weight{1.0f};      // fast travel off the line that RISES, once the hand went half
+                                  // of min_travel ahead, counts this much (a stab ending upward)
     float max_time{0.45f};        // s: a motion that is not a thrust by then is not one
     float refractory{0.35f};      // s after a thrust: no other
 
@@ -104,15 +122,43 @@ struct Config {
     // more off its axis. A swing (its blade turning 90-170 degrees) still is none. The turn: the
     // user's real stabs at the Blood-starved Beast (2026-10-18 log) turned the blade 23-29 degrees
     // and the ones at its open viscerals were judged swings for turning it (40 then): 55 now.
-    Config EasedForOpenVisceral() const {
+    // 2026-10-27, the user: a tiny bit easier, more forgiving with the angle, above all a stab
+    // that goes straight and then up; 2026-10-28: a tiny bit harder again, between the two: 20%
+    // less travel (8 cm, the user), 8 degrees off the line (53), 30 more turn (60), 2.5 cm off its axis
+    // (8.5), the hand's path bending 12 degrees, and travel off the line that rises counts 60%.
+    // The speed and the blade's 50 degrees above level stay (a reach, a weapon raised fast, are
+    // still none). 2026-10-30, the user: a little easier, but never by mistake: only shorter, 7 cm
+    // (30% less travel); the speed, the angles and the turn, which keep swings and reaches out,
+    // stay as on 10-28. 2026-11-06, the user: a TINY bit easier, the travel staying 7 cm ("I think
+    // it's the angle"): 1 degree more off the blade's line (54, the user; 56 tried) and the hand's
+    // path bending 14; the blade off the path stays 60 (65 let 32 swings of the sweep through), as
+    // do the speed and the blade's turn, which keep swings and reaches out.
+    Config EasedForOpenVisceral(bool claw_punch = false) const {
         Config c = *this;
         c.min_speed = std::max(min_speed * 0.85f, 0.8f);
-        c.min_travel = std::max(min_travel * 0.85f, 0.04f);
+        c.min_travel = std::max(min_travel * 0.70f, 0.04f);
         const float align = std::acos(std::clamp(align_cos, -1.0f, 1.0f));
-        c.align_cos = std::cos(std::min(align + 5.0f * Deg, 60.0f * Deg));
-        c.max_turn = std::min(max_turn + 25.0f * Deg, 90.0f * Deg);
-        c.misaligned_max = misaligned_max + 0.02f;
+        c.align_cos = std::cos(std::min(align + 9.0f * Deg, 60.0f * Deg));
+        c.max_turn = std::min(max_turn + 30.0f * Deg, 90.0f * Deg);
+        c.misaligned_max = misaligned_max + 0.025f;
+        c.max_path_bend = max_path_bend + 6.0f * Deg;
+        c.rise_weight = 0.6f;
+        c.draw_free = true;
+        if (claw_punch) {
+            // Only the extra axis-independent route needs this stricter path. Keep the
+            // eased blade thresholds above, so previously valid stabs are not delayed.
+            c.hand_path = true;
+            c.punch_travel = min_travel * 1.2f;
+            c.punch_bend = max_path_bend;
+        }
         return c;
+    }
+
+    Config ForWeapon(std::int32_t variation, bool form_b, bool opening) const {
+        if (!opening) {
+            return *this;
+        }
+        return EasedForOpenVisceral(ForwardAssistWeapon(variation, form_b));
     }
 };
 
@@ -140,6 +186,7 @@ struct Stats {
     float path_peak{};   // m/s toward the facing
     float path_bend{};   // rad, the hand's direction off its path so far (the most)
     float path_off{};    // m of fast travel off the facing's cone
+    float ahead{};       // m of the hand's level travel toward the facing
 };
 
 struct Output {
@@ -151,9 +198,9 @@ struct Output {
     Stats stats{};
 };
 
-class Detector {
+class MotionDetector {
 public:
-    Output Update(const Input& in, const Config& c) {
+    Output Update(const Input& in, const Config& c, bool may_fire = true) {
         Output out{};
         const double raw = have_t_ ? in.t - last_t_ : 0.0;
         have_t_ = true;
@@ -192,8 +239,13 @@ public:
         } else {
             slow_ = 0.0f;
         }
-        // A pull back along the blade (a wind-up): the motion starts over from here.
-        if (speed >= c.fast_speed && along <= c.back_cos * speed) {
+        const V3 fwd = Normalize(V3{in.head_fwd.x, 0.0f, in.head_fwd.z});
+        const bool facing = Length(fwd) > 0.5f;
+        const float toward = facing ? Dot(rel, fwd) : 0.0f;
+        // A wind-up starts the motion over. A claw punch uses the facing, not a sword axis.
+        if (speed >= c.fast_speed &&
+            (c.hand_path ? (facing && toward <= c.back_cos * speed)
+                         : along <= c.back_cos * speed)) {
             if (verdict_ == Verdict::Pending || verdict_ == Verdict::Swing) {
                 Begin(false);
                 why_ = "pulled back (a wind-up)";
@@ -203,19 +255,38 @@ public:
         }
         stats_.time += dt;
         stats_.turn += turn;
+        stats_.ahead += std::max(toward, 0.0f) * dt;
         if (along >= c.align_cos * speed) {
             stats_.travel += std::max(along, 0.0f) * dt;
             stats_.peak = std::max(stats_.peak, along);
         } else if (speed >= c.fast_speed) {
-            stats_.misaligned += speed * dt;
+            stats_.misaligned += speed * dt * RiseWeight(rel - b * along, c);
         }
-        const V3 fwd = Normalize(V3{in.head_fwd.x, 0.0f, in.head_fwd.z});
-        const bool facing = Length(fwd) > 0.5f;
         // The hand's own path toward the facing; back toward the body: that path starts over.
-        const float toward = facing ? Dot(rel, fwd) : 0.0f;
         if (speed >= c.fast_speed && toward <= c.back_cos * speed) {
             stats_.path_travel = stats_.path_peak = stats_.path_bend = stats_.path_off = 0.0f;
             stats_.time = 0.0f; // (a wind-up the blade route did not see)
+            path_ = {};
+            path_dir_ = {};
+        } else if (facing && (c.hand_path || c.draw_free) && toward < c.path_fwd_cos * speed &&
+                   (c.hand_path || (along < c.align_cos * speed && stats_.travel < PathChordM)) &&
+                   stats_.path_travel < PathChordM && cock_ < CockMaxM && cock_time_ < CockMaxS) {
+            // A fist drawn up or aside before the punch (2026-11-15, the user's Beast Claw punches
+            // at open viscerals in the Forbidden Woods: 21 cm ahead at 2.8 m/s "bent 90 degrees",
+            // 12 cm at 2.2 "bent 152": the bend was measured from where the hand went FIRST, the
+            // drawing back; only one straight back started the path over). Until the hand has
+            // gone ahead, at most CockMaxM of fast travel and CockMaxS: not the punch's path yet.
+            if (speed >= c.fast_speed) {
+                cock_ += speed * dt;
+            }
+            cock_time_ += dt;
+            // A blade that turns while the hand goes aside is a swing under way, not a hand
+            // drawn back: no more of it is let off (a punch's fist has no blade to hold still).
+            cock_turn_ += turn;
+            if (!c.hand_path && cock_turn_ > CockMaxTurn) {
+                cock_ = CockMaxM;
+            }
+            stats_ = {};
             path_ = {};
             path_dir_ = {};
         } else if (facing) {
@@ -232,7 +303,7 @@ public:
                 stats_.path_travel += toward * dt;
                 stats_.path_peak = std::max(stats_.path_peak, toward);
             } else if (speed >= c.fast_speed) {
-                stats_.path_off += speed * dt;
+                stats_.path_off += speed * dt * RiseWeight(rel - fwd * toward, c);
             }
         }
         // The blade's aim: ahead and level enough.
@@ -247,23 +318,26 @@ public:
             // (the blade turned before the hand went anywhere: a wrist flick, a slow swing)
             const bool path_no = !facing || stats_.path_bend > c.max_path_bend ||
                                  stats_.path_off > c.misaligned_max ||
-                                 (blade_no != nullptr && stats_.path_travel < PathChordM);
+                                 (!c.hand_path && blade_no != nullptr &&
+                                  stats_.path_travel < PathChordM);
             const bool by_blade =
-                blade_no == nullptr && stats_.travel >= c.min_travel && stats_.peak >= c.min_speed;
+                !c.hand_path && blade_no == nullptr && stats_.travel >= c.min_travel &&
+                stats_.peak >= c.min_speed;
             const bool by_path = !path_no && stats_.path_travel >= c.min_travel &&
                                  stats_.path_peak >= c.min_speed &&
-                                 Angle(path_, b) <= c.path_blade_max;
-            if (blade_no != nullptr && path_no) {
-                Decide(Verdict::Swing, blade_no);
+                                 (c.hand_path || Angle(path_, b) <= c.path_blade_max);
+            if ((c.hand_path || blade_no != nullptr) && path_no) {
+                Decide(Verdict::Swing,
+                       c.hand_path ? "the punch curved or moved off the facing" : blade_no);
             } else if (stats_.time > c.max_time) {
                 Decide(Verdict::Swing, "too slow (a push)");
             } else if (by_blade || by_path) {
-                if (stats_.yaw_off > std::acos(c.blade_fwd_cos)) {
+                if (!c.hand_path && stats_.yaw_off > std::acos(c.blade_fwd_cos)) {
                     Decide(Verdict::Swing, "the blade not ahead");
-                } else if (std::abs(stats_.elev) > c.blade_max_elev) {
+                } else if (!c.hand_path && std::abs(stats_.elev) > c.blade_max_elev) {
                     Decide(Verdict::Swing, stats_.elev > 0.0f ? "the blade raised"
                                                               : "the blade lowered");
-                } else if (since_fire_ < c.refractory) {
+                } else if (!may_fire || since_fire_ < c.refractory) {
                     Decide(Verdict::Swing, "right after a thrust");
                 } else {
                     Decide(Verdict::Thrust, by_blade ? "thrust" : "thrust (the hand's path)");
@@ -281,7 +355,7 @@ public:
     }
 
     void Reset() {
-        *this = Detector{};
+        *this = MotionDetector{};
     }
 
     // A visceral just opened: the motion under way is judged again from here (the same motion), so
@@ -299,6 +373,16 @@ public:
     }
 
 private:
+    // How much fast travel off the line counts: rise_weight for the part of it going up, once the
+    // hand has gone half of min_travel ahead, level, toward the facing (straight, then up; a weapon
+    // only raised counts all of it).
+    float RiseWeight(V3 off, const Config& c) const {
+        const float n = Length(off);
+        if (n < 1e-4f || stats_.ahead < 0.5f * c.min_travel) return 1.0f;
+        const float rise = std::clamp(off.y / n, 0.0f, 1.0f);
+        return 1.0f - rise * (1.0f - c.rise_weight);
+    }
+
     void Begin(bool new_motion) {
         live_ = true;
         if (new_motion) {
@@ -310,6 +394,7 @@ private:
         stats_ = {};
         path_ = {};
         path_dir_ = {};
+        cock_ = cock_time_ = cock_turn_ = 0.0f;
     }
 
     void Decide(Verdict v, const char* why) {
@@ -331,6 +416,10 @@ private:
     bool have_b_{false};
     V3 prev_b_{};
     static constexpr float PathChordM = 0.02f; // m of path before its bend is judged
+    static constexpr float CockMaxM = 0.20f;    // a fist drawn back before its punch: fast travel
+    static constexpr float CockMaxS = 0.30f;    // ... and time, not judged
+    static constexpr float CockMaxTurn = 15.0f * Deg; // ... the blade's turn meanwhile (not a punch's)
+    float cock_{0.0f}, cock_time_{0.0f}, cock_turn_{0.0f};
     V3 path_{}; // the hand's path since the motion (or its pull back) started
     V3 path_dir_{}; // ... its direction over the first PathChordM (zero: not yet)
     bool live_{false};
@@ -340,6 +429,90 @@ private:
     float slow_{0.0f};
     float since_fire_{1e3f};
     Stats stats_{};
+};
+
+// Keep both histories: a blade wind-up and a fist wind-up have different axes. Sharing
+// their rejection/reset state would let one route discard a valid motion in the other.
+// Only selected grips at an open visceral run the extra detector. Both routes share one event,
+// motion identity and refractory period; no allocations or changes to native hit rules.
+class Detector {
+public:
+    Output Update(const Input& in, const Config& c) {
+        const double raw = have_t_ ? in.t - last_t_ : 0.0;
+        have_t_ = true;
+        last_t_ = in.t;
+        since_fire_ += static_cast<float>(std::clamp(raw, 0.0, 0.05));
+        const bool may_fire = since_fire_ >= c.refractory;
+
+        Config ordinary = c;
+        ordinary.hand_path = false;
+        ordinary.refractory = 0.0f; // the actual event, not a duplicate candidate, starts cooldown
+        Output out = ordinary_.Update(in, ordinary, may_fire);
+        Output punch{};
+        // The extra route needs head-relative motion to distinguish a punch from a body
+        // step. Lose that reference: discard its partial travel, rather than use stale aim.
+        if (c.hand_path && in.head_ok) {
+            Config extra = c;
+            extra.min_travel = c.punch_travel;
+            extra.max_path_bend = c.punch_bend;
+            extra.refractory = 0.0f;
+            punch = punch_.Update(in, extra, may_fire);
+            punch_active_ = true;
+        } else if (punch_active_) {
+            punch_.Reset();
+            punch_active_ = false;
+        }
+        const auto motion = out.motion;
+        const float motion_age = std::max(out.stats.time, punch.stats.time);
+        if (motion != motion_) {
+            motion_ = motion;
+            decided_ = Verdict::None;
+        }
+        if (out.verdict == Verdict::None) return out; // tracking lost, stopped or disabled
+        if (decided_ != Verdict::None) {
+            if (punch_active_ && used_punch_) out = punch;
+            out.motion = motion;
+            out.fired = false;
+            out.verdict = decided_;
+            out.why = why_;
+            out.stats.time = motion_age;
+            return out;
+        }
+        if (out.fired || punch.fired) {
+            used_punch_ = !out.fired;
+            if (used_punch_) out = punch;
+            out.motion = motion;
+            decided_ = Verdict::Thrust;
+            why_ = out.why;
+            out.verdict = decided_;
+            out.why = why_;
+            since_fire_ = 0.0f;
+        } else if (may_fire && punch_active_ && out.verdict != Verdict::Pending &&
+                   punch.verdict == Verdict::Pending) {
+            // An axis rejection is not final while the straight-punch route is undecided.
+            out = punch;
+            out.motion = motion;
+        }
+        out.stats.time = motion_age;
+        return out;
+    }
+
+    void Reset() { *this = Detector{}; }
+    void Rejudge() {
+        ordinary_.Rejudge();
+        punch_.Rejudge();
+        decided_ = Verdict::None;
+    }
+    [[nodiscard]] std::uint32_t Motion() const { return ordinary_.Motion(); }
+
+private:
+    MotionDetector ordinary_{}, punch_{};
+    bool punch_active_{false}, used_punch_{false}, have_t_{false};
+    std::uint32_t motion_{};
+    Verdict decided_{Verdict::None};
+    const char* why_{""};
+    double last_t_{};
+    float since_fire_{1e3f};
 };
 
 // ---- The verdict of a melee window ---------------------------------------------------------------

@@ -228,6 +228,19 @@ void Liverpool::SyncRecorder(const char* reason, bool submit) {
 // gets there, and B goes on. A retirement that is not the last never waited and still does not.
 // False: the old path (recorder not threaded, or the switch off); with
 // FAST_CPU_ASYNC_IDLE_VERIFY the old path runs here with the replay's check.
+// FAST_CPU_FLIP_ON_B ('1' on, off by default; read once): the PatchedFlip packet becomes an
+// ordered task on stage B instead of a full pipeline drain on the command processor, so the next
+// frame's decode overlaps the end of this one on B, the recorder and the GPU (2026-10-24: the
+// drain and recorder sync here made every frame wait for the previous one end to end).
+// '2': without the recorder sync on B (B is the producer there: the present work it records
+// follows the frame's packets in stream order anyway). '3': the flip stays on the command
+// processor after its drain of B (A then records the present work, as before) but without
+// waiting for the recorder's replay of the frame, which goes on meanwhile.
+static const char g_flip_on_b = [] {
+    const char* value = std::getenv("FAST_CPU_FLIP_ON_B");
+    return value && (value[0] == '1' || value[0] == '2' || value[0] == '3') ? value[0] : '\0';
+}();
+
 bool Liverpool::RetireSubmission(Task::Handle finished) {
     if (!(Vulkan::g_async_idle || Vulkan::g_async_idle_verify) || !rasterizer)
         return false;
@@ -242,10 +255,13 @@ bool Liverpool::RetireSubmission(Task::Handle finished) {
         last = Vulkan::SignalPolicy::LastSubmission(num_submits, async_retires);
     }
     if (last) {
-        // SyncRecorder("gpu_idle", true) up to its drain.
-        if (Vulkan::g_task_publish)
-            scheduler.PublishRecorder();
-        scheduler.Flush();
+        // SyncRecorder("gpu_idle", true) up to its drain; the submission held for the next cut
+        // while the GPU is busy (A/B switch 3, Rasterizer::DeferGuestFlush).
+        if (!rasterizer->DeferGuestFlush()) {
+            if (Vulkan::g_task_publish)
+                scheduler.PublishRecorder();
+            scheduler.Flush();
+        }
         // The submission may have changed the recorder's mode (a FAST mask change): the old drain.
         const bool queue = scheduler.RecorderThreaded();
         const u64 signals = scheduler.GuestSignalsEncoded();
@@ -271,6 +287,7 @@ bool Liverpool::RetireSubmission(Task::Handle finished) {
     std::scoped_lock lock{submit_mutex};
     --num_submits;
     submit_cv.notify_all();
+    retire_cv.notify_all();
     return true;
 }
 
@@ -285,8 +302,9 @@ bool Liverpool::SignalIdle() {
     auto& scheduler = rasterizer->GetScheduler();
     if (!scheduler.RecorderThreaded())
         return false;
-    // SyncRecorder("gpu_idle_signal") up to its drain.
-    if (scheduler.SignalsNeedFlush()) {
+    // SyncRecorder("gpu_idle_signal") up to its drain; the submission held for the next cut while
+    // the GPU is busy (A/B switch 3, Rasterizer::DeferGuestFlush).
+    if (scheduler.SignalsNeedFlush() && !rasterizer->DeferGuestFlush()) {
         if (Vulkan::g_task_publish)
             scheduler.PublishRecorder();
         scheduler.Flush();
@@ -356,6 +374,7 @@ void Liverpool::RetireOnReplay(void* context, u64 signals) {
         --self.num_submits;
         --self.async_retires;
         self.submit_cv.notify_all();
+        self.retire_cv.notify_all();
     }
     self.async_tasks.fetch_sub(1, std::memory_order_release); // the last use of `self`
 }
@@ -422,6 +441,7 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    Common::PreferPerformanceCores();
     // The command processor is the frame's critical path:
     // keep it ahead of the game's own worker threads and background load
     // (VR_CP_NORMAL_PRIORITY=1: the old normal priority, for A/B tests).
@@ -469,12 +489,34 @@ void Liverpool::Process(std::stop_token stoken) {
                     queue.submits.pop();
                 }
                 --num_decode_submits;
+                {
+                    // FAST_CPU_SUBMIT_AHEAD=3 (WaitDecoded): the decoder is done with it.
+                    std::scoped_lock lock{submit_mutex};
+                    ++total_decoded;
+                    retire_cv.notify_all();
+                }
                 // The coroutine storage and guest-visible completion remain alive until
                 // every earlier draw and deferred fence has run on B.
+                // Every nested frame finished so far: its packets were all pushed before this
+                // completion, so B is past them when it runs.
+                struct Completion {
+                    Task::Handle finished;
+                    std::vector<Task::Handle>* nested;
+                };
+                const Completion done{task, finished_nested.empty()
+                                                ? nullptr
+                                                : new std::vector<Task::Handle>(
+                                                      std::exchange(finished_nested, {}))};
                 const auto complete = [](void* context, std::span<const std::byte> bytes) {
                     auto& self = *static_cast<Liverpool*>(context);
-                    Task::Handle finished;
-                    std::memcpy(&finished, bytes.data(), sizeof(finished));
+                    Completion done;
+                    std::memcpy(&done, bytes.data(), sizeof(done));
+                    if (done.nested) {
+                        for (const auto nested : *done.nested)
+                            nested.destroy();
+                        delete done.nested;
+                    }
+                    const Task::Handle finished = done.finished;
                     if (self.RetireSubmission(finished))
                         return; // FAST_CPU_ASYNC_IDLE
                     if (self.num_submits == 1)
@@ -483,9 +525,12 @@ void Liverpool::Process(std::stop_token stoken) {
                     std::scoped_lock lock{self.submit_mutex};
                     --self.num_submits;
                     self.submit_cv.notify_all();
+                    self.retire_cv.notify_all();
                 };
-                const auto bytes = std::as_bytes(std::span{&task, size_t{1}});
-                if (!rasterizer || !rasterizer->QueueOrderedTask(complete, this, bytes, true)) {
+                const auto bytes = std::as_bytes(std::span{&done, size_t{1}});
+                // Retire and recorder sync only: no guest reads (CE dumps need not wait).
+                if (!rasterizer || !rasterizer->QueueOrderedTask(complete, this, bytes, true,
+                                                                 false)) {
                     if (rasterizer)
                         rasterizer->DrainDrawPipe(5);
                     complete(this, bytes);
@@ -520,7 +565,7 @@ void Liverpool::Process(std::stop_token stoken) {
             if (self.num_submits == 0 && self.num_commands == 0)
                 Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
         };
-        if (!rasterizer || !rasterizer->QueueOrderedTask(idle, this, {}, true)) {
+        if (!rasterizer || !rasterizer->QueueOrderedTask(idle, this, {}, true, false)) {
             if (rasterizer)
                 rasterizer->DrainDrawPipe(6);
             idle(this, {});
@@ -609,6 +654,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                 YIELD_CE();
                 RESUME_CE(task);
             }
+            finished_nested.push_back(task.handle);
             break;
         }
         default:
@@ -931,7 +977,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                       (nop->data_block[0] != PM4CmdNop::PayloadType::DebugMarkerPush &&
                        nop->data_block[0] != PM4CmdNop::PayloadType::DebugColorMarkerPush &&
                        nop->data_block[0] != PM4CmdNop::PayloadType::DebugMarkerPop)));
-                if (!(FastRender::On(FastRender::SkipPureStateDrain) && inert) && rasterizer)
+                // FAST_CPU_FLIP_ON_B: the flip is an ordered task on B, so A goes on past it.
+                const bool flip_task = (g_flip_on_b == '1' || g_flip_on_b == '2') &&
+                                       nop->header.count.Value() != 0 &&
+                                       nop->data_block[0] == PM4CmdNop::PayloadType::PatchedFlip &&
+                                       rasterizer && rasterizer->DrawWorkerActive();
+                if (!(FastRender::On(FastRender::SkipPureStateDrain) && inert) && !flip_task &&
+                    rasterizer)
                     rasterizer->DrainDrawPipe(0, static_cast<u32>(opcode));
                 break;
             }
@@ -949,6 +1001,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // ClearState marks all blocks (or a reset) below. SetBase only changes A's
                 // indirect address, captured when an indirect draw is built.
                 if (!FastRender::On(FastRender::SkipPureStateDrain) && rasterizer)
+                    rasterizer->DrainDrawPipe(0, static_cast<u32>(opcode));
+                break;
+            case PM4ItOpcode::DrawIndirect:
+            case PM4ItOpcode::DrawIndirectMulti:
+            case PM4ItOpcode::DrawIndexIndirect:
+            case PM4ItOpcode::DrawIndexIndirectMulti:
+            case PM4ItOpcode::DispatchIndirect:
+                // Bit 48: A only records the packet with the arguments' address (VrFilterDraw
+                // reads no index or argument memory for an indirect draw); B binds the argument
+                // buffer in order and the GPU reads it. Like a direct draw, nothing here reads
+                // guest memory a queued packet may write.
+                if (!FastRender::On(FastRender::IndirectNoDrain) && rasterizer)
                     rasterizer->DrainDrawPipe(0, static_cast<u32>(opcode));
                 break;
             case PM4ItOpcode::DmaData:
@@ -980,11 +1044,33 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 case PM4CmdNop::PayloadType::PatchedFlip: {
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
-                    SyncRecorder("flip_handoff");
                     const auto flip = Libraries::VideoOut::DecodeFlip(
                         std::span{nop->data_block + 1, size_t(nop->header.count.Value())});
                     ASSERT_MSG(flip.has_value(), "Invalid patched flip identity");
                     if (!flip) break;
+                    if ((g_flip_on_b == '1' || g_flip_on_b == '2') && rasterizer &&
+                        rasterizer->DrawWorkerActive()) {
+                        // FAST_CPU_FLIP_ON_B: B reaches the flip in stream order, hands the frame
+                        // to the recorder there and queues the flip; A decodes the next frame
+                        // meanwhile instead of waiting for the whole frame to be replayed.
+                        const auto task = [](void* context, std::span<const std::byte> bytes) {
+                            auto& self = *static_cast<Liverpool*>(context);
+                            Libraries::VideoOut::FlipPacket packet;
+                            std::memcpy(&packet, bytes.data(), sizeof(packet));
+                            if (g_flip_on_b == '1')
+                                self.SyncRecorder("flip_handoff");
+                            Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                            Libraries::VideoOut::ExecuteEopFlip(packet);
+                        };
+                        if (rasterizer->QueueOrderedTask(task, this,
+                                                         std::as_bytes(std::span{&*flip, 1}), true))
+                            break;
+                        rasterizer->DrainDrawPipe(0, static_cast<u32>(opcode));
+                    }
+                    if (g_flip_on_b != '3')
+                        SyncRecorder("flip_handoff");
+                    else if (rasterizer)
+                        rasterizer->DrainDrawPipe(2); // the producer: A, the replay going on
                     static const bool trace_flip = std::getenv("VR_FLIP_ORDER_TRACE") != nullptr;
                     if (trace_flip) {
                         const u32 buffer = flip->buffer;
@@ -1035,7 +1121,52 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::ClearState: {
-                regs.SetDefaults();
+                // Only the blocks written since the last ClearState differ from the defaults
+                // (every Stage A register write marks its block): copy the defaults there
+                // instead of rewriting the whole ~213 KB file (bbport 0.7 regs.cpp; ~10 a
+                // frame, and the file evicts the next draws' data on small caches).
+                // FAST_CLEARSTATE_TOUCHED=0: the full SetDefaults. FAST_CLEARSTATE_VERIFY_A=N:
+                // every Nth touched reset compares the whole file with the defaults.
+                static const bool touched_reset = [] {
+                    const char* value = std::getenv("FAST_CLEARSTATE_TOUCHED");
+                    return !value || value[0] != '0';
+                }();
+                static const u64 verify_every = [] {
+                    const char* value = std::getenv("FAST_CLEARSTATE_VERIFY_A");
+                    return value ? std::strtoull(value, nullptr, 0) : 0ULL;
+                }();
+                static const auto default_regs = [] {
+                    auto state = std::make_unique<Regs>();
+                    state->SetDefaults();
+                    return state;
+                }();
+                if (touched_reset) {
+                    const auto& defaults = default_regs->reg_array;
+                    auto& file = regs.reg_array;
+                    for (const u16 block : register_deltas.SinceReset()) {
+                        const size_t first = size_t(block) * RegisterDeltas::WordsPerBlock;
+                        std::copy_n(defaults.data() + first,
+                                    std::min(RegisterDeltas::WordsPerBlock, file.size() - first),
+                                    file.data() + first);
+                    }
+                    ++clear_state_touched;
+                    clear_state_touched_blocks += register_deltas.SinceReset().size();
+                    if (verify_every && clear_state_touched % verify_every == 0) {
+                        ++clear_state_checks;
+                        if (std::memcmp(file.data(), defaults.data(), sizeof(file)) != 0) {
+                            size_t word = 0;
+                            while (file[word] == defaults[word])
+                                ++word;
+                            if (++clear_state_mismatches <= 32)
+                                LOG_ERROR(Render, "FAST clearstate A: register {:#x} = {:#x}, "
+                                                  "default {:#x} (an unmarked write); full reset",
+                                          word, file[word], defaults[word]);
+                            regs.SetDefaults();
+                        }
+                    }
+                } else {
+                    regs.SetDefaults();
+                }
                 // Bit 31 hashes the registers per draw: adopt the defaults' precomputed
                 // block checksums instead of rehashing all of them (bbport regs_reset).
                 const RegisterDeltas::ResetChecksums* defaults = nullptr;
@@ -1058,16 +1189,25 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else {
                     register_deltas.MarkAll();
                 }
+                // After MarkAll: the file equals the defaults now, whatever transport still owes.
+                register_deltas.ClearSinceReset();
                 if (++clear_states % 4096 == 0) {
                     const u64 frames = FastRender::g_counters.frames.load(std::memory_order_relaxed);
                     const u64 window = frames - clear_state_log_frames;
                     LOG_INFO(Render,
                              "FAST clearstate: clear_states={} resets={} full={} frames={} "
-                             "per_frame={:.1f}",
+                             "per_frame={:.1f} touched={} blocks/touched={:.0f} of {} checks={} "
+                             "mismatches={}",
                              clear_states, clear_state_resets, clear_states - clear_state_resets,
                              frames,
                              window ? double(clear_states - clear_state_log_states) / double(window)
-                                    : 0.0);
+                                    : 0.0,
+                             clear_state_touched,
+                             clear_state_touched ? double(clear_state_touched_blocks) /
+                                                       double(clear_state_touched)
+                                                 : 0.0,
+                             RegisterDeltas::NumBlocks, clear_state_checks,
+                             clear_state_mismatches);
                     clear_state_log_states = clear_states;
                     clear_state_log_frames = frames;
                 }
@@ -1494,7 +1634,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         };
                         pending_fence = {};
                         const auto bytes = std::as_bytes(std::span{&query, 1});
-                        const auto ticket = rasterizer ? rasterizer->QueueOrderedTask(write, this, bytes, true) : 0;
+                        const auto ticket =
+                            rasterizer ? rasterizer->QueueOrderedTask(write, this, bytes, true, false)
+                                       : 0;
                         if (rasterizer)
                             rasterizer->GuardConstantWrite(query.address, u64(query.pairs) * 16, ticket);
                         if (!ticket) {
@@ -1522,7 +1664,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                               [](void* context, std::span<const std::byte> packet) {
                                   static_cast<Liverpool*>(context)->ExecuteFencePacket(packet);
                               },
-                              this, bytes, true)
+                              this, bytes, true, false) // fence writes and downloads only
                         : 0;
                 if (rasterizer) {
                     if (opcode == PM4ItOpcode::EventWriteEop) {
@@ -1671,7 +1813,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // A later write may replace a predicted fence's value.
                 pending_fence = {};
                 const auto write_ticket =
-                    rasterizer ? rasterizer->QueueOrderedTask(write, this, bytes, true) : 0;
+                    rasterizer ? rasterizer->QueueOrderedTask(write, this, bytes, true, false) : 0;
                 if (rasterizer) {
                     const auto* cmd = reinterpret_cast<const PM4CmdWriteData*>(header);
                     rasterizer->GuardConstantWrite(reinterpret_cast<VAddr>(cmd->Address<void*>()),
@@ -1819,6 +1961,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                finished_nested.push_back(task.handle);
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -1984,6 +2127,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
             }
+            finished_nested.push_back(task.handle);
             break;
         }
         case PM4ItOpcode::DmaData: {
@@ -2334,6 +2478,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
 
     std::scoped_lock lk{submit_mutex};
     ++num_submits;
+    ++total_submits;
     ++num_decode_submits;
     submit_cv.notify_one();
 }
@@ -2352,6 +2497,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     std::scoped_lock lk{submit_mutex};
     num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
     ++num_submits;
+    ++total_submits;
     ++num_decode_submits;
     submit_cv.notify_one();
 }

@@ -276,7 +276,9 @@ constexpr std::int32_t DmyIdHead59 = 59;          // on Head, about 5 cm in fron
 constexpr std::int32_t DmyIdLockOn = 220;         // lock-on point on Spine1 (chest)
 constexpr std::int32_t DmyIdRightWeaponBase = 300; // weapon attach (FormA) on R_Weapon
 constexpr std::int32_t DmyIdRightTwoHand = 320;   // two-handed grip on R_Weapon
+constexpr std::int32_t DmyIdRightTwoHandBig = 322; // transformed greatswords/hammer, optional
 constexpr std::int32_t DmyIdLeftWeaponBase = 340; // off-hand weapon attach on L_Weapon
+constexpr std::int32_t DmyIdLeftShield = 341; // shield attach on L_Weapon
 constexpr std::int32_t DmyIdLeftHand = 344;       // on L_Hand (the wrist)
 constexpr std::int32_t DmyIdLeftGun = 345;        // off-hand gun attach (pistols) on L_Weapon
 constexpr std::int32_t DmyIdLeftGun2 = 347;       // off-hand gun attach on L_Weapon
@@ -297,7 +299,9 @@ struct Skeleton {
     DummyPoly lock_on{};
     DummyPoly right_weapon_base{};
     DummyPoly right_two_hand{};
+    DummyPoly right_two_hand_big{}; // optional; absent rigs retain the estimated grip rail
     DummyPoly left_weapon_base{};
+    DummyPoly left_shield{}; // optional clash attachment
     DummyPoly left_gun{};
     DummyPoly left_gun2{};
     DummyPoly left_gun3{};

@@ -34,9 +34,12 @@ public:
     bool FencedSpdInstalled() const {
         return fenced_spd;
     }
-    const std::string& Problem() const {
-        return problem;
+    std::string Problem() const {
+        return !problem.empty() || !session ? problem : session->Problem();
     }
+    /// FSR 4.1: what its bridge runs ("AMD FSR Upscaling 4.1.2 (...)", or FSR 3.1.5 in its place
+    /// and why; the bridge's VrFsr41GetStatus). Empty for the other providers.
+    std::string BridgeStatus() const;
     bool Shutdown(uint64_t completed);
 
 private:
@@ -44,6 +47,7 @@ private:
     const VR::Graphics::Upscaler provider;
     void* module{};
     const VrFsr4Api* api{};
+    const char* (*status)(){};
     std::unique_ptr<VrFsr4Session> session;
     std::filesystem::path assets;
     std::string problem;

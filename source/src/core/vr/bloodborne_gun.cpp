@@ -11,10 +11,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <span>
 #include <string>
 #include <vector>
@@ -22,14 +24,20 @@
 
 #include "common/logging/log.h"
 #include "common/thread.h"
+#include "core/cpu_patches.h"
 #include "core/vr/bloodborne_gun.h"
+#include "core/vr/blacksky_eye.h"
+#include "core/vr/bloodborne_evasion.h"
 #include "core/vr/bloodborne_held.h"
 #include "core/vr/bloodborne_iframes.h"
+#include "core/vr/bloodborne_melee.h"
 #include "core/vr/bloodborne_quickitems.h"
 #include "core/vr/bloodborne_tuning.h"
 #include "core/vr/body_channel.h"
 #include "core/vr/body_settings.h"
 #include "core/vr/bow.h"
+#include "core/vr/call_beyond.h"
+#include "core/vr/muzzle_flash.h"
 #include "core/vr/bow_channel.h"
 #include "core/vr/combat_channel.h"
 #include "core/vr/gun_aim.h"
@@ -37,7 +45,10 @@
 #include "core/vr/hook_util.h"
 #include "core/vr/melee_settings.h"
 #include "core/vr/melee_window.h"
+#include "core/vr/quick_items.h"
 #include "core/vr/shield_guard.h"
+#include "core/vr/seqlock.h"
+#include "core/vr/stake_driver.h"
 #include "core/vr/trick_weapons.h"
 #include "core/vr/vr_session.h"
 
@@ -237,11 +248,15 @@ constexpr u32 OffsetLauncherBullet = 0x1B4;
 constexpr u32 OffsetLauncherOwner = 0x1BC;
 constexpr u32 OffsetLauncherCategory = 0x1E4; // s32: 2 = a gun's BehaviorParam category
 constexpr s32 CategoryGun = 2;
+constexpr s32 CategoryItem = 5; // the items' launches (the tools', the throws')
+constexpr s32 CategoryDirect = 0; // ... a tool used directly (UseGoods with no item animation)
 // A launched projectile (the launch tail's P): position, velocity, bullet id, owner handle.
 constexpr u32 OffsetPPos = 0x10;
+constexpr u32 OffsetPQuat = 0x30; // its orientation (hkQuaternion x, y, z, w): what the game draws
 constexpr u32 OffsetPVel = 0x40;
 constexpr u32 OffsetPBullet = 0x2F4;
 constexpr u32 OffsetPOwner = 0x2FC;
+constexpr u32 OffsetPAlive = 0x7F1; // bit 0
 
 constexpr u32 GoodsCategory = 0x40000000u;
 constexpr s32 QuicksilverBullets = 900;
@@ -269,6 +284,7 @@ constexpr s64 HandsMaxAgeNs = 100 * Ms;
 constexpr s64 AnchorMaxAgeNs = 200 * Ms;
 constexpr s64 StatusMaxAgeNs = 250 * Ms;
 constexpr s64 KickNs = 600 * Ms;
+constexpr s64 HeavyKickNs = 900 * Ms; // let the cannons' slower return settle before cutting it off
 constexpr s64 StalePullNs = 500 * Ms; // a pull the pose tick first sees this late is ignored
 constexpr s64 StatsNs = 10000 * Ms;
 
@@ -576,146 +592,14 @@ bool LineAllowed() {
 
 // ---- The emitter hook (0x19F263A, the game's main thread, inside the bullet launch) -------------
 
-// ---- The bow's release sound (bow_direct, core/vr/bow.h) ------------------------------------------
-// A direct arrow (BladeShotTick, no shot clip) plays the bow's own release sound: learned from the
-// shots the game's own clip fires (the clip's sound at its arrow's launch, near the bow hand; the
-// same one at two arrows, so a footstep or a blow near the hand at one is never taken), saved in
-// vr.ini (bow_twang). A PlaySound detour (its 16-byte prologue, replayed) hears
-// the game's sounds while the bow form is up and the sound is not known yet; until then the bow's
-// shots are the game's own (the presenter: Combat::MeleeStatus::bow_direct).
-constexpr s32 ThrowWhoosh = 751;          // the throws' release (a direct arrow before the twang)
-constexpr s64 TwangBeforeNs = 100 * Ms;   // the release sound this long before the launch ...
-constexpr s64 TwangAfterNs = 60 * Ms;     // ... or this long after it
-constexpr float TwangNearM = 1.0f;        // ... this close to the bow hand
-struct HeardSound {
-    s32 type{0};
-    s32 id{-1};
-    B::Vec3 pos{};
-    s64 ns{0};
-};
-std::mutex g_heard_mutex;
-std::array<HeardSound, 8> g_heard{};
-u32 g_heard_next{0};
-s64 g_twang_launch_ns{0}; // a game-fired arrow still waiting for its sound (under g_heard_mutex)
-B::Vec3 g_twang_hand{};
-std::atomic<bool> g_twang_listen{false};
-std::atomic<s32> g_twang{-1};
-std::atomic<s32> g_twang_candidate{-1}; // heard at one arrow: learned when the next one plays it
+// ---- The bow's release sound (bow_direct, core/vr/bow.h) ----------------------------------------
+// A direct arrow (BladeShotTick, no shot clip) plays the bow's own release sound: every shot clip
+// of the Bowblade (TAE a149: 033300, 040000, 042500, 042620, 042630) plays 911 (w_bow_shot) at its
+// arrow's launch. It was once learned from the game's sounds near the bow hand round a launch,
+// which could take a struck enemy's groan (its sound 9000) or the hunter's own pain voice and keep
+// it in vr.ini (bow_twang, now ignored).
+constexpr s32 BowRelease = 911;
 std::atomic<bool> g_bow_no_rows{false}; // the bow has no arrow rows for a direct shot
-std::unique_ptr<Xbyak::CodeGenerator> g_listen_code;
-
-// The event-128 sound type the game's TAE sounds come with (1, or 0xA with the table's flag).
-s32 TaeSoundType() {
-    return g_sound_table != nullptr && Read<u8>(g_sound_table + 3) != 0 ? 0xA : 1;
-}
-
-void LearnTwang(s32 id, const char* how) {
-    if (g_twang_candidate.exchange(id) != id) {
-        LOG_INFO(Core, "VR bow: release sound {}? ({}): the next game-fired arrow confirms it", id,
-                 how);
-        return;
-    }
-    s32 none = -1;
-    if (!g_twang.compare_exchange_strong(none, id)) {
-        return;
-    }
-    VR::SaveSetting("bow_twang", std::to_string(id));
-    LOG_INFO(Core, "VR bow: its release sound is {} ({}): saved as bow_twang; from now on the "
-                   "arrow leaves at the release",
-             id, how);
-}
-
-// A sound near the bow hand within the window round a game-fired arrow's launch (heard under
-// g_heard_mutex).
-bool TwangOf(const HeardSound& h, s64 launch_ns, const B::Vec3& hand) {
-    return h.id >= 0 && h.type == TaeSoundType() && h.ns >= launch_ns - TwangBeforeNs &&
-           h.ns <= launch_ns + TwangAfterNs && B::Length(h.pos - hand) <= TwangNearM;
-}
-
-void PS4_SYSV_ABI OnGameSound(s32 type, s32 id, const float* pos) {
-    if (!g_twang_listen.load(std::memory_order_relaxed)) {
-        return;
-    }
-    const bool p = Plausible(reinterpret_cast<const u8*>(pos), 12);
-    const HeardSound h{type, id, p ? B::Vec3{pos[0], pos[1], pos[2]} : B::Vec3{}, NowNs()};
-    s32 learned = -1;
-    {
-        std::scoped_lock lock{g_heard_mutex};
-        g_heard[g_heard_next++ % g_heard.size()] = h;
-        if (g_twang_launch_ns != 0 && TwangOf(h, g_twang_launch_ns, g_twang_hand)) {
-            learned = id;
-            g_twang_launch_ns = 0;
-        }
-    }
-    if (learned >= 0) {
-        LearnTwang(learned, "just after the game's arrow left");
-    }
-}
-
-// The PlaySound detour (bow=1, bow_direct=1, its release sound not known yet). VR_SOUND_TRACE's
-// own detour on the same prologue (tests) wins: then the bow's shots stay the game's own.
-void InstallTwangListener(u8* module) {
-    namespace W = VR::Bow;
-    const auto& bs = W::GetBowSettings();
-    g_twang.store(bs.twang);
-    if (!g_sound || !bs.enabled || !bs.direct || bs.twang >= 0) {
-        return;
-    }
-    constexpr size_t Prologue = 16;
-    u8* const site = module + PlaySoundRva;
-    if (std::getenv("VR_SOUND_TRACE") != nullptr ||
-        std::memcmp(site, PlaySoundSig.data(), Prologue) != 0 ||
-        !Hook::MakeWritable(site, Prologue)) {
-        LOG_INFO(Core, "VR bow: its release sound cannot be heard (VR_SOUND_TRACE, or PlaySound "
-                       "differs): its shots stay the game's own");
-        return;
-    }
-    try {
-        g_listen_code = std::make_unique<Xbyak::CodeGenerator>(1024);
-        void* const stub = Hook::EmitHostCallStubWith(
-            *g_listen_code, reinterpret_cast<void*>(&OnGameSound), PlaySoundSig.data(), Prologue,
-            reinterpret_cast<u64>(site + Prologue), [](Xbyak::CodeGenerator& c) {
-                using namespace Xbyak::util;
-                c.mov(rdi, rdx); // type
-                c.mov(rax, rsi);
-                c.mov(rsi, rcx); // id
-                c.mov(rdx, rax); // the position
-            });
-        g_listen_code->ready();
-        Hook::WriteJump(site, Prologue, stub);
-    } catch (const Xbyak::Error& error) {
-        g_listen_code.reset();
-        LOG_ERROR(Core, "VR bow: the sound listener's code failed ({})", error.what());
-        return;
-    }
-    LOG_INFO(Core, "VR bow: listening for its release sound (the shots are the game's own until "
-                   "two of them play the same one)");
-}
-
-// A game-fired arrow just left (BowArrow): the sound the clip played with it, now or just after.
-void HearTwang(const B::Vec3& hand, s64 now) {
-    if (g_twang.load(std::memory_order_relaxed) >= 0 || !g_twang_listen.load()) {
-        return;
-    }
-    s32 learned = -1;
-    {
-        std::scoped_lock lock{g_heard_mutex};
-        s64 best_ns = 0;
-        for (const HeardSound& h : g_heard) {
-            if (TwangOf(h, now, hand) && h.ns >= best_ns) {
-                best_ns = h.ns;
-                learned = h.id;
-            }
-        }
-        if (learned < 0) {
-            g_twang_launch_ns = now; // the sound may come after the launch in this update
-            g_twang_hand = hand;
-        }
-    }
-    if (learned >= 0) {
-        LearnTwang(learned, "just before the game's arrow left");
-    }
-}
 
 // Simon's Bowblade's arrows (vr.ini bow, core/vr/bow.h): a launch of its behaviour rows (variation
 // 3200; the game's own shot, R1 / R2 pressed at the presenter's release) within BowShotMaxAgeNs
@@ -766,7 +650,7 @@ bool BowArrow(u8* out, u8* launcher, u8* player) {
     if (idx == 0) {
         g_bow_aimed_serial = shot.serial;
     }
-    const B::Vec3 dir = B::Normalize(
+    B::Vec3 dir = B::Normalize(
         B::TrackingToWorld({shot.dir[0], shot.dir[1], shot.dir[2]}, anchor.base_yaw, 1.0f),
         vanilla);
     const B::Vec3 game_start{rows[3], rows[7], rows[11]};
@@ -775,8 +659,16 @@ bool BowArrow(u8* out, u8* launcher, u8* player) {
     const s32 hand_dummy = shot.bow_hand == 0 ? 340 : 300; // the fist the bow is in
     const bool have_hand = DummyAt(player, hand_dummy, hand);
     const bool moved = !g_dry_aim && have_hand;
-    if (idx == 0 && have_hand) {
-        HearTwang(hand, now); // bow_direct: its release sound, once
+    // The soft assist (core/vr/bow.h AssistedLine, bow_assist_deg): the target the game picked,
+    // within a few degrees of the drawn line and in reach, takes the arrow straight at it.
+    const B::Vec3 from = moved ? hand + dir * BowOriginAheadM : game_start;
+    const B::Vec3 lock = Read3(player + OffsetLockPoint);
+    const VR::Bow::Assist assist = VR::Bow::AssistedLine(
+        {dir.x, dir.y, dir.z}, {from.x, from.y, from.z}, {lock.x, lock.y, lock.z},
+        Read<u8>(player + OffsetLockChosen) != 0 && B::IsFinite(lock),
+        VR::Bow::GetBowSettings().assist_deg);
+    if (assist.assisted) {
+        dir = B::Normalize({assist.dir.x, assist.dir.y, assist.dir.z}, dir);
     }
     if (moved) {
         start = hand + dir * BowOriginAheadM;
@@ -787,10 +679,14 @@ bool BowArrow(u8* out, u8* launcher, u8* player) {
     const bool written = !g_dry_aim && G::WriteLookRows(rows, dir, ChrForward(player));
     if (idx == 0 && LineAllowed()) {
         LOG_INFO(Core,
-                 "VR bow: ARROW #{} {} bid={} bullet={} draw {:.2f} ray{} (the game's {}, {:.1f} "
+                 "VR bow: ARROW #{} {} bid={} bullet={} draw {:.2f} ray{}{} (the game's {}, {:.1f} "
                  "deg off) from {} ({:.0f} cm from the game's start) {} ms after the release{}",
                  shot.serial, shot.charged ? "charged" : "quick", bid, bullet, shot.draw,
-                 YawPitch(dir), YawPitch(vanilla), B::Angle(vanilla, dir) / B::Deg,
+                 YawPitch(dir),
+                 assist.assisted ? fmt::format(" assisted onto the target ({:.1f} deg)",
+                                               assist.off_deg)
+                                 : std::string{},
+                 YawPitch(vanilla), B::Angle(vanilla, dir) / B::Deg,
                  moved ? fmt::format("the bow hand (dummy {})", hand_dummy)
                        : std::string{"the game's start"},
                  B::Length(start - game_start) * 100.0f, (now - shot.release_ns) / Ms,
@@ -810,8 +706,84 @@ struct BladeAimShot {
     B::Vec3 origin{};
     B::Vec3 dir{};
     B::Vec3 shift{}; // the first bullet's move (the others take it too)
+    B::Vec3 slash{}; // MoonWave only, world space; zero preserves the old emitter orientation
+    std::array<float, 12> native{}, oriented{};
+    bool oriented_wave{false};
+    s32 bullet{-1}; // the first bullet's id (its launcher's): the wave's short-lived parent
+    u32 owner{0};   // ... and owner
+    std::array<float, 4> q_game{}; // the parent's orientation, as the game built it from our rows
+    bool have_q{false};
 };
 BladeAimShot g_blade_aim{};
+
+// The moonlight wave in flight, turned as your slash (MoonWaveTail publishes it, MoonTurnHook keeps
+// it): the bullet, its id and owner, until when, and its orientation (float bits), under a sequence
+// lock (odd while MoonWaveTail writes it), so the hook, maybe on another thread, never takes half of
+// one wave and half of the next. g_moon_slot, in the crescent stubs' own page next to the game's
+// code, is the stubs' quick filter (they compare every bullet with it); null when InstallMoonTurn
+// made no stubs.
+struct MoonTurn {
+    std::atomic<u32> seq{0};
+    std::atomic<u8*> bullet{nullptr};
+    std::atomic<s32> id{-1};
+    std::atomic<u32> owner{0};
+    std::atomic<s64> until{0};
+    std::array<std::atomic<u32>, 4> q{};
+};
+MoonTurn g_moon_turn{};
+std::atomic<u8*>* g_moon_slot{nullptr};
+std::atomic<bool> g_moon_armed{false}; // the jumps are in the game's code (MoonTurnTick)
+constexpr s64 MoonTurnMaxNs = 4000 * Ms; // longer than any wave's flight
+
+struct MoonTurnRecord {
+    u8* bullet{nullptr};
+    s32 id{-1};
+    u32 owner{0};
+    s64 until{0};
+    std::array<u32, 4> q{};
+};
+
+// One consistent copy of g_moon_turn, or false while it is being written (a few stores: the next
+// update of the bullet gets it).
+bool ReadMoonTurn(MoonTurnRecord& r) {
+    for (int tries = 0; tries < 4; ++tries) {
+        const u32 seq = g_moon_turn.seq.load(std::memory_order_acquire);
+        if ((seq & 1) != 0) {
+            continue;
+        }
+        r.bullet = g_moon_turn.bullet.load(std::memory_order_relaxed);
+        r.id = g_moon_turn.id.load(std::memory_order_relaxed);
+        r.owner = g_moon_turn.owner.load(std::memory_order_relaxed);
+        r.until = g_moon_turn.until.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < r.q.size(); ++i) {
+            r.q[i] = g_moon_turn.q[i].load(std::memory_order_relaxed);
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (g_moon_turn.seq.load(std::memory_order_relaxed) == seq) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Right after the game re-aims a bullet from its velocity (0x19F8943 / 0x19F9973 store its
+// orientation; the hooks sit at the next instruction). Only the published wave gets here (its stub
+// compares the bullet with g_moon_slot); it gets its turned orientation back before the game builds
+// its draw transform from it. `p` is the bullet the game is updating right now (live memory); the
+// record must name it. Dropped once it is gone, another bullet, or past MoonTurnMaxNs.
+void PS4_SYSV_ABI MoonTurnHook(u8* p, u8* /*saved_ymm*/) {
+    MoonTurnRecord r{};
+    if (p == nullptr || !ReadMoonTurn(r) || r.bullet != p) {
+        return; // (replaced since the stub's compare, or being replaced)
+    }
+    if (NowNs() > r.until || Read<s32>(p + OffsetPBullet) != r.id ||
+        Read<u32>(p + OffsetPOwner) != r.owner || (Read<u8>(p + OffsetPAlive) & 1) == 0) {
+        u8* expected = p;
+        g_moon_slot->compare_exchange_strong(expected, nullptr, std::memory_order_relaxed);
+        return;
+    }
+    std::memcpy(p + OffsetPQuat, r.q.data(), sizeof(r.q));
+}
 
 bool BladeAim(u8* out, u8* launcher, u8* player) {
     BladeAimShot& a = g_blade_aim;
@@ -826,6 +798,11 @@ bool BladeAim(u8* out, u8* launcher, u8* player) {
     const B::Vec3 start{rows[3], rows[7], rows[11]};
     if (idx == 0) {
         a.shift = a.origin - start;
+        std::copy_n(rows, 12, a.native.begin());
+        a.oriented_wave = false;
+        a.bullet = Read<s32>(launcher + OffsetLauncherBullet);
+        a.owner = Read<u32>(launcher + OffsetLauncherOwner);
+        a.have_q = false;
     }
     bool written = false;
     if (!g_dry_aim) {
@@ -833,6 +810,19 @@ bool BladeAim(u8* out, u8* launcher, u8* player) {
         rows[7] += a.shift.y;
         rows[11] += a.shift.z;
         written = G::WriteLookRows(rows, a.dir, ChrForward(player));
+        if (written && G::WriteSlashRows(rows, a.dir, a.slash)) {
+            if (idx == 0) {
+                std::copy_n(rows, 12, a.oriented.begin());
+                a.oriented_wave = true;
+            } else if (a.oriented_wave) {
+                const B::Vec3 first{a.native[3], a.native[7], a.native[11]};
+                const B::Vec3 at = a.origin + G::WaveEmitterOffset(
+                    start - first, a.native.data(), a.oriented.data());
+                rows[3] = at.x;
+                rows[7] = at.y;
+                rows[11] = at.z;
+            }
+        }
     }
     if (idx == 0 && LineAllowed()) {
         LOG_INFO(Core,
@@ -845,19 +835,54 @@ bool BladeAim(u8* out, u8* launcher, u8* player) {
     return true;
 }
 
-// tool_aim (core/vr/trick_weapons.h): the Augur of Ebrietas' burst flies where you look when your
-// left hand pointed there within 0.8 s before it leaves (ToolGazeTick), else where the hand points
-// (the grip's forward, through the fist) as it leaves; not the hunter's facing. Its launch:
-// not a gun row, during an item animation (SpEffect 207) of goods 2000 (the goods the animation's
-// TAE event 65 uses, [player+0x1C0]). Thrown items never carry 207 (the quick items throw them
-// directly) and keep their own flight.
+// tool_aim (core/vr/trick_weapons.h ToolAims): the hunter tools that fire something fly where you
+// aim (ToolAimSource: where you look when your left hand pointed there within GazeS before the
+// launch, ToolGazeTick, else where the hand points: the grip's forward, through the fist), Tiny
+// Tonitrus only turned to that heading (ToolAimLine); not the hunter's facing. The Augur crushed
+// in the fist leaves from the fist along the controller's aim ray (ToolAimBy::Hand), eaten from
+// the clip's dummy where you look (ToolAimBy::Gaze). Locked on, an aim near the game's own line
+// keeps it (ToolKeepsLock). A tool's launch is its first bullet, known by
+// its BulletParam id (ToolAimOfBullet); also, for one used with no animation (quick_tool_direct:
+// NoteDirectTool), the hunter's first non-gun launch within DirectToolNs of that use (the log
+// names its bullet: the table's check), and for the game's own use of the Augur, as before, during
+// the item animation (SpEffect 207) of goods 2000 ([player+0x1C0]: the goods its TAE event 65
+// uses). Thrown items never carry 207 (the quick items throw them directly) and keep their own
+// flight; a tool's children (an impact, Tonitrus' chain along the ground) keep theirs.
 constexpr s32 AugurGoods = 2000;
 constexpr s32 ItemAnimEffect = 207;
 constexpr u32 OffsetAnimGoods = 0x1C0;
+constexpr s64 DirectToolNs = 400 * Ms;
 
 // When the left hand last pointed where you look (the head's forward, within Tricks::GazeDeg):
 // ToolGazeTick, every update; 0: not yet.
 std::atomic<s64> g_tool_gaze_ns{0};
+// The squeezed Augur's tentacles start this far ahead of the fist along their line (metres), and
+// never further than AugurFistMaxM from the hunter.
+constexpr float AugurFistLeadM = 0.06f;
+constexpr float AugurFistMaxM = 2.5f;
+// quick_tool_direct: the tool last used with no animation, and when (-1: none waiting); where its
+// launch goes (Quick::ToolAimBy).
+struct DirectAim {
+    s32 goods{-1};
+    s64 ns{};
+    VR::Quick::ToolAimBy by{VR::Quick::ToolAimBy::Default};
+    B::Vec3 direction{}; // captured world-space stroke; never a guest pointer
+    B::Vec3 origin{};
+};
+SeqLock<DirectAim> g_direct_tool_aim;
+// The squeezed Augur's burst (ToolAimBy::Hand): its first launch, when, and the controller's aim
+// ray in the world (zero: none, the live grip's forward); the burst's later launches follow it.
+struct AugurBurst {
+    s64 ns{};
+    B::Vec3 direction{};
+};
+SeqLock<AugurBurst> g_augur_burst;
+std::atomic<s64> g_direct_tool_consumed_ns{0};
+std::array<std::atomic<s64>,3> g_glove_launch_ns{};
+struct TonitrusArm { s64 ns{}; u32 owner{}; };
+SeqLock<TonitrusArm> g_tonitrus_arm;
+SeqLock<TonitrusContact> g_tonitrus_contact;
+std::atomic<s64> g_tonitrus_until{}, g_tonitrus_root{}, g_tonitrus_child{};
 
 // The left hand's pointing (tracked, fresh), and the head's (its forward), in the tracking space.
 bool LeftPoint(const B::HandsSample& hands, s64 now, B::Vec3& point) {
@@ -881,56 +906,401 @@ void ToolGazeTick(s64 now) {
     }
 }
 
-// The burst flies where you look when your hand pointed there within GazeS (thrust at what you
-// look at, it need not still point there as the clip lets it go), else where the hand points;
-// the game's own aim without either. The left hand feels it leave (GunEventKind::ToolBurst).
+// The direct use's own aim (NoteDirectTool), taken by its launch.
+DirectAim TakeDirectAim(const DirectAim& pending) {
+    s64 consumed=g_direct_tool_consumed_ns.load(std::memory_order_relaxed);
+    while(consumed<pending.ns) {
+        if(g_direct_tool_consumed_ns.compare_exchange_weak(consumed,pending.ns,
+                                                          std::memory_order_relaxed))return pending;
+    }
+    return {}; // another launch already took this exact record
+}
+
+// Which tool this launch of the hunter's is (kind None: none to aim); `how` names how it was
+// known, `direct` the direct use's own aim when it is that use's first launch.
+VR::Tricks::ToolAimInfo ToolOfLaunch(u8* launcher, u8* player, s32 idx, s64 now, const char*& how,
+                                     DirectAim& direct_aim,const DirectAim& pending) {
+    namespace T = VR::Tricks;
+    const s32 category = Read<s32>(launcher + OffsetLauncherCategory);
+    if (category == CategoryGun) {
+        return {};
+    }
+    const s32 bullet = Read<s32>(launcher + OffsetLauncherBullet);
+    const bool fresh = pending.by != VR::Quick::ToolAimBy::BladeContact &&
+                       pending.ns>0 && now>=pending.ns && now-pending.ns<=DirectToolNs &&
+                       g_direct_tool_consumed_ns.load(std::memory_order_relaxed)<pending.ns;
+    const s32 direct = fresh ? pending.goods : -1;
+    // (An item's launch only: a right-hand trick weapon's blast, category 1, is never a tool's.
+    // A tool used directly, quick_tool_direct's UseGoods with no item animation, launches as
+    // category 0, never 5 (the 2026-11-01 mock: the Eye's 460, the Brew's 470, the Augur's 370):
+    // the item's within DirectToolNs of that use.)
+    const bool item =
+        category == CategoryItem || (category == CategoryDirect && direct >= 0 && fresh);
+    if (const T::ToolAimInfo t = T::ToolAimOfBullet(bullet);
+        item && t.kind != T::ToolAimKind::None) {
+        how = "its bullet";
+        if (idx == 0 && direct == t.goods) {
+            const DirectAim a = TakeDirectAim(pending); // its launch came
+            if (fresh) {
+                direct_aim = a;
+            }
+        }
+        return t;
+    }
+    if (item && direct >= 0 && idx == 0 && fresh) {
+        direct_aim = TakeDirectAim(pending);
+        how = "the direct use's first launch (NOT its listed bullet)";
+        T::ToolAimInfo t = T::ToolAimOfGoods(direct);
+        t.goods = direct; // (a tool that is never aimed: logged as launched, ToolAim)
+        return t;
+    }
+    if (Read<s32>(player + OffsetAnimGoods) == AugurGoods && HasEffect(player, ItemAnimEffect)) {
+        how = "the Augur's animation";
+        return T::ToolAimOfGoods(AugurGoods);
+    }
+    return {};
+}
+
+// The game's lock-on candidates (LockTgtMan [base+0x553E860]: a list from +0x08 linked through
+// +0x80, each with its world lock point at +0x00; the throw trace's SCAN): the enemies near the
+// hunter, at most out.size().
+constexpr u64 LockTgtManRva = 0x553E860;
+std::size_t LockCandidates(std::array<VR::HunterRelics::Vector, 12>& out) {
+    if (g_base == nullptr) {
+        return 0;
+    }
+    u8* const mgr = Read<u8*>(g_base + LockTgtManRva);
+    u8* e = Plausible(mgr) ? Read<u8*>(mgr + 0x08) : nullptr;
+    std::size_t n = 0;
+    for (; n < out.size() && Plausible(e, 16); e = Read<u8*>(e + 0x80)) {
+        out[n++] = {Read<float>(e), Read<float>(e + 4), Read<float>(e + 8)};
+    }
+    return n;
+}
+
+// The thrown glove's spirits (HunterRelics::AimSpirits): from the landed glove, risen where the
+// space over it is clear, at the nearest enemy near it or level along the throw. Once per landing
+// (Game:Main, the launch hook); its three roots share it, the param keeping their fan. `rise`:
+// how far over the glove they start (0: no clear space, the glove's own height).
+struct SpiritsCast {
+    s64 ns{};
+    VR::HunterRelics::SpiritAim aim{};
+    float rise{};
+};
+SpiritsCast g_spirits_cast;
+const VR::HunterRelics::SpiritAim& SpiritsFor(const DirectAim& landing, float& rise) {
+    namespace R = VR::HunterRelics;
+    auto& c = g_spirits_cast;
+    if (c.ns != landing.ns) {
+        B::Anchor anchor{};
+        const float scale = B::LatestAnchor(anchor) && anchor.valid &&
+                                    std::isfinite(anchor.world_scale) && anchor.world_scale > 0.0f
+                                ? anchor.world_scale
+                                : 1.0f;
+        // (The request's origin is the glove's seat 6 cm up, quick_items' GLOVES landing; met by
+        // an enemy in the hand, where the glove touched it: from there, no rise.)
+        const bool contact = landing.by == VR::Quick::ToolAimBy::GloveContact;
+        const B::Vec3 land{landing.origin.x, landing.origin.y - (contact ? 0.0f : .06f * scale),
+                           landing.origin.z};
+        const B::Vec3 up{0.0f, 1.0f, 0.0f};
+        float r = 0.0f;
+        for (const float k : {1.0f, .5f}) {
+            const float want = R::SpiritRiseM * k * scale;
+            if (!contact &&
+                MapSpherePathClear(land + up * (.25f * scale), land + up * want, .12f * scale)) {
+                r = want;
+                break;
+            }
+        }
+        // Only enemies the spirits can fly to: in reach of the glove and in sight of where they
+        // start, never one behind a floor or a wall they would dive into (the 2026-11-04 review).
+        // At most 12 sweeps, once per use.
+        std::array<R::Vector, 12> candidates{}, targets{};
+        const std::size_t found = LockCandidates(candidates);
+        const B::Vec3 start = land + up * r;
+        std::size_t n = 0;
+        for (std::size_t i = 0; i < found; ++i) {
+            const auto& t = candidates[i];
+            const B::Vec3 at{t[0], t[1], t[2]};
+            if (!B::IsFinite(at) ||
+                B::LengthSq(at - land) > R::SpiritSeekM * R::SpiritSeekM * scale * scale ||
+                !MapSpherePathClear(start, at, .05f * scale)) {
+                continue;
+            }
+            targets[n++] = t;
+        }
+        c = {landing.ns,
+             R::AimSpirits({land.x, land.y, land.z}, targets.data(), n,
+                           {landing.direction.x, landing.direction.y, landing.direction.z},
+                           scale, r),
+             r};
+    }
+    rise = c.rise;
+    return c.aim;
+}
+
+// The tool flies where you aim; the game's own aim without a hand or a head. The left hand feels
+// the Augur's burst leave (GunEventKind::ToolBurst), as before.
 bool ToolAim(u8* out, u8* launcher, u8* player) {
-    if (!VR::Tricks::GetTrickSettings().tool_aim ||
-        Read<s32>(launcher + OffsetLauncherCategory) == CategoryGun ||
-        Read<s32>(player + OffsetAnimGoods) != AugurGoods || !HasEffect(player, ItemAnimEffect)) {
+    namespace T = VR::Tricks;
+    // Shaman contact placement is mandatory, independent of optional tool aiming.
+    // Other projectiles pay only this id check; they cannot take its pending contact.
+    if (Read<s32>(launcher + OffsetLauncherBullet) == 310) {
+        const s64 contact_now = NowNs();
+        DirectAim contact{};
+        if (g_direct_tool_aim.Load(contact) && contact.by == VR::Quick::ToolAimBy::BladeContact &&
+            contact.goods == VR::ShamanBlade::Goods && contact.ns > 0 && contact_now >= contact.ns &&
+            contact_now-contact.ns <= VR::ShamanBlade::MaxAgeNs && !g_dry_aim &&
+            (Read<s32>(launcher+OffsetLauncherCategory) == CategoryDirect ||
+             Read<s32>(launcher+OffsetLauncherCategory) == CategoryItem) &&
+            TakeDirectAim(contact).ns != 0) {
+            auto* rows = reinterpret_cast<float*>(out);
+            rows[3]=contact.origin.x; rows[7]=contact.origin.y; rows[11]=contact.origin.z;
+            return true;
+        }
+    }
+    if (!T::GetTrickSettings().tool_aim) {
         return false;
     }
     const s64 now = NowNs();
     auto* const rows = reinterpret_cast<float*>(out);
-    const B::Vec3 vanilla = G::FlightOfRows(rows);
     const float index_f = Read<float>(out + ShotIndexFromOut);
-    const s32 idx = std::isfinite(index_f) ? static_cast<s32>(index_f) : 0;
+    const s32 idx = std::isfinite(index_f) && index_f>=0.0f && index_f<1024.0f
+                        ? static_cast<s32>(index_f) : -1;
+    DirectAim landing{};
+    g_direct_tool_aim.Load(landing);
+    if((landing.by==VR::Quick::ToolAimBy::Landing || landing.by==VR::Quick::ToolAimBy::GloveContact) &&
+       landing.goods==VR::HunterRelics::Gloves &&
+       landing.ns>0 && now>=landing.ns && now-landing.ns<=DirectToolNs && idx>=0 && idx<3 &&
+       Read<s32>(launcher+OffsetLauncherBullet)==350 &&
+       (Read<s32>(launcher+OffsetLauncherCategory)==CategoryItem ||
+        Read<s32>(launcher+OffsetLauncherCategory)==CategoryDirect)) {
+        // Local game params: 2080 -> Bullet 350, exactly three roots, no impact child.
+        // Move only these roots, risen from the glove and at the nearest enemy (SpiritsFor);
+        // their native spread, dive, homing and life are the param's.
+        auto& claim=g_glove_launch_ns[static_cast<size_t>(idx)];
+        s64 consumed=claim.load(std::memory_order_relaxed);
+        while(consumed<landing.ns) {
+            if(claim.compare_exchange_weak(consumed,landing.ns,std::memory_order_relaxed)) {
+                if(g_dry_aim)return false;
+                const B::Vec3 hand{rows[3],rows[7],rows[11]};
+                float rise=0.0f;
+                const auto& aim=SpiritsFor(landing,rise);
+                const B::Vec3 from=VR::HunterRelics::Finite(aim.origin)&&rise>0
+                    ? B::Vec3{aim.origin[0],aim.origin[1],aim.origin[2]} : landing.origin;
+                rows[3]=from.x;rows[7]=from.y;rows[11]=from.z;
+                const auto line=VR::HunterRelics::SpiritLaunchLine(aim.direction);
+                const bool aimed=VR::HunterRelics::Length2(line)>.5f &&
+                    G::WriteLookRows(rows,{line[0],line[1],line[2]},ChrForward(player));
+                if(g_log>=1 || idx==0)
+                    LOG_INFO(Core,"VR relic: gloves spirit {} from {} ({:.2f} m over the glove; the "
+                             "hand's {}) launched along {}, {} cast={}",idx,V3(from),rise,V3(hand),
+                             YawPitch(G::FlightOfRows(rows)),
+                             !aimed ? "the game's own line"
+                             : aim.target>=0 ? "at the nearest enemy" : "level along the throw",
+                             landing.ns);
+                return true;
+            }
+        }
+        return false;
+    }
+    const char* how = "";
+    DirectAim direct{};
+    const T::ToolAimInfo tool = ToolOfLaunch(launcher, player, idx, now, how, direct,landing);
+    if (tool.kind == T::ToolAimKind::None) {
+        if (tool.goods == VR::CallBeyond::Goods) {
+            // A star: its gathered world is held until now (call_beyond.h HeldGray).
+            VR::CallBeyond::star_ns.store(now, std::memory_order_release);
+        }
+        if (tool.goods >= 0 && LineAllowed()) {
+            // A tool used directly whose bullets go their own way (Beast Roar round the hunter, A
+            // Call Beyond's stars, the Gloves' spirits): seen to launch.
+            LOG_INFO(Core, "VR tool aim: goods {}'s launch bullet={} keeps its own line ({}): "
+                           "#{} from {} along {}",
+                     tool.goods, Read<s32>(launcher + OffsetLauncherBullet), how, idx,
+                     V3(B::Vec3{rows[3], rows[7], rows[11]}), YawPitch(G::FlightOfRows(rows)));
+        }
+        return false;
+    }
+    const B::Vec3 vanilla = G::FlightOfRows(rows);
+    if(direct.by==VR::Quick::ToolAimBy::Swing && tool.goods==VR::HunterRelics::Tonitrus) {
+        // The strike's heading (quick_items: where you look, or the slash's way), the ground
+        // chain's native pitch/gravity kept. Locked on and struck toward the target (within
+        // 35 degrees, HunterRelics::StrikeKeepsLock), the game's own line at it.
+        const bool keep=VR::HunterRelics::StrikeKeepsLock(VR::IsLockedOn(),
+            {vanilla.x,vanilla.y,vanilla.z},{direct.direction.x,direct.direction.y,direct.direction.z});
+        const auto line=keep ? vanilla
+                             : T::ToolAimLine(T::ToolAimKind::Heading,vanilla,direct.direction);
+        if(g_dry_aim || (!keep && !G::WriteLookRows(rows,line,ChrForward(player))))return false;
+        if(Read<s32>(launcher+OffsetLauncherBullet)==410) {
+            g_tonitrus_arm.Store({direct.ns,Read<u32>(player+OffsetHandle)});
+            g_tonitrus_until.store(now+400*Ms,std::memory_order_release);
+        }
+        if(idx==0 && LineAllowed())
+            LOG_INFO(Core,"VR tool aim: Tiny Tonitrus' lightning bullet={} along {} (the game's {}, "
+                          "{:.1f} deg off){}",
+                     Read<s32>(launcher+OffsetLauncherBullet),YawPitch(line),YawPitch(vanilla),
+                     B::Angle(vanilla,line)/B::Deg,
+                     keep ? " (locked on, struck toward the target: the game's line)"
+                          : " (the strike's heading)");
+        return true;
+    }
     B::HandsSample hands{};
     B::Anchor anchor{};
     B::Vec3 point{};
     const bool have = B::LatestHands(hands);
     const bool tracked = have && LeftPoint(hands, now, point);
+    const bool head = have && hands.head_valid && now - hands.steady_ns <= HandsMaxAgeNs;
     const s64 seen = g_tool_gaze_ns.load(std::memory_order_relaxed);
-    const bool look = have && hands.head_valid && now - hands.steady_ns <= HandsMaxAgeNs &&
-                      seen != 0 && now - seen <= static_cast<s64>(VR::Tricks::GazeS * 1e9f);
+    const bool pointed = head && seen != 0 && now - seen <= static_cast<s64>(T::GazeS * 1e9f);
+    B::Vec3 along{};
+    T::ToolAimFrom from = T::ToolAimSource(tool.kind, head, pointed,
+                                           head ? GazeOf(hands) : B::Vec3{}, tracked, point, along);
+    // The use's own act says where: the Blacksky Eye held to your eye where you look; the Augur
+    // crushed in the fist (launched from the palm, its UseGoods dummy) along the controller's aim
+    // ray at the squeeze's end (as a gun's shot; the live grip's forward without one), never
+    // snapped to where you look. Its burst's later launches follow its first.
+    const char* act = nullptr;
+    if (tool.goods == AugurGoods && direct.by == VR::Quick::ToolAimBy::Hand && idx == 0) {
+        g_augur_burst.Store({now, direct.direction});
+    }
+    AugurBurst burst{};
+    const bool hand_aim = tool.goods == AugurGoods && g_augur_burst.Load(burst) && burst.ns > 0 &&
+                          now >= burst.ns && now - burst.ns <= DirectToolNs;
+    const bool aim_ray = hand_aim && B::LengthSq(burst.direction) > 0.5f;
+    const bool pointed_eye = tool.goods == VR::BlackskyEye::Goods &&
+                             direct.by == VR::Quick::ToolAimBy::Hand;
+    const bool eye_ray = pointed_eye && B::LengthSq(direct.direction) > 0.5f;
+    if (direct.by == VR::Quick::ToolAimBy::Gaze && head) {
+        along = GazeOf(hands);
+        from = T::ToolAimFrom::Gaze;
+        act = "held to your eye: where you look";
+    } else if (eye_ray || (pointed_eye && tracked)) {
+        along = point;
+        from = T::ToolAimFrom::Hand;
+        act = "pointed Blacksky Eye";
+    } else if (aim_ray || (hand_aim && tracked)) {
+        along = point;
+        from = T::ToolAimFrom::Hand;
+        act = aim_ray ? "squeezed: from the fist, along the controller's aim"
+                      : "squeezed: from the fist, along the grip (no aim pose)";
+    }
     const char* why = nullptr;
-    if (!look && !tracked) {
-        why = "no left hand";
+    if (from == T::ToolAimFrom::None) {
+        why = "no left hand or head";
     } else if (!B::LatestAnchor(anchor) || !anchor.valid ||
                now - anchor.steady_ns > AnchorMaxAgeNs) {
         why = "view";
     }
     B::Vec3 dir = vanilla;
+    B::Vec3 aimed = vanilla; // the line before the pointed eye's tilt (logged with it)
+    bool kept_lock = false;
     if (why == nullptr) {
-        const B::Vec3 along = look ? GazeOf(hands) : point;
-        dir = B::Normalize(B::TrackingToWorld(along, anchor.base_yaw, 1.0f), vanilla);
-        if (!g_dry_aim) {
+        const B::Vec3 world =
+            eye_ray ? direct.direction : aim_ray ? B::Normalize(burst.direction, vanilla)
+                    : B::Normalize(B::TrackingToWorld(along, anchor.base_yaw, 1.0f), vanilla);
+        dir = aimed = T::ToolAimLine(tool.kind, vanilla, world);
+        // vr.ini blacksky_aim_down_deg: the pointed eye only, a little under the aim ray (the eye
+        // cupped in the palm tips the hand up; the tester, 2026-11-05: "it fires too high").
+        if (pointed_eye) {
+            dir = T::PitchedDown(dir, VR::GetSettings().blacksky_aim_down_deg);
+        }
+        kept_lock = !pointed_eye && T::ToolKeepsLock(VR::IsLockedOn(), vanilla, dir);
+        if (kept_lock) {
+            dir = vanilla;
+        } else if (!g_dry_aim) {
             G::WriteLookRows(rows, dir, ChrForward(player));
         }
     }
-    if (idx == 0) {
+    // Squeezed: the burst leaves the fist itself (the left controller in the world, through the
+    // camera's own mapping, a little ahead along the line), whether or not the hunter's arm is
+    // drawn there. Never more than AugurFistMaxM from the hunter (else the palm dummy's start).
+    const B::Vec3 game_start{rows[3], rows[7], rows[11]};
+    bool from_fist = false;
+    if (hand_aim && tracked && why == nullptr && !g_dry_aim && std::isfinite(anchor.world_scale) &&
+        anchor.world_scale > 0.0f) {
+        const B::Vec3 fist =
+            anchor.eye_world +
+            B::TrackingToWorld(hands.hand[B::C0000::Left].p - anchor.head_k, anchor.base_yaw,
+                               anchor.world_scale) +
+            dir * (AugurFistLeadM * anchor.world_scale);
+        if (B::IsFinite(fist) && B::IsFinite(anchor.chr_t) &&
+            B::Length(fist - anchor.chr_t) <= AugurFistMaxM * anchor.world_scale) {
+            rows[3] = fist.x;
+            rows[7] = fist.y;
+            rows[11] = fist.z;
+            from_fist = true;
+        }
+    }
+    // The Blacksky Eye pointed: its meteor leaves its pupil (the eye turned onto this line,
+    // bloodborne_quickitems.cpp BlackskyEyeTurn), never more than AugurFistMaxM from the hunter,
+    // as the Augur's fist. The game's start (dummy 17 on his own hand, not where you hold it) is
+    // 50 to 70 cm from it: run 24's held eye 71 cm from it, 48 cm higher (the tester's 2026-11-05
+    // "there is an offset"; a 60 cm limit from it kept 3 of 4 shots there).
+    bool from_pupil = false;
+    if (tool.goods == VR::BlackskyEye::Goods && direct.by != VR::Quick::ToolAimBy::Gaze &&
+        why == nullptr && !g_dry_aim && std::isfinite(anchor.world_scale) &&
+        anchor.world_scale > 0.0f) {
+        std::array<float, 3> centre{};
+        float radius = 0.0f;
+        const char* kept = "no fresh eye";
+        float pupil_cm = -1.0f;
+        if (BlackskyPupil(now, centre, radius)) {
+            const B::Vec3 pupil = B::Vec3{centre[0], centre[1], centre[2]} + dir * (radius * 1.2f);
+            pupil_cm = B::Length(pupil - game_start) * 100.0f;
+            if (B::IsFinite(pupil) && B::IsFinite(anchor.chr_t) &&
+                B::Length(pupil - anchor.chr_t) <= AugurFistMaxM * anchor.world_scale) {
+                rows[3] = pupil.x;
+                rows[7] = pupil.y;
+                rows[11] = pupil.z;
+                from_pupil = true;
+            } else {
+                kept = "its pupil too far from the hunter";
+            }
+        }
+        if (idx == 0 && g_log >= 1 && LineAllowed())
+            LOG_INFO(Core, "VR tool aim: the Blacksky Eye's meteor {}{} (its pupil {:.0f} cm from the "
+                     "game's start), from ({:.3f}, {:.3f}, {:.3f}) the eye ({:.3f}, {:.3f}, {:.3f}) "
+                     "along {}, {:.1f} deg under the aim {}",
+                     from_pupil ? "leaves its pupil" : "keeps the game's start: ",
+                     from_pupil ? "" : kept, pupil_cm, rows[3], rows[7], rows[11], centre[0],
+                     centre[1], centre[2], YawPitch(dir),
+                     (G::PitchOf(aimed) - G::PitchOf(dir)) / B::Deg, YawPitch(aimed));
+    }
+    if (idx == 0 && tool.goods == AugurGoods) {
         Combat::PushGunEvent({Combat::GunEventKind::ToolBurst, 0, 0, 0.0f, now, ""});
     }
+    if constexpr (Common::Log::Enabled) {
+        // Where the game started the Augur's launch, against the palm (3), the clip's dummy (17)
+        // and the fist (where a squeezed one now starts).
+        B::Vec3 palm{}, clip{};
+        if (tool.goods == AugurGoods && g_log >= 1 && LineAllowed() &&
+            DummyAt(player, VR::Quick::ToolPalmDummy, palm) &&
+            DummyAt(player, VR::Quick::ToolHandDummy, clip)) {
+            const B::Vec3 start{rows[3], rows[7], rows[11]};
+            LOG_INFO(Core,
+                     "VR tool aim: the Augur's launch idx={} {}: the game's start {:.0f} cm from "
+                     "the palm, {:.0f} cm from dummy 17 (palm to 17: {:.0f} cm); moved {:.0f} cm",
+                     idx, from_fist ? "from the fist" : hand_aim ? "squeezed, NOT moved" : "eaten",
+                     B::Length(game_start - palm) * 100.0f, B::Length(game_start - clip) * 100.0f,
+                     B::Length(palm - clip) * 100.0f, B::Length(start - game_start) * 100.0f);
+        }
+    }
     if (idx == 0 && LineAllowed()) {
-        LOG_INFO(Core, "VR tool aim: the Augur's burst bid={} bullet={} along {} (the game's {}, "
-                       "{:.1f} deg off){}",
-                 Read<s32>(launcher + OffsetLauncherBid), Read<s32>(launcher + OffsetLauncherBullet),
-                 YawPitch(dir), YawPitch(vanilla), B::Angle(vanilla, dir) / B::Deg,
-                 why != nullptr ? fmt::format(" (the game's aim: {})", why)
-                 : look         ? fmt::format(" (where you look: the hand pointed there {:.0f} "
-                                              "ms before)",
-                                              static_cast<double>(now - seen) * 1e-6)
-                                : std::string{" (where the hand points)"});
+        const std::string aim_from =
+            why != nullptr ? fmt::format(" (the game's aim: {})", why)
+            : kept_lock    ? std::string{" (locked on, aimed at the target: the game's line)"}
+            : act != nullptr ? fmt::format(" ({})", act)
+            : from == T::ToolAimFrom::Hand ? std::string{" (where the hand points)"}
+            : pointed ? fmt::format(" (where you look: the hand pointed there {:.0f} ms before)",
+                                    static_cast<double>(now - seen) * 1e-6)
+                      : std::string{" (where you look)"};
+        LOG_INFO(Core,
+                 "VR tool aim: {} bid={} bullet={} (by {}) along {} (the game's {}, {:.1f} deg "
+                 "off){}",
+                 tool.name, Read<s32>(launcher + OffsetLauncherBid),
+                 Read<s32>(launcher + OffsetLauncherBullet), how, YawPitch(dir), YawPitch(vanilla),
+                 B::Angle(vanilla, dir) / B::Deg, aim_from);
     }
     return true;
 }
@@ -1116,6 +1486,9 @@ void PS4_SYSV_ABI GunEmitterHook(u8* out, u8* /*saved_ymm*/, u8* launcher) {
         std::scoped_lock lock{g_shot_mutex};
         if (idx == 0) {
             NoteShot(start, g_dry_aim ? vanilla : a.dir);
+            // The muzzle flash's light (muzzle_flash.h): at the muzzle, else the shot's start.
+            const B::Vec3 flash = have_muzzle ? muzzle : start;
+            MuzzleFlash::Publish(flash.x, flash.y, flash.z);
             g_last = {};
             g_last.n = ++g_stats.lines;
             g_last.bullet = bullet;
@@ -1233,6 +1606,62 @@ void RequestFlash(u8* chr, const TickState& t) {
     }
     const s32 dummy = t.flash_dummy;
     g_sfx_slot(ctl, t.flash_slot, t.flash_ffx, &dummy, 0);
+}
+
+// VR_SFX_SCAN=<file of effect ids> (tests only): after VR_SFX_SCAN_DELAY ms (default 20000) each
+// id is asked for on the hunter's palm for VR_SFX_SCAN_FRAMES updates (default 10), one after
+// another, each logged, so the shaders an effect compiles can be told from the log.
+struct SfxScan {
+    bool read{false};
+    std::vector<s32> ids;
+    s64 start_ns{0};
+    u32 frames{10};
+    size_t at{0};
+    u32 held{0};
+};
+SfxScan g_sfx_scan{};
+
+void SfxScanTick(u8* chr, s64 now) {
+    auto& s = g_sfx_scan;
+    if (!s.read) {
+        s.read = true;
+        const char* path = std::getenv("VR_SFX_SCAN");
+        if (path == nullptr) {
+            return;
+        }
+        if (std::FILE* f = std::fopen(path, "r"); f != nullptr) {
+            long id = 0;
+            while (std::fscanf(f, "%ld", &id) == 1) {
+                s.ids.push_back(static_cast<s32>(id));
+            }
+            std::fclose(f);
+        }
+        const char* delay = std::getenv("VR_SFX_SCAN_DELAY");
+        s.start_ns = now + (delay != nullptr ? std::atoi(delay) : 20000) * Ms;
+        if (const char* frames = std::getenv("VR_SFX_SCAN_FRAMES"); frames != nullptr) {
+            s.frames = static_cast<u32>(std::max(std::atoi(frames), 1));
+        }
+        LOG_INFO(Core, "VR sfxscan: {} ids from {}, {} updates each", s.ids.size(), path,
+                 s.frames);
+    }
+    if (s.at >= s.ids.size() || now < s.start_ns || !g_flash) {
+        return;
+    }
+    u8* const ctl = chr + OffsetSfxCtl;
+    if (Read<u8*>(ctl) != g_base + SfxCtlVtableRva) {
+        return;
+    }
+    if (s.held == 0) {
+        LOG_INFO(Core, "VR sfxscan: ffx {} ({}/{})", s.ids[s.at], s.at + 1, s.ids.size());
+    }
+    const s32 dummy = PalmDummy;
+    g_sfx_slot(ctl, FirstFlashSlot + FlashSlots, s.ids[s.at], &dummy, 0);
+    if (++s.held >= s.frames) {
+        s.held = 0;
+        if (++s.at == s.ids.size()) {
+            LOG_INFO(Core, "VR sfxscan: done");
+        }
+    }
 }
 
 void Fire(u8* chr, TickState& t, s64 now) {
@@ -1474,6 +1903,16 @@ void ScanTick(u8* chr, s64 now) {
     s64 hit_ns = 0;
     u8* const target = LastPlayerHitTarget(hit_ns);
     const bool follow = !sc.probe_ms.empty(); // the probe follows its target for good
+    // VR_VISCERAL_TEST: the probe follows the enemy the test put in front of the hunter.
+    if (u8* const test = follow ? VisceralTestTarget() : nullptr;
+        test != nullptr && test != sc.target) {
+        sc.ring = nullptr;
+        sc.last_id = -1;
+        sc.target = test;
+        sc.target_hit_ns = now;
+        LOG_INFO(Core, "VR gun: the parry probe follows the visceral test's target {}",
+                 fmt::ptr(test));
+    }
     if (target != nullptr && hit_ns != sc.target_hit_ns && now - hit_ns < 4000 * Ms) {
         if (target != sc.target) {
             sc.ring = nullptr;
@@ -1579,6 +2018,184 @@ void LogStats(TickState& t, s64 now) {
 template <size_t N>
 bool Matches(const u8* module, u64 rva, const std::array<u8, N>& sig) {
     return std::memcmp(module + rva, sig.data(), N) == 0;
+}
+
+// The moonlight wave's turn kept in flight (MoonTurnHook): the two places the game re-aims a bullet
+// from its velocity, each `vmovaps [r15+0x30], xmm0` and the instructions after it (the signature).
+// The first instruction after the store (a branch target itself, so that path is covered too)
+// becomes a 5-byte jump to a stub in the module's near pages (Core::ReserveNearCode), and only
+// while the Holy Moonlight Sword is the right weapon (MoonTurnTick); with any other weapon the
+// game's code is its own. In a stub any other bullet costs one compare and the moved instruction
+// (no register saved: the flags are dead there, the game sets them anew at 0x19F8988 / 0x19F9992
+// before it reads any); only the published wave goes through the full host call.
+constexpr u64 MoonTurnStoreA = 0x19F8943;
+constexpr std::array<u8, 22> MoonTurnSigA = {
+    0xC4, 0xC1, 0x78, 0x29, 0x47, 0x30, // vmovaps [r15+0x30], xmm0
+    0x41, 0xC6, 0x87, 0xF0, 0x07, 0x00, 0x00, 0x01, // mov byte [r15+0x7f0], 1
+    0xC5, 0xFA, 0x10, 0x85, 0x90, 0xF9, 0xFF, 0xFF}; // vmovss xmm0, [rbp-0x670]
+constexpr u64 MoonTurnStoreB = 0x19F9973;
+constexpr std::array<u8, 23> MoonTurnSigB = {
+    0xC4, 0xC1, 0x78, 0x29, 0x47, 0x30, // vmovaps [r15+0x30], xmm0
+    0xC4, 0xC1, 0x78, 0x28, 0x47, 0x10, // vmovaps xmm0, [r15+0x10]
+    0xC5, 0xF8, 0x29, 0x45, 0x90,       // vmovaps [rbp-0x70], xmm0
+    0xC4, 0xC1, 0x78, 0x28, 0x47, 0x30}; // vmovaps xmm0, [r15+0x30]
+constexpr size_t MoonTurnStoreLen = 6;
+constexpr std::array<size_t, 2> MoonTurnMovedLen = {8, 6}; // the instruction after each store
+constexpr u64 MoonTurnSlotAt = 0x1000; // the slot on its own page, after the stubs' page
+static_assert(sizeof(std::atomic<u8*>) == sizeof(u8*) && std::atomic<u8*>::is_always_lock_free);
+
+// One site: its 8-byte aligned block as the game has it and with the jump. A single atomic
+// exchange switches it while the game runs: a thread fetching it sees the one or the other whole
+// (the jump lies inside the block; the byte after it is never changed).
+struct MoonSite {
+    u8* site{nullptr};
+    u64* block{nullptr};
+    u64 original{0};
+    u64 patched{0};
+};
+std::array<MoonSite, 2> g_moon_sites{};
+// The full host calls (MoonTurnHook). Never freed, like the stubs: a game thread may be in one
+// until the process ends (quitting with a wave in flight).
+Xbyak::CodeGenerator* g_moon_code{nullptr};
+bool g_moon_broken{false}; // a block was neither form (someone else patched it): jumps stay out
+
+bool InstallMoonTurn(u8* module) {
+    using namespace Xbyak::util;
+    if (!Matches(module, MoonTurnStoreA, MoonTurnSigA) ||
+        !Matches(module, MoonTurnStoreB, MoonTurnSigB)) {
+        LOG_WARNING(Core, "VR blade shot: the bullet re-aim sites differ ({} / {}); the moonlight "
+                          "wave's crescent stays flat",
+                    Hook::HexBytes(module + MoonTurnStoreA, MoonTurnSigA.size()),
+                    Hook::HexBytes(module + MoonTurnStoreB, MoonTurnSigB.size()));
+        return false;
+    }
+    u8* const stubs =
+        static_cast<u8*>(::Core::ReserveNearCode(module + MoonTurnStoreA, 2 * MoonTurnSlotAt));
+    if (stubs == nullptr) {
+        LOG_WARNING(Core, "VR blade shot: no code space near the game's; the moonlight wave's "
+                          "crescent stays flat");
+        return false;
+    }
+    u8* const slot_at = stubs + MoonTurnSlotAt;
+    const std::array<u64, 2> stores = {MoonTurnStoreA, MoonTurnStoreB};
+    const std::array<const u8*, 2> moved = {MoonTurnSigA.data() + MoonTurnStoreLen,
+                                            MoonTurnSigB.data() + MoonTurnStoreLen};
+    std::array<MoonSite, 2> sites{};
+    std::array<const u8*, 2> entries{};
+    size_t stub_bytes = 0;
+    try {
+        g_moon_code = new Xbyak::CodeGenerator(2048); // (once: InstallGun runs once)
+        Xbyak::CodeGenerator c(MoonTurnSlotAt, stubs); // (in place: its addresses are final)
+        for (size_t i = 0; i < sites.size(); ++i) {
+            u8* const site = module + stores[i] + MoonTurnStoreLen;
+            const size_t len = MoonTurnMovedLen[i];
+            g_moon_code->align(16);
+            void* const host = Hook::EmitHostCallStub(*g_moon_code,
+                                                      reinterpret_cast<void*>(&MoonTurnHook),
+                                                      moved[i], len,
+                                                      reinterpret_cast<u64>(site + len), r15);
+            c.align(16);
+            entries[i] = c.getCurr();
+            Xbyak::Label call;
+            c.cmp(r15, qword[rip + static_cast<const void*>(slot_at)]);
+            c.je(call); // (forward, not taken: every bullet but the wave)
+            for (size_t b = 0; b < len; ++b) {
+                c.db(moved[i][b]); // the game's instruction (no RIP-relative operand)
+            }
+            c.jmp(static_cast<const void*>(site + len), Xbyak::CodeGenerator::T_NEAR);
+            c.L(call);
+            c.db(0xFF); // jmp qword [rip+0]; dq host
+            c.db(0x25);
+            c.dd(0);
+            c.dq(reinterpret_cast<u64>(host));
+
+            const auto at = reinterpret_cast<uintptr_t>(site);
+            const size_t off = at & 7;
+            const s64 rel = static_cast<s64>(reinterpret_cast<uintptr_t>(entries[i])) -
+                            static_cast<s64>(at + 5);
+            if (off + 5 > 8 || rel != static_cast<s32>(rel)) {
+                LOG_WARNING(Core, "VR blade shot: re-aim site {:#x} can't take a switchable jump; "
+                                  "the moonlight wave's crescent stays flat",
+                            stores[i] + MoonTurnStoreLen);
+                return false;
+            }
+            MoonSite& s = sites[i];
+            s.site = site;
+            s.block = reinterpret_cast<u64*>(at - off);
+            std::memcpy(&s.original, s.block, sizeof(u64));
+            std::array<u8, 8> bytes{};
+            std::memcpy(bytes.data(), &s.original, bytes.size());
+            const s32 rel32 = static_cast<s32>(rel);
+            bytes[off] = 0xE9; // jmp rel32
+            std::memcpy(&bytes[off + 1], &rel32, sizeof(rel32));
+            std::memcpy(&s.patched, bytes.data(), bytes.size());
+        }
+        stub_bytes = c.getSize();
+        g_moon_code->ready();
+    } catch (const Xbyak::Error& error) {
+        LOG_ERROR(Core, "VR blade shot: the crescent hooks not generated ({}); it stays flat",
+                  error.what());
+        return false;
+    }
+    Hook::FlushCode(stubs, stub_bytes);
+    if (!Hook::MakeWritable(reinterpret_cast<u8*>(sites[0].block), sizeof(u64)) ||
+        !Hook::MakeWritable(reinterpret_cast<u8*>(sites[1].block), sizeof(u64))) {
+        LOG_ERROR(Core, "VR blade shot: the bullet re-aim sites are not writable; the "
+                        "moonlight wave's crescent stays flat");
+        return false;
+    }
+    g_moon_sites = sites;
+    g_moon_slot = new (slot_at) std::atomic<u8*>(nullptr);
+    LOG_INFO(Core, "VR blade shot: the moonlight wave's crescent turns as the slash (re-aim hooks "
+                   "at {:#x} and {:#x}, in the game's code only while the Holy Moonlight Sword is "
+                   "held; stubs at {} +{:#x}: {})",
+             MoonTurnStoreA + MoonTurnStoreLen, MoonTurnStoreB + MoonTurnStoreLen,
+             fmt::ptr(stubs), entries[1] - entries[0], Hook::HexBytes(stubs, stub_bytes));
+    return true;
+}
+
+// Puts the two jumps into the game's code, or takes them out (one 8-byte atomic exchange each,
+// then the instruction cache). A block in neither form (someone else patched it) ends it for good.
+void MoonTurnSwitch(bool on) {
+    // Writable again first: the game or the emulator may have protected the code page since the
+    // install (an mprotect), and the exchange below would fault. (Rare: a weapon change.)
+    for (const MoonSite& s : g_moon_sites) {
+        if (!Hook::MakeWritable(reinterpret_cast<u8*>(s.block), sizeof(u64))) {
+            g_moon_broken = true;
+            LOG_WARNING(Core, "VR blade shot: a re-aim site is not writable any more; the "
+                              "crescent hooks stay {} the game's code",
+                        g_moon_armed.load(std::memory_order_relaxed) ? "in" : "out of");
+            return;
+        }
+    }
+    for (const MoonSite& s : g_moon_sites) {
+        std::atomic_ref<u64> block{*s.block};
+        u64 expected = on ? s.original : s.patched;
+        const u64 want = on ? s.patched : s.original;
+        if (!block.compare_exchange_strong(expected, want, std::memory_order_seq_cst) &&
+            expected != want) {
+            g_moon_broken = true;
+        }
+        Hook::FlushCode(s.site, 5);
+    }
+    if (g_moon_broken) {
+        for (const MoonSite& s : g_moon_sites) {
+            std::atomic_ref<u64> block{*s.block};
+            u64 expected = s.patched;
+            block.compare_exchange_strong(expected, s.original, std::memory_order_seq_cst);
+            Hook::FlushCode(s.site, 5);
+        }
+        g_moon_armed.store(false, std::memory_order_release);
+        LOG_WARNING(Core, "VR blade shot: a re-aim site changed under the crescent hooks ({} / "
+                          "{}); the moonlight wave's crescent stays flat",
+                    Hook::HexBytes(reinterpret_cast<u8*>(g_moon_sites[0].block), 8),
+                    Hook::HexBytes(reinterpret_cast<u8*>(g_moon_sites[1].block), 8));
+        return;
+    }
+    g_moon_armed.store(on, std::memory_order_release);
+    if (g_log >= 1) {
+        LOG_INFO(Core, "VR blade shot: the crescent hooks {} the game's code", on ? "in" : "out of");
+    }
 }
 
 bool InstallAim(u8* module) {
@@ -1763,6 +2380,7 @@ BladeRows ScanBladeRows(s32 variation, VR::Tricks::Shot shot) {
             r.shot = r.charged;
         }
         break;
+    case T::Shot::KosSpit: // its own judge (core/vr/trick_weapons.h KosSpitJudge)
     case T::Shot::None:
         break;
     }
@@ -1798,6 +2416,90 @@ void RequestBladeFlash(u8* chr, const BladeTick& t) {
 }
 
 } // Anonymous namespace
+
+// quick_tool_direct (core/vr/bloodborne_quickitems.cpp): `goods` is about to be used with no
+// animation; its first launch is the tool's (ToolOfLaunch).
+bool NoteDirectTool(s32 goods, u8 aim, const std::array<float,3>& direction,
+                    const std::array<float,3>& origin) {
+    DirectAim a{};
+    if (aim == static_cast<u8>(VR::Quick::ToolAimBy::BladeContact)) {
+        B::Anchor anchor{};
+        const s64 now=NowNs();
+        a.origin={origin[0],origin[1],origin[2]};
+        if (goods != VR::ShamanBlade::Goods || !g_aim || g_dry_aim ||
+            !VR::ShamanBlade::Finite(a.origin) || !B::LatestAnchor(anchor) || !anchor.valid ||
+            now < anchor.steady_ns || now-anchor.steady_ns > AnchorMaxAgeNs ||
+            !std::isfinite(anchor.world_scale) || anchor.world_scale <= 0 ||
+            !VR::ShamanBlade::Finite(anchor.chr_t) ||
+            B::Length(a.origin-anchor.chr_t)>3.0f*anchor.world_scale) return false;
+        a.by=VR::Quick::ToolAimBy::BladeContact;
+    } else if(aim==static_cast<u8>(VR::Quick::ToolAimBy::Swing)) {
+        B::Anchor anchor{};
+        const auto unit=VR::HunterRelics::Unit(direction);
+        const s64 now=NowNs();
+        if(goods!=VR::HunterRelics::Tonitrus || !g_aim || g_dry_aim ||
+           !VR::Tricks::GetTrickSettings().tool_aim ||
+           VR::HunterRelics::Length2(unit)<.5f || !B::LatestAnchor(anchor) ||
+           !anchor.valid || now<anchor.steady_ns || now-anchor.steady_ns>AnchorMaxAgeNs ||
+           !std::isfinite(anchor.base_yaw)) return false;
+        a.by=VR::Quick::ToolAimBy::Swing;
+        a.direction=B::TrackingToWorld({unit[0],unit[1],unit[2]},anchor.base_yaw,1.0f);
+    } else if(aim==static_cast<u8>(VR::Quick::ToolAimBy::Landing) ||
+              aim==static_cast<u8>(VR::Quick::ToolAimBy::GloveContact)) {
+        B::Anchor anchor{};const s64 now=NowNs();
+        if(goods!=VR::HunterRelics::Gloves || !g_aim || g_dry_aim ||
+           !VR::Tricks::GetTrickSettings().tool_aim || !VR::HunterRelics::Finite(origin) ||
+           !B::LatestAnchor(anchor) || !anchor.valid || now<anchor.steady_ns ||
+           now-anchor.steady_ns>AnchorMaxAgeNs || !std::isfinite(anchor.world_scale) ||
+           anchor.world_scale<=0)return false;
+        a.origin={origin[0],origin[1],origin[2]};
+        // As far as a throw can carry the glove (8 m until 2026-11-04: a far throw summoned
+        // nothing once the reach grew to GloveTossRange).
+        // (A landing 18 m out and 5 m down, the hunter a step back since: a sanity bound only,
+        // the landing itself was checked; the 2026-11-04 review.)
+        if(!VR::HunterRelics::Finite({anchor.chr_t.x,anchor.chr_t.y,anchor.chr_t.z}) ||
+           B::Length(a.origin-anchor.chr_t)>
+               (VR::HunterRelics::GloveTossRange+10.0f)*anchor.world_scale)return false;
+        a.by=static_cast<VR::Quick::ToolAimBy>(aim); // landed, or met an enemy in the hand
+        // The throw's way (world), or toward the enemy met: with no enemy near, along it.
+        if(VR::HunterRelics::Finite(direction))a.direction={direction[0],direction[1],direction[2]};
+    } else if(aim==static_cast<u8>(VR::Quick::ToolAimBy::Gaze)) {
+        a.by=VR::Quick::ToolAimBy::Gaze;
+    } else if(aim==static_cast<u8>(VR::Quick::ToolAimBy::Hand)) {
+        // The squeezed Augur: the controller's aim ray (LOCAL) mapped once to world; without a
+        // ray or a view, the launch takes the live grip's forward (ToolAim). Never a deny.
+        B::Anchor anchor{};
+        const auto unit=VR::HunterRelics::Unit(direction);
+        const s64 now=NowNs();
+        a.by=VR::Quick::ToolAimBy::Hand;
+        if(VR::HunterRelics::Length2(unit)>=.5f && B::LatestAnchor(anchor) && anchor.valid &&
+           now>=anchor.steady_ns && now-anchor.steady_ns<=AnchorMaxAgeNs &&
+           std::isfinite(anchor.base_yaw))
+            a.direction=B::TrackingToWorld({unit[0],unit[1],unit[2]},anchor.base_yaw,1.0f);
+    }
+    a.goods=goods;a.ns=NowNs();
+    g_direct_tool_aim.Store(a);
+    return true;
+}
+void CancelDirectTool() {
+    g_direct_tool_aim.Store({});
+    g_tonitrus_until.store(0,std::memory_order_release);
+}
+bool LatestTonitrusContact(TonitrusContact& contact) {
+    return g_tonitrus_contact.Load(contact) && contact.ns>0;
+}
+
+bool SpawnClipEffect(u8* chr, s32 ffx, s32 dummy) {
+    if (!g_flash || g_dry_run || chr == nullptr || ffx < 0) {
+        return false;
+    }
+    u8* const ctl = chr + OffsetSfxCtl;
+    if (Read<u8*>(ctl) != g_base + SfxCtlVtableRva) {
+        return false;
+    }
+    g_sfx_slot(ctl, -1, ffx, &dummy, 0);
+    return true;
+}
 
 void InstallGun(VAddr base, u64 size) {
     if (g_base != nullptr) {
@@ -1838,7 +2540,9 @@ void InstallGun(VAddr base, u64 size) {
                     "VR gun: the WorldChrMan proof (IsMainPlayer) differs; the gun is vanilla");
     }
     g_fire = InstallFire(module, wcm_ok);
-    InstallTwangListener(module);
+    if (g_fire) {
+        InstallMoonTurn(module); // (the moonlight wave's crescent, kept turned in flight)
+    }
     if (g_aim) {
         LOG_INFO(Core,
                  "VR gun: aim hook at {:#x} (emitter window ok, WorldChrMan ok, GetDmyPolyMtx {}): "
@@ -1965,6 +2669,7 @@ void GunPoseTick(u8* chr, const GunBody& body) {
         }
     }
     ScanTick(chr, now);
+    SfxScanTick(chr, now);
     if (!g_fire) {
         LogStats(t, now);
         return;
@@ -2146,6 +2851,138 @@ bool BowOutOfStamina(u8* chr, bool charged) {
            Read<s32>(data + OffsetStamina) <= 0;
 }
 
+namespace {
+
+// The Kos Parasite's spit (core/vr/trick_weapons.h KosSpitJudge; the presenter's Shot::KosSpit):
+// the game's own glob from your mouth where you look, with no animation (the launch steered by
+// BladeAim, as a blade shot's); the blade tick's cooldown and mouth effect.
+void KosSpit(u8* chr, BladeTick& t, const Combat::BladeShot& req, const BladeBody& body, s64 now) {
+    namespace T = VR::Tricks;
+    Combat::MeleeStatus ms{};
+    const GunBody gb{true, body.driven, body.arm_free, 1.0f, body.reason, false};
+    const char* why = nullptr;
+    if (now - req.press_ns > StalePullNs) {
+        why = "too old";
+    } else if (!Combat::LatestMeleeStatus(ms) || now - ms.ns > StatusMaxAgeNs) {
+        why = "no melee status";
+    } else if (ms.variation != T::KosRuneVariation) {
+        why = "not the Kos Parasite with the Milkweed rune";
+    } else if (const char* hard = HardReason(chr, gb); hard != nullptr) {
+        why = hard;
+    } else if (t.cooldown_left > 0.0f) {
+        why = "cooldown";
+    }
+    const s32 bid = 100000000 + T::KosRuneVariation * 1000 + T::KosSpitJudge;
+    RowOut row{};
+    s32 bullet = -1;
+    s32 row_stamina = 0;
+    if (why == nullptr) {
+        g_behavior_row(&row, bid, 1);
+        if (!Plausible(row.row, 4) || Read<u8>(row.row + RowRefType) != 1) {
+            why = "no spit row (not a bullet)";
+        } else {
+            bullet = Read<s32>(row.row + RowRefId);
+            row_stamina = Read<s32>(row.row + RowStamina);
+        }
+    }
+    u8* const data = DataModule(chr);
+    const s32 before = data != nullptr ? Read<s32>(data + OffsetStamina) : 0;
+    if (why == nullptr && data != nullptr && before <= 0) {
+        why = Combat::NoStamina;
+    }
+    B::Vec3 mouth{};
+    if (why == nullptr && !DummyAt(chr, T::KosSpitMouth, mouth)) {
+        why = "no mouth";
+    }
+    B::Anchor anchor{};
+    B::HandsSample hands{};
+    if (why == nullptr && !(req.dir_valid && B::LatestAnchor(anchor) && anchor.valid &&
+                            now - anchor.steady_ns <= AnchorMaxAgeNs && B::LatestHands(hands) &&
+                            hands.space_serial == req.space_serial)) {
+        why = "no view (or a recenter since the press)";
+    }
+    if (why != nullptr) {
+        Combat::PushMeleeEvent({Combat::MeleeEventKind::Shot, req.serial,
+                                static_cast<float>(req.shot), -1.0f, now, why});
+        LOG_INFO(Core, "VR Kos spit: #{} refused ({})", req.serial, why);
+        return;
+    }
+    // Where you look, lifted KosSpitLiftDeg as the glob arcs (its own gravity brings it down).
+    const B::Vec3 look =
+        B::Normalize(B::TrackingToWorld(req.dir, anchor.base_yaw, 1.0f), ChrForward(chr));
+    const B::Vec3 flat = B::Normalize(B::Vec3{look.x, 0.0f, look.z}, ChrForward(chr));
+    const float pitch = std::min(
+        std::asin(std::clamp(look.y, -1.0f, 1.0f)) + T::KosSpitLiftDeg * B::Deg, 80.0f * B::Deg);
+    const B::Vec3 dir =
+        B::Normalize(flat * std::cos(pitch) + B::Vec3{0.0f, std::sin(pitch), 0.0f}, look);
+    const B::Vec3 origin = mouth + dir * T::KosSpitAheadM - B::Vec3{0.0f, T::KosSpitChinM, 0.0f};
+    g_blade_aim = {req.serial, bid, now, origin, dir, {}};
+    u8 ok = 0;
+    if (!g_dry_run) {
+        ok = g_invoke_gun(chr, bid, T::KosSpitMouth, 0, HandRight, HandRight, 1, 1);
+    }
+    ++t.shots;
+    t.cooldown_left = T::KosSpitCooldownS;
+    s32 took = 0;
+    if (ok != 0) {
+        for (const s32 id : T::KosSpitSounds) {
+            Sound(id, mouth);
+        }
+        if (!VR::IsFirstPerson()) {
+            t.flash_slot = FirstBladeFlashSlot + static_cast<s32>(t.shots % FlashSlots);
+            t.flash_ffx = T::KosSpitFfx;
+            t.flash_dummy = T::KosSpitMouth;
+            t.flash_left = T::KosSpitFfxS;
+            RequestBladeFlash(chr, t);
+        }
+        // Its stamina: the row's (the game's spit takes it in its clip), unless the call did.
+        if (data != nullptr) {
+            took = before - Read<s32>(data + OffsetStamina);
+            if (took <= 0 && row_stamina > 0 && row_stamina <= 200) {
+                const s32 after = std::max(before - row_stamina, VR::Melee::StaminaFloor);
+                std::memcpy(data + OffsetStamina, &after, sizeof(after));
+                took = before - after;
+            }
+        }
+    }
+    Combat::PushMeleeEvent({Combat::MeleeEventKind::Shot, req.serial, static_cast<float>(req.shot),
+                            ok != 0 ? 1.0f : -1.0f, now, ok != 0 ? "" : "the game refused it"});
+    LOG_INFO(Core,
+             "VR Kos spit: #{} FIRE bid={} bullet={} ok={} from the mouth {} along {} (where you "
+             "look {}), stamina {} (the row's {}), {:.0f} ms after the press{}",
+             req.serial, bid, bullet, ok, V3(mouth), YawPitch(dir), YawPitch(look), took,
+             row_stamina, static_cast<float>(now - req.press_ns) * 1e-6f,
+             g_dry_run ? " DRY RUN (nothing fired)" : "");
+}
+
+} // namespace
+
+// The crescent hooks are in the game's code only while the Holy Moonlight Sword is the right
+// weapon, or its last wave still flies (2026-11-10: "ONLY if the moonlight is
+// equipped"); with any other weapon the game runs its own instructions. A stale status keeps them
+// as they are. Switching is rare (an equip, a weapon change): two atomic stores.
+void MoonTurnTick(s64 now) {
+    namespace T = VR::Tricks;
+    if (g_moon_slot == nullptr || g_moon_broken) {
+        return;
+    }
+    Combat::MeleeStatus ms{};
+    if (!Combat::LatestMeleeStatus(ms) || now - ms.ns > StatusMaxAgeNs) {
+        return;
+    }
+    const T::ShotWeapon* const w = T::ShotWeaponOf(ms.variation);
+    const bool held = w != nullptr && w->shot == T::Shot::MoonWave;
+    const bool flying = g_moon_slot->load(std::memory_order_relaxed) != nullptr &&
+                        now <= g_moon_turn.until.load(std::memory_order_relaxed);
+    const bool want = held || flying;
+    if (want != g_moon_armed.load(std::memory_order_relaxed)) {
+        MoonTurnSwitch(want);
+        if (!want) {
+            g_moon_slot->store(nullptr, std::memory_order_relaxed); // (after the jumps are out)
+        }
+    }
+}
+
 void BladeShotTick(u8* chr, const BladeBody& body) {
     namespace T = VR::Tricks;
     if (g_base == nullptr || chr == nullptr || !g_fire) {
@@ -2153,6 +2990,7 @@ void BladeShotTick(u8* chr, const BladeBody& body) {
     }
     auto& t = g_blade;
     const s64 now = NowNs();
+    MoonTurnTick(now);
     const float dt =
         t.last_ns != 0 ? std::clamp(static_cast<float>(now - t.last_ns) * 1e-9f, 0.0f, 0.1f) : 0.0f;
     t.last_ns = now;
@@ -2170,22 +3008,16 @@ void BladeShotTick(u8* chr, const BladeBody& body) {
             RequestBladeFlash(chr, t);
         }
     }
-    {
-        // bow_direct: the game's sounds heard while the bow is up and its release sound unknown.
-        const auto& bs = VR::Bow::GetBowSettings();
-        Combat::MeleeStatus up{};
-        g_twang_listen.store(bs.enabled && bs.direct && g_listen_code != nullptr &&
-                                 g_twang.load(std::memory_order_relaxed) < 0 &&
-                                 Combat::LatestMeleeStatus(up) && now - up.ns <= StatusMaxAgeNs &&
-                                 up.bow_hand >= 0,
-                             std::memory_order_relaxed);
-    }
     Combat::BladeShot req{};
     if (!Combat::LatestBladeShot(req) || req.serial == t.handled) {
         return;
     }
     t.handled = req.serial;
     const auto shot = static_cast<T::Shot>(req.shot);
+    if (shot == T::Shot::KosSpit) {
+        KosSpit(chr, t, req, body, now);
+        return;
+    }
     Combat::MeleeStatus ms{};
     const T::ShotWeapon* w = nullptr;
     const char* why = nullptr;
@@ -2246,12 +3078,13 @@ void BladeShotTick(u8* chr, const BladeBody& body) {
             origin = hand + dir * BowOriginAheadM;
         }
     } else if (why == nullptr) {
-        const B::Vec3 along = line ? B::Normalize(tip - base) : ChrForward(chr);
+        const T::ShotLine weapon_line = T::ShotLineOf(*w, base, tip);
+        const B::Vec3 along = line ? weapon_line.direction : ChrForward(chr);
         dir = mapped ? B::Normalize(B::TrackingToWorld(req.dir, anchor.base_yaw, 1.0f), along)
                      : along;
         B::Vec3 fist{};
         const bool have_fist = !line && DummyAt(chr, 300, fist); // R_Weapon's grip
-        origin = !line ? fist : shot == T::Shot::MoonWave ? (base + tip) * 0.5f : tip;
+        origin = line ? weapon_line.origin : fist;
         if (shot == T::Shot::GunBlade && !line) {
             why = "no barrel line (the weapon's dummies)";
         } else if (!line && !have_fist) {
@@ -2283,26 +3116,50 @@ void BladeShotTick(u8* chr, const BladeBody& body) {
         LOG_INFO(Core, "VR blade shot: #{} DRY (no bullets)", req.serial);
         return;
     }
+    const B::Vec3 sent_dir = dir; // (the wave's line before any snap at a target)
     if (shot == T::Shot::MoonWave) {
-        // A bit of target assist (2026-10-13): within MoonWaveAssistDeg of the target
-        // the game picked (locked on or not), the wave turns part of the way to it, as a gun's
-        // shot does (GentleAssist); a wave sent away from it flies where it was sent.
-        G::AssistCfg cfg{};
-        cfg.strength = T::MoonWaveAssist;
-        cfg.cone_deg = T::MoonWaveAssistDeg;
-        cfg.unlocked = true;
+        // Target first (trick_weapons.h MoonWaveAim; the tester, 2026-11-10): the target the game
+        // picked (locked on or not) in front of the hunter and in reach takes the wave straight at
+        // it; otherwise it flies along the blade, where it was sent.
         const bool have_target = Read<u8>(chr + OffsetLockChosen) != 0;
-        const G::AssistOut a = G::GentleAssist(dir, origin, Read3(chr + OffsetLockPoint),
-                                               have_target, VR::IsLockedOn(), false, cfg);
-        if (a.weight > 0.0f) {
-            LOG_INFO(Core, "VR blade shot: #{} the wave {:.1f} deg off the target: turned {:.1f} deg "
-                           "toward it",
-                     req.serial, a.angle_deg, a.moved_deg);
+        const T::MoonAim a = T::MoonWaveAim(dir, origin, Read3(chr + OffsetLockPoint), have_target,
+                                            ChrForward(chr));
+        if (a.at_target) {
+            LOG_INFO(Core, "VR blade shot: #{} the wave at the target (sent {:.1f} deg from it)",
+                     req.serial, a.off_deg);
             dir = a.dir;
+        } else if (have_target) {
+            LOG_INFO(Core, "VR blade shot: #{} the wave along the blade (the target not in front, "
+                           "in reach or where it was sent)",
+                     req.serial);
         }
     }
     const s32 bid = 100000000 + ms.variation * 1000 + judge;
+    if (g_log >= 1 && line && shot == T::Shot::GunBlade) {
+        B::Vec3 muzzle{};
+        std::array<float, 12> rows{};
+        if (DummyAt(chr, w->tip, muzzle, &rows)) {
+            const B::Vec3 native_forward{rows[2], rows[6], rows[10]};
+            LOG_INFO(Core, "VR blade shot: #{} variation {} ray {:.2f} deg from native muzzle "
+                           "forward (dummy {})",
+                     req.serial, ms.variation, B::Angle(dir, native_forward) / B::Deg, w->tip);
+        }
+    }
     g_blade_aim = {req.serial, bid, now, origin, dir, {}};
+    // The crescent's tilt as your slash (WriteSlashRows). The game draws the wave from a child
+    // bullet (1101) its short-lived parent (1100, the one these rows launch) spawns flat and turns
+    // flat again in its own update: MoonWaveTail and MoonTurnHook keep it turned as the parent.
+    constexpr bool MoonCrescentTilt = true;
+    if (MoonCrescentTilt && g_moon_armed.load(std::memory_order_relaxed) &&
+        shot == T::Shot::MoonWave && mapped && B::IsFinite(req.slash)) {
+        B::Vec3 slash = B::TrackingToWorld(req.slash, anchor.base_yaw, 1.0f);
+        // Snapped at a target: the crescent's tilt turns with the line (a 45-degree slash stays
+        // 45 degrees; projected instead, it skewed and past ~78 degrees went flat).
+        if (B::Angle(sent_dir, dir) > 1e-3f) {
+            slash = B::Rotate(B::FromTo(sent_dir, dir), slash);
+        }
+        g_blade_aim.slash = slash;
+    }
     u8 ok = 0;
     u8 consumed = 0;
     s32 cost = 0;
@@ -2337,8 +3194,7 @@ void BladeShotTick(u8* chr, const BladeBody& body) {
     } else if (shot == T::Shot::StakeBlast) {
         t.cooldown_left = w->cadence_s; // the blast's cooldown
     } else if (shot == T::Shot::Bow && ok != 0) {
-        const s32 twang = g_twang.load(std::memory_order_relaxed);
-        Sound(twang >= 0 ? twang : ThrowWhoosh, origin); // the string's release
+        Sound(BowRelease, origin); // the string's release
         s32 row_cost = -1;
         const s32 stamina = BowStaminaCost(bid, req.charged, row_cost);
         if (bow_data != nullptr) {
@@ -2378,7 +3234,84 @@ s32 GunBehaviorRefType(s32 bid) {
     return Plausible(row.row, 4) ? Read<u8>(row.row + RowRefType) : -1;
 }
 
+// The moonlight wave's crescent, turned as your slash (2026-11-10): at its launch tail
+// (same thread as the emitter, right after it), its parent (our emitter rows' bullet) carries the
+// slash's tilt as the game built it from them; its child, the drawn wave, launches flat: it takes
+// the parent's orientation and is published for MoonTurnHook, which keeps it so in flight. Only
+// the Holy Moonlight Sword's wave: oriented_wave is set by its slash alone (BladeAim).
+void MoonWaveTail(u8* p) {
+    BladeAimShot& a = g_blade_aim;
+    if (p == nullptr || !a.oriented_wave || a.bullet < 0 || NowNs() - a.ns > 500 * Ms ||
+        g_dry_aim || !g_moon_armed.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const s32 bullet = Read<s32>(p + OffsetPBullet);
+    if (Read<u32>(p + OffsetPOwner) != a.owner) {
+        return;
+    }
+    if (bullet == a.bullet) {
+        for (size_t i = 0; i < 4; ++i) {
+            a.q_game[i] = Read<float>(p + OffsetPQuat + 4 * i);
+        }
+        const B::Quat q{a.q_game[0], a.q_game[1], a.q_game[2], a.q_game[3]};
+        const float norm = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+        a.have_q = std::isfinite(norm) && std::abs(norm - 1.0f) < 0.01f; // (a unit quaternion)
+        return;
+    }
+    if (bullet != a.bullet + 1 || !a.have_q) {
+        return;
+    }
+    std::memcpy(p + OffsetPQuat, a.q_game.data(), sizeof(a.q_game));
+    // The record under its sequence lock (odd while written; launches are on one thread), then the
+    // stubs' filter.
+    const u32 seq = g_moon_turn.seq.load(std::memory_order_relaxed);
+    g_moon_turn.seq.store(seq + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    g_moon_turn.bullet.store(p, std::memory_order_relaxed);
+    for (size_t i = 0; i < 4; ++i) {
+        u32 bits{};
+        std::memcpy(&bits, &a.q_game[i], sizeof(bits));
+        g_moon_turn.q[i].store(bits, std::memory_order_relaxed);
+    }
+    g_moon_turn.id.store(bullet, std::memory_order_relaxed);
+    g_moon_turn.owner.store(a.owner, std::memory_order_relaxed);
+    g_moon_turn.until.store(NowNs() + MoonTurnMaxNs, std::memory_order_relaxed);
+    g_moon_turn.seq.store(seq + 2, std::memory_order_release);
+    g_moon_slot->store(p, std::memory_order_release); // (last: the record is ready)
+    if (g_log >= 1) {
+        LOG_INFO(Core, "VR blade shot: #{} the wave's crescent turned as the slash (bullet {})",
+                 a.serial, bullet);
+    }
+}
+
 void GunLaunchTail(u8* p) {
+    MoonWaveTail(p);
+    // Almost always one atomic read. Only our short, owner-matched 410 -> 411
+    // interval reads the projectile. Publish the real chain origin once per cast.
+    if(const s64 until=g_tonitrus_until.load(std::memory_order_acquire);until>0 && p) {
+        const s64 now=NowNs();
+        if(now>until)g_tonitrus_until.store(0,std::memory_order_relaxed);
+        else {
+            TonitrusArm arm{};
+            if(g_tonitrus_arm.Load(arm) && arm.ns>0 && now>=arm.ns &&
+               Read<u32>(p+OffsetPOwner)==arm.owner) {
+                const s32 bullet=Read<s32>(p+OffsetPBullet);
+                if(bullet==410)g_tonitrus_root.store(arm.ns,std::memory_order_relaxed);
+                else if(bullet==411 && g_tonitrus_root.load(std::memory_order_relaxed)==arm.ns) {
+                    const auto at=Read3(p+OffsetPPos);
+                    const std::array<float,3> point{at.x,at.y,at.z};
+                    s64 consumed=g_tonitrus_child.load(std::memory_order_relaxed);
+                    if(VR::HunterRelics::Finite(point) && consumed<arm.ns &&
+                       g_tonitrus_child.compare_exchange_strong(consumed,arm.ns,std::memory_order_relaxed)) {
+                        g_tonitrus_contact.Store({arm.ns,now,point});
+                        if(g_log>=1)
+                            LOG_INFO(Core,"VR relic: tonitrus child=411 contact={} cast={} age_ms={:.1f}",
+                                     V3(at),arm.ns,float(now-arm.ns)*1e-6f);
+                    }
+                }
+            }
+        }
+    }
     if (!g_aim_pending.load(std::memory_order_acquire) || p == nullptr) {
         return;
     }
@@ -2433,10 +3366,16 @@ void GunLaunchTail(u8* p) {
 void GunKick(VR::Body::ModelTarget& left_target, s64 now_ns) {
     const s64 at = g_kick_ns.load(std::memory_order_acquire);
     const float visual = G::GetGunSettings().recoil_visual;
-    if (at == 0 || visual <= 0.0f || now_ns - at > KickNs || now_ns < at || HeldLeftHidden()) {
+    if (at == 0 || visual <= 0.0f || now_ns - at > HeavyKickNs || now_ns < at) {
         return;
     }
     const auto family = static_cast<G::Family>(g_kick_family.load(std::memory_order_relaxed));
+    if (family != G::Family::Cannon && family != G::Family::ChurchCannon && now_ns - at > KickNs) {
+        return;
+    }
+    if (HeldLeftHidden()) {
+        return;
+    }
     const s32 attach = g_kick_attach.load(std::memory_order_relaxed);
     const G::Kick kick = G::KickOf(family);
     const float e = G::KickEnvelope(kick, static_cast<float>(now_ns - at) * 1e-6f) * visual;
@@ -2469,8 +3408,11 @@ void BladeKick(VR::Body::ModelTarget& right_target, s64 now_ns) {
     if (at == 0 || visual <= 0.0f || now_ns - at > BladeKickNs || now_ns < at) {
         return;
     }
-    const G::Kick kick = G::BladeKickOf(g_blade_kick_variation.load(std::memory_order_relaxed));
-    const float e = G::KickEnvelope(kick, static_cast<float>(now_ns - at) * 1e-6f) * visual;
+    const s32 variation = g_blade_kick_variation.load(std::memory_order_relaxed);
+    const G::Kick kick = G::BladeKickOf(variation);
+    const float e = G::BladeKickEnvelope(kick, static_cast<float>(now_ns - at) * 1e-6f,
+                                         variation == 1100 && VR::Tricks::StakeKickOut()) *
+                    visual;
     right_target = G::ApplyBladeKick(right_target, kick, e);
 }
 

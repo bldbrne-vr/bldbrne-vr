@@ -1,0 +1,1020 @@
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+#version 450
+
+// VrFogGrid (renderer_vulkan/vr_fog_grid.h; shader_recompiler/ir/passes/fog_grid.h). One thread a
+// column of the head's grid, front to back. At every cell:
+//  - the mist at its middle (air_light.h Mist, the same numbers and the same sums as
+//    emit_spirv_air_light.cpp MistAlong) and the moonlit thin air there (moon_shafts.h: the
+//    density, the near and far windows, the phase of emit_spirv_moon_shafts.cpp);
+//  - how much of the cell the moon reaches: a few places inside it asked of the game's cascaded
+//    shadow atlas (moon_shafts.h's test), moved every frame, blended with what the same place in
+//    the world held in the last frames (the picture of the last build, looked up through the
+//    camera's move) and kept for the next;
+//  - what it sends towards the eye (the mist by its own phase, cut by the shadow's contrast; the
+//    thin air's glow, lit places only), then the sums so far: "all the light the air between the
+//    eye and this cell's far face sends to the eye" and "how much of what is behind gets through".
+//    A cell's own part is exact for a slab of even air (light * (1 - exp(-e L)) / e).
+// Out: the buffer the scene's copy reads (fog_grid.h: a header, then two words a cell).
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const int MAX_PATCHES = 32; // fog_grid.h MaxPatches
+const int GROUND_CELLS = 32; // core/vr/mist_ground.h Cells
+const int MAX_MOVERS = 12;   // fog_grid.h Stir::MaxMovers
+const int MAX_LAMPS = 25;  // fog_grid.h Lamps: MaxLights, the tiles
+const ivec3 LAMP_TILES = ivec3(20, 12, 8);
+
+// (A read-only storage buffer, not a uniform one: the rasterizer hands it out of its stream
+// buffer at the storage alignment, as every other VR buffer. Every member is a vec4 or an ivec4:
+// std430 packs them as an array of dwords. fog_grid.h has the list.)
+layout(std430, binding = 0) readonly buffer FogGridParams {
+    ivec4 grid;            // cells x, y, z, the frame's tag (never 0: 0 in the header means nothing built)
+    vec4 frustum;          // tan x lo, tan y lo, tan x width, tan y width
+    vec4 slices;           // near, far, log2(far / near), 1 / that
+    vec4 view_to_world[3]; // rows: the rotation, then the camera's place
+    vec4 air_colour;       // rgb the moon's, w the mist's reach along the ray
+    vec4 mist0;            // time, density, 1 / height, the eye's height over the ground
+    vec4 mist1;            // ambient, forward, noise scale, extinction
+    vec4 mist2;            // wind xyz, patchy
+    vec4 mist3;            // near start, near full, strength, high
+    vec4 mist4;            // 1 / haze height, the mist's phase g, towards the moon: brightness, focus
+    vec4 moon;             // towards the moon xyz, half the eye distance
+    vec4 glow0;            // the thin air: density, reach, phase g, forward share
+    vec4 glow1;            // strength, near start, near full, the share of its density that dims
+    vec4 glow2;            // far keep, far fade | the taken-over fog's shadow contrast and lit gain
+    vec4 shadow;           // the mist's contrast, the lit gain, places a cell, places without a past
+    vec4 history;          // this frame's share, jitter on, the frame's number, the past can be read
+    vec4 to_last[3];       // this view to the last build's view
+    vec4 last_frustum;     // the last build's frustum
+    vec4 atlas;            // the compare's sign, width, height, shadows on
+    vec4 ends;             // the cascades' far ends in view z
+    vec4 cascade[16];      // per cascade: three view-to-shadow rows, then tile corner xy, size, bias
+    vec4 patches0;         // fog patches (fog_patches.h): how many, near start, near full, noise scale
+    vec4 patches1;         // far start, far end, the noise's drift (a share of the wind), its change in place (1 / s)
+    vec4 patches2;         // the patches' own colour (fog_patches.h TintNow), how much of it they take
+    vec4 fog_patch[4 * MAX_PATCHES]; // per patch: centre xyz, density | 1 / radii xyz, edge | ground y,
+                                 // 1 / fall height (0: none), box, noise | glow, its turn about y, its clear distance
+                                 // (cos, sin), 0
+    vec4 lamps0;           // the lamps (fog_grid.h Lamps): how many, strength, every cell asks all, the taken-over fog's gain - 1
+    vec4 lamp[2 * MAX_LAMPS]; // per light: view position xyz, reach (1 / radius^2) | colour, core
+    uvec4 lamp_tiles[480]; // a word a tile (row, column, band): four light indices (255: no more)
+    vec4 wake0;            // the hunter's wake in the fog (fog_patches.h Wake): how many points, the reach (m of the ray), the rim, the shove
+    vec4 wake_strength[2]; // each point's strength
+    vec4 wake[8];          // each point's place (the ground's y), 1 / its radius squared
+    vec4 patch_rect[MAX_PATCHES]; // the columns each patch can be seen in: first x, first y, last x, last y
+    vec4 lamp_shape;       // a lamp's light in the taken-over fog (fog_grid.h Lamps::Taken*): forward share, g, dim, cap
+    vec4 lamp_free[2 * MAX_LAMPS]; // a lamp's free lengths before a wall along the world's axes: +x +y +z | -x -y -z
+    vec4 organic;          // the taken-over banks (fog_patches.h Organic): billow, the merge's limit, the outline's break-up, its own shade (per unit of column)
+    vec4 patch_slope[MAX_PATCHES]; // each patch's ground: its rise per metre along the world's x and z, 0, 0 (fog_patches.h Slope)
+    vec4 clearings;        // lanes of thinner fog through crowded banks (fog_patches.h Organic::ClearNow): the share, 2 pi / the width, the merge's limit by the banks' shapes (0 or 1), how much the wisps' wave bends the lanes
+    vec4 layers;           // the wisps' strength by the height (fog_patches.h Organic::LayersNow): at the ground, 1 / the height's scale, high up, the share of the low fog that stays at the hunter's feet
+    vec4 world_vol;        // the world-fixed volume (fog_grid.h World): its low corner in the world, 1 when it is on
+    vec4 lamp_fall;        // a lamp's light dies in the fog (fog_grid.h Lamps::Fall*): per metre in the taken-over banks, in the mist, the even distance, times this in the mist
+    vec4 ground_head;      // the mist's ground from the map (core/vr/mist_ground.h): the lattice's low corner (x, z), 1 / a cell's width, 1 when it is on
+    vec4 ground[GROUND_CELLS * GROUND_CELLS / 4]; // its cells' ground heights (the world's y), row by row
+    vec4 stir0;            // the fog stirred by what moves through it (fog_grid.h Stir): the frame's seconds, 1 when it is on, how many movers, tests' bits
+    vec4 stir1;            // the last frame's volume corner (x, z), 1 when the last field is there, 0
+    vec4 stir2;            // what a frame keeps: of the push aside, of the clearing, of the churn; the share that spreads
+    vec4 mover[2 * MAX_MOVERS]; // a mover: its place (x, its low y, z), 1 / r^2 | its speed (x, z; m/s), its strength, its churn
+    vec4 lamp_far;         // a lamp's light gets further in fog much darker than it (fog_grid.h Lamps::Far*): what it dies less by a metre past the even distance in the taken-over banks, in the mist; the contrast it begins at, 1 / the contrast's span
+} par;
+
+layout(std430, binding = 1) writeonly restrict buffer FogGrid {
+    uint words[];
+} fog;
+
+// The moon's shadow atlas (the game's depth image, four cascades in tiles), the lit shares of the
+// last build (blended look-ups) and this build's.
+layout(binding = 2) uniform sampler2D moon_atlas;
+layout(binding = 3) uniform sampler3D last_lit;
+layout(binding = 4, LIT_FORMAT) uniform writeonly restrict image3D lit_out;
+// The world-fixed volume (fog_grid.h World): the taken-over banks' fog at fixed places of the
+// world, x and z across the picture, y its depth: r the fog there, g its plain-light weight.
+// Written by this shader built with WORLD_VOLUME (one thread a column of cubes), read by the grid.
+#ifdef WORLD_VOLUME
+layout(binding = 5, WORLD_FORMAT) uniform writeonly restrict image3D world_out;
+layout(binding = 6) uniform sampler2D stir_tex; // this frame's stir field (fog_grid.h Stir)
+#else
+layout(binding = 5) uniform sampler3D world_tex;
+#endif
+#ifdef STIR_FIELD
+layout(binding = 6, rgba16f) uniform writeonly restrict image2D stir_out;
+layout(binding = 7) uniform sampler2D stir_last;
+#endif
+// The stir field's rules (fog_grid.h Stir).
+const float STIR_ASIDE = 0.35;   // fog is pushed aside by this share of a mover's radius at most
+const float STIR_DRAG = 0.2;     // ... and dragged along by this share of the mover's way
+const float STIR_MAX_M = 1.5;    // never further than this
+const float STIR_RIM = 0.9;      // what a mover displaced lies thicker round it (fog_patches.h Wake::Rim)
+const float STIR_FLOW = 0.8;     // churned fog carries the field round (m/s at full churn)
+const float STIR_SWIRL_M = 0.5;  // ... and its wisps swirl by this much
+const ivec3 WORLD_SIZE = ivec3(128, 128, 48);  // cubes along the world's x, z, y
+const vec3 WORLD_CUBE = vec3(0.5, 0.5, 0.25);  // a cube's size along x, z, y (m)
+const float WORLD_EDGE_M = 4.0;                // the box's last metres across: cross-faded with the grid's own
+const float WORLD_EDGE_Y_M = 1.0;
+
+const uint HEADER_WORDS = 16u;
+const float MAX_LIGHT = 64.0;
+const float MOONWARD_SMOOTH = 0.7; // fog_grid.h MoonwardSmooth
+
+float Smooth01(float t) {
+    t = clamp(t, 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// The depth of a slice coordinate (0 at the near plane, cells z at the far one).
+float SliceZ(float k) {
+    return par.slices.x * exp2(k / float(par.grid.z) * par.slices.z);
+}
+
+float Gyroid(vec3 q) {
+    return dot(sin(q), cos(q.yzx));
+}
+
+uint Code16(float v) {
+    return uint(clamp(v, 0.0, 1.0) * 65535.0 + 0.5);
+}
+
+// Three numbers in 0..1 from a cell's index (pcg3d).
+vec3 Hash3(uvec3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    return vec3(v >> 8u) * (1.0 / 16777216.0);
+}
+
+// Does the moon reach this place of the head's view (1) or not (0): its cascade by its depth, its
+// place in that cascade's tile of the atlas, one texel; lit when the place's shadow depth passes
+// the atlas' within the bias (the game's compare, by its sign), and outside every cascade (beyond
+// the shadows' reach). emit_spirv_moon_shafts.cpp's test, the same.
+float MoonLit(vec3 p) {
+    const int k = p.z > par.ends.x ? (p.z > par.ends.y ? (p.z > par.ends.z ? 3 : 2) : 1) : 0;
+    const vec4 h = vec4(p, 1.0);
+    const vec3 sc = vec3(dot(par.cascade[4 * k], h), dot(par.cascade[4 * k + 1], h), dot(par.cascade[4 * k + 2], h));
+    const vec4 tile = par.cascade[4 * k + 3];
+    const bool inside = all(greaterThanEqual(sc.xy, tile.xy)) && all(lessThan(sc.xy, tile.xy + tile.z)) &&
+                        p.z <= par.ends.w;
+    if (!inside) {
+        return 1.0;
+    }
+    const ivec2 texel = clamp(ivec2(floor(sc.xy * par.atlas.yz)), ivec2(0), ivec2(par.atlas.yz) - 1);
+    const float stored = texelFetch(moon_atlas, texel, 0).r;
+    return par.atlas.x * (stored - sc.z) >= -tile.w ? 1.0 : 0.0;
+}
+
+// A way of the world in a fog patch's own axes (turned about y: its x radius lies along (cos, 0, sin)).
+vec3 PatchAxes(int i, vec3 v) {
+    const vec2 turn = par.fog_patch[4 * i + 3].yz;
+    return vec3(turn.x * v.x + turn.y * v.z, v.y, turn.x * v.z - turn.y * v.x);
+}
+
+// A fog patch's density at a place of the world (fog_patches.h): 1 at its heart, thinning over the
+// outer share of its radii (round, or a rounded box seen from above); one that hugs the ground
+// thins upward from the ground's height.
+// `tall`: half the height of the cell asking (m). A bank lower than that is spread over the
+// cell's height, the same fog in all: no slab that one row of cells has and the next has not.
+// `y_near`, `y_far`: the world's y of the cell's ray at its two ends (the cell reaches `tall` over
+// and under them); `half_run`: half the ray's way across the ground between them (x and z: with
+// the patch's slope, how much the ground rises along the cell). `wave`: the noise's wide wave at the place (-1.5..1.5): a bank
+// of the game's fog taken over is higher where it is high and its outline goes in and out with it
+// (fog_patches.h Organic: a billowing top, no clean oval).
+// `shade`: the share of the light the bank's fog in the cell gets through the bank's own fog above
+// it (fog_patches.h Organic::SelfShadeNow; 1 with none).
+// `low`: the share of the bank's fog in the cell that counts as at the ground for its wisps (the
+// mean of exp(-height / the layers' scale) over the fog there; below 0: not a bank with a fall).
+float PatchAt(int i, vec3 p, float tall, float y_near, float y_far, vec2 half_run, float wave, out float shade,
+              out float low) {
+    shade = 1.0;
+    low = -1.0;
+    const vec4 centre = par.fog_patch[4 * i], radii = par.fog_patch[4 * i + 1], more = par.fog_patch[4 * i + 2];
+    // (Only as much taller as the cell is taller than the bank: the root of the squares. With the
+    // plain sum a bank 0.3 m high was two fifths taller at 10 m than at the eye, and swelled and
+    // sank as the eye walked to and from it.)
+    const float spread = inversesqrt(1.0 + tall * tall * radii.y * radii.y);
+    // (Its ground a plane, fog_patches.h Slope: heights are over the ground here.)
+    const vec2 slope = par.patch_slope[i].xy;
+    vec3 rel = p - centre.xyz;
+    const float rise = dot(slope, rel.xz);
+    rel.y -= rise;
+    vec3 q = PatchAxes(i, rel) * radii.xyz;
+    q.y *= spread;
+    const vec2 h2 = q.xz * q.xz;
+    const float across = more.z > 0.5 ? sqrt(sqrt(dot(h2, h2))) : sqrt(h2.x + h2.y);
+    const bool taken = par.fog_patch[4 * i + 3].x < 0.0;
+    const float r = length(vec2(across, q.y)) + (taken ? 0.25 * par.organic.z * wave : 0.0);
+    float amount = 1.0 - Smooth01((r - (1.0 - radii.w)) / max(radii.w, 1e-3));
+    // (As much fog in the column as before: thinner by what it is taller, by the fall's height
+    // where it has one, which is the lower of the two.)
+    if (more.y > 0.0) {
+        // (The fall's mean over the cell's own heights, exact: all of it under the ground's height,
+        // exp(-h / fall) over it. Read at the cell's middle a bank lower than the cell was there or
+        // not by where the middle fell, and blinked as the eye walked.)
+        const float run = dot(slope, half_run);
+        const float h_near = y_near + run - rise - more.x, h_far = y_far - run - rise - more.x;
+        const float a = min(h_near, h_far) - tall, b = max(max(h_near, h_far) + tall, a + 1e-3);
+        const float under = clamp(-a, 0.0, b - a);
+        const float rate = taken ? more.y / clamp(1.0 + par.organic.x * wave, 0.35, 2.5) : more.y;
+        const float ea = exp(-rate * max(a, 0.0)), eb = exp(-rate * max(b, 0.0));
+        const float over = (ea - eb) / rate;
+        if (taken && par.organic.w > 0.0 && amount > 0.0) {
+            // (The bank's own column above the cell's foot and above its top, times k: the fog
+            // between them gets, weighed by where it is, (exp(-top) - exp(-foot)) / (foot - top)
+            // of the light, exact, whatever the cell's height: the same bank far off and at the
+            // eye. Times what keeps a heart's whole column as bright as with no shade.)
+            const float k = par.organic.w * centre.w * amount;
+            const float ca = k * (ea / rate + max(-a, 0.0)), cb = k * (eb / rate + max(-b, 0.0));
+            // (The gain: once a bank on the CPU, the slope vec4's z.)
+            shade = par.patch_slope[i].z * (ca - cb > 1e-4 ? (exp(-cb) - exp(-ca)) / (ca - cb) : exp(-ca));
+        }
+        if (taken) {
+            // (Of the bank's fog in the cell, how much is at the ground: exp(-height / scale)
+            // weighed by the fog, exact as the fall's mean is; all of what is under the ground.)
+            const float rate2 = rate + par.layers.y;
+            const float over2 = (exp(-rate2 * max(a, 0.0)) - exp(-rate2 * max(b, 0.0))) / rate2;
+            low = (under + over2) / max(under + over, 1e-6);
+        }
+        amount *= (under + over) / (b - a);
+    } else {
+        amount *= spread;
+    }
+    return centre.w * amount;
+}
+
+// The ground's height under the air's mist at a place of the world (core/vr/mist_ground.h): between
+// the lattice's four cells round it; `level`: the one level plane's height, without a lattice.
+float MistGround(vec2 xz, float level) {
+    if (par.ground_head.w < 0.5) {
+        return level;
+    }
+    const vec2 g = clamp((xz - par.ground_head.xy) * par.ground_head.z - 0.5, vec2(0.0), vec2(float(GROUND_CELLS - 1)));
+    const ivec2 lo = ivec2(g), hi = min(lo + 1, ivec2(GROUND_CELLS - 1));
+    const vec2 f = g - vec2(lo);
+    const int a = lo.y * GROUND_CELLS + lo.x, b = lo.y * GROUND_CELLS + hi.x;
+    const int c = hi.y * GROUND_CELLS + lo.x, d = hi.y * GROUND_CELLS + hi.x;
+    return mix(mix(par.ground[a >> 2][a & 3], par.ground[b >> 2][b & 3], f.x),
+               mix(par.ground[c >> 2][c & 3], par.ground[d >> 2][d & 3], f.x), f.y);
+}
+
+// 1 / the square of how far lamp `i`'s light gets towards a place `d` from it (the grid's view)
+// before a wall (core/vr/map_lights.h ReachAlong: between its free lengths along the world's axes,
+// by the squares of the direction's parts).
+float LampWall(uint i, vec3 d) {
+    const vec3 w = vec3(dot(par.view_to_world[0].xyz, d), dot(par.view_to_world[1].xyz, d), dot(par.view_to_world[2].xyz, d));
+    // (The box of the six lengths, core/vr/map_lights.h ReachAlong: `t` times the way to the
+    // place is where its direction leaves the box.)
+    const vec3 free = mix(par.lamp_free[2u * i + 1u].xyz, par.lamp_free[2u * i].xyz, greaterThan(w, vec3(0.0)));
+    const vec3 ts = free / max(abs(w), vec3(1e-4));
+    const float t = min(ts.x, min(ts.y, ts.z));
+    return 1.0 / max(dot(w, w) * t * t, 1e-4);
+}
+
+// How much further lamp `i`'s light gets at a place `away` from it (fog_grid.h Lamps::Far*): the
+// metres past the even distance, times the share the contrast gives (the lamp's own light at the
+// even distance, lamp_free's w, by 1 / the fog's own light here).
+float LampFurther(uint i, float per_own, float away) {
+    const float t = clamp((par.lamp_free[2u * i].w * per_own - par.lamp_far.z) * par.lamp_far.w, 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t) * max(away - par.lamp_fall.z, 0.0);
+}
+
+// A taken-over bank the volume holds: one with a fall and no clear distance of its own.
+bool InVolume(int i) {
+    return par.world_vol.w > 0.5 && par.fog_patch[4 * i + 3].x < 0.0 && par.fog_patch[4 * i + 2].y > 0.0 &&
+           par.fog_patch[4 * i + 3].w <= 0.0;
+}
+
+// What a cube of the world-fixed volume holds at its middle `p` (the taken-over fog there, its
+// plain-light weight): what the grid's own way gives a place (its loop over the patches below, kept
+// in step with it): the banks' shapes by PatchAt, the wisps, the merge's limit, the clearings, the
+// hunter's push. `mask`: the banks to ask.
+// `stir`: what the stir field holds for the place's column (fog_grid.h Stir): where its wisps are
+// read (x, z, from the place), the share of the fog that stays; a share below 0: no field, the
+// hunter's point wake.
+vec2 VolumeAt(vec3 p, uint mask, vec3 patch_drift, int wakes, vec3 stir) {
+    float taken = 0.0, plain = 0.0, shape_sum = 0.0;
+    float keep = 1.0;
+    vec3 shoved = vec3(0.0);
+    if (stir.z >= 0.0) {
+        keep = stir.z;
+        shoved.xz = stir.xy;
+        wakes = 0;
+    }
+    for (int w = 0; w < wakes; ++w) {
+        const vec3 off = p - par.wake[w].xyz;
+        const float x = (dot(off.xz, off.xz) + 0.25 * off.y * off.y) * par.wake[w].w;
+        const float heart = 1.0 / (1.0 + x * x);
+        const float s = par.wake_strength[w >> 2][w & 3];
+        keep *= 1.0 - s * (heart - par.wake0.z * x * heart);
+        shoved.xz -= off.xz * (s * heart * par.wake0.w);
+    }
+    const vec3 noise_at = (p + shoved) * par.patches0.w + patch_drift;
+    const float wave = Gyroid(noise_at * 0.303 + vec3(3.1, 0.7, 5.3));
+    // (A cube is half a metre: it holds every wave.)
+    const float wisp = 0.20 * wave + 0.22 * Gyroid(noise_at) + 0.11 * Gyroid(noise_at * 2.17 + vec3(1.7, 4.1, 2.9));
+    for (uint left = mask; left != 0u; left &= left - 1u) {
+        const int i = findLSB(left);
+        float shade;
+        float low;
+        float amount = PatchAt(i, p, 0.5 * WORLD_CUBE.z, p.y, p.y, vec2(0.0), wave, shade, low);
+        if (amount <= 0.0) {
+            continue;
+        }
+        shape_sum += amount;
+        const float wisps = par.fog_patch[4 * i + 2].w *
+                            (low < 0.0 ? 1.0 : par.layers.z - (par.layers.z - par.layers.x) * low);
+        amount *= max(1.0 + wisps * 2.0 * wisp, 0.0);
+        taken += amount;
+        plain += amount * -par.fog_patch[4 * i + 3].x * shade;
+    }
+    if (par.organic.y > 0.0 && taken > 1e-6) {
+        const float sum = par.clearings.z > 0.5 ? max(shape_sum, 1e-6) : taken;
+        const float kept = par.organic.y * (1.0 - exp(-sum / par.organic.y)) / sum;
+        taken *= kept;
+        plain *= kept;
+    }
+    if (par.clearings.x > 0.0 && taken > 1e-6) {
+        vec2 g = noise_at.xz / par.patches0.w * par.clearings.y;
+        g += par.clearings.w * vec2(wave, sin(g.x * 0.37 - g.y * 0.53 + 1.7 * wave));
+        const float lanes = sin(g.x * 0.94 + g.y * 0.34) * sin(g.y * 0.71 - g.x * 0.29 + 1.3) +
+                            0.5 * sin(g.x * 1.31 + g.y * 1.57 + 4.1) + 0.3 * sin(g.x * 2.63 - g.y * 2.11 + 0.6);
+        const float crowd = par.organic.y > 0.0 ? clamp(taken / (0.6 * par.organic.y), 0.0, 1.0) : 1.0;
+        const float left = 1.0 - par.clearings.x * crowd * Smooth01(lanes * 0.9 + 0.2);
+        taken *= left;
+        plain *= left;
+    }
+    return vec2(taken, plain) * keep;
+}
+
+#ifdef WORLD_VOLUME
+// The volume's build: a thread a column of cubes.
+void main() {
+    const ivec2 col = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(col, WORLD_SIZE.xy))) {
+        return;
+    }
+    const vec3 corner = par.world_vol.xyz;
+    const vec2 xz = corner.xz + (vec2(col) + 0.5) * WORLD_CUBE.xy;
+    const int patches = clamp(int(par.patches0.x), 0, MAX_PATCHES);
+    const float grow = 1.0 + 0.375 * par.organic.z;
+    uint mask = 0u;
+    // (The heights the column's banks reach at all, each one's radius up and down with its
+    // outline's break-up: the cubes over and under them hold nothing and ask nothing.)
+    float y_lo = 1e9, y_hi = -1e9;
+    for (int i = 0; i < patches; ++i) {
+        if (!InVolume(i)) {
+            continue;
+        }
+        const vec4 centre = par.fog_patch[4 * i], radii = par.fog_patch[4 * i + 1];
+        const vec3 q = PatchAxes(i, vec3(xz.x - centre.x, 0.0, xz.y - centre.z)) * radii.xyz;
+        if (max(abs(q.x), abs(q.z)) < grow) {
+            mask |= 1u << uint(i);
+            const float reach = grow / radii.y + WORLD_CUBE.z;
+            // (Its middle's height here: with its ground's slope, PatchAt.)
+            const float mid = centre.y + dot(par.patch_slope[i].xy, xz - centre.xz);
+            y_lo = min(y_lo, mid - reach);
+            y_hi = max(y_hi, mid + reach);
+        }
+    }
+    const vec3 drift = par.mist2.xyz * par.mist0.x;
+    const vec3 patch_drift = drift * par.patches1.z + vec3(0.0, par.mist0.x * par.patches1.w, 0.0);
+    const int wakes = clamp(int(par.wake0.x), 0, 8);
+    // The stir field at this column (fog_grid.h Stir): its cleared share is gone (below 0: the
+    // rim of what a body moved aside, thicker); the wisps are read where the fog came from, and
+    // carried round by a flow with no source where it is churned.
+    vec3 stir = vec3(0.0, 0.0, -1.0);
+    if (par.stir0.y > 0.5 && mask != 0u) {
+        const vec2 px = 1.0 / vec2(WORLD_SIZE.xy);
+        const vec2 uv = (vec2(col) + 0.5) * px;
+        const vec4 f = textureLod(stir_tex, uv, 0.0);
+        const float t = par.mist0.x;
+        const vec2 swirl = f.w * STIR_SWIRL_M * vec2(sin(xz.y * 1.9 + t * 1.3) + 0.5 * sin(xz.y * 4.3 - t * 2.1),
+                                                     cos(xz.x * 1.9 - t * 1.1) + 0.5 * cos(xz.x * 4.3 + t * 1.7));
+        // (Tests, VR_FOG_STIR_TEST: bit 0 no clearing, bit 2 the wisps not moved.)
+        const int test = int(par.stir0.w);
+        stir = vec3((test & 4) != 0 ? vec2(0.0) : swirl - f.xy, (test & 1) != 0 ? 1.0 : clamp(1.0 - f.z, 0.0, 1.6));
+    }
+    for (int y = 0; y < WORLD_SIZE.z; ++y) {
+        vec2 held = vec2(0.0);
+        const float py = corner.y + (float(y) + 0.5) * WORLD_CUBE.z;
+        if (mask != 0u && py > y_lo && py < y_hi) {
+            held = VolumeAt(vec3(xz.x, py, xz.y), mask, patch_drift, wakes, stir);
+        }
+        imageStore(world_out, ivec3(col, y), vec4(held, 0.0, 0.0));
+    }
+}
+#elif defined(STIR_FIELD)
+// The stir field's frame (fog_grid.h Stir): a thread a column of the world volume.
+void main() {
+    const ivec2 col = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(col, WORLD_SIZE.xy))) {
+        return;
+    }
+    const vec2 xz = par.world_vol.xz + (vec2(col) + 0.5) * WORLD_CUBE.xy;
+    const vec2 span = vec2(WORLD_SIZE.xy) * WORLD_CUBE.xy;
+    const float dt = par.stir0.x;
+    // What was here: the last frame's field at this place of the world (the box may have moved
+    // by whole cubes since), carried round by its own churn, spread a little, less by the time.
+    vec4 f = vec4(0.0);
+    const vec2 uv = (xz - par.stir1.xy) / span;
+    if (par.stir1.z > 0.5 && all(greaterThan(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)))) {
+        const vec2 px = 1.0 / vec2(WORLD_SIZE.xy);
+        const float churn = textureLod(stir_last, uv, 0.0).w;
+        const float t = par.mist0.x;
+        const vec2 flow = churn * STIR_FLOW * vec2(sin(xz.y * 1.9 + t * 1.3), cos(xz.x * 1.9 - t * 1.1));
+        const vec2 from = uv - flow * dt / span;
+        f = textureLod(stir_last, from, 0.0);
+        const vec4 round_it = 0.25 * (textureLod(stir_last, from + vec2(px.x, 0.0), 0.0) + textureLod(stir_last, from - vec2(px.x, 0.0), 0.0) +
+                                      textureLod(stir_last, from + vec2(0.0, px.y), 0.0) + textureLod(stir_last, from - vec2(0.0, px.y), 0.0));
+        f = mix(f, round_it, par.stir2.w);
+        f.xy *= par.stir2.x;
+        f.z *= par.stir2.y;
+        f.w *= par.stir2.z;
+    }
+    // The movers: each pushes the fog's wisps aside round itself (most at 0.7 of its radius, none
+    // at its own place and none far off), drags them along its way, clears the fog at its heart
+    // and piles it up round it, churns it.
+    const int movers = clamp(int(par.stir0.z), 0, MAX_MOVERS);
+    for (int i = 0; i < movers; ++i) {
+        const vec4 a = par.mover[2 * i], b = par.mover[2 * i + 1];
+        const vec2 r = xz - a.xz;
+        const float d2 = dot(r, r);
+        const float x = d2 * a.w;
+        if (x > 30.0) {
+            continue;
+        }
+        const float bell = exp(-x);
+        // (Aside: only the part of the push that points away from the mover is set, so what its
+        // way dragged along at its sides stays and flows back in its own time. Dragged: the sum
+        // over a pass is STIR_DRAG times the mover's width, whatever its speed.)
+        const vec2 away = r * inversesqrt(max(d2, 1e-4));
+        const float aside = STIR_ASIDE * inversesqrt(a.w) * 2.33 * sqrt(x) * bell * b.z;
+        f.xy += away * ((aside - dot(f.xy, away)) * clamp(2.5 * bell, 0.0, 1.0) * b.z);
+        f.xy += b.xy * (dt * STIR_DRAG * b.z * bell);
+        // (Cleared: the point wake's own rule round a body (fog_patches.h Wake: all but gone at
+        // its heart, thicker in a rim about its radius), which the field takes on at once near
+        // the mover and less and less far from it: the clearing goes with the mover, and what
+        // it leaves behind closes in its own time.)
+        const float heart = 1.0 / (1.0 + x * x);
+        f.z = mix(f.z, b.z * (heart - STIR_RIM * x * heart), clamp(3.0 * exp(-0.25 * x), 0.0, 1.0));
+        f.w = max(f.w, b.w * bell);
+    }
+    const float far = length(f.xy);
+    if (far > STIR_MAX_M) {
+        f.xy *= STIR_MAX_M / far;
+    }
+    if (any(isnan(f)) || any(isinf(f))) {
+        f = vec4(0.0);
+    }
+    imageStore(stir_out, col, f);
+}
+#else
+void main() {
+    const ivec2 column = ivec2(gl_GlobalInvocationID.xy);
+    // The header (one thread).
+    if (column == ivec2(0)) {
+        fog.words[0] = uint(par.grid.x);
+        fog.words[1] = uint(par.grid.y);
+        fog.words[2] = uint(par.grid.z);
+        fog.words[3] = uint(par.grid.w);
+        for (int i = 0; i < 4; ++i) {
+            fog.words[4 + i] = floatBitsToUint(par.frustum[i]);
+            fog.words[8 + i] = floatBitsToUint(par.slices[i]);
+        }
+        fog.words[12] = floatBitsToUint(par.moon.w);
+        fog.words[13] = 0u;
+        fog.words[14] = 0u;
+        fog.words[15] = 0u;
+    }
+    if (any(greaterThanEqual(column, par.grid.xy))) {
+        return;
+    }
+    // The column's ray through its cells' middles (the head's view: x right, y up, z ahead): a
+    // slice dz deep is dz * stretch long.
+    const vec2 cell_tan = par.frustum.zw / vec2(par.grid.xy);
+    const vec2 tangent = par.frustum.xy + cell_tan * (vec2(column) + 0.5);
+    const vec3 ray = vec3(tangent, 1.0);
+    const float stretch = length(ray);
+    const vec3 dir = ray / stretch;
+    // Along the ray in the world: the place, and the height over the ground.
+    const vec3 r0 = par.view_to_world[0].xyz, r1 = par.view_to_world[1].xyz, r2 = par.view_to_world[2].xyz;
+    const vec3 origin = vec3(par.view_to_world[0].w, par.view_to_world[1].w, par.view_to_world[2].w);
+    const vec3 world_ray = vec3(dot(r0, ray), dot(r1, ray), dot(r2, ray));
+    const vec3 drift = par.mist2.xyz * par.mist0.x;
+    const float density = clamp(par.mist0.y, 0.0, 4.0);
+    const float reach = max(par.air_colour.w, 2.0);
+    // The mist's light: a share from all round and a share by the mist's own wide phase towards
+    // the moon (the same along the whole column), times its strength.
+    const float towards = dot(dir, par.moon.xyz);
+    const float g = par.mist4.y, g2 = g * g;
+    const float d = max(1.0 + g2 - 2.0 * g * towards, 1e-4);
+    // Towards the moon (fog_grid.h WoodsMoonward): the mist's light more, its shadows fainter.
+    const float moonward = pow(max(towards, 0.0), max(par.mist4.w, 0.5));
+    const float mist_phase =
+        (par.mist1.x + par.mist1.y * (1.0 - g2) / (d * sqrt(d))) * par.mist3.z * (1.0 + par.mist4.z * moonward);
+    // (The game's fog taken over: no more light towards the moon, the plain contrast and lit gain.)
+    const float plain_phase = (par.mist1.x + par.mist1.y * (1.0 - g2) / (d * sqrt(d))) * par.mist3.z;
+    const float shadow_contrast = par.shadow.x * (1.0 - MOONWARD_SMOOTH * moonward * min(par.mist4.z, 1.0));
+    // The thin air's (moon_shafts.h): its own phase, sharper; strength times density.
+    const float glow_density = clamp(par.glow0.x, 0.0, 10.0);
+    const float glow_far = max(par.glow0.y, 1.0);
+    const float gg = par.glow0.z, gg2 = gg * gg;
+    const float gd = max(1.0 + gg2 - 2.0 * gg * towards, 1e-4);
+    // (Towards the moon the thin air too, by half the mist's share: fog_grid.h WoodsMoonward.)
+    const float glow_light = (1.0 + 0.5 * par.mist4.z * moonward) *
+        par.glow1.x * glow_density * ((1.0 - par.glow0.w) + par.glow0.w * (1.0 - gg2) / (gd * sqrt(gd)));
+    const bool glow_on = glow_light > 0.0;
+    const float glow_dims = glow_density * par.glow1.w;
+    const float glow_near = 1.0 / max(par.glow1.z - par.glow1.y, 1e-3);
+
+    // The fog patches this column's ray passes through: where it enters and leaves each one's box
+    // (depths along the ray: the world place is origin + world_ray * depth), and the span of them all.
+    const int patches = clamp(int(par.patches0.x), 0, MAX_PATCHES);
+    float patch_in[MAX_PATCHES], patch_out[MAX_PATCHES];
+    float patches_in = 1e9, patches_out = -1e9;
+    uint patch_mask = 0u; // the patches this column's ray passes through at all: only those are asked a cell
+    for (int i = 0; i < patches; ++i) {
+        // (Not in this column at all: no set-up. fog_grid.h RectVec4.)
+        const vec4 rect = par.patch_rect[i];
+        if (any(lessThan(vec2(column), rect.xy)) || any(greaterThan(vec2(column), rect.zw))) {
+            continue;
+        }
+        vec3 inv = par.fog_patch[4 * i + 1].xyz;
+        // (A taken-over bank's outline goes out past its radii with the wide wave, PatchAt: as
+        // far as 0.375 times the break-up. Met at its plain radii its outer rim was cut off.)
+        if (par.fog_patch[4 * i + 3].x < 0.0) {
+            inv /= 1.0 + 0.375 * par.organic.z;
+        }
+        const vec3 from = origin - par.fog_patch[4 * i].xyz;
+        // (As tall as PatchAt makes it at its far side: a low bank spread over a far cell's height.)
+        inv.y /= 1.0 + 0.5 * (length(from) + 1.0 / min(inv.x, inv.z)) * cell_tan.y * inv.y;
+        // (A patch on a slope: the ray and the eye's place sheared by it, the patch level.)
+        const vec2 slope = par.patch_slope[i].xy;
+        const vec3 o = PatchAxes(i, vec3(from.x, from.y - dot(slope, from.xz), from.z)) * inv;
+        vec3 way = PatchAxes(i, vec3(world_ray.x, world_ray.y - dot(slope, world_ray.xz), world_ray.z)) * inv;
+        way = mix(way, vec3(1e-6), lessThan(abs(way), vec3(1e-6)));
+        if (par.fog_patch[4 * i + 2].z > 0.5) {
+            const vec3 a = (vec3(-1.0) - o) / way, b = (vec3(1.0) - o) / way;
+            const vec3 lo = min(a, b), hi = max(a, b);
+            patch_in[i] = max(max(lo.x, lo.y), max(lo.z, 0.0));
+            patch_out[i] = min(hi.x, min(hi.y, hi.z));
+        } else {
+            // (Round: the ray through its ellipsoid, half the volume of the box about it.)
+            const float qa = dot(way, way), qb = dot(o, way), qc = dot(o, o) - 1.0;
+            const float disc = qb * qb - qa * qc;
+            const float root = sqrt(max(disc, 0.0));
+            patch_in[i] = disc > 0.0 ? max((-qb - root) / qa, 0.0) : 1.0;
+            patch_out[i] = disc > 0.0 ? (-qb + root) / qa : 0.0;
+        }
+        // (Only where it has fog at all: past its clear distance and the near start, before the far end.)
+        patch_in[i] = max(patch_in[i], max(0.4 * par.fog_patch[4 * i + 3].w, par.patches0.y) / stretch);
+        patch_out[i] = min(patch_out[i], par.patches1.y / stretch);
+        if (patch_out[i] > patch_in[i]) {
+            patch_mask |= 1u << uint(i);
+            patches_in = min(patches_in, patch_in[i]);
+            patches_out = max(patches_out, patch_out[i]);
+        }
+    }
+    // (The noise moves with the wind and changes where it stands: up through itself, so a low bank's
+    // wisps form and dissolve in place as the game's own puffs do; fog_patches.h Evolve.)
+    const int wakes = clamp(int(par.wake0.x), 0, 8);
+    const vec3 patch_drift = drift * par.patches1.z + vec3(0.0, par.mist0.x * par.patches1.w, 0.0);
+    uint held_mask = 0u; // (the banks the volume holds: for its check)
+    for (int i = 0; i < patches; ++i) {
+        held_mask |= InVolume(i) ? 1u << uint(i) : 0u;
+    }
+    const float patch_near = 1.0 / max(par.patches0.z - par.patches0.y, 1e-3);
+    const float patch_far = 1.0 / max(par.patches1.y - par.patches1.x, 1e-3);
+
+    // The lamps (fog_grid.h Lamps): this column's tiles, one word every band of slices.
+    const int lamps = int(par.lamps0.x);
+    const bool lamps_all = par.lamps0.z > 0.5;
+    const ivec2 lamp_tile = (column * LAMP_TILES.xy) / par.grid.xy;
+    const int lamp_first = (lamp_tile.y * LAMP_TILES.x + lamp_tile.x) * LAMP_TILES.z;
+    const float lamp_bands = float(LAMP_TILES.z) / float(par.grid.z);
+    int lamp_band = -1;
+    uint lamp_word = 0xFFFFFFFFu;
+    vec3 lamp_sum = vec3(0.0); // the lamps' light in the mist so far
+
+    const bool shadows = par.atlas.w > 0.5;
+    const bool past = par.history.w > 0.5;
+    const bool moving = par.history.y > 0.5;
+    const uint first = HEADER_WORDS + 2u * uint((column.y * par.grid.x + column.x) * par.grid.z);
+    vec3 sum = vec3(0.0); // the mist's light so far (the moon's colour in it)
+    float glow_sum = 0.0; // the thin air's (times the colour at the end: far things keep less of it)
+    float through = 1.0;  // how much gets through the mist so far
+    float dimmed = 1.0;   // ... and through the thin air's own dimming (moon_shafts.h ExtinctionShare)
+    float z0 = par.slices.x;
+    for (int k = 0; k < par.grid.z; ++k) {
+        const float z1 = SliceZ(float(k + 1));
+        const float zm = SliceZ(float(k) + 0.5);
+        const float t0 = z0 * stretch, t = zm * stretch, len = (z1 - z0) * stretch;
+        // The mist here (per metre): the layer over the ground and the thin haze above it, the
+        // drifting banks, clear near the eye.
+        float mist = 0.0;
+        if (density > 0.0) {
+            // (Over the map's own ground at the place, core/vr/mist_ground.h: the layer lies on
+            // each street at that street's height, and stays there as the hunter climbs or goes
+            // down. Without the lattice: over one level plane at his feet.)
+            const vec3 at = origin + world_ray * zm;
+            const float height = max(at.y - MistGround(at.xz, origin.y - par.mist0.w), 0.0);
+            const float layer = exp(-height * par.mist0.z) + par.mist3.w * exp(-height * par.mist4.x);
+            const vec3 q = (origin + world_ray * zm) * par.mist1.z + drift;
+            const vec3 q2 = q * 2.17 + vec3(1.7, 4.1, 2.9);
+            const float noise = clamp(0.5 + 0.30 * Gyroid(q) + 0.15 * Gyroid(q2), 0.0, 1.0);
+            const float banks = Smooth01((noise - 0.25) / 0.6) * 1.6;
+            const float near = Smooth01((t - par.mist3.x) / max(par.mist3.y - par.mist3.x, 1e-3));
+            // The march ended at the mist's reach along the ray: the share of this cell's stretch
+            // within it (a cell the reach cuts through counts in part: no step from column to column).
+            const float within = clamp((reach - t0) / max(len, 1e-4), 0.0, 1.0);
+            mist = density * layer * (1.0 + par.mist2.w * (banks - 1.0)) * near * within;
+            mist = (isnan(mist) || isinf(mist)) ? 0.0 : clamp(mist, 0.0, 16.0);
+        }
+        // The fog patches here (fog_patches.h), added to the mist: two places along the cell's
+        // depth (a far cell is deeper than a low patch is wide), each patch whose box the place is
+        // in, a slow drifting noise of the world place; clear near the eye, thinning out far off.
+        float patch_light = 0.0; // what the patches' own glow adds to (or takes from) the mist that is lit
+        float patch_plain = 0.0; // the light of the game's fog taken over: by the plain rules of every area
+        float patch_share = 0.0; // how much of the cell's mist is the game's fog taken over
+        if (z1 > patches_in && z0 < patches_out) {
+            float more = 0.0, more_light = 0.0, more_plain = 0.0, more_taken = 0.0;
+            const float tall = 0.5 * zm * cell_tan.y;
+            const float y_near = origin.y + world_ray.y * z0, y_far = origin.y + world_ray.y * z1;
+            const vec2 half_run = 0.5 * (z1 - z0) * world_ray.xz;
+            // (Two places along the cell with a hand-placed patch or two; one, the cell's middle,
+            // with the many of a map's own fog taken over: half the work, core/vr/fog_emitters.h.)
+            const int places_here = patches > 2 ? 1 : 2;
+            for (int s = 0; s < places_here; ++s) {
+                const float z = mix(z0, z1, (float(s) + 0.5) / float(places_here));
+                const vec3 p = origin + world_ray * z;
+                const float ts = z * stretch;
+                float here = 0.0, here_light = 0.0, here_plain = 0.0, here_taken = 0.0;
+                float here_shape = 0.0; // the taken-over banks here before their wisps (the merge's limit)
+                float here_feet = 0.0, here_feet_plain = 0.0; // their low part, before each one's clear distance (fog_patches.h Feet)
+                // (The hunter's wake, fog_patches.h Wake: a push, not a hole. Round his body and
+                // where he just was the fog thins by a point's strength at its heart, lies thicker
+                // in a rim about its radius (what he moved aside), and the wisps are shoved
+                // outward: the noise is read nearer to him. Taller than wide. Only a place within
+                // the wake's reach asks.)
+                float keep = 1.0;
+                vec3 shoved = vec3(0.0);
+                if (wakes > 0 && ts < par.wake0.y) {
+                    for (int w = 0; w < wakes; ++w) {
+                        const vec3 off = p - par.wake[w].xyz;
+                        const float x = (dot(off.xz, off.xz) + 0.25 * off.y * off.y) * par.wake[w].w;
+                        const float heart = 1.0 / (1.0 + x * x);
+                        const float s = par.wake_strength[w >> 2][w & 3];
+                        keep *= 1.0 - s * (heart - par.wake0.z * x * heart);
+                        shoved.xz -= off.xz * (s * heart * par.wake0.w);
+                    }
+                }
+                // (One noise of the place for every patch there, made at the first that needs it:
+                // two gyroids a place, not two a patch.)
+                // (The world-fixed volume here, fog_grid.h World: how much of this place it speaks
+                // for (all of it inside its box, less over the box's last metres), and what it
+                // holds along this place's part of the cell. The banks it holds are left to it by
+                // that much.)
+                float vol = 0.0;
+                vec2 vol_fog = vec2(0.0);
+                if (par.world_vol.w > 0.5) {
+                    const vec3 span = vec3(WORLD_SIZE) * WORLD_CUBE; // along x, z, y
+                    const vec3 inside = min(p - par.world_vol.xyz, par.world_vol.xyz + span.xzy - p);
+                    vol = clamp(min(inside.x, inside.z) / WORLD_EDGE_M, 0.0, 1.0) * clamp(inside.y / WORLD_EDGE_Y_M, 0.0, 1.0);
+                    if (vol > 0.0) {
+                        const float za = mix(z0, z1, float(s) / float(places_here)), zb = mix(z0, z1, float(s + 1) / float(places_here));
+                        for (int w = 0; w < 3; ++w) {
+                            const vec3 pw = origin + world_ray * mix(za, zb, (float(w) + 0.5) / 3.0);
+                            if (par.world_vol.w > 2.5) {
+                                // (A check, VR_FOG_VOLUME=3: the cube's rule here itself, no picture.)
+                                vol_fog += VolumeAt(pw, held_mask, patch_drift, wakes, vec3(0.0, 0.0, -1.0));
+                                continue;
+                            }
+                            const vec3 at = (pw - par.world_vol.xyz).xzy / span;
+                            vol_fog += textureLod(world_tex, at, 0.0).rg;
+                        }
+                        vol_fog *= vol / 3.0;
+                    }
+                }
+                float noise = -1.0;
+                float wisp_x[4];  // the wisps at up to four places along the cell (each: its noise less 0.5)
+                int wisp_n = 1;
+                float wave = 0.0;      // the wide wave here, read at the first patch the place is in
+                bool wave_read = false;
+                vec3 noise_at = vec3(0.0);
+                for (uint left = patch_mask; left != 0u; left &= left - 1u) {
+                    const int i = findLSB(left);
+                    const bool held = InVolume(i);
+                    if (held && vol >= 0.999) {
+                        continue; // (the volume has it)
+                    }
+                    if (z > patch_in[i] && z < patch_out[i]) {
+                        if (!wave_read) {
+                            wave_read = true;
+                            noise_at = (p + shoved) * par.patches0.w + patch_drift;
+                            wave = Gyroid(noise_at * 0.303 + vec3(3.1, 0.7, 5.3));
+                        }
+                        float shade;
+                        float low;
+                        float amount = PatchAt(i, p, tall, y_near, y_far, half_run, wave, shade, low);
+                        if (amount <= 0.0) {
+                            continue; // (inside its box, outside its shape: no noise for nothing)
+                        }
+                        if (noise < 0.0) {
+                            const vec3 q = noise_at;
+                            // (Each wave only where the cell is short enough along the ray to hold it:
+                            // all of it while the cell is under half the wave's length, none from a
+                            // whole one. A far cell, metres deep, read a 3 m wisp at one place and got
+                            // a value of chance, cell by cell: blocks, bright ones plain to see, that
+                            // crawled as the eye moved (2026-11-16: "blocky far away", "the
+                            // same as when looking underneath"). Far off a wave 3.3 times as wide
+                            // stands in for the main one: soft banks, the same contrast.)
+                            // (The wisps the same at every distance (2026-11-17: "they
+                            // shouldn't be flying around when we walk around"): where a cell is too long
+                            // to hold a wisp at one place, it is read at up to four places along the
+                            // cell, a quarter of the main wave apart at most. Until then a wave was
+                            // faded out by the cell's length: a bank had its wisps and holes only
+                            // within some metres of the camera and was a smooth lump beyond, and
+                            // changed as one walked at it or zoomed.)
+                            const float cell_all = len * par.patches0.w;
+                            wisp_n = clamp(int(ceil(cell_all / 1.5)), 1, 4);
+                            const float cell = cell_all / float(wisp_n);
+                            const float main_wave = clamp(2.0 - cell * 0.3183, 0.0, 1.0);
+                            const float fine_wave = clamp(2.0 - cell * 0.6907, 0.0, 1.0);
+                            const float wide_wave = clamp(2.0 - cell * 0.0965, 0.0, 1.0);
+                            const vec3 across = world_ray * ((z1 - z0) / float(places_here) * par.patches0.w);
+                            for (int w = 0; w < wisp_n; ++w) {
+                                const vec3 qw = q + across * ((float(w) + 0.5) / float(wisp_n) - 0.5);
+                                float x = 0.20 * wide_wave * wave;
+                                if (main_wave > 0.0) {
+                                    x += 0.22 * main_wave * Gyroid(qw);
+                                }
+                                if (fine_wave > 0.0) {
+                                    x += 0.11 * fine_wave * Gyroid(qw * 2.17 + vec3(1.7, 4.1, 2.9));
+                                }
+                                wisp_x[w] = x;
+                            }
+                            noise = 1.0; // (read)
+                        }
+                        if (held) {
+                            amount *= 1.0 - vol;
+                        }
+                        float shape = amount;
+                        // (A calm heavy pool at the ground, ragged wisps above: the wisps' strength
+                        // by where the bank's fog in the cell is, fog_patches.h Organic::LayersNow.)
+                        const float wisps = par.fog_patch[4 * i + 2].w *
+                                            (low < 0.0 ? 1.0 : par.layers.z - (par.layers.z - par.layers.x) * low);
+                        float wisped = 0.0;
+                        for (int w = 0; w < wisp_n; ++w) {
+                            wisped += max(1.0 + wisps * 2.0 * wisp_x[w], 0.0);
+                        }
+                        amount *= wisped / float(wisp_n);
+                        const float whole = amount; // (before its own clear distance)
+                        // (Its own clear distance from the eye, fog_patches.h Patch::clear: none
+                        // within 0.4 of it, all of it from there on.)
+                        const float clear = par.fog_patch[4 * i + 3].w;
+                        if (clear > 0.0) {
+                            const float cleared = Smooth01((ts - 0.4 * clear) / (0.6 * clear));
+                            amount *= cleared;
+                            shape *= cleared;
+                        }
+                        here += amount;
+                        // (A glow below 0: the game's own fog taken over, fog_patches.h Pick.)
+                        const float glow = par.fog_patch[4 * i + 3].x;
+                        here_light += amount * max(glow, 0.0);
+                        here_plain += amount * max(-glow, 0.0) * shade;
+                        here_taken += glow < 0.0 ? amount : 0.0;
+                        here_shape += glow < 0.0 ? shape : 0.0;
+                        if (glow < 0.0 && low > 0.0) {
+                            here_feet += whole * low;
+                            here_feet_plain += whole * low * -glow * shade;
+                        }
+                    }
+                }
+                // (The taken-over banks that overlap merge: a soft limit on their sum, so two
+                // banks are one bank with more and less of it, not a bright double; fog_patches.h
+                // Organic::MergeCap.)
+                if (par.organic.y > 0.0 && here_taken > 1e-6) {
+                    // (By the banks' shapes where asked, fog_patches.h Organic::MergeByShape: their
+                    // wisps stay as deep as one bank's.)
+                    const float sum = par.clearings.z > 0.5 ? max(here_shape, 1e-6) : here_taken;
+                    const float kept = par.organic.y * (1.0 - exp(-sum / par.organic.y)) / sum;
+                    here -= here_taken * (1.0 - kept);
+                    here_plain *= kept;
+                    here_taken *= kept;
+                    here_feet *= kept;
+                    here_feet_plain *= kept;
+                }
+                // (Clearings where much fog lies together, fog_patches.h Organic::ClearNow: slow
+                // lanes over the ground's x and z, the same at every height, moving with the wind.
+                // They take by how near the banks here are to their merge's limit: a lone bank's
+                // thin rim keeps what it has.)
+                if (par.clearings.x > 0.0 && here_taken > 1e-6) {
+                    // (Bent by the wisps' own wide wave, which drifts and changes where it stands:
+                    // no lane is straight, none comes round again; "a little chaotic like real
+                    // fog", the tester, 2026-11-16. A third, finer set crosses the two wide ones.)
+                    vec2 g = noise_at.xz / par.patches0.w * par.clearings.y;
+                    g += par.clearings.w * vec2(wave, sin(g.x * 0.37 - g.y * 0.53 + 1.7 * wave));
+                    const float lanes = sin(g.x * 0.94 + g.y * 0.34) * sin(g.y * 0.71 - g.x * 0.29 + 1.3) +
+                                        0.5 * sin(g.x * 1.31 + g.y * 1.57 + 4.1) +
+                                        0.3 * sin(g.x * 2.63 - g.y * 2.11 + 0.6);
+                    const float crowd = par.organic.y > 0.0 ? clamp(here_taken / (0.6 * par.organic.y), 0.0, 1.0) : 1.0;
+                    const float left = 1.0 - par.clearings.x * crowd * Smooth01(lanes * 0.9 + 0.2);
+                    here -= here_taken * (1.0 - left);
+                    here_plain *= left;
+                    here_taken *= left;
+                    here_feet *= left;
+                    here_feet_plain *= left;
+                }
+                here *= keep;
+                here_light *= keep;
+                here_plain *= keep;
+                here_taken *= keep;
+                // (What the volume holds here; its own push is in it.)
+                here += vol_fog.x;
+                here_taken += vol_fog.x;
+                here_plain += vol_fog.y;
+                const float near_part = Smooth01((ts - par.patches0.y) * patch_near);
+                const float far_part = Smooth01((par.patches1.y - ts) * patch_far);
+                const float fade = near_part * far_part;
+                more += here * fade;
+                more_light += here_light * fade;
+                more_plain += here_plain * fade;
+                more_taken += here_taken * fade;
+                // (A little of the low fog stays at the hunter's feet inside the near clearing,
+                // pushed by his steps as the rest is: fog_patches.h Feet.)
+                const float stays = par.layers.w * (1.0 - near_part) * far_part * keep;
+                if (stays > 0.0) {
+                    more += here_feet * stays;
+                    more_plain += here_feet_plain * stays;
+                    more_taken += here_feet * stays;
+                }
+            }
+            if (!(isnan(more) || isinf(more) || isnan(more_light) || isinf(more_light) || isnan(more_plain) ||
+                  isinf(more_plain))) {
+                const float had = mist;
+                const float each = 1.0 / float(places_here);
+                mist = clamp(mist + each * more, 0.0, 16.0);
+                patch_light = clamp(each * more_light, 0.0, 64.0) - (mist - had);
+                patch_plain = clamp(each * more_plain, 0.0, 64.0);
+                // (The taken-over fog's share of the cell's mist: that much of it takes their colour.)
+                patch_share = mist > 1e-5 && !(isnan(more_taken) || isinf(more_taken))
+                                  ? clamp(each * more_taken / mist, 0.0, 1.0)
+                                  : 0.0;
+            }
+        }
+        // The moonlit thin air here: thickening from its near start to its near full (what is at
+        // your hands stays clear), thinning out over the second half of its reach.
+        const float glow_air =
+            glow_on ? Smooth01((glow_far - t) * 2.0 / glow_far) * Smooth01((t - par.glow1.y) * glow_near) : 0.0;
+
+        // How much of the cell the moon reaches.
+        float lit = 1.0;
+        if (shadows) {
+            if (mist > 1e-5 || glow_air > 1e-4) {
+                // Where this cell's middle was in the last build's grid: its lit share then.
+                float before = -1.0;
+                if (past) {
+                    const vec4 centre = vec4(tangent * zm, zm, 1.0);
+                    const vec3 was = vec3(dot(par.to_last[0], centre), dot(par.to_last[1], centre),
+                                          dot(par.to_last[2], centre));
+                    if (was.z > par.slices.x) {
+                        const vec3 uvw = vec3((was.xy / was.z - par.last_frustum.xy) / par.last_frustum.zw,
+                                              log2(was.z / par.slices.x) * par.slices.w);
+                        if (all(greaterThanEqual(uvw, vec3(0.0))) && all(lessThanEqual(uvw, vec3(1.0)))) {
+                            before = textureLod(last_lit, uvw, 0.0).r;
+                        }
+                    }
+                }
+                // This frame's places inside the cell: spread along its depth (where a cell is
+                // longest), each one's place across it its own; all moved from frame to frame (each
+                // cell its own sequence: the sum along a column and the blend of eight cells at a
+                // pixel average them out).
+                const int places = int(clamp(before < 0.0 ? par.shadow.w : par.shadow.z, 1.0, 16.0));
+                vec3 jitter = vec3(0.5);
+                if (moving) {
+                    jitter = fract(Hash3(uvec3(column, k)) +
+                                   par.history.z * vec3(0.7548776662, 0.5698402910, 0.6180339887));
+                }
+                float now = 0.0;
+                for (int i = 0; i < places; ++i) {
+                    const vec2 across =
+                        moving ? fract(jitter.xy + float(i) * vec2(0.6180339887, 0.7548776662)) : vec2(0.5);
+                    const float z = SliceZ(float(k) + (float(i) + jitter.z) / float(places));
+                    now += MoonLit(vec3((par.frustum.xy + cell_tan * (vec2(column) + across)) * z, z));
+                }
+                now /= float(places);
+                lit = before < 0.0 ? now : mix(before, now, clamp(par.history.x, 0.0, 1.0));
+            }
+            imageStore(lit_out, ivec3(column, k), vec4(lit));
+        }
+
+        // A slab of even air: what it sends, seen through itself; then through all before it.
+        // The mist's light by the shadow's contrast (what is lit counts the lit gain times); the
+        // thin air's from lit places only, a little less the deeper it sits in its own air.
+        const float mist_light =
+            max(mist + patch_light, 0.0) * mist_phase * max(1.0 + shadow_contrast * (lit * par.shadow.y - 1.0), 0.0) +
+            patch_plain * plain_phase * max(1.0 + par.glow2.z * (lit * par.glow2.w - 1.0), 0.0);
+        const float glow_here = glow_light * glow_air * exp(-glow_density * t) * lit;
+        // (The thin air's own dimming darkens what is behind it, never the air's light: the
+        // marched glow's rule, which its strengths were chosen with.)
+        const float e = par.mist1.w * mist;
+        const float slab = exp(-e * len);
+        const float sent = e > 1e-6 ? (1.0 - slab) / e : len;
+        sum += mix(par.air_colour.rgb, par.patches2.rgb, patch_share * par.patches2.w) * (through * mist_light * sent);
+        // The lamps in this cell's mist: the lights of its tile (four at most), each its colour
+        // times the game's falloff, softened by the cell's own length. Only with a light this
+        // frame, only a cell with mist, only a tile a light reaches.
+        if (lamps > 0 && mist > 1e-4) {
+            const int band = int(float(k) * lamp_bands);
+            if (band != lamp_band) {
+                lamp_band = band;
+                const int t = lamp_first + band;
+                lamp_word = par.lamp_tiles[t >> 2][t & 3];
+            }
+            if (lamp_word != 0xFFFFFFFFu || lamps_all) {
+                const vec3 p = vec3(tangent * zm, zm);
+                const float soft = 0.25 * len * len;
+                vec3 lit_by = vec3(0.0);
+                // (In the game's fog taken over a lamp's light travels: fog_grid.h Lamps::Taken*.)
+                vec3 lit_taken = vec3(0.0);
+                const bool taken_here = patch_share > 0.0;
+                const float shape_g = par.lamp_shape.y, shape_g2 = shape_g * shape_g;
+                // (1 / the fog's own light here for its amount: what a lamp's light stands out
+                // from, fog_grid.h Lamps::Far*.)
+                const float per_own =
+                    mist / max(dot(mix(par.air_colour.rgb, par.patches2.rgb, patch_share * par.patches2.w), vec3(0.3, 0.6, 0.1)) * mist_light, 1e-6 * mist);
+                if (!lamps_all) {
+                    for (uint w = lamp_word; (w & 255u) != 255u; w = (w >> 8) | 0xFF000000u) {
+                        const vec4 a = par.lamp[2u * (w & 255u)], b = par.lamp[2u * (w & 255u) + 1u];
+                        const vec3 d = p - a.xyz;
+                        const float d2 = dot(d, d);
+                        // (No further than the wall that way: the falloff ends at the shorter reach.)
+                        const float reaches = max(1.0 / (d2 + b.w + soft) - max(a.w, LampWall(w & 255u, d)), 0.0);
+                        if (reaches <= 0.0) {
+                            continue;
+                        }
+                        // (The light dies on its way through the fog, fog_grid.h Lamps::Fall*: by the
+                        // distance, the same in a wisp and in a hole of the bank.)
+                        const float away = sqrt(max(d2, 1e-4));
+                        const float further = LampFurther(w & 255u, per_own, away);
+                        lit_by += b.rgb * (reaches * par.lamp_fall.w * exp(par.lamp_far.y * further - par.lamp_fall.y * away));
+                        if (taken_here) {
+                            // (The turn the light makes at the fog to reach the eye: none, its cosine 1,
+                            // looking at the lamp through the fog.)
+                            const float turn = -dot(d, dir) / away;
+                            const float lobe = max(1.0 + shape_g2 - 2.0 * shape_g * turn, 1e-3);
+                            const float phase = mix(1.0, (1.0 - shape_g2) / (lobe * sqrt(lobe)), par.lamp_shape.x);
+                            lit_taken += b.rgb * (reaches * phase * exp(par.lamp_far.x * further - (par.lamp_shape.z * mist + par.lamp_fall.x) * away));
+                        }
+                    }
+                } else {
+                    for (int i = 0; i < lamps; ++i) {
+                        const vec4 a = par.lamp[2 * i], b = par.lamp[2 * i + 1];
+                        const vec3 d = p - a.xyz;
+                        const float d2 = dot(d, d);
+                        const float reaches = max(1.0 / (d2 + b.w + soft) - max(a.w, LampWall(uint(i), d)), 0.0);
+                        if (reaches <= 0.0) {
+                            continue;
+                        }
+                        const float away = sqrt(max(d2, 1e-4));
+                        const float further = LampFurther(uint(i), per_own, away);
+                        lit_by += b.rgb * (reaches * par.lamp_fall.w * exp(par.lamp_far.y * further - par.lamp_fall.y * away));
+                        if (taken_here) {
+                            const float turn = -dot(d, dir) / away;
+                            const float lobe = max(1.0 + shape_g2 - 2.0 * shape_g * turn, 1e-3);
+                            const float phase = mix(1.0, (1.0 - shape_g2) / (lobe * sqrt(lobe)), par.lamp_shape.x);
+                            lit_taken += b.rgb * (reaches * phase * exp(par.lamp_far.x * further - (par.lamp_shape.z * mist + par.lamp_fall.x) * away));
+                        }
+                    }
+                }
+                // (On the game's fog taken over a lamp's light counts TakenGain times, shaped as above
+                // and capped: its hue kept, its brightest part at most the cap.)
+                lit_taken *= 1.0 + par.lamps0.w;
+                if (par.lamp_shape.w > 0.0) {
+                    lit_taken *= min(1.0, par.lamp_shape.w / max(max(lit_taken.r, lit_taken.g), max(lit_taken.b, 1e-6)));
+                }
+                lamp_sum += mix(lit_by, lit_taken, patch_share) * (through * mist * sent * par.lamps0.y);
+            }
+        }
+        glow_sum += through * glow_here * sent;
+        through *= slab;
+        dimmed *= exp(-glow_dims * glow_air * len);
+        z0 = z1;
+        // A surface far beyond the thin air's reach keeps less of the glow in front of it
+        // (moon_shafts.h FarKeep; the sky, which looks the last slice up, the least). The fade
+        // ends at the grid's end (fog_grid.h GlowFarFade), so the last slice holds its end by
+        // this rule itself; where a test's reach is longer than the grid no fade fits and no
+        // slice is forced to one (it was: a quarter of the glow over the last slice).
+        const float beyond = Smooth01((z1 * stretch - glow_far) / (glow_far * max(par.glow2.y - 1.0, 1e-3)));
+        const float keep = 1.0 - (1.0 - par.glow2.x) * beyond;
+        const vec3 code =
+            sqrt(clamp((sum + lamp_sum + par.air_colour.rgb * (glow_sum * keep)) / MAX_LIGHT, 0.0, 1.0));
+        const uint at = first + 2u * uint(k);
+        fog.words[at] = Code16(code.r) | (Code16(code.g) << 16);
+        fog.words[at + 1u] = Code16(code.b) | (Code16(through * dimmed) << 16);
+    }
+}
+#endif

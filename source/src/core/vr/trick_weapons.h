@@ -9,6 +9,8 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -33,9 +35,12 @@
 //    the right grip again turns it back;
 //  - Tonitrus: hold the right grip and lift the weapon up over your head: it charges (its L1);
 //    then a cooldown;
-//  - the Boom Hammer: hold the right grip until its furnace lights (then a cooldown); the Beast
-//    Claw: hold it 2 s; Simon's Bowblade: hold it 0.5 s to open the bow (a squeeze while fighting
-//    with the blade never does; the bow closes with a squeeze);
+//  - the Boom Hammer: its furnace starts like an engine (boom_pull): squeeze the right grip, a
+//    pull, until it catches (3 to 5 pulls); it idles, rumbling: keep the grip held and it revs
+//    up and lights, squeeze it again and again (each pumps it up), or strike its head: it lights.
+//    Before it catches, a strike within 0.28 s of a starter CHUFF lights it early;
+//  - the Beast Claw: hold it 2 s; Simon's Bowblade: hold it 0.5 s to open the bow (a squeeze
+//    while fighting with the blade never does; the bow closes with a squeeze);
 //  - the Whirligig Saw: right grip does nothing; the left hand grabbing the handle transforms it.
 //  - the others: a squeeze transforms, as before.
 // shield_raise: the Wooden Shield or the Loch Shield in the left hand blocks while you hold it up
@@ -61,19 +66,52 @@ struct Settings {
     bool moon_wave{true};      // the Holy Moonlight Sword's wave on a charged swing
     bool stake_blast{true};    // the Stake Driver's blast (the trigger held, let go)
     bool weapon_hum{true};     // the Whirligig Saw's and Boom Hammer's hum, revving with a swing
-    bool saw_spin{true};       // the transformed Whirligig Saw held in both hands: either
-                               // trigger spins it (SawSpin)
-    bool tool_aim{true};       // the Augur's burst where you look or the left hand points
+    bool kos_visions{true};    // the Kos ritual's vision (KosRitualAt; vr_kos_ritual.glsl)
+    bool saw_spin{true};       // the transformed Whirligig Saw held in both hands: left trigger
+                               // spins it (right in the optimized scheme) (SawSpin)
+    bool tool_aim{true};       // the tools that fire something fly where you aim (ToolAims)
     bool melee_left{true};     // a left-hand swing attacks with the left hand's blade, claw, fist
     bool weapon_wall{true};    // solid weapons: they stop at walls and each other, thud, buzz,
                                // spark (core/vr/solid_weapon.h, weapon_wall.h); off: none of it
                                // runs
-    bool weapon_wall_map{false}; // ... at the walls too (weapon_wall=1); weapon_wall=2: weapons only,
-                                // solid against each other but through the walls, as in the game
+    bool weapon_wall_map{true}; // ... at the walls too (weapon_wall=1, the default since 0.7.0, the
+                               // user 2026-10-24); weapon_wall=2: weapons only, solid against each
+                               // other but through the walls, as in the game
+    bool weapon_wall_shape{true}; // ... the right weapon's shape against the other weapon fitted
+                                  // to its own model (core/vr/weapon_fit.h, 2026-10-25; the walls
+                                  // meet the line); 0: the line along its blade as in 0.7.0
     bool haptics{true};
-    float pull_m{0.18f};   // a split: the hands this much further apart than at the grab
+    float pull_m{0.15f};   // a split: the hands this much further apart than at the grab
+                           // (18 cm until the tester, 2026-11-10: "15cm")
+    bool pull_seen{false}; // hand_transform_pull_seen: the 18 -> 15 cm move ran (vr_session.cpp)
     float shield_m{0.18f}; // the left hand this far in front of the eyes: the shield up
-    float charge_cooldown_s{10.0f}; // Tonitrus' charge, the Boom Hammer's ignition: then this long
+    float charge_cooldown_s{8.5f}; // Tonitrus' charge, the Boom Hammer's ignition: then this long
+                                   // (2026-11-10; 10 before)
+    bool cooldown_seen{false}; // charge_cooldown_seen: the 10 -> 8.5 s move ran (vr_session.cpp)
+    // boom_pull: the Boom Hammer's furnace started like an engine (RightGrip, GripUse::Pull; the
+    // user, 2026-11-06: "press 1-3 times and when it starts vibrate to either keep it held, or
+    // smack it"): each right-grip squeeze is a pull, coughing until it catches (on a pull between
+    // boom_pulls_min and boom_pulls_max, drawn each time; pulls further apart than
+    // boom_pull_gap_s start over); caught it idles boom_idle_s, held it revs up over boom_rev_s
+    // and lights (the tester: "make that hold longer"), each squeeze more pumps it up boom_pump
+    // ("if we press grip many times in succession ... it should still light up"), struck it
+    // lights at once. Before the catch, each squeeze opens BoomStrikeWindowS for a timed strike;
+    // a late strike does not count as another pull or open a fresh window. Then boom_cooldown_s.
+    // 0: held 1.5 s, as before.
+    bool boom_pull{true};
+    // 3 to 5 (2026-11-06: "at least 3 (with max up to 5)"; 2 to 4 tried, then "actually
+    // 3-5 felt good"; 1 to 3 first).
+    int boom_pulls_min{3}, boom_pulls_max{5};
+    float boom_pull_gap_s{1.2f};
+    float boom_idle_s{2.0f};
+    float boom_rev_s{2.1f};
+    float boom_pump{0.3f};
+    float boom_cooldown_s{3.0f};
+    float boom_volume{1.0f}; // its cough and growl (0: silent)
+    // The Boom Hammer's fire goes out after this many hits landed while lit, once that swing is
+    // over (the base game's buff is one hit; the tester, 2026-11-06: "can we have the fire go out
+    // after doing a hit? right now it feels like it lasts forever"). 0: it stays lit.
+    int boom_fire_hits{1};
     // melee_left_rows: the left hand's attack row per weapon, learned in the game (LeftRowOf)
     std::string left_rows{};
     // l2_canned: the right weapons (vr.ini weapon_grip_<key> keys, comma separated) whose
@@ -106,6 +144,8 @@ inline bool ParseTrickSetting(const std::string& key, const std::string& value) 
         s.weapon_hum = on;
     } else if (key == "saw_spin") {
         s.saw_spin = on;
+    } else if (key == "kos_visions") {
+        s.kos_visions = on;
     } else if (key == "tool_aim") {
         s.tool_aim = on;
     } else if (key == "melee_left") {
@@ -113,14 +153,40 @@ inline bool ParseTrickSetting(const std::string& key, const std::string& value) 
     } else if (key == "weapon_wall") {
         s.weapon_wall = on || value == "2";
         s.weapon_wall_map = value != "2";
+    } else if (key == "weapon_wall_shape") {
+        s.weapon_wall_shape = on;
     } else if (key == "trick_haptics") {
         s.haptics = on;
     } else if (key == "hand_transform_pull_cm") {
         s.pull_m = std::clamp(std::stof(value), 8.0f, 40.0f) * 0.01f;
+    } else if (key == "hand_transform_pull_seen") {
+        s.pull_seen = on;
+    } else if (key == "charge_cooldown_seen") {
+        s.cooldown_seen = on;
     } else if (key == "shield_raise_cm") {
         s.shield_m = std::clamp(std::stof(value), 10.0f, 45.0f) * 0.01f;
     } else if (key == "charge_cooldown_s") {
         s.charge_cooldown_s = std::clamp(std::stof(value), 0.0f, 120.0f);
+    } else if (key == "boom_pull") {
+        s.boom_pull = on;
+    } else if (key == "boom_pulls_min") {
+        s.boom_pulls_min = std::clamp(static_cast<int>(std::lround(std::stof(value))), 1, 6);
+    } else if (key == "boom_pulls_max") {
+        s.boom_pulls_max = std::clamp(static_cast<int>(std::lround(std::stof(value))), 1, 6);
+    } else if (key == "boom_pull_gap_s") {
+        s.boom_pull_gap_s = std::clamp(std::stof(value), 0.3f, 5.0f);
+    } else if (key == "boom_idle_s") {
+        s.boom_idle_s = std::clamp(std::stof(value), 0.5f, 10.0f);
+    } else if (key == "boom_rev_s") {
+        s.boom_rev_s = std::clamp(std::stof(value), 0.2f, 5.0f);
+    } else if (key == "boom_pump") {
+        s.boom_pump = std::clamp(std::stof(value), 0.0f, 1.0f);
+    } else if (key == "boom_cooldown_s") {
+        s.boom_cooldown_s = std::clamp(std::stof(value), 0.0f, 120.0f);
+    } else if (key == "boom_volume") {
+        s.boom_volume = std::clamp(std::stof(value), 0.0f, 2.0f);
+    } else if (key == "boom_fire_hits") {
+        s.boom_fire_hits = std::clamp(static_cast<int>(std::lround(std::stof(value))), 0, 10);
     } else if (key == "melee_left_rows") {
         s.left_rows = value;
     } else if (key == "l2_canned") {
@@ -140,14 +206,39 @@ inline void WriteTrickDefaults(std::ostream& out) {
            "handle transforms it, letting\n# go turns it back; the Blade of Mercy / Rakuyo: the "
            "right grip, then pull them apart; the\n# Bloodletter: hold the right grip, stab it "
            "into your chest; Tonitrus: hold the right grip\n# and lift it up; the Boom Hammer, the "
-           "Beast Claw and Simon's Bowblade (into the bow): hold the right\n# grip (0: a squeeze "
-           "transforms them all)\n"
+           "Beast Claw and Simon's Bowblade (into the bow): hold the right\n# grip (the Boom "
+           "Hammer: squeeze it until its furnace catches, then hold it or strike the head:\n# "
+           "boom_pull below) (0: a squeeze transforms them all)\n"
         << "# Whirligig Saw: right grip does nothing; the left-hand grab transforms it.\n"
         << "hand_transform=" << b(d.hand_transform) << "\n"
         << "# a split: the hands this much further apart (cm) than where they took hold\n"
         << "hand_transform_pull_cm=" << d.pull_m * 100.0f << "\n"
+        << "hand_transform_pull_seen=1\n"
         << "# Tonitrus' charge and the Boom Hammer's ignition: none again for this long (s)\n"
         << "charge_cooldown_s=" << d.charge_cooldown_s << "\n"
+        << "charge_cooldown_seen=1\n"
+        << "# 1 = the Boom Hammer's furnace starts like an engine: each right-grip squeeze is a "
+           "pull that\n# coughs until it catches (on a pull between boom_pulls_min and "
+           "boom_pulls_max); then it idles,\n# rumbling, boom_idle_s: keep the grip held and it "
+           "revs up over boom_rev_s and lights, squeeze\n# again and each squeeze pumps it up "
+           "boom_pump (0..1 of the way), or strike its head with your\n# left hand, gun or "
+           "torch: it lights at once. Before it catches, hit within 0.28 s of a starter CHUFF\n# "
+           "to light it early. Then boom_cooldown_s before the next (0: hold the grip 1.5 s,\n# "
+           "then charge_cooldown_s)\n"
+        << "boom_pull=" << b(d.boom_pull) << "\n"
+        << "boom_pulls_min=" << d.boom_pulls_min << "\n"
+        << "boom_pulls_max=" << d.boom_pulls_max << "\n"
+        << "# pulls further apart than this (s) start over\n"
+        << "boom_pull_gap_s=" << d.boom_pull_gap_s << "\n"
+        << "boom_idle_s=" << d.boom_idle_s << "\n"
+        << "boom_rev_s=" << d.boom_rev_s << "\n"
+        << "boom_pump=" << d.boom_pump << "\n"
+        << "boom_cooldown_s=" << d.boom_cooldown_s << "\n"
+        << "# its cough and growl (the game's own sounds; 0 = silent)\n"
+        << "boom_volume=" << d.boom_volume << "\n"
+        << "# the Boom Hammer's fire goes out after this many hits landed while lit, once that "
+           "swing is over\n# (the base game: one; 0 = it stays lit)\n"
+        << "boom_fire_hits=" << d.boom_fire_hits << "\n"
         << "# the right weapons whose two-handed form keeps the game's own left-trigger special "
            "(L2, with its\n# animation), by their weapon_grip_ keys; any other two-handed form's "
            "left trigger does nothing\n"
@@ -162,21 +253,29 @@ inline void WriteTrickDefaults(std::ostream& out) {
         << "# 1 = the transformed Reiterpallasch shoots at the right trigger along the blade; "
            "the transformed\n# Rifle Spear blasts: hold the trigger 0.3 s to charge it, let go\n"
         << "gun_blade=" << b(d.gun_blade) << "\n"
-        << "# 1 = a charged swing (the trigger held 1 s) of the transformed Holy Moonlight Sword "
-           "sends its wave\n# where you look when the blade swept through your line of sight, "
-           "else along the swing\n"
+        << "# 1 = a charged swing of the transformed Holy Moonlight Sword sends its wave as the "
+           "blade crosses\n# where you face (your heading, the sword's up/down), or when you let "
+           "go of the trigger\n# mid-swing (along the blade); at the target in front of you "
+           "either way\n"
         << "moon_wave=" << b(d.moon_wave) << "\n"
-        << "# 1 = the transformed Stake Driver: hold the trigger 1 s, punch while held or release to discharge\n"
+        << "# 1 = the transformed Stake Driver: hold the trigger 1 s, punch while held or release "
+           "to discharge\n"
         << "stake_blast=" << b(d.stake_blast) << "\n"
         << "# 1 = the transformed Whirligig Saw and Boom Hammer hum faintly in your hand and rev "
            "up as you swing\n"
         << "weapon_hum=" << b(d.weapon_hum) << "\n"
         << "# 1 = the transformed Whirligig Saw held with both hands (the left grip on its "
-           "handle): either\n# trigger held spins it up, let go it spins down (never the "
+           "handle): left trigger\n# (right in the optimized scheme) held spins it up, let go it "
+           "spins down (never the "
            "game's canned special)\n"
         << "saw_spin=" << b(d.saw_spin) << "\n"
-        << "# 1 = the Augur of Ebrietas bursts where you look when your left hand pointed "
-           "there, else where\n# it points\n"
+        << "# 1 = the Kos Parasite's ritual (the left trigger held in form B, with the Milkweed "
+           "rune) folds\n# the edge of your view into a kaleidoscope of flesh and eyes until its "
+           "burst (the centre stays\n# clear); 0 = the game's ritual alone\n"
+        << "kos_visions=" << b(d.kos_visions) << "\n"
+        << "# 1 = the hunter tools that fire something fly where you aim: the Augur, the "
+           "Blacksky Eye and the\n# Accursed Brew where you look when your left hand pointed "
+           "there, else where it points;\n# Tiny Tonitrus' lightning runs where you look\n"
         << "tool_aim=" << b(d.tool_aim) << "\n"
         << "# 1 = a left-hand swing attacks too: the second blade of the transformed Blade of "
            "Mercy and\n# Rakuyo, the Beast Claw's left claw, the Kos Parasite, the Torch, the Fist "
@@ -186,7 +285,15 @@ inline void WriteTrickDefaults(std::ostream& out) {
         << "# 1 = solid weapons: your weapons and hands stop at walls and at each other; a strike "
            "thuds, a\n# scrape buzzes and throws a few sparks (0: they pass through, as in the "
            "game; 2: weapons\n# only: solid against each other, through the walls)\n"
-        << "weapon_wall=" << (!d.weapon_wall ? 0 : d.weapon_wall_map ? 1 : 2) << "\n"
+        << "weapon_wall="
+        << (!d.weapon_wall      ? 0
+            : d.weapon_wall_map ? 1
+                                : 2)
+        << "\n"
+        << "# 1 = the right weapon meets your other weapon with a shape fitted to its own model "
+           "(read from\n# your game files: the folded Saw Cleaver's blade, an axe's head, the "
+           "scythe; the walls meet a\n# line along its blade); 0 = a line along its blade\n"
+        << "weapon_wall_shape=" << b(d.weapon_wall_shape) << "\n"
         << "trick_haptics=" << b(d.haptics) << "\n";
 }
 
@@ -221,10 +328,11 @@ constexpr bool UsesL1(std::int32_t family) {
 
 // Form B only while both hands hold the handle (HoldForm): the Chikage (20), the Hunter Axe (50),
 // the Burial Blade (51), the Kirkhammer (80), Ludwig's Holy Blade (81), the Rifle Spear (100),
-// and the Whirligig Saw (310; its grab does not need a right-grip squeeze first).
+// Logarius' Wheel (120: its second handle, across the wheel; the tester, 2026-11-06) and the
+// Whirligig Saw (310; its grab does not need a right-grip squeeze first).
 constexpr bool GrabFamily(std::int32_t family) {
     return family == 20 || family == 50 || family == 51 || family == 80 || family == 81 ||
-           family == 100 || family == 310;
+           family == 100 || family == 120 || family == 310;
 }
 
 // What a right-grip squeeze does (RightGrip).
@@ -235,8 +343,9 @@ enum class GripUse : std::uint8_t {
                // blades' split) transforms it
     Arm,       // arms the Bloodletter's stab
     Lift,      // held, the weapon lifted up over the head: Tonitrus' charge (its L1)
-    Hold,      // held HoldSOf: the Boom Hammer's ignition, the Beast Claw's unleashing, the
-               // Bowblade's bow
+    Hold,      // held HoldSOf: the Beast Claw's unleashing, the Bowblade's bow (the Boom Hammer's
+               // ignition with boom_pull=0)
+    Pull,      // the Boom Hammer's furnace started like an engine (Settings::boom_pull)
 };
 
 constexpr GripUse GripUseOf(std::int32_t family, bool form_b) {
@@ -255,7 +364,10 @@ constexpr GripUse GripUseOf(std::int32_t family, bool form_b) {
     if (family == 290) {
         return GripUse::Arm;
     }
-    if (family == 280 || family == 90 || family == 320) {
+    if (family == 280) {
+        return GripUse::Pull;
+    }
+    if (family == 90 || family == 320) {
         return GripUse::Hold;
     }
     return GripUse::Transform;
@@ -293,7 +405,7 @@ constexpr bool InKeyList(std::string_view list, std::string_view key) {
 
 // The right hand's shots (core/vr/bloodborne_gun.cpp): fired by the game's own bullet call from
 // the weapon's behaviour rows, with no animation.
-enum class Shot : std::uint8_t { None, GunBlade, MoonWave, StakeBlast, Bow };
+enum class Shot : std::uint8_t { None, GunBlade, MoonWave, StakeBlast, Bow, KosSpit };
 
 struct ShotWeapon {
     std::int32_t variation; // the right weapon's behaviour variation
@@ -303,8 +415,9 @@ struct ShotWeapon {
     std::int32_t flash_ffx; // the muzzle flash at `tip` (-1: none)
     std::int32_t bang;      // the shot's sound (-1: none)
     std::int32_t dry;       // ... without bullets
-    std::int32_t base;      // the transformed part's line: from this dummy ...
-    std::int32_t tip;       // ... to this one (core/vr/melee_moves.h, its form-B rows)
+    std::int32_t base;      // first transformed-part marker (not necessarily behind the muzzle)
+    std::int32_t tip;       // second marker; the gun-blades' muzzle/flash and native shot dummy
+    bool reverse_line{false}; // reverse direction only; keep the native emission/flash markers
 };
 
 // The pistol's flash and sounds for the Reiterpallasch, the rifle's for the Rifle Spear
@@ -316,12 +429,83 @@ constexpr float RifleCooldownS = 1.0f;
 constexpr float BlastChargeS = 1.0f;
 constexpr float BlastCooldownS = 3.0f;
 
+// The Kos Parasite's spit (core/vr/kos_lash.h; the tester, 2026-11-09: "use the game's own poison
+// spit"): with the Milkweed rune (its tendril weapon, variation 3800) the left trigger in form A,
+// a tap in form B, spits the game's own glob with no animation: its spit clips' (a156_032500,
+// 042500) TAE event 2, the behaviour judge 200 (bullet 960, 6 m/s; on a hit its 0.8 m cloud 961,
+// SpEffect 6190: poison) from the mouth (dummy 7), here from your mouth where you look,
+// KosSpitLiftDeg above it as the glob arcs. The clip's sounds (SoundType 1: the gag 8000, 950, 951,
+// 923) and its effect at the mouth (250102, 0.67 s; third person only: at your eyes it filled the
+// view). Not in ShotWeaponOf: that table is the right trigger's.
+constexpr std::int32_t KosRuneVariation = 3800;
+constexpr bool KosFamily(std::int32_t family) {
+    return family == 380 || family == 400 || family == 410;
+}
+constexpr bool CannedSpecialAvailable(std::int32_t family, std::int32_t variation) {
+    // The no-Milkweed Parasite has fists, not the ritual. Its trigger must not
+    // steal a physical heavy punch and turn it into the game's L2 animation.
+    return !KosFamily(family) || variation == KosRuneVariation;
+}
+constexpr std::int32_t KosSpitJudge = 200;
+constexpr std::int32_t KosSpitMouth = 7;    // the hunter's dummy at the front of his face
+constexpr std::int32_t KosSpitFfx = 250102; // the glob gathering at the mouth
+constexpr float KosSpitFfxS = 0.67f;
+constexpr float KosSpitCooldownS = 0.9f; // the game's spit clip's pace
+constexpr float KosSpitLiftDeg = 12.0f;
+// The glob starts this far ahead of the mouth, and below it (the chin): nearer, in first person the
+// game's glob covered the whole view for half a second (MockXR 2026-11-09).
+constexpr float KosSpitAheadM = 0.30f;
+constexpr float KosSpitChinM = 0.06f;
+constexpr std::array<std::int32_t, 4> KosSpitSounds{8000, 951, 950, 923};
+constexpr float KosRitualHoldS = 0.25f; // form B: held this long, the left trigger is the ritual
+// The ritual in your hands (the user's mock page, 2026-11-09): a heartbeat quickening through the
+// arms' rise and the coil (its beats, s after the ritual starts), then one deep pulse at its burst
+// (the game's ritual a156_046000: the burst at frame 42, 1.40 s).
+constexpr std::array<float, 5> KosRitualBeatsS{0.0f, 0.42f, 0.78f, 1.06f, 1.27f};
+constexpr float KosRitualBurstS = 1.40f;
+// Its vision (kos_visions; host_shaders/vr_kos_ritual.glsl) at `age` s after it began: the rise
+// eases in through the arms' rise and the coil (0 to 1 by the burst), then the burst flashes and
+// eases out over KosRitualSettleS (the eyes shut, a ring of light rushes out). Nothing before or
+// after.
+constexpr float KosRitualSettleS = 0.6f;
+struct KosRitualLook {
+    float rise{0.0f};
+    float burst{0.0f};
+};
+inline KosRitualLook KosRitualAt(float age) {
+    KosRitualLook l{};
+    if (!(age >= 0.0f) || age >= KosRitualBurstS + KosRitualSettleS) {
+        return l;
+    }
+    if (age < KosRitualBurstS) {
+        const float u = age / KosRitualBurstS;
+        l.rise = u * u * (3.0f - 2.0f * u);
+    } else {
+        const float v = (age - KosRitualBurstS) / KosRitualSettleS;
+        l.burst = 1.0f - v * v * (3.0f - 2.0f * v);
+    }
+    return l;
+}
+// Confirmed animation start, shared by native and reconstructed eyes.
+inline std::array<float, 4> KosRitualVisionAt(std::int64_t now, std::int64_t start) {
+    if (start == 0 || now < start) {
+        return {};
+    }
+    const float age = static_cast<float>(now - start) * 1e-9f;
+    const auto l = KosRitualAt(age);
+    if (l.rise <= 0.0f && l.burst <= 0.0f) {
+        return {};
+    }
+    const float seed = static_cast<float>((start / 1000003) % 997) / 997.0f;
+    return {l.rise, l.burst, age, seed};
+}
+
 inline const ShotWeapon* ShotWeaponOf(std::int32_t variation) {
     static constexpr ShotWeapon table[] = {
-        {1010, Shot::GunBlade, 0.867f, 0.0f, 6102, 720, 721, 12100, 12130}, // Reiterpallasch
+        {1010, Shot::GunBlade, 0.867f, 0.0f, 6102, 720, 721, 12100, 12130, true}, // Reiterpallasch
         {1000, Shot::GunBlade, RifleCooldownS, RifleChargeS, 6302, 700, 712, 12100,
-         12130},                                                          // Rifle Spear
-        {2600, Shot::MoonWave, 0.0f, 0.0f, -1, -1, -1, 12100, 12120},     // Holy Moonlight Sword
+         12130, true},                                                     // Rifle Spear
+        {2600, Shot::MoonWave, 0.0f, 0.0f, -1, -1, -1, 12100, 12120, true}, // Holy Moonlight Sword
         {1100, Shot::StakeBlast, BlastCooldownS, BlastChargeS, -1, -1, -1, 11110,
          11206},                                                          // Stake Driver
         {3200, Shot::Bow, 0.0f, 0.0f, -1, -1, -1, -1,
@@ -333,6 +517,20 @@ inline const ShotWeapon* ShotWeaponOf(std::int32_t variation) {
         }
     }
     return nullptr;
+}
+
+struct ShotLine {
+    Body::Vec3 origin{};
+    Body::Vec3 direction{};
+};
+
+inline ShotLine ShotLineOf(const ShotWeapon& weapon, Body::Vec3 base, Body::Vec3 tip) {
+    // Retail 1.09 FLVERs: dummy 100 is farther along the blade than muzzle 130
+    // (Rifle Spear/Reiterpallasch) or grip 120 (Moonlight Sword). Their old
+    // tip-base ray pointed back into the handle. Keep their existing emission
+    // positions: the muzzle for gun-blades, midpoint for the Moonlight wave.
+    return {weapon.shot == Shot::MoonWave ? (base + tip) * 0.5f : tip,
+            Body::Normalize(weapon.reverse_line ? base - tip : tip - base)};
 }
 
 // A verified charged melee row routes the stake discharge to a powered melee window,
@@ -372,7 +570,7 @@ constexpr float HumRev(float tip_speed) {
 // ---- The Whirligig Saw's spin (the tester's, 2026-10-12) ---------------------------------------------
 
 // Its transformed form (family 310) held with both hands (the two-handed grip on its handle):
-// either trigger held revs the saw up over SpinUpS (a pull-start, then a rising buzz), keeps it
+// the spin trigger (left normally, right in optimized mode) revs it up over SpinUpS, keeps it
 // spinning (a deep rumble with the teeth's grain, in both hands), and let go (or a hand off the
 // handle) it spins down over SpinDownS (a decaying whir). Never the game's L2 (its canned step).
 // The weapon-only clip and the repeating attack run on the game thread (SawAttackTick).
@@ -382,6 +580,11 @@ constexpr float SpinDownS = 0.5f;
 constexpr float SpinTeethHz = 14.0f; // the grain at full speed (slower as it winds down)
 constexpr float SpinRumble = 0.35f;  // the rumble at full speed ...
 constexpr float SpinGrain = 0.12f;   // ... and the teeth's swing above and below it (felt on Touch)
+
+// Attachment keeps the left trigger in the optimized scheme; standard mode frees right for charge.
+inline constexpr bool SawSpinTrigger(bool optimized, bool left, bool right) {
+    return optimized ? right : left;
+}
 
 class SawSpin {
 public:
@@ -397,10 +600,6 @@ public:
         float rev{0.0f};   // 0 (still) .. 1 (full speed)
         float level{0.0f}; // the feel's level in the hands (0: none)
     };
-
-    Out Step(bool left_trigger, bool right_trigger, bool both_hands, float dt) {
-        return Step(left_trigger || right_trigger, both_hands, dt);
-    }
 
     Out Step(bool trigger, bool both_hands, float dt) {
         Out out{};
@@ -489,9 +688,11 @@ inline constexpr std::int32_t ChargedJudgesB[] = {570, 930};
 
 // The right weapons whose transformed form puts a part of them in the left hand (its attacks are
 // the left hand's): the Blade of Mercy's (400) and Rakuyo's (2700) second blade, the Beast Claw's
-// (900) left claw, the Kos Parasite's (101) parasite.
+// (900) left claw, the Kos Parasite's (101) parasite, and with the Milkweed rune the tendril
+// weapon the game swaps in for it (3800; core/vr/kos_lash.h): its left hand's tendrils.
 constexpr bool LeftPartWeapon(std::int32_t variation) {
-    return variation == 400 || variation == 2700 || variation == 900 || variation == 101;
+    return variation == 400 || variation == 2700 || variation == 900 || variation == 101 ||
+           variation == 3800;
 }
 
 // The left-hand weapons that attack (their L2): the Torch and the Hunter's Torch (2000), the Fist
@@ -539,18 +740,16 @@ constexpr int GunPunchStaminaPct(std::int32_t punch, int light_pct) {
 // and the shield's punch too), the Torch (20000) and the Fist of Gratia (34000). Before, a left
 // swing attacked only once the game's own L2 had been seen once, which no run ever did: the
 // Torch, the punches never hit (2026-10-13). -1: none known (learned in the game, as before).
-// The Holy Moonlight Sword's wave: a bit of target assist toward the game's chosen target (locked
-// on or not): within MoonWaveAssistDeg of it, up to MoonWaveAssist of the error removed (half the
-// cone: full, fading to none at its edge; core/vr/gun_aim.h GentleAssist).
-constexpr float MoonWaveAssist = 0.6f;
-constexpr float MoonWaveAssistDeg = 14.0f;
-
 constexpr std::int32_t KnownLeftRow(std::int32_t key) {
     switch (key) {
     case FistVariation * 10:
     case 2000 * 10:
     case 3400 * 10:
         return 800;
+    case 3800 * 10 + 1:
+        // The Kos Parasite's tendril weapon (the Milkweed rune), form B's left hand: the game's
+        // own first form-B R1 (a156_040000, judge 400) lashes with the left tendrils alone.
+        return 400;
     default:
         return -1;
     }
@@ -638,17 +837,20 @@ constexpr CapsuleSide SideOf(float to_left, float to_right) {
 // kept when its hitbox shows at the left fist (Learned), ended when at the right one (Wrong: the
 // next candidate), and given up for this swing after `frames_max` updates with no side seen (no
 // hitbox, the fists together: Unseen). Pure (core/vr/bloodborne_melee.cpp CheckLeftProbe).
+// ProbeFrames is tuned at 60 fps: the caller passes it for the game's frame rate (the hitbox comes
+// on the attack's own clock, as long in time at any rate: VR::GameFramesAt60).
 enum class Probe : std::uint8_t { Wait, Learned, Wrong, Unseen };
 constexpr std::uint32_t ProbeFrames = 6;
 
-constexpr Probe ProbeStep(bool seen, float to_left, float to_right, std::uint32_t frames) {
+constexpr Probe ProbeStep(bool seen, float to_left, float to_right, std::uint32_t frames,
+                          std::uint32_t frames_max = ProbeFrames) {
     if (seen) {
         const CapsuleSide side = SideOf(to_left, to_right);
         if (side != CapsuleSide::Unsure) {
             return side == CapsuleSide::Left ? Probe::Learned : Probe::Wrong;
         }
     }
-    return frames >= ProbeFrames ? Probe::Unseen : Probe::Wait;
+    return frames >= frames_max ? Probe::Unseen : Probe::Wait;
 }
 
 // ---- Geometry -------------------------------------------------------------------------------------
@@ -690,36 +892,332 @@ inline Vec3 WaveAim(Vec3 chest, Vec3 blade_mid, Vec3 forward, float max_pitch_de
     return flat * std::cos(pitch) + Vec3{0.0f, std::sin(pitch), 0.0f};
 }
 
-// Where you look (moon_wave, tool_aim): a motion that passed through your line of sight (within
-// GazeDeg of where the head points) lets its shot go there; the Augur's within GazeS before its
+// The moonlight wave (2026-11-10: "It should fly out of the sword when it crosses our
+// vision vector"; "think of the vision check like rotated along the horizon"; "the horizontal angle
+// is more important than the vertical one"; "I have an enemy in front of me. I swing my weapon, and
+// a beam flies off and hits the enemy"). A charged stroke lets it go:
+// - the moment the blade sweeps across where you face (ViewCrossing): its middle, seen from your
+//   eyes, passing your view's heading left to right or right to left, at any height (looking up
+//   or down changes nothing); a chop in front of you (within ChopYawDeg of your heading), which
+//   never crosses it sideways, as it comes down through your eye line. Out along your view's
+//   heading, its up/down the sword's own, not your eyes' (MoonWaveLine: look up, swing a level
+//   sword, the wave flies level); a chop's flies level;
+// - a stroke that never crosses (beside you, or with your eyes elsewhere): when you let go of the
+//   trigger while it is under way (its far end past MoonMinPeakMps), along the blade, hilt to tip
+//   (BladeWaveAim).
+// Its up/down is pulled HorizonPullDeg toward level (within it: level; 10 at first, 15 since the
+// user's "a tiny bit more" toward the horizon) and never steeper than WaveMaxPitchDeg; its
+// crescent, tilted as your slash, drawn flat within FlatCrescentDeg of flat (LevelSlash). Either way the game side turns it straight at the target the game picked (locked
+// on or not) when that target is in front of the hunter, within reach and not clearly away from
+// where it was sent (MoonWaveAim): a swing at an enemy hits it.
+constexpr float ChopYawDeg = 15.0f;
+constexpr float HorizonPullDeg = 15.0f;
+constexpr float FlatCrescentDeg = 10.0f;
+constexpr float WaveMaxPitchDeg = 20.0f;
+constexpr float MoonMinPeakMps = 1.5f; // a stroke under way, not a twitch
+// The blade's middle nearer your eyes than this, seen from above (right over your head at the top of
+// an overhead chop): its heading is noise there, a hand's wobble flips it; and a heading that jumps
+// more than CrossingJumpDeg in a frame went over or past you, not across: neither is a crossing
+// (review, 2026-11-10: a centred chop fired at its top, up into the air).
+constexpr float CrossingMinM = 0.15f;
+constexpr float CrossingJumpDeg = 60.0f;
+// A slash crosses from a side: the blade had been at least this far out on the side it leaves
+// (a hand's wobble about your heading, as a chop comes over, never is).
+constexpr float SlashArmDeg = 8.0f;
+// Where the blade crosses: checked between frames (a fast slash moves the blade ~14 degrees a
+// frame: a point test would skip over it). Step every frame of the stroke; Slash on the frame its
+// middle passed your view's heading (in front of you), Chop on the frame a blade in front of you
+// passed your eye line; None otherwise.
+struct ViewCrossing {
+    enum class Kind { None, Slash, Chop };
+    bool have{false};
+    int side{0};       // the side it has been on, SlashArmDeg out: -1 left, +1 right, 0 neither
+    float yaw{0.0f};   // the blade's heading off your view's (radians, + to your right)
+    float pitch{0.0f}; // its height off your eye line, seen from your eyes (radians)
+    Kind Step(Vec3 eye, Vec3 gaze, Vec3 point) {
+        const Vec3 to = point - eye;
+        const Vec3 flat_gaze{gaze.x, 0.0f, gaze.z};
+        const Vec3 flat_to{to.x, 0.0f, to.z};
+        if (!Body::IsFinite(to) || !Body::IsFinite(gaze) || Body::LengthSq(flat_gaze) < 1e-4f ||
+            Body::LengthSq(flat_to) < CrossingMinM * CrossingMinM) {
+            have = false; // right over your head, or at your eyes: start afresh
+            side = 0;
+            return Kind::None;
+        }
+        const Vec3 g = Body::Normalize(flat_gaze);
+        const float ahead = Body::Dot(flat_to, g);
+        const float right = flat_to.x * -g.z + flat_to.z * g.x; // (y up: the heading's right)
+        const float now_yaw = std::atan2(right, ahead);
+        const float now_pitch = std::atan2(to.y, Body::Length(flat_to));
+        const bool had = have;
+        const float from_yaw = yaw, from_pitch = pitch;
+        const int from_side = side;
+        have = true;
+        yaw = now_yaw;
+        pitch = now_pitch;
+        const float arm = SlashArmDeg * Body::Deg;
+        if (std::abs(now_yaw) < 0.5f * Body::Pi && std::abs(now_yaw) >= arm) {
+            side = now_yaw < 0.0f ? -1 : 1;
+        }
+        if (!had) {
+            return Kind::None;
+        }
+        // In front both frames (the sign of a heading flips behind you too: never that), and no
+        // jump (CrossingJumpDeg).
+        const float quarter = 0.5f * Body::Pi;
+        if (std::abs(from_yaw) >= quarter || std::abs(now_yaw) >= quarter ||
+            std::abs(now_yaw - from_yaw) > CrossingJumpDeg * Body::Deg) {
+            return Kind::None;
+        }
+        if ((from_yaw < 0.0f) != (now_yaw < 0.0f) && from_side == (from_yaw < 0.0f ? -1 : 1)) {
+            return Kind::Slash;
+        }
+        const float chop = ChopYawDeg * Body::Deg;
+        if (std::abs(from_yaw) <= chop && std::abs(now_yaw) <= chop &&
+            (from_pitch < 0.0f) != (now_pitch < 0.0f)) {
+            return Kind::Chop;
+        }
+        return Kind::None;
+    }
+};
+// Let go mid-stroke: fires once the stroke is under way.
+constexpr bool MoonReleaseFires(float tip_peak, bool trigger_released) {
+    return trigger_released && tip_peak >= MoonMinPeakMps;
+}
+// An up/down angle pulled HorizonPullDeg toward level (within it: level), at most WaveMaxPitchDeg.
+inline float TowardHorizon(float pitch) {
+    const float pull = HorizonPullDeg * Body::Deg;
+    const float most = WaveMaxPitchDeg * Body::Deg;
+    const float magnitude = std::clamp(std::abs(pitch) - pull, 0.0f, most);
+    return pitch < 0.0f ? -magnitude : magnitude;
+}
+// The way `heading` points (flat), at `pitch` (radians).
+inline Vec3 HeadingAt(Vec3 heading, float pitch) {
+    Vec3 flat{heading.x, 0.0f, heading.z};
+    flat = Body::Normalize(flat, Vec3{0.0f, 0.0f, -1.0f});
+    return flat * std::cos(pitch) + Vec3{0.0f, std::sin(pitch), 0.0f};
+}
+// The crossing's flight: your view's heading (the forward when you look straight up or down), the
+// sword's up/down toward the horizon (a chop: level).
+inline Vec3 MoonWaveLine(Vec3 gaze, Vec3 blade_axis, Vec3 forward, bool chop) {
+    const Vec3 flat{gaze.x, 0.0f, gaze.z};
+    const Vec3 heading = Body::LengthSq(flat) > 0.01f ? flat : forward;
+    const Vec3 axis = Body::Normalize(blade_axis, forward);
+    const float pitch = chop ? 0.0f : TowardHorizon(std::asin(std::clamp(axis.y, -1.0f, 1.0f)));
+    return HeadingAt(heading, pitch);
+}
+// Along the blade, hilt to tip, its up/down toward the horizon (an overhead chop ends pointing
+// down: the wave goes along the ground, not into it). A blade straight up or down: the forward.
+inline Vec3 BladeWaveAim(Vec3 blade_axis, Vec3 forward) {
+    const Vec3 axis = Body::Normalize(blade_axis, forward);
+    const Vec3 flat{axis.x, 0.0f, axis.z};
+    const Vec3 heading = Body::Length(flat) > 0.05f ? flat : forward;
+    return HeadingAt(heading, TowardHorizon(std::asin(std::clamp(axis.y, -1.0f, 1.0f))));
+}
+// The crescent's tilt (the slash across the flight): within FlatCrescentDeg of flat, flat.
+inline Vec3 LevelSlash(Vec3 slash) {
+    const float length = Body::Length(slash);
+    if (!(length > 1e-4f) || !Body::IsFinite(slash)) {
+        return slash;
+    }
+    const Vec3 n = slash * (1.0f / length);
+    if (std::abs(std::asin(std::clamp(n.y, -1.0f, 1.0f))) > FlatCrescentDeg * Body::Deg) {
+        return slash;
+    }
+    const Vec3 flat{n.x, 0.0f, n.z};
+    return Body::LengthSq(flat) > 1e-6f ? Body::Normalize(flat) * length : slash;
+}
+// The target in front: within MoonTargetFrontDeg of the hunter's facing (flat), MoonTargetRangeM
+// of the wave's start (it reaches ~6.6 m: two bullets at 20 m/s, row 590/591 and their flight) and
+// MoonTargetAwayDeg of where the wave was sent (one sent clearly elsewhere goes there).
+constexpr float MoonTargetRangeM = 8.0f;
+constexpr float MoonTargetFrontDeg = 60.0f;
+constexpr float MoonTargetAwayDeg = 90.0f;
+struct MoonAim {
+    Vec3 dir{};
+    bool at_target{false};
+    float off_deg{0.0f}; // where it was sent, from the target (degrees; with a target in reach)
+};
+inline MoonAim MoonWaveAim(Vec3 sent, Vec3 origin, Vec3 target, bool have_target, Vec3 facing) {
+    MoonAim out{};
+    out.dir = Body::Normalize(sent, facing);
+    if (!have_target || !Body::IsFinite(out.dir) || !Body::IsFinite(origin) ||
+        !Body::IsFinite(target) || !Body::IsFinite(facing)) {
+        return out;
+    }
+    const Vec3 to = target - origin;
+    const float distance = Body::Length(to);
+    if (!(distance >= 0.5f && distance <= MoonTargetRangeM)) {
+        return out;
+    }
+    const Vec3 flat_to{to.x, 0.0f, to.z};
+    const Vec3 flat_facing{facing.x, 0.0f, facing.z};
+    if (Body::LengthSq(flat_to) < 1e-6f || Body::LengthSq(flat_facing) < 1e-6f ||
+        Body::Angle(Body::Normalize(flat_to), Body::Normalize(flat_facing)) >
+            MoonTargetFrontDeg * Body::Deg) {
+        return out;
+    }
+    const Vec3 to_dir = to * (1.0f / distance);
+    out.off_deg = Body::Angle(out.dir, to_dir) / Body::Deg;
+    if (out.off_deg > MoonTargetAwayDeg) {
+        return out;
+    }
+    out.dir = to_dir;
+    out.at_target = true;
+    return out;
+}
+
+// Where you look (tool_aim; the moonlight wave has its own: ViewCrossing): a motion that passed
+// through your line of sight (within GazeDeg of where the head points) lets its shot go there; the Augur's within GazeS before its
 // burst leaves (the item clip's delay).
 constexpr float GazeDeg = 20.0f;
 constexpr float GazeS = 0.8f;
 
-// The moonlight wave of one swing, fed every frame of its window: where you look when the blade
-// (its middle, seen from the head) swept through your line of sight; else where it pointed at the
-// stroke's fastest (a swing beside you, or up past your view, keeps its own line).
-struct WaveSweep {
-    float gaze_deg{180.0f}; // the sweep's nearest to the line of sight (degrees)
-    float peak{-1.0f};      // the blade's fastest so far (m/s) ...
-    Vec3 at_peak{};         // ... and the wave's line then (WaveAim)
+// tool_aim for the hunter tools that fire something (the tester's 2026-10-30 "yes we need this too.
+// And done well and carefully"), from the 1.09 params (EquipParamGoods refId -> BulletParam):
+//  - Full (the line where you aim): the Augur of Ebrietas' burst (bullet 370: 7 m/s, 6 m), the
+//    Blacksky Eye's meteor (460: 30 m/s, 16 m, its impact 461), the Accursed Brew's skull (470:
+//    15-20 m/s, 7.6 m, a little gravity, its blast 471);
+//  - Heading (only its heading where you aim, the game's own pitch kept): Tiny Tonitrus' bolt (410:
+//    33 m/s and a gravity of 500, so it falls at once, then 18 links of lightning along the
+//    ground, 411-428, each from the last: only the first is turned, the chain follows it).
+// Only a tool's first bullet is aimed, never its children (an impact keeps where it hit). Not
+// aimed: the bullets that seek on their own (A Call Beyond's 24 stars, 380/381; the Executioner's
+// Gloves' 3 spirits, 350), those round the hunter (Beast Roar 390, the Choir Bell 360) and the
+// Madaras Whistle's snake (480-484: it rises at its dummy by the hunter).
+enum class ToolAimKind : std::uint8_t { None, Full, Heading };
+struct ToolAimInfo {
+    std::int32_t goods{-1};
+    std::int32_t bullet{-1}; // its first bullet (the launch's BulletParam id)
+    ToolAimKind kind{ToolAimKind::None};
+    const char* name{""};
+};
+inline constexpr std::array<ToolAimInfo, 4> ToolAims{{
+    {2000, 370, ToolAimKind::Full, "the Augur's burst"},
+    {2120, 460, ToolAimKind::Full, "the Blacksky Eye's meteor"},
+    {2130, 470, ToolAimKind::Full, "the Accursed Brew's skull"},
+    {2070, 410, ToolAimKind::Heading, "Tiny Tonitrus' lightning"},
+}};
+constexpr ToolAimInfo ToolAimOfBullet(std::int32_t bullet) {
+    for (const ToolAimInfo& t : ToolAims) {
+        if (t.bullet == bullet) {
+            return t;
+        }
+    }
+    return {};
+}
+constexpr ToolAimInfo ToolAimOfGoods(std::int32_t goods) {
+    for (const ToolAimInfo& t : ToolAims) {
+        if (t.goods == goods) {
+            return t;
+        }
+    }
+    return {};
+}
+// Where it is aimed: where you look when the left hand pointed there within GazeS (thrust at what
+// you look at; it need not still point there as it leaves), else where the hand points; a
+// Heading tool where you look (Tiny Tonitrus is struck down: the hand points at the floor then),
+// else the hand's heading. False: neither known (the game's own aim).
+enum class ToolAimFrom : std::uint8_t { None, Gaze, Hand };
+inline ToolAimFrom ToolAimSource(ToolAimKind kind, bool gaze_ok, bool pointed_at_gaze, Vec3 gaze,
+                                 bool hand_ok, Vec3 hand, Vec3& aim) {
+    const bool flat_hand = hand_ok && std::hypot(hand.x, hand.z) > 0.2f;
+    if (gaze_ok && (kind == ToolAimKind::Heading || pointed_at_gaze)) {
+        aim = gaze;
+        return ToolAimFrom::Gaze;
+    }
+    if (hand_ok && (kind == ToolAimKind::Full || flat_hand)) {
+        aim = hand;
+        return ToolAimFrom::Hand;
+    }
+    if (gaze_ok) {
+        aim = gaze;
+        return ToolAimFrom::Gaze;
+    }
+    return ToolAimFrom::None;
+}
+// The bullet's new line from the game's (`vanilla`) and the aim: Full the aim itself; Heading the
+// aim's heading at the game's own pitch (a near-vertical aim has no heading: the game's).
+inline Vec3 ToolAimLine(ToolAimKind kind, Vec3 vanilla, Vec3 aim) {
+    const Vec3 v = Body::Normalize(vanilla, Vec3{0.0f, 0.0f, 1.0f});
+    if (kind == ToolAimKind::Full) {
+        return Body::Normalize(aim, v);
+    }
+    const float run = std::hypot(aim.x, aim.z);
+    if (kind != ToolAimKind::Heading || run < 0.2f) {
+        return v;
+    }
+    const float pitch_y = std::clamp(v.y, -1.0f, 1.0f);
+    const float level = std::sqrt(std::max(0.0f, 1.0f - pitch_y * pitch_y));
+    return Vec3{aim.x / run * level, pitch_y, aim.z / run * level};
+}
+// `line` turned down by `deg` (up for a negative one), its heading kept; a near-vertical line has
+// no heading to turn about and stays as is. Never turned past 86 degrees either way.
+inline Vec3 PitchedDown(Vec3 line, float deg) {
+    const Vec3 d = Body::Normalize(line, Vec3{0.0f, 0.0f, 1.0f});
+    const float run = std::hypot(d.x, d.z);
+    if (run < 0.05f || deg == 0.0f || !std::isfinite(deg)) {
+        return d;
+    }
+    const float was = std::atan2(d.y, run);
+    const float pitch = std::clamp(was - deg * Body::Deg, std::min(was, -1.5f), std::max(was, 1.5f));
+    const float level = std::cos(pitch);
+    return Vec3{d.x / run * level, std::sin(pitch), d.z / run * level};
+}
+// Locked on, an aim within ToolLockKeepDeg of the game's own line (the game aims a tool at its lock
+// target within 30 degrees of the hunter's facing) keeps the game's: a tool thrust at the target
+// you are locked on to hits it; one aimed elsewhere goes there.
+constexpr float ToolLockKeepDeg = 10.0f;
+inline bool ToolKeepsLock(bool locked, Vec3 vanilla, Vec3 line) {
+    return locked && Body::Angle(Body::Normalize(vanilla, line), Body::Normalize(line, vanilla)) <=
+                         ToolLockKeepDeg * Body::Deg;
+}
 
-    void Step(Vec3 head, Vec3 gaze, Vec3 chest, Vec3 blade_mid, Vec3 forward, float tip_speed) {
-        const Vec3 to = blade_mid - head;
-        if (Body::LengthSq(to) > 1e-4f && Body::LengthSq(gaze) > 0.5f) {
-            gaze_deg = std::min(gaze_deg, Body::Angle(Body::Normalize(to), gaze) / Body::Deg);
+// Orientation only: sample blade-midpoint motion relative to the head, with a short filter.
+// Freeze the slash at peak speed, before the follow-through can change its plane.
+struct WaveSlash {
+    Vec3 previous{}, filtered{}, at_peak{}, normal_at_peak{};
+    float peak{0.0f};
+    bool have_previous{false};
+
+    void Step(Vec3 relative_mid, float dt, float speed, Vec3 blade_axis = {}) {
+        if (!Body::IsFinite(relative_mid) || !std::isfinite(dt) || dt <= 0.0f || dt > 0.1f) {
+            *this = {};
+            return;
         }
-        if (tip_speed > peak) {
-            peak = tip_speed;
-            at_peak = WaveAim(chest, blade_mid, forward);
+        if (have_previous) {
+            const Vec3 v = (relative_mid - previous) * (1.0f / dt);
+            if (Body::IsFinite(v) && Body::Length(v) <= 40.0f) {
+                filtered = filtered + (v - filtered) * (1.0f - std::exp(-dt / 0.025f));
+                if (std::isfinite(speed) && speed >= 1.5f && speed > peak &&
+                    Body::Length(filtered) >= 0.5f) {
+                    peak = speed;
+                    at_peak = filtered;
+                    // A chop can travel straight toward the target at its fastest. Its blade
+                    // axis still identifies the vertical sweep plane then.
+                    normal_at_peak = {};
+                    if (Body::IsFinite(blade_axis)) {
+                        const Vec3 normal = Body::Cross(Body::Normalize(blade_axis),
+                                                       Body::Normalize(filtered));
+                        if (Body::LengthSq(normal) >= 0.04f)
+                            normal_at_peak = Body::Normalize(normal);
+                    }
+                }
+            } else {
+                filtered = {};
+                at_peak = {};
+                normal_at_peak = {};
+                peak = 0.0f;
+            }
         }
+        previous = relative_mid;
+        have_previous = true;
     }
-    bool AtGaze() const {
-        return gaze_deg <= GazeDeg;
-    }
-    // The wave's line: along the gaze (no steeper than a wave goes) or the swing's at its fastest.
-    Vec3 Aim(Vec3 head, Vec3 gaze, Vec3 forward) const {
-        return AtGaze() ? WaveAim(head, head + gaze, forward) : at_peak;
+
+    Vec3 Across(Vec3 flight) const {
+        const Vec3 across = Body::Cross(normal_at_peak, Body::Normalize(flight));
+        return Body::IsFinite(across) && Body::LengthSq(across) >= 0.04f
+                   ? across : at_peak;
     }
 };
 
@@ -742,6 +1240,8 @@ struct Frame {
     Vec3 forward{0.0f, 0.0f, -1.0f}; // the head's horizontal forward (unit)
     Vec3 axis{};      // the right weapon: from the fist toward its far end (unit; zero: unknown)
     Vec3 left_axis{}; // the left blade of the dual blades' form B (zero: unknown)
+    float left_reach{0.0f}; // what the left hand holds reaches this far along left_axis (m; 0: the
+                            // bare hand; LeftReachOf)
 };
 
 enum class Gesture : std::uint8_t {
@@ -996,8 +1496,62 @@ constexpr float FreeS = 5.0f;       // freed left hand: waits this long for the 
 constexpr float LiftM = 0.25f;      // Tonitrus: the fist rises this much from its lowest since the
                                     //     grip closed ...
 constexpr float LiftAboveM = 0.05f; // ... to this far above the eyes ...
-constexpr float LiftUp = 0.5f;      // ... the weapon pointing up (its line's up: within 60 degrees;
-                                    //     a raised wrist rarely gets the blade nearer vertical)
+constexpr float LiftUp = 0.5736f;   // ... the weapon pointing up (its line's up: within 55 degrees,
+                                    //     cos 55; the tester, 2026-11-10; 60 before; a raised wrist
+                                    //     rarely gets the blade much nearer vertical)
+
+// The Boom Hammer's furnace, struck while the right grip is held (2026-11-06: "grip
+// button + strike it with our left hand/left hand weapon"): it lights at once, as the held
+// HoldSOf does. Its head runs FurnaceFromM..FurnaceToM out from the fist (the weight 65 cm out);
+// a strike is the left hand's line (Frame::left_reach) coming in from outside FurnaceR of it,
+// the gap closing at StrikeSpeed at least (a hand resting on it, or drifting in, is none).
+constexpr float FurnaceFromM = 0.55f, FurnaceToM = 0.90f, FurnaceR = 0.12f;
+constexpr float StrikeSpeed = 1.0f; // m/s (the head's own swing into the hand counts too)
+constexpr float BoomStrikeWindowS = 0.28f; // after each cold starter CHUFF, before it catches
+
+constexpr std::int32_t BoomFamily = 280; // the Boom Hammer
+
+constexpr bool StrikeLights(std::int32_t family) {
+    return family == BoomFamily;
+}
+
+// How far the left hand's gun, torch or shield reaches out from the fist (m; 0: none, the hand).
+constexpr float LeftReachOf(std::int32_t family) {
+    switch (family) {
+    case 60: case 61: case 150: case 330: case 350: case 360: // the long guns
+        return 0.45f;
+    case 140: case 141: case 142: case 180: case 181: // the pistols, Rosmarinus, the Flamesprayer
+        return 0.25f;
+    case 200: case 201: // the torches
+        return 0.40f;
+    case 190: case 191: // the shields
+        return 0.20f;
+    default:
+        return 0.0f;
+    }
+}
+
+// The gap between the segments a0-a1 and b0-b1 (m; either may be a point).
+inline float SegmentGap(Vec3 a0, Vec3 a1, Vec3 b0, Vec3 b1) {
+    const Vec3 u = a1 - a0, v = b1 - b0, w = a0 - b0;
+    const float a = Body::Dot(u, u), b = Body::Dot(u, v), c = Body::Dot(v, v);
+    const float d = Body::Dot(u, w), e = Body::Dot(v, w);
+    if (c <= 1e-9f) { // b a point
+        const float s = a > 1e-9f ? std::clamp(-d / a, 0.0f, 1.0f) : 0.0f;
+        return Body::Length(a0 + u * s - b0);
+    }
+    const float den = a * c - b * b;
+    float s = den > 1e-9f ? std::clamp((b * e - c * d) / den, 0.0f, 1.0f) : 0.0f;
+    float t = (b * s + e) / c;
+    if (t < 0.0f) {
+        t = 0.0f;
+        s = a > 1e-9f ? std::clamp(-d / a, 0.0f, 1.0f) : 0.0f;
+    } else if (t > 1.0f) {
+        t = 1.0f;
+        s = a > 1e-9f ? std::clamp((b - d) / a, 0.0f, 1.0f) : 0.0f;
+    }
+    return Body::Length(a0 + u * s - (b0 + v * t));
+}
 
 class RightGrip {
 public:
@@ -1009,14 +1563,21 @@ public:
         Start,   // Lift / Hold: the grip closed, the charge building
         Fire,    // Lift / Hold: done: transform (Tonitrus: its L1) now
         Short,   // Lift / Hold: let go before it took (a soft tick)
-        Cooling, // Lift / Hold: squeezed during the cooldown (the deny)
+        Cooling, // Lift / Hold / Pull: squeezed during the cooldown (the deny; Pull: a dry cough)
+        Cough,   // Pull: a pull that did not catch
+        Catch,   // Pull: caught (held: revs; squeezed: pumps; any valid strike: lights)
+        Pump,    // Pull: caught, squeezed again: revved up Settings::boom_pump more
+        Die,     // Pull: idled out unrevved: it sputters out (pull again)
     };
     struct Out {
         Event event{Event::None};
         bool ready{false};    // Free / Arm: freed or armed now
-        bool charging{false}; // Lift / Hold: held, building ...
-        float progress{0.0f}; // ... 0..1
+        bool charging{false}; // Lift / Hold: held, building ...; Pull: caught, idling ...
+        float progress{0.0f}; // ... 0..1 (Pull: revved up)
         float cooldown_s{0.0f};
+        bool struck{false};       // Fire: the Boom Hammer's head struck (StrikeLights), not held
+        float strike_speed{0.0f}; // ... the gap closing then (m/s)
+        int pull{0};              // Cough / Catch: which pull this was (1, 2, ...)
     };
 
     // Every gameplay frame: `f.right.grip` the right grip (latched), `use` the weapon's
@@ -1027,13 +1588,24 @@ public:
         const bool edge = grip && !prev_grip;
         prev_grip = grip;
         cooldown = std::max(cooldown - f.dt, 0.0f);
+        if (use == GripUse::Pull && !s.boom_pull) {
+            use = GripUse::Hold;
+        }
         if (use != last_use || family != last_family) {
             last_use = use;
             last_family = family;
             ready = false;
             charging = false;
+            gap = -1.0f;
+            pulls = 0;
+            rev = 0.0f;
         }
         switch (use) {
+        case GripUse::Pull: {
+            const bool struck = StrikeLights(family) && Struck(f);
+            Engine(f, edge, grip, struck, s, out);
+            break;
+        }
         case GripUse::Arm:
             if (edge) {
                 ready = true;
@@ -1057,7 +1629,9 @@ public:
             }
             break;
         case GripUse::Lift:
-        case GripUse::Hold:
+        case GripUse::Hold: {
+            // (Followed every frame, the grip held or not: a strike comes in from outside.)
+            const bool struck = use == GripUse::Hold && StrikeLights(family) && Struck(f);
             if (edge && cooldown > 0.0f) {
                 out.event = Event::Cooling;
             } else if (edge) {
@@ -1069,12 +1643,15 @@ public:
                 charging = false;
                 out.event = Event::Short;
             }
-            if (charging && Charge(f, use, family)) {
+            if (charging && (struck || Charge(f, use, family))) {
                 charging = false;
                 out.event = Event::Fire;
+                out.struck = struck;
+                out.strike_speed = struck ? closing : 0.0f;
                 cooldown = CoolsDown(family) ? s.charge_cooldown_s : 0.0f;
             }
             break;
+        }
         case GripUse::None:
         case GripUse::Transform:
             ready = false;
@@ -1083,9 +1660,14 @@ public:
         }
         out.ready = ready;
         out.charging = charging;
-        out.progress = charging ? progress : 0.0f;
+        out.progress = charging ? (use == GripUse::Pull ? rev : progress) : 0.0f;
         out.cooldown_s = cooldown;
         return out;
+    }
+
+    // A new random sequence of catches (the presenter: the clock), so no two sessions pull alike.
+    void Seed(std::uint32_t value) {
+        seed = value != 0 ? value : 0x9E3779B9u;
     }
 
     // The freed hand or the armed stab was used (its transform taken): back to idle.
@@ -1101,12 +1683,112 @@ public:
     // Idle, the right grip as it is now (a grip already held is no squeeze); a cooldown runs on.
     void Reset(bool grip_now) {
         const float c = cooldown;
+        const std::uint32_t sd = seed;
         *this = RightGrip{};
         cooldown = c;
+        seed = sd;
         prev_grip = grip_now;
     }
 
 private:
+    // Cold: each squeeze is a starter CHUFF with a short strike window. Once caught
+    // (`charging`): any valid strike lights it, or hold to rev over boom_rev_s. Let go,
+    // the rev runs back down and after boom_idle_s it dies.
+    void Engine(const Frame& f, bool edge, bool grip, bool struck, const Settings& s, Out& out) {
+        since_pull += f.dt;
+        if (cooldown > 0.0f) {
+            charging = false;
+            pulls = 0;
+            rev = 0.0f;
+            if (edge) {
+                out.event = Event::Cooling;
+            }
+            return;
+        }
+        if (!charging) {
+            if (pulls > 0 && since_pull > s.boom_pull_gap_s) {
+                pulls = 0; // it sagged: start over
+            }
+            if (edge) {
+                if (pulls == 0) { // a new start: which pull catches
+                    const int lo = std::max(1, s.boom_pulls_min);
+                    const int hi = std::max(lo, s.boom_pulls_max);
+                    seed = seed * 1664525u + 1013904223u;
+                    catch_on = lo + static_cast<int>((seed >> 16) % static_cast<std::uint32_t>(hi - lo + 1));
+                }
+                ++pulls;
+                since_pull = 0.0f;
+                out.pull = pulls;
+            }
+            // Also accept a strike coincident with the squeeze. An expired strike
+            // cannot manufacture another CHUFF and grant itself a fresh window.
+            if (struck && pulls > 0 && since_pull <= BoomStrikeWindowS) {
+                Ignite(true, s, out);
+                return;
+            }
+            if (!edge) {
+                return;
+            }
+            if (pulls < catch_on) {
+                out.event = Event::Cough;
+                return;
+            }
+            pulls = 0;
+            charging = true;
+            idle = 0.0f;
+            rev = 0.0f;
+            out.event = Event::Catch;
+            return;
+        }
+        if (edge) { // squeezed again: pumped up (mashing the grip lights it too)
+            rev = std::min(rev + s.boom_pump, 1.0f);
+            out.event = Event::Pump;
+        }
+        if (grip) {
+            rev = std::min(rev + f.dt / s.boom_rev_s, 1.0f);
+            idle = 0.0f;
+        } else {
+            rev = std::max(rev - f.dt / s.boom_rev_s, 0.0f);
+            idle += f.dt;
+        }
+        if (struck || rev >= 1.0f) {
+            Ignite(struck, s, out);
+        } else if (idle >= s.boom_idle_s) {
+            charging = false;
+            rev = 0.0f;
+            out.event = Event::Die;
+        }
+    }
+
+    void Ignite(bool struck, const Settings& s, Out& out) {
+        charging = false;
+        pulls = 0;
+        rev = 0.0f;
+        out.event = Event::Fire;
+        out.struck = struck;
+        out.strike_speed = struck ? closing : 0.0f;
+        cooldown = s.boom_cooldown_s;
+    }
+
+    // The left hand's line (its gun, its torch) striking the weapon's head this frame: in from
+    // outside FurnaceR, the gap closing at StrikeSpeed at least (smoothed over a few frames).
+    bool Struck(const Frame& f) {
+        if (!f.left.tracked || !f.right.valid || Body::LengthSq(f.axis) < 0.5f || f.dt <= 0.0f) {
+            gap = -1.0f; // (no strike measured across a gap)
+            closing = 0.0f;
+            return false;
+        }
+        const float reach = Body::LengthSq(f.left_axis) > 0.5f ? f.left_reach : 0.0f;
+        const float now = SegmentGap(f.left.p, f.left.p + f.left_axis * reach,
+                                     f.right.p + f.axis * FurnaceFromM,
+                                     f.right.p + f.axis * FurnaceToM);
+        const bool had = gap >= 0.0f;
+        closing = had ? closing + 0.5f * ((gap - now) / f.dt - closing) : 0.0f;
+        const bool hit = had && gap > FurnaceR && now <= FurnaceR && closing >= StrikeSpeed;
+        gap = now;
+        return hit;
+    }
+
     // The charge held a frame: true when it is done.
     bool Charge(const Frame& f, GripUse use, std::int32_t family) {
         held_s += f.dt;
@@ -1135,6 +1817,16 @@ private:
     float low_y{0.0f};
     float progress{0.0f};
     float cooldown{0.0f};
+    float gap{-1.0f};    // Struck: the left hand's line to the head last frame (-1: none)
+    float closing{0.0f}; // ... how fast it closes (m/s)
+    // Engine (GripUse::Pull): the pulls of this start, the one that catches, since the last;
+    // caught: unrevved for `idle`, revved up `rev` (0..1).
+    int pulls{0};
+    int catch_on{1};
+    float since_pull{0.0f};
+    float idle{0.0f};
+    float rev{0.0f};
+    std::uint32_t seed{0x9E3779B9u};
 };
 
 // GrabFamily: form B lasts while both hands hold the handle. Letting go (the grip, the hands apart,

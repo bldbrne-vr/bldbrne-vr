@@ -25,8 +25,9 @@ namespace Vulkan {
 // place natively (the shader's imageLoad path, the same texel), from the reduced proxy otherwise.
 // Not covered, so still copied: FSR 4 (its backend's barriers are COLOR aspect, layer 0), DLSS 5
 // (its chain hands the depth input to a second feature), VR_TEMPORAL_CAPTURE_DIR (captures read
-// the copies) and any depth format other than D32/D32S8. The canonical images stay allocated so
-// a flip needs no reallocation (about 55 MB unused at 1456x1576 while the bit is on).
+// the copies) and any depth format other than D32/D32S8. The colour and depth copies are made
+// only when a frame first copies into them (VrTemporalImages::EnsureCopies), so with the bit on
+// they never take memory; turning it off mid-run allocates them once. On by default.
 static constexpr auto DlssDirect = static_cast<FastRender::Bit>(46);
 
 /// Whether a frame of this provider may read the scene directly when the bit is on (see above).

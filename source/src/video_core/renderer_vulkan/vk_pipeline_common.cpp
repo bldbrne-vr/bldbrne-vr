@@ -10,6 +10,7 @@
 #include <bit>
 
 #include "common/hash.h"
+#include "shader_recompiler/eye_spec.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/fast_render.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -18,6 +19,9 @@
 #include "video_core/renderer_vulkan/vk_pass_breaks.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_stereo_set_codec.h"
+#include "video_core/renderer_vulkan/vr_eye_spec_variants.h"
+#include "video_core/ds_ab.h"
 
 namespace Vulkan {
 
@@ -40,6 +44,14 @@ const bool g_push_template = std::getenv("VR_PUSH_TEMPLATE") != nullptr;
 const bool g_push_template_bulk = [] {
     const char* value = std::getenv("FAST_CPU_PUSH_TEMPLATE");
     return !value || value[0] != '0';
+}();
+// FAST_CPU_FLAT_BULK (on unless '0'; 2026-11-02): without native stereo too, a push's writes go as
+// the bulk packet (FAST bit 28) from the rasterizer's own two info arrays, so through the
+// pipeline's update template (FAST_CPU_PUSH_TEMPLATE). Flat encoded every write and its infos one
+// at a time (stage B's descriptor encode, ~6% of it at 1280x720).
+const bool g_flat_bulk = [] {
+    const char* value = std::getenv("FAST_CPU_FLAT_BULK");
+    return !(value && value[0] == '0');
 }();
 // FAST_CPU_PUSH_TEMPLATE_VERIFY=1: every push the template takes is recorded through it (the
 // template's entries, its packet and the replay's vkCmdPushDescriptorSetWithTemplateKHR all run,
@@ -90,6 +102,13 @@ const bool g_driver_calls = [] {
     const char* value = std::getenv("FAST_CPU_DRIVER_CALLS");
     return !value || value[0] != '0';
 }();
+// VR_COMPACT_SETS (on unless '0'; 'v' on with the replay checking every expanded set against the
+// pairing's writes; read once): Pipeline::BindCompactSet, vk_stereo_set_codec.h. 2026-11-01:
+// 0 mismatches over 6.9 M sets; stage B ~1.4% a draw (in-run A/B, also on 4 cores / 4 threads).
+const char g_compact_sets = [] {
+    const char* value = std::getenv("VR_COMPACT_SETS");
+    return value && (value[0] == '0' || value[0] == 'v') ? value[0] : '1';
+}();
 } // namespace
 
 u64 Pipeline::GuestShaderKey(Shader::LogicalStage stage) const noexcept {
@@ -122,26 +141,236 @@ std::span<const u8> Pipeline::NativeWritableBindings() const {
     return native_writable_bindings;
 }
 
+const Pipeline::StageWrites& Pipeline::Writes() const {
+    if (!stage_writes_ready) {
+        for (const auto* stage : GetStages()) {
+            if (!stage) continue;
+            stage_writes.dma |= stage->uses_dma;
+            for (const auto& buffer : stage->buffers)
+                stage_writes.buffers |= buffer.is_written;
+            for (const auto& image : stage->images)
+                stage_writes.images |= image.is_written;
+        }
+        stage_writes_ready = true;
+    }
+    return stage_writes;
+}
+
+u32 Pipeline::VrFsBuffers() const {
+    if (!vr_fs_buffers_ready) {
+        u32 bits = 0;
+        const Shader::Info* const fs =
+            is_compute ? nullptr : stages[u32(Shader::LogicalStage::Fragment)];
+        bool mask_seen = false;
+        for (u32 i = 0; fs != nullptr && i < fs->buffers.size(); ++i) {
+            const auto& buffer = fs->buffers[i];
+            switch (buffer.buffer_type) {
+            case Shader::BufferType::VrBodyMaps:
+                bits |= VrFsBodyMaps;
+                break;
+            case Shader::BufferType::VrSceneMaps:
+                bits |= VrFsSceneMaps;
+                break;
+            case Shader::BufferType::VrShadowMask:
+                if (!mask_seen && !buffer.is_written)
+                    bits |= VrFsShadowMaskRead;
+                mask_seen = true;
+                break;
+            case Shader::BufferType::VrDepthPyramid:
+                bits |= VrFsDepthPyramid;
+                break;
+            default:
+                break;
+            }
+        }
+        vr_fs_buffers = bits;
+        vr_fs_buffers_ready = true;
+    }
+    return vr_fs_buffers;
+}
+
+// VR_EYE_SPEC (vr_eye_spec_variants.h): from paired writes (each info a [left, right] pair,
+// NativeStereo::PairDescriptors' layout), the storage buffer bindings whose two descriptors are
+// equal, and the single-descriptor ones whose right is the left moved in the same buffer.
+static void EyeDrawPaired(std::span<const vk::WriteDescriptorSet> writes,
+                          EyeSpecVariants::DrawMask& out) {
+    for (const auto& w : writes) {
+        if (w.descriptorType != vk::DescriptorType::eStorageBuffer || !w.pBufferInfo ||
+            w.descriptorCount < 2 || (w.descriptorCount & 1) != 0 ||
+            w.dstBinding >= Shader::EyeSpec::MaxBindings) {
+            continue;
+        }
+        bool equal = true;
+        for (u32 i = 0; i < w.descriptorCount && equal; i += 2) {
+            const auto& left = w.pBufferInfo[i];
+            const auto& right = w.pBufferInfo[i + 1];
+            equal = left.buffer == right.buffer && left.offset == right.offset &&
+                    left.range == right.range;
+        }
+        if (equal) {
+            out.shared |= u64{1} << w.dstBinding;
+        } else if (w.descriptorCount == 2) {
+            out.AddStride(w.dstBinding, w.pBufferInfo[0], w.pBufferInfo[1]);
+        }
+    }
+}
+
+// VR_EYE_SPEC: the same from a compact set's unpaired writes and what the pairing gives the right
+// eye (StereoSetCodec::Rights: a handle per buffer or image info in write order; a buffer info in
+// the camera table takes its camera pair's right, another allocation).
+static void EyeDrawCompact(std::span<const vk::WriteDescriptorSet> writes,
+                           const StereoSetCodec::Rights& rights, EyeSpecVariants::DrawMask& out) {
+    u32 paired = 0, buffer_index = 0;
+    for (const auto& w : writes) {
+        switch (StereoSetCodec::KindOf(w.descriptorType)) {
+        case StereoSetCodec::Kind::Buffer: {
+            bool equal = w.descriptorCount != 0 && w.dstBinding < Shader::EyeSpec::MaxBindings;
+            const vk::DescriptorBufferInfo* camera = nullptr;
+            for (u32 i = 0; i < w.descriptorCount; ++i, ++buffer_index, ++paired) {
+                const u64 left =
+                    reinterpret_cast<u64>(static_cast<VkBuffer>(w.pBufferInfo[i].buffer));
+                if (paired >= rights.paired || rights.handles[paired] != left) {
+                    equal = false;
+                }
+                for (u32 c = 0; c < rights.cameras_used; ++c) {
+                    if (rights.cameras[c].index == buffer_index) {
+                        equal = false;
+                        camera = &rights.cameras[c].right;
+                    }
+                }
+            }
+            if (equal) {
+                out.shared |= u64{1} << w.dstBinding;
+            } else if (camera && w.descriptorCount == 1) {
+                out.AddStride(w.dstBinding, w.pBufferInfo[0], *camera);
+            }
+            break;
+        }
+        case StereoSetCodec::Kind::Image:
+            paired += w.descriptorCount;
+            break;
+        default:
+            break;
+        }
+    }
+}
+
 void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
                              const Shader::PushData& push_data, const Shader::VrPushData& vr_push,
                              const NativeStereo::Handles* native_handles,
-                             EyeOverlap::Check* eye_check) const {
+                             EyeOverlap::Check* eye_check,
+                             std::span<const vk::DescriptorBufferInfo> flat_buffers,
+                             std::span<const vk::DescriptorImageInfo> flat_images) const {
     FastRender::BProfile::Scope b_profile{FastRender::BProfile::Recording};
     ScratchProfile::Cpu scratch_cpu(12,"Pipeline::BindResources");
     const bool reuse_native = g_reuse_native_descriptors;
-    NativeStereo::Descriptors temporary_native;
-    // Vulkan consumes descriptor host arrays during these calls. No array pointer is
-    // retained across BindResources calls; each recording thread has its own storage.
+    // Vulkan consumes these host arrays synchronously; reused storage stays thread-local.
     thread_local NativeStereo::Descriptors reusable_native;
-    auto& native = reuse_native ? reusable_native : temporary_native;
-    BufferBarriers paired_barriers;
-    const BufferBarriers* barriers = &buffer_barriers;
-    // FAST bit 28: pairing leaves every write inside native.buffers/images, and the recorder
-    // copies the writes and both arrays in three blocks (bbport vk_pipeline_common.cpp:49-90).
-    // Read once so pairing and encoding agree when the toggle flips.
-    static constexpr auto PushDescBulk = static_cast<FastRender::Bit>(28);
-    const bool bulk =
-        NativeStereo::Enabled() && uses_push_descriptors && FastRender::On(PushDescBulk);
+    const bool eye_spec = Shader::EyeSpec::Enabled() && !IsCompute();
+    if (eye_spec) {
+        EyeSpecVariants::g_draw_mask = {};
+    }
+    if (g_compact_sets != '0' &&
+        BindCompactSet(set_writes, buffer_barriers, push_data, vr_push, native_handles, eye_check)) {
+        return;
+    }
+    const auto bind = [&] [[clang::always_inline]] (NativeStereo::Descriptors& native) {
+        BufferBarriers paired_barriers;
+        const BufferBarriers* barriers = &buffer_barriers;
+        // FAST bit 28: pairing leaves every write inside native.buffers/images, and the recorder
+        // copies the writes and both arrays in three blocks (bbport vk_pipeline_common.cpp:49-90).
+        // Read once so pairing and encoding agree when the toggle flips.
+        static constexpr auto PushDescBulk = static_cast<FastRender::Bit>(28);
+        const bool bulk =
+            NativeStereo::Enabled() && uses_push_descriptors && FastRender::On(PushDescBulk);
+        PairInto(set_writes, buffer_barriers, native_handles, eye_check, native, reuse_native, bulk,
+                 paired_barriers, barriers);
+        if (eye_spec && NativeStereo::Enabled()) {
+            auto& drawn = EyeSpecVariants::g_draw_mask;
+            drawn.pipeline = this;
+            EyeDrawPaired(set_writes, drawn);
+            static_cast<const GraphicsPipeline*>(this)->EyeSelect(drawn);
+        }
+        if (!NativeStereo::Enabled()) {
+            // FAST_CPU_FLAT_BULK: flat's writes point into the rasterizer's two arrays (a write
+            // outside them, a texel view, is encoded one at a time by the recorder's fallback).
+            const bool flat_bulk = g_flat_bulk && uses_push_descriptors &&
+                                   FastRender::On(PushDescBulk) &&
+                                   (!flat_buffers.empty() || !flat_images.empty());
+            EncodeBound(set_writes, *barriers, flat_buffers, flat_images, flat_bulk, push_data,
+                        vr_push);
+            return;
+        }
+        EncodeBound(set_writes, *barriers, {native.buffers.data(), native.buffers_used},
+                    {native.images.data(), native.images_used}, bulk, push_data, vr_push);
+    };
+    if (reuse_native) {
+        bind(reusable_native);
+    } else {
+        NativeStereo::Descriptors temporary_native;
+        bind(temporary_native);
+    }
+}
+
+bool Pipeline::BindCompactSet(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
+                              const Shader::PushData& push_data, const Shader::VrPushData& vr_push,
+                              const NativeStereo::Handles* native_handles,
+                              EyeOverlap::Check* eye_check) const {
+    // Draws only (a dispatch's eye check, and VR_DISPATCH_MONO=d after it, read the paired
+    // writes), sets only (push layouts keep the bulk template), and what the pairing carried alone.
+    if (IsCompute() || eye_check || !DsAb::CompactOn() || !NativeStereo::Enabled() ||
+        uses_push_descriptors ||
+        !g_driver_calls || !native_handles || !native_handles->fused || set_writes.empty()) {
+        return false;
+    }
+    const auto cmdbuf = scheduler.Commands();
+    if (!cmdbuf.Encoding()) {
+        return false;
+    }
+    thread_local StereoSetCodec::Rights rights;
+    if (!NativeStereo::CompactRights(*this, set_writes, *native_handles, rights) ||
+        StereoSetCodec::EncodedBytes(set_writes, rights) == 0) {
+        return false;
+    }
+    if (Shader::EyeSpec::Enabled()) {
+        auto& drawn = EyeSpecVariants::g_draw_mask;
+        drawn.pipeline = this;
+        EyeDrawCompact(set_writes, rights, drawn);
+        static_cast<const GraphicsPipeline*>(this)->EyeSelect(drawn);
+    }
+    u64 check = 0;
+    if (g_compact_sets == 'v') {
+        // The pairing's writes, made aside (it records nothing for these: CompactRights found
+        // nothing to create, mirror or look up), for the replay to compare its expansion with.
+        thread_local NativeStereo::Descriptors aside;
+        if (NativeStereo::PairCarried(scheduler, *this, set_writes, aside, true, *native_handles,
+                                      false)) {
+            check = StereoSetCodec::FieldHash(aside.writes);
+        }
+        check |= check == 0 ? 1 : 0; // a check is never 0
+    }
+    // The barriers as PairInto pairs them (bit 25: one registry lock, entries carried).
+    BufferBarriers paired_barriers = buffer_barriers;
+    if (!buffer_barriers.empty()) {
+        boost::container::small_vector<vk::Buffer, 16> right(buffer_barriers.size());
+        NativeStereo::PairBarriers({buffer_barriers.data(), buffer_barriers.size()},
+                                   *native_handles, {right.data(), right.size()});
+        for (size_t i = 0; i < right.size(); ++i) {
+            if (right[i]) {
+                auto b = buffer_barriers[i];
+                b.buffer = right[i];
+                paired_barriers.push_back(b);
+            }
+        }
+    }
+    EncodeBound(set_writes, paired_barriers, {}, {}, false, push_data, vr_push, &rights, check);
+    return true;
+}
+
+void Pipeline::PairInto(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
+                        const NativeStereo::Handles* native_handles, EyeOverlap::Check* eye_check,
+                        NativeStereo::Descriptors& native, bool reuse_native, bool bulk,
+                        BufferBarriers& paired_barriers, const BufferBarriers*& barriers) const {
     if (NativeStereo::Enabled()) {
         // FAST_CPU_FUSED_PAIR: from what the binding carried, the registry lock only for what it
         // did not; the registry pass when the registry changed since binding.
@@ -181,28 +410,20 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
         }
         barriers=&paired_barriers;
     }
+}
+
+void Pipeline::EncodeBound(DescriptorWrites& set_writes, const BufferBarriers& encode_barriers,
+                           std::span<const vk::DescriptorBufferInfo> bulk_buffers,
+                           std::span<const vk::DescriptorImageInfo> bulk_images, bool bulk,
+                           const Shader::PushData& push_data,
+                           const Shader::VrPushData& vr_push,
+                           const StereoSetCodec::Rights* compact, u64 compact_check) const {
+    const BufferBarriers* barriers = &encode_barriers;
     const auto cmdbuf = scheduler.Commands();
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
 
-    if (!barriers->empty()) {
-        const auto dependencies = vk::DependencyInfo{
-            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-            .bufferMemoryBarrierCount = u32(barriers->size()),
-            .pBufferMemoryBarriers = barriers->data(),
-        };
-        if (PassBreaks::StatsEnabled() && scheduler.IsRendering()) [[unlikely]] {
-            // FAST_PASS_BREAK_STATS: would bit 43 part 4 have kept this pass (only read -> read)?
-            bool read_after_read = true;
-            for (const auto& barrier : *barriers) {
-                read_after_read = read_after_read && PassBreaks::IsPureRead(barrier.srcAccessMask) &&
-                                  PassBreaks::IsPureRead(barrier.dstAccessMask);
-            }
-            scheduler.NoteBarrierBreak(read_after_read);
-        }
-        scheduler.EndRendering();
-        cmdbuf.pipelineBarrier2(dependencies);
-    }
+    EncodeBarriers(*barriers);
 
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
     if (g_submission_audit) {
@@ -257,7 +478,8 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
             scheduler.CurrentTick(),
             std::bit_cast<u64>(VkPipelineLayout(*pipeline_layout)),
             scheduler.CurrentTick(), static_cast<u32>(stage_flags)};
-        skip_push = ScratchPush::OwnedEnabled()
+        // FAST_CPU_STAGEB_SPLIT=2: two threads encode, so only the scheduler's memo knows.
+        skip_push = ScratchPush::OwnedEnabled() || scheduler.SplitThreaded()
             ? scheduler.PushStateMemo().PrepareOwned(key, push_bytes, push_size)
             : memo.Prepare(key, push_bytes, push_size);
         static const bool stats = std::getenv("VR_PERF_CHECK") || std::getenv("VR_PERF_STATS");
@@ -288,10 +510,8 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     if (uses_push_descriptors) {
         if (g_push_template && TryPushTemplate(cmdbuf, set_writes)) return;
         if (bulk) {
-            const std::span<const vk::DescriptorBufferInfo> buffers{native.buffers.data(),
-                                                                    native.buffers_used};
-            const std::span<const vk::DescriptorImageInfo> images{native.images.data(),
-                                                                  native.images_used};
+            const std::span<const vk::DescriptorBufferInfo> buffers = bulk_buffers;
+            const std::span<const vk::DescriptorImageInfo> images = bulk_images;
             // FAST_CPU_PUSH_TEMPLATE: the same descriptors from the two arrays alone.
             if (g_push_template_bulk) {
                 if (const auto update_template =
@@ -323,6 +543,15 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     }
 
     if (g_driver_calls) {
+        if (compact) {
+            // VR_COMPACT_SETS: BindCompactSet found the recorder encoding and the writes
+            // encodable, and nothing since borrows it raw.
+            const bool encoded = cmdbuf.writeDescriptorSetCompact(
+                desc_heap, *desc_layout, bind_point, *pipeline_layout, 0, set_writes, *compact,
+                compact_check);
+            ASSERT_MSG(encoded, "VR_COMPACT_SETS: a checked set write was refused");
+            return;
+        }
         cmdbuf.writeDescriptorSet(desc_heap, *desc_layout, bind_point, *pipeline_layout, 0,
                                   set_writes);
         return;
@@ -333,6 +562,134 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     }
     instance.GetDevice().updateDescriptorSets(set_writes, {});
     cmdbuf.bindDescriptorSets(bind_point, *pipeline_layout, 0, desc_set, {});
+}
+
+void Pipeline::EncodeBarriers(const BufferBarriers& barriers) const {
+    if (barriers.empty()) {
+        return;
+    }
+    const auto dependencies = vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount = u32(barriers.size()),
+        .pBufferMemoryBarriers = barriers.data(),
+    };
+    if (PassBreaks::StatsEnabled() && scheduler.IsRendering()) [[unlikely]] {
+        // FAST_PASS_BREAK_STATS: would bit 43 part 4 have kept this pass (only read -> read)?
+        bool read_after_read = true;
+        for (const auto& barrier : barriers) {
+            read_after_read = read_after_read && PassBreaks::IsPureRead(barrier.srcAccessMask) &&
+                              PassBreaks::IsPureRead(barrier.dstAccessMask);
+        }
+        scheduler.NoteBarrierBreak(read_after_read);
+    }
+    scheduler.EndRendering();
+    scheduler.Commands().pipelineBarrier2(dependencies);
+}
+
+void Pipeline::PairResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
+                             const NativeStereo::Handles* native_handles,
+                             EyeOverlap::Check* eye_check, Prepared& out) const {
+    FastRender::BProfile::Scope b_profile{FastRender::BProfile::NativePairing};
+    const bool reuse_native = g_reuse_native_descriptors;
+    NativeStereo::Descriptors temporary_native;
+    thread_local NativeStereo::Descriptors reusable_native;
+    auto& native = reuse_native ? reusable_native : temporary_native;
+    BufferBarriers paired_barriers;
+    const BufferBarriers* barriers = &buffer_barriers;
+    static constexpr auto PushDescBulk = static_cast<FastRender::Bit>(28);
+    out.bulk = NativeStereo::Enabled() && uses_push_descriptors && FastRender::On(PushDescBulk);
+    if (NativeStereo::Enabled()) {
+        // The pairing straight into `out`: its writes point into out.native, nothing copied
+        // (the caller's set_writes takes out's previous vector; it is cleared per draw).
+        if (!out.native)
+            out.native = std::make_shared<NativeStereo::Descriptors>();
+        PairInto(set_writes, buffer_barriers, native_handles, eye_check, *out.native,
+                 reuse_native, out.bulk, paired_barriers, barriers);
+        out.writes.swap(set_writes);
+        out.barriers = *barriers;
+        out.bulk_buffers = {out.native->buffers.data(), out.native->buffers_used};
+        out.bulk_images = {out.native->images.data(), out.native->images_used};
+        // A write the pairing left alone still points into the caller's arrays, which the next
+        // draw refills (FAST_CPU_STAGEB_SPLIT=2 encodes later): its infos copied into `out`.
+        const auto within = [](const auto* p, const auto& v) {
+            const auto at = reinterpret_cast<std::uintptr_t>(p);
+            const auto begin = reinterpret_cast<std::uintptr_t>(v.data());
+            return at >= begin && at < begin + v.size() * sizeof(v[0]);
+        };
+        size_t outside_buffers = 0, outside_images = 0;
+        for (const auto& w : out.writes) {
+            if (w.pBufferInfo && !within(w.pBufferInfo, out.native->buffers))
+                outside_buffers += w.descriptorCount;
+            if (w.pImageInfo && !within(w.pImageInfo, out.native->images))
+                outside_images += w.descriptorCount;
+        }
+        out.buffers.clear();
+        out.images.clear();
+        if (outside_buffers || outside_images) {
+            out.buffers.reserve(outside_buffers); // no reallocation below: the pointers hold
+            out.images.reserve(outside_images);
+            for (auto& w : out.writes) {
+                if (w.pBufferInfo && !within(w.pBufferInfo, out.native->buffers)) {
+                    const size_t at = out.buffers.size();
+                    out.buffers.insert(out.buffers.end(), w.pBufferInfo,
+                                       w.pBufferInfo + w.descriptorCount);
+                    w.pBufferInfo = out.buffers.data() + at;
+                }
+                if (w.pImageInfo && !within(w.pImageInfo, out.native->images)) {
+                    const size_t at = out.images.size();
+                    out.images.insert(out.images.end(), w.pImageInfo,
+                                      w.pImageInfo + w.descriptorCount);
+                    w.pImageInfo = out.images.data() + at;
+                }
+            }
+            out.bulk = false; // the bulk arrays no longer hold every info: the write path
+        }
+        if constexpr (Common::Log::Enabled) {
+            static thread_local u64 calls{}, copied{};
+            copied += (outside_buffers || outside_images) ? 1 : 0;
+            if ((++calls & 0x3FFFF) == 0)
+                LOG_INFO(Render_Vulkan, "FAST_CPU_STAGEB_SPLIT pairing: {} of {} with unpaired "
+                                        "infos copied",
+                         copied, calls);
+        }
+        return;
+    }
+    PairInto(set_writes, buffer_barriers, native_handles, eye_check, native, reuse_native, out.bulk,
+             paired_barriers, barriers);
+    // Owned copies: every info a write points at, in write order (the bulk packet and the push
+    // template then read the two arrays as the pairing's would be read).
+    out.writes.assign(set_writes.begin(), set_writes.end());
+    out.barriers = *barriers;
+    out.buffers.clear();
+    out.images.clear();
+    for (const auto& w : out.writes) {
+        if (w.pBufferInfo)
+            out.buffers.insert(out.buffers.end(), w.pBufferInfo, w.pBufferInfo + w.descriptorCount);
+        if (w.pImageInfo)
+            out.images.insert(out.images.end(), w.pImageInfo, w.pImageInfo + w.descriptorCount);
+    }
+    size_t buffer_at = 0, image_at = 0;
+    for (auto& w : out.writes) {
+        if (w.pBufferInfo) {
+            w.pBufferInfo = out.buffers.data() + buffer_at;
+            buffer_at += w.descriptorCount;
+        }
+        if (w.pImageInfo) {
+            w.pImageInfo = out.images.data() + image_at;
+            image_at += w.descriptorCount;
+        }
+    }
+    out.bulk_buffers = out.buffers;
+    out.bulk_images = out.images;
+    // FAST_CPU_FLAT_BULK: every info is in the two owned arrays.
+    out.bulk = g_flat_bulk && uses_push_descriptors && FastRender::On(PushDescBulk);
+}
+
+void Pipeline::EncodeResources(Prepared& in, const Shader::PushData& push_data,
+                               const Shader::VrPushData& vr_push) const {
+    FastRender::BProfile::Scope b_profile{FastRender::BProfile::Recording};
+    EncodeBound(in.writes, in.barriers, in.bulk_buffers, in.bulk_images, in.bulk, push_data,
+                vr_push);
 }
 
 // Keep this out of BindResources' hot body. Unsupported or changing shapes use
@@ -375,11 +732,11 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
         auto result = instance.GetDevice().createDescriptorUpdateTemplateUnique(info);
         if (result.result != vk::Result::eSuccess) {
             push_template_failed = true;
-            LOG_WARNING(Render_Vulkan, "Scratch push template creation failed: {}", vk::to_string(result.result));
+            LOG_WARNING(Render_Vulkan, "Push template creation failed: {}", vk::to_string(result.result));
             return false;
         }
         push_template = std::move(result.value);
-        LOG_INFO(Render_Vulkan, "Scratch push template created: {} writes, {} descriptors",
+        LOG_INFO(Render_Vulkan, "Push template created: {} writes, {} descriptors",
                  writes.size(), slots);
     }
     if (writes.size() != push_template_entries.size()) return false;

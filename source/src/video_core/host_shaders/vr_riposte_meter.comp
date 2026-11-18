@@ -1,0 +1,59 @@
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// The riposte burst's brightness meter (vr.ini riposte_style; renderer_vulkan/vr_riposte_meter.cpp):
+// one group of 256 reads a 16 x 16 grid of texels in each eye's rect and writes their mean
+// brightness (vr_riposte.glsl's RiposteLuma) over both eyes to meter.x, eased from the value
+// there. The burst's bands then cut both eyes at one value that holds still while the head moves.
+// When each eye measured itself from four taps, a red left eye could sit beside a black right one.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) uniform texture2D left_eye;
+layout(set = 0, binding = 1) uniform texture2D right_eye;
+layout(set = 0, binding = 2, std430) buffer Meter {
+    vec4 meter; // x = the brightness the burst cuts at, y = this frame's own measure
+};
+
+layout(push_constant) uniform MeterPush {
+    ivec4 rect[2]; // each eye's rect in its image: x, y, w, h
+    uvec4 mode;    // x = 1: sRGB bytes read as UNORM (gamma 2, as vr_eye_upscale.comp's taps);
+                   // y = 1: in B8G8R8A8 order
+    vec4 ease;     // x = how far toward this frame's measure (1: all the way, a new burst)
+} pc;
+
+shared float part[256];
+
+float Brightness(vec3 c) {
+    if (pc.mode.x != 0u) {
+        c *= c;
+    }
+    if (pc.mode.y != 0u) {
+        c = c.bgr;
+    }
+    return sqrt(max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0));
+}
+
+void main() {
+    const uint i = gl_LocalInvocationID.x;
+    const vec2 g = (vec2(i & 15u, i >> 4u) + 0.5) / 16.0;
+    const ivec2 l = pc.rect[0].xy + ivec2(g * vec2(pc.rect[0].zw));
+    const ivec2 r = pc.rect[1].xy + ivec2(g * vec2(pc.rect[1].zw));
+    part[i] = Brightness(texelFetch(left_eye, l, 0).rgb) +
+              Brightness(texelFetch(right_eye, r, 0).rgb);
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (i < s) {
+            part[i] += part[i + s];
+        }
+        barrier();
+    }
+    if (i == 0u) {
+        const float m = part[0] * (1.0 / 512.0);
+        // A new burst never reads the old value (the buffer starts uninitialised).
+        const float eased = pc.ease.x >= 1.0 ? m : mix(meter.x, m, clamp(pc.ease.x, 0.0, 1.0));
+        meter = vec4(eased, m, 0.0, 0.0);
+    }
+}

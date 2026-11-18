@@ -1,0 +1,42 @@
+A Call Beyond independently authored replacement
+
+Original procedural geometry, rig, albedo, normal and roughness maps for this mod.
+No extracted Bloodborne mesh, texture, skeleton or animation is included.
+Local reference and hunter-body review assets are not shipped.
+Source: model.js (kept with the project)
+Export: export-game.cjs -> pack-game.py (see source README).
+
+2,512 vertices, 3,840 triangles, sixteen bones, at most two influences per vertex.
+One indexed draw per visible model instance; 16-bit GPU indices.
+Two 256-square BC3 mip chains (256 through 4): 174,752 bytes.
+255 immutable palette frames: rest 0; idle 1–96; wiggle 97–144;
+charge 145–180; successful recovery 181–210; alternate wiggle 211–254.
+Animation uses the existing GPU palette renderer; stored instances remain at rest.
+Ready pose waits for the actual raise gesture, and the invocation effect requires a successful reply.
+
+BRZ1 + little-endian u32 decompressed size + zlib payload, BRB version 2.
+64-byte header; 32-byte position/normal/UV vertices; u32 CPU indices;
+vec4 joint0/joint1/weight0/weight1 metadata and colorRGB/normalStrength per vertex;
+three vec4 matrix rows per bone per frame; albedo and surface BC3 chains.
+Surface RGB holds tangent normals, alpha roughness. Albedo samples sRGB; surface linear.
+This is one full-surface material rather than the Beast Roar four-material atlas.
+
+278,392 bytes packed / 577,504 decoded / 554,400 GPU payload bytes before driver alignment.
+Decompression capped at 1 MiB; at most 4,096 vertices and 18,000 indices accepted.
+Parser validates exact lengths, finite data, weights, indices, palette and texture bounds.
+Regression runner: tests/test_call_beyond.py. Headset performance remains unmeasured.
+
+Cosmic tissue/motion pass (2026-11-03): delayed contractions and recoils along the
+free tail, independently clutching feelers, mottled violet bruising, green-grey
+membrane patches and restrained pearly flecks. Authored offline into the existing
+255-frame palette and two 256-square BC3 mip chains. Geometry, skin weights, grip
+bones, stored/rest, ready and recovery-start poses are exactly preserved. Runtime
+state logic, charge/raise behavior, invocation gating, draw count and GPU allocation
+size are unchanged. Full packed-asset tests pass; headset appearance remains unverified.
+
+Final motion tuning: the added contractions and independent feeler motion are amplified
+by 12%; original motion, timing and fixed/ready poses retain their existing behavior.
+
+Back face (2026-11-03): the face's ridges and pearly centre are mirrored onto the back of
+the head, the side that faces the hunter while it is held. 440 more vertices and 672 more
+triangles in the same draw; bones, weights, frames and textures are unchanged.

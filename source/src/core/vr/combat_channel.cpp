@@ -19,6 +19,7 @@ namespace VR::Combat {
 namespace {
 
 SeqLock<SawRequest> g_saw_request;
+SeqLock<WheelSpin> g_wheel_spin;
 SeqLock<GunPull> g_pull;
 SeqLock<GunStatus> g_status;
 std::atomic<s64> g_last_reload_shot_ns{0};
@@ -27,6 +28,7 @@ SeqLock<MeleeWindow> g_melee_window_left;
 SeqLock<MeleeStatus> g_melee_status;
 SeqLock<MeleeTelegraph> g_melee_telegraph;
 SeqLock<TransformPull> g_transform_pull;
+SeqLock<FurnaceQuench> g_furnace_quench;
 SeqLock<TransformStatus> g_transform_status;
 SeqLock<BladeShot> g_blade_shot;
 
@@ -86,6 +88,14 @@ void PublishSawRequest(const SawRequest& request) {
 
 bool LatestSawRequest(SawRequest& out) {
     return g_saw_request.Load(out);
+}
+
+void PublishWheelSpin(const WheelSpin& spin) {
+    g_wheel_spin.Store(spin);
+}
+
+bool LatestWheelSpin(WheelSpin& out) {
+    return g_wheel_spin.Load(out);
 }
 
 void PublishBladeShot(const BladeShot& shot) {
@@ -180,6 +190,14 @@ void PublishTransformPull(const TransformPull& pull) {
 
 bool LatestTransformPull(TransformPull& out) {
     return g_transform_pull.Load(out);
+}
+
+void PublishFurnaceQuench(const FurnaceQuench& quench) {
+    g_furnace_quench.Store(quench);
+}
+
+bool LatestFurnaceQuench(FurnaceQuench& out) {
+    return g_furnace_quench.Load(out);
 }
 
 void PublishTransformStatus(const TransformStatus& status) {

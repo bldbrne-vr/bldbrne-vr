@@ -43,11 +43,16 @@ struct Settings {
     bool quiver{true};      // bow_quiver: arrows from over the shoulder (else at the bow)
     bool haptics{true};
     // The arrow leaves at the release, fired by the game's update with no shot clip
-    // (core/vr/bloodborne_gun.cpp BladeShotTick), with the bow's own release sound (`twang`,
-    // learned from the game's own shot clips, or the release whoosh until known);
+    // (core/vr/bloodborne_gun.cpp BladeShotTick), with the sound the game's shot clips play;
     // 0: the game's R1 / R2 shot clips (the arrow at their fire event).
     bool direct{true};
-    std::int32_t twang{-1}; // bow_twang: the release sound's id (-1: not learned yet)
+    // bow_assist_deg: an arrow turns onto the target the game picked (locked on or not) only when
+    // that target is within this many degrees of the drawn line, ahead and in reach, so the turn
+    // makes it hit; otherwise it flies as drawn (0: never). bow_damage_pct: the bow's arrows deal
+    // this much of their damage. The user, 2026-11-10: "a tiny soft assist (like 10 degrees only
+    // if by doing the assist it would hit an enemy) and a 5% damage boost when in bow mode".
+    float assist_deg{10.0f};
+    float damage_pct{105.0f};
 };
 
 inline Settings& GetBowSettings() {
@@ -78,8 +83,13 @@ inline bool ParseBowSetting(const std::string& key, const std::string& value) {
         s.haptics = on();
     } else if (key == "bow_direct") {
         s.direct = on();
+    } else if (key == "bow_assist_deg") {
+        s.assist_deg = std::clamp(std::stof(value), 0.0f, 20.0f);
+    } else if (key == "bow_damage_pct") {
+        s.damage_pct = std::clamp(std::stof(value), 50.0f, 200.0f);
     } else if (key == "bow_twang") {
-        s.twang = std::stoi(value);
+        // Retired: the release sound was learned from the sounds round a launch and could keep an
+        // enemy's groan. The bow now plays its shot clips' own (bloodborne_gun.cpp BowRelease).
     } else {
         return false;
     }
@@ -115,9 +125,11 @@ inline void WriteBowDefaults(std::ostream& out) {
         << "# 1 = the arrow leaves the moment you let go (no shot animation); 0 = the game's own "
            "shots\n"
         << "bow_direct=" << (d.direct ? 1 : 0) << "\n"
-        << "# the bow's release sound, learned from game shots (-1 = the release whoosh "
-           "until known)\n"
-        << "bow_twang=" << d.twang << "\n";
+        << "# an arrow turns onto the target the game picked only when it is within this many "
+           "degrees of\n# your aim, so the turn makes it hit (0: never)\n"
+        << "bow_assist_deg=" << d.assist_deg << "\n"
+        << "# the bow's arrows deal this much (%) of their damage\n"
+        << "bow_damage_pct=" << d.damage_pct << "\n";
 }
 
 // The quiver (bow_quiver): the string hand over a shoulder, from just behind the ears (head-
@@ -139,6 +151,52 @@ inline V3 Sub(V3 a, V3 b) {
 }
 inline float Length(V3 a) {
     return std::sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+}
+
+// The soft assist (Settings::assist_deg): `dir` the drawn line (unit), `origin` where the arrow
+// starts, `target` the game's chosen target's lock-on point (`have_target`: it chose one). The
+// arrow turns straight at that point only when it lies within assist_deg of the line, at least
+// AssistMinM and at most AssistRangeM away: aimed at it, the arrow hits it. Otherwise the line
+// stays as drawn.
+constexpr float AssistMinM = 1.0f;
+constexpr float AssistRangeM = 30.0f;
+struct Assist {
+    V3 dir{0.0f, 0.0f, -1.0f};
+    bool assisted{false};
+    float off_deg{0.0f}; // how far the target was from the drawn line
+};
+inline Assist AssistedLine(V3 dir, V3 origin, V3 target, bool have_target, float assist_deg) {
+    Assist out{dir, false, 0.0f};
+    const float len = Length(dir);
+    if (!have_target || !(assist_deg > 0.0f) || !(len > 0.5f) || !std::isfinite(len)) {
+        return out;
+    }
+    const V3 to = Sub(target, origin);
+    const float dist = Length(to);
+    if (!std::isfinite(dist) || dist < AssistMinM || dist > AssistRangeM) {
+        return out;
+    }
+    const float cosine = (dir.x * to.x + dir.y * to.y + dir.z * to.z) / (len * dist);
+    out.off_deg = std::acos(std::clamp(cosine, -1.0f, 1.0f)) * 57.2957795f;
+    if (out.off_deg > assist_deg) {
+        return out;
+    }
+    out.dir = {to.x / dist, to.y / dist, to.z / dist};
+    out.assisted = true;
+    return out;
+}
+
+// A hit's damage scale (Settings::damage_pct): the Bowblade's arrows (a bullet of its behaviour
+// rows, 1032xxxxx, the hunter's own, at another character) while the physical bow is on.
+constexpr std::int32_t BowbladeVariation = 3200;
+constexpr bool IsBowbladeBehavior(std::int32_t behavior) {
+    return behavior >= 100000000 && behavior < 200000000 &&
+           (behavior - 100000000) / 1000 == BowbladeVariation;
+}
+inline float ArrowDamageScale(std::int32_t behavior, bool bullet, bool his, bool other,
+                              const Settings& s) {
+    const bool arrow = s.enabled && bullet && his && other && IsBowbladeBehavior(behavior);
+    return arrow ? std::clamp(s.damage_pct, 50.0f, 200.0f) * 0.01f : 1.0f;
 }
 
 struct Input {

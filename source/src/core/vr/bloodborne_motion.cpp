@@ -778,6 +778,45 @@ void PublishJumpLift(float lift, s64 now) {
     g_jump_lift_ns.store(now,std::memory_order_release);
 }
 
+// The last comfort tick, for ComfortNextDeltaY (the hands' pose copy, another thread).
+struct ComfortSnapshot {
+    bool valid{false};
+    M::ComfortCamera camera{}; // the filter after that tick
+    M::Phase phase{};
+    M::ComfortConfig cfg{};
+    M::V3 target{};
+    bool pair_first{true};
+    s64 now_ns{0};
+    s64 period_ns{0}; // since the tick before it
+    float out_y{0.0f};
+};
+std::mutex g_comfort_snapshot_mutex;
+ComfortSnapshot g_comfort_snapshot;
+constexpr s64 MaxPredictAgeNs = 10 * M::Millis; // the same render tick as the hands' anchor
+constexpr s64 MaxPredictPeriodNs = 50 * M::Millis;
+
+bool ComfortNextDeltaY(std::int64_t tick_ns, const VR::Vec3& root_move, float& delta_y) {
+    ComfortSnapshot snap;
+    {
+        std::scoped_lock lock{g_comfort_snapshot_mutex};
+        snap = g_comfort_snapshot;
+    }
+    if (!snap.valid || snap.period_ns <= 0 || snap.period_ns > MaxPredictPeriodNs ||
+        std::abs(tick_ns - snap.now_ns) > MaxPredictAgeNs || !std::isfinite(root_move.x) ||
+        !std::isfinite(root_move.y) || !std::isfinite(root_move.z)) {
+        return false;
+    }
+    const M::V3 next{snap.target.x + root_move.x, snap.target.y + root_move.y,
+                     snap.target.z + root_move.z};
+    const M::ComfortOut out = snap.camera.Step(next, snap.pair_first, snap.now_ns + snap.period_ns,
+                                               snap.phase, snap.cfg);
+    if (out.rejected || out.reset || !std::isfinite(out.position.y)) {
+        return false;
+    }
+    delta_y = out.position.y - snap.out_y;
+    return true;
+}
+
 VR::Vec3 ComfortEye(const EyeTick& tick, const char* reset) {
     auto& c = Cam();
     const M::Phase phase = StepGate(c, tick.now_ns);
@@ -828,6 +867,19 @@ VR::Vec3 ComfortEye(const EyeTick& tick, const char* reset) {
         LOG_INFO(Core, "VR motion cue: kind={} clip={} offset_mm={:.2f} animated_lift_mm={:.2f} camera_y={:.4f}",
                  M::KindName(phase.dodge.kind),phase.dodge_clip,
                  out.dip / cfg.scale * 1000.f,cfg.jump_lift / cfg.scale * 1000.f,out.position.y);
+    }
+    {
+        std::scoped_lock snapshot_lock{g_comfort_snapshot_mutex};
+        auto& snap = g_comfort_snapshot;
+        snap.period_ns = snap.valid ? tick.now_ns - snap.now_ns : 0;
+        snap.valid = !out.rejected && !out.reset;
+        snap.camera = c.comfort;
+        snap.phase = phase;
+        snap.cfg = cfg;
+        snap.target = ToMotion(tick.target);
+        snap.pair_first = tick.pair_first;
+        snap.now_ns = tick.now_ns;
+        snap.out_y = out.position.y;
     }
     Observe(tick, phase, out.position, &out);
     return ToVr(out.position);

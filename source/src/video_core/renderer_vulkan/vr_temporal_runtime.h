@@ -28,6 +28,8 @@ public:
     void ResetHistory() { if (!initialization.valid()) pair.ResetHistory(); }
     // FAST_UPSCALER_VERIFY: the FSR twin has followed every left-eye evaluation so far.
     bool VerifyTwinValid() const { return !initialization.valid() && pair.VerifyTwinValid(); }
+    // Foveated upscaling: the eyes' outputs hold the upscaler only in their rectangles.
+    bool FocusOn() const { return !initialization.valid() && pair.FocusOn(); }
     // FAST bit 45: the last resolve recorded its FSR eyes interleaved.
     // Like VerifyTwinValid, never reads `pair` while the initialization worker owns it.
     bool FsrPairInterleaved() const {
@@ -36,6 +38,9 @@ public:
     }
     // FAST_DLSS_DIRECT_VERIFY: the DLSS twin ran in step with its eye in the last Resolve.
     bool DlssTwinCurrent() const { return !initialization.valid() && pair.DlssTwinCurrent(); }
+    // FSR 4.1: what its bridge runs (VrFsr4Runtime::BridgeStatus); empty for other providers
+    // and while the initialization worker owns the provider.
+    std::string FsrBridgeStatus() const;
     const std::string& Problem() const { return problem; }
 private:
     const Instance& instance;

@@ -10,7 +10,10 @@
 
 #include <array>
 #include <cstdint>
+#include <future>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -34,6 +37,8 @@ class RecorderProxy;
 //  - the scene depth is copied into a private depth image first; our items are depth-tested and
 //    written against that copy only, so the game's depth/stencil is never touched (the HUD's own
 //    depth tests stay vanilla), and DIBR then reads the copy: our items get their own disparity;
+//    under S1 (native stereo, the scene reconstructed at the output size) the depth is already
+//    ours, scaled for us: the items go straight into its eye's layer (Target::depth_in_place);
 //  - colour goes into the scene colour through an sRGB view (the image holds sRGB-encoded values,
 //    as DIBR decodes it), linear blending, RGB only (the game's alpha is left alone);
 //  - camera: the record's own view (the list is built in it) and its projection (vfov, aspect,
@@ -43,7 +48,7 @@ class RecorderProxy;
 // descriptors (one texture per draw), push constants (128 bytes per draw). Single-sampled after the
 // game's AA: the cards' round edges are anti-aliased analytically in the shader and the icons and
 // labels (one mip level) are box-filtered over each pixel's footprint.
-// Light: the scene colour is box-filtered down to a coarse probe first (ProbeScene: blits into a mip
+// Light: the scene colour is box-filtered down to a coarse probe first (ProbeScenes: blits into a mip
 // chain, each texel of its 5th level averages 64 x 64 scene pixels), and every fragment reads the
 // scene's light behind it there: lit items darken in a dark room and take its tint, cards and text
 // keep a floor so they stay readable.
@@ -58,6 +63,11 @@ public:
     VrInFrame(const VrInFrame&) = delete;
     VrInFrame& operator=(const VrInFrame&) = delete;
 
+    /// Starts building the item meshes (vertices, indices, ranges; with their occlusion bakes) on
+    /// a thread of their own, if not started yet. Every VrInFrame (one per eye) takes that one
+    /// library: called when VR starts, long before the first world frame needs it.
+    static void PrewarmMeshes();
+
     struct Target {
         vk::ImageView color_view;   // sRGB view of the scene colour (eColorAttachmentOptimal)
         vk::Format color_format{};  // that view's format
@@ -69,6 +79,11 @@ public:
         float zmin{0.0f};
         float zmax{1.0f};
         u32 depth_layer{0};
+        // Set: `depth_image` is a scene depth of our own (S1's output-size twin), and this is its
+        // layer `depth_layer` as a depth/stencil attachment view. Our items then test and write
+        // it in place: no private copy (none is even made), and DepthView() is not this frame's
+        // (only the DIBR capture reads it, and S1 is native stereo).
+        vk::ImageView depth_in_place{};
     };
     struct Camera {
         float vfov{1.0f}; // radians
@@ -76,18 +91,31 @@ public:
         float near_z{0.1f}; // game units
         float far_z{3000.0f};
         float eye_x{0.0f}; // eye offset in the list's view space, in game units
+        s32 monocular_eye{-1}; // native stereo: the eye looking through the held Monocular
         std::array<float, 4> clip{1.0f, 1.0f, 0.0f, 0.0f}; // Vulkan clip xy scale/offset
         bool collect_probe{true}; // one arm-fit result per frame
+        u32 model_eye_mask{1}; // staged sever models: mono/DIBR 1, native stereo 3
     };
 
     // Records the depth copy, the texture uploads and the draws (outside a render pass). False:
     // nothing was recorded (an empty list, a refusal, disabled). On true the private depth copy
-    // holds the scene depth plus ours, in eDepthStencilReadOnlyOptimal, for DepthView().
+    // holds the scene depth plus ours, in eDepthStencilReadOnlyOptimal, for DepthView() (in place:
+    // the target's layer holds them, in eDepthStencilAttachmentOptimal).
+    // Runtime models dropped (a severed piece gone): their GPU copies freed. Once a frame, after
+    // both eyes have drawn (Rasterizer::VrEndFrame), drawn or not: never between the eyes, so a
+    // piece retired mid-frame goes from both at once (a code review, 2026-11-13). One test while
+    // this eye holds none.
+    void SweepDropped();
     bool Record(const RecorderProxy& cmdbuf, const Target& target, const Camera& camera,
-                const VR::InFrame::List& list);
-    // The private depth copy, sampled (depth aspect), after a Record that returned true.
+                const VR::InFrame::RenderList& list);
+    // The private depth copy, sampled (depth aspect), after a Record that returned true and
+    // HasDepthCopy().
     [[nodiscard]] vk::ImageView DepthView() const {
         return *depth_sampled_view;
+    }
+    // The last Record drew into the private depth copy (not in place).
+    [[nodiscard]] bool HasDepthCopy() const {
+        return depth_copied;
     }
     // After a Record that returned true: our items' coverage (R8, the depth copy's size, 0 where
     // nothing of ours is), in eTransferSrcOptimal. The DIBR warp keeps the HUD's edges from
@@ -96,15 +124,22 @@ public:
         return cover;
     }
     [[nodiscard]] vk::Extent2D CoverExtent() const {
-        return depth_extent;
+        return cover_extent;
     }
-    // Before Record, outside a render pass: the scene's light into the probe (`src` = the scene
-    // colour in eTransferSrcOptimal, `src_format` its own format). False: Record lights items
-    // with a neutral scene.
-    bool ProbeScene(const RecorderProxy& cmdbuf, vk::Image src, vk::Format src_format,
-                    vk::Extent2D extent, u32 source_layer = 0);
-    // Creates the pipeline for these formats ahead of the first list (no hitch at the first use).
-    void Warm(vk::Format color_format, vk::Format depth_format);
+    // Before Record, outside a render pass: the scene's light into each eye's probe (`src` = the
+    // scene colour in eTransferSrcOptimal, `src_format` its own format; each eye's from its
+    // `source_layer`). The eyes' mip chains go level by level, one barrier per level for all of
+    // them. An eye without a probe (too small, a failure) lights its items with a neutral scene.
+    struct ProbeSource {
+        VrInFrame* renderer{};
+        u32 source_layer{0};
+    };
+    static void ProbeScenes(const RecorderProxy& cmdbuf, std::span<const ProbeSource> eyes,
+                            vk::Image src, vk::Format src_format, vk::Extent2D extent);
+    // Creates the pipeline for these formats ahead of the first list (no hitch at the first use),
+    // for this camera's planes (0: the usual ones); the translucent one on a worker.
+    void Warm(vk::Format color_format, vk::Format depth_format, float near_z = 0.0f,
+              float far_z = 0.0f);
     [[nodiscard]] bool Active() const {
         return !failed;
     }
@@ -139,24 +174,62 @@ private:
     struct GpuModel {
         Buffer vertices{};
         Buffer indices{};
+        Buffer animation{};
+        vk::IndexType index_type{vk::IndexType::eUint32};
+        VideoCore::UniqueImage surface;
+        vk::UniqueImageView surface_view;
+        u32 vertex_count{0};
+        u32 animation_bones{16};
         u32 index_count{0};
         VideoCore::UniqueImage image;
         vk::UniqueImageView view;
+        u64 shared_key{0};          // its texture is shared_images' (ModelTexture::share_key)
+        vk::ImageView shared_view{}; // ... its view
         bool textured{false};
+        bool single_surface{false};
         u64 last_used{0};
+        u32 reveal_token{0}; // staged cut: pinned until visible or cancelled/dropped
+        vk::ImageView View() const {
+            return shared_key != 0 ? shared_view : *view;
+        }
+    };
+    // A texture several models share (a severed piece's of one enemy, the flesh tile), kept
+    // while any of them is.
+    struct SharedImage {
+        VideoCore::UniqueImage image;
+        vk::UniqueImageView view;
+        u32 users{0};
     };
 
+    // Record's list itself (after the frame's bookkeeping and the sweep).
+    bool RecordList(const RecorderProxy& cmdbuf, const Target& target, const Camera& camera,
+                    const VR::InFrame::RenderList& list);
     bool Fail(const std::string& what);
     bool CreateBuffer(Buffer& out, vk::DeviceSize size, vk::BufferUsageFlags usage);
     void DestroyBufferLater(Buffer& buffer);
     bool BuildMeshes();
     // `xray`: the pipeline of Item::xray (depth compare reversed, no depth write).
-    vk::Pipeline PipelineFor(vk::Format color_format, vk::Format depth_format, bool xray = false,
-                             const std::array<float, 4>& clip = {1.0f, 1.0f, 0.0f, 0.0f});
+    // `depth`: the shader's specialized depth mapping {A, B} (DepthTerms). The eye's projection
+    // is pushed per draw, so a moving projection (the Monocular's window) never builds one.
+    vk::Pipeline PipelineFor(vk::Format color_format, vk::Format depth_format, bool xray,
+                             const std::array<float, 2>& depth, bool translucent = false);
+    // The pipeline itself (no cache, no log); empty on failure. Any thread (the device and the
+    // shader modules only).
+    vk::UniquePipeline CreatePipeline(vk::Format color_format, vk::Format depth_format, bool xray,
+                                      const std::array<float, 2>& depth, bool translucent) const;
+    // The translucent pipeline for this target and camera, built on a worker the first time it is
+    // asked for (its build takes ~2 s: a world flash or a bolt would stall the frame and miss its
+    // moment); null until it is ready. Asked every frame, so it is ready long before it is needed.
+    vk::Pipeline TranslucentFor(vk::Format color_format, vk::Format depth_format,
+                                const std::array<float, 2>& depth);
+    // The private depth copy (not in place) and the coverage, of the target's depth size.
     bool EnsureDepth(const Target& target);
+    bool EnsureCover(vk::Extent2D extent);
+    // The probe image for this scene size and format; false: no probe this frame.
+    bool PrepareProbe(vk::Format src_format, vk::Extent2D extent);
     vk::ImageView IconView(const RecorderProxy& cmdbuf, u32 icon_id);
     // The model's GPU copy (uploaded on first use); nullptr while it loads or when it is missing.
-    const GpuModel* ModelOf(const RecorderProxy& cmdbuf, s32 model_id);
+    const GpuModel* ModelOf(const RecorderProxy& cmdbuf, s32 model_id, u32 reveal_token = 0);
     void DestroyModelLater(GpuModel& model);
     // The atlas row of a label (rasterised and uploaded on first use); -1 when not ready.
     int LabelRowOf(const RecorderProxy& cmdbuf, const VR::InFrame::Label& label);
@@ -165,7 +238,7 @@ private:
     void CollectTimes();
     // The depth probe (VR::InFrame::Probe): its texels of the game's depth copied for the CPU.
     void RecordProbe(const RecorderProxy& cmdbuf, const Target& t, const Camera& camera,
-                     const VR::InFrame::List& list);
+                     const VR::InFrame::RenderList& list);
     void CollectProbes();
     bool CreateReadback(Buffer& out, vk::DeviceSize size);
 
@@ -185,7 +258,8 @@ private:
         vk::Format color{};
         vk::Format depth{};
         bool xray{false};
-        std::array<float, 4> clip{};
+        bool translucent{false};
+        std::array<float, 2> depth_terms{}; // the specialized depth mapping {A, B}
         vk::UniquePipeline pipeline;
     };
     std::vector<PipelineEntry> pipelines;
@@ -201,13 +275,20 @@ private:
     vk::UniqueImageView depth_sampled_view;
     vk::Format depth_format{};
     vk::Extent2D depth_extent{};
+    bool depth_copied{false}; // HasDepthCopy
+    u32 in_place_lists{0};    // in a row, while a private copy is still kept (EnsureDepth)
     VideoCore::UniqueImage cover;
     vk::UniqueImageView cover_view;
+    vk::Extent2D cover_extent{};
 
     // Textures.
     std::unordered_map<u32, Texture> icons;
     std::unordered_map<s32, GpuModel> models;
     std::unordered_map<s32, bool> model_missing; // the game files have no such model
+    std::unordered_map<u64, SharedImage> shared_images;
+    u32 dropped_models{0}; // VR::Assets::DroppedModels as last checked
+    bool runtime_held{false}; // a runtime model uploaded (or refused) and maybe not dropped yet
+    u32 model_uploads{0};  // new models uploaded this frame (MaxModelUploadsPerFrame)
     vk::UniqueSampler model_sampler; // trilinear, repeat (the models' own uvs)
     VideoCore::UniqueImage white;    // 1 x 1 white: an untextured model
     vk::UniqueImageView white_view;
@@ -258,6 +339,17 @@ private:
     double stats_cpu_us{0.0};
     double stats_cpu_max_us{0.0};
     s64 stats_since_ns{0};
+
+    // TranslucentFor's build on a worker: its key and its result (the destructor waits for it).
+    struct PendingPipeline {
+        vk::Format color{};
+        vk::Format depth{};
+        std::array<float, 2> depth_terms{};
+        s64 start_ns{0};
+        std::future<vk::UniquePipeline> result;
+    };
+    std::optional<PendingPipeline> pending_translucent;
+    bool translucent_failed{false}; // a build failed: none is asked for again
 };
 
 } // namespace Vulkan

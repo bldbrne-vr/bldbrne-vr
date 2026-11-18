@@ -103,6 +103,8 @@ GpuPassProfiler::GpuPassProfiler(const Instance& instance, Scheduler& scheduler_
       tick_ms{tick_ns * 1e-6}, tick_mask{valid_bits >= 64 ? ~u64{0}
                                                           : (u64{1} << valid_bits) - 1},
       coarse{coarse_}, verify{verify_} {
+    const char* gaps_env = std::getenv("FAST_GPU_PASS_PROFILE_GAPS");
+    gap_detail = gaps_env != nullptr && gaps_env[0] == '1';
     // A segment longer than a second is a timestamp out of order (or a wrapped counter).
     max_ticks = static_cast<u64>(1000.0 / tick_ms);
     for (auto& slice : slices) {
@@ -155,6 +157,27 @@ bool GpuPassProfiler::Stamp(u64 key, bool call) {
     return true;
 }
 
+void GpuPassProfiler::StampInPass(u64 key, u32 views) {
+    next_pass = 0;
+    auto& slice = slices[current_slice];
+    // Never the frame's first (its reset cannot go inside a pass).
+    if (slice.used == 0 || slice.used + views + 1 > SliceQueries) {
+        ++overflow;
+        return;
+    }
+    const u32 base = current_slice * SliceQueries;
+    scheduler.Commands().writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool,
+                                         base + slice.used);
+    slice.keys.push_back(key);
+    slice.calls.push_back(1u);
+    for (u32 v = 1; v < views; ++v) {
+        slice.keys.push_back(PadKey);
+        slice.calls.push_back(0u);
+    }
+    slice.used += views;
+    current = key;
+}
+
 void GpuPassProfiler::BeginPass(const RenderState& state) {
     u64 key = std::exchange(next_pass, 0);
     if (key == 0) {
@@ -188,6 +211,17 @@ void GpuPassProfiler::LabelPassIfNew(const RenderState& state, u64 key, Group gr
 
 u64 GpuPassProfiler::SubmitBegin() {
     const u64 resume = current;
+    if (gap_detail) [[unlikely]] {
+        const u64 key = Mix(GapKey, resume);
+        const auto describe = [&] {
+            const auto it = labels.find(resume);
+            return fmt::format("(gap after: {})", it != labels.end() ? it->second.name
+                                                                      : std::string{"?"});
+        };
+        Name(key, Group::Gap, describe);
+        Stamp(key, true);
+        return resume;
+    }
     Stamp(GapKey, true);
     return resume;
 }
@@ -317,15 +351,23 @@ void GpuPassProfiler::Accumulate(GpuPassDetail::Slice& slice) {
         }
     }
     u64 span = 0;
-    for (u32 i = 0; i + 1 < count; ++i) {
-        const u64 ticks = (results[i + 1] - results[i]) & tick_mask;
+    // (A multiview timestamp's extra queries, PadKey, hold zero: skipped, the segment running
+    // from the last real one.)
+    u32 prev = 0;
+    for (u32 i = 1; i < count; ++i) {
+        if (i + 1 < count && slice.keys[i] == PadKey) {
+            continue;
+        }
+        const u64 ticks = (results[i] - results[prev]) & tick_mask;
+        const u32 from = prev;
+        prev = i;
         if (ticks > max_ticks) {
             ++nonmonotonic;
             continue;
         }
-        auto& total = totals[slice.keys[i]];
+        auto& total = totals[slice.keys[from]];
         total.ticks += ticks;
-        total.calls += slice.calls[i];
+        total.calls += slice.calls[from];
         span += ticks;
     }
     window_span_ticks += span;
@@ -394,7 +436,12 @@ void GpuPassProfiler::Report() {
         double rest_ms = 0.0;
         for (const auto& row : rows) {
             const auto it = labels.find(row.key);
-            if (shown < MaxRanked && row.ms >= 0.001 && it != labels.end()) {
+            // FAST_GPU_PASS_PROFILE_TOP=N (read once): rank N labels instead of MaxRanked.
+            static const u32 max_ranked = [] {
+                const char* value = std::getenv("FAST_GPU_PASS_PROFILE_TOP");
+                return value ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : MaxRanked;
+            }();
+            if (shown < max_ranked && row.ms >= 0.001 && it != labels.end()) {
                 ranked += fmt::format(" | {} {:.3f} ms/f {:.1f}/f", it->second.name, row.ms,
                                       row.calls);
                 ++shown;

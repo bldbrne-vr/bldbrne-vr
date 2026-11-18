@@ -45,6 +45,7 @@ enum class Kind : std::uint8_t {
     Book,   // a closed notebook by its side: the edge in the palm, the thumb on the front
     HookPinch, // a bell's hanger between the thumb and index pads, the bell hanging below
     RubPinch,  // a blade rub's end: the thumb on its face, the index and middle behind it
+    Cigarette, // between the index and middle fingers, the other fingers loosely folded
     Count,
 };
 
@@ -80,6 +81,8 @@ enum class Kind : std::uint8_t {
         return "hookpinch";
     case Kind::RubPinch:
         return "rubpinch";
+    case Kind::Cigarette:
+        return "cigarette";
     case Kind::Count:
         break;
     }
@@ -181,6 +184,14 @@ constexpr float Deg = 3.14159265358979f / 180.0f;
         finger(3, 28, 38, 25, 2);
         finger(4, 32, 38, 25, 6);
         s.thumb_oppose = 18 * Deg;
+        break;
+    case Kind::Cigarette:
+        finger(0, 20, 35, 25);
+        finger(1, 18, 22, 12, -.5f);
+        finger(2, 23, 26, 12, .5f);
+        finger(3, 65, 75, 50, 3);
+        finger(4, 75, 75, 50, 6);
+        s.thumb_oppose = 25 * Deg;
         break;
     case Kind::Pinch:
         finger(0, 0, 35, 30);

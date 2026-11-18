@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include <utility>
 #include "video_core/fast_render.h"
 #include "video_core/native_stereo/draw_registers.h"
@@ -40,6 +41,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -47,25 +49,32 @@
 #include <vector>
 
 #include "common/logging/log.h"
+#include "core/vr/bloodborne_frame_rate.h"
 #include "core/vr/inframe.h"
 #include "core/vr/live_tune.h"
 #include "core/vr/quick_settings.h"
 #include "core/vr/ui_layout.h"
 #include "core/vr/ui_lock_marker.h"
+#include "core/vr/ui_slots.h"
+#include "core/vr/graphics_settings.h"
 #include "core/vr/vr_session.h"
+#include "shader_recompiler/ir/passes/fog_light.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "shader_recompiler/ir/passes/light_shadow.h"
 #include "video_core/renderer_vulkan/vk_compile_trace.h"
+#include "video_core/renderer_vulkan/vk_gpu_frame_timer.h"
 #include "video_core/renderer_vulkan/vk_gpu_pass_profiler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vr_inframe.h"
 #include "video_core/renderer_vulkan/vr_render_taa.h"
-#include "video_core/renderer_vulkan/vr_dibr_dlss.h"
+#include "video_core/renderer_vulkan/vr_dibr_upscale.h"
 #include "video_core/renderer_vulkan/vr_stereo_warp.h"
 #include "video_core/renderer_vulkan/vr_temporal_capture.h"
 #include "video_core/renderer_vulkan/vr_ui_layer.h"
+#include "video_core/renderer_vulkan/vr_ui_snapshot.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -313,6 +322,9 @@ void Rasterizer::VrTrackTargets(const GraphicsPipeline* pipeline, const RenderSt
                  .extent = extent,
                  .components = LiverpoolToVK::ComponentMapping(swizzle.Inverse()),
                  .last_draw = vr_dibr.draws};
+        if (color_id == vr_scene_home.id && image.image_uid == vr_scene_home.uid) {
+            vr_dibr.home = *slot; // kept when another image of its size is drawn after it
+        }
     }
     const auto image_id = db_desc.first;
     if (!depth || !image_id || !state.depth_stencil_attachment.has_depth ||
@@ -421,8 +433,8 @@ bool Rasterizer::VrCaptureDepth(vk::Extent2D scene, bool allow_dlss_resize) {
     const vk::Extent2D depth_extent{depth->info.size.width, depth->info.size.height};
     if (scene.width == 0 || scene.height == 0) {
         scene = depth_extent;
-        if (allow_dlss_resize && vr_dibr_dlss && vr_ui_layer && VR::UiLayerFrameMode() == 1)
-            scene = vr_dibr_dlss->DesiredSize(scene);
+        if (allow_dlss_resize && vr_dibr_upscale && vr_ui_layer && VR::UiLayerFrameMode() == 1)
+            scene = vr_dibr_upscale->DesiredSize(scene);
     }
 
     const auto& s = VR::GetSettings();
@@ -443,13 +455,18 @@ bool Rasterizer::VrCaptureDepth(vk::Extent2D scene, bool allow_dlss_resize) {
         return false;
     }
     // A padded depth image is read 1:1 from its top-left corner; another size of the same
-    // aspect (a reduced-resolution depth) is read with nearest sampling.
-    vk::Extent2D read_extent = depth_extent;
-    if (depth_extent.width >= scene.width && depth_extent.height >= scene.height &&
-        depth_extent.width <= scene.width + scene.width / 16 &&
-        depth_extent.height <= scene.height + scene.height / 16) {
+    // aspect (a reduced-resolution depth) is read with nearest sampling. The in-frame items'
+    // private copy is read at its own size (the DIBR upscaler's output when they went into its
+    // reconstruction).
+    const vk::Extent2D sample_extent =
+        vr_dibr.inframe && vr_inframe && vr_inframe->HasDepthCopy() ? vr_inframe->CoverExtent()
+                                                                    : depth_extent;
+    vk::Extent2D read_extent = sample_extent;
+    if (sample_extent.width >= scene.width && sample_extent.height >= scene.height &&
+        sample_extent.width <= scene.width + scene.width / 16 &&
+        sample_extent.height <= scene.height + scene.height / 16) {
         read_extent = scene;
-    } else if (!SameAspect(depth_extent, scene)) {
+    } else if (!SameAspect(sample_extent, scene)) {
         WarnOnce(1u << 6, "the scene depth does not match the composite's size or aspect");
         return false;
     }
@@ -458,7 +475,7 @@ bool Rasterizer::VrCaptureDepth(vk::Extent2D scene, bool allow_dlss_resize) {
     // The in-frame items' private depth copy (scene depth + ours) when they were drawn; else the
     // scene depth itself.
     vk::ImageView depth_view{};
-    if (vr_dibr.inframe && vr_inframe) {
+    if (vr_dibr.inframe && vr_inframe && vr_inframe->HasDepthCopy()) {
         depth_view = vr_inframe->DepthView();
     } else {
         depth->Transit(vk::ImageLayout::eDepthStencilReadOnlyOptimal,
@@ -680,9 +697,76 @@ void Rasterizer::VrMatchCamera(const GraphicsPipeline* pipeline, const RenderSta
     }
 }
 
+namespace {
+// VR_DRAW_BREAKDOWN=1 (diagnostic, recording thread): the frame's draws by the pass they land
+// in (size, colour targets, depth, both eyes or one, before or after the composite), the 12
+// largest every 300 frames: which passes the draw count comes from.
+const bool g_draw_breakdown = [] {
+    const char* value = std::getenv("VR_DRAW_BREAKDOWN");
+    return value && value[0] == '1';
+}();
+std::unordered_map<u64, u64> g_breakdown_draws;
+u64 g_breakdown_frames = 0;
+// `cell`: in a square pass of 2048 or more (a shadow atlas), the viewport centre's cell of a 4x4
+// grid (which cascade); 0 elsewhere.
+void NoteBreakdown(const RenderState& s, bool ui, u32 cell) {
+    const u64 key = u64(s.width) | u64(s.height) << 16 | u64(s.num_color_attachments) << 32 |
+                    u64(s.depth_stencil_attachment.has_depth) << 36 |
+                    u64(s.probe_view_mask & 3) << 37 | u64(ui) << 39 | u64(cell & 31) << 40;
+    ++g_breakdown_draws[key];
+}
+void ReportBreakdown() {
+    if (++g_breakdown_frames < 300) {
+        return;
+    }
+    std::vector<std::pair<u64, u64>> rows(g_breakdown_draws.begin(), g_breakdown_draws.end());
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    u64 total = 0;
+    for (const auto& r : rows) {
+        total += r.second;
+    }
+    std::string text;
+    for (size_t i = 0; i < rows.size() && i < 12; ++i) {
+        const u64 k = rows[i].first;
+        const u64 cell = (k >> 40) & 31;
+        text += fmt::format(" | {}x{} c{}{}{}{}{} {:.0f}/f", k & 0xffff, (k >> 16) & 0xffff,
+                            (k >> 32) & 15, (k >> 36) & 1 ? " depth" : "",
+                            ((k >> 37) & 3) == 3 ? " stereo" : " mono", (k >> 39) & 1 ? " ui" : "",
+                            cell ? fmt::format(" cell {},{}", (cell - 1) % 4, (cell - 1) / 4)
+                                 : std::string{},
+                            double(rows[i].second) / g_breakdown_frames);
+    }
+    LOG_INFO(Render_Vulkan, "VR draw breakdown: {:.0f} draws/f over {} frames, {} pass shapes{}",
+             double(total) / g_breakdown_frames, g_breakdown_frames, rows.size(), text);
+    g_breakdown_draws.clear();
+    g_breakdown_frames = 0;
+}
+} // namespace
+
 void Rasterizer::VrAfterDraw(const GraphicsPipeline* pipeline, const RenderState& state) {
+    if (g_draw_breakdown) [[unlikely]] {
+        u32 cell = 0;
+        if (state.width >= 2048 && state.width == state.height) {
+            const auto& vp = std::as_const(ScratchDraw::Registers(liverpool)).viewports[0];
+            const int cx = std::clamp(int(vp.xoffset * 4.0f / state.width), 0, 3);
+            const int cy = std::clamp(int(vp.yoffset * 4.0f / state.height), 0, 3);
+            cell = 1 + u32(cy * 4 + cx);
+        }
+        NoteBreakdown(state, vr_ui.marker, cell);
+    }
     if (vr_ui.marker) {
-        return; // the UI phase: nothing more to track
+        // The UI phase: nothing more to track but the image the UI is drawn into (VrSceneColor),
+        // from the first UI draw into an image of the composite's size.
+        if (!vr_dibr.home_learned && state.num_color_attachments > 0 && cb_descs[0].first &&
+            cb_descs[0].second.view_info.range.base.layer == 0) {
+            const auto& image = texture_cache.GetImage(cb_descs[0].first);
+            if (image.info.size.width == vr_dibr.marker_extent.width &&
+                image.info.size.height == vr_dibr.marker_extent.height) {
+                vr_dibr.home_learned = true;
+                vr_scene_home = {cb_descs[0].first, image.image_uid};
+            }
+        }
+        return;
     }
     // S1 (FAST bit 51, vk_rasterizer_temporal.cpp): the composite was just drawn into X; the
     // reconstruction comes before our in-frame items and the UI layer's scene copy below.
@@ -723,9 +807,26 @@ void Rasterizer::VrAfterDraw(const GraphicsPipeline* pipeline, const RenderState
     }
     vr_ui.marker = true;     // once per frame
     vr_dibr.captured = true; // once per frame, captured or not
+    vr_dibr.marker_extent = {state.width, state.height};
+    // DIBR: the composite's pass is the scene's size; the next frames' mono passes of that size
+    // take foveation (VR_FOVEATED_DIBR).
+    if (dibr && scheduler.IsRendering()) {
+        const auto& composite = scheduler.GetRenderState();
+        scheduler.SetMonoFoveation({composite.width, composite.height});
+    }
+    // Native stereo: the next frames' foveated passes are the eye-sized ones (SetFoveationEye).
+    if (vr_eye_extent[0] != 0) {
+        scheduler.SetFoveationEye(vr_eye_extent[0], vr_eye_extent[1]);
+    }
+    // The game's UI follows: full-rate passes (menu text), until VrEndFrame.
+    scheduler.BlockFoveation(true);
     // Our in-frame items go in first: the DIBR capture and the UI layer's scene copy below take
-    // them with the scene (never into the UI layer).
-    if (!vr_dibr.depth_done && (dibr || inframe)) {
+    // them with the scene (never into the UI layer). With the DIBR upscaler ready they go into its
+    // reconstruction instead (sharp, and never into its history): VrDibrCaptureAtMarker.
+    vr_dibr.items_after = dibr && !vr_dibr.depth_done && !vr_dibr.items_unsupported &&
+                          vr_dibr_upscale && vr_dibr_upscale->Ready() && vr_ui_layer &&
+                          VR::UiLayerFrameMode() == 1;
+    if (!vr_dibr.depth_done && (dibr || inframe) && !vr_dibr.items_after) {
         VrInjectInFrame();
     }
     if (dibr) {
@@ -741,18 +842,13 @@ void Rasterizer::VrAfterDraw(const GraphicsPipeline* pipeline, const RenderState
 }
 
 void Rasterizer::VrDibrCaptureAtMarker() {
-    // Depth first: X is the last colour target of the scene depth's size (the HUD is drawn into
-    // it next).
+    // Depth first: X is the colour target of the scene depth's size the HUD is drawn into next
+    // (VrSceneColor).
     if (!vr_dibr.depth_done && !VrCaptureDepth({})) {
         return;
     }
-    const VrColorTarget* color = nullptr;
-    for (const auto& target : vr_dibr.color) {
-        if (target.id && target.extent == vr_dibr.depth_extent &&
-            (color == nullptr || target.last_draw > color->last_draw)) {
-            color = &target;
-        }
-    }
+    const VrColorTarget* color =
+        VrSceneColor([&](vk::Extent2D extent) { return extent == vr_dibr.depth_extent; });
     const VideoCore::Image* x_image =
         color ? texture_cache.TryGetImage(color->id, color->uid) : nullptr;
     if (x_image == nullptr) {
@@ -777,24 +873,42 @@ void Rasterizer::VrDibrCaptureAtMarker() {
         WarnOnce(1u << 8, "the composite target went away during the capture");
         return;
     }
-    VrDibrDlss::Output reconstructed{};
-    // Opt-in experiment: the UI stays on its own layer; no HUD-difference comparison
-    // between the reconstructed scene and the game's smaller composite.
-    // An early depth capture means the composite overwrites the raw depth.
-    // Use its preserved DIBR capture instead of feeding overwritten depth to DLSS.
-    if (!vr_dibr.depth_done && DibrDlss::Requested() && vr_ui_layer && VR::UiLayerFrameMode() == 1) {
+    VrDibrUpscale::Output reconstructed{};
+    // DIBR with DLSS / FSR (vr_dibr_upscale.h): the UI stays on its own layer (UI layer mode 1),
+    // so the game's smaller composite is never compared with the reconstructed scene. A depth
+    // captured early (the composite overwrites the raw depth) keeps this frame on that capture.
+    if (DibrUpscale::Requested() && vr_ui_layer && VR::UiLayerFrameMode() == 1) {
         const VrDepthCandidate* best = nullptr;
         for (const auto& candidate : vr_dibr.depth)
             if (candidate.draws && (!best || candidate.draws > best->draws)) best = &candidate;
         auto* depth = best ? texture_cache.TryGetImage(best->id, best->uid) : nullptr;
         VR::CameraRecord rec{};
-        if (depth && best->zero_to_w && best->zmin == 0.f && best->zmax == 1.f &&
-            VR::GetRecord(vr_warp->GetCaptureInfo().frame_tag, rec)) {
-            if (!vr_dibr_dlss) vr_dibr_dlss = std::make_unique<VrDibrDlss>(instance, scheduler);
-            reconstructed = vr_dibr_dlss->Record(*target, *depth, x_components, rec,
+        if (!vr_dibr.depth_done && depth && best->zero_to_w && best->zmin == 0.f &&
+            best->zmax == 1.f && VR::GetRecord(vr_warp->GetCaptureInfo().frame_tag, rec)) {
+            if (!vr_dibr_upscale)
+                vr_dibr_upscale = std::make_unique<VrDibrUpscale>(instance, scheduler);
+            reconstructed = vr_dibr_upscale->Record(*target, *depth, x_components, rec,
                 vr_taa.xscale < 0 ? -1.f : 1.f, vr_taa.yscale < 0 ? -1.f : 1.f,
                 vr_dibr.taa_resolved);
+        } else if (vr_dibr_upscale) {
+            vr_dibr_upscale->Skip();
         }
+    }
+    if (vr_dibr.items_after) {
+        // Our items after the reconstruction: into it when there is one (its output-size depth
+        // copy is then the warp's depth), else into X as usual. Either way the depth is captured
+        // again, with them.
+        if (reconstructed.image) {
+            if (!VrInjectInFrame(true) && vr_dibr.items_unsupported) {
+                VrInjectInFrame(); // the depth cannot be blitted: X after all (this frame too)
+                reconstructed = {};
+            }
+            vr_dibr_upscale->ItemsDone();
+        } else {
+            VrInjectInFrame();
+        }
+        if (vr_dibr.inframe)
+            vr_dibr.depth_output_extent = {};
     }
     if (reconstructed.image && reconstructed.extent != vr_dibr.depth_output_extent &&
         !VrCaptureDepth(reconstructed.extent)) reconstructed = {};
@@ -806,7 +920,7 @@ void Rasterizer::VrDibrCaptureAtMarker() {
             return;
         }
     }
-    vr_dibr.dlss = bool(reconstructed.image);
+    vr_dibr.upscaled = bool(reconstructed.image);
     if (reconstructed.image && vr_render_taa) {
         // Previous frames (and this frame's depth capture) may still reference TAA.
         // Release after this command buffer completes, without stalling the GPU.
@@ -818,7 +932,8 @@ void Rasterizer::VrDibrCaptureAtMarker() {
         target->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
     if (!vr_warp->CaptureColor(scheduler.CommandBuffer(),
                                reconstructed.image ? reconstructed.image : target->GetImage(),
-                               vk::ImageLayout::eTransferSrcOptimal,
+                               reconstructed.image ? reconstructed.layout
+                                                   : vk::ImageLayout::eTransferSrcOptimal,
                                reconstructed.image ? vk::Format::eR8G8B8A8Unorm : x_format,
                                reconstructed.image ? reconstructed.extent : x_extent,
                                static_cast<vk::SampleCountFlagBits>(x_samples),
@@ -830,8 +945,9 @@ void Rasterizer::VrDibrCaptureAtMarker() {
         return;
     }
     // Our in-frame items' coverage: the HUD over them is applied to them, never cuts them.
-    if (vr_dibr.inframe && vr_inframe && vr_inframe->CoverExtent() == x_extent) {
-        vr_warp->CaptureItemMask(scheduler.CommandBuffer(), vr_inframe->CoverImage(), x_extent);
+    const vk::Extent2D scene_extent = reconstructed.image ? reconstructed.extent : x_extent;
+    if (vr_dibr.inframe && vr_inframe && vr_inframe->CoverExtent() == scene_extent) {
+        vr_warp->CaptureItemMask(scheduler.CommandBuffer(), vr_inframe->CoverImage(), scene_extent);
     }
     vr_dibr.color_id = x_id;
     vr_dibr.color_uid = x_uid;
@@ -860,7 +976,7 @@ void Rasterizer::VrDibrCaptureAtMarker() {
     }
 }
 
-bool Rasterizer::VrInjectInFrame() {
+bool Rasterizer::VrInjectInFrame(bool upscaled) {
     vr_dibr.inframe = false;
     if (!VR::Quick::GetQuickSettings().inframe) {
         return false;
@@ -892,7 +1008,12 @@ bool Rasterizer::VrInjectInFrame() {
     // between equal sizes. By draws alone a reduced-size pass of the scene (532x584 beside the
     // 1840x2016 depth, DLSS Balanced) won some frames: our items were then depth-tested against
     // the wrong depth, blinking on the chest and the held vial hidden (2026-10-18). A candidate
-    // whose image is gone is passed over rather than ending the items' frame.
+    // whose image is gone is passed over rather than ending the items' frame. So is one with no
+    // colour target of its size: a near-square eye (1608x1640) let the 4096x4096 shadow map past
+    // the aspect check, it won on size and no item was drawn all session (2026-10-23).
+    const auto color_of = [this](vk::Extent2D extent) {
+        return VrSceneColor([extent](vk::Extent2D e) { return e == extent; });
+    };
     const VrDepthCandidate* best = nullptr;
     VideoCore::Image* depth = nullptr;
     u64 best_area = 0;
@@ -901,7 +1022,7 @@ bool Rasterizer::VrInjectInFrame() {
             continue;
         }
         VideoCore::Image* image = texture_cache.TryGetImage(candidate.id, candidate.uid);
-        if (image == nullptr) {
+        if (image == nullptr || !color_of({image->info.size.width, image->info.size.height})) {
             continue;
         }
         const u64 area = u64{image->info.size.width} * image->info.size.height;
@@ -938,13 +1059,7 @@ bool Rasterizer::VrInjectInFrame() {
         }
     }
     const vk::Extent2D depth_extent{depth->info.size.width, depth->info.size.height};
-    const VrColorTarget* color = nullptr;
-    for (const auto& target : vr_dibr.color) {
-        if (target.id && target.extent == depth_extent &&
-            (color == nullptr || target.last_draw > color->last_draw)) {
-            color = &target;
-        }
-    }
+    const VrColorTarget* color = color_of(depth_extent);
     VideoCore::Image* x = color ? texture_cache.TryGetImage(color->id, color->uid) : nullptr;
     if (x == nullptr || x->backing->num_samples != 1) {
         return false;
@@ -992,14 +1107,14 @@ bool Rasterizer::VrInjectInFrame() {
     if (stereo && !vr_inframe_right->Active()) {
         return false;
     }
-    VR::InFrame::List list{};
+    VR::InFrame::RenderList list{};
     const float aspect = rec.proj_aspect > 0.0f ? rec.proj_aspect
                              : static_cast<float>(depth_extent.width) / depth_extent.height;
     std::array<NativeProjection::Transform, 2> projections{};
     if (stereo && NativeStereo::AsymmetricProjection()) {
         const float tan_y = std::tan(rec.proj_vfov * 0.5f);
         for (u32 eye = 0; eye < 2; ++eye) {
-            const auto& fov = rec.eye_fov[eye];
+            const auto fov = NativeStereo::SceneEyeFov(rec, eye);
             projections[eye] = NativeProjection::Make(
                 {fov.angle_left, fov.angle_right, fov.angle_up, fov.angle_down},
                 tan_y * aspect, tan_y);
@@ -1036,32 +1151,64 @@ bool Rasterizer::VrInjectInFrame() {
             }
         }
     }
-    if (!taken ||
-        VR::InFrame::CullInvisible(list, rec.proj_vfov, aspect, eye_half_width,
-                                  horizontal_extent, vertical_extent) == 0) {
+    if (!taken || (VR::InFrame::CullInvisible(list, rec.proj_vfov, aspect, eye_half_width,
+                                              horizontal_extent, vertical_extent) == 0 &&
+                   list.world_gray <= 0.0f && list.world_storm <= 0.0f)) {
         static bool warmed = false;
         if (!warmed) {
             warmed = true; // the pipeline exists before the first item needs it
-            vr_inframe->Warm(srgb, depth_format);
+            vr_inframe->Warm(srgb, depth_format, rec.near_z, rec.far_z);
+            if (DibrUpscale::Requested() && srgb != vk::Format::eR8G8B8A8Srgb)
+                vr_inframe->Warm(vk::Format::eR8G8B8A8Srgb, depth_format, rec.near_z,
+                                 rec.far_z); // its reconstruction
+        }
+        // Nothing of the list in view, in a frame that takes our items: not a refusal (until
+        // 2026-11-03 these counted, and looking away from your body for half a second put the
+        // arc, the pouches and the shoulder vial away for 20 s). The DIBR upscaler that refused
+        // them (below) still refuses.
+        if (taken && !(upscaled && vr_dibr.items_unsupported)) {
+            VR::InFrame::NoteNothingInView();
         }
         return false;
     }
     scheduler.EndRendering();
     GpuPassProfiler::MarkAt(scheduler, 0x1F4A'0000'0001ull, GpuPassProfiler::Group::VrHost,
-                            "VR in-frame items (scene probe, depth copy, item draws)");
+                            "VR in-frame items: transits and scene probes");
     depth->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
     // The scene's light around our items (a box-filtered copy of X), then X as the target.
     x->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
-    vr_inframe->ProbeScene(scheduler.Commands(), x->GetImage(), x_format, depth_extent);
-    if (stereo) {
-        vr_inframe_right->ProbeScene(scheduler.Commands(), x->GetImage(), x_format, depth_extent,
-                                     1);
+    // Both eyes' mip chains level by level (one barrier per level for both). In-run A/B switch 8
+    // cleared: each eye's chain on its own, as before (twice the barriers).
+    const std::array<VrInFrame::ProbeSource, 2> probe_eyes{{{vr_inframe.get(), 0},
+                                                            {vr_inframe_right.get(), 1}}};
+    const std::span<const VrInFrame::ProbeSource> probe_list{probe_eyes.data(), stereo ? 2u : 1u};
+    if (FastRender::AbOn(8)) {
+        VrInFrame::ProbeScenes(scheduler.Commands(), probe_list, x->GetImage(), x_format,
+                               depth_extent);
+    } else {
+        for (const auto& eye : probe_list) {
+            VrInFrame::ProbeScenes(scheduler.Commands(), {&eye, 1}, x->GetImage(), x_format,
+                                   depth_extent);
+        }
     }
     // S1 (FAST bit 51): the eyes are made from the reconstructed output-size twin of X, so our
     // items go into it, against the scene depth blitted to its size (nearest, depth aspect).
     // Only when the UI layer (mode 1, VrUiArm) takes the eyes from that twin: otherwise the eyes
     // are X itself and the items must stay in X.
-    auto* whole = vr_temporal && vr_temporal->s1.valid && stereo && vr_ui_layer &&
+    // DIBR upscaler: its reconstruction, against the scene depth at its size.
+    std::optional<VrDibrUpscale::ItemTarget> up;
+    if (upscaled) {
+        up = vr_dibr_upscale ? vr_dibr_upscale->ItemsTarget(*depth) : std::nullopt;
+        if (!up) {
+            if (!vr_dibr.items_unsupported)
+                LOG_WARNING(Render_Vulkan, "VR inframe: the DIBR upscaler cannot take our items "
+                            "(scene depth {}); they go into the game's frame",
+                            vk::to_string(depth_format));
+            vr_dibr.items_unsupported = true;
+            return false;
+        }
+    }
+    auto* whole = !up && vr_temporal && vr_temporal->s1.valid && stereo && vr_ui_layer &&
                           VR::UiLayerFrameMode() == 1 && color->id == vr_temporal->s1.x_id &&
                           color->uid == vr_temporal->s1.x_uid
                       ? &vr_temporal->s1
@@ -1070,6 +1217,8 @@ bool Rasterizer::VrInjectInFrame() {
         whole = nullptr;
     }
     if (whole) {
+        GpuPassProfiler::MarkAt(scheduler, 0x1F4A'0000'0002ull, GpuPassProfiler::Group::VrHost,
+                                "VR in-frame items: S1 depth scale");
         const auto cmd = scheduler.Commands();
         const bool stencil = depth_format == vk::Format::eD32SfloatS8Uint ||
                              depth_format == vk::Format::eD24UnormS8Uint ||
@@ -1078,13 +1227,23 @@ bool Rasterizer::VrInjectInFrame() {
             stencil ? vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil
                     : vk::ImageAspectFlags{vk::ImageAspectFlagBits::eDepth},
             0, 1, 0, 2};
+        // Nearest, the depth aspect: a blit, or on AMD (no depth blits) a draw that samples the
+        // scene depth and writes ours as its attachment (else a compute copy).
+        const auto mode = VrDepthRescale::Choose(instance, *depth, vk::ImageAspectFlagBits::eDepth);
+        const bool draw = mode == VrDepthRescale::Mode::Draw;
+        constexpr auto ds_stages = vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                   vk::PipelineStageFlagBits2::eLateFragmentTests;
+        // After the last frame's items, drawn in place (their depth writes).
         vk::ImageMemoryBarrier2 barrier{
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eNone,
-            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .srcAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+            .dstStageMask = draw ? ds_stages : vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = draw ? vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite
+                                  : vk::AccessFlagBits2::eTransferWrite,
             .oldLayout = vk::ImageLayout::eUndefined,
-            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .newLayout = draw ? vk::ImageLayout::eDepthStencilAttachmentOptimal
+                              : vk::ImageLayout::eTransferDstOptimal,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = whole->depth.image,
@@ -1092,29 +1251,39 @@ bool Rasterizer::VrInjectInFrame() {
         };
         cmd.pipelineBarrier2(
             vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
-        const vk::ImageBlit region{
-            .srcSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 2},
-            .srcOffsets = std::array<vk::Offset3D, 2>{vk::Offset3D{0, 0, 0},
-                vk::Offset3D{static_cast<s32>(depth_extent.width),
-                             static_cast<s32>(depth_extent.height), 1}},
-            .dstSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 2},
-            .dstOffsets = std::array<vk::Offset3D, 2>{vk::Offset3D{0, 0, 0},
-                vk::Offset3D{static_cast<s32>(whole->width), static_cast<s32>(whole->height), 1}},
-        };
-        cmd.blitImage(depth->GetImage(), vk::ImageLayout::eTransferSrcOptimal, whole->depth.image,
-                      vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eNearest);
-        barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
-        barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
-        barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
-        barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
-        barrier.newLayout = vk::ImageLayout::eTransferSrcOptimal;
-        cmd.pipelineBarrier2(
-            vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
-        vr_temporal->S1ColorTo(vk::ImageLayout::eColorAttachmentOptimal,
-                               vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-                               vk::AccessFlagBits2::eColorAttachmentRead |
-                                   vk::AccessFlagBits2::eColorAttachmentWrite);
-    } else {
+        if (draw) {
+            depth->Transit(vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+                           vk::AccessFlagBits2::eShaderRead, {});
+        }
+        const bool scaled = vr_temporal->S1ScaleDepth(
+            cmd, mode, *depth, depth_extent, whole->depth.image, {whole->width, whole->height}, 2,
+            depth->backing->image.image_ci.format, vk::ImageAspectFlagBits::eDepth,
+            whole->depth_targets, {});
+        if (draw) {
+            // As the copies below and the game's next use expect it.
+            depth->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+                           {});
+        }
+        if (scaled) {
+            barrier.srcStageMask = draw ? ds_stages : vk::PipelineStageFlagBits2::eTransfer;
+            barrier.srcAccessMask = draw ? vk::AccessFlagBits2::eDepthStencilAttachmentWrite
+                                         : vk::AccessFlagBits2::eTransferWrite;
+            barrier.dstStageMask = vk::PipelineStageFlagBits2::eTransfer;
+            barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+            barrier.oldLayout = draw ? vk::ImageLayout::eDepthStencilAttachmentOptimal
+                                     : vk::ImageLayout::eTransferDstOptimal;
+            barrier.newLayout = vk::ImageLayout::eTransferSrcOptimal;
+            cmd.pipelineBarrier2(
+                vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+            vr_temporal->S1ColorTo(vk::ImageLayout::eColorAttachmentOptimal,
+                                   vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                                   vk::AccessFlagBits2::eColorAttachmentRead |
+                                       vk::AccessFlagBits2::eColorAttachmentWrite);
+        } else {
+            whole = nullptr; // nothing was recorded: the items go into X as without S1
+        }
+    }
+    if (!whole && !up) {
         x->Transit(vk::ImageLayout::eColorAttachmentOptimal,
                    vk::AccessFlagBits2::eColorAttachmentRead |
                        vk::AccessFlagBits2::eColorAttachmentWrite,
@@ -1138,15 +1307,33 @@ bool Rasterizer::VrInjectInFrame() {
         target.extent = target.depth_extent = {whole->width, whole->height};
         target.depth_image = whole->depth.image;
     }
+    if (up) {
+        // True RGBA (the provider read X through its component swap); the probe stays X's.
+        target.color_view = up->color;
+        target.color_format = vk::Format::eR8G8B8A8Srgb;
+        target.extent = target.depth_extent = up->extent;
+        target.depth_image = up->depth;
+    }
     VrInFrame::Camera camera{};
     camera.vfov = rec.proj_vfov;
     camera.aspect = aspect;
     camera.near_z = rec.near_z;
     camera.far_z = rec.far_z;
+    camera.monocular_eye = stereo ? rec.monocular_eye : -1;
+    camera.model_eye_mask = stereo ? 3u : 1u;
+    GpuPassProfiler::MarkAt(scheduler, 0x1F4A'0000'0003ull, GpuPassProfiler::Group::VrHost,
+                            "VR in-frame items: draws (and depth copies unless in place)");
     bool drawn = true;
     for (u32 eye = 0; eye < (stereo ? 2u : 1u); ++eye) {
-        target.color_view = whole ? *whole->srgb[eye] : eye ? *color_views.native_right : color_view;
+        target.color_view = up      ? up->color
+                            : whole ? *whole->srgb[eye]
+                            : eye   ? *color_views.native_right
+                                    : color_view;
         target.depth_layer = eye;
+        // S1: straight into its output-size depth (no private copy per eye). In-run A/B switch 7
+        // cleared: the copy, as before.
+        target.depth_in_place =
+            whole && FastRender::AbOn(7) ? vr_temporal->S1DepthTarget(eye) : vk::ImageView{};
         camera.eye_x = (eye ? 1.0f : -1.0f) * eye_half_width;
         camera.collect_probe = eye == 0;
         const auto& projection = projections[eye];
@@ -1209,13 +1396,8 @@ void Rasterizer::VrUiArm(s32 mode) {
         vr_ui.scene_in_warp = true;
     } else {
         const vk::Extent2D main{static_cast<u32>(std::lround(VR::MainAspect() * 1000.0f)), 1000};
-        const VrColorTarget* color = nullptr;
-        for (const auto& target : vr_dibr.color) {
-            if (target.id && SameAspect(target.extent, main) &&
-                (color == nullptr || target.last_draw > color->last_draw)) {
-                color = &target;
-            }
-        }
+        const VrColorTarget* color =
+            VrSceneColor([&](vk::Extent2D extent) { return SameAspect(extent, main); });
         if (color == nullptr) {
             refuse(1u << 0, "no colour target of the frame's aspect before the composite");
             return;
@@ -1440,8 +1622,10 @@ bool Rasterizer::VrUiPrepare(const GraphicsPipeline* pipeline, const RenderState
         if (it == vr_hud_draws.end() || !it->second.hud) {
             vr_ui.hud_draws = static_cast<s32>(vr_ui.shadowed);
             vr_ui.first_other = sig;
-            // Kept only for a full menu's frame (the resolve's menu HUD reads it).
+            // Kept only for a full menu's frame (the resolve's menu HUD reads it). Not with the
+            // HUD in its slots (ui_hud_slots): the menu never draws over it there, the sheet has it.
             vr_ui_hud_snap = vr_ui.native && VR::GetSettings().ui_menu_hud &&
+                             VR::Ui::Slots::Active() == nullptr &&
                              VR::DrawnFrameUiClass() == VR::UiClass::Full;
         }
     }
@@ -1662,7 +1846,10 @@ bool Rasterizer::VrUiShadowAfter(const GraphicsPipeline* pipeline, const RenderS
                   recording_vr.split != nullptr || recording_vr.body_split != nullptr ||
                   recording_vr.hands_split != nullptr || (vr_warp && vr_aa_action != 0) ||
                   pipeline->HasVrMotion();
-        in.scaled = vr_ui.hud_sx != 1.0f || vr_ui.hud_sy != 1.0f;
+        // FAST bit 42 (MergeScaledHud): a HUD at S1's output size merges too; its depth twin ends
+        // the pass itself before it records (VrTemporalCapture::S1UiDepth).
+        in.scaled = (vr_ui.hud_sx != 1.0f || vr_ui.hud_sy != 1.0f) &&
+                    !FastRender::On(FastRender::MergeScaledHud);
         in.clears = StateClears(state);
         // A target bound as a texture too: the shadows would sample this draw's output.
         in.feedback = attachment_feedback_loop;
@@ -1742,8 +1929,168 @@ void Rasterizer::ReportPassMerge() {
 // these writes them once; the shadows test the same masks). Push constants, descriptors and the
 // other dynamic state carry over between render passes. `after_draw` (FAST_GPU_PASS_MERGE): the
 // game's draw into X came first; then into K, then into W (PassMerge::Order).
+std::optional<Rasterizer::VrUiDepthUse> Rasterizer::VrUiDepthUseOf(const GraphicsPipeline* pipeline,
+                                                                     const RenderState& state) {
+    const bool hud_scaled = vr_ui.hud_sx != 1.0f || vr_ui.hud_sy != 1.0f;
+    if (!hud_scaled || !vr_temporal || !state.depth_stencil_attachment.image_view ||
+        !db_desc.first) {
+        return std::nullopt;
+    }
+    const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
+    const auto& dc = regs.depth_control;
+    // Shadow draws never write depth. ALWAYS/NEVER tests do not depend on its contents, even if
+    // the guest left depth testing enabled for stencil clipping.
+    const bool reads_depth = dc.depth_bounds_enable ||
+        (dc.depth_enable && dc.depth_func != AmdGpu::CompareFunc::Always &&
+         dc.depth_func != AmdGpu::CompareFunc::Never);
+    // Only view zero enters the UI atlas. Preserve both views' tests for any shader with memory
+    // side effects; changing its discarded view could change those writes.
+    bool shared = regs.vgt_strmout_config.raw == 0;
+    for (const Shader::Info* stage : pipeline->GetStages()) {
+        shared = shared && (stage == nullptr || !PipelineSkip::StageMayWrite(*stage));
+    }
+    return VrUiDepthUse{
+        .ds = &texture_cache.GetImage(db_desc.first),
+        .tested = (dc.stencil_enable ? vk::ImageAspectFlags{vk::ImageAspectFlagBits::eStencil}
+                                     : vk::ImageAspectFlags{}) |
+                  (reads_depth ? vk::ImageAspectFlags{vk::ImageAspectFlagBits::eDepth}
+                               : vk::ImageAspectFlags{}),
+        .shared = shared,
+    };
+}
+
+// Before the shadowed draw's binds: the twin's copy (a blit, or on AMD a draw or a compute copy
+// with state of its own) is recorded where the game's binds that follow replace that state.
+void Rasterizer::VrUiDepthBefore(const GraphicsPipeline* pipeline, const RenderState& state) {
+    if (const auto use = VrUiDepthUseOf(pipeline, state)) {
+        vr_temporal->S1UiDepth(*use->ds, use->tested, use->shared, true);
+    }
+}
+
+namespace {
+// FAST bit 59: the game's viewports and scissors (input size) scaled by (sx, sy) into K, W and
+// the twin (S1's output size, `extent`); the game's own returned, to be restored for its draw.
+std::pair<Viewports, Scissors> ScaleUiViewports(DynamicState& dynamic_state, float sx, float sy,
+                                                vk::Extent2D extent) {
+    std::pair<Viewports, Scissors> game_vp{dynamic_state.viewports, dynamic_state.scissors};
+    Viewports viewports = dynamic_state.viewports;
+    Scissors scissors = dynamic_state.scissors;
+    const s32 w = static_cast<s32>(extent.width);
+    const s32 h = static_cast<s32>(extent.height);
+    for (auto& v : viewports) {
+        v.x *= sx;
+        v.y *= sy;
+        v.width *= sx;
+        v.height *= sy;
+    }
+    for (auto& r : scissors) {
+        const s32 x0 = std::clamp(static_cast<s32>(std::floor(r.offset.x * sx)), 0, w);
+        const s32 y0 = std::clamp(static_cast<s32>(std::floor(r.offset.y * sy)), 0, h);
+        const s32 x1 = std::clamp(static_cast<s32>(std::ceil(
+            (static_cast<float>(r.offset.x) + r.extent.width) * sx)), x0, w);
+        const s32 y1 = std::clamp(static_cast<s32>(std::ceil(
+            (static_cast<float>(r.offset.y) + r.extent.height) * sy)), y0, h);
+        r = vk::Rect2D{{x0, y0}, {static_cast<u32>(x1 - x0), static_cast<u32>(y1 - y0)}};
+    }
+    dynamic_state.SetViewports(viewports);
+    dynamic_state.SetScissors(scissors);
+    return game_vp;
+}
+} // namespace
+
+bool Rasterizer::VrUiMaskPrepare(const GraphicsPipeline* pipeline, const RenderState& state,
+                                 bool shadowed) {
+    static const bool on = [] { // on by default since 2026-10-25 (the user); 0 turns it off
+        const char* value = std::getenv("VR_UI_MASK_REPLAY");
+        return !(value && std::strcmp(value, "0") == 0);
+    }();
+    if (!on || !vr_ui.armed || vr_ui.incomplete) {
+        return false;
+    }
+    if (!shadowed) {
+        // A colour draw VrUiPrepare left out (not the composite's) stays as before; Scaleform's
+        // masks come with no colour target bound (a slot with no view, or none).
+        for (u32 i = 0; i < state.num_color_attachments; ++i) {
+            if (state.color_attachments[i].image_view) {
+                return false;
+            }
+        }
+    }
+    // A shadowed mask writes no colour, so drawn again it changes only the twin.
+    const auto& write_masks = pipeline->GetGraphicsKey().write_masks;
+    for (u32 i = 0; i < state.num_color_attachments; ++i) {
+        if (state.color_attachments[i].image_view && write_masks[i]) {
+            return false;
+        }
+    }
+    // A clear (the pass's, or the DB's own) is the game's alone: the next test copies the twin.
+    const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
+    const auto& ds = state.depth_stencil_attachment;
+    if (ds.depth_clear || ds.stencil_clear || regs.depth_render_control.depth_clear_enable ||
+        regs.depth_render_control.stencil_clear_enable) {
+        return false;
+    }
+    const auto writes = DepthStencilOfRegisters(regs, state);
+    if (!PassMerge::WritesDepthStencil(writes)) {
+        return false; // writes nothing the twin holds
+    }
+    auto use = VrUiDepthUseOf(pipeline, state);
+    if (!use || !use->shared) {
+        return false; // none, or shaders that may write memory: drawn no more often than now
+    }
+    // The twin is the game's for what the mask tests (VrUiDepthUseOf) and for what it writes,
+    // so the replay keeps it the game's.
+    if (writes.has_depth && writes.depth_test && writes.depth_write) {
+        use->tested |= vk::ImageAspectFlagBits::eDepth;
+    }
+    if (writes.has_stencil && writes.stencil_test) {
+        use->tested |= vk::ImageAspectFlagBits::eStencil;
+    }
+    if (!vr_temporal->S1UiDepth(*use->ds, use->tested, use->shared, true)) {
+        return false; // no twin: the next test copies, as without the replay
+    }
+    vr_ui_mask = *use;
+    vr_ui_ds_wrote = false; // the replay writes the twin as the game's draw writes its image
+    return true;
+}
+
+// After the draw's binds and dynamic state, like the shadows: the game's pipeline, its depth and
+// stencil state as they are (no shadow overrides: the mask is written), into the twin at S1's
+// output size. Not replayed (no twin), the twin is taken again at the next test.
+void Rasterizer::VrUiMaskReplay(const GraphicsPipeline* pipeline, const RenderState& state,
+                                VrDrawCall issue) {
+    const vk::ImageView twin = vr_temporal->S1UiDepth(*vr_ui_mask.ds, vr_ui_mask.tested,
+                                                      vr_ui_mask.shared, false);
+    if (!twin) {
+        vr_temporal->s1.ui_ds_dirty = true;
+        UiWarnOnce(1u << 14, "VR_UI_MASK_REPLAY: no twin for a mask; it is copied instead");
+        return;
+    }
+    auto& dynamic_state = scheduler.GetDynamicState();
+    const auto game_vp =
+        ScaleUiViewports(dynamic_state, vr_ui.hud_sx, vr_ui.hud_sy, vr_ui.x_extent);
+    dynamic_state.Commit(instance, scheduler.Commands());
+    RenderState mask = state;
+    mask.width = static_cast<u16>(vr_ui.x_extent.width);
+    mask.height = static_cast<u16>(vr_ui.x_extent.height);
+    mask.depth_stencil_attachment.image_view = twin;
+    mask.depth_stencil_attachment.image_layout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
+    GpuPassProfiler::LabelPassAt(scheduler, mask, 0x0151'0000'0002ull,
+                                 GpuPassProfiler::Group::VrHost,
+                                 "VR UI layer mask replay (the HUD's depth/stencil twin)");
+    scheduler.BeginRendering(mask);
+    const auto cmdbuf = scheduler.Commands();
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics,
+                        EyeSpecVariants::Bound(pipeline, static_cast<const Pipeline*>(pipeline)));
+    issue(cmdbuf);
+    dynamic_state.SetViewports(game_vp.first);
+    dynamic_state.SetScissors(game_vp.second);
+    dynamic_state.Commit(instance, scheduler.Commands());
+    ++vr_temporal->s1.hud_masks;
+}
+
 void Rasterizer::VrUiShadowDraw(const GraphicsPipeline* pipeline, const RenderState& state,
-                                VrDrawCall issue, bool after_draw) {
+                                VrDrawCall issue, bool after_draw, bool mask_replay) {
     // ui_menu_hud_off_canvas: the HUD rows of K and W, reset after they were kept (below).
     std::optional<vk::Rect2D> hud_clear;
     const bool marker = vr_ui_marker_draw;
@@ -1758,13 +2105,8 @@ void Rasterizer::VrUiShadowDraw(const GraphicsPipeline* pipeline, const RenderSt
         vr_ui_hud_snap = false;
         scheduler.EndRendering();
         const vk::Extent2D x = vr_ui.x_extent;
-        vk::Rect2D rows{{0, 0}, x};
-        if (static_cast<float>(x.width) / static_cast<float>(x.height) < 16.0f / 9.0f - 0.02f) {
-            const u32 h = static_cast<u32>(std::lround(x.width * 9.0f / 16.0f));
-            rows = {{0, static_cast<s32>((x.height - h) / 2)}, {x.width, h}};
-        }
-        // The band's top, where the status clusters are (stage y 0 .. 260 of 1080).
-        rows.extent.height = std::min(rows.extent.height, rows.extent.height * 260 / 1080 + 16);
+        const auto r = UiSnapshot::MenuRows(x.width, x.height);
+        const vk::Rect2D rows{{r.x0, r.y0}, {r.Width(), r.Height()}};
         vr_ui_layer->SnapshotHud(scheduler.CommandBuffer(), rows);
         // The HUD is now kept for under the menu canvas (the resolve's menu HUD): taken out of K
         // and W, the menu draws from here on onto its rows without it, so the canvas never shows
@@ -1784,30 +2126,7 @@ void Rasterizer::VrUiShadowDraw(const GraphicsPipeline* pipeline, const RenderSt
     const bool hud_scaled = vr_ui.hud_sx != 1.0f || vr_ui.hud_sy != 1.0f;
     std::optional<std::pair<Viewports, Scissors>> game_vp;
     if (hud_scaled) {
-        game_vp.emplace(dynamic_state.viewports, dynamic_state.scissors);
-        Viewports viewports = dynamic_state.viewports;
-        Scissors scissors = dynamic_state.scissors;
-        const s32 w = static_cast<s32>(vr_ui.x_extent.width);
-        const s32 h = static_cast<s32>(vr_ui.x_extent.height);
-        for (auto& v : viewports) {
-            v.x *= vr_ui.hud_sx;
-            v.y *= vr_ui.hud_sy;
-            v.width *= vr_ui.hud_sx;
-            v.height *= vr_ui.hud_sy;
-        }
-        for (auto& r : scissors) {
-            const s32 x0 = std::clamp(
-                static_cast<s32>(std::floor(r.offset.x * vr_ui.hud_sx)), 0, w);
-            const s32 y0 = std::clamp(
-                static_cast<s32>(std::floor(r.offset.y * vr_ui.hud_sy)), 0, h);
-            const s32 x1 = std::clamp(static_cast<s32>(std::ceil(
-                (static_cast<float>(r.offset.x) + r.extent.width) * vr_ui.hud_sx)), x0, w);
-            const s32 y1 = std::clamp(static_cast<s32>(std::ceil(
-                (static_cast<float>(r.offset.y) + r.extent.height) * vr_ui.hud_sy)), y0, h);
-            r = vk::Rect2D{{x0, y0}, {static_cast<u32>(x1 - x0), static_cast<u32>(y1 - y0)}};
-        }
-        dynamic_state.SetViewports(viewports);
-        dynamic_state.SetScissors(scissors);
+        game_vp = ScaleUiViewports(dynamic_state, vr_ui.hud_sx, vr_ui.hud_sy, vr_ui.x_extent);
     }
     dynamic_state.Commit(instance, scheduler.Commands());
     const vk::Format view_format = instance.GetSupportedFormat(
@@ -1826,19 +2145,17 @@ void Rasterizer::VrUiShadowDraw(const GraphicsPipeline* pipeline, const RenderSt
             }
         }
     }
-    // Only view zero enters the UI atlas. Preserve both views' tests for any shader
-    // with memory side effects; changing its discarded view could change those writes.
-    bool shared_mask = std::as_const(ScratchDraw::Registers(liverpool)).vgt_strmout_config.raw == 0;
-    for (const Shader::Info* stage : pipeline->GetStages()) {
-        shared_mask = shared_mask && (stage == nullptr || !PipelineSkip::StageMayWrite(*stage));
-    }
+    const auto depth_use = VrUiDepthUseOf(pipeline, state);
+    bool twin_last = false; // the last shadow pass has the twin as its depth/stencil
     auto& merge = vr_ui_merge;
     for (const auto which : pair) {
         // FAST_GPU_PASS_MERGE (vk_pass_merge.h): no explicit end while TargetView records nothing
         // for the target; BeginRendering below ends the open pass when the shadow's state
         // differs, and goes on with it when it is this target's pass already.
-        const bool keep = PassMerge::KeepOpen(g_pass_merge, scheduler.IsRendering(),
-                                              vr_ui_layer->TargetBound(which), hud_scaled);
+        const bool keep =
+            PassMerge::KeepOpen(g_pass_merge, scheduler.IsRendering(),
+                                vr_ui_layer->TargetBound(which),
+                                hud_scaled && !FastRender::On(FastRender::MergeScaledHud));
         if (!keep) {
             scheduler.EndRendering();
         }
@@ -1881,22 +2198,12 @@ void Rasterizer::VrUiShadowDraw(const GraphicsPipeline* pipeline, const RenderSt
             shadow.height = static_cast<u16>(vr_ui.x_extent.height);
             if (shadow.depth_stencil_attachment.image_view) {
                 // The game's depth/stencil is input-size: its output-size twin instead, taken
-                // again from it (outside the pass) when a draw tests it after the game wrote it.
-                const auto& dc = std::as_const(ScratchDraw::Registers(liverpool)).depth_control;
-                auto* ds = db_desc.first ? &texture_cache.GetImage(db_desc.first) : nullptr;
-                // Shadow draws never write depth. ALWAYS/NEVER tests do not depend on its
-                // contents, even if the guest left depth testing enabled for stencil clipping.
-                const bool reads_depth = dc.depth_bounds_enable ||
-                    (dc.depth_enable && dc.depth_func != AmdGpu::CompareFunc::Always &&
-                     dc.depth_func != AmdGpu::CompareFunc::Never);
+                // again from it when a draw tests it after the game wrote it (VrUiDepthBefore,
+                // before this draw's binds: nothing is recorded for it here).
                 const vk::ImageView twin =
-                    ds && vr_temporal ? vr_temporal->S1UiDepth(
-                                            *ds, (dc.stencil_enable ? vk::ImageAspectFlagBits::eStencil
-                                                                   : vk::ImageAspectFlags{}) |
-                                                     (reads_depth ? vk::ImageAspectFlagBits::eDepth
-                                                                      : vk::ImageAspectFlags{}),
-                                            shared_mask)
-                                      : vk::ImageView{};
+                    depth_use ? vr_temporal->S1UiDepth(*depth_use->ds, depth_use->tested,
+                                                       depth_use->shared, false)
+                              : vk::ImageView{};
                 if (!twin) {
                     vr_ui.incomplete = true;
                     UiWarnOnce(1u << 13, "bit 58: the HUD's depth/stencil has no output-size "
@@ -1961,9 +2268,23 @@ void Rasterizer::VrUiShadowDraw(const GraphicsPipeline* pipeline, const RenderSt
                 }
             }
         }
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics,
+                            EyeSpecVariants::Bound(pipeline, static_cast<const Pipeline*>(pipeline)));
         issue(cmdbuf);
         drawn = true;
+        twin_last = hud_scaled && shadow.depth_stencil_attachment.image_view;
+    }
+    if (mask_replay) {
+        // VR_UI_MASK_REPLAY: both shadows tested the masks as they were, as the game's draw does;
+        // now its writes, in the last shadow pass (the twin attached, no colour written).
+        if (drawn && twin_last && !vr_ui.incomplete) {
+            UpdateDepthStencilState(); // the game's depth/stencil writes (the shadows' are off)
+            dynamic_state.Commit(instance, scheduler.Commands());
+            issue(scheduler.Commands());
+            ++vr_temporal->s1.hud_masks;
+        } else {
+            vr_temporal->s1.ui_ds_dirty = true; // not replayed: taken again at the next test
+        }
     }
     if (game_vp) {
         dynamic_state.SetViewports(game_vp->first);
@@ -2040,12 +2361,359 @@ std::string Rasterizer::VrUiLogTag() const {
 }
 
 void Rasterizer::VrEndFrame() {
+    if (g_draw_breakdown) [[unlikely]] {
+        ReportBreakdown();
+    }
+    {
+        // The next frame's lights in the air start empty (fog_light.h); the session's rule as the
+        // pipeline cache's (an upscaler turned on or off with the game running).
+        namespace Fog = Shader::Optimization::FogLight;
+        static const char* const fog_override = std::getenv("VR_FOG_LIGHT");
+        static const float density = [] {
+            const char* v = std::getenv("VR_FOG_DENSITY");
+            const float d = v ? std::strtof(v, nullptr) : Fog::Density;
+            return std::isfinite(d) && d >= 0.0f ? d : Fog::Density;
+        }();
+        std::scoped_lock lock{vr_fog.mutex};
+        // His body maps' lamps (vr_body_maps.h): this frame's, for the next frame.
+        vr_body.lights.swap(vr_body.building);
+        // The scene maps' slots for the next frame (light_shadow.h SceneMaps): the lamps lighting
+        // the most of the view.
+        {
+            const VrShadowCpuScope timed{2};
+            auto& cand = vr_scene.building;
+            // A lamp that held a slot keeps it unless a newcomer beats it clearly (no flipping
+            // between the map and the march at the cut-off as you walk).
+            for (auto& c : cand) {
+                for (u32 j = 0; j < vr_scene.count; ++j) {
+                    const auto& o = vr_scene.chosen[j];
+                    if (std::abs(o.world[0] - c.world[0]) + std::abs(o.world[1] - c.world[1]) +
+                            std::abs(o.world[2] - c.world[2]) < Shader::Optimization::LightShadow::SceneMaps::KeepFixedM) {
+                        c.score *= 1.5f;
+                        break;
+                    }
+                }
+            }
+            const size_t n = std::min<size_t>(cand.size(), vr_scene.chosen.size());
+            std::partial_sort(cand.begin(), cand.begin() + n, cand.end(),
+                              [](const auto& a, const auto& b) { return a.score > b.score; });
+            // Stable slots: a chosen lamp keeps the slot it had (its cube of last frame is its
+            // own); a new one takes a free slot, fresh (no cube of its own yet).
+            namespace Scene = Shader::Optimization::LightShadow::SceneMaps;
+            static_assert(VrScene::SlotCount == Scene::Slots);
+            constexpr size_t SlotN = VrScene::SlotCount;
+            std::array<VrScene::Lamp, SlotN> next{};
+            std::array<u32, SlotN> next_flags{};
+            std::array<u32, SlotN> next_age{};
+            std::array<bool, SlotN> taken{};
+            std::array<bool, SlotN> placed{};
+            // The resting spots' step (light_shadow.h AnchorTauS): this pick's time since the last.
+            const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch()).count();
+            const float dt = vr_scene.picked_ns != 0
+                                 ? std::clamp(static_cast<float>(now_ns - vr_scene.picked_ns) * 1e-9f, 0.0f, 0.25f)
+                                 : 0.0f;
+            vr_scene.picked_ns = now_ns;
+            const float follow = 1.0f - std::exp(-dt / Scene::AnchorTauS);
+            const float hold = Scene::AnchorHoldM();
+            [[maybe_unused]] float moved_max = 0.0f; // (tests: how far lamps strayed from their spots)
+            // Each keeps the nearest free slot it had: within KeepFixedM (a held light SlotKeepM), its
+            // reach within KeepReachShare (the nearest first: two candles side by side never trade).
+            for (size_t i = 0; i < n; ++i) {
+                const float keep = cand[i].held ? Scene::SlotKeepM : Scene::KeepFixedM;
+                float best_d2 = keep * keep;
+                s32 best = -1;
+                for (u32 j = 0; j < vr_scene.count; ++j) {
+                    const auto& o = vr_scene.chosen[j];
+                    const float dx = o.world[0] - cand[i].world[0], dy = o.world[1] - cand[i].world[1],
+                                dz = o.world[2] - cand[i].world[2];
+                    const float d2 = dx * dx + dy * dy + dz * dz;
+                    if (!taken[j] && (vr_scene.flags[j] & Scene::SlotUsed) && d2 < best_d2 &&
+                        std::abs(o.k - cand[i].k) <= Scene::KeepReachShare * o.k) {
+                        best_d2 = d2;
+                        best = s32(j);
+                    }
+                }
+                if (best >= 0) {
+                    next[best] = cand[i];
+                    next_flags[best] = Scene::SlotUsed;
+                    next_age[best] = std::min(vr_scene.age[best] + 1, 1u << 30);
+                    taken[best] = placed[i] = true;
+                    // Its resting spot (light_shadow.h AnchorHoldM): its shadows' place follows the
+                    // lamp's over AnchorTauS and stays within `hold` of it; its reach the same.
+                    if (!cand[i].held && hold > 0.0f) {
+                        const auto& was = vr_scene.chosen[best];
+                        auto& lamp = next[best];
+                        std::array<float, 3> spot{};
+                        float off2 = 0.0f;
+                        for (u32 c = 0; c < 3; ++c) {
+                            spot[c] = was.world[c] + (lamp.world[c] - was.world[c]) * follow;
+                            const float o = lamp.world[c] - spot[c];
+                            off2 += o * o;
+                        }
+                        const float off = std::sqrt(off2);
+                        moved_max = std::max(moved_max, off);
+                        if (off > hold) {
+                            for (u32 c = 0; c < 3; ++c) {
+                                spot[c] = lamp.world[c] - (lamp.world[c] - spot[c]) * (hold / off);
+                            }
+                        }
+                        lamp.world = spot;
+                        lamp.k = was.k + (lamp.k - was.k) * follow;
+                    }
+                }
+            }
+            // A lamp not listed this frame (looked away from) keeps its slot LingerFrames: its cube
+            // stays warm, no blink when it comes back.
+            std::array<u32, SlotN> next_unseen{};
+            std::array<bool, SlotN> lingering{};
+            for (u32 j = 0; j < vr_scene.count; ++j) {
+                if (!taken[j] && (vr_scene.flags[j] & Scene::SlotUsed) && vr_scene.unseen[j] < Scene::LingerFrames) {
+                    next[j] = vr_scene.chosen[j];
+                    next_flags[j] = Scene::SlotUsed;
+                    next_age[j] = std::min(vr_scene.age[j] + 1, 1u << 30);
+                    next_unseen[j] = vr_scene.unseen[j] + 1;
+                    taken[j] = lingering[j] = true;
+                }
+            }
+            // A lamp listed now takes a free slot, or else the longest-unseen lingering one's.
+            for (size_t i = 0; i < n; ++i) {
+                if (placed[i]) {
+                    continue;
+                }
+                s32 slot = -1;
+                for (u32 j = 0; j < next.size() && slot < 0; ++j) {
+                    if (!taken[j]) {
+                        slot = s32(j);
+                    }
+                }
+                for (u32 j = 0; j < next.size() && slot < 0; ++j) {
+                    if (lingering[j]) {
+                        u32 oldest = j;
+                        for (u32 o = j + 1; o < next.size(); ++o) {
+                            if (lingering[o] && next_unseen[o] > next_unseen[oldest]) {
+                                oldest = o;
+                            }
+                        }
+                        slot = s32(oldest);
+                    }
+                }
+                if (slot < 0) {
+                    break;
+                }
+                next[slot] = cand[i];
+                next_flags[slot] = Scene::SlotUsed | Scene::SlotFresh;
+                next_age[slot] = 0;
+                next_unseen[slot] = 0;
+                taken[slot] = true;
+                lingering[slot] = false;
+            }
+            // Where each slot's lamp was (this frame's cubes are made there; next frame's mask
+            // looks them up from it).
+            for (u32 j = 0; j < next.size(); ++j) {
+                vr_scene.prev[j] = (taken[j] && !(next_flags[j] & Scene::SlotFresh) && j < vr_scene.count)
+                                       ? std::array<float, 3>{vr_scene.chosen[j].world[0], vr_scene.chosen[j].world[1],
+                                                              vr_scene.chosen[j].world[2]}
+                                       : std::array<float, 3>{next[j].world[0], next[j].world[1], next[j].world[2]};
+            }
+            vr_scene.unseen = next_unseen;
+            u32 extent = 0;
+            for (u32 j = 0; j < next.size(); ++j) {
+                if (taken[j]) {
+                    extent = j + 1;
+                }
+            }
+            vr_scene.chosen = next;
+            vr_scene.flags = next_flags;
+            vr_scene.age = next_age;
+            vr_scene.count = extent;
+            // High lamp shadows (light_shadow.h High, SlotHero): the slots whose lamps march at full
+            // resolution in the lamp shaders. Among the lamps listed this frame that cast, the ones
+            // lighting the most of the view (a lamp in a hand scores the most: the torch, the
+            // lantern), at most HeroLamps; a hero's score counts 1 / HeroKeepShare against the
+            // others', so two lamps lighting about as much never trade the sharp shadows back and
+            // forth. (A kept lamp keeps its slot: last pick's bit is the same lamp's.)
+            {
+                const u32 was = vr_scene.hero_mask;
+                u32 heroes = 0;
+                if (VrLightShadowHigh()) {
+                    std::array<float, SlotN> rank{};
+                    u32 eligible = 0;
+                    for (u32 j = 0; j < extent; ++j) {
+                        const auto& lamp = vr_scene.chosen[j];
+                        if (!taken[j] || lingering[j] || !(next_flags[j] & Scene::SlotUsed) ||
+                            !(lamp.strength > 0.0f) || !(lamp.score > 0.0f)) {
+                            continue;
+                        }
+                        const bool kept = ((was >> j) & 1u) != 0 && !(next_flags[j] & Scene::SlotFresh);
+                        rank[j] = kept ? lamp.score / Scene::HeroKeepShare : lamp.score;
+                        eligible |= 1u << j;
+                    }
+                    for (u32 n = 0; n < Scene::HeroLamps; ++n) {
+                        s32 best = -1;
+                        for (u32 j = 0; j < extent; ++j) {
+                            if (((eligible >> j) & 1u) != 0 && ((heroes >> j) & 1u) == 0 &&
+                                (best < 0 || rank[j] > rank[best])) {
+                                best = s32(j);
+                            }
+                        }
+                        if (best < 0) {
+                            break;
+                        }
+                        heroes |= 1u << best;
+                    }
+                }
+                vr_scene.hero_mask = heroes;
+            }
+            // The trace's reach by the GPU's time (light_shadow.h TraceFarLevels, Dial): one level
+            // nearer after DialDownFrames frames running over DialDownShare of the game's frame
+            // time, one level back after DialUpSeconds under DialUpShare.
+            {
+                auto& dl = vr_scene.dial;
+                if (const float pinned = Scene::TraceFarPinned(); pinned >= 0.0f) {
+                    dl.reach_m = pinned;
+                } else if (!Scene::Dial() || !VrSceneMaskOn()) {
+                    dl.reach_m = Scene::TraceFarLevels[0];
+                } else {
+                    unsigned frames = 0;
+                    const float ms = LastGpuFrameMs(&frames);
+                    if (frames != dl.frames && ms > 0.0f) {
+                        dl.frames = frames;
+                        const int fps = std::clamp(
+                            VR::Bloodborne::FrameHooksActive() ? VR::Bloodborne::GameFrameRate() : 60, 20, 240);
+                        const float budget = 1000.0f / static_cast<float>(fps);
+                        dl.ms = dl.ms < 0.0f ? ms : dl.ms + (ms - dl.ms) * 0.25f;
+                        if (dl.ms > Scene::DialDownShare * budget) {
+                            dl.under = 0;
+                            if (++dl.over >= Scene::DialDownFrames) {
+                                dl.over = 0;
+                                dl.level = std::min(dl.level + 1, Scene::TraceFarLevelCount - 1);
+                            }
+                        } else if (dl.ms < Scene::DialUpShare * budget) {
+                            dl.over = 0;
+                            if (dl.level > 0 && ++dl.under >= static_cast<u32>(Scene::DialUpSeconds * fps)) {
+                                dl.under = 0;
+                                --dl.level;
+                            }
+                        } else {
+                            dl.over = dl.under = 0;
+                        }
+                    }
+                    dl.reach_m = Scene::TraceFarLevels[dl.level];
+                }
+                // The march's step dial (light_shadow.h StepDial): the same rule, its own level.
+                if (Scene::StepDial() && VrSceneMaskOn()) {
+                    auto& sd = vr_scene.step_dial;
+                    unsigned frames = 0;
+                    const float ms = LastGpuFrameMs(&frames);
+                    if (frames != sd.frames && ms > 0.0f) {
+                        sd.frames = frames;
+                        const int fps = std::clamp(
+                            VR::Bloodborne::FrameHooksActive() ? VR::Bloodborne::GameFrameRate() : 60, 20, 240);
+                        const float budget = 1000.0f / static_cast<float>(fps);
+                        sd.ms = sd.ms < 0.0f ? ms : sd.ms + (ms - sd.ms) * 0.25f;
+                        if (sd.ms > Scene::DialDownShare * budget) {
+                            sd.under = 0;
+                            if (++sd.over >= Scene::DialDownFrames) {
+                                sd.over = 0;
+                                sd.level = std::min(sd.level + 1, Scene::StepDialLevels - 1);
+                            }
+                        } else if (sd.ms < Scene::DialUpShare * budget) {
+                            sd.over = 0;
+                            if (sd.level > 0 && ++sd.under >= static_cast<u32>(Scene::DialUpSeconds * fps)) {
+                                sd.under = 0;
+                                --sd.level;
+                            }
+                        } else {
+                            sd.over = sd.under = 0;
+                        }
+                    }
+                }
+                if constexpr (Common::Log::Enabled) {
+                    // (Tests: the dial and how far fixed lamps strayed from their resting spots.)
+                    static u32 frames_seen = 0;
+                    static u32 level_frames[Scene::TraceFarLevelCount] = {};
+                    static float strayed = 0.0f;
+                    static u32 step_frames[Scene::StepDialLevels] = {};
+                    ++level_frames[std::min(dl.level, Scene::TraceFarLevelCount - 1)];
+                    ++step_frames[std::min(vr_scene.step_dial.level, Scene::StepDialLevels - 1)];
+                    strayed = std::max(strayed, moved_max);
+                    if (++frames_seen == 300) {
+                        LOG_INFO(Render_Vulkan,
+                                 "VR lamp shadows: trace reach {:.1f} m (level {}; frames at 12/8/5/3 m: {}/{}/{}/{}), "
+                                 "GPU {:.2f} ms a frame; lamps strayed up to {:.3f} m from their resting spots (hold {:.2f}); "
+                                 "step dial level {} (frames at 100/80/65/50%: {}/{}/{}/{}, GPU {:.2f} ms)",
+                                 dl.reach_m, dl.level, level_frames[0], level_frames[1], level_frames[2], level_frames[3],
+                                 dl.ms, strayed, hold, vr_scene.step_dial.level, step_frames[0], step_frames[1],
+                                 step_frames[2], step_frames[3], vr_scene.step_dial.ms);
+                        frames_seen = 0;
+                        strayed = 0.0f;
+                        std::fill(std::begin(level_frames), std::end(level_frames), 0u);
+                        std::fill(std::begin(step_frames), std::end(step_frames), 0u);
+                    }
+                }
+            }
+            if constexpr (Common::Log::Enabled) {
+                // (Tests: the upkeep's CPU time, render thread, a frame on average.)
+                static u32 timed_frames = 0;
+                if (++timed_frames == 900) {
+                    // (The clock itself: two reads a scope, timed here.)
+                    const auto c0 = std::chrono::steady_clock::now();
+                    for (u32 i = 0; i < 1000; ++i) {
+                        (void)std::chrono::steady_clock::now();
+                    }
+                    const double clock_ns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                       std::chrono::steady_clock::now() - c0).count()) / 1000.0;
+                    const double scopes = double(VrShadowCpuScope::scopes.exchange(0)) / 900.0;
+                    const auto part = [](u32 i) { return double(VrShadowCpuScope::parts[i].exchange(0)) / 900.0 / 1000.0; };
+                    LOG_INFO(Render_Vulkan, "VR lamp shadows: {} frames so far whose light lists' camera was not the AO pass's", vr_fog.views_apart);
+                    LOG_INFO(Render_Vulkan, "VR lamp shadows CPU: {:.1f} us a frame (render thread, 900 frames), {:.0f} timed scopes a frame, a clock read {:.0f} ns; draws' slots {:.1f}, candidates {:.1f}, slot pick {:.1f}, casters {:.1f}, body upload {:.1f} us; {} candidates now",
+                             double(VrShadowCpuScope::total.exchange(0)) / 900.0 / 1000.0, scopes, clock_ns, part(0), part(1), part(2), part(3), part(4), cand.size());
+                    timed_frames = 0;
+                }
+                static u32 logged = 0;
+                if (extent != 0 && (logged++ % 300) == 0) {
+                    // (Each lamp's place from the camera, world axes.)
+                    const auto& m = vr_fog.view;
+                    std::string line = fmt::format(" {} candidates", cand.size());
+                    for (u32 j = 0; j < extent; ++j) {
+                        const auto& l = next[j];
+                        line += fmt::format(" | {} r {:.1f} s {:.2f} c {:.2f} f {} at {:.1f} {:.1f} {:.1f}", j,
+                                            1.0f / std::sqrt(std::max(l.k, 1e-6f)), l.strength, l.clear, next_flags[j],
+                                            l.world[0] - m[3], l.world[1] - m[7], l.world[2] - m[11]);
+                    }
+                    LOG_INFO(Render_Vulkan, "VR scene shadow slots:{}", line);
+                }
+            }
+            cand.clear();
+        }
+        vr_body.building.clear();
+        vr_fog.building.clear();
+        vr_fog.building_keys.fill(0);
+        vr_fog.ready.clear();
+        ++vr_fog.frame; // the lamp memory's frame (its camera, its once-a-frame update)
+        vr_fog.density = density;
+        vr_fog.on = Fog::Enabled(VR::IsEnabled(), VR::GetSettings().fog_light,
+                                 VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
+                                 fog_override);
+    }
+    VrMoonEndFrame(); // the moonlight in the air's frame (vk_rasterizer_moon.cpp)
+    VrBumpEndFrame(); // the raised brickwork's depth for the next frame (vk_rasterizer.cpp)
+    // Dropped severed pieces' GPU copies, freed here alone (after both eyes, even in a frame that
+    // draws no in-frame item): both eyes lose a retired piece in the same frame.
+    if (vr_inframe) {
+        vr_inframe->SweepDropped();
+    }
+    if (vr_inframe_right) {
+        vr_inframe_right->SweepDropped();
+    }
     CompileTrace::EndFrame();
     if (vr_temporal_enabled) VrTemporalEndFrame();
     VrNativeAuditEnd();
     VrProbeEndFrame();
     vr_dibr = {};
     vr_ui = {};
+    scheduler.BlockFoveation(false);
     vr_ui_sigs.clear();
     vr_ui_solid.clear();
     vr_ui_hud_snap = false;

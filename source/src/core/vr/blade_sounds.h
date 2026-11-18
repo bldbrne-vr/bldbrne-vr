@@ -31,8 +31,8 @@
 //  - back and forth (a whetstone's rhythm): each reversal is a new stroke; so is a draw again after
 //    a pause; one draw on and on is one stroke.
 // Two kinds only, told apart by the motion the body already has (a few dot products an update).
-// Each sound is one of its kind's pool, never the same twice in a row (and the game's events
-// themselves pick among their own recordings: c935 among four). The sounds are the game's own
+// Each sound is one of its kind's pool, avoiding repeats when the pool has multiple entries.
+// The sounds are the game's own
 // (SoundType 1 events in sprj_main), played where the blades meet: the mix turns with your head
 // and goes through audio_binaural.
 //
@@ -127,11 +127,9 @@ inline std::string PoolText(const Pool& p) {
 
 struct Settings {
     bool on{true};
-    // sprj_main (the sample names of their recordings; chosen 2026-10-13):
-    Pool tap{Pool::Of({9044441, 935})}; // sword-x-sword1; iron-cut-iron x3 + sword-x-sword1
-    // the katana's draw from its sheath (1.5 s, 3 s), the Blade of Mercy's deploy (0.8 s)
-    Pool scrape{Pool::Of({10601, 10600, 6103})}; // sprj_katana_iai1, sprj_katana_iai0,
-                                                 // souken_tenkai
+    // Verified against CUSA03173 sprj_main.fev sound-definition references, not event labels.
+    Pool tap{Pool::Of({9000})}; // sword-x-sword
+    Pool scrape{Pool::Of({114426200, 114426000, 773})}; // katana_iai1, katana_iai0, souken_tenkai
     int grind{1};             // 0 off, 1 the sparks loop as it is ("A"), 2 lower, heavier ("B")
     float grind_volume{1.0f}; // 0..2
 };
@@ -141,14 +139,44 @@ inline Settings& GetSettings() {
     return settings;
 }
 
+// Repair the previously shipped misidentified events when loading existing vr.ini files.
+// 9044441 is a damage voice; 935 is a saw change, and the old scrapes are bowgun/knee sounds.
+// Keep unrelated custom selections. This runs only at settings load, never per frame.
+inline void RepairLegacyPool(Pool& pool, bool tap) {
+    Pool repaired{};
+    for (int i = 0; i < pool.n; ++i) {
+        auto id = pool.id[static_cast<size_t>(i)];
+        if (id == 9044441) {
+            id = 9000;
+        } else if (tap && id == 935) {
+            id = 9000;
+        } else if (!tap) {
+            if (id == 10601) {
+                id = 114426200;
+            } else if (id == 10600) {
+                id = 114426000;
+            } else if (id == 6103) {
+                id = 773;
+            }
+        }
+        const auto end = repaired.id.begin() + repaired.n;
+        if (std::find(repaired.id.begin(), end, id) == end) {
+            repaired.id[static_cast<size_t>(repaired.n++)] = id;
+        }
+    }
+    pool = repaired;
+}
+
 inline bool ParseBladeSoundSetting(const std::string& key, const std::string& value) {
     auto& s = GetSettings();
     if (key == "blade_sounds") {
         s.on = value == "1" || value == "true";
     } else if (key == "blade_sound_tap") {
         ParsePool(value, s.tap);
+        RepairLegacyPool(s.tap, true);
     } else if (key == "blade_sound_scrape") {
         ParsePool(value, s.scrape);
+        RepairLegacyPool(s.scrape, false);
     } else if (key == "blade_grind") {
         if (value == "0" || value == "1" || value == "2") {
             s.grind = value[0] - '0';
@@ -173,8 +201,8 @@ inline void WriteBladeSoundDefaults(std::ostream& out) {
            "of the\n# Blade of Mercy / Rakuyo; solid or not): a touch taps, a blade drawn along the "
            "other\n# scrapes like a sharpening stroke, back and forth a stroke each way\n"
         << "blade_sounds=" << (d.on ? 1 : 0) << "\n"
-        << "# the game's sounds for each (SoundType 1 ids, comma separated, at most 6; never the "
-           "same twice\n# in a row): a touch, a blade drawn along the other\n"
+        << "# the game's sounds for each (SoundType 1 ids, comma separated, at most 6; avoids "
+           "repeats\n# with multiple entries): a touch, a blade drawn along the other\n"
         << "blade_sound_tap=" << PoolText(d.tap) << "\n"
         << "blade_sound_scrape=" << PoolText(d.scrape) << "\n"
         << "# a blade drawn along the other grinds on while it slides (louder and brighter the "

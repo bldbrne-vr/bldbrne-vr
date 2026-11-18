@@ -16,6 +16,7 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
+#include "common/frame_timeline.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "core/vr/vr_session.h"
@@ -315,6 +316,7 @@ void VideoOutDriver::DrawLastFrame() {
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/, u64 vr_flip /*= 0*/) {
     FastRender::NoteFrame();
+    const s64 submitted_ns = Common::FrameTimeline::Now();
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
@@ -334,16 +336,17 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         vr_flip = VR::OnFlipSubmitted();
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
         liverpool->SendCommand(
-            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, vr_flip); });
+            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, vr_flip, submitted_ns); });
     } else {
-        SubmitFlipInternal(port, index, flip_arg, is_eop, vr_flip);
+        SubmitFlipInternal(port, index, flip_arg, is_eop, vr_flip, submitted_ns);
     }
 
     return true;
 }
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
-                                        u64 vr_flip) {
+                                        u64 vr_flip, s64 submitted_ns) {
+    Common::FrameTimeline::Decoded(submitted_ns);
     // VR test (VR_TEST_CP_DELAY_US=N): the GPU thread sleeps N us at every flip, so it falls
     // behind the game's render thread as in a heavy area (flips queued with later camera updates).
     static const s64 test_delay_us = [] {
@@ -358,6 +361,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
     // update queued with the flip's ticket at submission).
     const VR::FrameTag vr_tag =
         VR::OnGpuFrameBoundary(vr_flip, [] { presenter->GetRasterizer().Finish(); });
+    Common::FrameTimeline::Rendered();
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
         frame->vr_tag = vr_tag;
@@ -370,14 +374,19 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         frame = presenter->PrepareFrame(group, buffer.address_left, vr_tag);
     }
 
-    std::scoped_lock lock{mutex};
-    requests.push({
-        .frame = frame,
-        .port = port,
-        .flip_arg = flip_arg,
-        .index = index,
-        .eop = is_eop,
-    });
+    {
+        std::scoped_lock lock{mutex};
+        requests.push({
+            .frame = frame,
+            .port = port,
+            .flip_arg = flip_arg,
+            .index = index,
+            .eop = is_eop,
+        });
+    }
+    // VR: the next flip's output frame now, so its wait comes before that frame's commands, not
+    // between the finished frame and the headset (Presenter::ReserveRenderFrame).
+    presenter->ReserveRenderFrame();
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {

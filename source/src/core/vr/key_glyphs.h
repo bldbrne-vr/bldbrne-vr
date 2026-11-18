@@ -24,8 +24,9 @@
 #include "core/vr/thumb_layout.h"
 #include "core/vr/tpf_patch.h"
 
-// The game's button icons as the VR controllers' buttons (vr.ini ui_vr_buttons; header-only, no
-// emulator dependencies; tests/test_key_glyphs.cpp).
+// The game's button icons as the VR controllers' buttons (vr.ini ui_vr_buttons), or as an Xbox
+// pad's in a gamepad play style (XboxGlyphs below; header-only, no emulator dependencies;
+// tests/test_key_glyphs.cpp).
 //
 // Every button icon the game draws (the key guide under each menu, YES / NO dialogs, the quick
 // menu grid, messages, the controls help) is one of the 32 x 32 KG_* textures of
@@ -39,9 +40,11 @@
 //
 //   ✕ (KG_Cancel) -> A     ○ (KG_OK) -> B       □ (KG_R_L) -> LG     △ (KG_R_U) -> RG
 //   L1 -> LT               R1 -> RT              OPTIONS (KG_Start) -> ≡ (the Menu button)
+//   L3 / R3 -> a round LS / RS (a stick click tapped)    L2 / R2 -> a long LS / RS (held)
+//   the touchpad's left half (KG_TP_L) -> a round X (tapped), its right (KG_TP_R) -> a long X
 //
-// The rest stay the game's: L2 / R2 (nothing in a VR menu), L3 / R3 and the sticks (the sticks'
-// own clicks and pushes), the D-pad and the touchpad.
+// Round is a tap, long a hold (2026-11-12, the game menu branch's tap / hold rules). The rest stay
+// the game's: the sticks (their pushes) and the D-pad.
 //
 // The gameplay HUD (fe.gfx: the action prompts, "Operate Device", "Open Door") draws its own
 // smaller ✕, ○ and △ from two of its atlases (HudGlyphs). Those are shown in gameplay, so they get
@@ -55,22 +58,59 @@ using u32 = std::uint32_t;
 constexpr int Size = 32; // texels
 constexpr int Super = 4; // supersampling per axis
 
-enum class Shape : u8 { Disc, Pill, Menu };
+enum class Shape : u8 { Disc, Pill, Menu, View };
+
+struct Ink {
+    u8 r, g, b;
+};
+inline constexpr Ink Light{228, 228, 232};
 
 struct Glyph {
     std::u16string_view texture;
     Shape shape;
     const char* text; // Disc / Pill: the letters
+    Ink ink{Light};   // the letters' (or the symbol's) colour
 };
 
-inline constexpr std::array<Glyph, 7> Glyphs{{
-    {u"KG_Cancel", Shape::Disc, "A"}, // the game's ✕: confirm (A, or X)
+inline constexpr std::array<Glyph, 13> Glyphs{{
+    {u"KG_Cancel", Shape::Disc, "A"}, // the game's ✕: confirm (A)
     {u"KG_OK", Shape::Disc, "B"},     // ○: back (B, or Y)
     {u"KG_R_L", Shape::Pill, "LG"},   // □: the left grip
     {u"KG_R_U", Shape::Pill, "RG"},   // △: the right grip
     {u"KG_L1", Shape::Pill, "LT"},    // the left trigger
     {u"KG_R1", Shape::Pill, "RT"},    // the right trigger
-    {u"KG_Start", Shape::Menu, ""},   // OPTIONS: the Menu button (≡)
+    {u"KG_L3", Shape::Disc, "LS"},    // L3: the left stick's click, tapped (as the Xbox pad's)
+    {u"KG_R3", Shape::Disc, "RS"},    // R3: the right one's (the inventory's Help)
+    {u"KG_L2", Shape::Pill, "LS"},    // L2: the left stick's click held (the storage box)
+    {u"KG_R2", Shape::Pill, "RS"},    // R2: the right one held
+    {u"KG_TP_L", Shape::Disc, "X"},   // the touchpad's left half: X tapped (Controls)
+    {u"KG_TP_R", Shape::Pill, "X"},   // its right half: X held (Sort)
+    {u"KG_Start", Shape::Menu, ""},   // OPTIONS: the Menu button (≡); stays last (the tests)
+}};
+
+// An Xbox pad's buttons instead (a gamepad play style with an Xbox or other non-PlayStation pad
+// connected at the start: bloodborne_vrtile.cpp): the face buttons' letters in the Xbox colours, the
+// bumpers, triggers and stick clicks in the game's own gold (its L1 / L3), so they sit with its
+// D-pad and stick icons, which stay.
+//
+//   ✕ -> A   ○ -> B   □ -> X   △ -> Y   L1 / R1 -> LB / RB   L2 / R2 -> LT / RT
+//   L3 / R3 -> LS / RS   OPTIONS -> ≡ (Menu)   the touchpad (both halves) -> ⧉ (View)
+inline constexpr Ink XboxA{88, 192, 64}, XboxB{208, 44, 40}, XboxX{44, 112, 232},
+    XboxY{236, 184, 36}, Gold{196, 164, 116};
+inline constexpr std::array<Glyph, 13> XboxGlyphs{{
+    {u"KG_Cancel", Shape::Disc, "A", XboxA},
+    {u"KG_OK", Shape::Disc, "B", XboxB},
+    {u"KG_R_L", Shape::Disc, "X", XboxX},
+    {u"KG_R_U", Shape::Disc, "Y", XboxY},
+    {u"KG_L1", Shape::Pill, "LB", Gold},
+    {u"KG_R1", Shape::Pill, "RB", Gold},
+    {u"KG_L2", Shape::Pill, "LT", Gold},
+    {u"KG_R2", Shape::Pill, "RT", Gold},
+    {u"KG_L3", Shape::Disc, "LS", Gold},
+    {u"KG_R3", Shape::Disc, "RS", Gold},
+    {u"KG_Start", Shape::Menu, ""},
+    {u"KG_TP_L", Shape::View, ""},
+    {u"KG_TP_R", Shape::View, ""},
 }};
 
 // ---- Drawing (straight-alpha RGBA8, 32 x 32) ----------------------------------------------------
@@ -142,8 +182,31 @@ inline std::vector<u8> Draw(const Glyph& g, const GameText::GameFont* font, int 
             Over(c, y * Hi + x, v, v, v * 1.04f, body);
         }
     }
-    const float ink_r = 228 / 255.0f, ink_g = 228 / 255.0f, ink_b = 232 / 255.0f;
-    if (g.shape == Shape::Menu) {
+    const float ink_r = g.ink.r / 255.0f, ink_g = g.ink.g / 255.0f, ink_b = g.ink.b / 255.0f;
+    if (g.shape == Shape::View) {
+        // ⧉: two overlapping rounded frames, the front one filled with the body to hide the back
+        // one's corner.
+        const float fw = 1.25f * s; // the frames' width
+        const float body_v = 40.0f / 255.0f;
+        const auto frame = [&](float fx, float fy, bool fill) {
+            for (int y = 0; y < Hi; ++y) {
+                for (int x = 0; x < Hi; ++x) {
+                    const float d =
+                        RoundBox(x + 0.5f, y + 0.5f, fx, fy, 5.2f * s, 4.2f * s, 1.4f * s);
+                    if (fill) {
+                        if (const float a = Cover(d); a > 0.0f) {
+                            Over(c, y * Hi + x, body_v, body_v, body_v * 1.04f, a);
+                        }
+                    }
+                    if (const float a = Cover(std::abs(d + 0.5f * fw) - 0.5f * fw); a > 0.0f) {
+                        Over(c, y * Hi + x, ink_r, ink_g, ink_b, a);
+                    }
+                }
+            }
+        };
+        frame(cx - 2.3f * s, cy - 2.0f * s, false);
+        frame(cx + 2.3f * s, cy + 2.0f * s, true);
+    } else if (g.shape == Shape::Menu) {
         // ≡: three bars with round ends.
         for (int bar = -1; bar <= 1; ++bar) {
             const float by = cy + bar * 4.6f * s;
@@ -162,7 +225,11 @@ inline std::vector<u8> Draw(const Glyph& g, const GameText::GameFont* font, int 
         if (font == nullptr) {
             return {};
         }
-        const float em = (g.shape == Shape::Pill ? 14.0f : 19.0f) * s;
+        // Two letters on a disc (LS, RS) a size down, as the game's own L3.
+        const float em = (g.shape == Shape::Pill                         ? 14.0f
+                          : g.text[0] != '\0' && g.text[1] != '\0' ? 15.0f
+                                                                     : 19.0f) *
+                         s;
         GameText::Line line;
         if (!GameText::RasterizeLine(*font, g.text, em, g.shape == Shape::Pill ? 0.4f * s : 0.0f,
                                      2, line) ||
@@ -531,10 +598,11 @@ inline std::vector<u8> EncodeBc7(std::span<const u8> rgba, int width, int height
 
 // ---- Into the atlas -----------------------------------------------------------------------------
 
-// Writes every glyph (Glyphs) into the unpacked common.tpf in place: `written` counts them; the
-// returned text lists what was refused ("" = all). A texture that is not the retail 32 x 32 BC7
-// one is left as it is.
-inline std::string Apply(std::span<u8> tpf, const GameText::GameFont* font, int& written) {
+// Writes every glyph of `glyphs` (Glyphs: the VR controllers'; XboxGlyphs) into the unpacked
+// common.tpf in place: `written` counts them; the returned text lists what was refused ("" = all).
+// A texture that is not the retail 32 x 32 BC7 one is left as it is.
+inline std::string Apply(std::span<u8> tpf, const GameText::GameFont* font, int& written,
+                         std::span<const Glyph> glyphs = Glyphs) {
     written = 0;
     std::string why;
     const auto refuse = [&why](std::u16string_view name, const char* reason) {
@@ -547,7 +615,7 @@ inline std::string Apply(std::span<u8> tpf, const GameText::GameFont* font, int&
         why += ": ";
         why += reason;
     };
-    for (const Glyph& g : Glyphs) {
+    for (const Glyph& g : glyphs) {
         const auto t = TpfPatch::FindTexture(tpf, g.texture);
         if (!t) {
             refuse(g.texture, "no such texture");
@@ -597,12 +665,20 @@ inline constexpr std::array<HudGlyph, 4> HudGlyphs{{
     {u"MENU_Common_00092", 703, 108, 25, Thumbs::Control::B, "cross"},    // interact
 }};
 
+// An Xbox pad's button for a HUD glyph of the game: ✕ A, ○ B, △ Y (XboxGlyphs' colours).
+inline Glyph XboxHudGlyph(const HudGlyph& h) {
+    const std::string_view game = h.game;
+    if (game == "cross") return {h.texture, Shape::Disc, "A", XboxA};
+    if (game == "circle") return {h.texture, Shape::Disc, "B", XboxB};
+    return {h.texture, Shape::Disc, "Y", XboxY}; // triangle
+}
+
 // Redraws every HudGlyphs cell in place (the cell and a 1-texel ring around it, which only held
 // the old glyph's faint edge; the blocks it touches decoded, changed and encoded again; the rest of
-// those blocks keep the game's texels). `swap`: swap_sticks. `written` counts them; the returned
-// text lists what was refused ("" = all).
+// those blocks keep the game's texels): the gameplay layout's buttons (`swap`: swap_sticks), or with
+// `xbox` an Xbox pad's. `written` counts them; the returned text lists what was refused ("" = all).
 inline std::string ApplyHud(std::span<u8> tpf, const GameText::GameFont* font, bool swap,
-                            int& written) {
+                            int& written, bool xbox = false) {
     written = 0;
     std::string why;
     const auto refuse = [&why](const HudGlyph& h, const char* reason) {
@@ -623,7 +699,8 @@ inline std::string ApplyHud(std::span<u8> tpf, const GameText::GameFont* font, b
             refuse(h, "not the HUD's BC7 atlas");
             continue;
         }
-        const Glyph g{h.texture, Shape::Disc, Thumbs::LabelFor(h.logical, swap)};
+        const Glyph g = xbox ? XboxHudGlyph(h)
+                             : Glyph{h.texture, Shape::Disc, Thumbs::LabelFor(h.logical, swap)};
         // The game's discs fill their cells: ours too (26 texels across in a 32-texel icon).
         const std::vector<u8> badge =
             Draw(g, font, static_cast<int>(h.size), (static_cast<float>(h.size) - 0.5f) / 26.0f);

@@ -27,7 +27,30 @@
 // newest tick began (a shorter tick keeps its level that long), and only while the last call
 // still runs. Before this, every frame re-sent the level for 20 ms: ~120 calls a second per hand,
 // each replacing the vibration playing, while a Touch controller takes tens of ms to act on one.
+//
+// The frequency (2026-11-03: PS VR2 felt flat): each call carries the frequency of what
+// plays, crisp ticks high and deep thumps low, and a change of it is a call of its own. The
+// presenter sends it to the PS VR2 Sense controllers only (PSVR2 Toolkit draws its waveform at
+// it); every other controller gets none (all frequencies 0 in the Input), as always, its driver
+// choosing (a resonant motor goes weak away from its sweet spot). 0 = unspecified.
 namespace VR::Haptics {
+
+// A pattern step that names no frequency (DefaultHz): a short one is a crisp tick, a strong long
+// one a deep thump, the rest between. The hum (a swing's arc, a charge, the armed vial) and the
+// game's rumble have theirs.
+inline constexpr float TickHz = 260.0f;
+inline constexpr float BodyHz = 160.0f;
+inline constexpr float ThumpHz = 80.0f;
+inline constexpr float HumHz = 170.0f;
+inline constexpr float RumbleHz = 120.0f;
+inline constexpr float ShortStepS = 0.045f; // shorter: a tick
+inline constexpr float ThumpPeak = 0.75f;   // a longer step this strong (or more): a thump
+inline float DefaultHz(float peak, float seconds) {
+    if (!(seconds >= ShortStepS)) {
+        return TickHz;
+    }
+    return peak >= ThumpPeak ? ThumpHz : BodyHz;
+}
 
 struct Config {
     float gain{1.0f};                       // haptic_gain (0 = off)
@@ -48,6 +71,10 @@ struct Input {
     // pattern): the hum and the rumble are left out of the level (still in the diagnostics), so
     // an enemy's blows (0.8) or a swing's arc never smear its shape; they come back after it.
     bool own{};
+    // The frequency of each (Hz, 0 unspecified): the call takes the one of the level it plays.
+    float tick_hz{};
+    float hum_hz{HumHz};
+    float rumble_hz{RumbleHz};
 };
 
 enum class Call { None, Apply, Stop };
@@ -56,6 +83,7 @@ struct Decision {
     Call call{Call::None};
     float amplitude{};          // Apply: 0 .. 1
     std::int64_t duration_ns{}; // Apply
+    float hz{};                 // Apply: its frequency (0 unspecified)
     // This frame's levels after the gain (diagnostics): tick before the floor, hum, rumble, and
     // the level played (0 below the audible threshold).
     float tick{};
@@ -69,6 +97,7 @@ struct Output {
 
     bool vibrating{false};   // a call started a vibration that was neither stopped nor lapsed
     float applied{};         // its amplitude
+    float applied_hz{};      // and frequency
     std::int64_t until_ns{}; // when it runs out by itself
     std::int64_t onset_ns{}; // when the newest tick began (min_on counts from here)
     bool tick_on{false};     // the pattern was audible last frame
@@ -96,7 +125,14 @@ struct Output {
                              2 * period // the next frame may come late: no gap before its call
                        : c.keepalive_ns,
                 onset_ns + c.min_on_ns - now);
-            const bool changed = !vibrating || new_tick ||
+            // The frequency of the level played: the pattern's, else the hum's or the rumble's.
+            const float want_hz = tick_level >= hum_level ? in.tick_hz
+                                  : d.hum >= d.rumble    ? in.hum_hz
+                                                         : in.rumble_hz;
+            const float hz = std::isfinite(want_hz) && want_hz > 0.0f ? want_hz : 0.0f;
+            const bool retuned = (hz > 0.0f) != (applied_hz > 0.0f) ||
+                                 std::abs(hz - applied_hz) > 0.1f * std::max(hz, applied_hz);
+            const bool changed = !vibrating || new_tick || retuned ||
                                  std::abs(level - applied) >= std::max(0.05f, 0.15f * applied);
             const bool running_out =
                 until_ns - now < period + period / 2 && now + want > until_ns + period / 2;
@@ -104,6 +140,7 @@ struct Output {
                 d.call = Call::Apply;
                 d.amplitude = level;
                 d.duration_ns = std::max<std::int64_t>(want, 1'000'000);
+                d.hz = hz;
             }
             return d;
         }
@@ -118,13 +155,15 @@ struct Output {
 
     // The result of the Apply that Step asked for. A failed call (or XR_SESSION_NOT_FOCUSED) left
     // whatever played before to run out by itself: the next audible frame tries again.
-    void Applied(bool ok, float amplitude, std::int64_t duration_ns, std::int64_t now) {
+    void Applied(bool ok, float amplitude, std::int64_t duration_ns, std::int64_t now,
+                 float hz = 0.0f) {
         if (!ok) {
             vibrating = false;
             return;
         }
         vibrating = true;
         applied = amplitude;
+        applied_hz = hz;
         until_ns = now + duration_ns;
     }
 };
@@ -222,6 +261,22 @@ inline bool Replaces(int playing_priority, bool playing_impact, int next_priorit
     return next_priority >= playing_priority;
 }
 
+// A cut's tear (openxr_presenter.cpp MeleeEventKind::Sever) as the limb comes off, against what
+// the hand plays: its own cut's bite (`serial`, never 0) -> Continue (after the bite's full blow,
+// in its place, whatever the priorities); any other impact (a newer hit) -> GiveWay (never over
+// it); else -> Alone. The optional support-hand echo also yields to any other playing cue.
+enum class Tear : std::uint8_t { Continue, GiveWay, Alone };
+inline Tear TearFor(bool playing, std::uint32_t playing_sever, bool playing_impact,
+                    std::uint32_t serial, bool support_hand = false) {
+    if (playing && serial != 0 && playing_sever == serial) {
+        return Tear::Continue;
+    }
+    if (playing && (playing_impact || support_hand)) {
+        return Tear::GiveWay;
+    }
+    return Tear::Alone;
+}
+
 inline float Clamp01(float v) {
     return std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f;
 }
@@ -277,6 +332,13 @@ inline Shape MeleeImpact(float weight, float gain, float hold_ms = 0.0f, bool cr
     s.tail_from = std::min((0.70f + 0.15f * w) * g, 1.0f);
     s.tail_ms = 80.0f + 35.0f * w;
     return s;
+}
+
+// A pot/crate actually broke: less force and a shorter tail than flesh impact. Uses the normal
+// frequency fallback (short contact = TickHz), amplitude floor and per-user impact gain.
+inline Shape ObjectBreakImpact(float gain) {
+    const float g = std::isfinite(gain) ? std::clamp(gain, 0.0f, 1.5f) : 0.0f;
+    return {std::min(0.65f * g, 1.0f), 30.0f, 0.30f * g, 50.0f};
 }
 
 // A melee hit that did no damage (blocked, parried, immune): a dull short knock (0.51 played for

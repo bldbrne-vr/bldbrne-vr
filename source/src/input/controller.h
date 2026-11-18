@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -14,6 +15,7 @@
 #include "common/ring_buffer_queue.h"
 #include "core/libraries/pad/pad.h"
 #include "core/libraries/system/userservice.h"
+#include "input/pad_layers.h"
 
 namespace Input {
 
@@ -95,6 +97,16 @@ public:
 
     void Button(Libraries::Pad::OrbisPadButtonDataOffset button, bool isPressed);
     void Axis(Input::Axis axis, int value, bool smooth = true);
+    // The VR presenter's own presses and sticks (its PadMapper), kept apart from the gamepad's and
+    // the keyboard's (Button / Axis): the game sees a button held by either, and a stick the
+    // presenter drives off its rest (128; 0 for a trigger) over the physical one, which shows again
+    // when the presenter lets go. So a gamepad held through one of our presses is not dropped when
+    // we let go, and a gamepad event never ends a press or a stick we are holding.
+    void InjectButton(Libraries::Pad::OrbisPadButtonDataOffset button, bool isPressed);
+    void InjectAxis(Input::Axis axis, int value);
+    // The gamepad's and the keyboard's own buttons and sticks, without the presenter's, in one
+    // read (any thread).
+    PadLayers::Physical Physical();
     void UpdateGyro(const float gyro[3]);
     void UpdateAcceleration(const float acceleration[3]);
     void PollState();
@@ -109,8 +121,16 @@ public:
     float gyro_buf[3] = {0.0f, 0.0f, 0.0f}, accel_buf[3] = {0.0f, 9.81f, 0.0f};
     s32 user_id = Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID;
     SDL_Gamepad* m_sdl_gamepad = nullptr;
+    // The connected gamepad's type (taken at connect; UNKNOWN for none): any thread (the VR
+    // page names its buttons by it).
+    SDL_GamepadType GamepadType() const {
+        return m_gamepad_type.load(std::memory_order_relaxed);
+    }
 
 private:
+    std::atomic<SDL_GamepadType> m_gamepad_type{SDL_GAMEPAD_TYPE_UNKNOWN};
+    // The two layers of m_state (InjectButton, input/pad_layers.h): m_state_mutex.
+    PadLayers m_layers;
     // m_state_mutex must be held by the caller.
     void PushStateLocked(u64 timestamp = 0);
     void UpdateOrientationLocked(u64 timestamp);
@@ -155,5 +175,17 @@ public:
     }
     void ResetLightbarColors();
 };
+
+// A pad's buttons by Xbox's names (A B X Y, LB, RT ...) for an Xbox or a generic pad; by the
+// game's own (PlayStation's) for a PlayStation pad, none (the keyboard) and a Nintendo pad, whose
+// letters sit elsewhere (its B where Xbox has A): the VR page and the game's button icons.
+inline bool UsesXboxNames(SDL_GamepadType type) {
+    return type == SDL_GAMEPAD_TYPE_XBOX360 || type == SDL_GAMEPAD_TYPE_XBOXONE ||
+           type == SDL_GAMEPAD_TYPE_STANDARD;
+}
+
+// The type of the first connected gamepad (the one slot 0 gets), before the game opens it; UNKNOWN
+// for none.
+SDL_GamepadType FirstGamepadType();
 
 } // namespace Input

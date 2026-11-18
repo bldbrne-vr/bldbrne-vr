@@ -19,10 +19,11 @@
 // not move (the hunter's own wind-up in vanilla; measured in the mock, 0 = not measured); `flick`:
 // where a flick starts (a squeeze during a swing: the latest clip time before the switch at which
 // the weapon is still within 4 cm of its rest pose, measured; at least `still`). The cues
-// are the clip's own sounds (TAE 128, type 1: c<id>) and effects (TAE 96: ffx, dummy, slot; slot
-// -1 = one-shot) replayed without the body; the clip's body-only events (cancel windows, blends,
-// footsteps, cloth, the empty marker SpEffects 200 / 201 / 205 / 206 / 221, the gun-hide 322) are
-// not. `support`: Tested = seen
+// are the clip's own sounds (TAE 128, type 1: c<id>; type 5, s<id>, added by hand on 2026-11-17,
+// since the generator kept type 1 only: the Holy Moonlight Sword's and the Kos Parasite's) and
+// effects (TAE 96: ffx, dummy, slot; slot -1 = one-shot) replayed without the body; the clip's
+// body-only events (cancel windows, blends, footsteps, cloth, the empty marker SpEffects
+// 200 / 201 / 205 / 206 / 221, the gun-hide 322) are not. `support`: Tested = seen
 // working in the mock (eye dumps and the form flags), Untested = the same mechanism with only
 // cosmetic events, Vanilla = keeps the game's L1 (`why`: the clip carries gameplay events such as
 // SpEffects or bullets, there is no clip, or it is not a trick weapon).
@@ -36,10 +37,17 @@ struct Cue {
     CueKind kind;
     float t0;       // s into the clip
     float t1;       // the event's end (a held effect lives until then)
-    std::int32_t a; // Sound: the c-sound id; Ffx: the effect id
-    std::int32_t b; // Ffx: the dummy poly (10xxx / 12xxx: the right weapon's part 0 / part 2)
+    std::int32_t a; // Sound: the sound id; Ffx: the effect id
+    std::int32_t b; // Sound: its type (SoundC, SoundS); Ffx: the dummy poly (10xxx / 12xxx: the
+                    // right weapon's part 0 / part 2)
     std::int32_t c; // Ffx: the slot (-1: one-shot)
 };
+
+// A Sound cue's type (Cue::b): the hunter's c<id> (0, every generated row), or an effect's s<id>
+// (TAE 128 type 5, PlaySound's type 5: the Holy Moonlight Sword's blade swelling into its light,
+// s7010).
+inline constexpr std::int32_t SoundC = 0;
+inline constexpr std::int32_t SoundS = 5;
 
 struct Clip {
     std::int32_t family; // EquipParamWeapon id / 100000
@@ -55,6 +63,9 @@ struct Clip {
     const char* why; // Vanilla: why
     std::array<Cue, 8> cues;
     std::uint8_t cue_count;
+    // A SpEffect the clip adds, applied at the form switch instead (the game's own add; 0: none):
+    // Logarius' Wheel's B->A 6029 (2026-11-06: only the weapon transforms).
+    std::int32_t speffect{0};
 };
 
 // Generated table: keep clang-format away.
@@ -255,25 +266,24 @@ inline constexpr std::array<Clip, 60> Clips = {{
      {{{CueKind::Sound, 0.433f, 0.533f, 8512, 0, 0},
        {CueKind::Ffx, 0.567f, 0.667f, 60, 1, -1}}},
      2},
-    // Logarius' Wheel, A->B (a000_19160)
-    {120, true, 19160, 1.500f, 3, 0.700f, 0.000f, 0.000f, true, Support::Vanilla,
-     "the B->A clip adds SpEffect 6029",
-     {{{CueKind::Sound, 0.433f, 0.467f, 5600, 0, 0},
-       {CueKind::Sound, 0.433f, 0.500f, 5800, 0, 0},
-       {CueKind::Sound, 0.433f, 0.533f, 853, 0, 0},
-       {CueKind::Sound, 0.467f, 0.567f, 852, 0, 0},
-       {CueKind::Ffx, 0.667f, 0.767f, 7104, 10120, -1},
-       {CueKind::Sound, 2.767f, 2.800f, 8100, 0, 0}}},
-     6},
-    // Logarius' Wheel, B->A (a000_19310)
-    {120, false, 19310, 1.600f, 1, 0.300f, 0.000f, 0.000f, true, Support::Vanilla,
-     "the B->A clip adds SpEffect 6029",
+    // Logarius' Wheel, A->B (a000_19160; its TAE's c8100 at 2.767 s is past the 1.5 s clip)
+    {120, true, 19160, 1.500f, 3, 0.700f, 0.000f, 0.000f, true, Support::Untested,
+     nullptr,
      {{{CueKind::Sound, 0.433f, 0.467f, 5600, 0, 0},
        {CueKind::Sound, 0.433f, 0.500f, 5800, 0, 0},
        {CueKind::Sound, 0.433f, 0.533f, 853, 0, 0},
        {CueKind::Sound, 0.467f, 0.567f, 852, 0, 0},
        {CueKind::Ffx, 0.667f, 0.767f, 7104, 10120, -1}}},
      5},
+    // Logarius' Wheel, B->A (a000_19310): its SpEffect 6029 at the switch
+    {120, false, 19310, 1.600f, 1, 0.300f, 0.000f, 0.000f, true, Support::Untested,
+     nullptr,
+     {{{CueKind::Sound, 0.433f, 0.467f, 5600, 0, 0},
+       {CueKind::Sound, 0.433f, 0.500f, 5800, 0, 0},
+       {CueKind::Sound, 0.433f, 0.533f, 853, 0, 0},
+       {CueKind::Sound, 0.467f, 0.567f, 852, 0, 0},
+       {CueKind::Ffx, 0.667f, 0.767f, 7104, 10120, -1}}},
+     5, 6029},
     // Threaded Cane, A->B (a000_19150)
     {220, true, 19150, 1.167f, 5, 0.267f, 0.267f, 0.267f, true, Support::Tested,
      nullptr,
@@ -343,20 +353,24 @@ inline constexpr std::array<Clip, 60> Clips = {{
        {CueKind::Sound, 0.633f, 0.733f, 922, 0, 0},
        {CueKind::Ffx, 0.667f, 0.767f, 7101, 100, -1}}},
      5},
-    // Holy Moonlight Sword, A->B (a000_19560; no weapon clip: the parts change at the switch)
+    // Holy Moonlight Sword, A->B (a000_19560; no weapon clip: the parts change at the switch).
+    // Its s7010 (the blade swelling into its light, 4.5 s) by hand, 2026-11-17: its only sound.
     {260, true, 19560, 2.333f, 3, 0.467f, 0.467f, 0.467f, false, Support::Tested,
      nullptr,
      {{{CueKind::Ffx, 0.167f, 1.667f, 7116, 10120, 6},
+       {CueKind::Sound, 0.367f, 0.467f, 7010, SoundS, 0},
        {CueKind::Ffx, 0.467f, 1.667f, 7117, 12120, 7}}},
-     2},
-    // Holy Moonlight Sword, B->A (a000_19570; no weapon clip: the parts change at the switch)
+     3},
+    // Holy Moonlight Sword, B->A (a000_19570; no weapon clip: the parts change at the switch).
+    // Its s12390 (the light going out, 1.6 s) by hand, 2026-11-17.
     {260, false, 19570, 1.667f, 1, 0.467f, 0.450f, 0.456f, false, Support::Tested,
      nullptr,
      {{{CueKind::Ffx, 0.300f, 1.233f, 7118, 10120, 6},
+       {CueKind::Sound, 0.333f, 0.433f, 12390, SoundS, 0},
        {CueKind::Sound, 0.367f, 0.400f, 880, 0, 0},
        {CueKind::Sound, 0.433f, 0.467f, 4445, 0, 0},
        {CueKind::Ffx, 0.500f, 0.667f, 268, 10120, 2}}},
-     4},
+     5},
     // Rakuyo, A->B (a000_19580; no weapon clip: the parts change at the switch)
     {270, true, 19580, 1.233f, 3, 0.267f, 0.267f, 0.267f, false, Support::Tested,
      nullptr,
@@ -459,16 +473,32 @@ inline constexpr std::array<Clip, 60> Clips = {{
        {CueKind::Sound, 0.533f, 0.633f, 945, 0, 0},
        {CueKind::Sound, 0.533f, 0.633f, 940, 0, 0}}},
      6},
-    // Kos Parasite, A->B (a000_19130; no weapon clip: the parts change at the switch)
-    {380, true, 19130, 0.833f, 3, 0.200f, 0.000f, 0.000f, false, Support::Vanilla,
-     "Kos Parasite: not a trick weapon",
-     {{{CueKind::Sound, 0.033f, 0.067f, 8100, 0, 0}}},
-     1},
-    // Kos Parasite, B->A (a000_19280; no weapon clip: the parts change at the switch)
-    {380, false, 19280, 0.833f, 1, 0.267f, 0.000f, 0.000f, false, Support::Vanilla,
-     "Kos Parasite: not a trick weapon",
-     {{{CueKind::Sound, 0.033f, 0.067f, 8100, 0, 0}}},
-     1},
+    // Kos Parasite, A->B (a000_19720, its tendril weapon's: by hand, 2026-11-09; the generator
+    // gave it the fists' rows): the user, "when we transform to form B, we don't want to animate
+    // the hunter himself, just the weapon only". The tendril model (wp_a_1711) unfolds in its own
+    // a000_019720; without the Milkweed rune the parts change at the switch. MockXR 2026-11-09:
+    // A->B and B->A switched on time, the arms stayed on the controllers. Its s20255 (3.5 s) both
+    // ways by hand, 2026-11-17.
+    {380, true, 19720, 1.833f, 3, 0.600f, 0.000f, 0.000f, true, Support::Tested,
+     nullptr,
+     {{{CueKind::Sound, 0.000f, 0.100f, 951, 0, 0},
+       {CueKind::Sound, 0.533f, 0.633f, 953, 0, 0},
+       {CueKind::Sound, 0.533f, 0.633f, 20255, SoundS, 0},
+       {CueKind::Sound, 0.633f, 0.733f, 952, 0, 0},
+       {CueKind::Ffx, 0.633f, 1.633f, 7129, 53, 0},
+       {CueKind::Ffx, 0.633f, 1.633f, 7127, 3, 1}}},
+     6},
+    // Kos Parasite, B->A (a000_19730; no weapon clip: the parts change at the switch). Its clip's
+    // bullets (event 2, the parasite's burst as it lets go) are not fired: only the weapon.
+    {380, false, 19730, 1.700f, 1, 0.467f, 0.000f, 0.000f, false, Support::Tested,
+     nullptr,
+     {{{CueKind::Sound, 0.000f, 0.100f, 951, 0, 0},
+       {CueKind::Sound, 0.300f, 0.400f, 952, 0, 0},
+       {CueKind::Sound, 0.300f, 0.400f, 953, 0, 0},
+       {CueKind::Sound, 0.300f, 0.400f, 20255, SoundS, 0},
+       {CueKind::Ffx, 0.467f, 0.967f, 7130, 53, 0},
+       {CueKind::Ffx, 0.467f, 0.967f, 7128, 3, 1}}},
+     6},
     // weapon 390, A->B (a000_19700)
     {390, true, 19700, 0.000f, 3, 0.767f, 0.000f, 0.000f, true, Support::Vanilla,
      "no clip length",

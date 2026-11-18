@@ -57,6 +57,9 @@ VrTemporalRuntime::Result VrTemporalRuntime::BeginPair(const VR::Graphics::Confi
                     session && fsr->FencedSpdInstalled()};
         });
 }
+std::string VrTemporalRuntime::FsrBridgeStatus() const {
+    return !initialization.valid() && fsr ? fsr->BridgeStatus() : std::string{};
+}
 VrTemporalRuntime::InitializationResult VrTemporalRuntime::Initialize(
         const VR::Graphics::Config& accepted, const VrTemporalPair::Plan& plan,
         uint64_t ticket, uint64_t completed) {
@@ -96,7 +99,8 @@ VrTemporalRuntime::InitializationResult VrTemporalRuntime::Initialize(
     if (device.waitForFences(*fence, true, UINT64_MAX) != vk::Result::eSuccess)
         return fail("Provider initialization GPU completion failed");
     std::string why;
-    if (result == Result::Unavailable || result == Result::Failed || result == Result::Invalid) {
+    if (result == Result::Unavailable || result == Result::Failed || result == Result::Invalid ||
+        result == Result::FocusFailed) {
         why = accepted.upscaler == VR::Graphics::Upscaler::Dlss
             ? VrDlssRuntime::Get().Problem() : fsr ? fsr->Problem() : "FSR runtime unavailable";
         if (why.empty()) why = "Stereo provider initialization failed";
@@ -108,9 +112,11 @@ VrTemporalPair::Result VrTemporalRuntime::Begin(const VR::Graphics::Config& acce
     if (initialization.valid()) {
         if (initialization.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
             return accepted.upscaler == VR::Graphics::Upscaler::Off ? Result::Disabled : Result::Pending;
+        bool retry_whole_eyes = false;
         try {
             auto done = initialization.get();
             problem = std::move(done.problem);
+            retry_whole_eyes = done.result == Result::FocusFailed;
             initialization_failed = done.result == Result::Failed || done.result == Result::Unavailable ||
                                     done.result == Result::Invalid;
         } catch (const std::exception& e) {
@@ -122,6 +128,13 @@ VrTemporalPair::Result VrTemporalRuntime::Begin(const VR::Graphics::Config& acce
         g_upscaler_fast.fsr4_spd.store(pair.FsrSpdState(), std::memory_order_relaxed);
         g_fsr4_interleave.bridge.store(pair.FsrPairSupport(), std::memory_order_relaxed);
         g_dlss_direct.twin.store(pair.DlssTwinState(), std::memory_order_relaxed);
+        if (retry_whole_eyes) {
+            DlssFocus::Off("the provider could not initialize the cropped eyes");
+            // This frame already has a cropped plan. The next whole-eye plan retires the
+            // failed pair through the normal timeline before starting another initialization.
+            if (accepted.upscaler != VR::Graphics::Upscaler::Off)
+                return Result::Pending;
+        }
     }
     if (accepted.upscaler == VR::Graphics::Upscaler::Off) {
         initialization_failed = false;

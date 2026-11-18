@@ -8,6 +8,8 @@
 namespace Common {
 
 extern const char g_version[];
+inline constexpr char g_application_name[] = "BLDBRNE-VR";
+extern const char g_application_title[];
 extern const bool g_is_release;
 
 extern const char g_scm_rev[];

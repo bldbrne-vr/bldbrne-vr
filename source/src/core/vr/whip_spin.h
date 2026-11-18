@@ -55,7 +55,7 @@ struct PayoutConfig {
 };
 
 // Give the heavy chain time to finish its flight and land before passive recall.
-// Beast Cutter adds 500 ms to its pause (default 0.90 -> 1.40 s).
+// Beast Cutter adds 500 ms to its pause (default 0.90 -> 1.40 s; whip_cutter_hold_s sets its own).
 // Cane: shorten only the slow-motion pause (default 0.60 -> 0.42 s), keeping its return
 // duration unchanged. Payout resets this timer whenever swing speed recovers, so brief
 // direction reversals do not accumulate toward a recall.
@@ -75,6 +75,7 @@ public:
     // light move's; a heavy or charged window's), `dt` (s). Returns the extension to pay out to.
     float Step(float speed, float cap, float dt, const PayoutConfig& c,
                bool recall = false) {
+        start_ = target_;
         if (recall) {
             Recall();
             return target_;
@@ -97,6 +98,21 @@ public:
         target_ = std::min(target_, cap); // a heavy window's reach over: back to the light's
         return target_;
     }
+    // The extension asked for set from outside (the Beast Cutter's momentum length, whip_cutter_lab),
+    // after this frame's Step: reeled against the frame's start (Step's speed payout in between is
+    // not the chain out; read against it, every frame of a fast tip with the chain asked in reeled).
+    void SetTarget(float target) {
+        target = std::isfinite(target) ? std::max(target, 1.0f) : 1.0f;
+        reeled_ = start_ > 1.02f && target <= 1.02f;
+        target_ = target;
+        start_ = target;
+        slow_ = 0.0f;
+    }
+    // Out, the slow pause starts again from now (the Beast Cutter's tip still flying:
+    // whip_cutter_tip_keep): the chain comes back only after its own momentum is spent.
+    void KeepOut() {
+        if (Out()) slow_ = 0.0f;
+    }
     void Recall() {
         reeled_ = target_ > 1.02f;
         target_ = 1.0f;
@@ -118,12 +134,14 @@ public:
     }
     void Reset() {
         target_ = 1.0f;
+        start_ = 1.0f;
         slow_ = 0.0f;
         reeled_ = false;
     }
 
 private:
     float target_{1.0f};
+    float start_{1.0f}; // target_ as this frame began (Step), else as last set (SetTarget)
     float slow_{0.0f};
     bool reeled_{false};
 };

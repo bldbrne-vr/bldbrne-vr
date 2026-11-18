@@ -30,6 +30,10 @@ void InstallPlayerHook(VAddr base, u64 size);
 // The instant injection is installed (it may still disable itself later).
 [[nodiscard]] bool IsHealInstalled();
 
+// The game takes no items from `player` now (its state info 154, the Blood Vial's own refusal);
+// the main player's update (site A) only.
+[[nodiscard]] bool ItemUseForbidden(const u8* player);
+
 // The player update hook is installed (the menu detection samples in it).
 [[nodiscard]] bool IsPlayerHookInstalled();
 

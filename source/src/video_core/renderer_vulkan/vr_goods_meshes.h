@@ -26,6 +26,23 @@ inline void SetMaterial(MeshData& m, float material, float cavity = 0.0f) {
     for (auto& v : m.vertices) v.aux = {material, cavity};
 }
 
+// Built once, no texture allocation. A slightly bent 75 mm hand-rolled cigarette.
+inline MeshData CigaretteMesh(bool packet) {
+    if (packet) {
+        auto mesh = RoundedBox({.027f, .043f, .011f}, .0012f, 2);
+        SetMaterial(mesh, 20);
+        return mesh;
+    }
+    const std::array<LoftRing, 4> rings{{
+        {{0,-.012f,0},{1,0,0},{0,0,1},.0035f,.0032f},
+        {{0,.012f,0},{1,0,0},{0,0,1},.0037f,.0034f},
+        {{.001f,.048f,0},{1,0,0},{0,0,1},.0035f,.0033f},
+        {{.0015f,.063f,.0005f},{1,0,0},{0,0,1},.0032f,.003f}}};
+    auto mesh = Loft(rings, 10, {0,-.012f,0}, {.0015f,.063f,.0005f});
+    SetMaterial(mesh, 19);
+    return mesh;
+}
+
 // A cheap smooth noise for crumples and lumps (-1 .. 1).
 inline float GoodsNoise(Vec3 p) {
     return (std::sin(p.x * 1.7f + std::sin(p.y * 2.3f)) * std::sin(p.y * 1.9f + p.z * 1.3f) +
@@ -605,6 +622,35 @@ inline MeshData SkullMeshFrom(std::span<const u8> data) {
     mesh.closed = false; // the teeth are separate parts
     return mesh;
 }
+// Prefractured relic: bounded embedded data, loaded once. Material 8's fractional part
+// encodes piece 0..11; +.25 marks the unadorned fracture interior. Each triangle is uniform.
+inline MeshData MessengerChunksFrom(std::span<const u8> data) {
+    if (data.size()<12 || data[0]!='M' || data[1]!='G' || data[2]!='F' || data[3]!='1') return {};
+    const auto u32_at = [&](size_t at) {
+        return u32(data[at]) | u32(data[at+1])<<8 | u32(data[at+2])<<16 | u32(data[at+3])<<24;
+    };
+    const u32 nv=u32_at(4), ni=u32_at(8);
+    if (nv==0 || nv>=20000 || ni==0 || ni>=60000 || ni%3 ||
+        data.size()!=12+size_t(nv)*12+size_t(ni)*2) return {};
+    MeshData mesh{}; mesh.vertices.reserve(nv); mesh.indices.reserve(ni);
+    for (u32 i=0;i<nv;++i) {
+        const size_t at=12+size_t(i)*12;
+        if (data[at+10]>=12 || data[at+11]>1) return {};
+        const auto coord=[&](int j){return float(static_cast<s16>(data[at+j]|u16(data[at+j+1])<<8))*1e-4f;};
+        const Vec3 normal{float(static_cast<s8>(data[at+6])),float(static_cast<s8>(data[at+7])),float(static_cast<s8>(data[at+8]))};
+        mesh.vertices.push_back({{coord(0),coord(2),coord(4)},Normalize(normal),
+                                 {8.0f+data[at+10]*.01f+data[at+11]*.25f,data[at+9]/255.0f}});
+    }
+    for (u32 i=0;i<ni;++i) {
+        const size_t at=12+size_t(nv)*12+size_t(i)*2;
+        const u32 index=data[at]|u32(data[at+1])<<8;
+        if(index>=nv) return {};
+        mesh.indices.push_back(index);
+    }
+    mesh.closed=false;
+    return mesh;
+}
+
 // Reuse established geometry and procedural materials for otherwise icon-only goods.
 // Variant order matches the contiguous MeshId entries beginning with HunterMark.
 inline MeshData ReusedGoodsMesh(int variant) {

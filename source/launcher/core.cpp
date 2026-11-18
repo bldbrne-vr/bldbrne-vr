@@ -6,9 +6,14 @@
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #include "core.h"
+#include "core/vr/game_reflections.h"
+#include "common/addon_content.h"
+#include "core/vr/native_views.h"
+#include "core/vr/vr_page.h"
 #include <algorithm>
 #include <array>
 #include <bcrypt.h>
+#include <cctype>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -180,10 +185,41 @@ fs::path NormalizeSaveHome(const fs::path &path) {
                                  "rather than an individual save.");
     return full;
 }
+// A PKG chosen as the game, or the folder it sits in (its own entries only, at most 64, the
+// answer kept for that path: this runs every frame), gets told what the launcher needs instead
+// (2026-10-26, the user). The launcher never unpacks a PKG: that needs decryption keys.
+static bool PkgInstead(const fs::path &path) {
+    const auto is_pkg = [](const fs::path &p) {
+        return _wcsicmp(p.extension().c_str(), L".pkg") == 0;
+    };
+    if (is_pkg(path))
+        return true;
+    thread_local fs::path checked;
+    thread_local bool found = false;
+    if (path != checked) {
+        checked = path;
+        found = false;
+        std::error_code ec;
+        int seen = 0;
+        for (fs::directory_iterator it(path, ec), end; !ec && it != end && seen < 64;
+             it.increment(ec), ++seen)
+            if (is_pkg(it->path()) && it->is_regular_file(ec)) {
+                found = true;
+                break;
+            }
+    }
+    return found;
+}
 fs::path GameExecutable(const fs::path &path) {
     const auto exe = fs::is_directory(path) ? path / "eboot.bin" : path;
-    if (!fs::is_regular_file(exe) || _wcsicmp(exe.filename().c_str(), L"eboot.bin") != 0)
+    if (!fs::is_regular_file(exe) || _wcsicmp(exe.filename().c_str(), L"eboot.bin") != 0) {
+        if (!path.empty() && PkgInstead(path))
+            throw std::runtime_error(
+                "That is a PKG file (or the folder it is in), not the game itself. Choose the "
+                "game's extracted folder: the one with eboot.bin and sce_sys / param.sfo. "
+                "Extract the PKG with a separate tool first, then choose that folder.");
         throw std::runtime_error("Choose the game folder containing eboot.bin.");
+    }
     if (!fs::is_regular_file(exe.parent_path() / "sce_sys" / "param.sfo"))
         throw std::runtime_error("The game folder is missing sce_sys / param.sfo.");
     return exe;
@@ -195,7 +231,8 @@ static constexpr const wchar_t *RendererEnvironment[]{
     L"VR_NATIVE_STEREO=1",
     // Each eye renders exactly its lens frustum (and the headset-size resolution template).
     L"VR_NATIVE_ASYMMETRIC=1",
-    L"VR_STREAM_MEM=shadow",
+    // The stream buffer's shadow in VR, cached memory in a flat run (buffer.cpp).
+    L"VR_STREAM_MEM=auto",
     L"VR_NATIVE_REUSE_DESCRIPTORS=1",
     L"VR_NATIVE_REUSE_CAMERA=1",
     L"VR_NATIVE_COALESCE_COPIES=1",
@@ -228,7 +265,10 @@ static const std::vector<VR::Ini::Edit> &RendererIni() {
         {"frame_cap", "auto"},        {"ui_layer", "1"},
         {"menu_present", "layer"},    {"vr_menu", "1"},
         {"late_warp", "0"},           {"eye_size", "auto"},
-        {"eye_sharpen", "0"}};
+        {"eye_sharpen", "0"},
+        // The DLSS model follows the preset (K, or M for Ultra Quality and Balanced Plus). A scan
+        // applied by 0.5.0 or 0.5.1 pinned K here, and nothing in the menus can change it back.
+        {"dlss_model", "builtin"}};
     return edits;
 }
 std::string PatchFrameRate(const std::string &xml, int hz) {
@@ -266,7 +306,8 @@ std::string PatchFrameRate(const std::string &xml, int hz) {
     doc.save(out);
     return out.str();
 }
-std::string LaunchConfig(const std::string &text, const fs::path &home, int refresh_hz) {
+std::string LaunchConfig(const std::string &text, const fs::path &home, int refresh_hz,
+                         const std::optional<fs::path>& addons) {
     auto json = text.empty() ? Json::object() : Json::parse(text);
     if (!json.is_object())
         throw std::runtime_error("config.json must contain an object.");
@@ -276,8 +317,11 @@ std::string LaunchConfig(const std::string &text, const fs::path &home, int refr
                                      " section.");
     auto &general = json["General"];
     general["home_dir"] = PathText(home);
-    // The VR resolution template allocates its eye targets from this.
-    general["extra_dmem_in_mbytes"] = 4000;
+    if (addons) general["addon_install_dir"] = PathText(*addons);
+    // The VR resolution template allocates its eye targets from this. Its graphics heaps
+    // (4080 + 2304 MiB) and the game's other startup allocations (1416 MiB) take 7800 of the
+    // 8108 MiB this gives.
+    general["extra_dmem_in_mbytes"] = 3500;
     general["show_splash"] = false;
     general["discord_rpc_enabled"] = false;
     auto &gpu = json["GPU"];
@@ -297,12 +341,27 @@ std::string LaunchConfig(const std::string &text, const fs::path &home, int refr
     vulkan["vkhost_markers"] = false;
     return json.dump(2) + "\n";
 }
-StereoPreset StartupStereo(uint64_t dedicated_bytes) {
-    return dedicated_bytes > 0 && dedicated_bytes <= (8ull << 30)
-               ? StereoPreset::Dibr : StereoPreset::Native;
+// Video memory no longer picks DIBR (2026-10-22): every card starts in native stereo, and DIBR is
+// the player's choice on the Play page. Only a driver without native stereo's multiview and the
+// AMD RX 400, RX 500 and RX 5000 cards (2026-10-26) start in DIBR (StartupStereo(const
+// SystemInfo&)).
+StereoPreset StartupStereo(uint64_t) {
+    return StereoPreset::Native;
 }
 StereoPreset StartupStereo(const SystemInfo &system) {
-    return system.multiview_limited ? StereoPreset::Dibr : StartupStereo(system.vram);
+    return system.multiview_limited || system.auto_dibr ? StereoPreset::Dibr
+                                                        : StartupStereo(system.vram);
+}
+std::wstring NativeViewsValue(NativeViews choice) {
+    switch (choice) {
+    case NativeViews::Multiview:
+        return L"multiview";
+    case NativeViews::Layers:
+        return L"layers";
+    case NativeViews::Auto:
+        break;
+    }
+    return {};
 }
 int GameRefreshRate(bool follow_headset, int manual_hz, float headset_hz) {
     if (!ValidGameRefreshHz(manual_hz)) throw std::runtime_error("Invalid game frame-rate cap.");
@@ -316,9 +375,44 @@ std::string LaunchIni(const std::string &text, StereoPreset preset, int refresh_
     // Zero means keep the runtime's display rate. Gameplay's cap is still set in
     // config.json and the private game patch using the resolved numeric rate.
     edits.push_back({"refresh_hz",follow_headset ? "0" : std::to_string(refresh_hz)});
+    // The frame-rate hooks' cap: following the headset, game_fps=0 holds the game at the
+    // headset's own refresh and follows a change made mid-game (the rate the session reports,
+    // else the shortest frame period seen: never a runtime's throttled period, 60d6d78f1);
+    // otherwise the chosen rate.
+    edits.push_back({"game_fps", follow_headset ? "0" : std::to_string(refresh_hz)});
     edits.push_back({"stereo", "1"});
     if (preset == StereoPreset::Dibr)
         edits.push_back({"late_warp", "1"});
+    return VR::Ini::ApplyEdits(text, edits);
+}
+std::string MigrateIni(const std::string &text, const std::vector<VR::Ini::Edit> &choices) {
+    // Merely opening the launcher on a fresh install must leave the file for the game to create.
+    if (choices.empty() && VR::Ini::Trim(text).empty())
+        return text;
+    std::vector<VR::Ini::Edit> edits;
+    if (VR::Ini::ValueOf(text, "quick_fan_seen") != "1") {
+        const auto pick = VR::Ini::ValueOf(text, "quick_arc_pick").value_or("");
+        const auto style = VR::Ini::ValueOf(text, "quick_fan_style").value_or("");
+        if (pick != "fan" && pick != "2" && pick != "sector" && pick != "1")
+            edits.push_back({"quick_arc_pick", "fan"});
+        edits.push_back({"quick_fan_style", style == "brass" || style == "1" ? "brass" : "lancet"});
+        edits.push_back({"quick_fan_seen", "1"});
+    }
+    const auto graphics_seen = VR::Ini::ValueOf(text, "newgfx_096_seen");
+    if (graphics_seen != "1" && graphics_seen != "true") {
+        // The runtime retires the old water override once. A Wetness pick sets both keys,
+        // but the launcher only queues values that differ from disk. Keep the water half
+        // of an explicit pick even if only its wet-streets half needed writing.
+        const bool picked_wetness = std::any_of(choices.begin(), choices.end(), [](const auto &edit) {
+            return (edit.key == "water_reflections" || edit.key == "wet_streets") && edit.value;
+        });
+        if (!picked_wetness)
+            edits.push_back({"water_reflections", std::nullopt});
+        edits.push_back({"newgfx_096_seen", "1"});
+    }
+    if (edits.empty() && choices.empty())
+        return text;
+    edits.insert(edits.end(), choices.begin(), choices.end());
     return VR::Ini::ApplyEdits(text, edits);
 }
 std::wstring NativeIpd(const std::string &ini, bool bundled_runtime) {
@@ -350,55 +444,23 @@ fs::path PatchFile(const fs::path &runtime) {
     }
     throw std::runtime_error("bbvr_patch.xml is missing. Use a complete package.");
 }
-static std::optional<std::string> SfoText(const fs::path &path, std::string_view name) {
-    // Bound both the file and every index before reading untrusted installation metadata.
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    const auto size = file.tellg();
-    if (!file || size < 20 || size > 4 * 1024 * 1024)
-        return std::nullopt;
-    std::string data(size_t(size), '\0');
-    file.seekg(0);
-    if (!file.read(data.data(), std::streamsize(data.size())) ||
-        data.compare(0, 4, std::string("\0PSF", 4)) != 0)
-        return std::nullopt;
-    auto u16 = [&](size_t at) -> uint16_t {
-        return uint16_t(uint8_t(data[at])) | uint16_t(uint8_t(data[at + 1])) << 8;
-    };
-    auto u32 = [&](size_t at) -> uint32_t {
-        return uint32_t(u16(at)) | uint32_t(u16(at + 2)) << 16;
-    };
-    const size_t keys = u32(8), values = u32(12), count = u32(16);
-    if (count > (data.size() - 20) / 16 || keys < 20 + 16 * count ||
-        values < keys || values > data.size())
-        return std::nullopt;
-    for (size_t i = 0; i < count; ++i) {
-        const size_t entry = 20 + 16 * i;
-        const size_t key = keys + u16(entry);
-        if (key >= values)
-            continue;
-        const auto end = data.find('\0', key);
-        if (end == std::string::npos || end >= values ||
-            std::string_view(data).substr(key, end - key) != name)
-            continue;
-        const size_t length = u32(entry + 4), offset = values + size_t(u32(entry + 12));
-        if (u16(entry + 2) != 0x0204 || offset > data.size() ||
-            length > data.size() - offset || length == 0 || length > 128)
-            return std::nullopt;
-        auto text = data.substr(offset, length);
-        const auto nul = text.find('\0');
-        if (nul == std::string::npos)
-            return std::nullopt;
-        text.resize(nul);
-        if (text.empty() || std::any_of(text.begin(), text.end(), [](unsigned char c) {
-                return c < 0x20 || c > 0x7e;
-            }))
-            return std::nullopt;
-        return text;
-    }
-    return std::nullopt;
-}
+using Common::Addons::SfoText;
 std::optional<std::string> AppVersion(const fs::path &param_sfo) {
     return SfoText(param_sfo, "APP_VER");
+}
+std::string SaveDataFolder(const fs::path &param_sfo) {
+    auto id = SfoText(param_sfo, "INSTALL_DIR_SAVEDATA");
+    if (!id)
+        id = SfoText(param_sfo, "TITLE_ID");
+    const auto plain = [](const std::string &s) {
+        return s.size() == 9 &&
+               std::all_of(s.begin(), s.begin() + 4, [](char c) { return c >= 'A' && c <= 'Z'; }) &&
+               std::all_of(s.begin() + 4, s.end(), [](char c) { return c >= '0' && c <= '9'; });
+    };
+    if (!id || !plain(*id))
+        throw std::runtime_error("The game's save folder (param.sfo INSTALL_DIR_SAVEDATA or "
+                                 "TITLE_ID) cannot be read. Select the complete game folder.");
+    return *id;
 }
 std::string FileSha256(const fs::path &path) {
     std::ifstream file(path, std::ios::binary);
@@ -505,6 +567,78 @@ std::string PatchForVersion(const std::string &xml, const std::string &version) 
     }
     if (count == 0)
         throw std::runtime_error("bbvr_patch.xml contains no patches. Use a complete Bldbrne-VR package.");
+    std::ostringstream output;
+    document.save(output, "    ", pugi::format_default, pugi::encoding_utf8);
+    return output.str();
+}
+std::string PatchIntelSfx(const std::string &xml, const fs::path &eboot, bool enabled) {
+    pugi::xml_document document;
+    if (!document.load_buffer(xml.data(), xml.size(), pugi::parse_full))
+        throw std::runtime_error("Invalid game patch file.");
+    auto metadata = document.child("Patch").find_child_by_attribute(
+        "Metadata", "Name", "Intel 12th Gen+ SFX workaround");
+    if (!metadata) {
+        if (enabled)
+            throw std::runtime_error("This package does not include the Intel SFX workaround.");
+        return xml;
+    }
+    // The signature below is meaningful only for this exact patch. Reject a damaged
+    // or ambiguous package instead of reporting protection that was not applied.
+    const auto line = metadata.child("PatchList").child("Line");
+    size_t matching_entries = 0;
+    for (const auto entry : document.child("Patch").children("Metadata"))
+        if (std::string_view(entry.attribute("Name").value()) == "Intel 12th Gen+ SFX workaround")
+            ++matching_entries;
+    if (matching_entries != 1 || !metadata.attribute("isEnabled") ||
+        std::string_view(metadata.attribute("AppElf").value()) != "eboot.bin" ||
+        !line || line.next_sibling("Line") ||
+        std::string_view(line.attribute("Type").value()) != "bytes" ||
+        std::string_view(line.attribute("Address").value()) != "0x02CF83E0" ||
+        std::string_view(line.attribute("Value").value()) != "c3")
+        throw std::runtime_error("The Intel SFX patch is invalid. Use a complete Bldbrne-VR package.");
+    if (enabled) {
+        // Bloodborne 1.09: emoose's workaround returns before this function's prologue.
+        // Check the exact site in addition to CheckGameBuild's frame-limiter signatures.
+        constexpr unsigned char expected[]{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+                                           0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec,
+                                           0xc8, 0x00, 0x00, 0x00};
+        unsigned char actual[sizeof(expected)]{};
+        std::ifstream file(eboot, std::ios::binary);
+        file.seekg(std::streamoff(0x28eb0) + 0x02cf83e0 - 0x400000);
+        file.read(reinterpret_cast<char *>(actual), sizeof(actual));
+        if (!file || !std::equal(std::begin(expected), std::end(expected), actual))
+            throw std::runtime_error("The Intel SFX workaround does not match this game executable. "
+                                     "Use the unmodified Bloodborne 1.09 executable.");
+    }
+    metadata.attribute("isEnabled").set_value(enabled ? "true" : "false");
+    std::ostringstream output;
+    document.save(output, "    ", pugi::format_default, pugi::encoding_utf8);
+    return output.str();
+}
+std::string PatchNonAggro(const std::string &xml, bool enabled) {
+    pugi::xml_document document;
+    if (!document.load_buffer(xml.data(), xml.size(), pugi::parse_full))
+        throw std::runtime_error("Invalid game patch file.");
+    auto metadata =
+        document.child("Patch").find_child_by_attribute("Metadata", "Name", "Non-aggro mode");
+    if (!metadata) {
+        if (enabled)
+            throw std::runtime_error("This package does not include Non-aggro mode.");
+        return xml;
+    }
+    // Exactly the one-byte flag write: a damaged package must not write anything else.
+    const auto line = metadata.child("PatchList").child("Line");
+    size_t entries = 0;
+    for (const auto entry : document.child("Patch").children("Metadata"))
+        if (std::string_view(entry.attribute("Name").value()) == "Non-aggro mode")
+            ++entries;
+    if (entries != 1 || !metadata.attribute("isEnabled") ||
+        std::string_view(metadata.attribute("AppElf").value()) != "eboot.bin" || !line ||
+        line.next_sibling("Line") || std::string_view(line.attribute("Type").value()) != "bytes" ||
+        std::string_view(line.attribute("Address").value()) != "0x0593E88E" ||
+        std::string_view(line.attribute("Value").value()) != "01")
+        throw std::runtime_error("The Non-aggro patch is invalid. Use a complete Bldbrne-VR package.");
+    metadata.attribute("isEnabled").set_value(enabled ? "true" : "false");
     std::ostringstream output;
     document.save(output, "    ", pugi::format_default, pugi::encoding_utf8);
     return output.str();
@@ -622,10 +756,19 @@ Profile Profile::Load(const Paths &paths) {
         const auto stereo = json.value("stereo", Json{});
         out.stereo = stereo == "dibr" ? StereoChoice::Dibr
                      : stereo == "native" ? StereoChoice::Native : StereoChoice::Auto;
+        const auto views = json.value("native_views", Json{});
+        out.native_views = views == "multiview" ? NativeViews::Multiview
+                           : views == "layers"  ? NativeViews::Layers
+                                                : NativeViews::Auto;
         out.refresh_hz=json.value("refresh_hz",90);
         out.follow_headset=json.value("follow_headset",false);
+        out.intel_sfx_workaround = json.value("intel_sfx_workaround", true);
+        out.non_aggro = json.value("non_aggro", false);
+        out.free_camera = json.value("free_camera", false);
+        out.headset = json.value("headset", "");
         if(!ValidGameRefreshHz(out.refresh_hz))out.refresh_hz=90;
         out.game = json.value("game", "");
+        out.dlc = json.value("dlc", "");
         out.saves = json.value("saves", "");
         out.runtime = json.value("runtime", "");
         out.fullscreen_chosen = json.value("fullscreen_chosen", false);
@@ -658,9 +801,17 @@ Profile Profile::Load(const Paths &paths) {
 }
 void Profile::Save(const Paths &paths) const {
     if (!ValidGameRefreshHz(refresh_hz)) throw std::runtime_error("Invalid game frame-rate cap.");
-    Write(paths.Profile(), Json{{"game", game},{"refresh_hz",refresh_hz},{"follow_headset",follow_headset},
+    Write(paths.Profile(), Json{{"game", game},{"dlc",dlc},{"refresh_hz",refresh_hz},{"follow_headset",follow_headset},
+                                {"intel_sfx_workaround", intel_sfx_workaround},
+                                {"non_aggro", non_aggro},
+                                {"free_camera", free_camera},
+                                {"headset", headset},
                                 {"stereo", stereo == StereoChoice::Dibr ? "dibr"
                                            : stereo == StereoChoice::Native ? "native" : "auto"},
+                                {"native_views",
+                                 native_views == NativeViews::Multiview ? "multiview"
+                                 : native_views == NativeViews::Layers  ? "layers"
+                                                                        : "auto"},
                                 {"saves", saves},
                                 {"runtime", runtime},
                                 {"fullscreen", fullscreen},
@@ -671,6 +822,81 @@ void Profile::Save(const Paths &paths) const {
                                    .dump(2) +
                                "\n");
 }
+// The Old Hunters' three areas in the game's own files: Hunter's Nightmare (m34), the Research
+// Hall (m35) and the Fishing Hamlet (m36), each its map folder and its MapStudio layout. The Game
+// of the Year Edition carries the DLC's licence itself: with no add-on mounted its saves mark the
+// DLC in use (userdata0010 byte 0x16 = 1; CUSA00900 without the add-on: 0, 2026-11-03). The areas
+// are in every 1.09 game folder, licensed or not, so they only show this edition's folder is
+// complete; they never prove the DLC for another edition.
+static bool BundledOldHunters(const fs::path &game) {
+    const auto map = game / "dvdroot_ps4" / "map";
+    for (const char *area : {"m34_00_00_00", "m35_00_00_00", "m36_00_00_00"}) {
+        std::error_code error;
+        if (!fs::is_directory(map / area, error) ||
+            !fs::is_regular_file(map / "MapStudio" / (std::string(area) + ".msb.dcx"), error))
+            return false;
+    }
+    return true;
+}
+DlcStatus ResolveDlc(const Paths& paths, const Profile& profile) {
+    const auto game = fs::absolute(GameExecutable(Path(profile.game))).parent_path();
+    const auto title = SfoText(game / "sce_sys" / "param.sfo", "TITLE_ID");
+    if (!title || !Common::Addons::TitleId(*title))
+        return {{}, "Cannot detect DLC: the game's TITLE_ID is missing or invalid.", false};
+    fs::path configured;
+    const auto text = Read(paths.Config());
+    if (!text.empty()) {
+        const auto json = Json::parse(text);
+        // Most configs have no addon_install_dir (or an empty one): no configured folder, not an
+        // error (Path("") throws "Choose a folder or file first.", which blocked every launch).
+        if (json.contains("General") && json["General"].is_object()) {
+            const auto& general = json["General"];
+            if (general.contains("addon_install_dir") && general["addon_install_dir"].is_string() &&
+                !VR::Ini::Trim(general["addon_install_dir"].get<std::string>()).empty())
+                configured = Path(general["addon_install_dir"].get<std::string>());
+        }
+    }
+    // The runtime starts in the data directory, not the launcher's working directory.
+    // Resolve typed paths now; existing relative runtime config is relative to that data root.
+    const auto data_root = fs::absolute(paths.root);
+    if (!configured.empty() && configured.is_relative()) configured = data_root / configured;
+    const auto requested = profile.dlc.empty() ? fs::path{} : fs::absolute(Path(profile.dlc));
+    const auto selected = Common::Addons::Find(game, requested, configured,
+                                               data_root/"user"/"addcont", *title, "SPEXPANSIONDLC03");
+    // The Game of the Year Edition (CUSA03173) has The Old Hunters in the game itself: said to be
+    // included only when its three areas are really in the game folder (BundledOldHunters).
+    const bool bundled = *title == "CUSA03173";
+    const bool bundled_found = bundled && BundledOldHunters(game);
+    const std::string bundled_missing =
+        "The Old Hunters not found: this edition includes it, but its areas are missing from the "
+        "game folder (the game starts without it).";
+    if (!selected.scan.entries.empty()) {
+        const bool hunters = std::any_of(selected.scan.entries.begin(), selected.scan.entries.end(),
+            [](const auto& e){ return e.label == "SPEXPANSIONDLC03"; });
+        std::string message = hunters ? "DLC FOUND: The Old Hunters."
+            : bundled_found ? "DLC INCLUDED: The Old Hunters is built into this edition."
+            : bundled       ? bundled_missing
+                            : "Additional content detected.";
+        if (selected.scan.limited || selected.scan.unreadable)
+            message += " (Some folders could not be checked; choose the DLC folder directly.)";
+        return {selected.root, message, true, hunters || bundled_found};
+    }
+    // A stale separate-DLC choice must not block an edition with bundled DLC.
+    if (bundled)
+        return {data_root/"user"/"addcont",
+                bundled_found ? "DLC INCLUDED: The Old Hunters is built into this edition."
+                              : bundled_missing,
+                true, bundled_found};
+    if (!profile.dlc.empty())
+        return {selected.root, "No compatible extracted DLC found for " + *title +
+            " (the game starts without it). Choose the add-on itself, its parent, or an addcont "
+            "folder. Each add-on needs sce_sys/param.sfo with matching game metadata; PKG files "
+            "and folder names alone are not enough. Clear this field to use automatic discovery.", false};
+    std::string message = "The Old Hunters not detected (the game starts without it). If installed elsewhere, choose its folder below.";
+    if (selected.scan.limited || selected.scan.unreadable)
+        message += " Some folders could not be checked; choose the DLC folder directly.";
+    return {selected.root, message, true, false};
+}
 void ValidateSetup(const Profile &profile) {
     if (!ValidGameRefreshHz(profile.refresh_hz)) throw std::runtime_error("Invalid game frame-rate cap.");
     if (profile.game.empty())
@@ -679,7 +905,7 @@ void ValidateSetup(const Profile &profile) {
     const auto runtime = Path(profile.runtime);
     if (!fs::is_regular_file(runtime) || _wcsicmp(runtime.filename().c_str(), L"shadps4.exe") != 0)
         throw std::runtime_error(
-            "Select shadps4.exe in Runtime and setup, or use a complete package.");
+            "The bundled VR runtime is missing. Open Bldbrne-VR from a complete installation.");
     const auto home = NormalizeSaveHome(Path(profile.saves));
     if (!fs::is_directory(home))
         throw std::runtime_error("The save home folder does not exist.");
@@ -817,6 +1043,17 @@ fs::path BackupSaves(const Paths &paths, const fs::path &home) {
             fs::remove_all(backup.folder, error);
     return folder;
 }
+fs::path LaunchBackup(const Paths &paths, const fs::path &home) {
+    if (auto made = BackupSaves(paths, home); !made.empty())
+        return made;
+    // Unchanged since the newest backup: that one holds these very saves.
+    const auto fingerprint = SaveFingerprint(home);
+    const auto backups = SaveBackups(paths);
+    if (!fingerprint.empty() && !backups.empty() &&
+        Read(backups.front().folder / "fingerprint.txt") == fingerprint)
+        return backups.front().folder;
+    return {};
+}
 void RestoreSaves(const Paths &paths, const fs::path &home, const fs::path &backup) {
     if (!fs::exists(backup / "fingerprint.txt"))
         throw std::runtime_error("That backup is incomplete.");
@@ -869,11 +1106,22 @@ GraphicsFields ParseGraphics(const std::optional<std::string> &value) {
     }
     // The game's own limits (graphics_settings.h Parse).
     const bool valid = out[0] == 1 && out[1] >= -50 && out[1] <= 50 && out[1] % 10 == 0 &&
-                       out[2] >= 0 && out[2] <= 3 && out[3] >= 0 && out[3] <= 2 && out[4] >= 0 &&
-                       out[4] <= 2 && out[5] >= 0 && out[5] <= 1 && out[6] >= 0 && out[6] <= 2 &&
+                       out[2] >= 0 && out[2] <= 4 && out[3] >= 0 && out[3] <= 5 && out[4] >= 0 &&
+                       out[4] <= 5 && out[5] >= 0 && out[5] <= 1 && out[6] >= 0 && out[6] <= 2 &&
                        std::all_of(out.begin() + 7, out.end(),
                                    [](int v) { return v >= 0 && v <= 100; });
     return valid ? out : DefaultGraphics;
+}
+const char *PresetName(int preset) {
+    switch (preset) {
+    case 0: return "Performance";
+    case 1: return "Balanced";
+    case 2: return "Quality";
+    case 3: return "Ultra Performance";
+    case 4: return "Ultra Quality";
+    case 5: return "Balanced Plus";
+    default: return "Unknown";
+    }
 }
 std::string GraphicsText(const GraphicsFields &fields) {
     std::string out;
@@ -887,6 +1135,13 @@ bool DlssIncluded(const fs::path &runtime) {
 }
 bool Fsr31Included(const fs::path &runtime) {
     return IsFile(runtime.parent_path() / "fsr31" / "vr_fsr31_stereo.dll");
+}
+// FSR 4.1: its bridge and AMD's signed loader and upscaler (FSR SDK 2.4.0) in runtime/fsr41.
+bool Fsr41Included(const fs::path &runtime) {
+    const auto folder = runtime.parent_path() / "fsr41";
+    return IsFile(folder / "vr_fsr41_stereo.dll") &&
+           IsFile(folder / "amd_fidelityfx_loader_vk.dll") &&
+           IsFile(folder / "amd_fidelityfx_upscaler_vk.dll");
 }
 bool Fsr4Included(const fs::path &runtime) {
     const auto folder = runtime.parent_path() / "fsr4";
@@ -1045,16 +1300,231 @@ std::string OpenXrRuntime() {
     return PathText(fs::path(value).stem());
 }
 bool Dlss5Included(const fs::path &runtime) {
-    if (!DlssIncluded(runtime))
+    if (!DlssIncluded(runtime) || !IsFile(runtime.parent_path() / "dlss" / "nvngx.dll_dlssnr.dll"))
         return false;
     // Mapped without running it or loading what it imports: only its export table is read.
     const HMODULE bridge = LoadLibraryExW((runtime.parent_path() / "dlss" / "vr_dlss_stereo.dll").c_str(),
                                           nullptr, DONT_RESOLVE_DLL_REFERENCES);
     if (!bridge)
         return false;
-    const bool neural = GetProcAddress(bridge, "VrDlssSetNeuralConfig") != nullptr;
+    const bool neural = GetProcAddress(bridge, "VrDlssSetNeuralConfig") != nullptr &&
+                        GetProcAddress(bridge, "VrDlssSetNeuralRuntime") != nullptr;
     FreeLibrary(bridge);
     return neural;
+}
+namespace {
+std::wstring RegistryText(HKEY root, const wchar_t *key, const wchar_t *value) {
+    wchar_t text[1024]{};
+    DWORD size = sizeof(text);
+    if (RegGetValueW(root, key, value, RRF_RT_REG_SZ, nullptr, text, &size) != ERROR_SUCCESS)
+        return {};
+    return text;
+}
+// The folders games are installed in: every Steam library's steamapps/common, Epic's install
+// locations, and the Xbox app's and Epic's default folders on each drive.
+std::vector<fs::path> GameFolders() {
+    std::vector<fs::path> roots, out;
+    const auto steam = RegistryText(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath");
+    if (!steam.empty()) {
+        roots.push_back(fs::path(steam) / "steamapps" / "common");
+        // libraryfolders.vdf lines: "path"		"D:\\SteamLibrary"
+        std::istringstream vdf(Read(fs::path(steam) / "steamapps" / "libraryfolders.vdf"));
+        for (std::string line; std::getline(vdf, line);) {
+            const auto key = line.find("\"path\"");
+            if (key == std::string::npos)
+                continue;
+            const auto open = line.find('"', key + 6), close = line.rfind('"');
+            if (open == std::string::npos || close <= open)
+                continue;
+            std::string path;
+            for (size_t i = open + 1; i < close; ++i) {
+                path += line[i];
+                if (line[i] == '\\' && i + 1 < close && line[i + 1] == '\\')
+                    ++i;
+            }
+            roots.push_back(fs::path(Wide(path)) / "steamapps" / "common");
+        }
+    }
+    std::error_code error;
+    for (const auto &item :
+         fs::directory_iterator("C:/ProgramData/Epic/EpicGamesLauncher/Data/Manifests", error)) {
+        if (item.path().extension() != ".item")
+            continue;
+        try {
+            const auto json = Json::parse(Read(item.path()));
+            if (json.contains("InstallLocation"))
+                out.push_back(fs::path(Wide(json["InstallLocation"].get<std::string>())));
+        } catch (const std::exception &) {
+        }
+    }
+    for (wchar_t drive = L'C'; drive <= L'Z'; ++drive) {
+        const std::wstring root{drive, L':', L'\\'};
+        if (GetDriveTypeW(root.c_str()) != DRIVE_FIXED)
+            continue;
+        for (const wchar_t *folder :
+             {L"XboxGames", L"Program Files\\Epic Games", L"SteamLibrary\\steamapps\\common"})
+            roots.push_back(fs::path(root) / folder);
+    }
+    for (const auto &root : roots) {
+        for (const auto &item : fs::directory_iterator(root, error))
+            if (item.is_directory(error))
+                out.push_back(item.path());
+        error.clear();
+    }
+    return out;
+}
+bool SameName(const fs::path &path, const wchar_t *name) {
+    return _wcsicmp(path.filename().c_str(), name) == 0;
+}
+} // namespace
+std::vector<Dlss5Found> FindDlss5(const fs::path &runtime) {
+    std::vector<fs::path> files;
+    std::error_code error;
+    const auto options = fs::directory_options::skip_permission_denied;
+    // A game keeps it in its own folder or a few folders down (bin/, Binaries/Win64/...).
+    for (const auto &game : GameFolders()) {
+        for (fs::recursive_directory_iterator it(game, options, error), end; !error && it != end;
+             it.increment(error)) {
+            if (it.depth() >= 4)
+                it.disable_recursion_pending();
+            if (SameName(it->path(), VR::Dlss5File::Name))
+                files.push_back(it->path());
+        }
+        error.clear();
+    }
+    // NVIDIA's driver keeps the DLSS files it downloads under NGX/models/<feature>/versions.
+    for (fs::recursive_directory_iterator it("C:/ProgramData/NVIDIA/NGX/models", options, error), end;
+         !error && it != end; it.increment(error)) {
+        if (it->is_regular_file(error) && PathText(it->path()).find("dlssnr") != std::string::npos)
+            files.push_back(it->path());
+    }
+    error.clear();
+    files.push_back(runtime.parent_path() / "dlss" / VR::Dlss5File::Name);
+    std::vector<Dlss5Found> out;
+    for (const auto &file : files) {
+        if (!IsFile(file) || std::any_of(out.begin(), out.end(), [&](const Dlss5Found &f) {
+                return fs::equivalent(f.file, file, error);
+            }))
+            continue;
+        out.push_back({file, VR::Dlss5File::Verify(file)});
+    }
+    std::stable_sort(out.begin(), out.end(), [](const Dlss5Found &a, const Dlss5Found &b) {
+        if (a.check.ok != b.check.ok)
+            return a.check.ok;
+        return VR::Dlss5File::Newer(a.check.version, b.check.version);
+    });
+    return out;
+}
+VR::Dlss5File::Check AddDlss5(const Paths &paths, const fs::path &from) {
+    const auto source = VR::Dlss5File::Verify(from);
+    if (!source.ok)
+        throw std::runtime_error(source.problem);
+    const auto target = VR::Dlss5File::InUser(paths.User());
+    std::error_code error;
+    if (fs::equivalent(from, target, error))
+        return source;
+    fs::create_directories(target.parent_path());
+    auto temporary = target;
+    temporary += ".new";
+    fs::copy_file(from, temporary, fs::copy_options::overwrite_existing);
+    const auto copy = VR::Dlss5File::Verify(temporary);
+    if (!copy.ok) {
+        fs::remove(temporary, error);
+        throw std::runtime_error("The copy failed its check: " + copy.problem);
+    }
+    fs::rename(temporary, target);
+    return copy;
+}
+void RemoveDlss5(const Paths &paths) {
+    std::error_code error;
+    fs::remove(VR::Dlss5File::InUser(paths.User()), error);
+    if (error)
+        throw std::runtime_error("Cannot remove the DLSS 5 file: " + error.message());
+}
+// The four-digit model after `series` in a card's name ("NVIDIA GeForce RTX 4070 Ti" -> 4070,
+// `rest` " Ti"); 0 without one.
+static int ModelNumber(std::string_view name, std::string_view series, std::string_view &rest) {
+    for (size_t at = name.find(series); at != std::string_view::npos;
+         at = name.find(series, at + 1)) {
+        size_t i = at + series.size();
+        while (i < name.size() && name[i] == ' ')
+            ++i;
+        size_t j = i;
+        while (j < name.size() && j - i < 5 && std::isdigit(static_cast<unsigned char>(name[j])))
+            ++j;
+        int n = 0;
+        if (j - i == 4 && std::from_chars(name.data() + i, name.data() + j, n).ec == std::errc{}) {
+            rest = name.substr(j);
+            return n;
+        }
+    }
+    rest = {};
+    return 0;
+}
+StartupUpscale StartupUpscaler(const SystemInfo &system) {
+    constexpr uint64_t GiB = 1ull << 30;
+    // A "10 GB" card reports a little under 10 GiB of dedicated memory.
+    if (system.integrated || system.vram < 10 * GiB - GiB / 2)
+        return {};
+    const std::string_view name = system.gpu;
+    const bool laptop = name.find("Laptop") != std::string_view::npos ||
+                        name.find("Max-Q") != std::string_view::npos;
+    std::string_view rest;
+    if (system.nvidia) {
+        const int n = ModelNumber(name, "RTX", rest);
+        if (n < 3000 || n >= 6000)
+            return {};
+        const int tier = (n / 10) % 10; // 5090 -> 9
+        if (!laptop && n / 1000 == 5 && tier == 9)
+            return {1, 4}; // Ultra Quality
+        // Quality: RTX 5070 / 5080, and the RTX 4080 / 4090 (as fast as them or faster).
+        if (!laptop && ((n / 1000 == 5 && (tier == 7 || tier == 8)) ||
+                        (n / 1000 == 4 && (tier == 8 || tier == 9))))
+            return {1, 2};
+        return {1, 1}; // Balanced
+    }
+    if (system.amd) {
+        const int n = ModelNumber(name, "RX", rest);
+        // A mobile chip: "RX 7600M XT", "RX 6800S".
+        if (laptop || (!rest.empty() && (rest.front() == 'M' || rest.front() == 'S')))
+            return {};
+        const int series = n / 1000, hundreds = (n / 100) % 10, tens = (n / 10) % 10;
+        // A GRE (RX 9070 GRE, 7900 GRE: about an RTX 4070's speed) gets Quality, not Ultra
+        // Quality: FSR's Ultra Quality renders 75%, more than DLSS Quality's 67%.
+        const StartupUpscale top =
+            rest.find("GRE") != std::string_view::npos ? StartupUpscale{3, 2} : StartupUpscale{3, 4};
+        if (series == 9 && hundreds == 0)
+            return tens == 7 ? top : tens == 6 ? StartupUpscale{3, 5} : StartupUpscale{};
+        if (series == 7)
+            return hundreds == 9   ? top
+                   : hundreds == 8 ? StartupUpscale{3, 2}
+                   : hundreds == 7 ? StartupUpscale{3, 5}
+                                   : StartupUpscale{};
+        if (series == 6)
+            return hundreds >= 8 ? StartupUpscale{3, 2}
+                   : hundreds == 7 ? StartupUpscale{3, 5}
+                                   : StartupUpscale{};
+    }
+    return {};
+}
+GraphicsFields StartupGraphics(const SystemInfo &system) {
+    auto out = DefaultGraphics;
+    const auto pick = StartupUpscaler(system);
+    out[2] = pick.upscaler;
+    if (pick.upscaler == 1)
+        out[3] = pick.preset;
+    else if (pick.upscaler == 3)
+        out[4] = pick.preset;
+    return out;
+}
+int StartupFoveation(const SystemInfo &system) {
+    const auto pick = StartupUpscaler(system);
+    return pick.upscaler != 0 && (pick.preset == 2 || pick.preset == 4) ? 3 : -1;
+}
+bool StartupReducedShadows(const SystemInfo &system) {
+    constexpr uint64_t GiB = 1ull << 30;
+    // Below 9.5 GiB is 8 GB or less; unknown memory: nothing written.
+    return system.vram != 0 && (system.integrated || system.vram < 10 * GiB - GiB / 2);
 }
 std::string NvidiaDriver(uint64_t umd) {
     // 32.0.15.6094 -> 560.94: the last digit of the third part and the fourth part.
@@ -1135,6 +1605,9 @@ SystemInfo ReadSystem(bool probe_multiview) {
                 continue;
             out.gpu = Utf8(d.Description);
             out.nvidia = d.VendorId == 0x10de;
+            out.amd = d.VendorId == 0x1002;
+            out.auto_layers = VR::NativeViews::LayersByDefault(d.VendorId, d.DeviceId, out.gpu);
+            out.auto_dibr = VR::NativeViews::DibrByDefault(d.VendorId, d.DeviceId, out.gpu);
             out.vram = d.DedicatedVideoMemory;
             vendor = d.VendorId;
             device = d.DeviceId;
@@ -1176,29 +1649,41 @@ SystemInfo ReadSystem(bool probe_multiview) {
         out.notes.push_back("Less than 8 GB of video memory has not been tested.");
     if (out.multiview_limited)
         out.notes.push_back("This graphics driver lacks the multiview support native stereo needs "
-                            "(geometry or tessellation shaders). Auto uses DIBR.");
+                            "(geometry or tessellation shaders). Auto uses Simplified Rendering.");
+    else if (out.auto_dibr)
+        out.notes.push_back("On this AMD card Auto uses Simplified Rendering. Native stereo draws each "
+                            "eye itself (layers). Native stereo is untested on it.");
     if (out.ram && out.ram < 16 * GiB - GiB)
         out.notes.push_back("Less than 16 GB of system memory has not been tested.");
     return out;
 }
 fs::path CreatePlayShortcut() {
+    const auto check = [](HRESULT result, const char *action) {
+        if (FAILED(result)) {
+            const int code = HRESULT_FACILITY(result) == FACILITY_WIN32 ? HRESULT_CODE(result)
+                                                                        : int(result);
+            throw std::system_error(code, std::system_category(), action);
+        }
+    };
     PWSTR desktop = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &desktop)))
-        throw std::runtime_error("Cannot locate your desktop.");
+    check(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &desktop), "Cannot locate your desktop");
     const auto file = fs::path(desktop) / L"Play Bldbrne-VR.lnk";
     CoTaskMemFree(desktop);
     std::wstring exe(32768, L'\0');
     exe.resize(GetModuleFileNameW(nullptr, exe.data(), DWORD(exe.size())));
     Microsoft::WRL::ComPtr<IShellLinkW> link;
     Microsoft::WRL::ComPtr<IPersistFile> persist;
-    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
-                                IID_PPV_ARGS(&link))) ||
+    check(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_PPV_ARGS(&link)), "Could not start Windows shortcut creation");
+    if (
         FAILED(link->SetPath(exe.c_str())) || FAILED(link->SetArguments(L"--play")) ||
         FAILED(link->SetWorkingDirectory(fs::path(exe).parent_path().c_str())) ||
         FAILED(link->SetIconLocation(exe.c_str(), 0)) ||
         FAILED(link->SetDescription(L"Start Bldbrne-VR with your launcher settings")) ||
-        FAILED(link.As(&persist)) || FAILED(persist->Save(file.c_str(), TRUE)))
-        throw std::runtime_error("Could not create the desktop shortcut.");
+        FAILED(link.As(&persist)))
+        throw std::runtime_error("Could not configure the Play Bldbrne-VR shortcut.");
+    const auto save_message = "Could not save the shortcut to " + PathText(file);
+    check(persist->Save(file.c_str(), TRUE),save_message.c_str());
     return file;
 }
 // A shortcut's target, or empty when it cannot be read.
@@ -1270,13 +1755,28 @@ LaunchPlan Prepare(const Profile &profile, const Paths &paths, StereoPreset pres
     const auto patch = PatchFile(runtime);
     const auto version = CheckGameBuild(game);
     auto launch_patch = PatchForVersion(Read(patch), version);
+    launch_patch = PatchIntelSfx(launch_patch, game, profile.intel_sfx_workaround);
+    // Free camera brings its own non-aggro while it is on (bloodborne_camera.cpp): the patch is
+    // only the player's own Non-aggro mode, so Y in a free camera launch gives aggro back.
+    launch_patch = PatchNonAggro(launch_patch, profile.non_aggro);
     if(profile.refresh_hz!=90)launch_patch=PatchFrameRate(launch_patch,profile.refresh_hz);
     const auto runtime_argument = ArgumentPath(runtime);
     const auto game_argument = ArgumentPath(game);
-    BackupSaves(paths, home);
+    // DLC is optional: found or not, a folder that holds none or a check that fails, the game
+    // launches. Only a usable folder is written; otherwise config.json's add-on folder is left.
+    DlcStatus dlc;
+    try {
+        dlc = ResolveDlc(paths, profile);
+    } catch (const std::exception &e) {
+        dlc = {{}, std::string("Couldn't check for DLC (the game starts without it): ") + e.what(), false};
+    }
+    std::optional<fs::path> addons;
+    if (dlc.valid && !dlc.root.empty())
+        addons = dlc.root;
+    const auto save_backup = LaunchBackup(paths, home);
     fs::create_directories(paths.User());
     const auto before = Read(paths.Config());
-    Write(paths.Config(), LaunchConfig(before, home, profile.refresh_hz), before);
+    Write(paths.Config(), LaunchConfig(before, home, profile.refresh_hz, addons), before);
     const auto ini_before = Read(paths.Ini());
     const auto ini = LaunchIni(ini_before, preset, profile.refresh_hz, profile.follow_headset);
     Write(paths.Ini(), ini, ini_before);
@@ -1285,7 +1785,15 @@ LaunchPlan Prepare(const Profile &profile, const Paths &paths, StereoPreset pres
     const auto patch_copy = paths.User() / "patches" / "bbvr_patch.xml";
     Write(patch_copy, launch_patch, Read(patch_copy));
     LaunchPlan plan{runtime, paths.root};
-    plan.game_support_info = GameSupportInfo(game);
+    // The SFX line stays last (the support report's Windows details follow it).
+    plan.game_support_info = GameSupportInfo(game) + "DLC: " + dlc.message +
+                             "\nDLC directory: " + PathText(dlc.root) + "\nFree camera " +
+                             (profile.free_camera ? "ON\n" : "OFF\n") + "Non-aggro mode " +
+                             (profile.non_aggro       ? "ON\n"
+                              : profile.free_camera ? "WHILE FREE CAMERA\n"
+                                                    : "OFF\n") +
+                             "Skip dangerous SFX " +
+                             (profile.intel_sfx_workaround ? "ON\n" : "OFF\n");
     // argv[0] too: a graphics restart relaunches the game from it.
     plan.command = Quote(runtime_argument) + L" --openxr --fullscreen " +
                    (profile.fullscreen ? L"true" : L"false") + L" -p bbvr_patch.xml --game " +
@@ -1303,6 +1811,11 @@ LaunchPlan Prepare(const Profile &profile, const Paths &paths, StereoPreset pres
     }
     FreeEnvironmentStringsW(environment);
     entries.push_back(L"VR_INI=" + ArgumentPath(paths.Ini()));
+    // Soft save for every player (2026-10-30, the user): the game turns it on only when this
+    // backup is a byte-for-byte copy of the save it starts with (core/vr/soft_save_backup.h).
+    if (!save_backup.empty())
+        entries.push_back(L"VR_SOFT_SAVE_LAUNCHER_BACKUP=" + ArgumentPath(save_backup));
+    if (profile.free_camera) entries.emplace_back(L"VR_FREE_CAMERA=1");
     for (const auto *entry : RendererEnvironment) {
         // Native flags are presence-based: '=0' would still turn stereo on.
         if (preset == StereoPreset::Dibr && std::wstring_view(entry).starts_with(L"VR_NATIVE_"))
@@ -1311,6 +1824,10 @@ LaunchPlan Prepare(const Profile &profile, const Paths &paths, StereoPreset pres
     }
     if (preset == StereoPreset::Native)
         entries.push_back(L"VR_NATIVE_IPD=" + NativeIpd(ini, profile.use_bundled_runtime));
+    // Native stereo's eyes, a DIBR launch's too: it only names the mode (no stereo of its own),
+    // and the runtime's shader cache then stays the same across DIBR and native sessions.
+    if (const auto views = NativeViewsValue(profile.native_views); !views.empty())
+        entries.push_back(L"VR_NATIVE_VIEWS=" + views);
     std::sort(entries.begin(), entries.end(),
               [](const auto &a, const auto &b) { return _wcsicmp(a.c_str(), b.c_str()) < 0; });
     for (const auto &entry : entries) {
@@ -1381,12 +1898,115 @@ void OpenPath(const fs::path &path) {
             ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
         throw std::runtime_error("Cannot open " + PathText(path));
 }
-// The in-game VR page's tabs, in its order (vr_page.h Tabs).
+std::optional<HeadsetRequest> LastHeadsetRequest(const Paths &paths) {
+    try {
+        const auto text = Read(paths.User() / "log" / "headset.json");
+        if (text.empty())
+            return std::nullopt;
+        const auto json = Json::parse(text);
+        HeadsetRequest out{json.value("system", std::string{})};
+        for (int eye = 0; eye < 2; ++eye) {
+            out.width = std::max(out.width, json.at("width").at(eye).get<unsigned>());
+            out.height = std::max(out.height, json.at("height").at(eye).get<unsigned>());
+        }
+        out.max_width = json.value("max_width", 8192u);
+        out.max_height = json.value("max_height", 8192u);
+        if (out.max_width < 64 || out.max_height < 64 ||
+            out.max_width > 8192 || out.max_height > 8192)
+            return std::nullopt;
+        if (!out.width || !out.height || out.width > 16384 || out.height > 16384)
+            return std::nullopt;
+        return out;
+    } catch (const std::exception &) {
+        return std::nullopt;
+    }
+}
+// The in-game tabs the launcher leaves to the game: Upscaling (its Graphics tab has it all) and
+// Save (the soft save's buttons).
+static bool GameOnlyTab(std::string_view name) {
+    return name == "Upscaling" || name == "Save";
+}
 const std::vector<const char *> &Categories() {
-    static const std::vector<const char *> all{
-        "General", "Controls",  "Comfort", "HUD",     "Assists",      "Display", "Graphics",
-        "DLSS 5",  "Body",      "Inventory", "Feedback", "Weapons", "Interactions", "Color"};
+    static const std::vector<const char *> all = [] {
+        std::vector<const char *> out;
+        for (const auto &tab : VR::Page::Tabs())
+            if (!GameOnlyTab(tab.name))
+                out.push_back(tab.name);
+        out.push_back("Graphics");
+        out.push_back("Extras");
+        return out;
+    }();
     return all;
+}
+std::optional<std::string> ChoiceOverride(std::string_view key, std::optional<std::string> value) {
+    if (value && key == "light_shadow_detail") {
+        // Older generated files wrote "low" even when the card still chose shadow enablement.
+        // An explicit Game's or Low selection also sets light_shadows, which remains an override.
+        if (*value == "low") return std::nullopt;
+        if (*value == "0") return "low";
+        if (*value == "1") return "high";
+    }
+    if (value && key == "water_reflections")
+        return VR::WaterReflectionsEnabled(*value) ? "1" : "0";
+    return value;
+}
+
+std::optional<std::string> CardDefault(std::string_view key, uint64_t dedicated_bytes) {
+    const auto card = VR::CardTier::For(VR::CardTier::Of(dedicated_bytes));
+    if (key == "light_shadows") return card.lamp_shadows ? "1" : "0";
+    if (key == "light_shadow_detail") return "low";
+    if (key == "fog_banks") return card.fog_banks ? "1" : "0";
+    if (key == "moon_shafts") return card.moon_glow ? "1" : "0";
+    if (key == "ambient_occlusion") return card.ambient_occlusion ? "1" : "0";
+    if (key == "bounce_light") return card.bounce_light ? "1" : "0";
+    if (key == "water_reflections") return card.water_reflections ? "1" : "0";
+    if (key == "wet_streets") return card.wet_streets ? "1" : "0";
+    return std::nullopt;
+}
+
+bool FogEnabled(const std::optional<std::string> &choice, uint64_t dedicated_bytes) {
+    if (choice)
+        return *choice == "1" || *choice == "true";
+    return VR::CardTier::For(VR::CardTier::Of(dedicated_bytes)).fog_banks;
+}
+
+std::optional<std::string> CodeDefault(const std::string &key) {
+    // core/vr/vr_session.h, two_hand_grip.h, body_settings.h and quick_settings.h (2026-10-31);
+    // foveation: core/vr/graphics_settings.h (-1, Auto: on where the card supports it).
+    static const std::map<std::string, std::string, std::less<>> defaults{
+        {"foveation", "-1"},             {"upscale_focus", "2"},
+        {"snap_turn_deg", "30"},         {"smooth_turn_deg_per_s", "120"},
+        {"vitals_heartbeat", "1"},       {"vitals_edge", "1"},
+        {"health_color", "1"},           {"health_color_strength", "0.5"},
+        {"stamina_color", "1"},          {"stamina_color_strength", "0.7"},
+        {"ui_enemy_hp_bars", "0"},       {"ui_boss_bar", "1"},
+        {"melee_kill_ragdoll", "1"},     {"melee_ragdoll_impulse", "1"},
+        {"two_hand_optimized_controls", "0"}, {"two_hand_trigger_hold", "1"},
+        {"body_align", "1"},             {"body_posture", "lean"},
+        {"quick_arc_pick", "fan"},       {"quick_fan_style", "lancet"},
+        {"x_button", "fan"},
+        {"canted_eyes", "1"},            {"cinematic_ladder_skip", "1"},
+        {"vr_interactions", "1"}};
+    const auto it = defaults.find(key);
+    return it == defaults.end() ? std::nullopt : std::optional<std::string>(it->second);
+}
+bool SearchFinds(const std::string &needle, const std::string &text) {
+    // A word counts where a word of the text starts with it: "turn" finds turning, not return.
+    const auto starts_word = [&](const std::string &word) {
+        for (auto at = text.find(word); at != std::string::npos; at = text.find(word, at + 1))
+            if (at == 0 || !std::isalnum(static_cast<unsigned char>(text[at - 1])))
+                return true;
+        return false;
+    };
+    std::istringstream words(needle);
+    std::string word;
+    bool any = false;
+    while (words >> word) {
+        if (!starts_word(word))
+            return false;
+        any = true;
+    }
+    return any;
 }
 static Setting Choice(const char *category, const char *label, const char *help,
                       std::vector<std::string> keys, std::vector<Option> options,
@@ -1447,267 +2067,459 @@ std::optional<int> NumberShown(const Setting &row, const std::string &value) {
         return std::nullopt;
     return shown;
 }
-// Labels, help and values follow the in-game VR page (vr_page.h Rows); the details come from the
-// game code. Not offered: the page's read-only headset resolution, and Smooth motion
-// (late_warp_motion), which needs late_warp=1 while the headset preset runs late_warp=0.
-// Scenes on a screen and Camera are launcher-only: the page has no row for them.
+namespace {
+// What the launcher adds to an in-game row (vr_page.h Rows): its tooltip, from what the game code
+// does; more words the search finds it by; a number row's shown code default; and the launcher's
+// own text for a number's 0 (nullptr: the page's).
+struct RowNote {
+    const char *id;
+    const char *details;
+    const char *words = "";
+    int fallback = 0;
+    const char *zero = nullptr;
+};
+const RowNote Notes[]{
+    // You
+    {"height",
+     "As the hunter: standing straight, your eyes are at the hunter's eye height. As the player: "
+     "your real height, measured from the headset's floor. Seated play always uses the hunter's "
+     "height.",
+     "tall short eye level standing floor"},
+    {"height_adjust", "Moves your eyes up or down from the height choice, in centimetres.",
+     "taller shorter floor offset cm", 0},
+    {"ipd",
+     "Headset: your headset's own eye distance. A smaller value makes the world look larger, a "
+     "larger one smaller.",
+     "ipd eye distance world scale size big small", 0},
+    {"body_mode",
+     "Full: everything but the head. The hunter's shadow always shows the whole body.",
+     "arms hands full body visible avatar"},
+    {"cutaway",
+     "Full body only: parts of the body closer than about 20 cm to your eyes fade out, so you can "
+     "look down past the collar and chest.",
+     "collar chest coat fade clipping look down"},
+    {"body_follow",
+     "How the hunter's body follows your head. Lean keeps the spine's length; Legacy shift is the "
+     "older behaviour.",
+     "posture lean spine body follow"},
+    {"camera_distance",
+     "Third person: how far the camera sits behind the hunter, from 50% to 100% of the game's "
+     "distance. Closer only, so the camera never goes through walls. With a gamepad: hold the "
+     "left stick click and push the right stick up (closer) or down.",
+     "third person camera distance zoom closer orbit", 100},
+    {"camera_tilt",
+     "Third person: how much the view tilts down as a gamepad's right stick raises the camera. "
+     "Off keeps the view level, which is easiest on the stomach; Full looks down at the hunter "
+     "like the flat game.",
+     "third person camera tilt pitch gamepad right stick orbit"},
+    {"ladder_skip",
+     "On (the default): on a long ladder, where the climb would switch to the flat view, the "
+     "screen goes dark while the hunter climbs on by himself, faster, and you're back in VR near "
+     "the top or bottom. A hit or a fall gives you control back at once. Off: the flat climb. "
+     "Only with Scenes on a screen on (otherwise ladders stay in first person).",
+     "ladder climb skip fade dark black stairs"},
+    {"lean_side", "The furthest the hunter leans sideways before he takes a step.",
+     "lean step sideways posture body", 20},
+    {"lean_response", "How long the body takes to follow your posture, in milliseconds.",
+     "smoothing posture delay latency body", 50},
+    {"body_comfort",
+     "On: extra protection against the body clipping into your view on sideways leans, and a "
+     "staged return of the body after a roll or hit.",
+     "clipping comfort roll hit body"},
+    // Controls
+    {"move_with",
+     "Right stick: the right stick walks and the left stick turns. The stick clicks and face "
+     "buttons change hands too.",
+     "left handed swap sticks locomotion walk thumbstick"},
+    {"turning",
+     "Snap turns jump by the chosen angle. Smooth turning rotates at 90 (slow), 120, 180 (fast) "
+     "or 240 (very fast) degrees per second.",
+     "snap smooth turn rotate rotation comfort degrees"},
+    {"controls", "Motion: swing the controller to attack. Buttons: attack with buttons only.",
+     "motion buttons classic gestures swing attack scheme"},
+    {"stance",
+     "Seated: smaller strong swings and throws, your lap counts as a place for Blood Vials, and "
+     "walking around your room does not move the hunter.",
+     "seated sitting standing chair"},
+    {"vibration", "Scales every controller vibration. 7 is the game's normal strength.",
+     "haptics rumble vibration strength", 7},
+    {"inject",
+     "Stab: take a vial from the pouch at your hip or over your right shoulder (or with X button: "
+     "Vial, press X), then touch it to your wrist or body to inject it. Button: X uses a vial, as "
+     "in the original game.",
+     "blood vial heal healing stab wrist"},
+    {"x_button",
+     "Fan menu: X opens and closes the quick-item fan, the Blood Vial comes from the pouch at your "
+     "hip or over your right shoulder. Vial: X readies a vial to stab, as before; the pouch and "
+     "the shoulder still work. With Blood Vial: Button, X always uses a vial.",
+     "x button fan menu quick items vial heal"},
+    {"laser", "A thin line along the gun barrel while you raise your gun hand to aim.",
+     "gun aim sight pointer"},
+    {"grip_adjust",
+     "On: hold the grip-adjust buttons 1.2 s standing still to change how the weapon sits in your "
+     "hand.",
+     "weapon hold angle grip offset"},
+    // Combat
+    {"weighted_weapons",
+     "On (Regular, the default): weight, gravity and air resistance; the weapon's shape and one- "
+     "or two-handed support affect handling. On (Light): the same, softened. Off: direct "
+     "handling. Whip forms are excluded.",
+     "weight momentum heavy inertia physics floaty light regular"},
+    {"weapon_wall",
+     "On (the default): weapons stop at walls and at each other. Weapons only: they only stop at "
+     "each other.",
+     "collision walls clash solid clip"},
+    {"blade_sounds",
+     "On: weapons ring when they touch, and drawing one along the other makes a sharpening sound.",
+     "sharpen ring clink sound audio"},
+    {"riposte_style",
+     "Visceral attacks briefly turn the scene black, red and white with ink outlines. Beast Roar "
+     "briefly turns the scene deep crimson.",
+     "visceral beast roar flash effect"},
+    {"ragdoll",
+     "Off: an enemy your blade kills plays its death animation. Limp: it goes limp at once. The "
+     "pushes throw the body as hard as your swing, from light to strongest (Normal is the game "
+     "default).",
+     "ragdoll physics death corpse body push throw"},
+    {"two_handed",
+     "Original (the default): the right grip transforms and B / Y slide your hands. Optimized: "
+     "tap the right stick to transform instead of lock-on; the left trigger near a transformed "
+     "handle attaches your left hand (Hold: while squeezed, Toggle: press to grab, press again to "
+     "let go); hold either grip to slide that hand. Motion controls only.",
+     "two hand two-handed grip trigger attach transform optimized"},
+    {"two_hand_guide",
+     "Shows where your left hand can grab the handle. In Original motion controls, hold the "
+     "right grip to reveal it. In Optimized, the guide appears when a two-handed handle is available.",
+     "two hand left hand guide marker"},
+    {"gun_wrist_reload",
+     "After a shot, release the trigger. Snap the muzzle up and lower it slightly, or flick it "
+     "down more sharply and let it rebound. Choose Off/Original to fire again without a gesture.",
+     "reload gun flick wrist pistol"},
+    {"vr_grab_attacks",
+     "On: enemy grab attacks stay in VR, with the view following the hunter. Off (the default): "
+     "the existing behaviour.",
+     "grab enemy grab camera cutscene"},
+    {"two_hand_swing_hum", "Vibration strength during fast two-handed swings.",
+     "vibration haptics two hand swing", 100},
+    // Items & world
+    {"holster_mode",
+     "Grip + Body: grip opens the menu and body slots are available. No Grip: disables only "
+     "grip-to-open-menu, including on SteamVR; grabbing and holding still work. No Body: "
+     "disables body slots. Menu button shortcuts remain available.",
+     "inventory pouch belt holster quick items slots"},
+    {"quick_arc_pick",
+     "Fan A and Fan B: the items you carry on a fan round your left hand (Fan A gothic panes of "
+     "candle-lit glass, Fan B an engraved brass rim); move the hand a little toward one to light "
+     "it, and pull the hand away to close the menu. Boxes: the arc of cards above your left hand; "
+     "put your fist on an item.",
+     "quick items menu fan boxes inventory"},
+    {"shoulder_vial",
+     "On: reach over your right shoulder with the left hand and squeeze the grip to draw a Blood "
+     "Vial, as from the pouch. Waits while the right grip is held (a two-handed grip). Needs Item "
+     "access: No Grip or Grip + Body.",
+     "blood vial shoulder heal"},
+    {"shoulder_switch",
+     "On: reach over a shoulder and press B (right) or Y (left) to switch that hand's weapon; hold "
+     "for about 0.4 seconds to go unarmed.",
+     "weapon switch shoulder unarmed swap"},
+    {"upscale_focus",
+     "Quality, Medium (the default), Performance: DLSS or FSR reconstructs only the middle of "
+     "each eye (90%, 85%, 75% of its width and height), around the lens centre; the rest is the "
+     "game's image enlarged and smoothed by a TAA, where the lenses blur anyway. Performance is "
+     "the fastest. Off: DLSS or FSR reconstructs the whole of each eye. Requires native stereo "
+     "and regular DLSS or FSR (DLSS 5 keeps its own neural centre). Perf Scan uses Medium "
+     "for supported configurations. Applies after restarting the game.",
+     "foveated upscale dlss fsr taa performance middle centre lens"},
+    {"vr_interactions",
+     "Immersive (the default): in first person, doors, gates, chests and coffins open in front of "
+     "you without the hunter's animation, a lamp lights at once, and a knock on a resident's door "
+     "is answered without the knocking animation, while you keep moving. In third person the "
+     "hunter knocks in VR. Flat: the hunter's own animations, shown on the virtual screen. "
+     "Resting and travelling at a lamp stay on the screen either way. Lamps and knocks change at "
+     "the next start.",
+     "door gate chest coffin lamp light open knock resident immersive flat animation interaction"},
+    {"physical_levers",
+     "On: grip a lever with either hand and pull it. Off: the game's original interaction.",
+     "lever pull elevator gate"},
+    {"lamp_travel",
+     "On: rest, refill and travel between lit lamps from the lamp itself. Offline only, and "
+     "experimental.",
+     "lamp lantern rest travel teleport fast travel"},
+    {"physical_summon_bell",
+     "On (the default): in first person, B draws the summon bell into your hand; shake it to "
+     "summon. B again cancels. Off: the game's own bell.",
+     "bell summon beckoning help helper co-op"},
+    {"doll_respec",
+     "On (the default): the Doll's list offers Rechannel Blood Echoes: her Level Up on your own "
+     "build, using the lowest starting value of each stat across all origins "
+     "(7/8/9/9/5/6). Redistribute for free at the same level; your origin stays unchanged. "
+     "Leave to cancel. Normal levelling uses Channel Blood Echoes.",
+     "respec rebirth reallocate stats attributes doll level up"},
+    {"holster_haptics", "On: a small vibration when your hand reaches a pouch.",
+     "vibration haptics pouch"},
+    // HUD & feedback
+    {"hud_vitals",
+     "Wrist gauge: a Blood Gauge on the left wrist shows health, stamina and bullets; the game's "
+     "own health display appears when you look down. Classic: the game's HUD.",
+     "health stamina bar wrist gauge hud bullets"},
+    {"low_hp",
+     "On: a heartbeat in both controllers and darkened edges of your view while your health is "
+     "low.",
+     "heartbeat low health warning"},
+    {"counters",
+     "Look down: the counters fade in when you look well below the horizon. Menus and dialogs "
+     "always show them.",
+     "blood echoes insight currency"},
+    {"hit_flash", "On: the edges of your view flash red when you take a hit.",
+     "damage red flash vignette"},
+    {"hud_size",
+     "The size of the health bars, item icons and prompts. Medium is the game default.",
+     "ui scale size hud"},
+    {"low_hp_edges",
+     "A red edge around your view below 30% health, in three strengths (Medium is the game "
+     "default). It takes priority over the exhaustion color.",
+     "red vignette low health color edge"},
+    {"exhaustion_color",
+     "Colors soften briefly when your stamina runs out, then return, in three strengths (Medium "
+     "is the game default).",
+     "stamina desaturation grey gray color"},
+    {"health_bars",
+     "Bosses only (the default): the boss's bar near the top. All: also the bars and damage "
+     "numbers over enemies you hit or lock on to. The lock-on dot and your own HUD always show.",
+     "boss bar enemy hp bar damage numbers"},
+    // The strengths in steps of 10, as the launcher had them before Low-health edges and
+    // Exhaustion color (their three steps) replaced the rows.
+    {"health_color_strength",
+     "The red edge's exact strength. Low-health edges picks 30, 50 (the game default) or 80%; any "
+     "other strength shows there as Custom.",
+     "red vignette low health color edge strength intensity", 50},
+    {"stamina_color_strength",
+     "The exhaustion effect's exact strength. Exhaustion color picks 40, 70 (the game default) or "
+     "100%; any other strength shows there as Custom.",
+     "stamina desaturation grey gray color strength intensity", 70},
+    // Picture
+    {"aa",
+     "SMAA: dual-eye SMAA replaces the game's FXAA (the default). Game FXAA: the game's own. "
+     "None: no extra edge smoothing. Off while DLSS or FSR is on.",
+     "anti aliasing jaggies smaa fxaa edges"},
+    {"lod",
+     "Performance (the default): the game's own simpler models far away, the best frame rate. "
+     "Balanced: a little more detail at a distance. Quality: every object's full model at any "
+     "distance, the slowest.",
+     "lod draw distance detail pop-in fps"},
+    {"color_contrast", "Separation between light and dark areas.", "brightness picture color", 0},
+    {"color_saturation", "Colour intensity. -100 % is black and white.",
+     "black white monochrome picture color", 0},
+    {"color_gamma", "Brightness of the midtones; higher is brighter.",
+     "brightness dark picture color", 0},
+    // Difficulty
+    {"hp_bonus",
+     "Raises the hunter's maximum health (+10 % by default). Your save file is not changed.",
+     "easy health hp difficulty"},
+    {"iframes",
+     "Extra invincibility after a quickstep or roll, in 1/30 s frames (off by default). "
+     "Backsteps get none.",
+     "dodge roll quickstep invincibility frames iframes"},
+    {"attack_stamina",
+     "Light swings cost this share of the game's stamina (80% by default). Strong swings always "
+     "cost the full amount; with too little stamina a strong swing becomes a light one. Dodges, "
+     "sprinting and guns are unchanged.",
+     "stamina cost attack swing"},
+    {"outgoing_damage",
+     "Your attacks' damage to enemies, from -60% to +30% in steps of 5. 0% is the game's normal "
+     "damage.",
+     "damage harder easier difficulty attack", 0},
+    // Picture > Performance (foveation), Graphics > Performance (frame overlap)
+    {"foveation",
+     "Less detail toward the lens edges, which the lenses blur anyway, for more frames. Auto (the "
+     "default): on where the graphics card supports it (NVIDIA RTX 20, AMD RX 6000, Intel Arc and "
+     "newer); a new player with a fast card starts on Light. Light: a wider sharp centre and never "
+     "the coarsest steps. Performance: coarser "
+     "still. In the game it changes at once (the VR page's Picture > Performance).",
+     "foveated ffr fixed foveated performance fps lens edges light"},
+    {"frame_overlap",
+     "On (the default): the game prepares its next frame while the graphics card finishes this "
+     "one, which removes the look-around hitches in busy areas such as the sewers and Old "
+     "Yharnam. Off: each frame waits until the graphics card is done; try it if the headset shows "
+     "doubled or stuttering images while the graphics card runs near its limit.",
+     "stutter hitch fps smooth performance"},
+    {"canted_eyes",
+     "For headsets whose screens are angled outward (Pimax); the game finds them itself. "
+     "On (the default): the game turns each eye to its screen itself, which looks right whatever "
+     "the headset's software does. Off: each eye is drawn facing straight ahead over its whole "
+     "view, and the headset's software turns it to the screen. It costs a little GPU time, and "
+     "only on such a headset: headsets with straight screens are never affected.",
+     "pimax canted angled screens cross eyed parallel projections double vision"},
+    {"shadows_far",
+     "Reduced (the default): the farthest band of shadows is left out, which gives more FPS in big "
+     "open areas with little visible change. Full: every shadow at every distance, as the game "
+     "draws them. A new player whose graphics card has 8 GB or less is set to Reduced.",
+     "shadow shadows distance performance fps"},
+    {"reflections",
+     "Off: no mirrored scene. Water: water mirrors the scene around it, as the game draws it (a "
+     "second drawing of the scene, which costs FPS where there is water, such as Old Yharnam and "
+     "the sewers; applies at once). Wet streets and water: puddles, wet stones and polished floors "
+     "mirror what is round them too (the game's own screen-space reflections, which it never turns "
+     "on, found by LanternEngine, traced by the mod's own code that looks the same in both eyes; "
+     "it costs FPS everywhere; applies at the next start). Not set: by your graphics card's "
+     "memory (water from 12 GB, wet streets from 13.8 GiB).",
+     "water reflection reflections mirror ssr wet puddles wetness performance fps"},
+    {"shadows_busy",
+     "Off (the default): only Far shadows decides. On: while a view is very busy, the "
+     "next-farthest shadows are left out too, and they come back once the frame rate recovers. "
+     "Helps a graphics card that is close to its limit.",
+     "shadow shadows busy performance fps"},
+    // New graphics (2026-11-10): the lighting the mod adds; each needs DLSS or FSR.
+    {"new_shadows",
+     "Game's: only the game's own shadows. Low: the lights near you (your lantern, a torch, a "
+     "gun's flash, the lamps of the street) cast real shadows, from the mod's half-resolution "
+     "shadow mask, which is cheap. High: the lamps that matter most (a torch or lantern in your "
+     "hand, and the lamps lighting the most of what you see, three at most) cast sharp, detailed "
+     "shadows worked out at full resolution; it costs some GPU time near such lamps. Needs DLSS "
+     "or FSR; applies at the next start. Not set: by your graphics card's memory (Low from 12 GB).",
+     "shadow shadows lantern torch lamp lamps detail sharp high low dynamic lighting performance fps"},
+    {"new_fog",
+     "On: the fog banks that linger over the ground, and the ground mist of the Forbidden Woods, "
+     "are drawn by the mod's own fog: it stays where it is in the world, lamps and the moon light "
+     "it, and it has its own color. Game's: the game's fog as it draws it. The fog needs the "
+     "moon's glow, so Moon glow is on while Fog is on. Needs DLSS or FSR; applies at the next "
+     "start. Not set: by your graphics card's memory (on from 12 GB).",
+     "fog mist banks volumetric volumetrics ground haze performance fps"},
+    {"moon_glow",
+     "On: moonlight in the air: a soft glow towards the moon, haze, and rays through trees and "
+     "windows. It is always on while Fog is on. Needs DLSS or FSR; applies at the next start. "
+     "Not set: by your graphics card's memory (on from 12 GB).",
+     "moon glow haze god rays godrays shafts beams moonlight air performance fps"},
+    {"new_ambient",
+     "AO: deeper, more grounded shading in corners, under ledges and where things meet, in place "
+     "of the game's; with it blood looks wet and fine detail shimmers less. AO and bounce: also "
+     "light reflected off lit walls and floors onto what is near them, the most expensive of the "
+     "new graphics. Needs DLSS or FSR; applies at the next start. Not set: by your graphics card's "
+     "memory (AO from 10 GB, bounce from 13.8 GiB).",
+     "ambient occlusion ao gtao bounce gi global illumination lighting"},
+    {"raised_bricks",
+     "On: brick walls, big stone blocks and roof tiles get real depth. Their joints sink and "
+     "darken, and each eye sees them from its own side, so they look built rather than painted. "
+     "Every other surface is drawn exactly as the game draws it. Applies at the next start.",
+     "parallax bricks brick stones walls tiles roof depth relief bump raised joints"},
+    {"cinematic_look",
+     "A film-like color curve on the game's final image: deeper blacks and calmer shadows. 0 is "
+     "the game's own look. Applies at once.",
+     "cinematic grade color contrast film look blacks",
+     30}, // (the game's default: vr_session.h cinematic_look; unset showed "0% (default)" until 2026-11-17)
+    {"eye_adaptation",
+     "On: stepping from bright light into a dark place, the view starts darker and opens up "
+     "over a couple of seconds as your eyes adjust; stepping back out, it starts too bright and "
+     "settles. Once adjusted, it is the game's own brightness. Costs nothing measurable. "
+     "Applies at once.",
+     "eye adaptation auto exposure adaptive eyes brightness dark bright hdr"},
+};
+const RowNote *NoteOf(std::string_view id) {
+    for (const auto &note : Notes)
+        if (id == note.id)
+            return &note;
+    return nullptr;
+}
+// The page's rows its tabs leave out (vr.ini tuning since 2026-10-30), at the end of their tab.
+constexpr std::pair<const char *, const char *> LauncherOnly[]{
+    {"You", "lean_side"},
+    {"You", "lean_response"},
+    {"You", "body_comfort"},
+    {"Combat", "two_hand_swing_hum"},
+    {"Items & world", "holster_haptics"},
+    {"HUD & feedback", "health_color_strength"},
+    {"HUD & feedback", "stamina_color_strength"},
+};
+// A game row as a launcher row: its keys, choices (an empty value leaves that key, Keep) or
+// number range, and the launcher's note.
+Setting FromPage(const VR::Page::Row &row, const char *category, const char *group) {
+    Setting s{category, row.label, row.help};
+    for (const char *key : row.keys)
+        if (key)
+            s.keys.emplace_back(key);
+    if (row.widget == VR::Page::Widget::Choice) {
+        for (const auto &o : row.options) {
+            Option option{o.text, {}, o.ini_only};
+            for (size_t j = 0; j < s.keys.size(); ++j)
+                option.values.emplace_back(o.values[j] ? o.values[j] : Keep);
+            s.options.push_back(std::move(option));
+        }
+    } else {
+        s.min = row.min;
+        s.max = row.max;
+        s.step = row.step;
+        s.unit = row.unit;
+        if (row.widget == VR::Page::Widget::Slider) {
+            // A float 1/7 or 1/100 as the exact fraction (0.5 is 3.5 sevenths, shown as 4).
+            const double inverse = 1.0 / row.ini_scale;
+            s.scale = std::abs(inverse - std::round(inverse)) < 1e-3 ? 1.0 / std::round(inverse)
+                                                                     : row.ini_scale;
+        } else {
+            s.sign = row.signed_value;
+            s.zero = row.zero_text;
+        }
+    }
+    s.id = row.id;
+    s.group = group;
+    if (const auto *note = NoteOf(row.id)) {
+        s.details = note->details;
+        s.words = note->words;
+        s.fallback = note->fallback;
+        if (note->zero)
+            s.zero = note->zero;
+    }
+    return s;
+}
+} // namespace
+// Built from the in-game VR page (vr_page.h Tabs and Rows). Not offered: Smooth motion
+// (late_warp_motion), which needs late_warp=1 while the headset preset runs late_warp=0, and the
+// Upscaling tab's rows (the Graphics tab draws graphics_config itself).
 const std::vector<Setting> &Settings() {
-    static const std::vector<Setting> all{
-        // General
-        Choice("General", "Height",
-               "As the hunter: his eye height. As the player: your real height (from the "
-               "headset's floor).",
-               {"height_base"}, {{"As the hunter", {"hunter"}}, {"As the player", {"player"}}},
-               "As the hunter: standing straight, your eyes are at the hunter's eye height. As "
-               "the player: your real height, measured from the headset's floor. Seated play "
-               "always uses the hunter's height."),
-        Number("General", "Adjust height",
-               "Taller or shorter, from the choice above. Also corrects a floor that is a few cm "
-               "off.",
-               "height_adjust_cm", -10, 10, 1, 1, 0, " cm", true,
-               "Moves your eyes up or down from the height choice, in centimetres."),
-        Choice("General", "Move with", "Which thumb walks. Your right hand still holds the blade.",
-               {"swap_sticks"}, {{"Left stick", {"0"}}, {"Right stick", {"1"}}},
-               "Right stick: the right stick walks and the left stick turns. The stick clicks "
-               "and face buttons change hands too."),
-        Choice("General", "Turning", "How the turning stick turns you.",
-               {"snap_turn_deg", "smooth_turn_deg_per_s"},
-               {{"Snap 15\xC2\xB0", {"15", Keep}},
-                {"Snap 30\xC2\xB0", {"30", Keep}},
-                {"Snap 45\xC2\xB0", {"45", Keep}},
-                {"Snap 90\xC2\xB0", {"90", Keep}},
-                {"Smooth, slow", {"0", "90"}},
-                {"Smooth", {"0", "120"}},
-                {"Smooth, fast", {"0", "180"}}},
-               "Snap turns jump by the chosen angle. Smooth turning rotates at 90 (slow), 120 or "
-               "180 (fast) degrees per second."),
-        Number("General", "Vibration", "Strength of every vibration. 0 turns it off.",
-               "haptic_gain", 0, 10, 1, 1.0 / 7, 7, "", false,
-               "Scales every controller vibration. 7 is the game's normal strength."),
-        // Controls
-        Choice("Controls", "Control style",
-               "Motion: swing to attack. Buttons: the classic layout.", {"controls"},
-               {{"Motion", {"motion"}}, {"Buttons", {"classic"}}},
-               "Motion: swing the controller to attack. Buttons: attack with buttons only."),
-        Choice("Controls", "Blood Vial", "Stab the vial into your wrist, or use a button.",
-               {"inject"}, {{"Stab to inject", {"1"}}, {"Button", {"0"}}},
-               "Stab: X readies a vial, then touch it to your wrist or body to inject it. "
-               "Button: X uses a vial, as in the original game."),
-        Choice("Controls", "Gun laser", "A thin line from the gun's barrel.", {"laser"},
-               {{"Off", {"0"}}, {"On", {"1"}}},
-               "A thin line along the gun barrel while you raise your gun hand to aim."),
-        Choice("Controls", "Grip adjust",
-               "Press the grip-adjust button twice and hold to set how the weapon sits in your "
-               "hand.",
-               {"grip_adjust"}, {{"On", {"1"}}, {"Off", {"0"}}},
-               "On: double-press and hold the grip-adjust button to change how the weapon sits "
-               "in your hand. The in-game VR page names the button for your controllers."),
-        Choice("Controls", "Stance", "Seated: smaller swings and throws, the lap counts for the vial.",
-               {"seated"}, {{"Standing", {"0"}}, {"Seated", {"1"}}},
-               "Seated: smaller strong swings and throws, your lap counts as a place for Blood "
-               "Vials, and walking around your room does not move the hunter."),
-        // Comfort
-        Choice("Comfort", "Body near your eyes",
-               "Full body only: fade his coat where it comes close to your eyes.",
-               {"body_cutaway"}, {{"Fade", {"1"}}, {"Show", {"0"}}},
-               "Full body only: parts of the body closer than about 20 cm to your eyes fade out, "
-               "so you can look down past the collar and chest."),
-        Choice("Comfort", "Hunter's body",
-               "See the hunter's whole body, only his hands and forearms, or only his hands.",
-               {"body_mode"},
-               {{"Full", {"no_head"}}, {"Arms only", {"arms_only"}}, {"Hands only", {"hands_only"}}},
-               "Full: everything but the head. The hunter's shadow always shows the whole body."),
-        Number("Comfort", "World size (eye distance)",
-               "A smaller eye distance makes the world look larger.", "ipd_mm", 40, 80, 1, 1, 0,
-               " mm", false,
-               "The fast renderer uses a fixed eye distance chosen at launch: Standard is 64 mm, "
-               "not your headset's own setting. Smaller values make the world look larger.",
-               "Standard (64 mm)"),
-        Choice("Comfort", "Scenes on a screen",
-               "Show grabs, viscerals, doors and ladders on a virtual screen.", {"cinematic"},
-               {{"On", {"1"}}, {"Off", {"0"}}},
-               "On: viscerals, grabs, doors, levers, lamps and ladders play from the game's own "
-               "camera on a virtual screen. Off: they stay in first person. Launcher only: the "
-               "in-game VR page has no row for it."),
-        // HUD
-        Choice("HUD", "Health & stamina", "On your wrist, or in the corner like the game.",
-               {"hud_vitals"}, {{"Wrist gauge", {"wrist"}}, {"Classic", {"classic"}}},
-               "Wrist gauge: a Blood Gauge on the left wrist shows health, stamina and bullets; "
-               "the game's own health display appears when you look down. Classic: the game's "
-               "HUD."),
-        Choice("HUD", "Low-health warning",
-               "A heartbeat in both hands and dark edges when your health is low.",
-               {"vitals_heartbeat", "vitals_edge"}, {{"On", {"1", "1"}}, {"Off", {"0", "0"}}},
-               "On: a heartbeat in both controllers and darkened edges of your view while your "
-               "health is low."),
-        Choice("HUD", "Echoes & Insight", "Look down: they show when you look down at your feet.",
-               {"ui_counters"},
-               {{"Look down", {"look_down"}}, {"Always", {"always"}}, {"Hidden", {"hidden"}}},
-               "Look down: the counters fade in when you look well below the horizon. Menus and "
-               "dialogs always show them."),
-        Choice("HUD", "Hit flash", "The edges of your view flash red when you are hit.",
-               {"hit_vignette"}, {{"On", {"1"}}, {"Off", {"0"}}},
-               "On: the edges of your view flash red when you take a hit."),
-        Choice("HUD", "HUD size", "The size of the health bars, items and prompts.",
-               {"ui_hud_scale_deg"},
-               {{"Small", {"0.035"}}, {"Medium", {"0.042"}}, {"Large", {"0.05"}}},
-               "The size of the health bars, item icons and prompts. Medium is the game "
-               "default."),
-        // Assists
-        Choice("Assists", "Extra health", "More maximum health for the hunter.",
-               {"player_hp_bonus_pct"},
-               {{"Off", {"0"}}, {"+10 %", {"10"}}, {"+20 %", {"20"}}, {"+30 %", {"30"}},
-                {"+50 %", {"50"}}},
-               "Raises the hunter's maximum health (+10 % by default). Your save file is not "
-               "changed."),
-        Choice("Assists", "Longer dodge invincibility", "Extra frames of invincibility in a dodge.",
-               {"dodge_iframes_extra"},
-               {{"Off", {"0"}}, {"+1 frame", {"1"}}, {"+2 frames", {"2"}}, {"+3 frames", {"3"}},
-                {"+4 frames", {"4"}}},
-               "Extra invincibility after a quickstep or roll, in 1/30 s frames (+1 by default). "
-               "Backsteps get none."),
-        Choice("Assists", "Instant ragdoll",
-               "An enemy your blade kills goes limp at once. Off: its death animation.",
-               {"melee_kill_ragdoll"}, {{"On", {"1"}}, {"Off", {"0"}}},
-               "On: an enemy killed by your blade goes limp straight away. Off: it plays its "
-               "death animation."),
-        Choice("Assists", "Ragdoll push", "How hard your swing throws the body. None: it just falls.",
-               {"melee_ragdoll_impulse"},
-               {{"None", {"0"}}, {"Light", {"0.5"}}, {"Normal", {"1"}}, {"Strong", {"2"}},
-                {"Strongest", {"3"}}},
-               "How far your swing throws a body. Normal is the game default."),
-        Choice("Assists", "Light attack stamina",
-               "Light swing cost. Strong swings cost 100%; low stamina makes them light.",
-               {"melee_stamina_pct"},
-               {{"Original", {"100"}}, {"80%", {"80"}}, {"50%", {"50"}}, {"10%", {"10"}}},
-               "Light swings cost this share of the game's stamina (80% by default). Strong "
-               "swings always cost the full amount; with too little stamina a strong swing "
-               "becomes a light one. Dodges, sprinting and guns are unchanged."),
-        // Display
-        Choice("Display", "Anti-aliasing",
-               "Game FXAA, dual-eye SMAA, or None. Bypassed while DLSS or FSR 4 is on.",
-               {"aa_mode"}, {{"Game FXAA", {"fxaa"}}, {"SMAA", {"smaa"}}, {"None", {"off"}}},
-               "SMAA: dual-eye SMAA replaces the game's FXAA (the default). Game FXAA: the "
-               "game's own. None: no extra edge smoothing."),
-        Choice("Display", "Distant detail",
-               "Performance: the game's simpler distant models, fastest.", {"lod_bias"},
-               {{"Performance", {"0"}}, {"Balanced", {"-1"}}, {"Quality", {"-2"}}},
-               "Performance (the default): the game's own simpler models far away, the best "
-               "frame rate. Balanced: a little more detail at a distance. Quality: every object's "
-               "full model at any distance, the slowest. Applies at once, in game too."),
-        Choice("Display", "Show enemy health bars",
-               "The bars over enemies you hit or lock on to. Boss bars always show.",
-               {"ui_enemy_hp_bars"}, {{"On", {"1"}}, {"Off", {"0"}}},
-               "On: bars and damage numbers over enemies you hit or lock on to. Boss bars, the "
-               "lock-on dot and your own HUD always show."),
-        Choice("Display", "Camera", "Choose the initial perspective.", {"first_person"},
-               {{"First person", {"1"}}, {"Third person", {"0"}}},
-               "Third person turns the VR body off. Launcher only: the in-game VR page has no "
-               "row for it."),
-        // Body
-        Choice("Body", "Tracked posture", "Lean keeps the spine's length as you move your head.",
-               {"body_align", "body_posture"},
-               {{"Lean", {"1", "lean"}}, {"Legacy shift", {"1", "shift"}}, {"Off", {"0", "lean"}}},
-               "How the hunter's body follows your head. Lean keeps the spine's length; Legacy "
-               "shift is the older behaviour."),
-        Number("Body", "Side lean limit",
-               "How far the hunter leans sideways. More lean lets you move farther before he "
-               "steps.",
-               "body_lean_side_deg", 0, 35, 1, 1, 20, "\xC2\xB0", false,
-               "The furthest the hunter leans sideways before he takes a step."),
-        Choice("Body", "Extra clipping protection",
-               "Protect sideways leans and restore the body in stages after a roll or hit.",
-               {"body_comfort"}, {{"Off", {"0"}}, {"On", {"1"}}},
-               "On: extra protection against the body clipping into your view on sideways leans, "
-               "and a staged return of the body after a roll or hit."),
-        Number("Body", "Posture smoothing",
-               "Less smoothing follows faster; more softens small movements.", "body_align_ms", 0,
-               500, 25, 1, 50, " ms", false,
-               "How long the body takes to follow your posture, in milliseconds."),
-        // Inventory
-        Choice("Inventory", "Item access",
-               "Left grip takes and holds items. Release returns an unused vial, or throws a "
-               "throwable. Vials stay right; pocket/chest follow equipped quick slots 1/2.",
-               {"holster_mode"}, {{"Menu", {"0"}}, {"Body slots", {"1"}}, {"Both", {"2"}}},
-               "Menu: the quick-item menu. Body slots: pouches on the hunter's body (Y still "
-               "opens the menu). Both: either."),
-        Choice("Inventory", "Pouch touch feedback", "A small vibration when your hand finds a pouch.",
-               {"holster_haptics"}, {{"On", {"1"}}, {"Off", {"0"}}},
-               "On: a small vibration when your hand reaches a pouch."),
-        // Feedback
-        Choice("Feedback", "Low-health red edges",
-               "A restrained red edge below 30% health. Takes priority over stamina color "
-               "feedback.",
-               {"health_color"}, {{"Off", {"0"}}, {"On", {"1"}}},
-               "On: a red edge around your view below 30% health."),
-        Number("Feedback", "Health intensity", "Strength of the low-health red edge.",
-               "health_color_strength", 0, 100, 10, 0.01, 50, " %", false,
-               "How strong the low-health red edge is."),
-        Choice("Feedback", "Exhaustion desaturation",
-               "Briefly soften colors at exhausted stamina, then fade back. Never full grayscale.",
-               {"stamina_color"}, {{"Off", {"0"}}, {"On", {"1"}}},
-               "On: colours soften briefly when your stamina runs out, then return."),
-        Number("Feedback", "Stamina intensity", "Strength of the brief exhaustion effect.",
-               "stamina_color_strength", 0, 100, 10, 0.01, 70, " %", false,
-               "How strong the exhaustion effect is."),
-        Choice("Feedback", "Shoulder weapon switch",
-               "B at right shoulder / Y at left: tap to switch, hold about 0.7 seconds for unarmed. "
-               "Tap unarmed to restore the remembered weapon.",
-               {"shoulder_switch"}, {{"Off", {"0"}}, {"On", {"1"}}},
-               "On: reach over a shoulder and press B (right) or Y (left) to switch that hand's "
-               "weapon; hold for about 0.7 seconds to go unarmed."),
-        // Weapons
-        Choice("Weapons", "Weighted weapons",
-               "Weight, gravity and air resistance for rigid weapons. Whip forms are excluded.",
-               {"weighted_weapons"}, {{"On", {"1"}}, {"Off", {"0"}}},
-               "On: weapon shape and one- or two-handed support affect handling. Off: direct handling."),
-        Choice("Weapons", "Solid weapons", "Stop at walls and each other. Weapons only: just each other.",
-               {"weapon_wall"}, {{"Off", {"0"}}, {"On", {"1"}}, {"Weapons only", {"2"}}},
-               "On: weapons stop at walls and at each other. Weapons only (the default): they "
-               "only stop at each other."),
-        Choice("Weapons", "Grip guide", "Hold the right grip to show where your left hand can grab.",
-               {"two_hand_guide"}, {{"On", {"1"}}, {"Off", {"0"}}},
-               "On: holding the right grip shows where your left hand can take the weapon with "
-               "both hands."),
-        Number("Weapons", "Swing feel", "Faint feedback during fast swings with both hands on one weapon.",
-               "two_hand_swing_hum", 0, 100, 10, 0.01, 100, " %", false,
-               "Vibration strength during fast two-handed swings."),
-        Choice("Weapons", "Flick to reload",
-               "After a shot, release the trigger and flick your left wrist firmly in any direction "
-               "to reload.",
-               {"gun_wrist_reload"}, {{"Wrist flick", {"1"}}, {"Off/Original", {"0"}}},
-               "Wrist flick: flick your left wrist after each shot. Off/Original: fire again without a flick."),
-        Choice("Weapons", "Blade sounds",
-               "Your weapons ring when they meet; draw one along the other to sharpen it.",
-               {"blade_sounds"}, {{"On", {"1"}}, {"Off", {"0"}}},
-               "On: weapons ring when they touch, and drawing one along the other makes a "
-               "sharpening sound."),
-        // Interactions
-        Choice("Interactions", "Physical levers",
-               "Grip a lever with either hand and pull. Off: original interaction.",
-               {"physical_levers"}, {{"On", {"1"}}, {"Off", {"0"}}},
-               "On: grip a lever with either hand and pull it. Off: the game's original "
-               "interaction."),
-        Choice("Interactions", "Lamp rest & travel",
-               "Rest, refill and travel between lit lamps. Offline only. Experimental.",
-               {"lamp_travel"}, {{"Off", {"0"}}, {"On", {"1"}}},
-               "On: rest, refill and travel between lit lamps from the lamp itself. Offline "
-               "only, and experimental."),
-        Choice("Interactions", "VR Grab attacks",
-               "Stay in VR during enemy grabs. The view follows the hunter. Off: existing "
-               "behavior.",
-               {"vr_grab_attacks"}, {{"Off", {"0"}}, {"On", {"1"}}},
-               "On: enemy grab attacks stay in VR, with the view following the hunter. Off (the "
-               "default): the existing behaviour."),
-        // Color
-        Number("Color", "Contrast", "Light and dark separation. 0 is unchanged.", "color_contrast",
-               -50, 50, 5, 1, 0, " %", true, "Separation between light and dark areas."),
-        Number("Color", "Saturation", "Color intensity. -100 is monochrome; 0 is unchanged.",
-               "color_saturation", -100, 100, 5, 1, 0, " %", true,
-               "Colour intensity. -100 % is black and white."),
-        Number("Color", "Gamma", "Midtone brightness. Higher is brighter; 0 is unchanged.",
-               "color_gamma", -50, 50, 5, 1, 0, " %", true,
-               "Brightness of the midtones; higher is brighter.")};
+    static const std::vector<Setting> all = [] {
+        std::vector<Setting> out;
+        const auto &rows = VR::Page::Rows();
+        const auto add = [&](const char *id, const char *category, const char *group) {
+            if (const int at = VR::Page::RowIndex(id); at >= 0)
+                out.push_back(FromPage(rows[size_t(at)], category, group));
+        };
+        for (const auto &tab : VR::Page::Tabs()) {
+            if (GameOnlyTab(tab.name))
+                continue;
+            // A tab with pages: each page's name is the heading of its rows.
+            for (int page = 0; page < tab.Pages(); ++page)
+                for (const int r : tab.RowsOf(page))
+                    if (r >= 0 && std::string_view(rows[size_t(r)].id) != "smooth_motion")
+                        out.push_back(FromPage(rows[size_t(r)], tab.name,
+                                               tab.Pages() > 1 ? tab.PageName(page) : nullptr));
+            for (const auto &[in, id] : LauncherOnly)
+                if (std::string_view(in) == tab.name)
+                    add(id, tab.name, LauncherOnlyGroup);
+        }
+        // The performance choice that needs a restart; the live ones (foveated rendering among
+        // them since 2026-11-01) are on the page's Picture tab (its Performance page).
+        add("frame_overlap", "Graphics", "Performance");
+        add("upscale_focus", "Graphics", "Upscaling"); // the in-game Upscaling tab's own row
+        add("canted_eyes", "Graphics", "Headset");
+        // Launcher only: the page has no row for them.
+        auto camera = Choice("Extras", "Camera", "Choose the initial perspective.",
+                             {"first_person"}, {{"First person", {"1"}}, {"Third person", {"0"}}},
+                             "Third person turns the VR body off. Launcher only: the in-game VR "
+                             "page has no row for it.");
+        camera.words = "third person first person view perspective";
+        out.push_back(std::move(camera));
+        auto scenes =
+            Choice("Extras", "Scenes on a screen",
+                   "Show grabs, viscerals, doors and ladders on a virtual screen.", {"cinematic"},
+                   {{"On", {"1"}}, {"Off", {"0"}}},
+                   "On: viscerals, grabs, levers and ladders play from the game's own camera on "
+                   "a virtual screen, and so do doors, chests and lamps with VR interactions on "
+                   "Flat. Off: they stay in first person. Resting and travelling at a lamp stay "
+                   "on the screen either way. Launcher only: the in-game VR page has no row for "
+                   "it.");
+        scenes.words = "cinematic cutscene screen visceral door ladder lamp";
+        out.push_back(std::move(scenes));
+        return out;
+    }();
     return all;
 }
 } // namespace Launcher

@@ -20,4 +20,6 @@ bool VisceralStagePlacement(s64 now, float scale, GrabCamera::ThrowPlacement& ou
 void TraceVisceralCamera(u64 record, const float* position, const float* tracked_offset);
 void TraceVisceralDraw(u64 record, const float* expected, const float* actual, const float* scene);
 void TraceVisceralView(const char* kind, u64 record, const float* expected, const float* actual);
+// VR_VISCERAL_STAGE_TRACE: callers skip building trace-only data when it is off.
+bool VisceralTraceOn();
 } // namespace VR::Bloodborne

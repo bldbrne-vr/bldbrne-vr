@@ -20,12 +20,15 @@
 #include "core/emulator_settings.h"
 #include "core/vr/ui_conditions.h"
 #include "core/vr/ui_lock_marker.h"
+#include "core/vr/ui_slots.h"
 #include "video_core/host_shaders/vr_ui_resolve_comp.h"
+#include "video_core/renderer_vulkan/vk_gpu_pass_profiler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vr_ui_layer.h"
+#include "video_core/renderer_vulkan/vr_ui_snapshot.h"
 
 #include <vk_mem_alloc.h>
 
@@ -37,6 +40,13 @@ namespace {
 // atlas (OpenXRPresenter WarpUiRest's draw), so the atlases are also made sampled.
 const bool g_atlas_sampled = [] {
     const char* value = std::getenv("FAST_GPU_UI_COPY");
+    return value == nullptr || value[0] != '0';
+}();
+
+// Diagnostic A/B switch, read once at startup. Both layouts use the same resolve;
+// compare against an unchanged build for an end-to-end performance claim.
+const bool g_compact_snapshot = [] {
+    const char* value = std::getenv("VR_UI_COMPACT_SNAPSHOT");
     return value == nullptr || value[0] != '0';
 }();
 
@@ -76,6 +86,7 @@ enum ResolveFlag : u32 {
     FlagConditions = 1u << 19, // cut 3 is the build-up meter: into the strip (ui_conditions)
     FlagAreaName = 1u << 23,   // an area name is up: its corner whole on the band
     FlagAreaKey = 1u << 24,    // ... and its dark backing keyed out
+    FlagSheet = 1u << 25,      // the slot sheet below the halves (mode 9), no strip
 };
 constexpr u32 StatusShift = 8;   // flags bits 8..11: cuts left out of the content box
 constexpr u32 DynamicShift = 12; // flags bits 12..15: the dynamic cut
@@ -90,7 +101,27 @@ enum Mode : u32 {
     ModeMenuGone = 6,
     ModeMenuHud = 7,
     ModeMarkerBox = 8,
+    ModeSlots = 9,
+    ModeVeilOriginal = 10, // mode 0 as it was (VR_UI_RESOLVE_FAST=0)
+    ModeVeilCheck = 11,    // ... comparing its words with mode 0's (VR_UI_RESOLVE_FAST=v)
+    ModeSplitRowsCheck = 12, // mode 4, also walking every row the original way (=v)
 };
+
+// VR_UI_RESOLVE_FAST: the one-workgroup passes reading ahead (the veil estimate, mode 0, and the
+// split rows, mode 4: the same sums in the same order) and the scene veil dispatched only with a
+// veil (its groups from mode 0's words, an indirect dispatch), on by default; '0' the original
+// veil estimate and scene veil; 'v' on, with mode 11 after mode 0 and mode 12 for mode 4 every
+// frame (any word or row that differs from the original passes is counted and logged).
+char ResolveFast() {
+    static const char mode = [] {
+        const char* value = std::getenv("VR_UI_RESOLVE_FAST");
+        if (value == nullptr) {
+            return '1';
+        }
+        return value[0] == '0' ? '0' : value[0] == 'v' ? 'v' : '1';
+    }();
+    return mode;
+}
 
 // Stats words (vr_ui_resolve.comp).
 constexpr u32 WVeil = 0;
@@ -123,6 +154,12 @@ constexpr u32 WStripKd = 38;
 constexpr u32 WBox = 40;
 constexpr u32 WCutBox = 44; // 4 words per cut-out (44..59)
 constexpr u32 WMarkBox = 60; // the lock-on marker's box (60..63)
+constexpr u32 WSlotArea = 64;   // mode 9: UI pixels in the area name's slot ...
+constexpr u32 WSlotBanner = 65; // ... and in the banners' rows
+constexpr u32 WVerifyN = 66;    // mode 11: 1 when it compared this frame
+constexpr u32 WVerifyBad = 67;  // ... 1 when mode 0's words differed
+constexpr u32 WVeilArgs = 68;   // the scene veil's groups x, y, z (68..70)
+constexpr u32 WVerifySplit = 71; // mode 12: split rows that differed
 
 constexpr vk::ImageSubresourceRange ColorRange{
     .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -313,11 +350,17 @@ VrUiLayer::VrUiLayer(const Instance& instance_, Scheduler& scheduler_)
     const size_t version = source.find("\n#version"); // not the comments' mention of it
     ASSERT(version != std::string::npos);
     const size_t line_end = source.find('\n', version + 1);
-    static constexpr std::array<const char*, 9> names{
-        "vr ui veil",       "vr ui atlas", "vr ui scene veil", "vr ui check",
-        "vr ui split rows", "vr ui split", "vr ui menu gone",  "vr ui menu hud",
-        "vr ui marker box"};
+    static constexpr std::array<const char*, 13> names{
+        "vr ui veil",       "vr ui atlas",          "vr ui scene veil", "vr ui check",
+        "vr ui split rows", "vr ui split",          "vr ui menu gone",  "vr ui menu hud",
+        "vr ui marker box", "vr ui slot sheet",     "vr ui veil (original)",
+        "vr ui veil check", "vr ui split rows check"};
     for (u32 mode = 0; mode < pipelines.size(); ++mode) {
+        // The original veil estimate and the checks only where VR_UI_RESOLVE_FAST uses them.
+        if ((mode == ModeVeilOriginal && ResolveFast() != '0') ||
+            ((mode == ModeVeilCheck || mode == ModeSplitRowsCheck) && ResolveFast() != 'v')) {
+            continue;
+        }
         std::string code = source;
         code.insert(line_end + 1, fmt::format("#define MODE {}\n", mode));
         const vk::ShaderModule module = Compile(code, vk::ShaderStageFlagBits::eCompute, device);
@@ -342,7 +385,7 @@ VrUiLayer::VrUiLayer(const Instance& instance_, Scheduler& scheduler_)
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = StatsWords * sizeof(u32),
             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                     VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
         };
         const VmaAllocationCreateInfo alloc{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VkBuffer buffer{};
@@ -437,62 +480,56 @@ void VrUiLayer::EnsureTargets(vk::Format x_format, vk::Extent2D x_extent,
     extent = x_extent;
     components = comps;
     target_layers = layers;
-    const vk::Format raw = UnormTwin(x_format);
+    hud_keep_extent = {};
+    hud_keep_rect = {};
     for (u32 i = 0; i < targets.size(); ++i) {
-        auto& target = targets[i];
-        const vk::ImageCreateInfo image_ci{
-            .flags = vk::ImageCreateFlagBits::eMutableFormat,
-            .imageType = vk::ImageType::e2D,
-            .format = x_format,
-            .extent{.width = x_extent.width, .height = x_extent.height, .depth = 1},
-            .mipLevels = 1,
-            .arrayLayers = layers,
-            .samples = vk::SampleCountFlagBits::e1,
-            .tiling = vk::ImageTiling::eOptimal,
-            .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
-                     vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
-            .sharingMode = vk::SharingMode::eExclusive,
-            .initialLayout = vk::ImageLayout::eUndefined,
-        };
-        target.image = VideoCore::UniqueImage(device, allocator);
-        target.image.Create(image_ci);
-        static constexpr std::array<const char*, 4> target_names{"K", "W", "marker K",
-                                                                 "marker W"};
-        SetObjectName(device, static_cast<vk::Image>(target.image), "VR UI {} {}x{}",
-                      target_names[i], x_extent.width, x_extent.height);
-        target.sampled = Check<"create vr ui target view">(device.createImageViewUnique({
-            .image = target.image,
-            .viewType = vk::ImageViewType::e2D,
-            .format = raw,
-            .components = comps,
-            .subresourceRange = ColorRange,
-        }));
-        if (i >= hud_keep.size()) {
-            continue; // the lock-on marker's pair: no copy kept
+        if (i == MarkBlack || i == MarkGrey) {
+            continue; // made at the marker's first draw (TargetView)
         }
-        // Its copy before a menu's first draw (SnapshotHud): the HUD under the menu.
-        auto& keep = hud_keep[i];
-        vk::ImageCreateInfo keep_ci = image_ci;
-        keep_ci.arrayLayers = 1; // only the common UI from view zero enters the atlas
-        keep_ci.usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst;
-        keep.image = VideoCore::UniqueImage(device, allocator);
-        keep.image.Create(keep_ci);
-        SetObjectName(device, static_cast<vk::Image>(keep.image), "VR UI {} kept {}x{}",
-                      i == Black ? "K" : "W", x_extent.width, x_extent.height);
-        keep.sampled = Check<"create vr ui kept view">(device.createImageViewUnique({
-            .image = keep.image,
-            .viewType = vk::ImageViewType::e2D,
-            .format = raw,
-            .components = comps,
-            .subresourceRange = ColorRange,
-        }));
+        CreateTarget(i);
+    }
+    // No snapshot with the HUD in its slots (ui_hud_slots): the menu never draws over it there.
+    if (VR::Ui::Slots::Active() == nullptr) {
+        const auto rows = UiSnapshot::MenuRows(extent.width, extent.height);
+        EnsureHudKeep(g_compact_snapshot ? vk::Extent2D{rows.Width(), rows.Height()} : extent);
     }
     LOG_INFO(Render_Vulkan,
-             "VR ui layer: K/W targets {}x{} {} read as {}{}{}{} ({} MB with their copies kept "
-             "for the HUD under menus and the lock-on marker's pair), grey {:.2f}",
+             "VR ui layer: K/W targets {}x{} {} read as {}{}{}{}; menu HUD snapshots allocated "
+             "in {} layout, grey {:.2f}",
              x_extent.width, x_extent.height, vk::to_string(x_format), vk::to_string(comps.r),
              vk::to_string(comps.g), vk::to_string(comps.b), vk::to_string(comps.a),
-             (4 * target_layers + 2) * x_extent.width * x_extent.height * 4 / (1024 * 1024), grey);
+             g_compact_snapshot ? "compact" : "full-size diagnostic", grey);
+}
+
+void VrUiLayer::CreateTarget(u32 i) {
+    auto& target = targets[i];
+    const vk::ImageCreateInfo image_ci{
+        .flags = vk::ImageCreateFlagBits::eMutableFormat,
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent{.width = extent.width, .height = extent.height, .depth = 1},
+        .mipLevels = 1,
+        .arrayLayers = target_layers,
+        .samples = vk::SampleCountFlagBits::e1,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
+                 vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
+        .sharingMode = vk::SharingMode::eExclusive,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    };
+    target.image = VideoCore::UniqueImage(device, allocator);
+    target.image.Create(image_ci);
+    static constexpr std::array<const char*, 4> target_names{"K", "W", "marker K", "marker W"};
+    SetObjectName(device, static_cast<vk::Image>(target.image), "VR UI {} {}x{}", target_names[i],
+                  extent.width, extent.height);
+    target.sampled = Check<"create vr ui target view">(device.createImageViewUnique({
+        .image = target.image,
+        .viewType = vk::ImageViewType::e2D,
+        .format = UnormTwin(format),
+        .components = components,
+        .subresourceRange = ColorRange,
+    }));
+    target.layout = vk::ImageLayout::eUndefined;
 }
 
 bool VrUiLayer::BeginFrame(vk::Format x_format, vk::Extent2D x_extent,
@@ -520,6 +557,10 @@ bool VrUiLayer::BeginFrame(vk::Format x_format, vk::Extent2D x_extent,
 
 vk::ImageView VrUiLayer::TargetView(RecorderProxy cmdbuf, Which which, vk::Format view_format) {
     auto& target = targets[which];
+    if (frame_active && !target.image && (which == MarkBlack || which == MarkGrey) &&
+        targets[Black].image) {
+        CreateTarget(which); // the lock-on marker's first draw (outside a render pass)
+    }
     if (!frame_active || !target.image) {
         return {};
     }
@@ -590,34 +631,64 @@ void VrUiLayer::NoteGameClear(Which which) {
     targets[which].cleared = true;
 }
 
+void VrUiLayer::EnsureHudKeep(vk::Extent2D required) {
+    // Exact texels, no unused full-screen rows. Retain capacity until capture targets
+    // change; Retire keeps replaced images alive for earlier GPU commands.
+    if (required.width > hud_keep_extent.width || required.height > hud_keep_extent.height) {
+        hud_keep_extent.width = std::max(hud_keep_extent.width, required.width);
+        hud_keep_extent.height = std::max(hud_keep_extent.height, required.height);
+        for (const auto which : {Black, Grey}) {
+            auto& keep = hud_keep[which];
+            std::vector<vk::UniqueImageView> views;
+            views.push_back(std::move(keep.sampled));
+            Retire(keep.image, std::move(views));
+            auto ci = targets[which].image.image_ci;
+            ci.extent = vk::Extent3D{hud_keep_extent.width, hud_keep_extent.height, 1};
+            ci.arrayLayers = 1; // the common UI from view zero
+            ci.usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst;
+            keep.image = VideoCore::UniqueImage(device, allocator);
+            keep.image.Create(ci);
+            keep.sampled = Check<"create vr ui kept view">(device.createImageViewUnique({
+                .image = keep.image,
+                .viewType = vk::ImageViewType::e2D,
+                .format = UnormTwin(format),
+                .components = components,
+                .subresourceRange = ColorRange,
+            }));
+            SetObjectName(device, static_cast<vk::Image>(keep.image), "VR UI {} kept {}x{}",
+                          which == Black ? "K" : "W", hud_keep_extent.width,
+                          hud_keep_extent.height);
+        }
+        LOG_INFO(Render_Vulkan, "VR ui: menu HUD snapshot pair {}x{} (source {}x{}, no resampling)",
+                 hud_keep_extent.width, hud_keep_extent.height, extent.width, extent.height);
+    }
+}
+
 void VrUiLayer::SnapshotHud(vk::CommandBuffer cmdbuf, const vk::Rect2D& rows) {
     if (!frame_active || hud_snap != HudSnap::Whole) {
         return;
     }
     // No UI draw yet (K and W not even cleared for this frame): the menu came first.
-    if (!written || !targets[Black].cleared || !targets[Grey].cleared ||
-        !hud_keep[Black].image || !hud_keep[Grey].image) {
+    if (!written || !targets[Black].cleared || !targets[Grey].cleared) {
         hud_snap = HudSnap::Empty;
         return;
     }
-    const s32 x0 = std::clamp(rows.offset.x, 0, static_cast<s32>(extent.width));
-    const s32 y0 = std::clamp(rows.offset.y, 0, static_cast<s32>(extent.height));
-    const s32 x1 = std::clamp(rows.offset.x + static_cast<s32>(rows.extent.width), x0,
-                              static_cast<s32>(extent.width));
-    const s32 y1 = std::clamp(rows.offset.y + static_cast<s32>(rows.extent.height), y0,
-                              static_cast<s32>(extent.height));
-    if (x1 <= x0 || y1 <= y0) {
+    const auto r = UiSnapshot::Clip(extent.width, extent.height, rows.offset.x, rows.offset.y,
+                                    rows.extent.width, rows.extent.height);
+    if (r.Empty()) {
         hud_snap = HudSnap::Empty;
         return;
     }
+    const vk::Extent2D copy_extent{r.Width(), r.Height()};
+    EnsureHudKeep(g_compact_snapshot ? copy_extent : extent);
+    hud_keep_rect = g_compact_snapshot ? vk::Rect2D{{r.x0, r.y0}, copy_extent}
+                                       : vk::Rect2D{{0, 0}, extent};
     const vk::ImageCopy region{
         .srcSubresource = ColorLayers,
-        .srcOffset = {x0, y0, 0},
+        .srcOffset = {r.x0, r.y0, 0},
         .dstSubresource = ColorLayers,
-        .dstOffset = {x0, y0, 0},
-        .extent = {.width = static_cast<u32>(x1 - x0),
-                   .height = static_cast<u32>(y1 - y0),
-                   .depth = 1},
+        .dstOffset = g_compact_snapshot ? vk::Offset3D{0, 0, 0} : vk::Offset3D{r.x0, r.y0, 0},
+        .extent = {.width = copy_extent.width, .height = copy_extent.height, .depth = 1},
     };
     for (const auto which : {Black, Grey}) {
         auto& target = targets[which];
@@ -827,13 +898,19 @@ void VrUiLayer::EndFrame() {
     scene_valid = false;
 }
 
-VrUiLayer::Atlas VrUiLayer::AtlasFor(u32 slot, vk::Extent2D band, bool strip) {
+u32 VrUiLayer::AtlasRows(vk::Extent2D band, bool strip, u32 sheet_rows) {
+    // The slot sheet where the strip would be, padded to a multiple of 8 like it (the mips).
+    return sheet_rows > 0
+               ? (VR::Ui::Conditions::StripTop(band.height) + sheet_rows + 7u) & ~7u
+               : VR::Ui::Conditions::AtlasHeight(band.width, band.height, strip);
+}
+
+VrUiLayer::Atlas VrUiLayer::AtlasFor(u32 slot, vk::Extent2D band, bool strip, u32 sheet_rows) {
     if (atlases.size() <= slot) {
         atlases.resize(slot + 1);
     }
     auto& atlas = atlases[slot];
-    const vk::Extent2D size{band.width,
-                            VR::Ui::Conditions::AtlasHeight(band.width, band.height, strip)};
+    const vk::Extent2D size{band.width, AtlasRows(band, strip, sheet_rows)};
     if (!atlas.image || atlas.extent != size) {
         std::vector<vk::UniqueImageView> views;
         views.push_back(std::move(atlas.storage));
@@ -915,9 +992,7 @@ bool VrUiLayer::Resolve(vk::CommandBuffer cmdbuf, const Atlas* atlas, const Scen
     }
     if (!params.check &&
         (atlas == nullptr || !atlas->image || atlas->extent.width != params.band.extent.width ||
-         atlas->extent.height != VR::Ui::Conditions::AtlasHeight(params.band.extent.width,
-                                                                  params.band.extent.height,
-                                                                  params.strip))) {
+         atlas->extent.height != AtlasRows(params.band.extent, params.strip, 0u))) {
         return false;
     }
     if (params.check && (!params.x_final.sampled || !scene_ref.sampled)) {
@@ -968,9 +1043,12 @@ bool VrUiLayer::Resolve(vk::CommandBuffer cmdbuf, const Atlas* atlas, const Scen
                      vk::AccessFlagBits2::eShaderSampledRead);
         target.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
     }
-    // The stats words: the previous frame's passes and copy-out are done with them.
+    // The stats words: the previous frame's passes, scene veil dispatch and copy-out are done with
+    // them.
     MemoryBarrier(
-        cmdbuf, vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
+        cmdbuf,
+        vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer |
+            vk::PipelineStageFlagBits2::eDrawIndirect,
         vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eShaderStorageRead |
             vk::AccessFlagBits2::eTransferRead,
         vk::PipelineStageFlagBits2::eComputeShader,
@@ -1023,6 +1101,7 @@ bool VrUiLayer::Resolve(vk::CommandBuffer cmdbuf, const Atlas* atlas, const Scen
                  (params.menu_box ? FlagMenuBox : 0u) | (marker ? FlagMarker : 0u) |
                  (marker && params.marker_over ? FlagMarkerOver : 0u) |
                  (params.empty_snap ? FlagEmpty : 0u) |
+                 (params.slots.on && !params.check ? FlagSheet : 0u) |
                  (params.conditions && params.strip && push.cut_count == 4 ? FlagConditions
                                                                            : 0u) |
                  ((params.status_cuts & 0xFu) << StatusShift) |
@@ -1101,11 +1180,23 @@ bool VrUiLayer::Resolve(vk::CommandBuffer cmdbuf, const Atlas* atlas, const Scen
     const u32 groups_x = DivCeil(params.band.extent.width, 16);
     const u32 groups_y = DivCeil(params.band.extent.height, 16);
 
+    // FAST_GPU_PASS_PROFILE: the resolve's steps apart (the presenter's "VR UI layer resolve"
+    // label holds the barriers before them).
+    const auto mark = [this](u64 step, const char* name) {
+        GpuPassProfiler::MarkAt(scheduler, 0xF11F'0000'0040ull + step,
+                                GpuPassProfiler::Group::VrHost, name);
+    };
+    mark(1, "VR UI resolve: veil estimate and marker box");
     // 1. The veil estimate (and the frame's counters cleared).
+    const char fast = ResolveFast();
     {
         const std::array writes{sampled(0, k_info), sampled(1, w_info), stats_write};
-        dispatch(ModeVeil, writes, 1, 1);
+        dispatch(fast == '0' ? ModeVeilOriginal : ModeVeil, writes, 1, 1);
         stats_written();
+        if (fast == 'v') {
+            dispatch(ModeVeilCheck, writes, 1, 1);
+            stats_written();
+        }
     }
     // 1b. The lock-on marker's box (mode 1 scales it about the box's centre).
     if (marker) {
@@ -1126,6 +1217,7 @@ bool VrUiLayer::Resolve(vk::CommandBuffer cmdbuf, const Atlas* atlas, const Scen
         stats_written();
     } else {
         // 2. The atlas.
+        mark(2, "VR UI resolve: atlas");
         ImageBarrier(cmdbuf, atlas->image, vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral,
                      vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eNone,
                      vk::PipelineStageFlagBits2::eComputeShader,
@@ -1137,6 +1229,7 @@ bool VrUiLayer::Resolve(vk::CommandBuffer cmdbuf, const Atlas* atlas, const Scen
                                 sampled(9, mw_info)};
         dispatch(ModeAtlas, writes, groups_x, groups_y);
         if (split) {
+            mark(3, "VR UI resolve: split");
             // The dynamic region: its rows' HUD extents from the mask, then the split of the
             // atlas (both of its halves were written above).
             const auto compute_to_compute = [&] {
@@ -1153,7 +1246,7 @@ bool VrUiLayer::Resolve(vk::CommandBuffer cmdbuf, const Atlas* atlas, const Scen
                 });
             };
             compute_to_compute();
-            dispatch(ModeSplitRows, writes, 1, 1);
+            dispatch(fast == 'v' ? ModeSplitRowsCheck : ModeSplitRows, writes, 1, 1);
             compute_to_compute();
             const Region& r = params.cut[dynamic];
             dispatch(ModeSplit, writes, DivCeil(static_cast<u32>(r.x1 - r.x0), 16),
@@ -1211,14 +1304,59 @@ bool VrUiLayer::Resolve(vk::CommandBuffer cmdbuf, const Atlas* atlas, const Scen
                 .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
             const std::array hud_writes{sampled(0, hk_info), sampled(1, hw_info),
                                         storage(2, atlas_info), stats_write, split_write};
+            // ModeMenuHud alone uses box as source origin + valid size. Guard by the
+            // copied rectangle, not capacity: a smaller later copy leaves stale texels.
+            const std::array saved_box{push.box[0], push.box[1], push.box[2], push.box[3]};
+            const vk::Rect2D source = kept ? hud_keep_rect : vk::Rect2D{{0, 0}, extent};
+            push.box[0] = source.offset.x;
+            push.box[1] = source.offset.y;
+            push.box[2] = static_cast<s32>(source.extent.width);
+            push.box[3] = static_cast<s32>(source.extent.height);
             dispatch(ModeMenuHud, hud_writes, groups_x,
                      DivCeil(static_cast<u32>(std::max(rows, 0)), 16));
+            std::copy(saved_box.begin(), saved_box.end(), push.box);
+        }
+        const auto& sl = params.slots;
+        mark(4, "VR UI resolve: menu passes and slot sheet");
+        if (sl.on && sl.Rows() > 0) {
+            // The slot sheet (mode 9): the margins' blocks below the halves, after the passes
+            // above wrote the halves (the atlas's mips are made from the whole image later).
+            const vk::MemoryBarrier2 memory{
+                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead |
+                                 vk::AccessFlagBits2::eShaderStorageWrite,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .memoryBarrierCount = 1,
+                .pMemoryBarriers = &memory,
+            });
+            const auto put = [](s32 (&dst)[4], const std::array<s32, 4>& v) {
+                std::copy(v.begin(), v.end(), dst);
+            };
+            // Its words go in the cut, box and scene size fields, put back after it: the scene
+            // veil below reads the scene size (left as the banner rows, the menu's dim darkened
+            // only a corner of each eye and none of the rest, 2026-10-27).
+            const ResolvePush saved = push;
+            put(push.cut[0], {sl.top_src, sl.top_rows, sl.bottom_src, sl.bottom_rows});
+            put(push.cut[1], {sl.sheet_row, sl.status_home_dy, 0, 0});
+            put(push.cut[2], sl.status_left);
+            put(push.cut[3], sl.status_right);
+            put(push.box, sl.area);
+            push.scene_size[0] = sl.banner_y0;
+            push.scene_size[1] = sl.banner_y1;
+            const std::array slot_writes{sampled(0, k_info), sampled(1, w_info),
+                                         storage(2, atlas_info), stats_write};
+            dispatch(ModeSlots, slot_writes, groups_x, DivCeil(sl.Rows(), 16));
+            push = saved;
         }
         ImageBarrier(
             cmdbuf, atlas->image, vk::ImageLayout::eGeneral, vk::ImageLayout::eTransferSrcOptimal,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
         stats_written();
+        mark(5, "VR UI resolve: scene veil");
         // 3. The veil into the scene the eyes are made from.
         if (params.veil && scene_ref.storage && scene_ref.image) {
             ImageBarrier(
@@ -1228,13 +1366,31 @@ bool VrUiLayer::Resolve(vk::CommandBuffer cmdbuf, const Atlas* atlas, const Scen
                 vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite);
             // One UI atlas, the same full-screen dim applied to each already-rendered eye.
             // These views are disjoint; there is no second scene render or UI resolve.
+            // VR_UI_RESOLVE_FAST: as many groups as mode 0 wrote (none without a veil, when every
+            // group of a direct dispatch returned at once), read as an indirect dispatch.
+            if (fast != '0') {
+                MemoryBarrier(cmdbuf, vk::PipelineStageFlagBits2::eComputeShader,
+                              vk::AccessFlagBits2::eShaderStorageWrite,
+                              vk::PipelineStageFlagBits2::eDrawIndirect,
+                              vk::AccessFlagBits2::eIndirectCommandRead);
+            }
             for (const auto view : {scene_ref.storage, scene_ref.right_storage}) {
                 if (!view) continue;
                 const vk::DescriptorImageInfo scene_info{.imageView = view,
                                                          .imageLayout = vk::ImageLayout::eGeneral};
                 const std::array writes2{stats_write, storage(4, scene_info)};
-                dispatch(ModeSceneVeil, writes2, DivCeil(scene_ref.extent.width, 16),
-                         DivCeil(scene_ref.extent.height, 16));
+                if (fast == '0') {
+                    dispatch(ModeSceneVeil, writes2, DivCeil(scene_ref.extent.width, 16),
+                             DivCeil(scene_ref.extent.height, 16));
+                    continue;
+                }
+                cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *pipelines[ModeSceneVeil]);
+                cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pipeline_layout, 0,
+                                            writes2);
+                ScratchPush::Invalidate();
+                cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                                     sizeof(push), &push);
+                cmdbuf.dispatchIndirect(stats_buffer, WVeilArgs * sizeof(u32));
             }
             ImageBarrier(cmdbuf, scene_ref.image, vk::ImageLayout::eGeneral, scene_ref.layout,
                          vk::PipelineStageFlagBits2::eComputeShader,
@@ -1245,6 +1401,7 @@ bool VrUiLayer::Resolve(vk::CommandBuffer cmdbuf, const Atlas* atlas, const Scen
         }
     }
     // The words into this frame's readback slot (read a few frames later, never waited for).
+    mark(6, "VR UI resolve: stats copy");
     CollectStats();
     const u32 slot = readback_slot;
     readback_slot = (readback_slot + 1) % ReadbackSlots;
@@ -1298,6 +1455,25 @@ void VrUiLayer::CollectStats() {
         const u32* w = readback_words + slot * StatsWords;
         auto& s = stats_sum;
         ++s.frames;
+        if (ResolveFast() == 'v') {
+            static u64 compared = 0;
+            static u64 differed = 0;
+            static u64 split_rows_differed = 0;
+            compared += w[WVerifyN] != 0 ? 1 : 0;
+            differed += w[WVerifyN] != 0 && w[WVerifyBad] != 0 ? 1 : 0;
+            const u32 split_now = w[WVerifyN] != 0 ? w[WVerifySplit] : 0;
+            split_rows_differed += split_now;
+            if (w[WVerifyN] != 0 &&
+                (compared % 600 == 0 || ((w[WVerifyBad] != 0 || split_now != 0) &&
+                                         differed + split_rows_differed <= 5 + split_now))) {
+                LOG_INFO(Render_Vulkan,
+                         "VR_UI_RESOLVE_FAST=v: {} frames compared, {} with a veil word that "
+                         "differs from the original pass, {} split rows that differ (this frame "
+                         "veil {} args {} {} {}, split rows found {})",
+                         compared, differed, split_rows_differed, w[WVeilOn], w[WVeilArgs],
+                         w[WVeilArgs + 1], w[WVeilArgs + 2], w[WSplitRows]);
+            }
+        }
         const float veil = std::bit_cast<float>(w[WVeil]);
         if (w[WVeilOn] != 0) {
             ++s.veil_frames;
@@ -1333,6 +1509,8 @@ void VrUiLayer::CollectStats() {
                         : std::array<s32, 4>{};
             }
             latest_box.border = w[WBorder];
+            latest_box.slot_area = w[WSlotArea];
+            latest_box.slot_banner = w[WSlotBanner];
             latest_box.hud_right = static_cast<s32>(w[WSplitRight]);
             latest_box.content = w[WContent];
             latest_box.opaque = w[WOpaque];

@@ -329,6 +329,23 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                 result.unsupported_cpu_patch_instruction_count,
                 result.indirect_red_zone_function_count);
         }
+        if (HostLacksSse4a()) {
+            // On a CPU without SSE4a, any EXTRQ/INSERTQ left in the code costs a CPU exception
+            // each time it runs (cpu_patches.cpp TryExecuteIllegalInstruction).
+            u64 left = 0;
+            std::vector<u64> samples;
+            for (const auto& [segment_addr, segment_size] : executable_segments) {
+                left += CountSse4aLeft(segment_addr, segment_size, samples);
+            }
+            std::string where;
+            for (const u64 address : samples) {
+                where += fmt::format(" {:#x}", address - base_virtual_addr);
+            }
+            LOG_BENCHMARK_INFO(Core_Linker,
+                               "SSE4a substitution for {}: {} encodings left unpatched (each "
+                               "would fault every time it runs); module offsets:{}",
+                               name, left, where.empty() ? " none" : where);
+        }
         if (!executable_segments.empty() && analyzed_function_count == 0) {
             LOG_WARNING(Core_Linker,
                         "Windows guest red-zone static patching could not find function "

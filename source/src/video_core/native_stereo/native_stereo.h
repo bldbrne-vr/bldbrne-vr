@@ -10,13 +10,15 @@
 #include <cstdlib>
 #include "common/types.h"
 #include <span>
+#include <string_view>
 #include <array>
 #include <vector>
 #include "video_core/renderer_vulkan/vk_common.h"
 VK_DEFINE_HANDLE(VmaAllocator)
 namespace Vulkan { class ConstantRing; class Scheduler; class Instance; class Pipeline; struct RenderState; }
-namespace VideoCore { class StreamBuffer; struct ImageInfo; }
-namespace VR { struct CameraRecord; }
+namespace VideoCore { class StreamBuffer; struct ImageInfo; class SparsePool; }
+namespace VR { struct CameraRecord; struct Fov; }
+namespace Vulkan::StereoSetCodec { struct Rights; }
 namespace AmdGpu { union Regs; }
 namespace NativeStereo {
 inline const bool g_native_stereo = std::getenv("VR_NATIVE_STEREO") != nullptr;
@@ -33,11 +35,35 @@ inline const bool g_fused_pair = [] {
            !(handles_verify && std::atoi(handles_verify) > 0);
 }();
 inline bool FusedPair() { return g_native_stereo && g_fused_pair; }
+// Layer draws: both eyes without the driver's multiview. A both-eye pass renders its two-layer
+// attachments with layerCount 2 and viewMask 0, each of its draws is recorded once per eye (the
+// right eye's with vr_hud's sign bit set: Shader::PushData::NativeRightEyeBit), and the last
+// vertex stage writes gl_Layer from that bit. VR_NATIVE_VIEWS=layers or multiview chooses; by
+// default AMD RX 6000 cards draw layers (VR::NativeViews::LayersByDefault): an RX 6700's multiview
+// right eye stayed white or grey once the world loaded (GitHub #9, driver 2.0.353; the menus and
+// DIBR were fine), while other generations' multiview works (RX 9070 XT). Needs
+// shaderOutputLayer. Chosen once at device creation, before any pipeline or pass, in every session.
+bool LayerDraws(); // native stereo with layer draws
+// The card's mode whether or not native stereo is on (Shader::Profile::native_layer_draws): DIBR
+// and native sessions on one card then keep one shader cache, whose profile they share.
+bool LayerDrawsMode();
+void ChooseLayerDraws(u32 vendor_id, u32 device_id, std::string_view device_name,
+                      bool shader_output_layer);
 // Narrow, opt-in experiment for the audited Bloodborne directional shadow atlas.
 bool SharedShadowAtlas(const VideoCore::ImageInfo&);
+// A perspective (spot light) camera drew into the shared atlas: logged once, never fatal.
+void SharedShadowPerspective(float m66, float m67);
 // The captured frame distance; numeric environment overrides remain for experiments.
 float Ipd(const VR::CameraRecord&);
 bool AsymmetricProjection();
+// The air pass (shader_recompiler/ir/passes/air_light.h): each eye's inverse projection (ndc x, y,
+// raw depth -> its view) from the flat camera's cascades336, by LightingBuffer's own remap.
+// False, both the flat camera's, without asymmetric eyes or when the layout is not that.
+bool EyeInverseProjections(const float* cascades336, const VR::CameraRecord&,
+                           std::array<std::array<float, 16>, 2>& out);
+// The scene projection for one eye. A held Monocular narrows only its optical eye;
+// the headset submission continues to use CameraRecord::eye_fov unchanged.
+VR::Fov SceneEyeFov(const VR::CameraRecord&, u32 eye);
 // FAST_GPU_MIRROR_FLIP (on unless '0'; read once), with the asymmetric projection: a planar
 // reflection's mirrored camera (NativeProjection::MirroredCamera) and the rest of its pass
 // (NativeProjection::MirrorPass) get each eye's frustum upside down (NativeProjection::Flipped).
@@ -115,14 +141,36 @@ void AuditCameraBuffer(const float*, u32 size, u64 shader, u32 stage, u32 bindin
 // Registry entry of one buffer: its address is stable from RegisterBuffer until ForgetBuffer.
 struct BufferEntry;
 BufferEntry* RegisterBuffer(vk::Buffer, VkDeviceSize, VmaAllocator, bool stream);
+// A sparse view of the buffer cache (buffer_cache/sparse_pool.h) at guest `view_begin`: its
+// twin shares the view's pieces, except blocks the right eye writes (RightForWrite).
+BufferEntry* RegisterSparseView(vk::Buffer, VkDeviceSize, VmaAllocator, VideoCore::SparsePool*,
+                                u64 view_begin);
 void ForgetBuffer(vk::Buffer);
+// The buffer keeps its entry, its right twin goes (the buffer cache's eviction of an idle
+// buffer's twin): memos holding the twin see a new buffer generation; the twin is destroyed once
+// the GPU is past the current tick (background thread). A later per-eye write makes a new twin
+// from the left copy. Returns its bytes (0: no twin, or a stream buffer's).
+VkDeviceSize ReleaseRight(Vulkan::Scheduler&, vk::Buffer);
 vk::Buffer ExistingRight(vk::Buffer);
 vk::Buffer RightBuffer(Vulkan::Scheduler&,vk::Buffer,bool create);
+// The right buffer of `b` for a per-eye write of [offset, offset + size): a sparse view's twin
+// has that range in its own memory after this (copy-on-write, maybe a new twin handle); any
+// other buffer as RightBuffer(create). `b` itself when VRAM has no room (mono there).
+vk::Buffer RightForWrite(Vulkan::Scheduler&, vk::Buffer b, u64 offset, u64 size);
+// The parts of [offset, offset + size) the twin of `b` holds in its own memory: all of it for
+// an ordinary twin, the private blocks for a sparse view's (the rest shares the left bytes, so
+// writing the same bytes to both eyes skips it). Empty, and `right` null, without a twin.
+std::vector<std::pair<u64, u64>> RightOwnRanges(vk::Buffer b, u64 offset, u64 size, vk::Buffer& right);
+// A sparse view's twin (shares the left memory in part): FAST bit 63's paired paths skip it.
+bool IsSparseTwin(vk::Buffer b);
 void Barrier(Vulkan::Scheduler&);
 // outer_right (FAST bit 63): the caller's own barriers before and after already name this right
 // destination, so a pair whose right destination is outer_right and whose source has no right
 // twin records both copies with no barrier between them; anything else keeps its barriers.
 void Copy(Vulkan::Scheduler&,vk::Buffer,vk::Buffer,std::span<const vk::BufferCopy>, bool hle = false, vk::Buffer outer_right = {});
+// Sparse views (buffer_cache/sparse_pool.h): a merge shares the left bytes, so only the right
+// eye's copy of `src`, if it has one, moves into `dst`'s (made from dst's left when missing).
+void CopyRight(Vulkan::Scheduler&, vk::Buffer src, vk::Buffer dst, std::span<const vk::BufferCopy>);
 inline void Copy(Vulkan::Scheduler& s,vk::Buffer a,vk::Buffer b,const vk::BufferCopy& c) { Copy(s,a,b,std::span{&c,1}); }
 void RegisterView(vk::ImageView,vk::ImageView,vk::ImageView);
 void ForgetView(vk::ImageView);
@@ -174,4 +222,10 @@ bool PairCarried(Vulkan::Scheduler&, const Vulkan::Pipeline&, std::span<const vk
                  Descriptors&, bool reuse, const Handles& handles, bool fold);
 // ExistingRight of every barrier's buffer under one registry lock (null: no right).
 void PairBarriers(std::span<const vk::BufferMemoryBarrier2>, const Handles&, std::span<vk::Buffer>);
+// VR_COMPACT_SETS (Vulkan::StereoSetCodec): what Fused::Pair would give each paired info's right
+// eye, from the carried handles alone, when its pairing needs nothing recorded or looked up (no
+// right buffer to create, no stream mirror, no registry lookup) and no entry was erased or view
+// changed since binding. False: the caller pairs as before (`out` then means nothing).
+bool CompactRights(const Vulkan::Pipeline&, std::span<const vk::WriteDescriptorSet> writes,
+                   const Handles& handles, Vulkan::StereoSetCodec::Rights& out);
 }

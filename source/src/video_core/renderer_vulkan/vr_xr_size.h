@@ -73,6 +73,44 @@ inline bool CropFitsRect(Size crop, Size max_rect) {
     return crop.width <= max_rect.width && crop.height <= max_rect.height;
 }
 
+// The most one eye image may be for the runtime: within its largest swapchain and both views'
+// largest image rects. A limit the runtime left at 0 (not reported) is the other one; the largest
+// swapchain itself is never 0 (OpenXRPresenter keeps 4096 when the runtime gives none).
+inline Size EyeLimit(Size max_swapchain, Size max_rect_left, Size max_rect_right) {
+    const auto pick = [](u32 swapchain, u32 left, u32 right) {
+        u32 limit = swapchain;
+        for (const u32 rect : {left, right}) {
+            if (rect != 0) {
+                limit = std::min(limit, rect);
+            }
+        }
+        return limit;
+    };
+    return {pick(max_swapchain.width, max_rect_left.width, max_rect_right.width),
+            pick(max_swapchain.height, max_rect_left.height, max_rect_right.height)};
+}
+
+// Native stereo's eyes are made at the render's size; one larger than `limit` (EyeLimit) is
+// scaled down to the largest even size of its own aspect inside it (the same FOV, fewer pixels),
+// instead of going mono. An eye that fits, an empty eye or an empty limit: unchanged.
+inline Size FitEye(Size eye, Size limit) {
+    if (eye.width == 0 || eye.height == 0 || limit.width < 2 || limit.height < 2 ||
+        (eye.width <= limit.width && eye.height <= limit.height)) {
+        return eye;
+    }
+    // The tighter side takes the limit, the other follows the aspect (integers, rounded down).
+    const bool height_tight = static_cast<u64>(limit.height) * eye.width <=
+                              static_cast<u64>(limit.width) * eye.height;
+    const Size scaled =
+        height_tight
+            ? Size{static_cast<u32>(static_cast<u64>(eye.width) * limit.height / eye.height),
+                   limit.height}
+            : Size{limit.width,
+                   static_cast<u32>(static_cast<u64>(eye.height) * limit.width / eye.width)};
+    return {std::clamp<u32>(scaled.width & ~1u, 2u, limit.width & ~1u),
+            std::clamp<u32>(scaled.height & ~1u, 2u, limit.height & ~1u)};
+}
+
 // Why DIBR eyes cannot go to the headset at their size (CheckDibrEyes).
 enum class EyeRefusal : u8 {
     None,

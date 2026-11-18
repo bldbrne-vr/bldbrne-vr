@@ -27,13 +27,31 @@ add_library(launcher_ui STATIC
     ${IMGUI}/backends/imgui_impl_win32.cpp ${IMGUI}/backends/imgui_impl_dx11.cpp)
 target_include_directories(launcher_ui PUBLIC ${IMGUI} ${IMGUI}/backends ${IMGUI}/misc/cpp)
 target_compile_definitions(launcher_ui PRIVATE IMGUI_DISABLE_DEMO_WINDOWS)
-add_library(launcher_core STATIC core.cpp benchmark.cpp benchmark_runner.cpp "${REPO}/externals/pugixml/src/pugixml.cpp")
+add_library(launcher_core STATIC core.cpp benchmark.cpp benchmark_runner.cpp sky_upscale.cpp controls_guide.cpp "${REPO}/src/core/vr/dlss5_file.cpp" "${REPO}/src/core/vr/sky_textures.cpp" "${REPO}/externals/pugixml/src/pugixml.cpp")
 target_include_directories(launcher_core PUBLIC ${REPO}/src ${REPO}/externals/json/include ${REPO}/externals/pugixml/src ${REPO}/externals/vulkan-headers/include)
+target_sources(launcher_core PRIVATE "${REPO}/src/core/vr/card_memory.cpp")
+target_include_directories(launcher_core PRIVATE ${REPO}/externals/stb ${REPO}/externals/xxhash)
 target_compile_definitions(launcher_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(launcher_core PUBLIC shell32 ole32 dxgi bcrypt user32)
+target_link_libraries(launcher_core PUBLIC shell32 ole32 dxgi bcrypt user32 advapi32 wintrust crypt32 version)
 add_executable(BloodborneVR WIN32 main.cpp launcher.rc)
 set_source_files_properties(launcher.rc PROPERTIES
     OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/app-icon.ico")
+set_property(SOURCE launcher.rc APPEND PROPERTY OBJECT_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/theme/yharnam.jpg"
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/theme/leather.png"
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/theme/frame.png")
+set_property(SOURCE launcher.rc APPEND PROPERTY OBJECT_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/theme/button-frame.png"
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/theme/launch-plaque.png"
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/theme/cabinet-frame.png"
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/theme/hardware.png"
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/theme/scrollbar-eye.png")
+foreach(controller quest psvr2 frame index)
+    foreach(hand left right)
+        set_property(SOURCE launcher.rc APPEND PROPERTY OBJECT_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/controllers/${controller}-${hand}.png")
+    endforeach()
+endforeach()
 # The launcher ships as Bldbrne-VR.exe (2026-10-17: no game name in the product's own files).
 set_target_properties(BloodborneVR PROPERTIES OUTPUT_NAME "Bldbrne-VR")
 target_include_directories(BloodborneVR PRIVATE "${VELOPACK_SDK}/include")
@@ -76,15 +94,38 @@ add_custom_command(TARGET BloodborneVR POST_BUILD COMMAND ${CMAKE_COMMAND} -E co
     "${CMAKE_CURRENT_SOURCE_DIR}/bbvr_patch.xml" "$<TARGET_FILE_DIR:BloodborneVR>/bbvr_patch.xml")
 install(TARGETS BloodborneVR RUNTIME DESTINATION .)
 install(FILES bbvr_patch.xml DESTINATION .)
+# Sharper skies (sky_upscale.h): Real-ESRGAN's official Windows build (realesrgan-ncnn-vulkan,
+# MIT; Real-ESRGAN and its model BSD-3-Clause; ncnn BSD-3-Clause), only the exe, its OpenMP
+# runtime and the realesrgan-x4plus model, in realesrgan/ next to the launcher.
+include(FetchContent)
+FetchContent_Declare(realesrgan
+    URL https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-windows.zip
+    URL_HASH SHA256=abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(realesrgan)
+foreach(file realesrgan-ncnn-vulkan.exe vcomp140.dll
+        models/realesrgan-x4plus.param models/realesrgan-x4plus.bin)
+    add_custom_command(TARGET BloodborneVR POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${realesrgan_SOURCE_DIR}/${file}" "$<TARGET_FILE_DIR:BloodborneVR>/realesrgan/${file}")
+endforeach()
 
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmark_tests.cpp")
-    add_executable(benchmark_tests benchmark_tests.cpp)
-    target_link_libraries(benchmark_tests PRIVATE launcher_core)
-    target_compile_definitions(benchmark_tests PRIVATE BBVR_BENCHMARK_TEST_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/..")
-    add_test(NAME launcher_benchmark COMMAND benchmark_tests)
-endif()
+# Exercise the shipped patch template in launcher regression tests.
+add_custom_command(TARGET launcher_tests POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/bbvr_patch.xml" "$<TARGET_FILE_DIR:launcher_tests>/bbvr_patch.xml")
+
+add_executable(benchmark_tests benchmark_tests.cpp)
+target_link_libraries(benchmark_tests PRIVATE launcher_core)
+target_compile_definitions(benchmark_tests PRIVATE BBVR_BENCHMARK_TEST_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/..")
+add_test(NAME launcher_benchmark COMMAND benchmark_tests)
+add_executable(performance_search_tests performance_search_tests.cpp)
+target_link_libraries(performance_search_tests PRIVATE launcher_core)
+add_dependencies(benchmark_tests performance_search_tests)
+add_test(NAME launcher_performance_search COMMAND performance_search_tests)
 
 # Developer end-to-end driver for the same runner used by the UI; not installed.
 add_executable(benchmark_cli benchmark_cli.cpp)
 target_link_libraries(benchmark_cli PRIVATE launcher_core)
+# The same for sharper skies (sky_upscale.h); not installed.
+add_executable(sky_cli sky_cli.cpp)
+target_link_libraries(sky_cli PRIVATE launcher_core)

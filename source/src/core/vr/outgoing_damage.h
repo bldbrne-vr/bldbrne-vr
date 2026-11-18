@@ -11,13 +11,18 @@
 #include <cmath>
 
 namespace VR::OutgoingDamage {
+// The VR page's Damage dealt range, in percent (2026-11-04: down to -60%).
+inline constexpr int MinPercent = -60;
+inline constexpr int MaxPercent = 30;
 inline std::atomic<int> live_percent{0};
 inline int Clamp(float percent) {
-    return std::isfinite(percent) ? static_cast<int>(std::lround(std::clamp(percent, -30.f, 30.f))) : 0;
+    return std::isfinite(percent)
+               ? static_cast<int>(std::lround(std::clamp(percent, float(MinPercent), float(MaxPercent))))
+               : 0;
 }
 inline float Scale(float damage, int percent, bool player_attacker, bool other_target) {
     if (!player_attacker || !other_target || percent == 0 ||
         !std::isfinite(damage) || damage <= 0.f) return damage;
-    return std::min(damage * (1.f + std::clamp(percent, -30, 30) * .01f), 2.0e9f);
+    return std::min(damage * (1.f + std::clamp(percent, MinPercent, MaxPercent) * .01f), 2.0e9f);
 }
 }

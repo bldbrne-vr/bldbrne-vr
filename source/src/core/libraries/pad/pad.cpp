@@ -9,6 +9,9 @@
 #include "core/libraries/libs.h"
 #include "core/libraries/pad/pad_errors.h"
 #include "core/user_settings.h"
+#include "core/vr/pad_menu.h"
+#include "core/vr/page_pad.h"
+#include "core/vr/vr_page_runtime.h"
 #include "core/vr/vr_session.h"
 #include "imgui/renderer/imgui_core.h"
 #include "input/controller.h"
@@ -16,9 +19,23 @@
 
 #include <algorithm>
 #include <array>
+#include <mutex>
 #include <optional>
 
 namespace Libraries::Pad {
+
+static_assert(static_cast<u32>(OrbisPadButtonDataOffset::Cross) == VR::PagePad::Bit::Cross &&
+              static_cast<u32>(OrbisPadButtonDataOffset::Circle) == VR::PagePad::Bit::Circle &&
+              static_cast<u32>(OrbisPadButtonDataOffset::L1) == VR::PagePad::Bit::L1 &&
+              static_cast<u32>(OrbisPadButtonDataOffset::R1) == VR::PagePad::Bit::R1 &&
+              static_cast<u32>(OrbisPadButtonDataOffset::L2) == VR::PagePad::Bit::L2 &&
+              static_cast<u32>(OrbisPadButtonDataOffset::R2) == VR::PagePad::Bit::R2 &&
+              static_cast<u32>(OrbisPadButtonDataOffset::Up) == VR::PagePad::Bit::Up &&
+              static_cast<u32>(OrbisPadButtonDataOffset::Down) == VR::PagePad::Bit::Down &&
+              static_cast<u32>(OrbisPadButtonDataOffset::Left) == VR::PagePad::Bit::Left &&
+              static_cast<u32>(OrbisPadButtonDataOffset::Right) == VR::PagePad::Bit::Right &&
+              static_cast<u32>(OrbisPadButtonDataOffset::TouchPad) == VR::PagePad::Bit::TouchPad &&
+              static_cast<u32>(OrbisPadButtonDataOffset::Options) == VR::PagePad::Bit::Options);
 
 using Input::GameController;
 using Input::GameControllers;
@@ -367,7 +384,8 @@ int PS4_SYSV_ABI scePadOutputReport() {
     return ORBIS_OK;
 }
 
-int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
+int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num,
+                  const Input::PadLayers::Physical& physical) {
     if (num > 0 && !states[0].connected) {
         pData[0] = {};
         pData[0].orientation = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -376,6 +394,29 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
     }
 
     const bool gamepad_input_intercepted = ImGui::Core::IsGamepadInputCaptured();
+    // The VR page reads the gamepad itself while it is open; the game gets none of it then, nor
+    // after the page closes until every gamepad control is let go (core/vr/page_pad.h).
+    // Held: the gamepad's (and keyboard's) own layer now, never our injected sticks (a VR stick
+    // held as the page closed kept it shut, the game's sticks centred) and whatever the queue
+    // gave this read (an empty one opened it under a held button).
+    const u32 injected = VR::PagePad::Injected();
+    const auto& a = physical.axes;
+    const bool physical_held =
+        VR::PagePad::PhysicalHeld(physical.buttons, 0, {a[0], a[1], a[2], a[3], a[4], a[5]});
+    static std::mutex page_gate_mutex;
+    static VR::PagePad::Gate page_gate;
+    // The gamepad's Options is the presenter's to decide while it does (core/vr/pad_menu.h): a tap
+    // reaches the game as its own press, a hold is the recenter.
+    const bool menu_taken = VR::PadMenu::Taken();
+    bool page_has_pad = false;
+    {
+        // The page has the pad only while the presenter is there to drive it (the same heartbeat):
+        // the headset off with the page up, the gamepad is the game's again.
+        std::scoped_lock lock{page_gate_mutex};
+        page_has_pad =
+            page_gate.Update(VR::Page::Runtime::Get().IsOpen() && menu_taken, physical_held);
+    }
+    VR::PagePad::SetGateShut(page_has_pad);
     for (int i = 0; i < num; i++) {
         pData[i] = {};
         if (gamepad_input_intercepted) {
@@ -426,6 +467,27 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
         pData[i].timestamp = states[i].time;
         pData[i].connectedCount = states[i].connected_count;
         pData[i].deviceUniqueDataLen = 0;
+        if (VR::IsFreeCamera() && (VR::IsCameraActive() || VR::CinematicActive()) && !VR::IsGameMenuOpen()) {
+            pData[i].buttons &= OrbisPadButtonDataOffset::Options; // Options only: menus remain accessible
+            pData[i].leftStick = {128,128};
+            pData[i].rightStick = {128,128};
+            pData[i].analogButtons = {};
+            pData[i].touchData = {};
+        }
+        if (page_has_pad) {
+            // The VR page has the gamepad (core/vr/page_pad.h): only the presenter's own presses.
+            pData[i].buttons &= static_cast<OrbisPadButtonDataOffset>(injected);
+            pData[i].leftStick = {128, 128};
+            pData[i].rightStick = {128, 128};
+            pData[i].analogButtons.l2 = (injected & VR::PagePad::Bit::L2) ? 255 : 0;
+            pData[i].analogButtons.r2 = (injected & VR::PagePad::Bit::R2) ? 255 : 0;
+            if (!(injected & VR::PagePad::Bit::TouchPad)) {
+                pData[i].touchData = {};
+            }
+        }
+        if (menu_taken && !(injected & VR::PagePad::Bit::Options)) {
+            pData[i].buttons &= ~OrbisPadButtonDataOffset::Options;
+        }
     }
 
     return num;
@@ -443,7 +505,7 @@ int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
     auto& controller = *it->second;
     std::array<Input::State, ORBIS_PAD_MAX_DATA_NUM> states;
     const int ret_num = controller.ReadStates(states.data(), num);
-    return ProcessStates(pData, states.data(), ret_num);
+    return ProcessStates(pData, states.data(), ret_num, controller.Physical());
 }
 
 int PS4_SYSV_ABI scePadReadBlasterForTracker() {

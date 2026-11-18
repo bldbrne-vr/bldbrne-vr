@@ -11,10 +11,17 @@
 #include <functional>
 
 namespace Launcher::Benchmark {
+// One policy for search, confirmation and report interpretation. Ratios refer to
+// uncapped game throughput, not the headset's presentation rate.
+inline constexpr double RequiredReservePercent = 13.8;
+inline constexpr double RequiredReserve = 1.0 + RequiredReservePercent / 100.0;
+inline constexpr double ExploreReserve = 1.30;
+inline constexpr double PredictedReserve = 1.20;
+inline constexpr unsigned QuickScanMaxRuns = 8;
 inline constexpr int QuickScanWorkSeconds = 175;
 inline constexpr int QuickScanBudgetSeconds = 180;
-// A slow PC's confirmation of a passing screen may run past the 3-minute budget, up to this:
-// new candidates still have to fit the budget.
+// Adaptive steps in either direction and confirmation may extend the 3-minute budget.
+// The runner reserves confirmation time within this hard limit.
 inline constexpr int QuickScanHardSeconds = 360;
 // The scan's look-around (the mock runtime's MOCKXR_HEAD: left and right, dipping down and up)
 // and the runtime's GPU timing windows (VR_GPU_TIMING_WINDOW_S) share one period, so every
@@ -28,6 +35,7 @@ inline constexpr unsigned ScanGameplaySeconds = 7 * ScanSweepSeconds + 8;
 inline constexpr unsigned ScanRunMaxSeconds = 150;
 inline constexpr int LongScanBudgetSeconds = 1800;
 inline constexpr int LongScanWorkSeconds = 1785;
+inline constexpr int ScanFoveatedUpscale = 2; // Medium
 inline bool CanStartLongPair(double elapsed, double estimated_run) {
     return elapsed >= 0 && estimated_run > 0 && elapsed + 2 * estimated_run * 1.1 < LongScanWorkSeconds;
 }
@@ -43,6 +51,7 @@ struct Candidate {
     GraphicsFields graphics = DefaultGraphics;
     std::string model = "builtin";
     int quality = 0; // Conservative ordering, not a measured image-quality score.
+    int upscale_focus = 0; // Old scan reports did not enable foveated upscaling.
 };
 struct Sample {
     bool valid = false;
@@ -70,6 +79,8 @@ struct PacingStats {
     bool acceptable{};
 };
 PacingStats EvaluatePacing(const Sample &sample, double target_hz);
+std::string ScanInput();
+bool ScanActivityObserved(const std::string& log);
 int TargetRate(int requested, float headset_hz);
 int InitialScale(const SystemInfo &system, const Headset &headset, int target_hz);
 Headset ScanHeadset(const fs::path &runtime, const std::atomic_bool* cancel = nullptr);
@@ -83,6 +94,7 @@ std::vector<Candidate> Candidates(const SystemInfo &system, bool dlss, bool fsr4
 std::optional<Candidate> NextCandidate(const SystemInfo &system, bool dlss, bool fsr4,
                                        const std::vector<Result> &results, int target_hz, bool fsr31 = false, const Headset *headset = nullptr);
 // Quick screening never grants recommendation eligibility; confirmation uses Summarize.
+// allow_screening is retained for existing callers; adaptive steps use the runner's hard limit.
 std::optional<Candidate> NextQuickCandidate(const SystemInfo &system, bool dlss, bool fsr4,
                                           const std::vector<Result> &results, int target_hz,
                                           bool allow_screening = true, bool fsr31 = false, const Headset *headset = nullptr);
@@ -105,8 +117,10 @@ Profile ApplySettings(const Paths &paths, const Profile &profile, const Candidat
 std::string UncapPatch(const std::string &xml);
 std::string FileHash(const fs::path &path);
 // Only explicit, hash-verified savedata files are copied. No user's live home
-// is read.
-void CopyFixture(const fs::path &package, const fs::path &destination);
+// is read. They go into `save_folder` (SaveDataFolder: the folder the selected game reads,
+// whichever title id the fixture was made under).
+void CopyFixture(const fs::path &package, const fs::path &destination,
+                 const std::string &save_folder = "CUSA00207");
 struct Request {
     Profile profile;
     Paths paths;

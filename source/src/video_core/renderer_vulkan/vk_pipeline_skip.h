@@ -67,6 +67,20 @@ inline u64 AgeCapNs(const char* env) {
     return std::min(ms, Max) * 1'000'000;
 }
 
+// An effect draw (2026-11-03, the hit stutter): blended into a colour target, testing depth and
+// writing none - a particle, a spark, a blood sprite. Its first hit built ~95 pipelines in place
+// (24-74 ms frames); bbport's rule held most of them back (12 indices or fewer: a sprite quad; a
+// target not drawn in each of the last 8 frames). Left out for a frame or two it is never missed,
+// so neither rule applies to one; the vetoes still do. A full-screen pass tests no depth, so it
+// stays under bbport's rule. FAST_ASYNC_EFFECT_SKIP=0 turns this off (read once).
+constexpr bool EffectDraw(bool has_color, bool any_blend, bool depth_test, bool depth_write) {
+    return has_color && any_blend && depth_test && !depth_write;
+}
+
+constexpr bool EffectSkipOn(const char* env) {
+    return !(env != nullptr && env[0] == '0');
+}
+
 // Past the cap: more than `cap_ns` (0: no cap) since `since_ns` (0: not yet). The rule starts
 // two clocks: since a key was first left out (its job then goes to the front of the compile
 // queue) and since its compile started (then it is waited for, at most one such wait a frame).

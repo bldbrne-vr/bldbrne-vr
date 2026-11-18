@@ -81,14 +81,15 @@ private:
 
 // Ownership of a vial physically drawn from a pouch. X/legacy draws never Start this.
 // Checked before stab detection; returning only disarms the prop, never touches inventory.
+// The caller supplies the bounded pickup-pose grace, independently of motion/stab tracking.
 class VialGripHold {
 public:
     void Start(float release) {
         release_ = std::clamp(release, 0.0f, 1.0f);
         active_ = true;
     }
-    bool Return(float left_grip, bool left_tracked) {
-        if (!active_ || (left_tracked && std::isfinite(left_grip) && left_grip > release_))
+    bool Return(float left_grip, bool left_pose_valid) {
+        if (!active_ || (left_pose_valid && std::isfinite(left_grip) && left_grip > release_))
             return false;
         Reset();
         return true;

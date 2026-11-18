@@ -202,6 +202,17 @@ inline Clock NormalClock(const Clip& c, const Timing& tm) {
     return k;
 }
 
+// The Stake Driver's charged blast kicking the stake back to form A (stake_driver.h StakeReturn):
+// its B->A from the start at the top clip speed up to the form switch (a000_19110: locked 0.125 s
+// in), then the settling at 2.5x (0.31 s): shut within the blast's recoil, not a calm retract.
+inline constexpr float KickSettleSpeed = 2.5f;
+inline Clock KickClock(const Clip& c) {
+    Clock k{0.0f, KickSettleSpeed};
+    k.lead_end = std::max(c.t_style, 0.0f);
+    k.lead_speed = MaxClipSpeed;
+    return k;
+}
+
 // ---- The flick ----------------------------------------------------------------------------------
 //
 // A squeeze during a swing or with the weapon hand moving fast (the presenter's flick flag), or a

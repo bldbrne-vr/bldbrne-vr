@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_submit_lock_trace.h"
 #include "video_core/renderer_vulkan/vr_device_lost.h"
+#include "video_core/vram_report.h"
 
 namespace Vulkan {
 
@@ -290,6 +291,7 @@ bool VrOverlayRenderer::CreateImage(ImageResource& out, vk::Format format,
     }
     out.image = vk::Image{image};
     out.allocation = allocation;
+    VideoCore::VramReport::Name(dev.allocator, allocation, std::string(name));
     VmaAllocationInfo alloc_info{};
     vmaGetAllocationInfo(dev.allocator, allocation, &alloc_info);
     memory_bytes += alloc_info.size;
@@ -958,6 +960,12 @@ bool VrOverlayRenderer::HeadPose(O::Pose& head) const {
     return true;
 }
 
+bool VrOverlayRenderer::EyePose(u32 eye, O::Pose& pose) const {
+    if (!frame_open || !views_valid || eye >= 2) return false;
+    pose = ToPose(pending.pose[eye]);
+    return true;
+}
+
 void VrOverlayRenderer::BeginFrame(const EyeViews& views, bool valid, bool should_render) {
     ++frame;
     items.clear();
@@ -1249,6 +1257,7 @@ void VrOverlayRenderer::Record(Slot& slot, u32 index, vk::CommandBuffer external
         cmd.setScissor(0, vk::Rect2D{.offset = {static_cast<s32>(eye * w), 0}, .extent = {w, h}});
         vk::Pipeline bound{};
         for (const O::DrawItem& item : items) {
+            if ((item.eye_mask & (1u << eye)) == 0) continue;
             const u32 mesh = static_cast<u32>(item.mesh);
             const vk::Pipeline pipeline = pipelines[PipelineIndex(item.pass)];
             if (mesh >= O::MeshCount || !pipeline || ranges[mesh].index_count == 0) {

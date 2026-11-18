@@ -46,8 +46,10 @@ constexpr float CapstanMaxStep = 1.0f;
 // transform the weapon or open the item arc (which would end the hold). Metres, as a reach.
 constexpr float SecondHandReach = GrabRadius + 0.10f;
 
-// How the hand drives the bone. Pull: a lever stick; the fist keeps where it caught the handle and
-// the stick turns with it. Capstan: a long bar turned about a vertical hub (motion 101230, the
+// How the hand drives the bone. Pull: a lever stick; the stick turns with the fist about its hinge,
+// and the fist slides along the stem with the hand (Slides: the tester, 2026-11-10, Chalice levers
+// "very high up": a hand that caught the top of a tall lever pulls it over from lower down, so the
+// top of its swing is not out of reach). Capstan: a long bar turned about a vertical hub (motion 101230, the
 // Research Hall's o353010): the fist slides freely along the bar (only leaving it slips), the bar's
 // angle follows the hand's angle about the hub, and a bar let go before its stop stays there
 // (the game adapter parks it; nothing turns it back).
@@ -72,6 +74,10 @@ inline Vec3 HandleAt(const Rig &rig, float angle) {
     return rig.pivot + Rotate(rig.rest, rig.axis, angle);
 }
 
+// Whether a held hand's contact slides along the grabbable part with it (a capstan's bar, a
+// lever's stem) instead of staying where it caught it: only leaving that part slips.
+inline bool Slides(const Rig &rig) { return rig.motion == Motion::Capstan || rig.shaft; }
+
 // Project onto the moving shaft only when acquiring; retain that contact for the hold.
 inline Vec3 ClosestGrip(const Rig &rig, float angle, Vec3 hand) {
     const auto top = HandleAt(rig, angle);
@@ -94,8 +100,9 @@ inline Rig Scaled(Rig rig, float factor) {
 }
 
 // The largest handle radius (and pivot -> shaft start distance) a rig may have, metres: a lever
-// stick is at most about 1.2 m long; a capstan's bar reaches 2.9 m out from its hub (o353010).
-inline constexpr float MaxReach(Motion motion) { return motion == Motion::Capstan ? 5.0f : 2.0f; }
+// stick is about 1.2 m long, the Chalice Dungeons' door lever (o290020) 2.06 m (grabbed along its
+// stem); a capstan's bar reaches 2.9 m out from its hub (o353010).
+inline constexpr float MaxReach(Motion motion) { return motion == Motion::Capstan ? 5.0f : 2.5f; }
 
 inline bool Valid(const Rig &rig) {
     if (!Body::IsFinite(rig.pivot) || !Body::IsFinite(rig.axis) || !Body::IsFinite(rig.rest) ||
@@ -316,10 +323,10 @@ class Tracker {
 public:
     float Angle() const { return angle; }
     // While holding: where the hand that caught the handle would be at the current angle (the
-    // slip check's reference; a capstan's: its contact on the bar, which slides with the hand),
-    // and the held rig. For the hold's progress log only.
+    // slip check's reference; on a capstan's bar or a lever's stem: its contact, which slides with
+    // the hand), and the held rig. For the hold's progress log only.
     Vec3 Expected() const {
-        if (held.rig.motion == Motion::Capstan)
+        if (Slides(held.rig))
             return held.rig.pivot + Rotate(contact_rest, held.rig.axis, angle);
         return held.rig.pivot + Rotate(grab_vector, held.rig.axis, angle - held.angle);
     }
@@ -370,6 +377,15 @@ public:
     }
 
     // This hand's grip is released and its own (not owned): its next squeeze is a grab edge.
+    // Only the short approach buffer may retry an unowned held squeeze. A held or
+    // consumed lever grip cannot be revived; ordinary acquisition still checks eligibility.
+    bool RetryApproachSqueeze(int hand) {
+        if (hand < 0 || hand > 1 || active >= 0 || owned[hand] || !down[hand])
+            return false;
+        down[hand] = false;
+        return true;
+    }
+
     bool CanSqueeze(int hand) const { return hand >= 0 && hand < 2 && !down[hand] && !owned[hand]; }
 
     std::array<bool, 2> GrabEdges(const std::array<Hand, 2> &hands) const {
@@ -440,10 +456,11 @@ public:
                                    Body::Dot(previous_radial, radial));
                     const float next = std::clamp(angle + delta, std::min(0.0f, held.rig.sweep),
                                                   std::max(0.0f, held.rig.sweep));
-                    // Preserve where the real hand caught the handle, including the grab offset.
-                    // A capstan's bar is long: the hand may slide along it (toward or away from
-                    // the hub) and only leaving the bar slips; the contact slides with it.
-                    const bool slide = held.rig.motion == Motion::Capstan;
+                    // Without a grabbable part (no shaft), preserve where the real hand caught
+                    // the handle, including the grab offset. A capstan's bar and a lever's stem:
+                    // the hand may slide along it (toward or away from the hinge) and only leaving
+                    // it slips; the contact slides with it.
+                    const bool slide = Slides(held.rig);
                     const Vec3 expected =
                         slide ? ClosestGrip(held.rig, next, hand.position)
                               : held.rig.pivot + Rotate(grab_vector, held.rig.axis, next - held.angle);

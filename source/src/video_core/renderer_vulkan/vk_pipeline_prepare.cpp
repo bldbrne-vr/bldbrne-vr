@@ -7,6 +7,7 @@
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vr_merged_eyes.h"
 #include "common/hash.h"
 #include "common/decoder.h"
 #include "common/thread.h"
@@ -22,6 +23,7 @@
 #include "video_core/native_stereo/draw_registers.h"
 #include "video_core/native_stereo/graphics_packet_replay.h"
 #include "video_core/native_stereo/graphics_submission_scan.h"
+#include "video_core/native_stereo/lighting_reconstruction.h"
 #include "video_core/native_stereo/native_stereo.h"
 #include "video_core/native_stereo/register_delta.h"
 #include <magic_enum/magic_enum.hpp>
@@ -140,13 +142,15 @@ bool ValidFlat(const Shader::Info& info) {
                words <= info.flattened_ud_buf.size() - offset;
     };
     for (const auto& b : info.buffers) {
-        if (!b.inline_cbuf && !fits(b.sharp_idx, 4)) return false;
+        // A VR host buffer (resource.h) reads no user data.
+        if (!b.inline_cbuf && !b.IsVrHost() && !fits(b.sharp_idx, 4)) return false;
         const auto sharp = b.GetSharp(info);
         if (sharp && b.is_formatted && !ValidConversion(sharp.data_format, sharp.num_format))
             return false;
     }
     for (const auto& i : info.images) {
-        if (!fits(i.sharp_idx, i.is_r128 ? 4 : 8)) return false;
+        // A VR host image (resource.h) reads no user data.
+        if (!i.IsVrHost() && !fits(i.sharp_idx, i.is_r128 ? 4 : 8)) return false;
         const auto sharp = i.GetSharp(info);
         if (sharp && (!ValidConversion(sharp.data_format, sharp.num_format) ||
                       sharp.last_level < sharp.base_level)) return false;
@@ -171,6 +175,11 @@ struct PipelinePreparation {
 };
 
 PipelineCache::~PipelineCache() {
+    // VR_EYE_SPEC: unpublished, then joined (a variant being built finishes; queued ones fail).
+    EyeSpecVariants::g_compiler.store(nullptr, std::memory_order_release);
+    eye_spec_compiler.reset();
+    // VR_MERGED_EYES: its thread uses the device; queued variants end Failed.
+    merged_compiler.reset();
     // Jobs capture this cache. Stop and join them while every program is still alive.
     graphics_preparation_live.store(nullptr, std::memory_order_release);
     graphics_preparation.reset();
@@ -296,6 +305,9 @@ std::optional<PrepProgramResult> PipelineCache::PrepareProgramLocked(const PrepS
     // Match the same direction and first-permutation order as the ordinary selector.
     const auto module = std::ranges::find(program.modules, spec, &Program::Module::spec);
     if (module == program.modules.end()) return {};
+    // Its own resources (Program::Module::info): prepared from the program's, they would not be
+    // its; the draw selects it the ordinary way.
+    if (module->info) return {};
     return PrepProgramResult{module->id, // the permutation's id, as GetProgram returns it
                              &program.info, &owned, module->module, module->spec.fetch_shader_data,
                              std::move(fetch_source), module->vertex_output_locations};
@@ -346,8 +358,8 @@ bool IsDirectDraw(AmdGpu::PM4ItOpcode opcode) {
 // The only camera inputs of graphics runtime info: the asymmetric native projection and the
 // light scissors (BuildRuntimeInfo), and only without VrPushData (then they are pushed per draw).
 void CameraKey(const VR::CameraRecord& record, std::array<float, 10>& key) {
-    const auto& l = record.eye_fov[0];
-    const auto& r = record.eye_fov[1];
+    const auto l = NativeStereo::SceneEyeFov(record, 0);
+    const auto r = NativeStereo::SceneEyeFov(record, 1);
     key = {record.vfov,    record.aspect,   l.angle_left,  l.angle_right, l.angle_up,
            l.angle_down,   r.angle_left,    r.angle_right, r.angle_up,    r.angle_down};
 }
@@ -550,7 +562,8 @@ bool PrepareResourcesBlob(const PreparedDraw& draw, const PrepGraphicsContext& c
                 continue;
             const u64 size = sharp.GetSize();
             if (native &&
-                (size == 864 || size == 208 || size == 272 || size == 336 || size == 416) &&
+                (size == 864 || size == 208 || size == 272 || size == 336 || size == 416 ||
+                 (size == 320 && stage.pgm_hash == NativeProjection::ReflectionProgram)) &&
                 memory->ClampRangeSize(sharp.base_address, size) == size)
                 s.captures.push_back({sharp.base_address, size});
             else if (stage.l_stage == Shader::LogicalStage::Vertex && size == 416 &&

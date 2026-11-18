@@ -15,8 +15,12 @@ namespace VR::Whip {
 // Strong close hits; -10 percentage points per metre beyond 1.5 m, floor 60%.
 // The caller supplies the ATTACK's weapon identity, so a weapon switch cannot
 // give an earlier Cane hit the Cutter's falloff. Compact/canned hits pass false.
+// The Beast Cutter's chain, and the Amygdalan Arm's whip form (2026-11-07: "weaken the
+// amygdala arm whip form so that users don't just spam it non stop and just kill everything"):
+// its tip at 3.5 m deals 80%.
 inline float ContactDamageFactor(std::int32_t variation, bool physical_chain, float distance_m) {
-    if (variation != 2400 || !physical_chain || !std::isfinite(distance_m) || distance_m < 0) {
+    if ((variation != 2400 && variation != 2500) || !physical_chain || !std::isfinite(distance_m) ||
+        distance_m < 0) {
         return 1.0f;
     }
     return std::clamp(1.0f - 0.10f * std::max(0.0f, distance_m - 1.5f), 0.60f, 1.0f);
@@ -35,7 +39,9 @@ inline float ContactDamageFactor(std::int32_t variation, bool physical_chain, fl
 // lashes at the game's own pace and the game's own R1 -> R2 hit in full; at twice the pace, half
 // each; a light right after a heavy pays for the heavy's longer recovery. A window counts from its
 // lash (its attack opening: the whip's attack waits for the chain's tip to come up to speed), so a
-// stroke, a spin's revolution and a crack are timed alike. Each window adds its share of its own
+// stroke, a spin's revolution and a crack are timed alike. Contact-held Cane/Cutter sweeps instead
+// count from first damaging contact (PaceTime), since their opening may be seconds earlier.
+// Each window adds its share of its own
 // recovery to the game's clock, which never runs back and runs ahead of a window by (1 + floor) of
 // its recovery at most: no flurry, spin or crack, of any mix of moves and whatever the budget lets
 // through, deals more damage per second than the whip's best move at the game's pace. A window that
@@ -51,6 +57,12 @@ struct PaceConfig {
     // (owed back by the next ones).
     float floor{0.15f};
 };
+
+// Contact-held Cane/Cutter sweeps can wait seconds before hitting. Charge their recovery at
+// first damaging contact; the Attack caches the resulting share for the entire sweep.
+inline std::int64_t PaceTime(bool contact_hold, std::int64_t opened, std::int64_t contact) {
+    return contact_hold ? contact : opened;
+}
 
 class PaceMeter {
 public:

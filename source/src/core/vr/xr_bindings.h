@@ -48,8 +48,9 @@ enum class Act : std::uint8_t {
     GripPoseRight, // pose
     HapticLeft,    // vibration output
     HapticRight,   // vibration output
-    // The capacitive sensors (bool): a finger or thumb resting on the control. Only the VR page's
-    // controls view reads them (it lights what you touch); suggested with Profile::touches.
+    // The capacitive sensors (bool): a finger or thumb resting on the control. The VR page's
+    // controls view lights what you touch, and the bare hands' fingers follow them (hand_rig);
+    // suggested with Profile::touches.
     TouchTriggerLeft,
     TouchTriggerRight,
     TouchA,
@@ -58,6 +59,8 @@ enum class Act : std::uint8_t {
     TouchY,
     TouchStickLeft,
     TouchStickRight,
+    TouchRestLeft, // the thumb's rest off the buttons: the Touch's thumb rest, the Index's trackpad
+    TouchRestRight,
     Count,
 };
 
@@ -121,6 +124,8 @@ inline constexpr std::array Touch{
     BBVR_XR_POSES_AND_HAPTICS,
 };
 
+// Steam Frame: the left d-pad's down or right is X (the Blood Vial), up or left is Y (the user's
+// choice, 2026-10-26); either button of a pair works.
 inline constexpr std::array Frame{
     Binding{Act::Move, "/user/hand/left/input/thumbstick"},
     Binding{Act::Turn, "/user/hand/right/input/thumbstick"},
@@ -131,7 +136,9 @@ inline constexpr std::array Frame{
     Binding{Act::ButtonA, "/user/hand/right/input/a/click"},
     Binding{Act::ButtonB, "/user/hand/right/input/b/click"},
     Binding{Act::ButtonX, "/user/hand/left/input/dpad_down/click"},
+    Binding{Act::ButtonX, "/user/hand/left/input/dpad_right/click"},
     Binding{Act::ButtonY, "/user/hand/left/input/dpad_up/click"},
+    Binding{Act::ButtonY, "/user/hand/left/input/dpad_left/click"},
     Binding{Act::StickLeft, "/user/hand/left/input/thumbstick/click"},
     Binding{Act::StickRight, "/user/hand/right/input/thumbstick/click"},
     Binding{Act::Menu, "/user/hand/left/input/view/click"},
@@ -259,6 +266,19 @@ inline constexpr std::array TouchTouches{
     Binding{Act::TouchStickLeft, "/user/hand/left/input/thumbstick/touch"},
     Binding{Act::TouchStickRight, "/user/hand/right/input/thumbstick/touch"},
 };
+// Quest Touch / Touch Plus: the same and the thumb rests (PICO keeps the set above).
+inline constexpr std::array QuestTouches{
+    Binding{Act::TouchTriggerLeft, "/user/hand/left/input/trigger/touch"},
+    Binding{Act::TouchTriggerRight, "/user/hand/right/input/trigger/touch"},
+    Binding{Act::TouchA, "/user/hand/right/input/a/touch"},
+    Binding{Act::TouchB, "/user/hand/right/input/b/touch"},
+    Binding{Act::TouchX, "/user/hand/left/input/x/touch"},
+    Binding{Act::TouchY, "/user/hand/left/input/y/touch"},
+    Binding{Act::TouchStickLeft, "/user/hand/left/input/thumbstick/touch"},
+    Binding{Act::TouchStickRight, "/user/hand/right/input/thumbstick/touch"},
+    Binding{Act::TouchRestLeft, "/user/hand/left/input/thumbrest/touch"},
+    Binding{Act::TouchRestRight, "/user/hand/right/input/thumbrest/touch"},
+};
 inline constexpr std::array FrameTouches{
     Binding{Act::TouchTriggerLeft, "/user/hand/left/input/trigger/touch"},
     Binding{Act::TouchTriggerRight, "/user/hand/right/input/trigger/touch"},
@@ -269,7 +289,8 @@ inline constexpr std::array FrameTouches{
     Binding{Act::TouchStickLeft, "/user/hand/left/input/thumbstick/touch"},
     Binding{Act::TouchStickRight, "/user/hand/right/input/thumbstick/touch"},
 };
-// Valve Index: the same, its left A / B carrying X / Y as in its map.
+// Valve Index: the same, its left A / B carrying X / Y as in its map, and the trackpads as the
+// thumbs' rests.
 inline constexpr std::array IndexTouches{
     Binding{Act::TouchTriggerLeft, "/user/hand/left/input/trigger/touch"},
     Binding{Act::TouchTriggerRight, "/user/hand/right/input/trigger/touch"},
@@ -279,6 +300,8 @@ inline constexpr std::array IndexTouches{
     Binding{Act::TouchY, "/user/hand/left/input/b/touch"},
     Binding{Act::TouchStickLeft, "/user/hand/left/input/thumbstick/touch"},
     Binding{Act::TouchStickRight, "/user/hand/right/input/thumbstick/touch"},
+    Binding{Act::TouchRestLeft, "/user/hand/left/input/trackpad/touch"},
+    Binding{Act::TouchRestRight, "/user/hand/right/input/trackpad/touch"},
 };
 // Vive wands: the trackpads are the sticks.
 inline constexpr std::array ViveTouches{
@@ -291,9 +314,9 @@ inline constexpr std::array ViveTouches{
 // Every profile suggested, in this order (the order does not matter to a runtime).
 inline constexpr std::array Profiles{
     Profile{"/interaction_profiles/oculus/touch_controller", NeedsNothing, "Touch", Detail::Touch,
-            {}, nullptr, Detail::TouchTouches},
+            {}, nullptr, Detail::QuestTouches},
     Profile{"/interaction_profiles/meta/touch_controller_plus", NeedsTouchPlus, "Touch",
-            Detail::Touch, {}, nullptr, Detail::TouchTouches},
+            Detail::Touch, {}, nullptr, Detail::QuestTouches},
     Profile{FrameProfile, NeedsFrame, "Steam Frame", Detail::Frame, {}, nullptr,
             Detail::FrameTouches},
     Profile{"/interaction_profiles/valve/index_controller", NeedsNothing, "Index", Detail::Index, {},

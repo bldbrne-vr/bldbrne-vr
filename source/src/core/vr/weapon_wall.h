@@ -135,4 +135,29 @@ inline SeqLock<State>& Channel() {
     return channel;
 }
 
+// VR_SOLID_SHAPES=1 (tests): each hand's solid shape where the solver holds it this update, for
+// the in-frame overlay (bloodborne_quickitems.cpp): capsules in the world (game units; a == b is
+// a sphere), the weapon-clash shape (`now`: green, =new, authored/fitted when ready) and the
+// simple wall shape (`old`: red, =old) on the same pose.
+struct ShapeCapsule {
+    float a[3]{};
+    float b[3]{};
+    float r{0.0f};
+};
+struct DebugShapes {
+    struct Hand {
+        std::array<ShapeCapsule, 8> now{};
+        std::array<ShapeCapsule, 8> old{};
+        std::uint8_t now_count{0};
+        std::uint8_t old_count{0};
+    };
+    std::array<Hand, 2> hand{}; // 0 left, 1 right
+    std::int64_t ns{0};
+};
+
+inline SeqLock<DebugShapes>& DebugChannel() {
+    static SeqLock<DebugShapes> channel;
+    return channel;
+}
+
 } // namespace VR::WeaponWall

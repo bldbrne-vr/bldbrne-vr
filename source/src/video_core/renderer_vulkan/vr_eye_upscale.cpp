@@ -67,7 +67,7 @@ vk::Extent2D VrEyeUpscale::Scaled(vk::Extent2D in, float scale) {
     return {out.width, out.height};
 }
 
-bool VrEyeUpscale::Init(vk::Device dev, VmaAllocator alloc) {
+bool VrEyeUpscale::Init(vk::Device dev, VmaAllocator alloc, bool vignettes) {
     Shutdown();
     device = dev;
     allocator = alloc;
@@ -76,10 +76,11 @@ bool VrEyeUpscale::Init(vk::Device dev, VmaAllocator alloc) {
         Shutdown();
         return false;
     };
-    // No sampler: the shader fetches texels (a combined immutable sampler read garbage in the
-    // game's device, though not in a stand-alone test; texel fetches need none).
-    // Binding 2: the vignettes (VR_VIGNETTE variants only; the others never use it).
-    const std::array<vk::DescriptorSetLayoutBinding, 3> bindings{{
+    // Scene input uses samplerless texel fetches (an immutable sampler previously read garbage).
+    // 2: vignette uniforms; 3: riposte meter; 4: the independent iris texture, using an ordinary
+    // explicitly written combined sampler (never an immutable sampler or the scene binding).
+    if (vignettes) kos_iris.Init(device, allocator);
+    const std::array<vk::DescriptorSetLayoutBinding, 5> bindings{{
         {.binding = 0,
          .descriptorType = vk::DescriptorType::eSampledImage,
          .descriptorCount = 1,
@@ -92,10 +93,18 @@ bool VrEyeUpscale::Init(vk::Device dev, VmaAllocator alloc) {
          .descriptorType = vk::DescriptorType::eUniformBuffer,
          .descriptorCount = 1,
          .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        {.binding = 3,
+         .descriptorType = vk::DescriptorType::eStorageBuffer,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        {.binding = 4,
+         .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eCompute},
     }};
     auto [lr, sl] = device.createDescriptorSetLayout({
         .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
-        .bindingCount = static_cast<u32>(bindings.size()),
+        .bindingCount = kos_iris.Ready() ? 5u : 4u,
         .pBindings = bindings.data(),
     });
     if (lr != vk::Result::eSuccess) {
@@ -117,8 +126,12 @@ bool VrEyeUpscale::Init(vk::Device dev, VmaAllocator alloc) {
         return fail("pipeline layout");
     }
     layout = pl;
+    // `defines`' module as the colour variants `first` .. 2 (0: none, 1: the output gamma, 2: the
+    // colour grade and the gamma) into out[variant].
     const auto make = [&](std::vector<std::string> defines, const char* name,
-                          std::array<vk::Pipeline, 3>& out) {
+                          std::array<vk::Pipeline, 3>& out, u32 first = 0) {
+        if (kos_iris.Ready() && std::find(defines.begin(), defines.end(), "VR_VIGNETTE") != defines.end())
+            defines.emplace_back("VR_KOS_IRIS");
         const vk::ShaderModule module = Compile(HostShaders::VR_EYE_UPSCALE_COMP,
                                                 vk::ShaderStageFlagBits::eCompute, device,
                                                 std::move(defines));
@@ -145,7 +158,7 @@ bool VrEyeUpscale::Init(vk::Device dev, VmaAllocator alloc) {
             },
             .layout = layout,
         };
-        for (u32 variant = 0; variant < out.size(); ++variant) {
+        for (u32 variant = first; variant < out.size(); ++variant) {
             color_flags = {variant == 2, variant != 0};
             auto [result, p] = device.createComputePipeline({}, info);
             if (result != vk::Result::eSuccess) {
@@ -163,8 +176,9 @@ bool VrEyeUpscale::Init(vk::Device dev, VmaAllocator alloc) {
         return fail("pipelines");
     }
     // vignette_in_warp: without them the vignettes stay on the overlay (logged).
-    if (!make({"VR_EASU", "VR_VIGNETTE"}, "vr_eye_upscale.comp (EASU + vignettes)", easu_vig) ||
-        !make({"VR_RCAS", "VR_VIGNETTE"}, "vr_eye_upscale.comp (RCAS + vignettes)", rcas_vig)) {
+    if (vignettes &&
+        (!make({"VR_EASU", "VR_VIGNETTE"}, "vr_eye_upscale.comp (EASU + vignettes)", easu_vig) ||
+         !make({"VR_RCAS", "VR_VIGNETTE"}, "vr_eye_upscale.comp (RCAS + vignettes)", rcas_vig))) {
         LOG_ERROR(Render_Vulkan, "VR eye upscale: no vignette variants; the vignettes stay on the "
                                  "overlay layer");
         for (vk::Pipeline* p : {&easu_vig[0], &easu_vig[1], &easu_vig[2],
@@ -173,6 +187,34 @@ bool VrEyeUpscale::Init(vk::Device dev, VmaAllocator alloc) {
                 device.destroyPipeline(*p);
                 *p = vk::Pipeline{};
             }
+        }
+    }
+    // riposte_style: the burst's own pipelines, so the vignette variants the rest of the time run
+    // without its code. One each, the colour grade and the output gamma read from the push
+    // constants (variant 2): a burst lasts under a second, and two cold pipelines instead of six
+    // at the first start. Without them (logged) the late warp draws no burst.
+    const bool vignette_variants = easu_vig[0] && easu_vig[1] && easu_vig[2] && rcas_vig[0] &&
+                                   rcas_vig[1] && rcas_vig[2];
+    if (vignette_variants) {
+        std::array<vk::Pipeline, 3> easu_r{};
+        std::array<vk::Pipeline, 3> rcas_r{};
+        const bool made = make({"VR_EASU", "VR_VIGNETTE", "VR_RIPOSTE"},
+                               "vr_eye_upscale.comp (EASU + vignettes + riposte)", easu_r, 2) &&
+                          make({"VR_RCAS", "VR_VIGNETTE", "VR_RIPOSTE"},
+                               "vr_eye_upscale.comp (RCAS + vignettes + riposte)", rcas_r, 2) &&
+                          riposte_meter.Init(device, allocator);
+        easu_rip = easu_r[2];
+        rcas_rip = rcas_r[2];
+        if (!made) {
+            LOG_ERROR(Render_Vulkan, "VR eye upscale: no riposte variants; the late warp draws no "
+                                     "riposte burst");
+            for (vk::Pipeline* p : {&easu_rip, &rcas_rip}) {
+                if (*p) {
+                    device.destroyPipeline(*p);
+                    *p = vk::Pipeline{};
+                }
+            }
+            riposte_meter.Shutdown();
         }
     }
     ready = true;
@@ -184,15 +226,17 @@ void VrEyeUpscale::Shutdown() {
     if (!device) {
         return;
     }
+    kos_iris.Shutdown();
     DestroyMid();
     for (vk::Pipeline* p : {&easu[0], &easu[1], &easu[2], &rcas[0], &rcas[1], &rcas[2],
                             &easu_vig[0], &easu_vig[1], &easu_vig[2],
-                            &rcas_vig[0], &rcas_vig[1], &rcas_vig[2]}) {
+                            &rcas_vig[0], &rcas_vig[1], &rcas_vig[2], &easu_rip, &rcas_rip}) {
         if (*p) {
             device.destroyPipeline(*p);
             *p = vk::Pipeline{};
         }
     }
+    riposte_meter.Shutdown();
     if (layout) {
         device.destroyPipelineLayout(layout);
         layout = vk::PipelineLayout{};
@@ -323,6 +367,15 @@ bool VrEyeUpscale::Record(vk::CommandBuffer cmd, const std::array<Source, 2>& so
         up[e] = out != in;
     }
     const bool any_up = up[0] || up[1];
+    // riposte_style: while a burst shows, both eyes' brightness first (its meter, from the sources
+    // the passes read), then the burst variants write the eyes last.
+    const bool riposte = vignettes != nullptr && vignettes->riposte > 0.0001f && RiposteReady();
+    if (riposte) {
+        riposte_meter.Record(cmd,
+                             {{{sources[0].view, source_layout, {{0, 0}, sources[0].extent}},
+                               {sources[1].view, source_layout, {{0, 0}, sources[1].extent}}}},
+                             true, bgra, vk::PipelineStageFlagBits2::eComputeShader);
+    }
     // EASU into `mid` when RCAS follows, else straight into the targets.
     const bool use_mid = any_up && sharpen > 0.0f;
     std::array<vk::Offset2D, 2> mid_offset{};
@@ -352,6 +405,7 @@ bool VrEyeUpscale::Record(vk::CommandBuffer cmd, const std::array<Source, 2>& so
         };
         cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_write});
     }
+    if (vignettes) kos_iris.Upload(cmd, vk::PipelineStageFlagBits2::eComputeShader);
     // `last`: this dispatch writes the eye last (the vignettes go in with it, when there are any).
     const auto bind = [&](vk::ImageView in, vk::ImageLayout in_layout, vk::ImageView out,
                           bool last = false) {
@@ -364,7 +418,12 @@ bool VrEyeUpscale::Record(vk::CommandBuffer cmd, const std::array<Source, 2>& so
             .offset = vignettes != nullptr ? vignettes->offset : 0,
             .range = vignettes != nullptr ? vignettes->range : 0,
         };
-        const std::array<vk::WriteDescriptorSet, 3> writes{{
+        const vk::DescriptorBufferInfo meter_info{
+            .buffer = riposte ? riposte_meter.Buffer() : vk::Buffer{},
+            .offset = 0,
+            .range = VK_WHOLE_SIZE,
+        };
+        std::array<vk::WriteDescriptorSet, 5> writes{{
             {.dstBinding = 0,
              .descriptorCount = 1,
              .descriptorType = vk::DescriptorType::eSampledImage,
@@ -377,8 +436,17 @@ bool VrEyeUpscale::Record(vk::CommandBuffer cmd, const std::array<Source, 2>& so
              .descriptorCount = 1,
              .descriptorType = vk::DescriptorType::eUniformBuffer,
              .pBufferInfo = &vig_info},
+            {.dstBinding = 3,
+             .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageBuffer,
+             .pBufferInfo = &meter_info},
         }};
-        const u32 count = last && vignettes != nullptr ? 3u : 2u;
+        u32 count = last && vignettes != nullptr ? (riposte ? 4u : 3u) : 2u;
+        const auto iris_info = kos_iris.Descriptor();
+        if (last && vignettes && kos_iris.Ready()) {
+            writes[count++] = {.dstBinding = 4, .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &iris_info};
+        }
         cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, count, writes.data());
     };
     if (any_up) {
@@ -386,7 +454,8 @@ bool VrEyeUpscale::Record(vk::CommandBuffer cmd, const std::array<Source, 2>& so
         const bool easu_last = !use_mid && vignettes != nullptr;
         const u32 easu_variant = use_mid ? 0u : output_variant;
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute,
-                         easu_last ? easu_vig[easu_variant] : easu[easu_variant]);
+                         easu_last ? (riposte ? easu_rip : easu_vig[easu_variant])
+                                   : easu[easu_variant]);
         for (u32 e = 0; e < 2; ++e) {
             if (!up[e]) {
                 continue;
@@ -450,7 +519,9 @@ bool VrEyeUpscale::Record(vk::CommandBuffer cmd, const std::array<Source, 2>& so
     }
     // RCAS always writes the target last.
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute,
-                     vignettes != nullptr ? rcas_vig[output_variant] : rcas[output_variant]);
+                     vignettes == nullptr ? rcas[output_variant]
+                     : riposte            ? rcas_rip
+                                          : rcas_vig[output_variant]);
     for (u32 e = 0; e < 2; ++e) {
         if (up[e] && !use_mid) {
             continue; // EASU wrote the target, nothing to sharpen

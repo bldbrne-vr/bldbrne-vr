@@ -38,7 +38,9 @@ inline Frame Surface(const Pose& pose, int slot, float height, float width, floa
     const float ahead = (chest ? .125f : .067f) + forward;
     // Rib-height mounts obstruct the arms and thighs in first person. Seat the right
     // pouch at the belt and the left item at the pants pocket; hit radii stay unchanged.
-    const float up = chest ? .035f : (slot == 0 ? -.105f : -.145f);
+    // The chest 3 cm lower (3.5 cm up until the tester, 2026-11-05: "lower the chest pocket by 3cm
+    // (it feels visually a bit too high now)"); its zone's bottom stays (ChestLoweredM).
+    const float up = chest ? .005f : (slot == 0 ? -.105f : -.145f);
     out.origin = bone.origin + bone.right * side + bone.up * (height + up) - bone.back * ahead;
     // Both hip mounts lie tangent to the front diagonal of the waist.
     const float sine = chest ? 0.f : (slot == 0 ? .5735764f : -.5735764f);

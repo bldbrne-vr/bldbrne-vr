@@ -294,6 +294,28 @@ public:
     }
     return {};
   }
+  // FAST_CPU_PIPE_PREFETCH: the packet after the one Peek returned, if published, pulled toward
+  // this core (up to `lines` cache lines from its header) while the current one is handled; stage
+  // A wrote it on another core moments ago. A hint only: nothing is read or consumed.
+  void PrefetchNext(unsigned lines) const {
+    Header header;
+    std::memcpy(&header, storage->bytes + tail % Capacity, sizeof(header));
+    const std::uint64_t next = tail + header.size;
+    if (!header.size || next >= published.load(std::memory_order_acquire) ||
+        next % Capacity == 0)
+      return;
+    const std::byte* at = storage->bytes + next % Capacity;
+    const std::size_t room = Capacity - next % Capacity;
+    for (unsigned line = 0; line < lines && std::size_t(line) * 64 < room; ++line)
+      _mm_prefetch(reinterpret_cast<const char*>(at + std::size_t(line) * 64), _MM_HINT_T0);
+  }
+  // Consumer only, after Peek returned a packet and before Release. A producer publishing
+  // concurrently may make this conservative (an extra idle flush), never hide the final packet.
+  bool IsLastPacket() const {
+    Header header;
+    std::memcpy(&header, storage->bytes + tail % Capacity, sizeof(header));
+    return tail + header.size == published.load(std::memory_order_acquire);
+  }
   void Release() {
     Header header;
     std::memcpy(&header, storage->bytes + tail % Capacity, sizeof(header));

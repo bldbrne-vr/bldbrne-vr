@@ -2,15 +2,18 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <filesystem>
 #include <atomic>
 #include <cstdlib>
 #include <ranges>
 #include "video_core/native_stereo/native_stereo.h"
 #include "common/assert.h"
+#include "common/rdtsc.h"
 #include "common/slow_scope.h"
 #include "video_core/fast_render.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/vram_report.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_transfer_eye_barriers.h"
 #include "video_core/renderer_vulkan/vr_perf.h"
@@ -93,17 +96,60 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
     return feature_flags;
 }
 
+// bbport (BB_VMA_DEDICATED_MB): an image of 4 MB or more gets memory of its own, which goes back
+// to the driver when the image is freed. In VMA's shared blocks a freed image leaves a hole, and a
+// block returns its memory only once wholly empty (bbport: ~0.9 GB of such holes on an RX 7800
+// XT). VR_VMA_DEDICATED_MB=<n> sets the threshold, 0 turns it off. Each such image is one of the
+// driver's memory allocations (maxMemoryAllocationCount, 4096 on Windows drivers): past a quarter
+// of that limit, new images share blocks again, so the limit is never approached.
+static std::atomic<u32> dedicated_images{0};
+
+u32 DedicatedImages() {
+    return dedicated_images.load(std::memory_order_relaxed);
+}
+
+static vk::DeviceSize DedicatedFrom() {
+    static const vk::DeviceSize from = [] {
+        const char* value = std::getenv("VR_VMA_DEDICATED_MB");
+        return vk::DeviceSize(value ? std::strtoull(value, nullptr, 10) : 4) << 20;
+    }();
+    return from;
+}
+
+static u32 DedicatedCap(VmaAllocator allocator) {
+    static const u32 cap = [allocator] {
+        const VkPhysicalDeviceProperties* properties{};
+        vmaGetPhysicalDeviceProperties(allocator, &properties);
+        const u32 limit = properties ? properties->limits.maxMemoryAllocationCount : 4096;
+        return std::max<u32>(limit / 4, 64);
+    }();
+    return cap;
+}
+
 UniqueImage::~UniqueImage() {
     if (image) {
         vmaDestroyImage(allocator, image, allocation);
+        if (dedicated)
+            dedicated_images.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
+void UniqueImage::DestroyReleased(const Released& released) {
+    if (released.image) {
+        vmaDestroyImage(released.allocator, released.image, released.allocation);
+        if (released.dedicated)
+            dedicated_images.fetch_sub(1, std::memory_order_relaxed);
     }
 }
 
 void UniqueImage::Destroy() {
     if (image) {
         vmaDestroyImage(allocator, image, allocation);
+        if (dedicated)
+            dedicated_images.fetch_sub(1, std::memory_order_relaxed);
         image = vk::Image{};
         allocation = {};
+        dedicated = false;
     }
 }
 
@@ -116,19 +162,32 @@ u64 UniqueImage::SizeBytes() const {
     return info.size;
 }
 
-void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
-    const bool created = TryCreate(image_ci);
+void UniqueImage::Create(const vk::ImageCreateInfo& image_ci, std::source_location where) {
+    const bool created = TryCreate(image_ci, where);
     if (!created) {
         Common::CrashRecord::Note("out of memory: a texture could not be allocated");
     }
     ASSERT_MSG(created, "Failed allocating image: out of device memory");
 }
 
-bool UniqueImage::TryCreate(const vk::ImageCreateInfo& image_ci) {
+bool UniqueImage::TryCreate(const vk::ImageCreateInfo& image_ci, std::source_location where) {
     this->image_ci = image_ci;
     ASSERT(!image);
+    // Reserve a dedicated slot before allocating (released again below if it is not used), so
+    // concurrent creations never take more than the cap together.
+    bool own_memory = false;
+    if (const auto from = DedicatedFrom(); from != 0 && device) {
+        const vk::DeviceImageMemoryRequirements query{.pCreateInfo = &image_ci};
+        if (device.getImageMemoryRequirements(query).memoryRequirements.size >= from) {
+            own_memory =
+                dedicated_images.fetch_add(1, std::memory_order_relaxed) < DedicatedCap(allocator);
+            if (!own_memory)
+                dedicated_images.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
     const VmaAllocationCreateInfo alloc_info = {
-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT |
+                 (own_memory ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0u),
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         .requiredFlags = 0,
         .preferredFlags = 0,
@@ -147,6 +206,8 @@ bool UniqueImage::TryCreate(const vk::ImageCreateInfo& image_ci) {
                                   nullptr);
         },
         false); // The cache may still recover; record a crash note only on final failure.
+    if (result != VK_SUCCESS && own_memory)
+        dedicated_images.fetch_sub(1, std::memory_order_relaxed);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
         allocation = {};
         return false;
@@ -154,6 +215,23 @@ bool UniqueImage::TryCreate(const vk::ImageCreateInfo& image_ci) {
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
+    dedicated = own_memory;
+    if (own_memory) {
+        static std::atomic<bool> noted{false};
+        if (!noted.exchange(true, std::memory_order_relaxed))
+            LOG_INFO(Render_Vulkan,
+                     "VR memory: images of {} MB or more get memory of their own (at most {} at "
+                     "once; VR_VMA_DEDICATED_MB)",
+                     DedicatedFrom() >> 20, DedicatedCap(allocator));
+    }
+    // VR_VRAM_REPORT: images made outside the texture cache keep this name (the cache renames its own).
+    if (VramReport::Enabled())
+        VramReport::Name(allocator, allocation,
+                         fmt::format("img {} {}x{} L{} M{} @{}:{}", vk::to_string(image_ci.format),
+                                     image_ci.extent.width, image_ci.extent.height,
+                                     image_ci.arrayLayers, image_ci.mipLevels,
+                                     std::filesystem::path(where.file_name()).filename().string(),
+                                     where.line()));
     return true;
 }
 
@@ -258,6 +336,14 @@ bool Image::RetryAllocation() {
                           info.size.height, info.size.depth, AmdGpu::NameOf(info.tile_mode),
                           vk::to_string(info.pixel_format), info.guest_address, info.guest_size,
                           info.resources.layers, info.resources.levels, info.num_samples);
+    if (VramReport::Enabled())
+        VramReport::Name(backing->image.allocator, backing->image.allocation,
+                         fmt::format("tc {}x{}x{} {} L{} M{} S{} {} {:#x}+{:#x}", info.size.width,
+                                     info.size.height, info.size.depth,
+                                     vk::to_string(backing->image.image_ci.format),
+                                     backing->image.image_ci.arrayLayers, info.resources.levels,
+                                     info.num_samples, AmdGpu::NameOf(info.tile_mode),
+                                     info.guest_address, info.guest_size));
     return true;
 }
 
@@ -426,8 +512,100 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
     return barriers;
 }
 
+// FAST_CPU_TRANSIT_NOOP (on by default; '0' off, 'v' verify, 'a' measure; read once): a
+// transition to the state the whole image already holds returns at once. Exactly the case where
+// GetBarriers emits nothing and changes nothing: no scene proxy to notify, no per-subresource
+// states, a full range (no partial transition to start), the same layout and access, the last
+// access not a write, and a read-only target from a defined layout (no resync-memo write count).
+// Verify: GetBarriers still runs and must return no barrier. Measure: on every other call, the
+// cycles of each kind of call summed (`FAST_CPU_TRANSIT_NOOP a/b:` every 2^20 calls).
+// On since 2026-10-31: verify found no transition it skipped that emitted a barrier; measured
+// 177.7 -> 148.6 cycles per Transit call (alternating calls, 53 million).
+static const char g_transit_noop = [] {
+    const char* v = std::getenv("FAST_CPU_TRANSIT_NOOP");
+    return !v ? '1' : (v[0] == 'v' || v[0] == 'a' || v[0] == '0') ? v[0] : '1';
+}();
+struct TransitNoopAb {
+    u64 calls[2]{}, ticks[2]{};
+};
+static thread_local TransitNoopAb g_transit_noop_ab;
+
+bool Image::TransitIsNoop(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                          const std::optional<SubresourceRange>& range) const {
+    constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
+                                 vk::AccessFlagBits2::eShaderWrite |
+                                 vk::AccessFlagBits2::eMemoryWrite;
+    if (scene_proxy || !backing->subresource_states.empty()) {
+        return false;
+    }
+    if (range && (range->base != SubresourceBase{} || range->extent != info.resources)) {
+        return false;
+    }
+    const auto& s = backing->state;
+    return s.layout == dst_layout && s.access_mask == dst_mask &&
+           !static_cast<bool>(s.access_mask & write_flags) &&
+           s.layout != vk::ImageLayout::eUndefined &&
+           !PerfLogic::MayWrite(static_cast<VkAccessFlags2>(dst_mask), false);
+}
+
 void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                     std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf /*= {}*/) {
+    if (g_transit_noop != '0') {
+        if (g_transit_noop == '1') {
+            if (TransitIsNoop(dst_layout, dst_mask, range)) {
+                return;
+            }
+        } else if (g_transit_noop == 'v') {
+            if (TransitIsNoop(dst_layout, dst_mask, range)) {
+                const vk::PipelineStageFlags2 stage =
+                    (dst_mask == vk::AccessFlagBits2::eTransferRead ||
+                     dst_mask == vk::AccessFlagBits2::eTransferWrite)
+                        ? vk::PipelineStageFlagBits2::eTransfer
+                        : vk::PipelineStageFlagBits2::eAllGraphics |
+                              vk::PipelineStageFlagBits2::eComputeShader;
+                if (!GetBarriers(dst_layout, dst_mask, stage, range).empty()) [[unlikely]] {
+                    static std::atomic<u32> logged{0};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 64)
+                        LOG_ERROR(Render_Vulkan,
+                                  "FAST_CPU_TRANSIT_NOOP verify: a no-op transition emitted a "
+                                  "barrier (layout {})",
+                                  vk::to_string(dst_layout));
+                }
+                return;
+            }
+        } else {
+            auto& m = g_transit_noop_ab;
+            const int k = (m.calls[0] + m.calls[1]) & 1;
+            const u64 start = Common::FencedRDTSC();
+            if (k == 1 && TransitIsNoop(dst_layout, dst_mask, range)) {
+                m.ticks[1] += Common::FencedRDTSC() - start;
+                ++m.calls[1];
+                return;
+            }
+            struct Done {
+                TransitNoopAb& m;
+                int k;
+                u64 start;
+                ~Done() {
+                    m.ticks[k] += Common::FencedRDTSC() - start;
+                    if ((++m.calls[k] + m.calls[1 - k]) % (1u << 20) == 0)
+                        LOG_INFO(Render_Vulkan,
+                                 "FAST_CPU_TRANSIT_NOOP a/b: full {:.1f} cycles/call, with the "
+                                 "check {:.1f} cycles/call, over {} calls",
+                                 double(m.ticks[0]) / double(m.calls[0] ? m.calls[0] : 1),
+                                 double(m.ticks[1]) / double(m.calls[1] ? m.calls[1] : 1),
+                                 m.calls[0] + m.calls[1]);
+                }
+            } done{m, k, start};
+            TransitFull(dst_layout, dst_mask, range, cmdbuf);
+            return;
+        }
+    }
+    TransitFull(dst_layout, dst_mask, range, cmdbuf);
+}
+
+void Image::TransitFull(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                        std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf) {
     // Adjust pipeline stage
     const vk::PipelineStageFlags2 dst_pl_stage =
         (dst_mask == vk::AccessFlagBits2::eTransferRead ||
@@ -580,7 +758,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> download_copies, vk::B
     if (native_stereo && (pair_download_barriers || pair_bit)) {
         // Establish right backing before either eye copy. Its initialization preserves
         // all untouched bytes; each download range is then overwritten by its own eye.
-        const auto right = NativeStereo::RightBuffer(*scheduler, buffer, true);
+        const auto right = NativeStereo::RightForWrite(*scheduler, buffer, offset, download_size);
         ASSERT(right && right != buffer);
         std::array<vk::BufferMemoryBarrier2, 2> before{pre_barrier, pre_barrier};
         std::array<vk::BufferMemoryBarrier2, 2> after{post_barrier, post_barrier};
@@ -626,7 +804,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> download_copies, vk::B
     cmdbuf.copyImageToBuffer(GetImage(), vk::ImageLayout::eTransferSrcOptimal, buffer,
                              download_copies);
     if (native_stereo) {
-        auto right = NativeStereo::RightBuffer(*scheduler, buffer, true);
+        auto right = NativeStereo::RightForWrite(*scheduler, buffer, offset, download_size);
         std::vector<vk::BufferImageCopy> copies(download_copies.begin(), download_copies.end());
         for (auto& c : copies) c.imageSubresource.baseArrayLayer = 1;
         NativeStereo::Barrier(*scheduler);
@@ -995,6 +1173,7 @@ void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_ra
 
     flags |= VideoCore::ImageFlagBits::GpuModified;
     flags &= ~VideoCore::ImageFlagBits::Dirty;
+    ++write_serial;
 }
 
 void Image::Clear(const vk::ClearValue& clear_value, const VideoCore::SubresourceRange& range) {

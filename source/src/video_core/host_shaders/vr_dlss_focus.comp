@@ -1,0 +1,231 @@
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-FileCopyrightText: MJP (Matt Pettineo) (SampleTextureCatmullRom)
+// SPDX-License-Identifier: GPL-2.0-or-later AND MIT
+
+// Foveated upscaling (renderer_vulkan/vr_dlss_focus.h): the upscaler (DLSS or FSR) reconstructed
+// only the rectangle around the lens centre of this eye, into an image of its own; here the whole
+// eye is written, the same way for both eyes: the upscaler's pixels inside the rectangle (texel
+// for texel), the render enlarged outside it (Catmull-Rom from the render's texel centres, the
+// frame's jitter taken out so it holds still) and steadied by its own TAA (the last composed eye
+// reprojected with the motion vectors, clamped to the render's neighbourhood, then mostly kept),
+// and over a band just inside the rectangle's edge the enlargement going over to the upscaler's
+// pixels, so its edge (where it had no neighbours) never shows. Without history (the first frame,
+// a reset) a light FXAA takes the TAA's place. The render holds what the upscaler reads (its
+// bytes as they are), so both parts are in the same encoding; alpha is written 1 (the eyes'
+// projection layers ignore it).
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D render_tex; // this eye's render (linear filter)
+// This eye's output, in its own format: R8G8B8A8_UNORM (DLSS's default in S1) or RGBA16F.
+#ifdef FOCUS_RGBA8
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D eye_img;
+#else
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D eye_img;
+#endif
+layout(set = 0, binding = 2) uniform texture2D dlss_tex;    // the upscaler's rectangle
+layout(set = 0, binding = 3) uniform sampler2D history_tex; // the last composed eye (linear)
+layout(set = 0, binding = 4) uniform texture2D motion_tex;  // render pixels, current to previous
+
+layout(push_constant) uniform FocusPush {
+    ivec4 rect;   // the upscaler's rectangle in the eye: x0, y0, x1, y1 (exclusive), for the band
+                  // only: a side on the eye's own edge is pushed far outside, so no band softens
+                  // the upscaler there (no seam to hide)
+    vec4 map;     // render pixels per eye pixel (x, y); the jitter's texel shift (x, y)
+    vec4 inv;     // 1 / render size (x, y); the band's width in eye pixels; this frame's weight
+                  // in the TAA (1: no history)
+    ivec4 size;   // the eye's size (x, y); the render's size (z, w)
+    ivec4 origin; // the upscaler's rectangle in the eye: x, y, width, height (its texel 0, 0)
+    ivec4 frame;  // the frame's number (x: the dither's pattern changes with it); y: the share of
+                  // this frame's sample taken from its 3x3's mean, in thousandths; z: the history
+                  // box's least half-width in hundredths of an 8-bit step
+} pc;
+
+// Catmull-Rom through 5 bilinear taps (MJP's SampleTextureCatmullRom), at pixel position `pos`
+// of `tex` (texel centres at i + 0.5; `inv`: 1 / its size). Unclamped: callers bound it.
+vec3 CatmullRom5(sampler2D tex, vec2 pos, vec2 inv) {
+    const vec2 centre = floor(pos - 0.5) + 0.5;
+    const vec2 f = pos - centre;
+    const vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    const vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    const vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    const vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    const vec2 w12 = w1 + w2;
+    const vec2 off12 = w2 / w12;
+    const vec2 t0 = (centre - 1.0) * inv;
+    const vec2 t3 = (centre + 2.0) * inv;
+    const vec2 t12 = (centre + off12) * inv;
+    vec3 c = textureLod(tex, vec2(t12.x, t0.y), 0.0).rgb * w12.x * w0.y;
+    c += textureLod(tex, vec2(t0.x, t12.y), 0.0).rgb * w0.x * w12.y;
+    c += textureLod(tex, t12, 0.0).rgb * w12.x * w12.y;
+    c += textureLod(tex, vec2(t3.x, t12.y), 0.0).rgb * w3.x * w12.y;
+    c += textureLod(tex, vec2(t12.x, t3.y), 0.0).rgb * w12.x * w3.y;
+    const float total = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    return c / total;
+}
+
+// CatmullRom5 clamped to its 2x2 neighbourhood's range against ringing (4 more taps).
+vec3 CatmullRom(sampler2D tex, vec2 pos, vec2 inv) {
+    const vec2 centre = floor(pos - 0.5) + 0.5;
+    const vec2 f = pos - centre;
+    const vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    const vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    const vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    const vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    const vec2 w12 = w1 + w2;
+    const vec2 off12 = w2 / w12;
+    const vec2 t0 = (centre - 1.0) * inv;
+    const vec2 t3 = (centre + 2.0) * inv;
+    const vec2 t12 = (centre + off12) * inv;
+    vec3 c = textureLod(tex, vec2(t12.x, t0.y), 0.0).rgb * w12.x * w0.y;
+    c += textureLod(tex, vec2(t0.x, t12.y), 0.0).rgb * w0.x * w12.y;
+    c += textureLod(tex, t12, 0.0).rgb * w12.x * w12.y;
+    c += textureLod(tex, vec2(t3.x, t12.y), 0.0).rgb * w3.x * w12.y;
+    c += textureLod(tex, vec2(t12.x, t3.y), 0.0).rgb * w12.x * w3.y;
+    const float total = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    c /= total;
+    // Anti-ringing: within the 2x2 the centre tap's bilinear footprint covers.
+    const vec3 a = textureLod(tex, (centre + vec2(0.0, 0.0)) * inv, 0.0).rgb;
+    const vec3 b = textureLod(tex, (centre + vec2(1.0, 0.0)) * inv, 0.0).rgb;
+    const vec3 d = textureLod(tex, (centre + vec2(0.0, 1.0)) * inv, 0.0).rgb;
+    const vec3 e = textureLod(tex, (centre + vec2(1.0, 1.0)) * inv, 0.0).rgb;
+    return clamp(c, min(min(a, b), min(d, e)), max(max(a, b), max(d, e)));
+}
+
+float Luma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+// Without history: the render's edges are stair-stepped (the game's own anti-aliasing is off
+// under the upscaler), so a light FXAA (Timothy Lottes' classic FXAA, 9 bilinear taps on the
+// render) on edges with contrast, `sharp` (the Catmull-Rom enlargement) elsewhere.
+vec3 Fxaa(vec2 pos, vec3 sharp) {
+    const vec2 uv = pos * pc.inv.xy;
+    const vec2 texel = pc.inv.xy;
+    const float nw = Luma(textureLod(render_tex, uv + vec2(-0.5, -0.5) * texel, 0.0).rgb);
+    const float ne = Luma(textureLod(render_tex, uv + vec2(0.5, -0.5) * texel, 0.0).rgb);
+    const float sw = Luma(textureLod(render_tex, uv + vec2(-0.5, 0.5) * texel, 0.0).rgb);
+    const float se = Luma(textureLod(render_tex, uv + vec2(0.5, 0.5) * texel, 0.0).rgb);
+    const float m = Luma(sharp);
+    const float lo = min(m, min(min(nw, ne), min(sw, se)));
+    const float hi = max(m, max(max(nw, ne), max(sw, se)));
+    if (hi - lo < max(1.0 / 24.0, hi * 0.125))
+        return sharp; // no edge worth smoothing
+    vec2 dir = vec2(-((nw + ne) - (sw + se)), (nw + sw) - (ne + se));
+    const float reduce = max((nw + ne + sw + se) * (0.25 / 8.0), 1.0 / 128.0);
+    dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + reduce), vec2(-8.0), vec2(8.0)) * texel;
+    const vec3 a = 0.5 * (textureLod(render_tex, uv + dir * (1.0 / 3.0 - 0.5), 0.0).rgb +
+                          textureLod(render_tex, uv + dir * (2.0 / 3.0 - 0.5), 0.0).rgb);
+    const vec3 b = 0.5 * a + 0.25 * (textureLod(render_tex, uv - dir * 0.5, 0.0).rgb +
+                                     textureLod(render_tex, uv + dir * 0.5, 0.0).rgb);
+    const float lb = Luma(b);
+    return lb < lo || lb > hi ? a : b;
+}
+
+// YCoCg: the history's box is tighter around brightness than in RGB.
+vec3 ToYCoCg(vec3 c) {
+    return vec3(dot(c, vec3(0.25, 0.5, 0.25)), dot(c, vec3(0.5, 0.0, -0.5)),
+                dot(c, vec3(-0.25, 0.5, -0.25)));
+}
+vec3 FromYCoCg(vec3 c) {
+    return vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
+// The render enlarged at render position `pos` for eye pixel `p`, steadied by the TAA (20 taps):
+//  - this frame's sample: Catmull-Rom on the render, clamped to the 2x2 its centre covers (taken
+//    from the 3x3 below) against ringing;
+//  - the history: the last composed eye where this pixel was (its render texel's motion vector,
+//    Catmull-Rom), kept inside the render's 3x3 neighbourhood (YCoCg: its mean +- 1.25 times its
+//    spread, within its range), so neither ghosts nor jumps as the jitter moves the box;
+//  - their blend: this frame weighs more where a render sample lies near this pixel and less
+//    between samples (the jitter's sharp and soft frames then average out instead of pulsing),
+//    and bright samples count less (Karis' weights: one-frame sparkles do not flash).
+// A pixel that came from outside the eye takes this frame's sample alone.
+vec3 Enlarged(vec2 pos, ivec2 p) {
+    const float base = pc.inv.w;
+    if (base >= 1.0)
+        return Fxaa(pos, CatmullRom(render_tex, pos, pc.inv.xy));
+    const ivec2 texel = clamp(ivec2(floor(pos)), ivec2(0), pc.size.zw - 1);
+    // The 2x2 the Catmull-Rom's centre covers, as offsets in the 3x3: (o.x or o.x + 1, ...).
+    const ivec2 o = ivec2(floor(pos - 0.5)) - ivec2(floor(pos));
+    vec3 near_lo = vec3(1e9), near_hi = vec3(-1e9);
+    vec3 mean = vec3(0.0), square = vec3(0.0), lo = vec3(1e9), hi = vec3(-1e9);
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            const vec3 rgb =
+                texelFetch(render_tex, clamp(texel + ivec2(x, y), ivec2(0), pc.size.zw - 1), 0).rgb;
+            if (x - o.x >= 0 && x - o.x <= 1 && y - o.y >= 0 && y - o.y <= 1) {
+                near_lo = min(near_lo, rgb);
+                near_hi = max(near_hi, rgb);
+            }
+            const vec3 s = ToYCoCg(rgb);
+            mean += s;
+            square += s * s;
+            lo = min(lo, s);
+            hi = max(hi, s);
+        }
+    }
+    mean *= 1.0 / 9.0;
+    // Outside the upscaler the lenses blur anyway: part of this frame's sample is its 3x3's mean,
+    // which the jitter barely moves, so the coarse shading out here (foveation's 2x2 / 4x4) and
+    // thin edges do not sparkle from frame to frame.
+    const vec3 sharp = mix(clamp(CatmullRom5(render_tex, pos, pc.inv.xy), near_lo, near_hi),
+                           FromYCoCg(mean), float(pc.frame.y) * 0.001);
+    const vec2 was = vec2(p) + 0.5 + texelFetch(motion_tex, texel, 0).rg / pc.map.xy;
+    const vec2 uv = was / vec2(pc.size.xy);
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))))
+        return sharp;
+    const vec3 spread = 1.25 * sqrt(max(square * (1.0 / 9.0) - mean * mean, vec3(0.0)));
+    // A flat neighbourhood (foveation's 2x2 / 4x4 blocks out here, a smooth wall) has no spread,
+    // which would pin the history to this frame and let every jitter step through: the box keeps
+    // a least half-width around its mean (brightness; half of it for colour), so small changes are
+    // still steadied while large ones (what moved) are not kept.
+    const float least = float(pc.frame.z) * (0.01 / 255.0);
+    const vec3 box_lo = min(max(lo, mean - spread), mean - vec3(least, 0.5 * least, 0.5 * least));
+    const vec3 box_hi = max(min(hi, mean + spread), mean + vec3(least, 0.5 * least, 0.5 * least));
+    const vec3 history = FromYCoCg(
+        clamp(ToYCoCg(CatmullRom5(history_tex, was, 1.0 / vec2(pc.size.xy))), box_lo, box_hi));
+    // How near this frame's nearest render sample is (render pixels; 1 on it, 0.29 at a corner):
+    // averages 0.66 over the jitter, so the weight averages `base`.
+    const vec2 d = pos - (floor(pos) + 0.5);
+    const float weight = clamp(base * 1.5 * exp(-2.5 * dot(d, d)), 0.02, 0.5);
+    const float now = weight / (1.0 + Luma(sharp)), then = (1.0 - weight) / (1.0 + Luma(history));
+    return (sharp * now + history * then) / (now + then);
+}
+
+// Interleaved gradient noise (Jimenez), -0.5 .. 0.5, a new pattern each frame.
+float Dither(ivec2 p) {
+    const vec2 q = vec2(p) + 5.588238 * float(pc.frame.x & 63);
+    return fract(52.9829189 * fract(dot(q, vec2(0.06711056, 0.00583715)))) - 0.5;
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.size.x || p.y >= pc.size.y)
+        return;
+    // How far inside the upscaler's rectangle (negative outside), in eye pixels.
+    const int inside = min(min(p.x - pc.rect.x, pc.rect.z - 1 - p.x),
+                           min(p.y - pc.rect.y, pc.rect.w - 1 - p.y));
+    const float band = pc.inv.z;
+    const ivec2 q = p - pc.origin.xy; // this pixel in the upscaler's image
+    const bool in_dlss = all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, pc.origin.zw));
+    if (in_dlss && float(inside) >= band) {
+        imageStore(eye_img, p, vec4(texelFetch(dlss_tex, q, 0).rgb, 1.0)); // the upscaler's own
+        return;
+    }
+    const vec3 enlarged = Enlarged((vec2(p) + 0.5) * pc.map.xy + pc.map.zw, p);
+    vec3 c = enlarged;
+    if (in_dlss) {
+        const float w = smoothstep(0.0, band, float(inside) + 0.5);
+        c = mix(enlarged, texelFetch(dlss_tex, q, 0).rgb, w);
+    }
+#ifdef FOCUS_RGBA8
+    // 8 bits: a blend of a tenth moves a channel by less than a step where it changes slowly, so
+    // the history would stop short (dark gradients sticking, then stepping); the dither keeps the
+    // average right. Under half a step, below what an 8-bit eye shows.
+    c += Dither(p) * (1.0 / 255.0);
+#endif
+    imageStore(eye_img, p, vec4(c, 1.0));
+}

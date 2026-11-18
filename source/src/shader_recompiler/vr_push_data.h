@@ -23,6 +23,16 @@ namespace Shader {
 // permutations (EmitVrCutaway) and the pushed values (VrPushData::SetCut) both decode it here, so
 // they are the same floats bit for bit.
 struct VrCut {
+    // Reserved cut codes: EncodeCut caps near at 32766 mm, so these cannot be normal body cuts.
+    // The Monocular hides the hunter's foreground draw in only the magnified eye.
+    static constexpr u32 MonocularLeft = 0x7fff'ffffu;
+    static constexpr u32 MonocularRight = 0xffff'ffffu;
+    static constexpr s32 MonocularEye(u32 code) {
+        return code == MonocularLeft ? 0 : code == MonocularRight ? 1 : -1;
+    }
+    static constexpr u32 MonocularCode(s32 eye) {
+        return eye == 0 ? MonocularLeft : eye == 1 ? MonocularRight : 0;
+    }
     float near_units{};
     float scale{};
     bool back{};
@@ -47,7 +57,7 @@ struct VrCut {
 // between pipelines, VrDrawCapeSplit's cut pipeline in the middle of a draw included).
 struct VrPushData {
     static constexpr u32 Begin = 128; // sizeof(PushData)
-    static constexpr u32 End = 224;
+    static constexpr u32 End = 232;
     // The push block's SPIR-V members after PushData's 13 (a pair: left, right = left + 1).
     static constexpr u32 SceneInverseIndex = 13; // x, then y at 14
     static constexpr u32 CutNearIndex = 15;
@@ -55,8 +65,9 @@ struct VrPushData {
     static constexpr u32 ProjectionIndex = 17; // left 17, right 18
     static constexpr u32 LightIndex = 19;      // left 19, right 20
     static constexpr u32 MotionIndex = 21;     // the parameters' address 21, the positions' 22
+    static constexpr u32 BumpDepthIndex = 23;  // bump_depth, then bump_scale at 24
     static constexpr u32 CutNearOffset = 136, CutScaleOffset = 140, ProjectionOffset = 144,
-                         LightOffset = 176, MotionOffset = 208;
+                         LightOffset = 176, MotionOffset = 208, BumpOffset = 224;
     // A light test that keeps every pixel (a draw without a tile of its own).
     static constexpr float Unbounded = std::numeric_limits<float>::max();
     static constexpr std::array<float, 4> AllPixels{-Unbounded, -Unbounded, Unbounded, Unbounded};
@@ -79,9 +90,20 @@ struct VrPushData {
     // draw. The shader reads each as a uvec2 {low word, high word} and bitcasts it to a u64.
     u64 motion_params{};
     u64 motion_positions{};
+    // The raised brickwork (ir/passes/parallax.h BumpGaps; vk_rasterizer.h VrBumpState):
+    // bump_depth is the joints' depth in metres for a draw whose bump map is a height map; 0 (the
+    // default: every read of ours is skipped) for a blue that is none, and with raised_bricks
+    // off. bump_scale is not read any more (one scale for every map: the shader's constant) and
+    // stays 0: a value that never changes keeps the block the recorder can leave out.
+    float bump_depth{0.0f};
+    float bump_scale{0.0f};
 
-    // The cut of the draw's code (0: none, the default).
-    void SetCut(u32 code) {
+    // The cut of the draw's code (0: none, the default). A Monocular code (its eye is baked
+    // into the variant) pushes `free_cut`, the body cut its free eye keeps.
+    void SetCut(u32 code, u32 free_cut = 0) {
+        if (VrCut::MonocularEye(code) >= 0) {
+            code = VrCut::MonocularEye(free_cut) >= 0 ? 0 : free_cut;
+        }
         if (code == 0) {
             cut_near = -1.0f;
             cut_scale = 1.0f;
@@ -98,6 +120,7 @@ static_assert(offsetof(VrPushData, cut_scale) == VrPushData::CutScaleOffset - Vr
 static_assert(offsetof(VrPushData, projection) == VrPushData::ProjectionOffset - VrPushData::Begin);
 static_assert(offsetof(VrPushData, light) == VrPushData::LightOffset - VrPushData::Begin);
 static_assert(offsetof(VrPushData, motion_params) == VrPushData::MotionOffset - VrPushData::Begin);
+static_assert(offsetof(VrPushData, bump_depth) == VrPushData::BumpOffset - VrPushData::Begin);
 static_assert(offsetof(VrPushData, motion_positions) ==
               VrPushData::MotionOffset + 8 - VrPushData::Begin);
 static_assert(VrPushData::ProjectionOffset % 16 == 0 && VrPushData::LightOffset % 16 == 0 &&

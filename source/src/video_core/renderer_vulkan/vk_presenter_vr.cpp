@@ -35,6 +35,7 @@
 #include "core/vr/live_tune.h"
 #include "core/vr/ui_conditions.h"
 #include "core/vr/ui_layout.h"
+#include "core/vr/ui_slots.h"
 #include "core/vr/vitals_channel.h"
 #include "core/vr/vr_page_runtime.h"
 #include "core/vr/vr_session.h"
@@ -204,13 +205,13 @@ void Presenter::RecordVrStereo(vk::CommandBuffer cmdbuf, Frame& frame, vk::Exten
             frame.vr_tag.record = drawn; // `tag` refers to it: the crops and poses below use it
         }
     }
-    const bool dibr_dlss = rasterizer->VrDibrDlssFrame();
-    if ((!dibr_dlss && info.size != game_size) || (dibr_dlss && !frame.vr_ui.valid) ||
+    const bool dibr_upscaled = rasterizer->VrDibrUpscaledFrame();
+    if ((!dibr_upscaled && info.size != game_size) || (dibr_upscaled && !frame.vr_ui.valid) ||
         frame.width != game_size.width || frame.height != game_size.height) {
         ++stats.size;
         return;
     }
-    if (dibr_dlss) game_size = info.size;
+    if (dibr_upscaled) game_size = info.size;
     // The DIBR eyes go to their own swapchains (OpenXRPresenter::RecordStereoCopy, one eye each,
     // sized from its crop): only the format is shared with the centre image's swapchains, never
     // their size. (Until 2026-10-07 those had to be the render's size; on Meta Link, whose
@@ -300,6 +301,7 @@ void Presenter::RecordVrStereo(vk::CommandBuffer cmdbuf, Frame& frame, vk::Exten
         OpenXRPresenter::StereoEyes stereo{};
         for (u32 i = 0; i < 2; ++i) {
             stereo.image[i] = frame.vr_eye_image[i];
+            stereo.view[i] = *eyes.view[i];
             stereo.extent[i] = frame.vr_eye_extent[i];
             stereo.crop[i] = {frame.vr_eye_fov[i], frame.vr_eye_rect[i]};
         }
@@ -319,6 +321,7 @@ void Presenter::RecordVrStereo(vk::CommandBuffer cmdbuf, Frame& frame, vk::Exten
             if ((out != in || sharpen > 0.0f) && UpscaleVrEyes(cmdbuf, eyes, out, sharpen)) {
                 for (u32 i = 0; i < 2; ++i) {
                     stereo.image[i] = vr_eye_scaled.image[i];
+                    stereo.view[i] = *vr_eye_scaled.view[i];
                     stereo.extent[i] = out[i];
                 }
             }
@@ -327,6 +330,7 @@ void Presenter::RecordVrStereo(vk::CommandBuffer cmdbuf, Frame& frame, vk::Exten
         // The late warp's source: this capture, with the settings its eyes were warped with.
         stereo.late = vr_warp->GetLateCapture(settings);
         stereo.late.render_taa = frame.vr_tag.aa_mode == VR::Aa::Mode::Taa;
+        stereo.late.upscaled = dibr_upscaled;
         if (settings.depth) {
             stereo.depth_buffer = vr_warp->DepthBuffer();
             stereo.depth_offset = {vr_warp->DepthOffset(0), vr_warp->DepthOffset(1)};
@@ -651,6 +655,42 @@ void Presenter::RecordVrUi(vk::CommandBuffer cmdbuf, Frame& frame, vk::Extent2D 
                                               s.ui_hud_scale_deg, s.ui_hud_pitch_deg);
     VR::Ui::FitDialogue(hud, params.dialogue);
     const float k = VR::Ui::BandScale(static_cast<float>(band.extent.width));
+    // The HUD widgets in their own slots above and below the band (ui_hud_slots, set as the HUD
+    // movie loaded): the slot sheet below the atlas's halves; the clusters, the meter, the
+    // banners' words and the area name are no longer in the band, so they are not cut from it.
+    namespace Slots = VR::Ui::Slots;
+    const Slots::Layout* slot_layout = Slots::Active();
+    if (slot_layout != nullptr && x.height <= band.extent.height) {
+        slot_layout = nullptr; // this render has no rows above the band (not the movie's shape)
+    }
+    Slots::Blocks slot_blocks{};
+    Slots::Sheet sheet{};
+    if (slot_layout != nullptr) {
+        slot_blocks = Slots::BlocksOf(*slot_layout);
+        sheet = Slots::SheetOf(slot_blocks, k, band.offset.y, static_cast<s32>(x.height));
+        auto& sl = params.slots;
+        sl.on = sheet.Rows() > 0;
+        sl.top_src = sheet.top_src;
+        sl.top_rows = sheet.top_rows;
+        sl.bottom_src = sheet.bottom_src;
+        sl.bottom_rows = sheet.bottom_rows;
+        const auto in_sheet = [&](const Slots::Slot& slot, const VR::Ui::StageRect& home) {
+            return slot.on ? Slots::SheetRect(sheet, slot_blocks, slot.Moved(home), k)
+                           : std::array<s32, 4>{};
+        };
+        sl.status_left = in_sheet(slot_layout->status, Slots::StatusLeftHome);
+        sl.status_right = in_sheet(slot_layout->status, Slots::StatusRightHome);
+        sl.status_home_dy =
+            static_cast<s32>(std::floor(Slots::StatusLeftHome.y0 * k)) - sl.status_left[1];
+        sl.area = in_sheet(slot_layout->area, Slots::AreaHome);
+        const auto banner = in_sheet(slot_layout->banner, Slots::BannerHome);
+        sl.banner_y0 = banner[1];
+        sl.banner_y1 = banner[3];
+    }
+    const bool slot_status = params.slots.on && slot_layout->status.on;
+    const bool slot_area = params.slots.on && slot_layout->area.on;
+    const bool slot_gauge = params.slots.on && slot_layout->gauge.on;
+    bool area_up = false; // an area name is up (its slot's or the lower group's)
     // An area name (VR::Ui::StepAreaName on the newest measured gameplay frame, a few frames old;
     // not a fade's or a loading page's rows reaching the stage's edge): this frame's lower cut
     // reaches the stage's bottom (its backing's last rows were a detached strip on the rest
@@ -665,8 +705,19 @@ void Presenter::RecordVrUi(vk::CommandBuffer cmdbuf, Frame& frame, vk::Extent2D 
                                             : 0.0f;
         vr_ui_area_ns = now_ns;
         float right = 0.0f;
-        if (tag.ui_class == static_cast<u8>(VR::UiClass::None) && measured.seq != 0 &&
-            measured.cls == static_cast<u8>(VR::UiClass::None) && measured.hud_right != 0) {
+        if (slot_area) {
+            // Its own slot: a name is up while the slot holds its words (nothing else is ever
+            // drawn there: no fade, loading page or lantern reaches it). The step's hold and
+            // threshold as before.
+            constexpr u32 AreaSlotMinPx = 64;
+            if (tag.ui_class == static_cast<u8>(VR::UiClass::None) && measured.seq != 0 &&
+                measured.cls == static_cast<u8>(VR::UiClass::None) &&
+                measured.slot_area >= AreaSlotMinPx) {
+                right = VR::Ui::AreaNameRightX + 1.0f;
+            }
+        } else if (tag.ui_class == static_cast<u8>(VR::UiClass::None) && measured.seq != 0 &&
+                   measured.cls == static_cast<u8>(VR::UiClass::None) &&
+                   measured.hud_right != 0) {
             right = static_cast<float>(measured.hud_right) / k;
             // Without its dark strip (VR::IsAreaDimRemoved) a name ends by x ~1830 (1661 in the
             // 2026-10-14 run): a row to the edge is a fade over the whole screen, never a name
@@ -684,14 +735,18 @@ void Presenter::RecordVrUi(vk::CommandBuffer cmdbuf, Frame& frame, vk::Extent2D 
         const bool was_on = vr_ui_area.on;
         if (VR::Ui::StepAreaName(vr_ui_area, right, params.dialogue, dt) != was_on) {
             LOG_INFO(Render_Vulkan, "VR ui: area name {}",
-                     vr_ui_area.on
-                         ? fmt::format("up (the lower group's HUD to stage x {:.0f}, frame {}): its "
-                                       "corner keyed, down to the stage's bottom",
-                                       right, measured.seq)
-                         : std::string{"gone"});
+                     !vr_ui_area.on ? std::string{"gone"}
+                     : slot_area
+                         ? fmt::format("up (its slot holds {} px, frame {}): its own piece",
+                                       measured.slot_area, measured.seq)
+                         : fmt::format("up (the lower group's HUD to stage x {:.0f}, frame {}): "
+                                       "its corner keyed, down to the stage's bottom",
+                                       right, measured.seq));
         }
-        params.area_name = vr_ui_area.on && !params.dialogue &&
-                           tag.ui_class == static_cast<u8>(VR::UiClass::None);
+        area_up = vr_ui_area.on && !params.dialogue &&
+                  tag.ui_class == static_cast<u8>(VR::UiClass::None);
+        // In its slot the name is never in the band: the lower cut stays as it is, nothing keyed.
+        params.area_name = area_up && !slot_area;
         params.area_key = !VR::IsAreaDimRemoved();
     }
     const auto band_rect = [&](const VR::Ui::StageRect& r) {
@@ -701,16 +756,22 @@ void Presenter::RecordVrUi(vk::CommandBuffer cmdbuf, Frame& frame, vk::Extent2D 
     };
     for (u32 i = 0; i < hud.count && i < params.cut.size(); ++i) {
         const auto& seg = hud.segment[i];
-        params.cut[i] = band_rect(VR::Ui::CutRect(seg, params.area_name));
         if (seg.dynamic) {
+            // Up to the stage's right edge only to find an area name there; in its slot the split
+            // keeps to the lower group's own rect (a smaller split each frame).
+            params.cut[i] = band_rect(slot_area ? seg.rect
+                                                : VR::Ui::CutRect(seg, params.area_name));
             params.dynamic_cut = static_cast<s32>(i);
+        } else if (slot_status) {
+            params.cut[i] = {}; // the clusters are in their slot: nothing of the band is theirs
         } else {
+            params.cut[i] = band_rect(VR::Ui::CutRect(seg, params.area_name));
             params.status_cuts |= 1u << i; // never part of a dialog's box
         }
     }
     params.cut_count = std::min<u32>(hud.count, static_cast<u32>(params.cut.size()));
     // A raised boss bar in the HP cluster's rows: that cut stops short of it (StatusLeftBossCutX).
-    if (VR::Bloodborne::BossBarUp()) {
+    if (VR::Bloodborne::BossBarUp() && !slot_status) {
         for (u32 i = 0; i < params.cut_count; ++i) {
             if (std::string_view{hud.segment[i].name} == "status_left") {
                 params.cut[i].x1 = std::min(
@@ -724,11 +785,15 @@ void Presenter::RecordVrUi(vk::CommandBuffer cmdbuf, Frame& frame, vk::Extent2D 
     // rows' rect is cut 3: its pixels go into the atlas's strip, out of the HP cluster's piece and
     // the rest quad, for the presenter's conditions piece (VR::Ui::Conditions). The rows are held
     // at their largest for a moment (the game fills them on its own thread).
+    // In its slot (ui_hud_slots) the meter is not in the band: no strip, no cut; its rows are cut
+    // from the slot sheet (cond is then in sheet px).
     namespace Cond = VR::Ui::Conditions;
-    params.strip = Cond::StripWanted(s.ui_conditions, s.ui_hud_layout);
+    const bool cond_wanted = Cond::StripWanted(s.ui_conditions, s.ui_hud_layout);
+    params.strip = cond_wanted && !slot_gauge;
     Cond::BandRegion cond{};
     Cond::Rows cond_rows{};
-    if (params.strip) {
+    bool cond_sheet = false;
+    if (cond_wanted) {
         const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now().time_since_epoch())
                                .count();
@@ -736,7 +801,13 @@ void Presenter::RecordVrUi(vk::CommandBuffer cmdbuf, Frame& frame, vk::Extent2D 
         const bool belt_class = tag.ui_class == static_cast<u8>(VR::UiClass::None) ||
                                 tag.ui_class == static_cast<u8>(VR::UiClass::Dialog) ||
                                 tag.ui_class == static_cast<u8>(VR::UiClass::Note);
-        if (cond_rows.n > 0 && belt_class && !vr_ui_screen_wide.on && params.cut_count == 3) {
+        if (cond_rows.n > 0 && belt_class && !vr_ui_screen_wide.on && slot_gauge) {
+            const auto r = Slots::SheetRect(
+                sheet, slot_blocks, slot_layout->gauge.Moved(Cond::GaugeRect(cond_rows)), k);
+            cond = {r[0], r[1], r[2], r[3]};
+            cond_sheet = r[3] > r[1];
+        } else if (cond_rows.n > 0 && belt_class && !vr_ui_screen_wide.on &&
+                   params.cut_count == 3) {
             cond = Cond::CutRegion(cond_rows, band.extent.width);
             params.cut[3] = {cond.x0, cond.y0, cond.x1, cond.y1};
             params.cut_count = 4;
@@ -744,16 +815,18 @@ void Presenter::RecordVrUi(vk::CommandBuffer cmdbuf, Frame& frame, vk::Extent2D 
             params.conditions = true;
         }
     }
-    if (params.conditions != vr_ui_conditions_on) {
-        vr_ui_conditions_on = params.conditions;
+    if ((params.conditions || cond_sheet) != vr_ui_conditions_on) {
+        vr_ui_conditions_on = params.conditions || cond_sheet;
         static u32 cond_logs = 0;
         if (cond_logs < 200) {
             ++cond_logs;
-            if (params.conditions) {
+            if (vr_ui_conditions_on) {
                 LOG_INFO(Render_Vulkan,
-                         "VR ui: build-up meter: {} row(s) (longest bar {}%), band px {} {} {} {} "
-                         "into the strip: its own piece under the view's centre",
-                         cond_rows.n, cond_rows.max_len, cond.x0, cond.y0, cond.x1, cond.y1);
+                         "VR ui: build-up meter: {} row(s) (longest bar {}%), {} px {} {} {} {} "
+                         "{}: its own piece under the view's centre",
+                         cond_rows.n, cond_rows.max_len, cond_sheet ? "sheet" : "band", cond.x0,
+                         cond.y0, cond.x1, cond.y1,
+                         cond_sheet ? "from its slot" : "into the strip");
             } else {
                 LOG_INFO(Render_Vulkan, "VR ui: build-up meter gone");
             }
@@ -795,6 +868,88 @@ void Presenter::RecordVrUi(vk::CommandBuffer cmdbuf, Frame& frame, vk::Extent2D 
     // The atlas in the UI swapchain's byte order (the eye swapchains' format).
     params.bgra = openxr_presenter == nullptr ||
                   openxr_presenter->EyeSwapchainFormat() != vk::Format::eR8G8B8A8Srgb;
+    const auto box = vr_ui_layer->LatestContentBox();
+    // Back in VR from the virtual screen (a cinematic, a warp's arrival): the screen-wide picture
+    // a fade to black turned on is over, and the HUD band (and an area name's own place) is back
+    // at once. Before, it held on ~6 s after a lamp's warp (the arrival's wake-up fade, then the
+    // area name's ink at the edges), the name 20..35 deg right. The measures are a few frames old:
+    // the fade's last ones may not turn it on again for a moment (not while dead: the death
+    // screen is one picture).
+    const s64 ui_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+    const bool immersive = VR::IsImmersive();
+    VR::Vitals::Status ui_vit{};
+    const bool ui_dead = VR::Vitals::LatestStatus(ui_vit) && ui_vit.ok && ui_vit.max_hp > 0 &&
+                         ui_vit.hp <= 0 && ui_now_ns - ui_vit.steady_ns < 5'000'000'000;
+    if (immersive && !vr_ui_was_immersive && !ui_dead) {
+        if (vr_ui_screen_wide.on) {
+            LOG_INFO(Render_Vulkan, "VR ui: back in VR: the screen-wide picture is over, the HUD "
+                                    "band again");
+        }
+        vr_ui_screen_wide = {};
+        vr_ui_wide_hold_ns = ui_now_ns + 750'000'000;
+    }
+    vr_ui_was_immersive = immersive;
+    const bool wide_held = !ui_dead && ui_now_ns < vr_ui_wide_hold_ns;
+    // A gameplay frame whose UI reaches the screen's edges (the death screen's backdrop and YOU
+    // DIED, a loading page) goes whole onto the rest quad, never cut into the belt's pieces. Each
+    // measured gameplay frame (a few frames old) steps it once; a menu's frames leave it as is.
+    if (!wide_held && box.seq != 0 && box.cls == static_cast<u8>(VR::UiClass::None) &&
+        VR::Ui::StepScreenWide(vr_ui_screen_wide, box.seq, box.border, band.extent.width,
+                               band.extent.height,
+                               VR::GameFramesAt60(VR::Ui::ScreenWideOffFrames))) {
+        const bool wide = vr_ui_screen_wide.on;
+        LOG_INFO(Render_Vulkan,
+                 "VR ui: gameplay UI {} the screen's edges ({} of {} border px, frame {}): {}",
+                 wide ? "reaches" : "left", box.border,
+                 VR::Ui::BorderPixels(band.extent.width, band.extent.height), box.seq,
+                 wide ? "shown whole on the rest quad, no HUD band" : "the HUD band again");
+    }
+    // An area name (lower right) is never part of the screen-wide picture: it keeps its place.
+    bool area_name = false;
+    if (params.gameplay && vr_ui_screen_wide.on && box.hud_right != 0 && band.extent.width != 0) {
+        const float right =
+            static_cast<float>(box.hud_right) /
+            VR::Ui::BandScale(static_cast<float>(band.extent.width));
+        area_name = VR::Ui::AreaNameOverScreenWide(right, params.dialogue, ui_dead);
+        if (area_name != vr_ui_area_over_wide) {
+            LOG_INFO(Render_Vulkan,
+                     "VR ui: {} (the lower group's HUD to stage x {:.0f}, frame {})",
+                     area_name ? "an area name over the screen-wide picture: kept in its place"
+                               : "no area name over the screen-wide picture any more",
+                     right, box.seq);
+        }
+    }
+    vr_ui_area_over_wide = area_name;
+    // The slot sheet's place in the atlas (ui_hud_slots): rows of a half this frame does not show.
+    // A gameplay frame (and a menu shown as the HUD, menu_present=hud) shows the rest half and, of
+    // the top half, only the lower group's rows: the sheet above them. A menu's, a dialog's and a
+    // screen-wide frame show the top half whole and never the rest half: the sheet there, 8 rows
+    // down (the halves' mips). So the atlas keeps its two halves, no rows added.
+    const bool screen_wide_frame = params.gameplay && vr_ui_screen_wide.on &&
+                                   !params.action_prompt && !params.item_pickup &&
+                                   !params.dialogue && !area_name;
+    if (params.slots.on) {
+        const s32 bh = static_cast<s32>(band.extent.height);
+        const bool whole_rest = VR::MenuPresentMode() == VR::MenuPresent::Hud &&
+                                tag.ui_class != static_cast<u8>(VR::UiClass::None);
+        const bool top = (params.gameplay || whole_rest) && !screen_wide_frame;
+        s32 free_rows = bh - 8;
+        if (top && params.dynamic_cut >= 0) {
+            free_rows = params.cut[params.dynamic_cut].y0 - 8;
+        }
+        params.slots.sheet_row = top ? 0 : bh + 8;
+        if (static_cast<s32>(params.slots.Rows()) > free_rows) {
+            params.slots.on = false; // never with Slots::Compute's margins (at most ~656 stage rows)
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LOG_ERROR(Render_Vulkan, "VR ui: the slot sheet ({} rows) does not fit {} free rows",
+                          params.slots.Rows(), free_rows);
+            }
+        }
+    }
     const auto atlas = vr_ui_layer->AtlasFor(frame.id, band.extent, params.strip);
     const bool resolved = vr_ui_layer->Resolve(cmdbuf, &atlas, scene, params);
     if (resolved) {
@@ -803,7 +958,10 @@ void Presenter::RecordVrUi(vk::CommandBuffer cmdbuf, Frame& frame, vk::Extent2D 
         ++stats.empty;
     }
     const auto snap = vr_ui_layer->HudSnapState();
-    const bool menu_hud = resolved && params.menu_hud && snap != VrUiLayer::HudSnap::Empty;
+    // With the clusters in their slot the menu never covers them: the sheet holds them every frame.
+    const bool menu_hud =
+        resolved && ((slot_status && params.full_menu && s.ui_menu_hud) ||
+                     (params.menu_hud && snap != VrUiLayer::HudSnap::Empty));
     // The gameplay HUD's draws are learnt from gameplay frames (not a screen-wide one: a fade or
     // the death screen); plain translucent rects only while the HUD alone is up (no prompt, text,
     // talk, pop-up or lock-on: their boxes are drawn like a menu's dim). A menu's frame keeps K
@@ -834,59 +992,6 @@ void Presenter::RecordVrUi(vk::CommandBuffer cmdbuf, Frame& frame, vk::Extent2D 
                      menu_hud ? ", shown under the canvas" : "");
         }
     }
-    const auto box = vr_ui_layer->LatestContentBox();
-    // Back in VR from the virtual screen (a cinematic, a warp's arrival): the screen-wide picture
-    // a fade to black turned on is over, and the HUD band (and an area name's own place) is back
-    // at once. Before, it held on ~6 s after a lamp's warp (the arrival's wake-up fade, then the
-    // area name's ink at the edges), the name 20..35 deg right. The measures are a few frames old:
-    // the fade's last ones may not turn it on again for a moment (not while dead: the death
-    // screen is one picture).
-    const s64 ui_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                              std::chrono::steady_clock::now().time_since_epoch())
-                              .count();
-    const bool immersive = VR::IsImmersive();
-    VR::Vitals::Status ui_vit{};
-    const bool ui_dead = VR::Vitals::LatestStatus(ui_vit) && ui_vit.ok && ui_vit.max_hp > 0 &&
-                         ui_vit.hp <= 0 && ui_now_ns - ui_vit.steady_ns < 5'000'000'000;
-    if (immersive && !vr_ui_was_immersive && !ui_dead) {
-        if (vr_ui_screen_wide.on) {
-            LOG_INFO(Render_Vulkan, "VR ui: back in VR: the screen-wide picture is over, the HUD "
-                                    "band again");
-        }
-        vr_ui_screen_wide = {};
-        vr_ui_wide_hold_ns = ui_now_ns + 750'000'000;
-    }
-    vr_ui_was_immersive = immersive;
-    const bool wide_held = !ui_dead && ui_now_ns < vr_ui_wide_hold_ns;
-    // A gameplay frame whose UI reaches the screen's edges (the death screen's backdrop and YOU
-    // DIED, a loading page) goes whole onto the rest quad, never cut into the belt's pieces. Each
-    // measured gameplay frame (a few frames old) steps it once; a menu's frames leave it as is.
-    if (!wide_held && box.seq != 0 && box.cls == static_cast<u8>(VR::UiClass::None) &&
-        VR::Ui::StepScreenWide(vr_ui_screen_wide, box.seq, box.border, band.extent.width,
-                               band.extent.height)) {
-        const bool wide = vr_ui_screen_wide.on;
-        LOG_INFO(Render_Vulkan,
-                 "VR ui: gameplay UI {} the screen's edges ({} of {} border px, frame {}): {}",
-                 wide ? "reaches" : "left", box.border,
-                 VR::Ui::BorderPixels(band.extent.width, band.extent.height), box.seq,
-                 wide ? "shown whole on the rest quad, no HUD band" : "the HUD band again");
-    }
-    // An area name (lower right) is never part of the screen-wide picture: it keeps its place.
-    bool area_name = false;
-    if (params.gameplay && vr_ui_screen_wide.on && box.hud_right != 0 && band.extent.width != 0) {
-        const float right =
-            static_cast<float>(box.hud_right) /
-            VR::Ui::BandScale(static_cast<float>(band.extent.width));
-        area_name = VR::Ui::AreaNameOverScreenWide(right, params.dialogue, ui_dead);
-        if (area_name != vr_ui_area_over_wide) {
-            LOG_INFO(Render_Vulkan,
-                     "VR ui: {} (the lower group's HUD to stage x {:.0f}, frame {})",
-                     area_name ? "an area name over the screen-wide picture: kept in its place"
-                               : "no area name over the screen-wide picture any more",
-                     right, box.seq);
-        }
-    }
-    vr_ui_area_over_wide = area_name;
     // A lantern warp (VR::PublishLampWarp) leaves and arrives in full VR, without the lamp's own
     // scene before the load: on the first frames after it the game still draws its loading page
     // over the new world, and it went whole onto the rest quad (the 2026-10-14 run: the loading
@@ -933,11 +1038,14 @@ void Presenter::RecordVrUi(vk::CommandBuffer cmdbuf, Frame& frame, vk::Extent2D 
         .screen_wide = params.gameplay && vr_ui_screen_wide.on && !params.action_prompt &&
                        !params.item_pickup && !params.dialogue && !area_name,
         .dialogue = params.dialogue,
-        .area_name = shown && params.area_name,
+        .area_name = shown && area_up,
         .menu_hud = menu_hud,
-        .conditions = shown && params.conditions,
+        .conditions = shown && (params.conditions || cond_sheet),
         .conditions_rect = {cond.x0, cond.y0, cond.x1, cond.y1},
-        .strip_top = Cond::StripTop(band.extent.height),
+        .strip_top = params.slots.on ? static_cast<u32>(params.slots.sheet_row)
+                                     : Cond::StripTop(band.extent.height),
+        .slots = resolved && params.slots.on,
+        .slot_banner = box.slot_banner,
     };
 }
 

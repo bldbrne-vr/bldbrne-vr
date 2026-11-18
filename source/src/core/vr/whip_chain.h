@@ -110,7 +110,105 @@ struct ChainConfig {
     float floor_y{-1e9f};
     float floor_slide{0.85f};
     bool inelastic_floor{false}; // remove landing bounce, never pin a point to the ground
+    // Out (scaled by the extension), each link pulled toward the straight line from the root to the
+    // chain's own tip, the fraction of the gap closed per 1/240 s: one broad direction, the
+    // chain's own momentum's (not the hand's), so the links do not tangle (whip_cutter_spine).
+    float spine{0.0f};
+    // Out, no link nearer the root than this share of its length along the chain: a turn of the
+    // hand swings the chain round instead of folding it back onto the hand (whip_cutter_unfold).
+    float unfold{0.0f};
+    // The guide vector (the Cutter Chain Lab's; whip_cutter_lab): a swinging body of its own along
+    // the chain, pivoting at the hand - its angular momentum carried, torqued by gravity and the
+    // hand's acceleration as a pendulum on a moving pivot, steered by a soft wrist hinge - that
+    // each link is pulled toward as a damped spring riding on its swing, so a turn of the hand
+    // swings the chain round instead of folding it onto the hand. 0: none.
+    float guide{0.0f};        // the pull, rad/s (at the root)
+    float guide_zeta{0.3f};   // its damping ratio
+    float guide_taper{0.5f};  // the share of it left at the tip
+    float guide_w0{25.0f};    // the wrist hinge, rad/s at x1 (paid out: / the extension)
+    float guide_hzeta{0.35f}; // the hinge's damping ratio
+    float guide_drag{0.5f};   // the vector's own angular drag, 1/s
+    // Where the swing drive and the guide's wrist hinge aim (world, unit; zero: the handle's
+    // line): the arm's line, chest to hand, as the Chain Lab's weapon always points. The
+    // controller's own line swings 40 degrees and more off it in real swings, and pulls toward it
+    // dragged the chain back across the player. `aim_share` blends handle (0) to aim (1).
+    B::Vec3 aim{};
+    float aim_share{0.0f};
+    // The swing-path lash (whip_cutter_lab model=path; the hook's per-frame half is
+    // core/vr/cutter_path.h): out, each link pulled toward the shape the arm's swing traced - each
+    // link along the arm's line (`pivot`, the chest, to the hand) as it was a moment ago, the tip's
+    // `path_delay` ago and less nearer the hand, so the chain curls behind the swing (the tip at most
+    // `path_curl` off the arm's line now) - as a damped spring riding on that shape, `path` rad/s
+    // at the root down to `path_taper` of it at the tip, times `path_share` (the hook's: the swing's
+    // momentum; as it fades the chain flies and falls on its own). The wrist never steers it, and
+    // a turn of the arm swings the shape round outward: it never lies back across the hand. 0: none.
+    float path{0.0f};
+    float path_taper{0.3f};
+    float path_zeta{0.5f};
+    float path_delay{0.07f}; // s
+    float path_curl{0.7f};   // rad (40 degrees)
+    float path_share{1.0f};
+    // The shape follows the arm's line through a pointer of its own, a critically damped body
+    // (`path_follow` rad/s; 0: the arm's line itself) turning at most `path_rate` rad/s (0: any):
+    // a fast turn of the stroke swings the shape round instead of folding the chain back on itself.
+    float path_follow{0.0f};
+    float path_rate{0.0f};
+    // A link lying on the ground is pulled this share of it: it lies there and the chain drags it.
+    float path_ground{0.15f};
+    // The hand circling (the hook's, cutter_path.h): out from the centre of its circle (unit) x how
+    // strongly (0..1), blended into the arm's line: spun round overhead the chain flies out level
+    // from the circle like a helicopter blade instead of straight up along the arm.
+    B::Vec3 spin_out{};
+    // The chain's weight in the shape: each link's direction turned toward the ground as a chain
+    // flown at its speed hangs (its tip's speed around the hand v, its centre of mass's reach R:
+    // normalize(d * v^2 / R - g * path_gravity up)): slow it sags until its turning holds it,
+    // stopped it hangs, and it never flies up without the speed to. 0: the guide's direction.
+    float path_gravity{1.0f};
+    B::Vec3 pivot{};
+    bool pivot_ok{false};
+    // A living tendril's sway (the Kos Parasite's, core/vr/kos_lash.h): each link's direction, in
+    // the swing's shape and in the rest shape, turned sideways by about `sway` rad at the tip on a
+    // slow wave travelling down the chain (two axes across its line, up to 1.4 times that when both
+    // peak; `sway_phase` its own rhythm).
+    // Turns only: it never pulls the chain in or out. 0: none.
+    float sway{0.0f};
+    float sway_phase{0.0f};
+    // The sway's own clock (s), for a tendril with a tempo of its own (form B's, kos_lash.h
+    // Wiggle); below 0: the chain's.
+    double sway_clock{-1.0};
+    // A bundle's spread (the Kos Parasite's form B, core/vr/kos_lash.h): each link's direction in
+    // the swing's shape tilted `fan` rad (at the tip) off the arm's line toward its own side,
+    // `fan_roll` rad round the line from the sway's carried axis. 0: none.
+    float fan{0.0f};
+    float fan_roll{0.0f};
 };
+
+// The sway's first axis across the chain's `line` (unit), carried from the last one: projected off
+// the line, so it turns with the chain instead of flipping where an axis from world up would (the
+// tendril hanging straight down, an overhead slam).
+inline B::Vec3 CarrySwayAxis(B::Vec3 carried, B::Vec3 line) {
+    const B::Vec3 a = carried - line * B::Dot(carried, line);
+    return B::LengthSq(a) > 1e-6f ? B::Normalize(a, B::AnyPerpendicular(line))
+                                  : B::AnyPerpendicular(line);
+}
+
+// The sway's turn of a direction `d` at `u` along the chain (0 root .. 1 tip), the chain's line
+// `line` (unit) and an axis across it `across` (unit, CarrySwayAxis), at time `t` (s):
+// ChainConfig::sway.
+inline B::Vec3 SwayDirection(B::Vec3 d, B::Vec3 line, B::Vec3 across, float u, float amp,
+                             float phase, double t) {
+    if (!(amp > 0.0f)) {
+        return d;
+    }
+    const B::Vec3 a2 = B::Normalize(B::Cross(line, across), B::AnyPerpendicular(across));
+    const float tt = static_cast<float>(std::fmod(t, 1000.0));
+    const float k = amp * u;
+    const float th1 = k * (0.65f * std::sin(6.9f * tt - 5.0f * u + phase) +
+                           0.35f * std::sin(11.9f * tt - 2.5f * u + 2.1f * phase));
+    const float th2 = k * (0.65f * std::sin(8.8f * tt - 4.0f * u + 1.7f * phase) +
+                           0.35f * std::sin(14.5f * tt - 3.0f * u + 0.4f * phase));
+    return B::RotateAbout(B::RotateAbout(d, across, th1), a2, th2);
+}
 
 inline float ChainPointMass(float u, const ChainConfig& c) {
     const float along = std::clamp(u / std::max(c.mass_ramp_end, 0.001f), 0.0f, 1.0f);
@@ -160,7 +258,8 @@ inline ChainConfig ConfigFor(std::int32_t variation) {
             // Slightly reduce relative link rebound without changing bend limits or mass.
             c.link_velocity_damp = 20.0f; // (18 on 2026-10-14..15 felt floaty: the tester, back to 20)
             c.swing_drive = 22.0f * 1.08f;
-            // Preserve the response boost with the new 8% longer reach.
+            // Preserve the response boost with the new 8% longer reach (a throw's own:
+            // CutterThrowDrive).
             c.drive_accel = 240.0f * 1.08f * 1.08f;
             c.damp = 1.45f; // air drag (1.35 until 2026-10-15: the tester, settles a little sooner)
             c.payout_momentum = 0.35f;
@@ -172,6 +271,94 @@ inline ChainConfig ConfigFor(std::int32_t variation) {
     }
     return c;
 }
+
+// Small Cutter-only outgoing-swing adjustment. Blend with deliberate swing speed so a
+// gentle movement keeps the normal payout and drag, and stopping restores normal settling.
+// Call with a fresh ConfigFor(2400); recall/compact mode bypass this adjustment.
+inline void TuneCutterFlight(float speed, float v_keep, float v_full, ChainConfig& c) {
+    if (!std::isfinite(speed) || !std::isfinite(v_keep) || !std::isfinite(v_full)) {
+        return;
+    }
+    const float t = std::clamp((speed - v_keep) / std::max(v_full - v_keep, 0.1f), 0.0f, 1.0f);
+    const float blend = t * t * (3.0f - 2.0f * t);
+    c.t_out *= 1.0f - blend * (1.0f / 14.0f); // 140 -> 130 ms at full swing speed
+    c.damp *= 1.0f - blend * (0.10f / 1.45f); // 1.45 -> 1.35; keep internal damping
+}
+
+// A throw's front drive, for its first CutterThrowS (2026-11-08: "the links in the
+// front should lag only a little bit"; whip_cutter_follow, 0 = as before .. 1): toward 67% of the
+// drive at the blade instead of 23%, and a limit that carries a 4.7 m chain round with the hand.
+// On the game's own attacks (the hand's path and payout of a141_04xxxx) the tip trailed the
+// weapon's line by 32 degrees against the game's 15; at 1, 13 - and in the headset it flew out
+// "as if it's solid". Only the throw: always on, it whipped a chain lifted off the floor by a
+// flick back into a crack and let lazy wrist circles hang lower.
+inline constexpr float CutterThrowS = 0.6f;
+inline void CutterThrowDrive(ChainConfig& c, float follow) {
+    const float a = std::isfinite(follow) ? std::clamp(follow, 0.0f, 1.0f) : 0.0f;
+    c.drive_span += (3.0f - c.drive_span) * a;
+    c.drive_accel += (700.0f - c.drive_accel) * a;
+}
+
+// The Beast Cutter's chain thrown as the game's is (2026-11-08: "we throw it and the
+// chain expands and moves forward"): the game's comes out in 0.10-0.15 s on the strike only, is
+// back 0.3-0.4 s after it, and is in between two attacks. Ours pays out on the wind-up (2.5 m/s in
+// any direction), stays out 1.4 s after, and folds back onto the hand at each turn of a series of
+// swings. All of it at once (a payout from 80% of whip_payout_speed, back below 65% after 0.35 s,
+// the throw gate, the pull-in on a turn, the full throw drive) snapped back too quickly and flew
+// out solid; each is a live dial now (whip_settings.h), every default as before.
+
+// The share of the swing's speed that may START a payout: the weapon's line (grip to its far
+// end, level) against the hunter's facing, none at cos -0.2 .. all from cos 0.3. A wind-up behind
+// him or over his shoulder no longer throws the chain out behind him; out, the swing's own speed
+// keeps it out (a helicopter spin overhead). Unknown directions: all of it, as before.
+inline float CutterThrowShare(B::Vec3 weapon_axis, B::Vec3 facing) {
+    weapon_axis.y = 0.0f;
+    facing.y = 0.0f;
+    const float a = B::Length(weapon_axis), f = B::Length(facing);
+    if (!(a > 1e-4f) || !(f > 1e-4f) || !std::isfinite(a) || !std::isfinite(f)) return 1.0f;
+    const float t = std::clamp((B::Dot(weapon_axis, facing) / (a * f) + 0.2f) / 0.5f, 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// A stroke that turns back (a backhand after a forehand): the weapon's far end moving against the
+// last fast stroke (cos below -0.3) brings the chain in for 0.10 s, reeled in 0.12 s, and the new
+// stroke throws it out again: each swing its own lash, as the game's attacks are, instead of a
+// chain left out folding round the hand. A helicopter spin never turns back: it stays out.
+class CutterStrokeTurn {
+public:
+    static constexpr float TurnCos = -0.3f;
+    static constexpr float InS = 0.10f;
+    static constexpr float ReelS = 0.12f; // the chain's t_in meanwhile
+    static constexpr float MovingMs = 1.5f;
+
+    // `velocity`: the far end's, relative to the hunter (m/s; zero when unknown); `fast`: the
+    // stroke speed that sets the direction (whip_payout_speed). True while the chain comes in.
+    bool Step(B::Vec3 velocity, float fast, float dt) {
+        const float speed = B::Length(velocity);
+        if (std::isfinite(speed) && speed > MovingMs) {
+            const B::Vec3 dir = velocity * (1.0f / speed);
+            if (have_ && B::Dot(dir, stroke_) < TurnCos) {
+                left_ = InS;
+                have_ = false;
+            }
+            if (speed > fast) {
+                stroke_ = dir;
+                have_ = true;
+            }
+        }
+        const bool in = left_ > 0.0f;
+        left_ = std::max(0.0f, left_ - (std::isfinite(dt) ? std::max(dt, 0.0f) : 0.0f));
+        return in;
+    }
+    void Reset() {
+        *this = {};
+    }
+
+private:
+    B::Vec3 stroke_{};
+    bool have_{false};
+    float left_{0.0f};
+};
 
 // Gentle direction assistance for an outgoing lash. Both the tip's sightline and its motion
 // must already be near the view. Never adds speed, grabs a return stroke, or steers an idle tip.
@@ -219,6 +406,16 @@ inline Frame LerpFrame(const Frame& a, const Frame& b, float k) {
     return {B::Lerp(a.t, b.t, k), B::Slerp(a.q, b.q, k)};
 }
 
+// The weighted chain's own test for a jump of the hand's frame in one step (over 30 cm at over
+// 20 m/s, or over 60 degrees at over 70 rad/s): Chain::Step restarts the chain closed there; the
+// hook may carry it through first (the swing-path lash).
+inline bool HandJump(const Frame& from, const Frame& to, float dt) {
+    if (!(dt > 0.0f)) return false;
+    const float travel = B::Length(to.t - from.t);
+    const float turn = 2.0f * std::acos(std::clamp(std::abs(B::Dot(from.q, to.q)), 0.0f, 1.0f));
+    return (travel > 0.30f && travel / dt > 20.0f) || (turn > 60.0f * B::Deg && turn / dt > 70.0f);
+}
+
 class Chain {
 public:
     // The idle shape: the chain bones' positions in the part's frame (the game's idle clip), from
@@ -254,6 +451,10 @@ public:
         lash_drive_.Reset();
         drive_direction_ = {};
         span_ = 0.0f;
+        guide_ready_ = false;
+        path_count_ = 0;
+        path_have_target_ = false;
+        path_flight_ = 0.0f;
         ready_ = true;
     }
 
@@ -264,9 +465,18 @@ public:
     void Carry(const B::Quat& r, B::Vec3 from, B::Vec3 to) {
         drive_direction_ = B::Rotate(r, drive_direction_);
         lash_drive_.Carry(r);
+        guide_d_ = B::Rotate(r, guide_d_);
+        guide_w_ = B::Rotate(r, guide_w_);
+        guide_hand_v_ = B::Rotate(r, guide_hand_v_);
+        for (auto& d : path_dir_) d = B::Rotate(r, d);
+        path_arm_ = B::Rotate(r, path_arm_);
+        path_ptr_ = B::Rotate(r, path_ptr_);
+        path_spin_ = B::Rotate(r, path_spin_);
+        path_flat_ = B::Rotate(r, path_flat_);
         for (int i = 0; i < n_; ++i) {
             x_[i] = to + B::Rotate(r, x_[i] - from);
             v_[i] = B::Rotate(r, v_[i]);
+            path_target_[i] = to + B::Rotate(r, path_target_[i] - from);
         }
     }
 
@@ -276,6 +486,9 @@ public:
             x_[i] = points[i];
             v_[i] = {};
         }
+        guide_ready_ = false;
+        path_count_ = 0;
+        path_have_target_ = false;
         payout_rate_ = 0.0f;
         drive_left_ = drive_idle_ = 0.0f;
         lash_drive_.Reset();
@@ -285,10 +498,37 @@ public:
         ready_ = true;
     }
 
+    // A new rest shape for the same points (the Amygdalan Arm's lash: its idle fold or the
+    // tentacle straight out): the pull and the links' lengths follow it from the next step, the
+    // points and their motion stay where they are (longer links push out with momentum).
+    bool SetRest(const B::Vec3* rest) {
+        std::array<float, MaxPoints> len{};
+        for (int i = 1; i < n_; ++i) {
+            len[i] = B::Length(rest[i] - rest[i - 1]);
+            if (!(len[i] > 1e-5f) || !std::isfinite(len[i])) {
+                return false;
+            }
+        }
+        for (int i = 0; i < n_; ++i) {
+            rest_[i] = rest[i];
+        }
+        for (int i = 1; i < n_; ++i) {
+            len_[i] = len[i];
+        }
+        return true;
+    }
+    // A point's velocity (world m/s): a clip's motion the chain takes over, or a launch.
+    void SetVelocity(int i, B::Vec3 v) {
+        if (i > 0 && i < n_ && B::IsFinite(v)) {
+            v_[i] = v;
+        }
+    }
+
     // One game frame: the part frame went from `from` to `to` over `dt`; `s_target` is the
     // extension asked for (1 = idle). Returns the substeps run (0: reset, the gap was too long).
     int Step(const Frame& from, const Frame& to, float dt, float s_target, const ChainConfig& c,
              const GazeAssist& gaze = {}) {
+        impact_ = 0.0f;
         if (!ready_ || !(dt >= 0.0f) || dt > c.max_dt) {
             Reset(to);
             return 0;
@@ -297,17 +537,12 @@ public:
             return 0;
         }
         Frame start = from;
-        if (c.weighted) {
-            const float travel = B::Length(to.t - from.t);
-            const float turn = 2.0f * std::acos(std::clamp(std::abs(B::Dot(from.q, to.q)), 0.0f, 1.0f));
-            // Tracking/animation discontinuities must not be interpreted as a physical flick.
-            // Restart at short reach: rotating an extended chain through the floor would
-            // itself create a large contact impulse. Normal locomotion carries happen upstream.
-            if ((travel > 0.30f && travel / dt > 20.0f) ||
-                (turn > 60.0f * B::Deg && turn / dt > 70.0f)) {
-                Reset(to);
-                start = to;
-            }
+        // Tracking/animation discontinuities must not be interpreted as a physical flick.
+        // Restart at short reach: rotating an extended chain through the floor would itself
+        // create a large contact impulse. Normal locomotion carries happen upstream.
+        if (c.weighted && HandJump(from, to, dt)) {
+            Reset(to);
+            start = to;
         }
         const int steps =
             std::clamp(static_cast<int>(std::ceil(dt / c.substep)), 1, std::max(c.max_substeps, 1));
@@ -330,6 +565,8 @@ public:
     bool Ready() const { return ready_; }
     B::Vec3 Point(int i) const { return x_[i]; }
     B::Vec3 Velocity(int i) const { return v_[i]; }
+    // The swing-path lash's shape at the last substep (ChainConfig::path; the root while it is off).
+    B::Vec3 PathTarget(int i) const { return path_have_target_ ? path_target_[i] : x_[0]; }
     B::Vec3 Rest(int i) const { return rest_[i]; }
     float Extension() const { return s_; }
     // 0 at idle .. 1 at the payout's peak so far.
@@ -358,6 +595,18 @@ public:
             m = std::max(m, B::LengthSq(x_[i] - Apply(f, rest_[i])));
         }
         return std::sqrt(m);
+    }
+    // The line the drive and the guide aim along in frame `f`: the handle's, turned toward
+    // ChainConfig::aim by aim_share.
+    B::Vec3 AimedLine(const Frame& f, const ChainConfig& c) const {
+        const B::Vec3 line = B::Rotate(f.q, B::Normalize(rest_[n_ - 1] - rest_[0]));
+        if (!(c.aim_share > 0.0f) || !(B::LengthSq(c.aim) > 0.5f)) return line;
+        const float a = std::clamp(c.aim_share, 0.0f, 1.0f);
+        return B::Normalize(line * (1.0f - a) + B::Normalize(c.aim) * a, line);
+    }
+    // The fastest any link landed on the ground during the last Step (m/s; 0: none).
+    float Impact() const {
+        return impact_;
     }
     // The sharpest bend between two consecutive links (rad).
     float MaxBend() const {
@@ -439,6 +688,202 @@ private:
         // carries the chain with him.)
         const float side = std::exp(-std::max(c.side_damp, 0.0f) * h);
         const B::Vec3 hand_v = (root - x_[0]) * (1.0f / h);
+        const bool guiding = c.guide > 0.0f;
+        std::array<float, MaxPoints> reach{};
+        if (guiding) {
+            for (int i = 1; i < n_; ++i) reach[i] = reach[i - 1] + len_[i] * s;
+            const B::Vec3 hdir = AimedLine(f, c);
+            // The hand's spin and acceleration this substep.
+            const B::Quat dq = B::Normalize(f.q * B::Conjugate(previous.q));
+            const float half = std::acos(std::clamp(std::abs(dq.w), 0.0f, 1.0f));
+            B::Vec3 w_hand{};
+            if (half > 1e-6f) {
+                const float sign = dq.w < 0.0f ? -1.0f : 1.0f;
+                w_hand = B::Normalize(B::Vec3{dq.x, dq.y, dq.z} * sign) * (2.0f * half / h);
+            }
+            B::Vec3 hand_a = guide_ready_ ? (hand_v - guide_hand_v_) * (1.0f / h) : B::Vec3{};
+            const float am = B::Length(hand_a);
+            if (am > 400.0f) hand_a = hand_a * (400.0f / am);
+            guide_hand_v_ = hand_v;
+            if (!guide_ready_ || s <= 1.02f) {
+                guide_d_ = hdir;
+                guide_w_ = w_hand;
+                guide_ready_ = true;
+            } else {
+                const float L = std::max(reach[n_ - 1], 0.1f);
+                const float wh = c.guide_w0 / s;
+                const B::Vec3 grav{0.0f, -c.gravity, 0.0f};
+                const B::Vec3 alpha = B::Cross(guide_d_, grav - hand_a) * (1.5f / L) +
+                                      B::Cross(guide_d_, hdir) * (wh * wh) -
+                                      (guide_w_ - w_hand) * (2.0f * c.guide_hzeta * wh) -
+                                      guide_w_ * c.guide_drag;
+                guide_w_ = guide_w_ + alpha * h;
+                guide_w_ = guide_w_ - guide_d_ * B::Dot(guide_w_, guide_d_);
+                const float turn = B::Length(guide_w_) * h;
+                if (turn > 1e-7f) {
+                    guide_d_ = B::Normalize(
+                        B::Rotate(B::AxisAngle(guide_w_ * (1.0f / B::Length(guide_w_)), turn), guide_d_));
+                }
+                if (c.floor_y > -1e8f && root.y + guide_d_.y * L < c.floor_y) {
+                    // On the ground the vector lies there (a smash does not bounce it back up).
+                    const float y = std::clamp((c.floor_y - root.y) / L, -1.0f, 1.0f);
+                    B::Vec3 flat{guide_d_.x, 0.0f, guide_d_.z};
+                    const float fl = B::Length(flat);
+                    flat = fl > 1e-5f ? flat * (1.0f / fl) : B::Vec3{0.0f, 0.0f, -1.0f};
+                    guide_d_ = flat * std::sqrt(std::max(0.0f, 1.0f - y * y)) + B::Vec3{0.0f, y, 0.0f};
+                    guide_w_ = guide_w_ * 0.5f;
+                }
+            }
+        }
+        // The swing-path lash's shape this substep (ChainConfig::path): the arm's line now into
+        // the history, then each link along it as it was that link's delay ago.
+        std::array<B::Vec3, MaxPoints> path_t{}, path_v{};
+        bool path_on = false;
+        if (c.path > 0.0f) {
+            path_clock_ += h;
+            B::Vec3 arm = path_count_ > 0 ? path_arm_ : B::Vec3{};
+            if (c.pivot_ok && B::IsFinite(c.pivot) && B::LengthSq(root - c.pivot) > 0.01f) {
+                arm = B::Normalize(root - c.pivot); // (the hand within 10 cm of it: as before)
+            }
+            if (!(B::LengthSq(arm) > 0.5f)) {
+                arm = B::Rotate(f.q, B::Normalize(rest_[n_ - 1] - rest_[0]));
+            }
+            // (only with the arm raised: there the line from the chest points up, not out; a swing
+            // round the body already flies out along the arm)
+            const float raised = std::clamp((arm.y - 0.3f) / 0.5f, 0.0f, 1.0f);
+            const float spun = B::IsFinite(c.spin_out)
+                                   ? std::min(B::Length(c.spin_out), 1.0f) * raised * raised *
+                                         (3.0f - 2.0f * raised)
+                                   : 0.0f;
+            if (spun > 1e-3f) {
+                arm = B::Normalize(arm * (1.0f - spun) + c.spin_out * (spun / B::Length(c.spin_out)), arm);
+            }
+            path_arm_ = arm;
+            if (path_count_ == 0 || !(c.path_follow > 0.0f)) {
+                path_ptr_ = arm;
+                path_spin_ = {};
+            } else {
+                // The pointer, toward the arm's line as a critically damped body.
+                const float angle = B::Angle(path_ptr_, arm);
+                const B::Vec3 err =
+                    angle > 1e-6f
+                        ? B::Normalize(B::Cross(path_ptr_, arm), B::AnyPerpendicular(path_ptr_)) * angle
+                        : B::Vec3{};
+                const float k = c.path_follow;
+                path_spin_ = path_spin_ + (err * (k * k) - path_spin_ * (2.0f * k)) * h;
+                path_spin_ = path_spin_ - path_ptr_ * B::Dot(path_spin_, path_ptr_);
+                float w = B::Length(path_spin_);
+                if (c.path_rate > 0.0f && w > c.path_rate) {
+                    path_spin_ = path_spin_ * (c.path_rate / w);
+                    w = c.path_rate;
+                }
+                if (w * h > 1e-7f) {
+                    path_ptr_ = B::Normalize(
+                        B::Rotate(B::AxisAngle(path_spin_ * (1.0f / w), w * h), path_ptr_), arm);
+                }
+            }
+            // The level heading the shape runs on along the ground: toward the pointer's own, as
+            // fast as the pointer is level (pointing at the floor it keeps the last).
+            const B::Vec3 level{path_ptr_.x, 0.0f, path_ptr_.z};
+            const float m = B::Length(level);
+            if (path_count_ == 0 || !(B::LengthSq(path_flat_) > 0.5f)) {
+                path_flat_ = m > 1e-3f ? level * (1.0f / m)
+                                       : B::Normalize(B::Vec3{x_[n_ - 1].x - root.x, 0.0f,
+                                                              x_[n_ - 1].z - root.z},
+                                                      B::Vec3{0.0f, 0.0f, -1.0f});
+            } else if (m > 1e-3f) {
+                const float a = 1.0f - std::exp(-12.0f * m * h);
+                path_flat_ = B::Normalize(path_flat_ + (level * (1.0f / m) - path_flat_) * a, path_flat_);
+            }
+            path_head_ = path_count_ > 0 ? (path_head_ + 1) % PathHistory : 0;
+            path_dir_[path_head_] = path_ptr_;
+            path_time_[path_head_] = path_clock_;
+            path_count_ = std::min(path_count_ + 1, PathHistory);
+            path_on = s > 1.02f;
+        }
+        if (path_on) {
+            // The chain's flight: its tip's speed around the hand, squared over its centre of mass's
+            // reach (the outward pull that holds it up against its weight), smoothed.
+            {
+                const B::Vec3 rel = v_[n_ - 1] - hand_v;
+                float reach_now = 0.0f;
+                for (int i = 1; i < n_; ++i) reach_now += len_[i] * s;
+                const float r_cm = std::max(0.6f * reach_now, 0.3f);
+                const float flight = std::min(B::LengthSq(rel) / r_cm, 2000.0f);
+                path_flight_ += (flight - path_flight_) * (1.0f - std::exp(-h / 0.05f));
+            }
+            const float weight = std::max(c.gravity * c.path_gravity, 0.0f);
+            const auto slot = [&](int k) { return (path_head_ - k + PathHistory) % PathHistory; };
+            std::array<float, MaxPoints> along_rest{};
+            for (int i = 1; i < n_; ++i) along_rest[i] = along_rest[i - 1] + len_[i];
+            const float total = std::max(along_rest[n_ - 1], 1e-4f);
+            const B::Vec3 handle = B::Rotate(f.q, B::Normalize(rest_[n_ - 1] - rest_[0]));
+            const B::Vec3 now_d = path_dir_[path_head_];
+            if (c.sway > 0.0f || c.fan > 0.0f) {
+                sway_path_axis_ = CarrySwayAxis(sway_path_axis_, now_d);
+            }
+            const float delay = std::clamp(c.path_delay, 0.0f, 0.3f);
+            int k = 0; // back through the history as the delay grows down the chain
+            path_t[0] = root;
+            for (int i = 1; i < n_; ++i) {
+                const float u = along_rest[i] / total;
+                const double when = path_clock_ - static_cast<double>(delay * u);
+                while (k + 1 < path_count_ && path_time_[slot(k)] > when) ++k;
+                B::Vec3 d = path_dir_[slot(k)];
+                if (k > 0 && path_time_[slot(k)] <= when) {
+                    const double t0 = path_time_[slot(k)], t1 = path_time_[slot(k - 1)];
+                    const float a = t1 > t0 ? static_cast<float>((when - t0) / (t1 - t0)) : 1.0f;
+                    d = B::Normalize(B::Lerp(d, path_dir_[slot(k - 1)], std::clamp(a, 0.0f, 1.0f)), d);
+                }
+                // The curl held: the tip at most path_curl behind the arm's line now.
+                const float most = std::max(c.path_curl, 0.0f) * u;
+                if (B::Angle(now_d, d) > most) {
+                    const B::Vec3 axis = B::Normalize(B::Cross(now_d, d), B::AnyPerpendicular(now_d));
+                    d = B::RotateAbout(now_d, axis, most);
+                }
+                // A living tendril's sway (ChainConfig::sway).
+                d = SwayDirection(d, now_d, sway_path_axis_, u, c.sway, c.sway_phase,
+                                  c.sway_clock >= 0.0 ? c.sway_clock : path_clock_);
+                if (c.fan > 0.0f) {
+                    // A bundle's spread (ChainConfig::fan).
+                    const B::Vec3 side = B::RotateAbout(sway_path_axis_, now_d, c.fan_roll);
+                    d = B::RotateAbout(
+                        d, B::Normalize(B::Cross(now_d, side), B::AnyPerpendicular(now_d)),
+                        c.fan * std::sqrt(u));
+                }
+                // Its weight: turned toward the ground as far as the flight cannot hold it up.
+                if (weight > 0.0f) {
+                    d = B::Normalize(d * path_flight_ - B::Vec3{0.0f, weight, 0.0f}, d);
+                }
+                // Out of the handle: its first tenth turns from the handle's line onto the path.
+                const float w = std::clamp(u / 0.1f, 0.0f, 1.0f);
+                d = B::Normalize(handle * (1.0f - w) + d * w, d);
+                path_t[i] = path_t[i - 1] + d * (len_[i] * s);
+                if (c.floor_y > -1e8f && path_t[i].y < c.floor_y) {
+                    // On the ground the shape runs on along it, outward (a smash lands the chain
+                    // out in front instead of coiling it under the hand).
+                    // (the link's own heading where it is clearly level, the smooth one where it
+                    // points at the floor, blended between)
+                    const B::Vec3 own{d.x, 0.0f, d.z};
+                    const float lv = B::Length(own);
+                    const float w = std::clamp((lv - 0.3f) / 0.4f, 0.0f, 1.0f);
+                    const B::Vec3 flat = B::Normalize(
+                        (lv > 1e-4f ? own * (1.0f / lv) : path_flat_) * (w * w * (3.0f - 2.0f * w)) +
+                            path_flat_ * (1.0f - w * w * (3.0f - 2.0f * w)),
+                        path_flat_);
+                    const float l = len_[i] * s;
+                    const float drop = std::clamp(path_t[i - 1].y - c.floor_y, 0.0f, l);
+                    path_t[i] = path_t[i - 1] + flat * std::sqrt(l * l - drop * drop) +
+                                B::Vec3{0.0f, -drop, 0.0f};
+                }
+                B::Vec3 tv = path_have_target_ ? (path_t[i] - path_target_[i]) * (1.0f / h) : hand_v;
+                const float tvm = B::Length(tv);
+                if (tvm > 150.0f) tv = tv * (150.0f / tvm);
+                path_v[i] = tv;
+            }
+            for (int i = 0; i < n_; ++i) path_target_[i] = path_t[i];
+        }
+        path_have_target_ = path_on;
         const B::Vec3 g{0.0f, -c.gravity * h * h * (c.weighted ? e : 1.0f), 0.0f};
         const float settle = 1.0f - std::exp(-c.idle_velocity_damp * (1.0f - e) * h);
         // Apply one bounded rotation to the outer links, tapering toward the pinned root.
@@ -469,6 +914,19 @@ private:
         // and robbed the front of the momentum that should hold it out against gravity.
         const float motion_drive = c.lock_closed || s_target <= 1.0f ? 0.0f : e *
             drive_ramp * drive_ramp * (3.0f - 2.0f * drive_ramp);
+        // The drive's frames turned so the idle line lies along the aimed line (the hand's own
+        // when there is no aim).
+        Frame aimed_f = f, aimed_prev = previous;
+        if (c.aim_share > 0.0f && B::LengthSq(c.aim) > 0.5f) {
+            const B::Vec3 line = B::Rotate(f.q, B::Normalize(rest_[n_ - 1] - rest_[0]));
+            const B::Quat turn = B::FromTo(line, AimedLine(f, c));
+            aimed_f.q = B::Normalize(turn * f.q);
+            aimed_prev.q = B::Normalize(turn * previous.q);
+            // Turned about the chain's root, which stays at the hand.
+            const B::Vec3 d = Apply(f, rest_[0]) - f.t, dp = Apply(previous, rest_[0]) - previous.t;
+            aimed_f.t = f.t + d - B::Rotate(turn, d);
+            aimed_prev.t = previous.t + dp - B::Rotate(turn, dp);
+        }
         std::array<B::Vec3, MaxPoints> p{};
         std::array<bool, MaxPoints> contact{};
         p[0] = root;
@@ -495,8 +953,8 @@ private:
                 // Soft coupling, not additional pinned links. Taper the moving handle
                 // drive down the chain so the weighted front keeps its own inertia.
                 const B::Vec3 local = rest_[0] + (rest_[i] - rest_[0]) * s;
-                const B::Vec3 target = Apply(f, local);
-                const B::Vec3 target_v = (target - Apply(previous, local)) * (1.0f / h);
+                const B::Vec3 target = Apply(aimed_f, local);
+                const B::Vec3 target_v = (target - Apply(aimed_prev, local)) * (1.0f / h);
                 const float omega = swing_drive;
                 B::Vec3 acceleration = (target - x_[i]) * (omega * omega) +
                                        (target_v - v) * (2.0f * omega);
@@ -505,6 +963,21 @@ private:
                     acceleration = acceleration * (c.drive_accel / magnitude);
                 const float taper = 1.0f - u / std::max(c.drive_span, 1e-3f);
                 v += acceleration * (h * drive * taper);
+            }
+            if (guiding && s > 1.02f && i > c.handle_links) {
+                // Toward the guide vector's line, a damped spring riding on its swing.
+                const float k = c.guide * (1.0f - (1.0f - c.guide_taper) * u);
+                const B::Vec3 target = root + guide_d_ * reach[i];
+                const B::Vec3 target_v = hand_v + B::Cross(guide_w_, target - root);
+                v += ((target - x_[i]) * (k * k) + (target_v - v) * (2.0f * c.guide_zeta * k)) * h;
+            }
+            if (path_on && i > c.handle_links) {
+                // Toward the swing's path, a damped spring riding on it.
+                const float k = c.path * (1.0f - (1.0f - c.path_taper) * u);
+                const float share = std::clamp(c.path_share, 0.0f, 1.0f) * e *
+                                    (path_ground_[i] ? std::clamp(c.path_ground, 0.0f, 1.0f) : 1.0f);
+                v += ((path_t[i] - x_[i]) * (k * k) + (path_v[i] - v) * (2.0f * c.path_zeta * k)) *
+                     (h * share);
             }
             p[i] = x_[i] + v * (h * drag) + g;
             contact[i] = c.floor_y > -1e8f && p[i].y <= c.floor_y;
@@ -519,15 +992,39 @@ private:
                 x_[i] = x_[i] + (x_[i] - x_[0]) * ((k - 1.0f) * (1.0f - c.payout_momentum));
             }
         }
-        // Toward the idle shape (scaled by the extension), firm at the root, soft at the tip.
+        // Toward the idle shape (scaled by the extension), firm at the root, soft at the tip; a
+        // living tendril's sways (ChainConfig::sway).
         const float steps240 = h * 240.0f;
+        const B::Vec3 rest_line =
+            B::Normalize(B::Rotate(f.q, rest_[n_ - 1] - rest_[0]), B::Vec3{0.0f, 0.0f, 1.0f});
+        if (c.sway > 0.0f) sway_rest_axis_ = CarrySwayAxis(sway_rest_axis_, rest_line);
         for (int i = 1; i < n_; ++i) {
             const float u = static_cast<float>(i) / static_cast<float>(n_ - 1);
             const float k = std::clamp((c.k_tip + c.k_root * std::pow(1.0f - u, c.k_pow)) * release,
                                        0.0f, 0.99f);
             const float a = 1.0f - std::pow(1.0f - k, steps240);
-            const B::Vec3 target = root + B::Rotate(f.q, rest_[i] - rest_[0]) * s;
+            const B::Vec3 target =
+                root + SwayDirection(B::Rotate(f.q, rest_[i] - rest_[0]), rest_line,
+                                     sway_rest_axis_, u, c.sway, c.sway_phase,
+                                     c.sway_clock >= 0.0 ? c.sway_clock : path_clock_) *
+                           s;
             p[i] = p[i] + (target - p[i]) * a;
+        }
+        // Each link's length along the chain from the root (the spine and the no-fold guard).
+        std::array<float, MaxPoints> along{};
+        if (c.spine > 0.0f || c.unfold > 0.0f) {
+            for (int i = 1; i < n_; ++i) along[i] = along[i - 1] + len_[i] * s;
+        }
+        if (c.spine > 0.0f && e > 0.0f && along[n_ - 1] > 1e-4f) {
+            // The spine: toward the root-to-tip line, each link at its share of the length.
+            const float k = std::clamp(c.spine * e, 0.0f, 0.99f);
+            const float a = 1.0f - std::pow(1.0f - k, steps240);
+            const B::Vec3 chord = p[n_ - 1] - root;
+            const float per = 1.0f / along[n_ - 1];
+            for (int i = 1; i + 1 < n_; ++i) {
+                const B::Vec3 target = root + chord * (along[i] * per);
+                p[i] = p[i] + (target - p[i]) * a;
+            }
         }
         // Bending: each inner point toward its neighbours' middle.
         for (int it = 0; it < (c.weighted ? 0 : c.bend_iters); ++it) {
@@ -541,6 +1038,7 @@ private:
             for (int i = 1; i <= pinned; ++i) {
                 p[i] = root + B::Rotate(f.q, rest_[i] - rest_[0]) * s;
             }
+            const float unfold = std::clamp(c.unfold, 0.0f, 0.95f) * e;
             std::array<float, MaxPoints> inv_mass{};
             std::array<float, MaxPoints> min_span{};
             const float cos_bend = std::cos(c.max_bend);
@@ -578,6 +1076,17 @@ private:
                     for (int i = pinned + 1; i < n_; ++i) {
                         contact[i] = contact[i] || p[i].y <= c.floor_y;
                         p[i].y = std::max(p[i].y, c.floor_y);
+                    }
+                }
+                if (unfold > 0.0f && ((pass & 15) == 15 || pass + 1 == c.constraint_iters)) {
+                    // No link folded back toward the hand: out along the line from the root.
+                    for (int i = pinned + 1; i < n_; ++i) {
+                        const B::Vec3 r = p[i] - root;
+                        const float dist = B::Length(r);
+                        const float least = unfold * along[i];
+                        if (dist < least && dist > 1e-5f) {
+                            p[i] = root + r * (least / dist);
+                        }
                     }
                 }
             }
@@ -661,12 +1170,14 @@ private:
                 if (contact[i] && p[i].y <= c.floor_y + 0.002f) {
                     // No restitution at a resting/landing contact. Once tension lifts a link
                     // clear of the surface, it is entirely free again (no grounded latch).
+                    impact_ = std::max(impact_, -v_[i].y);
                     v_[i].y = 0.0f;
                 }
             }
         }
         for (int i = 0; i < n_; ++i) {
             x_[i] = p[i];
+            path_ground_[i] = contact[i];
         }
     }
 
@@ -678,6 +1189,26 @@ private:
     LashDrive lash_drive_{};
     B::Vec3 drive_direction_{};
     float span_{0.0f}; // the payout's peak extension - 1 (the reel-in rate, Out())
+    // The guide vector (ChainConfig::guide): its direction and spin, the hand's last velocity.
+    B::Vec3 guide_d_{}, guide_w_{}, guide_hand_v_{};
+    bool guide_ready_{false};
+    // The swing-path lash (ChainConfig::path): the arm's line over the last moments (a ring, the
+    // newest at path_head_, its substeps' clock) and the shape's points at the last substep.
+    static constexpr int PathHistory = 160; // 0.6 s and more at 1/240 s substeps
+    std::array<B::Vec3, PathHistory> path_dir_{};
+    std::array<double, PathHistory> path_time_{};
+    int path_head_{0}, path_count_{0};
+    double path_clock_{0.0};
+    // ChainConfig::sway's axes across the lines (carried from step to step).
+    B::Vec3 sway_path_axis_{1.0f, 0.0f, 0.0f};
+    B::Vec3 sway_rest_axis_{1.0f, 0.0f, 0.0f};
+    B::Vec3 path_arm_{}, path_ptr_{}, path_spin_{}; // the arm's line, the pointer and its spin
+    B::Vec3 path_flat_{};                           // the level heading on the ground
+    float path_flight_{0.0f}; // the chain's flight (v^2 / R, m/s^2), smoothed
+    std::array<bool, MaxPoints> path_ground_{};     // the links on the ground at the last substep
+    std::array<B::Vec3, MaxPoints> path_target_{};
+    bool path_have_target_{false};
+    float impact_{0.0f}; // the fastest landing on the ground in the last Step, m/s
     std::array<B::Vec3, MaxPoints> rest_{};
     std::array<float, MaxPoints> len_{};
     std::array<B::Vec3, MaxPoints> x_{};

@@ -6,6 +6,7 @@
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
+#include <chrono>
 #include <algorithm>
 #include "common/sync_log.h"
 #include <array>
@@ -27,19 +28,31 @@
 #include "core/vr/anim_classes.h"
 #include "core/vr/arm_ik.h"
 #include "core/vr/bb_weapons.h"
+#include "core/vr/messenger_gift.h"
 #include "core/vr/blade_sounds.h"
+#include "core/vr/dual_blades.h"
+#include "core/vr/game_area.h"
 #include "core/vr/game_sounds.h"
 #include "core/vr/grind_audio.h"
 #include "core/vr/bloodborne_body.h"
+#include "core/vr/bloodborne_corpse.h"
+#include "core/vr/bloodborne_frame_rate.h"
+#include "core/vr/bloodborne_shoulder.h"
 #include "core/vr/grip_lab_pose.h"
 #include "core/vr/bloodborne_visceral_pull.h"
+#include "core/vr/bloodborne_woods_shadows.h"
 #include "core/vr/bloodborne_cinematic.h"
+#include "core/vr/bloodborne_deflect.h"
 #include "core/vr/bloodborne_evasion.h"
 #include "core/vr/bow.h"
 #include "core/vr/bow_pose.h"
 #include "core/vr/combat_channel.h"
 #include "core/vr/bloodborne_gun.h"
 #include "core/vr/bloodborne_held.h"
+#include "core/vr/blood_draw_channel.h"
+#include "core/vr/bloodborne_quickitems.h"
+#include "core/vr/call_beyond.h"
+#include "core/vr/augur.h"
 #include "core/vr/bloodborne_layout.h"
 #include "core/vr/bloodborne_facing.h"
 #include "core/vr/bloodborne_melee.h"
@@ -58,6 +71,8 @@
 #include "core/vr/grip_adjust.h"
 #include "core/vr/gun_aim.h"
 #include "core/vr/hand_grip.h"
+#include "core/vr/hunter_relics.h"
+#include "core/vr/hand_rig.h"
 #include "core/vr/lever_channel.h"
 #include "core/vr/lever_grip.h"
 #include "core/vr/music_box_grip.h"
@@ -71,6 +86,10 @@
 #include "core/vr/pose_refresh.h"
 #include "core/vr/quick_settings.h"
 #include "core/vr/solid_weapon.h"
+#include "core/vr/torch_collision.h"
+#include "core/vr/left_clash_data.h"
+#include "core/vr/bloodborne_sever.h"
+#include "core/vr/bloodborne_wheelchair.h"
 #include "core/vr/trick_weapons.h"
 #include "core/vr/two_hand_channel.h"
 #include "core/vr/weapon_wall.h"
@@ -158,6 +177,7 @@ constexpr u32 OffsetAsmParts = 0x28;
 constexpr u64 WeaponPartVtableRva = 0x539D100;
 constexpr u32 OffsetPartMode = 0x138;
 constexpr u32 OffsetPartDummy = 0x13C;
+constexpr s32 LeftPartSlot = 7;
 constexpr s32 RightPartSlot = 11;
 constexpr u64 WorldChrManRva = 0x553E878;
 constexpr u32 OffsetMainPlayer = 0x60;
@@ -200,6 +220,10 @@ constexpr s64 Ms = 1'000'000;
 constexpr s64 AnchorMaxAgeNs = 1000 * Ms;
 constexpr s64 HandsMaxAgeNs = 100 * Ms; // an older sample: the XR frame thread stopped
 constexpr s64 HoldNs = 300 * Ms;        // tracking lost: the last pose is held this long
+// ... and this long for the left hand while the Monocular is at an eye: held against the
+// headset the controller often loses its optical tracking (2026-10-30: "if I move the monocular
+// TOO close to the eye, then the hand drops it"); the IMU still turns the wrist (the zoom).
+constexpr s64 MonocularHoldNs = 10'000 * Ms;
 constexpr float SlowBlendOutS = 0.4f;   // an arm going back after a tracking loss or death
 constexpr s64 WindowNs = 500 * Ms;      // VR_BODY_LOG lines
 constexpr s64 DetailNs = 2000 * Ms;     // VR_BODY_LOG=2: per-frame lines after a MARK
@@ -461,8 +485,12 @@ struct SolidSide {
     B::Vec3 clash_side{}; // the two weapons' touch normal last update (they keep to its side)
     float clash_share{0.5f}; // right hand's share of the separation
     bool clash_met{false};
+    // Each weapon's pose as last solved (apart from the other, or just touching): where each pair
+    // of the fitted capsules lay, the side it touches from (Solid::Separate).
+    std::array<VR::Solid::Pose, 2> solved{};
+    std::array<bool, 2> have_solved{};
     bool active{false}; // on last update (off: let go once, then nothing runs)
-    std::array<int, 2> shape_logged{-1, -1}; // (logs) 0 the hand, 1 its line
+    std::array<int, 2> shape_logged{-1, -1}; // (logs) 0 the hand, 1 its line, 2+ fitted capsules
     std::array<bool, 2> touch_logged{};
     VR::WeaponWall::State state{};
 };
@@ -520,6 +548,7 @@ struct PoseSide {
     // The last driven frame's inputs, kept while the body eases out.
     bool have_inputs{false};
     B::Vec3 last_eye_m{};
+    float stair_dy{0.0f};   // the camera's smoothing of his root's height his upper body rides
     B::Vec3 last_ahead_m{}; // the camera's lead over the hunter's eyes (fp_ahead_m), model space
     float last_head_yaw{0.0f};
     float last_view_pitch{0.0f};
@@ -532,6 +561,8 @@ struct PoseSide {
     bool solved{false}; // `out` is this frame's
     B::AnimGate gate{};
     B::GateOut gate_out{};
+    s64 kos_ritual_start_ns{0};
+    s64 kos_ritual_sample_ns{0};
     bool roomscale_idle{false};
     const char* roomscale_idle_why{""}; // why not (the room-scale walk's log)
     std::array<B::HandHold, 2> hold{};
@@ -543,6 +574,10 @@ struct PoseSide {
     std::array<bool, 2> have_target{};
     std::array<B::BlendWeight, 2> arm_w{};
     std::array<float, 2> arm_weight{};
+    // corpse_hands: how much each drawn hand sits on the corpse it holds (eased 0..1), and when.
+    std::array<float, 2> corpse_grip_w{};
+    std::array<B::Vec3, 2> corpse_palm{}; // model space, kept while it eases off
+    s64 corpse_grip_ns{0};
     B::BlendWeight body_w{};
     float body_weight{0.0f};
     s64 last_solve_ns{0};
@@ -563,6 +598,7 @@ struct PoseSide {
     s32 grip_goods{-1};
     u8 grip_kind{0};
     float grip_weight{0.0f};
+    float call_beyond_squeeze{0.0f};
     s64 grip_log_ns{0}; // VR_GRIP_LOG
     u64 writes{0};
     s64 last_fail_log_ns{0};
@@ -955,6 +991,25 @@ void Gather(PoseSide& s, s64 now, bool native_throw) {
     s.drift = eye.drift;
     if (have_anchor) {
         s.anchor.eye_rel = eye.eye_rel + turn_eye;
+        // Height: the camera's own next step, not the character root's (stairs). The anchor
+        // keeps the eye's offset over the root, so the hands followed every step of the root
+        // while the comfort camera smooths them away: the weapons jittered up and down against
+        // the view (the tester's 2026-11-04 report). The comfort filter, stepped once more on a
+        // copy, says where the eye goes next (bloodborne_motion.cpp ComfortNextDeltaY); x and z
+        // stay the rigid follow. Only an unpaired anchor (a pair lock carries its own eye), and
+        // only with a fresh comfort tick of that render tick.
+        if (eye.source == B::EyeSource::Anchor && s.frame.valid) {
+            // W at the frame's camera: now plus its move after this pose copy (eye.drift).
+            const B::Vec3 at_camera = s.frame.t + eye.drift;
+            const VR::Vec3 root_move{at_camera.x - anchor.chr_t.x, at_camera.y - anchor.chr_t.y,
+                                     at_camera.z - anchor.chr_t.z};
+            if (float dy = 0.0f; ComfortNextDeltaY(anchor.steady_ns, root_move, dy)) {
+                s.anchor.eye_rel.y = anchor.eye_world.y + dy - at_camera.y + turn_eye.y;
+                // ... and its smoothing of the root's height with it (camera_dip: the camera's
+                // base moves by dy, the root's eye by the root's move), for this frame's camera.
+                s.anchor.camera_dip = anchor.camera_dip + dy - root_move.y;
+            }
+        }
         s.anchor.rig_offset = eye.rig_offset;
         float phys_yaw = 99.0f;
         if (Common::SyncLog::On()) {
@@ -1207,6 +1262,23 @@ const char* Owner(bool ik) {
 // VR_ANIM_LOG: every new id. Ids of unknown or unverified classes are logged the first time
 // they are seen even without it (they refine the class table).
 void LogNewAnims(PoseSide& s, const B::GateOut& g) {
+    if constexpr (!Common::Log::Enabled) {
+        // The release scan needs proof of movement, not the per-frame animation trace.
+        // Keep at most one locomotion record per second, and do no work in normal play.
+        if (!Common::Log::BenchmarkEnabled()) return;
+        static thread_local s64 last_recorded = 0;
+        const s64 now = B::SteadyNowNs();
+        if (now - last_recorded < 1'000'000'000LL) return;
+        for (u32 i = 0; i < s.new_count; ++i) {
+            const auto& a = s.new_anims[i];
+            if (B::ClassifyAnim(a.id) == B::AnimClass::Locomotion) {
+                LOG_BENCHMARK_INFO(Core, "VR anim: id {} class locomotion", a.id);
+                last_recorded = now;
+                break;
+            }
+        }
+        return;
+    }
     for (u32 i = 0; i < s.new_count; ++i) {
         const NewAnim& a = s.new_anims[i];
         const B::AnimClass c = B::ClassifyAnim(a.id);
@@ -1336,7 +1408,7 @@ G::Shape TunedShape(G::Kind kind, s32 goods = -1) {
 // The left fingers closed round the held item (the vial, a quick item: the held tick's grip of
 // the last update), eased in and out over GripBlendS, over whatever the animation does with them
 // (vr.ini held_grip). Written after the arms, into the same pose; RestoreGame puts the game's back.
-void ApplyGrip(PoseSide& s, B::HkQsTransform* local, float dt) {
+void ApplyGrip(PoseSide& s, B::HkQsTransform* local, float dt, const u8* player) {
     const auto held = HeldGrip();
     const u8 want = held.kind;
     const bool on = want != 0 && want < static_cast<u8>(G::Kind::Count) &&
@@ -1346,12 +1418,33 @@ void ApplyGrip(PoseSide& s, B::HkQsTransform* local, float dt) {
         s.grip_goods = held.goods;
     }
     const float step = dt / GripBlendS;
+    if (on && held.goods == VR::CallBeyond::Goods) {
+        const float target = CallBeyondSqueeze(B::SteadyNowNs());
+        const float squeeze_step = std::clamp(dt, 0.0f, .1f) / .14f;
+        s.call_beyond_squeeze += std::clamp(target - s.call_beyond_squeeze,
+                                          -squeeze_step, squeeze_step);
+    } else {
+        s.call_beyond_squeeze = 0.0f;
+    }
     s.grip_weight = std::clamp(s.grip_weight + (on ? step : -step), 0.0f, 1.0f);
     if (s.grip_weight <= 0.0f || s.grip_kind == 0) {
         return;
     }
     const float w = s.grip_weight * s.grip_weight * (3.0f - 2.0f * s.grip_weight);
-    const G::Shape shape = TunedShape(static_cast<G::Kind>(s.grip_kind), s.grip_goods);
+    G::Shape shape = TunedShape(static_cast<G::Kind>(s.grip_kind), s.grip_goods);
+    // Let the Bone Ash little-finger claw clear the side of the Accursed Brew.
+    if (s.grip_goods == 2130 && EquippedArmArmor(player) == 42000) {
+        shape.bend[4][1] -= .26f;
+        shape.bend[4][2] -= .25f;
+    }
+    if (s.grip_goods == VR::CallBeyond::Goods)
+        VR::CallBeyond::Tighten(shape, s.call_beyond_squeeze);
+    if (on && held.goods == VR::Augur::Goods)
+        VR::Augur::Tighten(shape, AugurSqueeze(B::SteadyNowNs()));
+    if (on && held.goods == VR::MessengerGift::Goods)
+        VR::Augur::Tighten(shape, MessengerSqueeze(B::SteadyNowNs()));
+    if (on && held.goods == VR::HunterRelics::Gloves)
+        VR::HunterRelics::OpenGloveHand(shape, GloveHandOpen(B::SteadyNowNs()));
     const float bend_sign = VR::Tune::Get("grip.bend_sign", 1.0f);
     const float oppose_sign = VR::Tune::Get("grip.oppose_sign", 1.0f);
     for (int f = 0; f < 5; ++f) {
@@ -1412,6 +1505,44 @@ void ApplyMusicBoxGrip(PoseSide& s, B::HkQsTransform* local, s64 now) {
     }
 }
 
+// The bare hands' fingers (core/vr/hand_rig.h; the presenter's ApplyFingerRig): in unarmed mode a
+// hand's fingers follow its controller, over the game's own by the presenter's weight and the
+// arm's (the game's own clips keep theirs). Before the other finger grips: a held item's grip, a
+// lever or the music box then blends from these fingers (no jump back to the game's), and the
+// game's own locals are what is kept for RestoreGame.
+void ApplyFingerRig(PoseSide& s, B::HkQsTransform* local, s64 now) {
+    const auto& fingers_in = s.used.fingers;
+    if ((fingers_in[0].weight <= 0.0f && fingers_in[1].weight <= 0.0f) ||
+        now - s.used.steady_ns > 250'000'000) {
+        return; // the usual case: both hands armed
+    }
+    for (int h = 0; h < 2; ++h) {
+        const auto i = static_cast<size_t>(h);
+        const B::FingerCurl& c = fingers_in[i];
+        const float w = std::clamp(c.weight, 0.0f, 1.0f) * std::clamp(s.arm_weight[i], 0.0f, 1.0f);
+        if (!(w > 0.0f) || !B::IsTracked(s.used.hand[i])) {
+            continue;
+        }
+        const auto side = static_cast<C::Side>(h);
+        const auto& fingers = side == C::Right ? G::RightFingers : G::LeftFingers;
+        const G::Shape shape = VR::Body::Rig::ShapeOf({c.thumb, c.index, c.grip});
+        const float k = w * w * (3.0f - 2.0f * w);
+        for (int f = 0; f < 5; ++f) {
+            for (int j = 0; j < 3; ++j) {
+                const int bone = fingers[static_cast<size_t>(f)][static_cast<size_t>(j)];
+                if (!s.edited.test(static_cast<size_t>(bone))) {
+                    s.animated[static_cast<size_t>(bone)] = local[bone];
+                    s.edited.set(static_cast<size_t>(bone));
+                }
+                B::QsTransform x = B::FromHavok(local[bone]);
+                x.q = B::Slerp(x.q, G::ShapeLocal(shape, f, j, 1.0f, 1.0f, C::Ref(), side), k);
+                B::ToHavok(x, local[bone]);
+                s.locals[static_cast<size_t>(bone)] = x;
+            }
+        }
+    }
+}
+
 // ---- The two-handed grip (core/vr/two_hand_grip.h) ---------------------------------------------
 
 // [[PlayerIns+0xF0]]: the right weapon's arm style (1 form A, 3 form B two-handed, 5 form B
@@ -1467,6 +1598,10 @@ void ObserveTwoHand(PoseSide& s, const u8* chr, float dt, s64 now) {
     st.style = style;
     st.two_handed = two;
     st.grip = th.grips.Get(scale, st.measured);
+    // Logarius' Wheel's second handle is its model's (WheelOtherHandle), known before the game
+    // ever shows its two-handed pose: its grab in form A transforms it (GrabFamily).
+    if (family == 120) st.measured = true;
+    if (st.measured) st.grip = T::OnHandle(family, st.grip, &C::Ref().right_two_hand_big);
     // Keep the learned transformed grip in form A too: it defines the cue/rail's axis and
     // estimated extent, not a forced hand position. Unknown grips only request a transform;
     // SupportGrip leaves the hand tracked until the native rail is available and reached.
@@ -1553,14 +1688,166 @@ bool PairedPartLine(int hand, VR::Solid::Shape& sh) {
     return true;
 }
 
+// weapon_wall_shape: capsules fitted in the held weapon's grip frame (dummy 300 or 340), then
+// placed on its weapon bone (the skeleton's weapon base, as PairedPartLine), the first the line
+// from the hand, the others its further capsules: what the other weapon meets (SolidWeapons' clash;
+// most walls meet the line; Beast Claw uses its pair for both). False (the shape
+// untouched) when none is fitted.
+bool FittedShape(int hand, float scale, VR::Solid::Shape& sh) {
+    VR::WeaponFit::Fit fit{};
+    const C::Skeleton* const sk = C::Active();
+    if (sk == nullptr || !MeleeFittedShape(fit, hand == C::Left)) {
+        return false;
+    }
+    const auto& dummy = hand == C::Left ? sk->left_weapon_base : sk->right_weapon_base;
+    const B::Vec3 origin{dummy.position[0], dummy.position[1], dummy.position[2]};
+    const B::Vec3 forward{dummy.forward[0], dummy.forward[1], dummy.forward[2]};
+    const B::Vec3 up{dummy.up[0], dummy.up[1], dummy.up[2]};
+    const B::Vec3 right = B::Cross(up, forward);
+    const auto on_bone = [&](B::Vec3 p) { return origin + right * p.x + up * p.y + forward * p.z; };
+    sh.line = true;
+    sh.base = on_bone(fit.caps[0].a);
+    sh.tip = on_bone(fit.caps[0].b);
+    sh.line_r = fit.caps[0].r * scale;
+    sh.extra = std::min(fit.count - 1, VR::Solid::MaxMore);
+    for (int k = 0; k < sh.extra; ++k) {
+        const VR::WeaponFit::Capsule& c = fit.caps[static_cast<std::size_t>(k + 1)];
+        sh.more[static_cast<std::size_t>(k)] = {on_bone(c.a), on_bone(c.b), c.r * scale, c.carried, c.detached};
+    }
+    return true;
+}
+
+// corpse_hands (bloodborne_corpse.cpp): each bare hand where its controller holds it (its weapon
+// bone, the palm) with its squeeze, for the corpses near. Bare: unarmed at its shoulder (that hand's
+// weapon family 10 and the shoulder's empty slot, as the finger rig's), tracked and yours (not a
+// clip's), not on a lever.
+void CorpseHandsUpdate(PoseSide& s, const u8* chr, const B::BodyInput& in, bool driven,
+                       int lever_hand, s64 now) {
+    VR::Bloodborne::CorpseHandsIn c{};
+    c.now = now;
+    c.scale = std::max(s.anchor.world_scale, 1e-3f);
+    c.player = chr;
+    c.feet = s.frame.t;
+    const bool on = driven && s.frame.valid && s.have_used;
+    for (int i = 0; i < 2; ++i) {
+        const auto h = static_cast<size_t>(i);
+        const int family =
+            i == C::Right ? s.weapon_family : B::Weapons::FamilyOf(s.left_weapon_id);
+        if (!on || family != 10 || i == lever_hand || !in.target[i].has_value() ||
+            !(s.arm_weight[h] >= B::DetachWatch::OwnedWeight) || !B::IsTracked(s.used.hand[h]) ||
+            !VR::Bloodborne::ShoulderUnarmed(static_cast<unsigned>(i))) {
+            continue;
+        }
+        const B::ModelTarget& t = *in.target[i];
+        c.bare[h] = true;
+        c.palm[h] = B::ToWorld(s.frame, t.p);
+        c.q[h] = B::Normalize(s.frame.q * t.q);
+        c.squeeze[h] = s.used.hand[h].grip;
+    }
+    VR::Bloodborne::GehrmanChairHands(c);
+    VR::Bloodborne::CorpseHands(c);
+}
+
+// corpse_hands: a hand holding a corpse is drawn where its palm holds it (bloodborne_corpse.h
+// CorpseGrip), eased on in CorpseGripOnS and off in CorpseGripOffS; the controller goes on, its
+// pull with it. After CorpseHandsUpdate (which hands over the controllers). A hand holding
+// Gehrman's wheelchair likewise, on its grip (bloodborne_wheelchair.h LatestChairGrips).
+constexpr float CorpseGripOnS = 0.08f;
+constexpr float CorpseGripOffS = 0.15f;
+constexpr s64 CorpseGripFreshNs = 250'000'000;
+void CorpseGripPresent(PoseSide& s, B::BodyInput& in, s64 now) {
+    std::array<VR::Bloodborne::CorpseGrip, 2> grips{};
+    bool have = VR::Bloodborne::LatestCorpseGrips(grips);
+    std::array<VR::Bloodborne::CorpseGrip, 2> chair{};
+    if (VR::Bloodborne::LatestChairGrips(chair)) {
+        for (size_t h = 0; h < 2; ++h) {
+            if (!(have && grips[h].on) && chair[h].on) {
+                grips[h] = chair[h];
+            }
+        }
+        have = true;
+    }
+    const float dt = s.corpse_grip_ns != 0
+                         ? std::clamp(static_cast<float>(now - s.corpse_grip_ns) * 1e-9f, 0.0f, 0.1f)
+                         : 0.0f;
+    s.corpse_grip_ns = now;
+    for (int i = 0; i < 2; ++i) {
+        const auto h = static_cast<size_t>(i);
+        const VR::Bloodborne::CorpseGrip& g = grips[h];
+        const bool on = have && g.on && now - g.ns <= CorpseGripFreshNs && in.target[i].has_value();
+        float& w = s.corpse_grip_w[h];
+        w = on ? std::min(w + dt / CorpseGripOnS, 1.0f) : std::max(w - dt / CorpseGripOffS, 0.0f);
+        if (!(w > 0.0f) || !in.target[i].has_value()) {
+            continue;
+        }
+        if (on) {
+            s.corpse_palm[h] = B::ToModel(s.frame, g.palm);
+        }
+        B::ModelTarget& t = *in.target[i];
+        const float k = w * w * (3.0f - 2.0f * w);
+        t.p = t.p + (s.corpse_palm[h] - t.p) * k;
+    }
+}
+
+// A stowed, hidden or transforming off-hand part must not acquire a clash shape.
+bool LeftPartVisible(const u8* chr, int attach) {
+    const int style = ReadArmStyle(chr);
+    if (style < 0 || style == 2 || style == 3 || HeldLeftHidden()) return false;
+    const u8* parts = Read<const u8*>(chr + OffsetChrAsm);
+    const u8* part = Plausible(parts) ? Read<const u8*>(parts + OffsetAsmParts + 8 * LeftPartSlot) : nullptr;
+    return Plausible(part) && Read<const u8*>(part) == g_base + WeaponPartVtableRva &&
+           Read<s32>(part + OffsetPartMode) == 2 && Read<s32>(part + OffsetPartDummy) == attach;
+}
+
+bool LeftClashShape(const PoseSide& s, const C::Skeleton& sk, int attach,
+                    std::span<const VR::Solid::Capsule> caps, float scale, VR::Solid::Shape& out) {
+    const C::DummyPoly* mount = nullptr;
+    for (const auto* d : {&sk.left_weapon_base, &sk.left_shield, &sk.left_gun, &sk.left_gun2,
+                          &sk.left_gun3, &sk.left_gun4}) {
+        if (d->id == attach) { mount = d; break; }
+    }
+    if (!mount || (mount->bone != C::L_Weapon && mount->bone != C::L_Forearm)) return false;
+    B::Vec3 origin{mount->position[0], mount->position[1], mount->position[2]};
+    B::Vec3 up{mount->up[0], mount->up[1], mount->up[2]};
+    B::Vec3 forward{mount->forward[0], mount->forward[1], mount->forward[2]};
+    if (mount->bone == C::L_Forearm) {
+        // Church Cannon: its mount is on the forearm, but Separate consumes L_Weapon space.
+        const auto weapon = B::Compose(s.locals[C::L_Hand], s.locals[C::L_Weapon]);
+        const auto inv = B::Conjugate(weapon.q);
+        origin = B::Rotate(inv, origin - weapon.t);
+        up = B::Rotate(inv, up);
+        forward = B::Rotate(inv, forward);
+    }
+    const auto right = B::Cross(up, forward);
+    if (!B::IsFinite(origin) || !B::IsFinite(right) || B::LengthSq(right) < 0.5f) return false;
+    const auto point = [&](B::Vec3 p) { return origin + right*p.x + up*p.y + forward*p.z; };
+    out.line = true;
+    out.base = point(caps[0].a);
+    out.tip = point(caps[0].b);
+    out.line_r = caps[0].r * scale;
+    out.extra = static_cast<int>(caps.size()) - 1;
+    for (int k = 0; k < out.extra; ++k) {
+        const auto& c = caps[k + 1];
+        out.more[k] = {point(c.a), point(c.b), c.r * scale};
+    }
+    return true;
+}
+
 // The weapon in hand `i` on its weapon bone (SolidWeapons, BladeSounds): the right one its blade
 // along R_Weapon -Y (MeleeBladeReach: the default grip's blade axis, its dummies within 3 degrees of
 // it) or its part in that hand, the left a gun along its barrel (GunBarrelReach) or the right
-// weapon's part in it (PairedPartLine: the dual blades' second blade), else the bare hand.
-void HandShape(int i, float scale, VR::Solid::Shape& sh) {
+// weapon's part in it (PairedPartLine: the dual blades' second blade), a torch on dummy 340,
+// else the bare hand.
+// `fitted` (SolidWeapons against the other weapon): the held weapon's fitted capsules when there
+// are (FittedShape), else the same; true when it is those.
+bool HandShape(const PoseSide& s, const u8* chr, int i, float scale,
+               VR::Solid::Shape& sh, bool fitted = false) {
     namespace S = VR::Solid;
     sh.hand_r = 0.05f * scale;
     sh.line_r = 0.02f * scale;
+    if (fitted && FittedShape(i, scale, sh)) {
+        return true;
+    }
     if (i == C::Right) {
         float base = 0.0f;
         float tip = 0.0f;
@@ -1569,6 +1856,28 @@ void HandShape(int i, float scale, VR::Solid::Shape& sh) {
         const bool have_reach = MeleeBladeReach(base, tip);
         S::BladeOrPartLine(have_reach, base, tip, 0.05f * scale, part, sh);
     } else if (!PairedPartLine(C::Left, sh)) {
+        const int family = B::Weapons::FamilyOf(s.left_weapon_id);
+        if (fitted && VR::Tricks::GetTrickSettings().weapon_wall_shape) {
+            const auto caps = VR::LeftClash::Find(family);
+            if (!caps.empty()) {
+                const auto* info = B::Weapons::FindFamily(family);
+                if (!info || !LeftPartVisible(chr, info->dmy_left)) return false;
+                if (const auto* sk = C::Active(); sk && LeftClashShape(s, *sk, info->dmy_left, caps, scale, sh))
+                    return true;
+            }
+        }
+        if (family == 200 || family == 201) {
+            // Check the current part, not the flame effect (torch_lift can be off).
+            // A stowed torch or a vial hiding it must never leave a solid shaft behind.
+            if (const auto* sk = C::Active(); sk && LeftPartVisible(chr, 340)) {
+                const auto& d = sk->left_weapon_base;
+                VR::Torch::CollisionShape(family, true, scale,
+                    {d.position[0], d.position[1], d.position[2]},
+                    {d.forward[0], d.forward[1], d.forward[2]},
+                    {d.up[0], d.up[1], d.up[2]}, sh);
+            }
+            return false; // simple line, not the right weapon's fitted multi-capsule shape
+        }
         s32 attach = -1;
         float back = 0.0f;
         float front = 0.0f;
@@ -1580,6 +1889,7 @@ void HandShape(int i, float scale, VR::Solid::Shape& sh) {
             sh.tip = dir * front;
         }
     }
+    return false;
 }
 
 // Before the arms are solved: each hand's weapon against the static map (the game's own sweep,
@@ -1588,7 +1898,10 @@ void HandShape(int i, float scale, VR::Solid::Shape& sh) {
 // R_Weapon -Y (MeleeBladeReach: the default grip's blade axis, its dummies within 3 degrees of it),
 // the left a gun along its barrel (GunBarrelReach) or the right weapon's part in it (PairedPartLine:
 // the dual blades' second blade), else the bare hand; a left hand on the right weapon's handle
-// (the two-handed grip) goes where that weapon goes. Each contact and the
+// (the two-handed grip) goes where that weapon goes. Against the other weapon the right one is its
+// capsules fitted to its model when there are (weapon_wall_shape), each pair of capsules touching
+// from the side it lay on where the two were last solved (SolidSide::solved; Solid::Separate); the
+// walls meet the line, or Beast Claw's two authored prongs. Each contact and the
 // controller's motion where it touches go through WeaponWall::Contact (a strike, a scrape) to the
 // presenter (the feel, the sparks: tracking space). A snap turn places the weapons again from the
 // chest (no sweep through the turn, never into a wall); it and a stereo pair's second eye (its
@@ -1596,7 +1909,7 @@ void HandShape(int i, float scale, VR::Solid::Shape& sh) {
 // `lever_hand`: the hand on a lever (its fist pinned to the handle, its weapon hidden): not solid,
 // so neither it nor the hidden weapon pushes the fist off the handle; let go, it is placed again
 // from the chest like any hand the game gave back (-1: none).
-void SolidWeapons(PoseSide& s, B::BodyInput& in, bool driven, int lever_hand, s64 now) {
+void SolidWeapons(PoseSide& s, const u8* chr, B::BodyInput& in, bool driven, int lever_hand, s64 now) {
     namespace S = VR::Solid;
     namespace WW = VR::WeaponWall;
     SolidSide& w = s.solid;
@@ -1609,6 +1922,7 @@ void SolidWeapons(PoseSide& s, B::BodyInput& in, bool driven, int lever_hand, s6
                 w.weapon[i].Reset();
                 w.touch[i] = {};
                 w.have_last[i] = false;
+                w.have_solved[i] = false;
             }
             w.clash = {};
             w.clash_met = false;
@@ -1618,6 +1932,7 @@ void SolidWeapons(PoseSide& s, B::BodyInput& in, bool driven, int lever_hand, s6
         return;
     }
     w.active = true;
+    VR::FeatureCost::Scope cost{VR::FeatureCost::SolidWeapons};
     const float turn =
         w.have_yaw ? std::remainder(s.anchor.base_yaw - w.yaw, 2.0f * 3.14159265f) : 0.0f;
     const bool snap = std::abs(turn) > 8.0f * B::Deg;
@@ -1667,7 +1982,10 @@ void SolidWeapons(PoseSide& s, B::BodyInput& in, bool driven, int lever_hand, s6
         out[1] = v.y;
         out[2] = v.z;
     };
-    std::array<S::Shape, 2> shape{};
+    std::array<S::Shape, 2> shape{};       // against the walls: the lines (as in 0.7.0)
+    std::array<S::Shape, 2> clash_shape{}; // against each other (Separate): weapon_wall_shape's
+                                           // fitted capsules when there are, else the lines
+    std::array<bool, 2> fitted{};          // ... it is those capsules
     std::array<S::Pose, 2> pose{};
     std::array<S::Pose, 2> target{};
     std::array<S::Pose, 2> prev{};
@@ -1687,24 +2005,80 @@ void SolidWeapons(PoseSide& s, B::BodyInput& in, bool driven, int lever_hand, s6
             w.weapon[i].Reset();
             w.touch[i] = {};
             w.have_last[i] = false;
+            w.have_solved[i] = false;
             out.scraping = false;
             continue;
         }
         S::Shape& sh = shape[i];
-        HandShape(i, scale, sh);
-        if (w.shape_logged[i] != (sh.line ? 1 : 0)) {
-            w.shape_logged[i] = sh.line ? 1 : 0;
-            LOG_INFO(Core, "VR solid: the {} hand: {}", i == C::Right ? "right" : "left",
+        HandShape(s, chr, i, scale, sh);
+        fitted[i] = HandShape(s, chr, i, scale, clash_shape[i], true);
+        // The transformed left beast hand is articulated: read its current
+        // fingers once, then share those capsules between walls and clashes.
+        // No pose work for other weapons, unavailable hands or the setting off.
+        if (i == C::Left && s.weapon_family == 90 &&
+            VR::Tricks::GetTrickSettings().weapon_wall_shape) {
+            const auto* sk = C::Active();
+            S::Shape fingers{};
+            if (sk && MeleeLeftClawShape(const_cast<u8*>(chr), scale, fingers)) {
+                const auto& d = sk->left_weapon_base;
+                const B::Vec3 origin{d.position[0],d.position[1],d.position[2]};
+                const B::Vec3 up{d.up[0],d.up[1],d.up[2]};
+                const B::Vec3 forward{d.forward[0],d.forward[1],d.forward[2]};
+                const B::Vec3 right = B::Cross(up,forward);
+                const auto on_bone = [&](B::Vec3 p) {
+                    return origin + right*p.x + up*p.y + forward*p.z;
+                };
+                fingers.base = on_bone(fingers.base);
+                fingers.tip = on_bone(fingers.tip);
+                for (int k = 0; k < fingers.extra; ++k) {
+                    fingers.more[k].a = on_bone(fingers.more[k].a);
+                    fingers.more[k].b = on_bone(fingers.more[k].b);
+                }
+                sh = clash_shape[i] = fingers;
+                fitted[i] = true;
+            }
+        }
+        // Beast Claw's two rigid prongs (both forms): use the same checked, cached
+        // pair against walls as against the other weapon. Until ready, or with
+        // weapon_wall_shape off, keep the old line.
+        if (i == C::Right && s.weapon_family == 90 && fitted[i] &&
+            clash_shape[i].extra == 1) {
+            sh = clash_shape[i];
+            sh.more[0].sweep_tip = true;
+        }
+        static bool base_logged = std::getenv("VR_SOLID_SHAPE_LOG") == nullptr;
+        if (const C::Skeleton* sk = C::Active(); !base_logged && sk != nullptr) {
+            base_logged = true;
+            const auto dummy = [](const C::DummyPoly& d) {
+                return fmt::format("({:.4f},{:.4f},{:.4f}) forward ({:.3f},{:.3f},{:.3f}) up "
+                                   "({:.3f},{:.3f},{:.3f})",
+                                   d.position[0], d.position[1], d.position[2], d.forward[0],
+                                   d.forward[1], d.forward[2], d.up[0], d.up[1], d.up[2]);
+            };
+            LOG_INFO(Core, "VR solid dump: weapon bases on their bones: right {} | left {}",
+                     dummy(sk->right_weapon_base), dummy(sk->left_weapon_base));
+        }
+        const S::Shape& met = clash_shape[i];
+        const int logged = !sh.line ? 0 : fitted[i] ? 2 + met.extra : 1;
+        if (w.shape_logged[i] != logged) {
+            w.shape_logged[i] = logged;
+            LOG_INFO(Core, "VR solid: the {} hand: {}{}", i == C::Right ? "right" : "left",
                      sh.line ? fmt::format("its weapon from {:.0f} to {:.0f} cm out of the hand",
                                            B::Length(sh.base) * 100.0f / scale,
                                            B::Length(sh.tip) * 100.0f / scale)
-                             : std::string{"the bare hand"});
+                             : std::string{"the bare hand"},
+                     fitted[i] ? fmt::format("; against the other weapon its {} capsule{} fitted "
+                                             "to its model (reaching {:.0f} cm)",
+                                             1 + met.extra, met.extra == 0 ? "" : "s",
+                                             S::ReachOf(met) * 100.0f / scale)
+                               : std::string{});
         }
         const B::ModelTarget& t = *in.target[i];
         target[i] = {B::ToWorld(s.frame, t.p), B::Normalize(s.frame.q * t.q)};
         if (snap) {
             w.weapon[i].Reset(); // placed again from the chest: a carried pose could be in a wall
             w.have_last[i] = false;
+            w.have_solved[i] = false;
         }
         prev[i] = w.last[i];
         had[i] = w.have_last[i];
@@ -1715,6 +2089,11 @@ void SolidWeapons(PoseSide& s, B::BodyInput& in, bool driven, int lever_hand, s6
             LOG_INFO(Core, "VR solid: the {} hand's weapon was caught far from the controller: "
                            "back at it (clear from the chest)",
                      i == C::Right ? "right" : "left");
+        }
+        if (r.replaced) {
+            LOG_INFO(Core, "VR solid: the {} hand's new shape met something where the weapon "
+                           "rested: placed again from the chest{}",
+                     i == C::Right ? "right" : "left", r.through ? " (not reached yet)" : "");
         }
         if (!feel) {
             continue;
@@ -1753,18 +2132,24 @@ void SolidWeapons(PoseSide& s, B::BodyInput& in, bool driven, int lever_hand, s6
         w.last[i] = target[i];
         w.have_last[i] = true;
     }
-    // The two weapons against each other (the right blade, the left gun), each kept to its side.
+    // The two weapons against each other (the right blade's capsules or line, the left gun's line),
+    // each kept to its side. With the fitted capsules, each pair of them touches from the side it
+    // lay on where the two were last solved; the lines alone keep the contact's side as in 0.7.0.
     WW::Sample clash{};
     clash.dt = dt;
     bool met = false;
-    if (mine[0] && mine[1] && solid[0] && solid[1] && shape[0].line && shape[1].line) {
+    if (!(s.have_used && s.used.suppress_self_clash) &&
+        mine[0] && mine[1] && solid[0] && solid[1] && clash_shape[0].line &&
+        clash_shape[1].line) {
         const std::array<S::Pose, 2> was = pose;
+        const bool sides = (fitted[0] || fitted[1]) && w.have_solved[0] && w.have_solved[1];
         const S::Touch k =
-            S::Separate(pose[C::Right], shape[C::Right], pose[C::Left], shape[C::Left],
+            S::Separate(pose[C::Right], clash_shape[C::Right], pose[C::Left], clash_shape[C::Left],
                         w.clash_met ? &w.clash_side : nullptr, S::CrossM * scale,
                         had[0] && had[1] ? &prev[C::Right] : nullptr,
                         had[0] && had[1] ? &prev[C::Left] : nullptr,
-                        w.clash_met ? w.clash_share : 0.5f);
+                        w.clash_met ? w.clash_share : 0.5f,
+                        sides ? &w.solved[C::Right] : nullptr, sides ? &w.solved[C::Left] : nullptr);
         met = k.any;
         w.clash_side = k.normal;
         w.clash_share = k.a_share;
@@ -1801,6 +2186,12 @@ void SolidWeapons(PoseSide& s, B::BodyInput& in, bool driven, int lever_hand, s6
         }
     }
     w.clash_met = met;
+    for (int i = 0; i < 2; ++i) {
+        if (mine[i]) {
+            w.solved[i] = pose[i];
+            w.have_solved[i] = true;
+        }
+    }
     s.blade.solid_fresh = feel;
     s.blade.solid = {clash.dt, clash.contact, clash.normal, clash.v};
     if (feel) {
@@ -1817,10 +2208,66 @@ void SolidWeapons(PoseSide& s, B::BodyInput& in, bool driven, int lever_hand, s6
     if (ride) {
         const B::ModelTarget& t = *in.target[C::Left];
         const B::Vec3 p = B::ToWorld(s.frame, t.p);
-        const B::Quat turn = B::Normalize(pose[C::Right].q * B::Conjugate(target[C::Right].q));
-        const B::Vec3 held = pose[C::Right].p + B::Rotate(turn, p - target[C::Right].p);
-        pose[C::Left] = {B::Lerp(p, held, two),
-                         B::Normalize(B::ScaleRotation(turn, two) * (s.frame.q * t.q))};
+        const auto attached = VR::TwoHand::FollowWeaponCorrection(
+            {target[C::Right].p, target[C::Right].q},
+            {pose[C::Right].p, pose[C::Right].q}, {p, s.frame.q * t.q}, two);
+        pose[C::Left] = {attached.p, attached.q};
+    }
+    // melee_deflect: the right weapon's capsules where it is now (the clash shape: fitted to its
+    // model when ready; not the hand's sphere), for the enemies' bullets (bloodborne_deflect.h).
+    if (mine[C::Right] && clash_shape[C::Right].line) {
+        const S::Shape& sh = clash_shape[C::Right];
+        const S::Pose& at = pose[C::Right];
+        VR::Deflect::Blade blade{};
+        const auto add = [&blade](B::Vec3 a, B::Vec3 b, float r) {
+            if (blade.n < VR::Deflect::MaxCapsules) {
+                blade.caps[static_cast<std::size_t>(blade.n++)] = {a, b, r};
+            }
+        };
+        add(S::At(at, sh.base), S::At(at, sh.tip), sh.line_r);
+        for (int k = 0; k < sh.extra; ++k) {
+            const S::Capsule& c = sh.more[static_cast<std::size_t>(k)];
+            add(S::At(at, c.a), S::At(at, c.b), c.r);
+        }
+        VR::Bloodborne::DeflectBlade(blade, scale, !s.reused, snap, now);
+    } else {
+        VR::Bloodborne::DeflectNoBlade();
+    }
+    // VR_SOLID_SHAPES (tests): each hand's shapes where its weapon is. The weapon-clash shape
+    // (authored/fitted capsules when ready) is `now` (green, =new); the wall shape is
+    // `old` (red, =old), normally a line, the same pair for Beast Claw.
+    static const bool debug_shapes = std::getenv("VR_SOLID_SHAPES") != nullptr;
+    if (debug_shapes) {
+        WW::DebugShapes d{};
+        d.ns = now;
+        for (int i = 0; i < 2; ++i) {
+            if (!mine[i]) {
+                continue;
+            }
+            const auto fill = [&](const S::Shape& sh, std::array<WW::ShapeCapsule, 8>& out,
+                                  u8& n) {
+                const auto add = [&](B::Vec3 a, B::Vec3 b, float r) {
+                    if (n < out.size()) {
+                        put(out[n].a, a);
+                        put(out[n].b, b);
+                        out[n].r = r;
+                        ++n;
+                    }
+                };
+                add(pose[i].p, pose[i].p, sh.hand_r);
+                if (sh.line) {
+                    add(S::At(pose[i], sh.base), S::At(pose[i], sh.tip), sh.line_r);
+                }
+                for (int k = 0; k < sh.extra; ++k) {
+                    const S::Capsule& c = sh.more[static_cast<std::size_t>(k)];
+                    add(S::At(pose[i], c.a), S::At(pose[i], c.b), c.r);
+                }
+            };
+            WW::DebugShapes::Hand& h = d.hand[static_cast<std::size_t>(i)];
+            fill(clash_shape[i], h.now, h.now_count);
+            fill(shape[i], h.old, h.old_count);
+        }
+        WW::DebugChannel().Store(d);
     }
     // The arms hold the weapons where they are.
     for (int i = 0; i < 2; ++i) {
@@ -1830,6 +2277,17 @@ void SolidWeapons(PoseSide& s, B::BodyInput& in, bool driven, int lever_hand, s6
         in.target[i]->p = B::ToModel(s.frame, pose[i].p);
         in.target[i]->q = B::Normalize(B::Conjugate(s.frame.q) * pose[i].q);
         s.target[i] = *in.target[i];
+    }
+    // A bullet deflected since the last update (bloodborne_deflect.cpp): the right weapon's strike
+    // (the sparks, the thud).
+    if (VR::Bloodborne::DeflectStrike k{}; VR::Bloodborne::TakeDeflectStrike(k) && mine[C::Right]) {
+        WW::Touching& out = w.state.hand[C::Right];
+        ++out.strike_serial;
+        out.strike_speed = k.speed;
+        out.steel = true;
+        put(out.point, track(k.point));
+        put(out.normal, B::WorldToTracking(k.normal, s.anchor.base_yaw, 1.0f));
+        put(out.slide, B::Vec3{});
     }
     w.state.ns = now;
     WW::Channel().Store(w.state);
@@ -1844,7 +2302,7 @@ void SolidWeapons(PoseSide& s, B::BodyInput& in, bool driven, int lever_hand, s6
 // stereo pair's second eye are no motion (as SolidWeapons). The hand on a lever (`lever_hand`, its
 // weapon hidden) is not the hunter's to ring, as when the game has the arm (-1: none).
 // Game:Main (the body's pose copy).
-void BladeSounds(PoseSide& s, B::BodyInput& in, bool driven, int lever_hand, s64 now) {
+void BladeSounds(PoseSide& s, const u8* chr, B::BodyInput& in, bool driven, int lever_hand, s64 now) {
     namespace S = VR::Solid;
     namespace BS = VR::BladeSound;
     BladeSide& b = s.blade;
@@ -1870,7 +2328,8 @@ void BladeSounds(PoseSide& s, B::BodyInput& in, bool driven, int lever_hand, s64
         own[i] = driven && s.frame.valid && in.target[i].has_value() &&
                  s.arm_weight[i] >= B::DetachWatch::OwnedWeight && i != lever_hand;
     }
-    if (!set.on || g_play_sound == nullptr || !own[0] || !own[1] || two > 0.0f) {
+    if (!set.on || g_play_sound == nullptr || !own[0] || !own[1] || two > 0.0f ||
+        (s.have_used && s.used.suppress_self_clash)) {
         b.have_last = false;
         b.have_side = false;
         b.solid_fresh = false;
@@ -1910,7 +2369,7 @@ void BladeSounds(PoseSide& s, B::BodyInput& in, bool driven, int lever_hand, s64
         std::array<S::Shape, 2> shape{};
         std::array<S::Pose, 2> pose{};
         for (int i = 0; i < 2; ++i) {
-            HandShape(i, scale, shape[i]);
+            HandShape(s, chr, i, scale, shape[i]);
             const B::ModelTarget& t = *in.target[i];
             pose[i] = {B::ToWorld(s.frame, t.p), B::Normalize(s.frame.q * t.q)};
         }
@@ -1964,6 +2423,9 @@ void BladeSounds(PoseSide& s, B::BodyInput& in, bool driven, int lever_hand, s64
         return;
     }
     const BS::Out o = b.director.Step(sample, set, grinding);
+    if (o.kind == BS::Kind::Scrape) {
+        VR::DualBlades::NoteStroke(); // a rub (the split blades hone: core/vr/dual_blades.h)
+    }
     if (o.grind > 0.0f && s.have_used && s.used.head_valid) {
         // Left or right of the head, as the whip's drag (the mix turns with it).
         const B::Vec3 eye = s.anchor.eye_world +
@@ -1978,7 +2440,9 @@ void BladeSounds(PoseSide& s, B::BodyInput& in, bool driven, int lever_hand, s64
     }
     alignas(16) std::array<float, 4> pos{point.x, point.y, point.z, 1.0f};
     u64 handle = 0;
-    const s32 type = g_sound_table != nullptr && Read<u8>(g_sound_table + 3) != 0 ? 0xA : 1;
+    // BladeSound pools contain verified c-prefixed (SoundType 1) events. The native
+    // animation sound-type flag must not reinterpret these IDs in the g namespace.
+    constexpr s32 type = 1;
     g_play_sound(&handle, pos.data(), type, o.id);
     if (b.played < 20 || BladeSoundLog()) {
         ++b.played;
@@ -2112,8 +2576,9 @@ void SolveBody(PoseSide& s, const u8* chr, const u8* pose, B::HkQsTransform* loc
         if (driven) {
             // A sample the XR thread stopped refreshing counts as lost (held 0.3 s first).
             B::TrackedHand hand{};
+            const bool optic = side == 0 && VR::MonocularEye(s.used.space_serial, now) >= 0;
             s.use[i] = s.hold[i].Update(hands_fresh ? s.used.hand[i] : B::TrackedHand{}, now,
-                                        HoldNs, hand, sample_ns, head);
+                                        optic ? MonocularHoldNs : HoldNs, hand, sample_ns, head);
             s.glitches += s.hold[i].rejected ? 1 : 0;
             if (s.use[i] != B::HandUse::Lost) {
                 // The right hand's weapon has its own grip (weapon_grip_<weapon>, the live
@@ -2195,10 +2660,19 @@ void SolveBody(PoseSide& s, const u8* chr, const u8* pose, B::HkQsTransform* loc
         // left out of the body's height goal: only your real head's height moves him (the hands
         // stay relative to the camera you see).
         B::Vec3 eye_rel = s.anchor.eye_rel;
+        s.stair_dy = 0.0f;
         if (VR::Tune::Get("body.height_from_head", settings.body_height_from_head ? 1.0f : 0.0f) !=
                 0.0f &&
             std::isfinite(s.anchor.camera_dip)) {
             eye_rel.y -= s.anchor.camera_dip;
+            // ... which his upper body then rides (BodyInput::stair_dy; VR_TUNE_FILE
+            // body.stair_ride=0: off, the shoulders on the root as before).
+            // A throw's or a visceral's rig places all of him itself (its own dip): none.
+            if (VR::Tune::Get("body.stair_ride", 1.0f) >= 0.5f && !s.anchor.rig_held &&
+                B::LengthSq(s.anchor.rig_offset) == 0.0f) {
+                s.stair_dy =
+                    B::StairRide(s.anchor.camera_dip, std::max(s.anchor.world_scale, 1e-3f));
+            }
         }
         s.last_eye_m = B::RotateToModel(s.frame, eye_rel);
         // fp_ahead_m / fp_ahead_down_m: the camera leads the hunter's eyes by this much along the
@@ -2219,6 +2693,7 @@ void SolveBody(PoseSide& s, const u8* chr, const u8* pose, B::HkQsTransform* loc
     in.chr_yaw = s.last_chr_yaw;
     in.head_yaw = s.last_head_yaw;
     in.eye_m = s.last_eye_m - s.last_ahead_m;
+    in.stair_dy = s.stair_dy;
     // All descendants of Master (legs, torso, arms and attached weapons) move
     // with the same anchor as the eye and controller targets, before the solve.
     in.rig_offset = s.frame.valid ? B::RotateToModel(s.frame, s.anchor.rig_offset) : B::Vec3{};
@@ -2318,10 +2793,16 @@ void SolveBody(PoseSide& s, const u8* chr, const u8* pose, B::HkQsTransform* loc
     if (!s.levelup_pose) s.standing_player = chr;
     // The hand on a lever (its fist on the handle, its weapon hidden): neither solid nor ringing.
     const int lever_held = lever_present ? lever_hand.hand : -1;
-    SolidWeapons(s, in, driven && !dead, lever_held, now); // weapon_wall: the weapons against the
+    SolidWeapons(s, chr, in, driven && !dead, lever_held, now); // weapon_wall: the weapons against the
                                                            // walls (off: returns at once)
-    BladeSounds(s, in, driven && !dead, lever_held, now); // blade_sounds: the two weapons ring
+    BladeSounds(s, chr, in, driven && !dead, lever_held, now); // blade_sounds: the two weapons ring
+    CorpseHandsUpdate(s, chr, in, driven && !dead, lever_held, now); // corpse_hands: bare hands
+    CorpseGripPresent(s, in, now); // ... and a holding one drawn on its corpse
     in.two_hand = s.have_used ? s.used.two_hand : 0.0f;
+    if (s.weapon_family == 50 && ReadArmStyle(chr) == 3 && !s.levelup_pose) {
+        in.right_weapon_local = VR::TwoHand::RightHandWeaponLocal(
+            s.weapon_family, 3, s.locals[C::R_Weapon], in.arm_weight[C::Right]);
+    }
     s.out = s.solver.Solve(s.locals.data(), in, params);
     if (s.levelup_pose && s.out.ok) s.out.written.set();
     s.solved = true;
@@ -2405,7 +2886,8 @@ void SolveBody(PoseSide& s, const u8* chr, const u8* pose, B::HkQsTransform* loc
     }
     s.edited = s.out.written;
     LogFingers(s, local, now);
-    ApplyGrip(s, local, dt);
+    ApplyFingerRig(s, local, now);
+    ApplyGrip(s, local, dt, chr);
     ApplyLeverGrip(s, local, now);
     ApplyMusicBoxGrip(s, local, now);
     std::memcpy(s.written_locals.data(), local, sizeof(s.written_locals));
@@ -2687,6 +3169,8 @@ void PublishStatus(PoseSide& s, s64 now, bool driven) {
     status.seq = ++s.status_seq;
     status.steady_ns = now;
     status.driven = driven && !DryRun();
+    status.kos_ritual_start_ns = s.kos_ritual_start_ns;
+    status.kos_ritual_sample_ns = s.kos_ritual_sample_ns;
     for (size_t i = 0; i < 2; ++i) {
         // A kept hit or dodge: the arm is drawn yours, but nothing uses it before the game's
         // cancel window (items, the crank: as when the game had it).
@@ -2696,6 +3180,7 @@ void PublishStatus(PoseSide& s, s64 now, bool driven) {
         status.detached[i] = status.driven && s.detach[i].detached;
         status.tracked[i] = s.use[i] != B::HandUse::Lost;
     }
+    status.items_ok = s.gate_out.items_ok;
     status.weapon_id = s.weapon_id >= 0 ? s.weapon_id : -1;
     status.weapon_slot = s.weapon_slot;
     status.left_weapon_slot = s.left_weapon_slot;
@@ -2800,7 +3285,13 @@ void PublishStatus(PoseSide& s, s64 now, bool driven) {
         }
     }
     u64 contact_drain_word = 0;
-    if (status.driven && s.frame.valid && s.out.ok && HeldVialOurs(now, contact_drain_word)) {
+    // The left arm's anatomy for a stab: the left hand's Blood Vial ours, or the right hand's
+    // empty syringe out (its stab gate needs the same zones and the right grip; without it the
+    // syringe never injected, the user's headset run, 2026-11-04).
+    VR::BloodDraw::Scene syringe{};
+    const bool syringe_out = VR::BloodDraw::LatestActive(now, syringe);
+    if (status.driven && s.frame.valid && s.out.ok &&
+        (HeldVialOurs(now, contact_drain_word) || syringe_out)) {
         auto locals = s.locals;
         // Visibility shrink must not shrink the anatomical head target.
         for (auto& local : locals)
@@ -2981,6 +3472,15 @@ void MainPoseWritten(u8* chr) {
         : !signals.ladder_valid || signals.ladder != -1   ? "a ladder"
                                                           : "the animation is not idle or walking";
     s.gate_out = s.gate.Step(signals, now);
+    // Read only on a fresh pose: republishing a stale pose must not extend the effect.
+    // Milkweed can swap the equipped Parasite for hidden families 400/410.
+    const bool kos = s.weapon_family == 380 || s.weapon_family == 400 || s.weapon_family == 410;
+    const bool ritual = kos && signals.ring_valid &&
+        signals.hp_valid && signals.hp > 0 && s.gate_out.held &&
+        s.gate_out.owner_id == 156046000 &&
+        (s.gate_out.reason == B::GateReason::None || s.gate_out.reason == B::GateReason::Anim);
+    s.kos_ritual_start_ns = ritual ? now - s.gate_out.owner_age_ns : 0;
+    s.kos_ritual_sample_ns = now;
     // Keep the player's last standing pose during the Doll's known kneel sequence.
     // The guest animation/event still runs to completion; only this main-player
     // render pose changes. NPCs, root motion, and the level-up script stay untouched.
@@ -3197,6 +3697,47 @@ void MainPoseWritten(u8* chr) {
 // Slot path: the wrapper's post call for every PlayerIns pose copy (rdi = the character). The
 // held vial (core/vr/bloodborne_held.h) ticks here for the main player too, also while the body
 // is disabled (with no arm gate then).
+// BodyLateRootFix's shift of the whole hunter (Master's local) for one frame's render, and where
+// it went (the render-camera hook and the pose copy run on the same loop thread).
+struct LateFix {
+    bool on{false};
+    const u8* chr{nullptr};
+    const u8* pose{nullptr};
+    B::HkQsTransform* local{nullptr};
+    float before[3]{};
+    float after[3]{};
+    u32 checks{0}; // log mode: GetDmyPolyMtx seen following the shift (the first few)
+};
+LateFix g_late_fix;
+
+// Takes the shift back out before anything reads the pose again: unless a fresh copy has replaced
+// Master since (it holds just what the shift left), it gets its value from before the shift. Only
+// on `main`, the main player now (a load that replaced him leaves the old one's memory alone).
+void UndoLateFix(const u8* main) {
+    auto& f = g_late_fix;
+    if (!f.on) {
+        return;
+    }
+    f.on = false;
+    const char* why = "";
+    u8* const pose = f.chr != nullptr && f.chr == main ? PoseNode(f.chr, why) : nullptr;
+    if (pose == nullptr || pose != f.pose || Read<B::HkQsTransform*>(pose + OffsetPoseLocal) != f.local) {
+        return;
+    }
+    auto& m = f.local[C::Master];
+    if (m.t[0] != f.after[0] || m.t[1] != f.after[1] || m.t[2] != f.after[2]) {
+        return; // a fresh copy since
+    }
+    std::memcpy(m.t, f.before, sizeof(f.before));
+    u8* const flags = Read<u8*>(pose + OffsetPoseFlags);
+    if (Read<s32>(pose + OffsetPoseFlagsSize) == C::BoneCount && Plausible(flags, 4)) {
+        for (int i = 0; i < C::BoneCount; ++i) {
+            std::memcpy(flags + 4 * i, &BoneFlagCopied, sizeof(BoneFlagCopied));
+        }
+        std::memcpy(pose + OffsetPoseSync, &SyncLocalOnly, sizeof(SyncLocalOnly));
+    }
+}
+
 void PS4_SYSV_ABI OnPoseWritten(u8* chr) {
     if (chr == nullptr) {
         return;
@@ -3206,6 +3747,7 @@ void PS4_SYSV_ABI OnPoseWritten(u8* chr) {
         g_other_calls.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    UndoLateFix(chr); // a throttled frame (no copy) keeps no render shift into its refresh and solve
     if (g_busy.test_and_set(std::memory_order_acquire)) {
         g_busy_calls.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -3215,7 +3757,7 @@ void PS4_SYSV_ABI OnPoseWritten(u8* chr) {
         MainPoseWritten(chr);
     }
     const B::GateOut& g = Pose().gate_out;
-    HeldPoseTick(chr, {body, g.reason, g.owner, g.held});
+    HeldPoseTick(chr, {body, g.reason, g.owner, g.held, B::BloodBulletVialWindow(g)});
     // The gun after the held item (a vial stepping aside for a pull is seen this update): its
     // shot, flash and status (core/vr/bloodborne_gun.h).
     const PoseSide& s = Pose();
@@ -3227,7 +3769,8 @@ void PS4_SYSV_ABI OnPoseWritten(u8* chr) {
                       body ? s.arm_weight[C::Left] : 0.0f, g.reason,
                       body && g.dodge_attack && g.ik[C::Left]});
     // Physical melee: the swing's attack on the IK blade (core/vr/bloodborne_melee.h).
-    MeleePoseTick(chr, {body, body && s.inactive == nullptr && !DryRun(),
+    const bool chair_grip = GehrmanChairGrabAvailable(0, s.last_pose_call_ns) || GehrmanChairGrabAvailable(1, s.last_pose_call_ns);
+    MeleePoseTick(chr, {body, body && s.inactive == nullptr && !DryRun() && !chair_grip,
                         g.ik[C::Right] && g.attack_ok[C::Right],
                         body ? s.arm_weight[C::Right] : 0.0f, g.reason, g.held, g.owner_id,
                         g.kept && g.ik[C::Right] && !g.attack_ok[C::Right],
@@ -3246,6 +3789,8 @@ void PS4_SYSV_ABI OnPoseWritten(u8* chr) {
 
 // Tail-patch path: after the copy of every character (rdi = the character, rsi = its pose).
 void PS4_SYSV_ABI OnPoseWrittenTail(u8* chr, u8* /*pose*/) {
+    GehrmanChairPose(chr);
+    SeverPose(chr);
     OnPoseWritten(chr);
 }
 
@@ -3711,6 +4256,118 @@ void LogInstalled(const char* how) {
         RecordPath().empty() ? std::string{} : " record=" + RecordPath());
 }
 
+// The Gehrman wheelchair (bloodborne_wheelchair.cpp) needs the seated Gehrman's own pose
+// copy. The slot hook wraps only the player classes' tables (PoseCopySlotRvas), so the chair
+// never saw him (the user's headset run, 2026-11-04: "I still can't push gehrman around"): the
+// same slot (+0xE0) of the ChrIns and EnemyIns tables it accepts, each checked to hold the same
+// pose copy first, wrapped only while the chair is on.
+constexpr std::array<u64, 2> NpcPoseCopySlotRvas = {0x538E2D0 + 0xE0, 0x538EBC0 + 0xE0};
+// (Never freed: a game thread may still call through the tables at exit.)
+Xbyak::CodeGenerator* g_npc_code = nullptr;
+
+// The same two tables' update (vt+0xF8, 0x18BF460, every character every frame on its own thread:
+// its ChrCtrl's ragdoll update writes a dead enemy's model-space pose from the ragdoll, after the
+// pose copy). Its wrapper (the Beast Claw's dismemberment: a cut corpse's piece is shrunk in that
+// pose too, bloodborne_sever.cpp SeverAfterUpdate) is built at start but in the game's tables only
+// while a cut corpse is hidden (SeverNpcUpdateHook): otherwise the game calls its own update
+// straight, nothing added.
+constexpr std::array<u64, 2> NpcUpdateSlotRvas = {0x538E2D0 + 0xF8, 0x538EBC0 + 0xF8};
+constexpr u64 NpcUpdateRva = 0x18BF460;
+std::array<Xbyak::CodeGenerator*, 2> g_npc_update_code{}; // never freed (as g_npc_code)
+std::mutex g_npc_update_mutex;
+u8* g_npc_update_module = nullptr;            // under g_npc_update_mutex
+std::array<u64, 2> g_npc_update_stub{};      // ... 0: that slot not wrapped
+bool g_npc_update_in = false;                // ... swapped in
+std::atomic<bool> g_npc_pose_wrapped{false}; // InstallNpcSlots swapped both pose slots
+
+void PS4_SYSV_ABI OnNpcUpdated(u8* chr) {
+    VR::Bloodborne::SeverAfterUpdate(chr);
+}
+
+void InstallNpcUpdateSlots(u8* module, u64 size) {
+    if (!VR::Bloodborne::SeverEnabled()) {
+        return;
+    }
+    const u64 original = reinterpret_cast<u64>(module + NpcUpdateRva);
+    int wrapped = 0;
+    for (size_t i = 0; i < NpcUpdateSlotRvas.size(); ++i) {
+        const u64 rva = NpcUpdateSlotRvas[i];
+        if (size < rva + sizeof(u64) || Read<u64>(module + rva) != original) {
+            LOG_WARNING(Core, "VR sever: NPC update slot {:#x} is not the update ({}); a ragdolled "
+                              "cut corpse keeps its part there",
+                        rva, size < rva + sizeof(u64)
+                                 ? std::string{"past the eboot"}
+                                 : Rva(reinterpret_cast<const u8*>(Read<u64>(module + rva))));
+            continue;
+        }
+        void* stub = nullptr;
+        try {
+            g_npc_update_code[i] = new Xbyak::CodeGenerator(256);
+            stub = Hook::EmitPostCallWrapper(*g_npc_update_code[i], original,
+                                             reinterpret_cast<void*>(&OnNpcUpdated));
+        } catch (const Xbyak::Error& e) {
+            LOG_ERROR(Core, "VR sever: no NPC update wrapper ({})", e.what());
+            continue;
+        }
+        std::scoped_lock lock{g_npc_update_mutex};
+        g_npc_update_module = module;
+        g_npc_update_stub[i] = reinterpret_cast<u64>(stub);
+        ++wrapped;
+    }
+    LOG_INFO(Core, "VR sever: {} of 2 NPC update wrappers ready (in the game's tables only while a "
+                   "cut corpse is hidden, its part hidden in its drawn pose)",
+             wrapped);
+}
+
+void PS4_SYSV_ABI OnNpcPoseWritten(u8* chr) {
+    VR::Bloodborne::GehrmanChairPose(chr);
+    VR::Bloodborne::SeverPose(chr); // a Beast Claw cut corpse's piece hidden
+}
+
+void InstallNpcSlots(u8* module, u64 size, u64 original) {
+    if (!VR::Bloodborne::GehrmanChairEnabled() && !VR::Bloodborne::SeverEnabled()) {
+        return;
+    }
+    for (const u64 rva : NpcPoseCopySlotRvas) {
+        if (size < rva + sizeof(u64) || Read<u64>(module + rva) != original) {
+            LOG_WARNING(Core, "VR wheelchair: NPC pose slot {:#x} is not the pose copy ({}); the "
+                              "chair stays still",
+                        rva, size < rva + sizeof(u64)
+                                 ? std::string{"past the eboot"}
+                                 : Rva(reinterpret_cast<const u8*>(Read<u64>(module + rva))));
+            return;
+        }
+    }
+    void* stub = nullptr;
+    try {
+        g_npc_code = new Xbyak::CodeGenerator(256);
+        stub = Hook::EmitPostCallWrapper(*g_npc_code, original,
+                                         reinterpret_cast<void*>(&OnNpcPoseWritten));
+    } catch (const Xbyak::Error& e) {
+        LOG_ERROR(Core, "VR wheelchair: no NPC pose wrapper ({}); the chair stays still", e.what());
+        return;
+    }
+    const u64 replacement = reinterpret_cast<u64>(stub);
+    for (size_t i = 0; i < NpcPoseCopySlotRvas.size(); ++i) {
+        u64 found = 0;
+        if (!Hook::SwapVtableSlot(module + NpcPoseCopySlotRvas[i], original, replacement, found)) {
+            for (size_t k = 0; k < i; ++k) {
+                u64 ignored = 0;
+                Hook::SwapVtableSlot(module + NpcPoseCopySlotRvas[k], replacement, original,
+                                     ignored);
+            }
+            LOG_WARNING(Core, "VR wheelchair: could not swap NPC pose slot {:#x}; the chair stays "
+                              "still",
+                        NpcPoseCopySlotRvas[i]);
+            return;
+        }
+    }
+    g_npc_pose_wrapped.store(true, std::memory_order_release);
+    LOG_INFO(Core, "VR wheelchair: NPC pose slots {:#x} and {:#x} wrapped (Gehrman's pose, cut "
+                   "corpses)",
+             NpcPoseCopySlotRvas[0], NpcPoseCopySlotRvas[1]);
+}
+
 void InstallSlots(u8* module, u64 size, const char* how) {
     if (g_tried) {
         return;
@@ -3773,6 +4430,8 @@ void InstallSlots(u8* module, u64 size, const char* how) {
                  PoseCopyRva, fmt::ptr(stub));
     }
     g_installed.store(true);
+    InstallNpcSlots(module, size, original);
+    InstallNpcUpdateSlots(module, size);
     LogInstalled(how);
 }
 
@@ -3834,12 +4493,61 @@ void InstallTailPatch(u8* module, u64 size) {
 
 } // Anonymous namespace
 
+bool SeverHookedCharacter(const u8* chr) {
+    if (!Plausible(chr) || !g_npc_pose_wrapped.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const u64 table = Read<u64>(chr);
+    std::scoped_lock lock{g_npc_update_mutex};
+    if (g_npc_update_module == nullptr) {
+        return false;
+    }
+    for (size_t i = 0; i < NpcUpdateSlotRvas.size(); ++i) {
+        const u64 base = reinterpret_cast<u64>(g_npc_update_module) + NpcUpdateSlotRvas[i] - 0xF8;
+        if (table == base) {
+            return g_npc_update_stub[i] != 0;
+        }
+    }
+    return false;
+}
+
+void SeverNpcUpdateHook(bool on) {
+    std::scoped_lock lock{g_npc_update_mutex};
+    if (g_npc_update_module == nullptr || on == g_npc_update_in) {
+        return;
+    }
+    const u64 original = reinterpret_cast<u64>(g_npc_update_module + NpcUpdateRva);
+    int swapped = 0;
+    for (size_t i = 0; i < NpcUpdateSlotRvas.size(); ++i) {
+        const u64 stub = g_npc_update_stub[i];
+        if (stub == 0) {
+            continue;
+        }
+        u64 found = 0;
+        // (An aligned word swapped atomically: a character mid-update finishes either way; the
+        // wrapper's code stays for good.)
+        if (Hook::SwapVtableSlot(g_npc_update_module + NpcUpdateSlotRvas[i], on ? original : stub,
+                                 on ? stub : original, found)) {
+            ++swapped;
+        } else {
+            LOG_WARNING(Core, "VR sever: NPC update slot {:#x} holds {:#x}, not the expected: left "
+                              "as it is",
+                        NpcUpdateSlotRvas[i], found);
+        }
+    }
+    g_npc_update_in = on;
+    LOG_INFO(Core, "VR sever: NPC update wrapper {} ({} slots)",
+             on ? "in (a cut corpse is hidden)" : "out (no cut corpse left: the game's own update)",
+             swapped);
+}
+
 void BodyEbootLoaded(VAddr base, u64 size) {
     if (!VR::IsEnabled() || g_base != nullptr || base == 0) {
         return;
     }
     g_base = reinterpret_cast<u8*>(base);
     g_size = size;
+    InstallGehrmanChair(base, size);
     if (Method() == HookMethod::Code) {
         InstallTailPatch(g_base, size);
     }
@@ -3915,6 +4623,99 @@ bool BodyRootHeight(float& height, float* yaw) {
     return true;
 }
 
+// The root's late move (the tester's 2026-11-04 "my weapons jitter up and down a bit as the hunter
+// goes up and down the stairs"). His arms are solved against W at the pose copy, assuming the eye
+// this frame sits eye_rel from W plus its predicted move (EyeTracker::PredictDrift, the comfort
+// camera's next height: ComfortNextDeltaY). The game then moves W again (its ground fit, every
+// step on stairs: the prediction, the last frame's move, alternates there) and the comfort camera
+// lands where it lands: the weapons missed the view by up to 6 cm on the mock's stairs. Here, at
+// the render-camera hook with this frame's camera placed and before anything reads his hands
+// (HeldRenderTick, VitalsRenderTick, QuickItemsRenderTick: GetDmyPolyMtx and the render rebuild
+// the model pose from the locals, the mock's probe), both are known: the whole hunter (Master)
+// moves by how far the eye really sits from W against what the solve assumed, for this frame's
+// render only (UndoLateFix before the next copy reads the pose), so his hands and weapons are
+// where you hold them against the view. First person with our arms in the pose (not a held
+// visceral rig: it places its own), translation only, at most 10 cm (more is a warp, not a step).
+// VR_TUNE body.late_fix=0: off. VR_SYNC_LOG: each frame's shift and his hands against the eye.
+void BodyLateRootFix(const VR::CameraOverride& result, const float* position) {
+    if (g_base == nullptr || !g_installed.load(std::memory_order_relaxed) ||
+        g_disabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    u8* const chr = MainPlayer();
+    UndoLateFix(chr); // the last frame's, when no pose copy came since
+    if (!FirstPersonNow() || position == nullptr || !result.active) {
+        return;
+    }
+    PoseSide& s = Pose();
+    const s64 now = B::SteadyNowNs();
+    if (chr == nullptr || !s.edits_in_pose || s.edits_chr != chr || !s.frame.valid ||
+        s.inactive != nullptr || s.anchor.rig_held || now - s.last_solve_ns > 100'000'000) {
+        return;
+    }
+    std::array<float, 12> rows{};
+    B::ChrFrame w{};
+    if (!ReadWorld(chr, rows) || !B::ChrFrameFromRows(rows, w)) {
+        return;
+    }
+    const B::Vec3 eye{position[0] - result.eye_offset.x, position[1] - result.eye_offset.y,
+                      position[2] - result.eye_offset.z};
+    const float scale = s.anchor.world_scale > 0.0f ? s.anchor.world_scale : 1.0f;
+    const char* why = "";
+    u8* const pose = PoseNode(chr, why);
+    auto* const local = pose != nullptr ? Read<B::HkQsTransform*>(pose + OffsetPoseLocal) : nullptr;
+    u8* const flags = pose != nullptr ? Read<u8*>(pose + OffsetPoseFlags) : nullptr;
+    B::Vec3 shift{};
+    bool on = false;
+    if (pose != nullptr && pose == s.edits_pose && local == s.edits_local &&
+        Read<s32>(pose + OffsetPoseFlagsSize) == C::BoneCount && Plausible(flags, 4)) {
+        // Rebuilt from the locals against the character as it is now, shift or not: the model
+        // pose the game synced before its late move gave his dummies (GetDmyPolyMtx: our vial,
+        // the gauge, the quick items) his hands from before it.
+        const auto resync = [&] {
+            for (int i = 0; i < C::BoneCount; ++i) {
+                std::memcpy(flags + 4 * i, &BoneFlagCopied, sizeof(BoneFlagCopied));
+            }
+            std::memcpy(pose + OffsetPoseSync, &SyncLocalOnly, sizeof(SyncLocalOnly));
+        };
+        resync();
+        // As far as his arms are ours (the arm weights, blending): the game's own hands (a ladder's
+        // rungs, an event) stay where the game put them against the world.
+        const float own = std::clamp(std::max(s.arm_weight[0], s.arm_weight[1]), 0.0f, 1.0f);
+        shift = ((eye - w.t) - s.anchor.eye_rel) * own;
+        on = VR::Tune::Get("body.late_fix", 1.0f) >= 0.5f && B::IsFinite(shift) &&
+             B::Length(shift) >= 1e-4f && B::Length(shift) <= 0.10f * scale;
+        if (on) {
+            const B::Vec3 m = B::RotateToModel(w, shift);
+            auto& f = g_late_fix;
+            f.on = true;
+            f.chr = chr;
+            f.pose = pose;
+            f.local = local;
+            std::memcpy(f.before, local[C::Master].t, sizeof(f.before));
+            local[C::Master].t[0] += m.x;
+            local[C::Master].t[1] += m.y;
+            local[C::Master].t[2] += m.z;
+            std::memcpy(f.after, local[C::Master].t, sizeof(f.after));
+            resync();
+        }
+    }
+    // (The left palm, dummy 3 on L_Hand itself: the weapon's dummy 300 also carries its weighted
+    // sway. Both as the game's dummies place them: they trail his drawn hands by one update of your
+    // play space's move, which inframe_hand_sync carries what is placed from them across, so this
+    // is not what the screen shows; that is measured by tracking the hand in the mirror's
+    // recording.)
+    if (B::Vec3 palm{}, blade{}; Common::SyncLog::On() && g_dmy_poly != nullptr &&
+                                 DummyAt(chr, 3, palm) && DummyAt(chr, 300, blade)) {
+        const B::Vec3 late = w.t - (s.frame.t + s.drift);
+        Common::SyncLog::Line("latefix applied=%d shift=(%.4f %.4f %.4f) late=(%.4f %.4f %.4f) "
+                              "hand_eye=(%.4f %.4f %.4f) weapon_eye=(%.4f %.4f %.4f)",
+                              g_late_fix.on ? 1 : 0, shift.x, shift.y, shift.z, late.x, late.y,
+                              late.z, palm.x - eye.x, palm.y - eye.y, palm.z - eye.z,
+                              blade.x - eye.x, blade.y - eye.y, blade.z - eye.z);
+    }
+}
+
 void BodyRenderTick(const VR::CameraOverride* result, const float* position, bool fp_follow) {
     static VR::GrabCamera::ThrowBodyRig throw_rig;
     if (g_base == nullptr) {
@@ -3930,6 +4731,20 @@ void BodyRenderTick(const VR::CameraOverride* result, const float* position, boo
     }
     if (!g_installed.load(std::memory_order_relaxed) ||
         g_disabled.load(std::memory_order_relaxed)) {
+        // (No body: third person, or the body off. The map he stands in all the same
+        // (game_area.h: the fog's banks and every look of one area go by it; without it the
+        // taken-over fog was nowhere in third person, the tester, 2026-11-17) and the walls round
+        // the lamps that light the fog near him (map_lights.h Reach).)
+        if (u8* const hunter = MainPlayer(); hunter != nullptr) {
+            VR::GameArea::Publish(Read<u32>(hunter + VR::GameArea::PlayerMapOffset));
+            StrangeMoonTick(); // (... and whether the blood moon is up: bloodborne_frame_rate.h)
+            std::array<float, 12> rows{};
+            B::ChrFrame frame{};
+            if (ReadWorld(hunter, rows) && B::ChrFrameFromRows(rows, frame)) {
+                VR::GameArea::PublishHunter(frame.t.x, frame.t.y, frame.t.z);
+                FogLampReachTick(frame.t.x, frame.t.y, frame.t.z);
+            }
+        }
         return;
     }
     auto& r = Render();
@@ -3998,8 +4813,67 @@ void BodyRenderTick(const VR::CameraOverride* result, const float* position, boo
                                                result->throw_weight, result->world_scale, now);
         }
         anchor.rig_held = result->throw_holding;
-        // The renderer's test for his own parts' draws (vk_rasterizer_vr_draws.cpp).
+        // The renderer's test for his own parts' draws (vk_rasterizer_vr_draws.cpp): his origin,
+        // and, only while it asks (a rigid piece near him), his bones of this tick's edited pose
+        // (a piece is his only when it sits on one of them).
         VR::SetRecordPlayerPosition(result->record_id, {frame.t.x, frame.t.y, frame.t.z});
+        // ... and the map he stands in (game_area.h: looks that belong to one area).
+        if (const u8* const hunter = MainPlayer(); hunter != nullptr) {
+            VR::GameArea::Publish(Read<u32>(hunter + VR::GameArea::PlayerMapOffset));
+            StrangeMoonTick(); // (... and whether the blood moon is up: bloodborne_frame_rate.h)
+        }
+        VR::GameArea::PublishHunter(frame.t.x, frame.t.y, frame.t.z);
+        // ... and the walls round the lamps that light the fog near him (map_lights.h Reach).
+        FogLampReachTick(frame.t.x, frame.t.y, frame.t.z);
+        static_assert(VR::PlayerBoneCount == C::BoneCount);
+        if (const PoseSide& pose_side = Pose(); pose_side.solved && VR::PlayerBonesWanted()) {
+            std::array<B::QsTransform, C::BoneCount> model;
+            if (B::LocalToModel(pose_side.locals.data(), C::Parents.data(), C::BoneCount,
+                                model.data())) {
+                std::array<VR::Vec3, VR::PlayerBoneCount> bones;
+                for (int b = 0; b < C::BoneCount; ++b) {
+                    const B::Vec3 w = B::RotateToWorld(frame, model[b].t);
+                    bones[b] = {w.x, w.y, w.z};
+                }
+                VR::SetRecordPlayerBones(result->record_id, bones);
+            }
+        }
+        // The lamp shadows' other casters (only while the renderer asks): live enemies' and
+        // NPCs' hurtbox capsules within 15 m of him, nearest body first.
+        if (VR::ShadowCastersWanted()) {
+            [[maybe_unused]] const auto gather_t0 = std::chrono::steady_clock::now();
+            static EnemyCapsules found; // Game:Main only (16 KB)
+            VR::ShadowCasters casters;
+            const float scale = result->world_scale > 0.0f ? result->world_scale : 1.0f;
+            const size_t n = GatherEnemyCapsules(frame.t, 15.0f * scale, scale, found);
+            u32 last_handle = ~0u;
+            for (size_t i = 0; i < n && casters.capsule_count < VR::ShadowCasters::MaxCapsules; ++i) {
+                if (found.handle[i] != last_handle) {
+                    if (casters.body_count == VR::ShadowCasters::MaxBodies) {
+                        break;
+                    }
+                    last_handle = found.handle[i];
+                    casters.bodies[casters.body_count++] = {casters.capsule_count, 0u};
+                }
+                const auto& c = found.capsules[i];
+                casters.capsules[casters.capsule_count++] = {{c.a.x, c.a.y, c.a.z}, {c.b.x, c.b.y, c.b.z}, c.radius};
+                ++casters.bodies[casters.body_count - 1].count;
+            }
+            VR::SetRecordShadowCasters(result->record_id, casters);
+            if constexpr (Common::Log::Enabled) {
+                // (Tests: the gather's CPU time, game thread, a frame on average.)
+                static u64 gather_ns = 0;
+                static u32 gather_frames = 0;
+                gather_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - gather_t0).count());
+                if (++gather_frames == 900) {
+                    LOG_INFO(Core, "VR lamp shadows casters: {:.1f} us a frame (game thread, 900 frames)",
+                             double(gather_ns) / 900.0 / 1000.0);
+                    gather_ns = 0;
+                    gather_frames = 0;
+                }
+            }
+        }
         anchor.head_k = {result->head_position.x, result->head_position.y, result->head_position.z};
         anchor.base_yaw = result->base_yaw;
         anchor.view_yaw = result->view_yaw;

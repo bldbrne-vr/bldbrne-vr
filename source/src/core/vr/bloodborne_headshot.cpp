@@ -130,4 +130,15 @@ float GunHeadshotDamage(const u8* result, const u8* target, float damage) {
     }
     return dry ? damage : after;
 }
+bool HitBodyName(const u8* result, const u8* target, std::array<char, 64>& name) {
+    name.fill(0);
+    if (!enabled || !result || !target)
+        return false;
+    const auto part = Headshot::Resolve(reinterpret_cast<std::uint64_t>(target),
+                                        Read<s32>(result + 0x1B0), Copy);
+    if (part.region == Headshot::Region::Unknown)
+        return false;
+    name = part.name;
+    return true;
+}
 } // namespace VR::Bloodborne

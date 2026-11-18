@@ -138,6 +138,11 @@ public:
         return values_capacity - free_list.size();
     }
 
+    /// One past the highest index ever handed out (is_allocated tells which are live).
+    std::size_t capacity() const noexcept {
+        return values_capacity;
+    }
+
     iterator begin() noexcept {
         return iterator(*this, 0);
     }

@@ -16,6 +16,7 @@
 #include "core/vr/bloodborne_menu.h"
 #include "core/vr/hook_util.h"
 #include "core/vr/lamp_channel.h"
+#include "core/vr/soft_save.h"
 #include "core/vr/lamp_native.h"
 #include "core/vr/lamp_sequence.h"
 #include "core/vr/vr_session.h"
@@ -341,6 +342,7 @@ bool Warp(u8* player) {
         Refuse("warp effect rejected; respawn restored");
         return false;
     }
+    SoftSave::LanternUsed();
     return true;
 }
 void Next(Phase value, s64 now) {
@@ -436,30 +438,29 @@ NearLamp FindNearLamp() {
     return out;
 }
 
-// The lamp the box belongs to: the conversation's talk id, else the lamp object you stand at,
-// else (no object list) the respawn point. The respawn point alone was wrong whenever you last
-// rested elsewhere (the 2026-10-14 run: at Central Yharnam's box with respawn 2412952, Rest took
-// you to the Great Bridge).
-const P::Lamp* CurrentLamp(int talk_id, bool& verified) {
-    verified = true;
+// The lamp the box belongs to: the conversation's talk id, else the lamp object you stand at
+// (every lamp's object is within 0.53 m of its talk character, all 44 checked in the maps), else
+// none: the box is not a lamp's, and the game's own box answers it. The respawn point no longer
+// stands in. It was the wrong lamp whenever you last rested elsewhere (the 2026-10-14 run: Rest at
+// Central Yharnam took you to the Great Bridge), and it put the lamp page on a box 27 m from any
+// lamp (the 2026-10-30 report: a chest in the Nightmare of Mensis).
+const P::Lamp* CurrentLamp(int talk_id) {
     if (const auto* lamp = P::ByTalk(talk_id))
         return lamp;
     const NearLamp found = FindNearLamp();
-    const int respawn = Read<s32>(Global(GameMan) + 0x1528);
     if (found.lamp) {
-        LOG_INFO(Core, "VR lamp: no talk id: the lamp object {:.2f} m away ({}; respawn {})",
-                 found.distance, found.lamp->name, respawn);
+        LOG_INFO(Core, "VR lamp: no talk id: the lamp object {:.2f} m away ({})", found.distance,
+                 found.lamp->name);
         return found.lamp;
     }
     if (found.searched) {
-        LOG_WARNING(Core, "VR lamp: no talk id and no lamp object within {:.0f} m; the respawn "
-                          "point {} as before",
-                    NearLampM, respawn);
+        LOG_INFO(Core, "VR lamp: no talk id and no lamp object within {:.0f} m: not a lamp's box; "
+                       "the game's own box answers it",
+                 NearLampM);
     } else {
-        LOG_WARNING(Core, "VR lamp: no talk id and no object list; the respawn point {}", respawn);
+        LOG_INFO(Core, "VR lamp: no talk id and no object list: the game's own box answers it");
     }
-    verified = false; // The last respawn point may belong to a different map.
-    return P::ByReturnPoint(respawn);
+    return nullptr;
 }
 const P::Lamp* offered_lamp{};
 bool offered_lamp_verified{};
@@ -544,10 +545,15 @@ void LampsSiteA(u8* player) {
         LOG_INFO(Core, "VR lamp: dialog serial {} talk {} message {} ({} {}) respawn {}", serial,
                  talk_id, message, Read<s32>(dialog + 4), Read<s32>(dialog + 8),
                  Read<s32>(Global(GameMan) + 0x1528));
-        const auto* lamp = CurrentLamp(talk_id, offered_lamp_verified);
+        const auto* lamp = CurrentLamp(talk_id);
         offered_lamp = lamp;
-        if (!lamp || !P::Available(*lamp, Flag)) {
-            Refuse("unrecognised, unlit or blocked current lamp");
+        offered_lamp_verified = lamp != nullptr; // by its talk id or its object, never a guess
+        if (!lamp) {
+            Refuse("no lamp here");
+            return;
+        }
+        if (!P::Available(*lamp, Flag)) {
+            Refuse("unlit or blocked current lamp");
             return;
         }
         if (Read<s32>(dialog + 0x18) != -1) {
@@ -647,6 +653,7 @@ void LampsSiteA(u8* player) {
             cleanup_arrival.Begin(reinterpret_cast<uintptr_t>(player),
                                   P::ChangesMapForCleanup(request.action, offered_lamp,
                                                           offered_lamp_verified), now);
+            if (request.action == P::Action::Dream) SoftSave::LanternUsed();
             Cancel("vanilla response delivered");
             break;
         case P::Sequence::Result::Warp:

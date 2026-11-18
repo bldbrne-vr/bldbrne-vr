@@ -8,10 +8,12 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <xbyak/xbyak.h>
 
@@ -63,10 +65,110 @@ float g_yaw_sign = 1.0f;
 // position row stays. One per guest thread, reused at every call.
 alignas(16) thread_local float t_matrix[16];
 
+// body_fill_lights=2: the lazy camera's view, shared by every builder call: the head's yaw off
+// the hunter's heading (stick and body turns pass at once, as the flat game's camera follows the
+// hunter) and the view's pitch. `settled` trails them with the catch-up time; the lights get the
+// settled view plus the share of what is left, so a look reaches them as the share at once.
+struct LazyView {
+    std::mutex mutex;
+    bool valid = false;
+    float yaw = 0.0f, pitch = 0.0f;
+    std::chrono::steady_clock::time_point at{};
+};
+LazyView g_lazy;
+
+float WrapPi(float a) {
+    constexpr float Pi = 3.14159265f;
+    return a - 2.0f * Pi * std::floor((a + Pi) / (2.0f * Pi));
+}
+
+// Follows `target` over `catchup` seconds (about 95% settled; 0 = at once) and returns the
+// lights' angle: the settled one plus `share` of the rest.
+float Lazy(float& settled, float target, float share, float catchup, float dt, bool wrap) {
+    const auto diff = [wrap](float a, float b) { return wrap ? WrapPi(a - b) : a - b; };
+    const float keep = catchup > 0.0f ? std::exp(-3.0f * dt / catchup) : 0.0f;
+    settled = target - diff(target, settled) * keep;
+    if (wrap) {
+        settled = WrapPi(settled);
+    }
+    return settled + share * diff(target, settled);
+}
+
+// The game's matrix turned from its own view to the lazy one: forward and up tipped by the pitch
+// difference (about the camera's right), then all three rows turned about the world's up by the
+// yaw difference. Roll and the position row stay; a settled view returns the game's matrix.
+// `head_yaw`: the newest camera update's look off the hunter's heading (the level builder's).
+const float* LazyLightMatrix(const float* m, float head_yaw) {
+    const float* const fwd = m + 8;
+    const float flat = std::sqrt(fwd[0] * fwd[0] + fwd[2] * fwd[2]);
+    if (!(flat > 0.05f)) {
+        return m; // looking straight up or down: no heading
+    }
+    // The head's look in the matrix's yaw (the level builder turns the camera by +sign * head_yaw
+    // back onto the hunter's heading).
+    const float look = WrapPi(-g_yaw_sign * head_yaw);
+    const float pitch = std::atan2(fwd[1], flat);
+    const auto& s = VR::GetSettings();
+    float light_look, light_pitch;
+    {
+        std::scoped_lock lk{g_lazy.mutex};
+        const auto now = std::chrono::steady_clock::now();
+        const float dt = std::chrono::duration<float>(now - g_lazy.at).count();
+        g_lazy.at = now;
+        if (!g_lazy.valid || dt > 0.5f) {
+            // The first frame, or back from a menu, a load or a cinematic: start settled.
+            g_lazy.valid = true;
+            g_lazy.yaw = look;
+            g_lazy.pitch = pitch;
+        }
+        light_look = Lazy(g_lazy.yaw, look, s.fill_light_yaw_share, s.fill_light_yaw_catchup, dt,
+                          true);
+        light_pitch = Lazy(g_lazy.pitch, pitch, s.fill_light_pitch_share,
+                           s.fill_light_pitch_catchup, dt, false);
+    }
+    const float dp = light_pitch - pitch;
+    const float dy = WrapPi(light_look - look);
+    float rows[3][3];
+    for (int r = 0; r < 3; ++r) {
+        for (int k = 0; k < 3; ++k) {
+            rows[r][k] = m[r * 4 + k];
+        }
+    }
+    // Pitch: forward toward up by dp (up's own sign keeps an upside-down matrix right).
+    const float cp = std::cos(dp), sp = std::sin(dp);
+    const float up_sign = m[5] >= 0.0f ? 1.0f : -1.0f;
+    for (int k = 0; k < 3; ++k) {
+        const float f = rows[2][k], u = rows[1][k];
+        rows[2][k] = f * cp + up_sign * u * sp;
+        rows[1][k] = u * cp - up_sign * f * sp;
+    }
+    // Yaw: about the world's up, the level builder's turn (atan2(x, z) grows by dy).
+    const float cy = std::cos(dy), sy = std::sin(dy);
+    for (auto& row : rows) {
+        const float x = row[0] * cy + row[2] * sy;
+        row[2] = -row[0] * sy + row[2] * cy;
+        row[0] = x;
+    }
+    float* const t = t_matrix;
+    for (int r = 0; r < 3; ++r) {
+        for (int k = 0; k < 3; ++k) {
+            t[r * 4 + k] = rows[r][k];
+        }
+        t[r * 4 + 3] = m[r * 4 + 3];
+    }
+    std::memcpy(t + 12, m + 12, 4 * sizeof(float));
+    g_turned.fetch_add(1, std::memory_order_relaxed);
+    return t;
+}
+
 const float* PS4_SYSV_ABI BodyLightMatrix(const float* m) {
     float yaw = 0.0f;
-    if (!VR::GetSettings().body_fill_lights || !VR::NewestHeadYaw(yaw)) {
+    const int mode = VR::GetSettings().body_fill_lights;
+    if (mode == 0 || !VR::NewestHeadYaw(yaw)) {
         return m; // menus, cinematics, the virtual screen, or off: the game's camera
+    }
+    if (mode == 2) {
+        return LazyLightMatrix(m, yaw);
     }
     const float* const right = m;
     const float* const up = m + 4;
@@ -177,8 +279,10 @@ void InstallLights(VAddr base, u64 size) {
              "VR lights: the light-set builders at {:#x} and {:#x} hooked; camera-attached fill "
              "lights follow {} (body_fill_lights={}, live; yaw sign {:+.0f})",
              Builders[0].rva, Builders[1].rva,
-             VR::GetSettings().body_fill_lights ? "the hunter's heading" : "your head, as the game",
-             VR::GetSettings().body_fill_lights ? 1 : 0, g_yaw_sign);
+             VR::GetSettings().body_fill_lights == 2   ? "a lazy camera"
+             : VR::GetSettings().body_fill_lights == 1 ? "the hunter's heading"
+                                                       : "your head, as the game",
+             VR::GetSettings().body_fill_lights, g_yaw_sign);
 }
 
 } // namespace VR::Bloodborne

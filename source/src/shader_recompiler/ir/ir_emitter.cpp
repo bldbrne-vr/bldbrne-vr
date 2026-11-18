@@ -442,6 +442,88 @@ U32 IREmitter::ReadConst(const Value& base, const U32& offset) {
     return Inst<U32>(Opcode::ReadConst, base, offset);
 }
 
+F32 IREmitter::VrMoonShadow(const Value& ndc, const Value& uv, const F32& depth) {
+    return Inst<F32>(Opcode::VrMoonShadow, ndc, uv, depth);
+}
+
+Value IREmitter::VrReflection(const Value& ndc, const Value& uv, const F32& depth) {
+    return Inst(Opcode::VrReflection, ndc, uv, depth);
+}
+
+Value IREmitter::VrReflectionUpsample(const Value& bilinear, const Value& uv, const F32& depth,
+                                      const F32& lod) {
+    return Inst(Opcode::VrReflectionUpsample, bilinear, uv, depth, lod);
+}
+
+F32 IREmitter::VrLightVisibility(const U32& light, const Value& ndc, const Value& uv,
+                                     const F32& depth) {
+    return Inst<F32>(Opcode::VrLightVisibility, light, ndc, uv, depth);
+}
+
+Value IREmitter::VrBounceLight(const Value& ndc, const Value& uv, const F32& depth) {
+    return Inst(Opcode::VrBounceLight, ndc, uv, depth);
+}
+
+Value IREmitter::VrFogLight(const Value& ndc, const Value& uv, const F32& depth) {
+    return Inst(Opcode::VrFogLight, ndc, uv, depth);
+}
+
+Value IREmitter::VrCinematic(const Value& colour) {
+    return Inst(Opcode::VrCinematic, colour);
+}
+
+Value IREmitter::VrFilmic(const Value& x, const Value& e) {
+    return Inst(Opcode::VrFilmic, x, e);
+}
+
+Value IREmitter::VrParticleAir(const Value& e, const Value& rgb) {
+    return Inst(Opcode::VrParticleAir, e, rgb);
+}
+
+F32 IREmitter::VrExposure(const Value& x) {
+    return Inst<F32>(Opcode::VrExposure, x);
+}
+
+F32 IREmitter::VrSpecularAa(const F32& gloss, const Value& normal, const F32& depth,
+                            const U32& matrix) {
+    return Inst<F32>(Opcode::VrSpecularAa, gloss, normal, depth, matrix);
+}
+
+F32 IREmitter::VrBumpDepth(const F32& height) {
+    return Inst<F32>(Opcode::VrBumpDepth, height);
+}
+
+Value IREmitter::VrBumpMarch(const U32& handle, const Value& view, const Value& at,
+                             const Value& base, const F32& height, const F32& near) {
+    return Inst(Opcode::VrBumpMarch, handle, view, at, base, height, near);
+}
+
+Value IREmitter::VrBumpSeed(const U32& handle, const Value& at) {
+    return Inst(Opcode::VrBumpSeed, handle, at);
+}
+
+Value IREmitter::VrMoonShafts(const Value& ndc, const Value& uv, const F32& depth,
+                              const U32& sets_image) {
+    return Inst(Opcode::VrMoonShafts, ndc, uv, depth, sets_image);
+}
+
+Value IREmitter::VrAirProbe(const Value& ndc, const Value& uv, const F32& depth,
+                            const U32& sets_image) {
+    return Inst(Opcode::VrAirProbe, ndc, uv, depth, sets_image);
+}
+
+F32 IREmitter::VrAirCompute() {
+    return Inst<F32>(Opcode::VrAirCompute);
+}
+
+Value IREmitter::VrAirApply(const U32& scene_image) {
+    return Inst(Opcode::VrAirApply, scene_image);
+}
+
+F32 IREmitter::VrAmbientOcclusion(const Value& ndc, const Value& uv, const F32& depth) {
+    return Inst<F32>(Opcode::VrAmbientOcclusion, ndc, uv, depth);
+}
+
 U32 IREmitter::ReadConstBuffer(const Value& handle, const U32& index, BufferInstInfo info) {
     return Inst<U32>(Opcode::ReadConstBuffer, Flags{info}, handle, index);
 }

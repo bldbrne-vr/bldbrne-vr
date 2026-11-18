@@ -26,6 +26,8 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/memory_policy.h"
 #include "video_core/texture_cache/sampler.h"
+#include "video_core/texture_cache/bump_height.h"
+#include "video_core/texture_cache/sky_detail.h"
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace AmdGpu {
@@ -87,7 +89,8 @@ public:
                  AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache, PageManager& tracker);
     ~TextureCache();
 
-    /// Allocation-failure recovery for VR scene storage (outside the cache lock).
+    /// Allocation-failure recovery for VR scene storage (outside the cache lock): the memory is
+    /// freed before this returns (ReclaimMemoryFor<true>).
     u64 ReclaimMemory(u64 bytes);
 
     TileManager& GetTileManager() noexcept {
@@ -96,6 +99,12 @@ public:
 
     /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
+
+    /// The heights made for bump maps that have none (bump_height.h): RefreshImage uploads a
+    /// ready one's bytes in place of the guest's.
+    [[nodiscard]] BumpHeight::Store& BumpHeights() {
+        return bump_heights;
+    }
 
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
@@ -407,6 +416,9 @@ private:
     [[nodiscard]] ImageId InsertImage(const ImageInfo& info);
 
     /// Caller holds mutex; only inactive guest-backed textures may be destroyed immediately.
+    /// FreeNow (allocation recovery, which retries at once): their memory is freed before this
+    /// returns, not by the background free after the current, unsubmitted tick.
+    template <bool FreeNow = false>
     u64 ReclaimMemoryFor(VAddr addr, size_t size, u64 bytes,
                          u64 max_tick = std::numeric_limits<u64>::max(),
                          size_t image_limit = std::numeric_limits<size_t>::max());
@@ -454,6 +466,11 @@ private:
 
     void GarbageCollectImages();
     void GarbageCollectSamplers();
+    /// The eviction marks from a budget (the start's, or a load's revision).
+    void SetMemoryMarks(s64 budget);
+    /// At a load: the marks follow Windows' budget for the game now (TextureMemory::RevisedBudget).
+    /// `live`: a reading during play (LiveBudget), applied when confirmed; else a load's.
+    void ReviseMemoryMarks(bool live = false);
 
 private:
     const Vulkan::Instance& instance;
@@ -463,14 +480,20 @@ private:
     PageManager& tracker;
     BlitHelper blit_helper;
     TileManager tile_manager;
+    SkyDetail::Builder sky_detail;
+    BumpHeight::Store bump_heights;
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
     std::unordered_set<ImageId> download_images;
     u64 total_used_memory = 0;
+    TextureMemory::CriticalBackoff critical_backoff;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
+    s64 start_budget = 0;     // the budget at the start (0: no memory budget to follow)
+    s64 marks_budget = 0;     // the one the marks come from now
+    u64 revised_sequence = 0; // the last load (transition request) the marks were revised at
     u64 total_used_samplers = 0;
     u64 trigger_gc_samplers = 0;
     u64 pressure_gc_samplers = 0;
@@ -478,6 +501,11 @@ private:
     u64 gc_tick = 0;
     TextureMemory::AgeCutoff reclaim_age;
     TextureMemory::TransitionCleanup transition_cleanup;
+    TextureMemory::LiveBudget live_budget;
+    TextureMemory::SpillWatch spill_watch;
+    bool spill_was_active{};
+    u32 spill_readings{};
+    u64 spill_sample{}; // the last Windows reading the watch took
     /// FAST_CPU_LRU_TICK (on unless '0') without FAST_CPU_LRU_TICK_VERIFY=1, read once at
     /// start-up: GetImage skips the touch of an image touched in this GC period.
     static const bool lru_tick_skip;

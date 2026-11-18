@@ -39,9 +39,9 @@ public:
     static void SetRequested(bool requested);
     [[nodiscard]] static bool IsRequested();
     [[nodiscard]] static bool IsRuntimeAvailable();
-    // A headset is connected and reports its eye sizes (asleep is fine): a throwaway instance,
-    // safe to call before IsRuntimeAvailable and from any thread until then.
-    [[nodiscard]] static bool IsHeadsetConnected();
+    enum class BootHeadset { Waiting, SettleMeta, Ready, Failed };
+    // Startup only. Link hands its confirmed instance to Vulkan; other runtimes initialize there.
+    [[nodiscard]] static BootHeadset PollBootHeadset(bool settle_meta = false);
     struct HeadsetInfo {
         std::string name;
         std::array<u32, 2> width{}, height{};
@@ -101,6 +101,8 @@ public:
     struct StereoEyes {
         std::array<vk::Image, 2> image{};    // crop-sized (or EyeOutputExtents'),
                                              // eTransferSrcOptimal, swapchain bytes
+        // Their RGBA8 UNORM storage views (null: none; vr.ini canted_eyes reads them in place).
+        std::array<vk::ImageView, 2> view{};
         std::array<vk::Extent2D, 2> extent{};
         std::array<EyeCrop, 2> crop{};       // where each image belongs in the render
         float eye_offset_m{};                // eye poses: head -/+ right * this (the warp's baseline)
@@ -131,6 +133,10 @@ public:
     // scaled when the render is larger than the largest swapchain) play no part. False (or not
     // ready): the frame goes mono, with an error line.
     [[nodiscard]] bool DibrEyesFit(const std::array<vk::Extent2D, 2>& eyes) const;
+    // The most one eye image may be for this runtime (vr_xr_size.h EyeLimit: its largest swapchain
+    // and both views' largest image rects; any thread). {} while not ready. Native stereo scales
+    // a larger eye down to it (FitEye) instead of sending the centre image to both eyes.
+    [[nodiscard]] vk::Extent2D NativeEyeLimit() const;
     // Present thread: copies both eyes into the headset swapchains; ReleaseFrame publishes them
     // together, so both eyes always show the same game frame. Falls back to CopyFrame with
     // source_image (the centre image to both eyes) when the eyes do not fit the swapchains.
@@ -215,6 +221,13 @@ public:
         bool conditions{false};
         std::array<s32, 4> conditions_rect{};
         u32 strip_top{0};
+        // The HUD widgets in their own slots (ui_hud_slots, VR::Ui::Slots::Active): the atlas's
+        // slot sheet from row strip_top holds the clusters, the meter (conditions_rect then in
+        // sheet px), the banners' words and the area name; their pieces are cut from it.
+        bool slots{false};
+        // ... and the banners' slot held this many UI px, as old as the box: a banner is drawn,
+        // whatever text effect the game's sampled state named (VrUiLayer::ContentBox).
+        u32 slot_banner{0};
     };
     // GPU thread (PrepareFrame), right after RecordStereoCopy recorded the frame's eyes: copies its
     // UI into a UI swapchain in the same draw stream; PublishStereo publishes both together.

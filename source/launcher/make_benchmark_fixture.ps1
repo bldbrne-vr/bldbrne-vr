@@ -10,7 +10,7 @@ param([Parameter(Mandatory)][string]$SaveHome,
       [Parameter(Mandatory)][string]$TestRuntime,
       [Parameter(Mandatory)][string]$OutputDirectory,
       [string]$RuntimeSource=(Join-Path $PSScriptRoot 'benchmark_runtime/mockxr.cpp'),
-      [string[]]$GameVersions=@('01.00'),
+      [string[]]$GameVersions=@('01.00','01.09'),
       [ValidateSet('timed','presentation-v1')][string]$StartupNavigation='timed')
 $ErrorActionPreference='Stop'
 $homeSource=(Resolve-Path -LiteralPath $SaveHome).Path

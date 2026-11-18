@@ -30,12 +30,17 @@
 //    before the full pass that made it (vk_rasterizer.cpp ObtainCopyBuffers).
 // Header-only and free of emulator state: tests/test_perf_memo.cpp.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <type_traits>
+#if !defined(__clang__) && !defined(__GNUC__)
+#include <xmmintrin.h>
+#endif
 
 #include "common/types.h"
 
@@ -397,6 +402,27 @@ public:
     static void Commit(Entry& e, u64 registry_epoch, u32 memo_epoch) noexcept {
         e.registry_epoch = registry_epoch;
         e.memo_epoch = memo_epoch;
+    }
+    // The lines a Find with this key reads, and a hit's first bindings, asked for ahead of it
+    // (FastRender::AbOn(12), Rasterizer::DrawRecord): the table is far larger than the caches, so
+    // each Find otherwise waits on memory. Reads nothing itself.
+    void Prefetch(const BindKey& key, u64 hash) const noexcept {
+        const Entry* e = &entries[Slot(hash)];
+        const auto lines = [](const void* begin, size_t bytes) {
+            const auto first = reinterpret_cast<std::uintptr_t>(begin) & ~std::uintptr_t{63};
+            const auto end = reinterpret_cast<std::uintptr_t>(begin) + bytes;
+            for (auto at = first; at < end; at += 64) {
+#if defined(__clang__) || defined(__GNUC__)
+                __builtin_prefetch(reinterpret_cast<const void*>(at), 0, 3);
+#else
+                _mm_prefetch(reinterpret_cast<const char*>(at), _MM_HINT_T0);
+#endif
+            }
+        };
+        const u32 count = std::min(key.count, BindKey::MaxImages);
+        lines(e->key.words.data(), count * BindKey::WordsPerImage * sizeof(u64));
+        lines(&e->hash, sizeof(e->hash) + sizeof(e->registry_epoch) + sizeof(e->memo_epoch));
+        lines(e->bindings.data(), std::min<u32>(count, Entry::MaxBindings) * sizeof(Binding));
     }
 
 private:

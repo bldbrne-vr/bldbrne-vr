@@ -133,6 +133,24 @@ inline std::array<float, 3> Linear(Srgb c) {
     return {SrgbToLinear(c.r), SrgbToLinear(c.g), SrgbToLinear(c.b)};
 }
 
+// A hunter tool refused for want of bullets: the counter's blink (ShortBlink), brighter than
+// the Blood Bullets' own red.
+constexpr Srgb ColorShortBullets{0xff, 0x30, 0x22};
+// The blink's strength at `now` (0..1): three bright pulses over ShortBlinkS from `short_ns`
+// (steady ns; 0: none), each sin^2, fading a little.
+constexpr float ShortBlinkS = 0.6f;
+inline float ShortBlink(std::int64_t short_ns, std::int64_t now) {
+    if (short_ns <= 0 || now < short_ns) {
+        return 0.0f;
+    }
+    const float t = static_cast<float>(now - short_ns) * 1e-9f / ShortBlinkS;
+    if (t >= 1.0f) {
+        return 0.0f;
+    }
+    const float s = std::sin(3.0f * 3.14159265f * t);
+    return s * s * (1.0f - 0.4f * t);
+}
+
 constexpr Srgb ToneColor(Tone t) {
     switch (t) {
     case Tone::Amber:

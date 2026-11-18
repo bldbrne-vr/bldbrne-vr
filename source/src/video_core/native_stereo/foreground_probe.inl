@@ -184,7 +184,7 @@ void Rasterizer::VrProbeDraw(const GraphicsPipeline* pipeline, const RenderState
     push_data=old_push;
     dynamic.SetViewports(old_viewports);
     dynamic.SetScissors(old_scissors);
-    UpdateDynamicState(pipeline, true);
+    UpdateDynamicState(pipeline, true, false); // the game's direct indexed draw
     pipeline->BindResources(set_writes, {}, push_data, vr_push); // the draw's own push again
     cb.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *p.queries,
                       p.slot * ForegroundProbe::Queries + p.count++);

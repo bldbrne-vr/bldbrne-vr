@@ -20,11 +20,13 @@
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vr_eye_cant.h"
 #include "video_core/renderer_vulkan/vr_eye_taa_math.h"
 #include "video_core/renderer_vulkan/vr_eye_upscale.h"
 #include "video_core/renderer_vulkan/vr_late_warp_math.h"
 #include "video_core/renderer_vulkan/vr_stereo_warp.h"
 #include "video_core/renderer_vulkan/vr_vignette_warp.h"
+#include "video_core/renderer_vulkan/vr_warp_reuse.h"
 
 VK_DEFINE_HANDLE(VmaAllocator)
 VK_DEFINE_HANDLE(VmaAllocation)
@@ -100,11 +102,19 @@ public:
         bool taa_follow{false};
         float taa_gate_px{0.05f};
         float taa_edge_cap{0.5f};
+        // Space is the warp's current tracking space, even with TAA off or an old capture.
         VrEyeTaa::Frame taa_frame{};
         std::array<VrEyeTaa::View, 2> taa_views{};
         std::array<XrFovf, 2> fovs{};      // ... and the FOV it is submitted with
         VrLate::Reprojection reprojection{};
         std::array<XrPosef, 2> eye_poses{}; // the virtual eyes the pair is rendered for
+        // Canted displays (core/vr/eye_cant.h): each eye's turn from the head (`cant`, eye ->
+        // head) and its located FOV (`cant_fovs`, around that turned axis). The finished parallel
+        // eyes (covering those views: `fovs`) are turned into the eyes' own views
+        // (VrEyeCant) and submitted with eye_poses turned by `cant` and these FOVs.
+        bool canted{false};
+        std::array<XrQuaternionf, 2> cant{};
+        std::array<XrFovf, 2> cant_fovs{};
         vk::Semaphore gpu{};                // the capture's draw-stream timeline ...
         u64 gpu_tick{0};                    // ... and the tick that finished it
         std::array<u64, 4> stamp{};         // VR_STAMP rows (WriteStamp)
@@ -149,6 +159,7 @@ public:
         double copy_ms{};      // the copy into the swapchain image (summed over gpu_samples)
         u32 vignettes{};       // warps that blended vignettes into the eyes (vignette_in_warp)
         u32 fetch_once{};      // warps through the fetch-once pass 2 (late_warp_fetch_once)
+        u32 canted{};          // warps whose eyes were turned into a canted display's views
         std::array<vk::Extent2D, 2> out{}; // the last warp's eye sizes in the swapchain
     };
 
@@ -179,11 +190,11 @@ public:
     // Frame thread, before the queue lock: waits (1 ms at most) for the acquired image.
     void BeginFrame();
     // Queue lock held: warps `source` and fills both views (pose, FOV, swapchain rect). False: no
-    // pair this frame (the caller shows the game-rate pair). `reuse_only`: show the last warp
-    // again if allowed (no new capture warp this frame).
+    // pair this frame (the caller shows the game-rate pair).
     bool Render(const Source& source, std::array<XrCompositionLayerProjectionView, 2>& views);
-    // The last warp again (at most ReuseFrames frames after it), e.g. when no capture can be warped.
-    bool Reuse(std::array<XrCompositionLayerProjectionView, 2>& views);
+    // The last warp again (at most ReuseFrames frames after it), only in its original tracking
+    // space. After a recenter the caller's game-rate pair has rebased poses; this cache does not.
+    bool Reuse(std::array<XrCompositionLayerProjectionView, 2>& views, u32 current_space);
 
     Stats TakeStats();
     // VR latency (VR_LATENCY_GPU=1, the presenter's warp-done watcher): every warp's submission
@@ -258,10 +269,11 @@ private:
     bool EnsureSwapchain(vk::Extent2D extent);
     void DestroySwapchain();
     bool AcquireImage();
-    void WaitIdle();
+    // False on device loss/disabled renderer; pending work is never retired on timeout.
+    bool WaitIdle();
     void ReadTimestamps(u32 slot);
     bool Record(Slot& slot, u32 index, const Source& source, bool scaling,
-                const std::array<vk::Extent2D, 2>& out);
+                const std::array<vk::Extent2D, 2>& out, const std::array<vk::Extent2D, 2>& shown);
     void FillViews(std::array<XrCompositionLayerProjectionView, 2>& views) const;
 
     static constexpr u32 ReuseFrames = 2;
@@ -288,6 +300,10 @@ private:
     Image v_tiles{};  // V's tiles (RGBA32F)
     bool q_map_cleared{false}; // V's images cleared once after (re)creation
     Image eyes{};     // both eyes side by side (RGBA8 UNORM storage, swapchain byte order)
+    // Canted displays: both eyes turned into their own views (VrEyeCant), side by side.
+    Image eyes_cant{};
+    VrEyeCant cant; // vr.ini canted_eyes: made at the first turned warp (none on other headsets)
+    bool cant_tried{false};
     // eye_upscale / eye_sharpen: the warp writes each eye at the render's pixels here, and
     // VrEyeUpscale enlarges and sharpens them into `eyes`.
     std::array<Image, 2> eye_src{};
@@ -349,9 +365,8 @@ private:
     u64 timestamp_mask{~u64{0}};
 
     // What the shown image was rendered for.
-    bool has_image{false};
     u64 frame{0};
-    u64 shown_frame{0};
+    VrWarpReuse::Frame shown{};
     std::array<XrPosef, 2> shown_poses{};
     std::array<XrFovf, 2> shown_fovs{};
     std::array<XrRect2Di, 2> shown_rects{};

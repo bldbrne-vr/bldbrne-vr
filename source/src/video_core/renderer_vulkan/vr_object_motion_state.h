@@ -19,7 +19,10 @@ public:
     static constexpr uint32_t FrameSlots = 4, DrawsPerFrame = 8192;
     static constexpr uint32_t ParameterCount = 2 + 2 * FrameSlots * DrawsPerFrame;
     static_assert(ParameterCount - 1 <= Shader::VrMotion::MaxParameterIndex);
-    explicit VrObjectMotionState(uint32_t capacity) : capacity(capacity), history(capacity) {
+    // `views`: 2 for native stereo's eyes, 1 for the DIBR centre (one position store; both
+    // parameter entries then name it).
+    explicit VrObjectMotionState(uint32_t capacity, uint32_t views = 2)
+        : capacity(capacity), views(views == 1 ? 1u : 2u), history(capacity) {
         assert(capacity && uint64_t(capacity) * 4 + 2 <= UINT32_MAX);
     }
     bool Begin(uint64_t frame_id, uint64_t epoch, uint64_t completed, bool enabled,
@@ -55,7 +58,7 @@ public:
         Prepared result;
         result.index = 2 + 2 * (slot * DrawsPerFrame + used++);
         for (uint32_t eye = 0; eye < 2; ++eye) {
-            const uint32_t base = eye * (2 * capacity + 1);
+            const uint32_t base = (views == 1 ? 0u : eye) * (2 * capacity + 1);
             result.eyes[eye] = {a.store ? base + a.store : 0,
                                 a.load ? base + a.load : 0,
                                 a.vertices,
@@ -74,14 +77,14 @@ public:
     }
     uint32_t Used() const { return history.Used(); }
     uint64_t PositionBytes() const {
-        return (uint64_t(capacity) * 4 + 2) * 16;
+        return (uint64_t(capacity) * 2 * views + 2) * 16;
     }
     const Motion::History::Stats& Stats() const {
         return history.stats;
     }
 
 private:
-    uint32_t capacity{}, slot{}, used{};
+    uint32_t capacity{}, views{2}, slot{}, used{};
     Motion::History history;
     std::array<uint64_t, FrameSlots> ticks{};
     uint64_t last_frame{}, last_epoch{}, completed_tick{};

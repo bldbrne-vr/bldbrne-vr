@@ -187,6 +187,7 @@ public:
     struct LateCapture {
         bool valid{false};
         bool render_taa{false}; // the captured frame, not the latest UI selection
+        bool upscaled{false};   // DIBR: the centre was reconstructed by DLSS / FSR
         u32 slot{0};
         vk::Extent2D size{};
         vk::ImageView scene{};         ///< colour (linear values unless scene_decode)

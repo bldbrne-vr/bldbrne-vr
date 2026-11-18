@@ -11,6 +11,7 @@ namespace Shader {
 
 struct Profile;
 struct RuntimeInfo;
+struct SrtSnapshot;
 
 struct Pools {
     static constexpr u32 InstPoolSize = 8192;
@@ -27,8 +28,10 @@ struct Pools {
     }
 };
 
+/// `srt_snapshot`: a translation off the thread that owns guest memory (ir/passes/srt.h).
 [[nodiscard]] IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools,
                                            Info& info, RuntimeInfo& runtime_info,
-                                           const Profile& profile);
+                                           const Profile& profile,
+                                           SrtSnapshot* srt_snapshot = nullptr);
 
 } // namespace Shader

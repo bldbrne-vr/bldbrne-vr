@@ -839,10 +839,11 @@ void InstallIframes(VAddr base, u64 size) {
     }
     LOG_INFO(Core,
              "VR iframes: installed at {:#x} (PlayerIns vt+0xE8 entry) extra={} frames ({:.1f} ms) "
-             "after quickstep/roll i-frames, {} on a quick lean, an attack during a dodge {} ({}) "
-             "log={}{}",
+             "after quickstep/roll i-frames, {} on a quick lean, {} on a quick duck, an attack "
+             "during a dodge {} ({}) log={}{}",
              PostUpdateRva, frames, static_cast<float>(std::max(frames, 0)) * I::GameFrame * 1000.0f,
              fmt::format("{} ms", settings.lean_iframes_ms),
+             fmt::format("{} ms", settings.duck_iframes_ms),
              !settings.dodge_attack      ? "waits for its window (dodge_attack=0)"
              : cut                       ? "ends its i-frames (dodge_attack_iframes=0)"
                                          : "keeps them (dodge_attack_iframes=1)",

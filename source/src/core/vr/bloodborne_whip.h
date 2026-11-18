@@ -74,6 +74,16 @@ struct WhipChainState {
 };
 [[nodiscard]] WhipChainState WhipChainNow(s64 now_ns);
 
+// The Amygdalan Arm's whip form (Game:Main): `valid` while its tentacle is driven; `lashing`: out on
+// a lash or a jab (folding back too; not holding an enemy); `grip`: the hand (world), for a hit's
+// distance.
+struct ArmLashState {
+    bool valid{false};
+    bool lashing{false};
+    VR::Body::Vec3 grip{};
+};
+[[nodiscard]] ArmLashState ArmLashNow(s64 now_ns);
+
 // Render pose, Game:Main: blade-chain bone origins in world space, root -> tip.
 // True means a physical whip is equipped; count == 0 means its pose is unavailable
 // (do not fall back to an invisible grip-to-tip chord). Excludes the bare handle.

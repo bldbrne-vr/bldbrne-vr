@@ -21,7 +21,7 @@ Bloodborne for PS4, version 1.09. Tested with CUSA03173 and CUSA00900.
 
 ## How to use
 
-1. Install the mod (or extract the portable ZIP) and open `Bldbrne-VR.exe`.
+1. Install the mod and open **Bldbrne-VR** from the Start menu. For the portable version, extract the whole ZIP and open `Bldbrne-VR.exe` at the top level.
 2. Connect your headset and start your VR software.
 3. Choose your **Game folder** — the Bloodborne 1.09 folder containing `eboot.bin`.
 4. **Have an existing save from shadPS4?** Choose its home folder under **Saves folder (optional)**. Otherwise, skip this step: your saves stay with the mod.
@@ -33,16 +33,16 @@ The first launch may stutter while shaders are built. Existing saves are used in
 
 ## Controls
 
-These are the default **Motion** controls with **Move with: Left stick**, using Touch-style button names (X/Y left, A/B right). For your headset's bindings, choose **Show VR controls** on the in-game VR page.
+These are the default **Motion** controls with **Move with: Left stick**, using Touch-style button names (X/Y left, A/B right). For your headset's bindings, choose **Show VR controls** on the in-game VR page, or open the launcher's **Controls** page: a tab for each controller with its own button names, and a searchable **VR interactions** guide.
 
 ### LEFT CONTROLLER
 
 - **Move:** push the stick. **Run:** click it while moving; centre it to stop running.
 - **Jump:** while running forward, press **A** on the right controller or click the left stick again. Steering away from your run direction makes A dodge instead.
 - **Shoot / parry:** aim your gun and press the trigger.
-- **Quick items:** squeeze the grip to open the item arc; use the trigger on a card to take or use it. With body slots enabled, grip at a pouch to take its item.
-- **Heal:** press **X**, then bring the vial to your wrist or body. Press X again to put it away. With **Blood Vial: Button**, X heals directly.
-- **Y:** open the item arc. On SteamVR's menu layout, Y opens the game menu instead; hold it to recenter.
+- **Quick items:** squeeze the grip (or press **X**) to open the item fan, then squeeze the grip again on an item to take it and hold it; the trigger uses it. With body slots enabled, grip at a pocket to take its item.
+- **Heal:** squeeze the grip at the vial pouch on your left hip, or reach over your right shoulder and squeeze, then stab the vial into your wrist or body. It works mid-fight too. With **X button: Vial**, X readies a vial instead; with **Blood Vial: Button**, X heals directly.
+- **Y:** tap to open the item fan. On SteamVR's menu layout, Y opens the game menu instead; hold it to recenter.
 - **Menu:** open the game menu; hold to recenter. On SteamVR, this button opens the dashboard instead.
 
 ### RIGHT CONTROLLER
@@ -50,7 +50,6 @@ These are the default **Motion** controls with **Move with: Left stick**, using 
 - **Attack:** swing your weapon. **Heavy attack:** hold the trigger to charge, then swing.
 - **Grip:** transform or prepare a physical weapon action; see the examples below.
 - **Turn:** move the stick left/right. **Target / lock on:** click the stick.
-- **Switch weapons:** hold the stick click and push left/right for that hand's equipped weapons.
 - **Next quick item:** flick the stick down. **Blood bullets:** hold it up.
 - **Dodge:** press **A**, steering with the movement stick. While running forward, A jumps.
 - **Interact:** press **B** to talk, open doors or pick up items.
@@ -59,11 +58,12 @@ These are the default **Motion** controls with **Move with: Left stick**, using 
 ### Physical actions
 
 - **Soft dodge:** lean, step or duck to move the hunter out of a blow. This physical evasion does not play a roll animation; the separate lean-to-roll option is off by default.
-- **Switch at the shoulder:** with **Shoulder weapon switch** enabled, tap **B at your right shoulder** or **Y at your left shoulder**. Hold there for about **0.7 seconds** to go unarmed; tap again to draw your weapon back.
+- **Switch at the shoulder:** with **Shoulder weapon switch** enabled, tap **B at your right shoulder** or **Y at your left shoulder**. Hold there for about **0.4 seconds** to go unarmed; tap again to draw your weapon back.
 - **Two-hand a weapon:** squeeze the right grip to free your left hand, bring the left hand to the handle, then squeeze the left grip. Release **both grips** to let go. The Whirligig Saw skips the initial right-grip squeeze.
 - **Split Blade of Mercy / Rakuyo:** squeeze the right grip, grip the hilt with your left hand, then pull apart. To rejoin, bring the blades together side by side and squeeze the left grip again.
 - **Physical gestures:** near the Doll, bow, point/wave, or raise a hand for rally/approval. Make Contact is also recognised; see the guide below for its pose and encounter. The corresponding gesture must be learned. Hold **Y**, then press **B** for the normal gesture menu.
 - **Levers:** with **Physical levers** enabled, grip and pull with either hand.
+- **Bare hands:** unarmed, your fingers follow yours. Touch a dead enemy to push it; squeeze the grip on it to grab, lift or drag it.
 
 [Full controls and weapon guide](https://github.com/bldbrne-vr/bldbrne-vr/blob/main/CONTROLS.md) — weapon-specific transformations, bow use, paired blades, gestures and alternate controls.
 
@@ -95,6 +95,7 @@ Defaults below are for a fresh configuration of this version; existing saved set
 | --- | --- | --- |
 | **Control style** | Motion | Motion: swing to attack. Buttons: the classic layout. |
 | **Blood Vial** | Stab to inject | Stab the vial into your wrist, or use a button. |
+| **X button** | Fan menu | Fan menu: X opens and closes your quick items. Vial: X readies a Blood Vial to stab. |
 | **Gun laser** | Off | A thin line from the gun's barrel. |
 | **Grip adjust** | On | Stand still and hold A+B for about 1.2 seconds. Align your controller with the frozen weapon, then release to save the grip. |
 | **Stance** | Standing | Seated: smaller swings and throws, the lap counts for the vial. |
@@ -132,7 +133,7 @@ Defaults below are for a fresh configuration of this version; existing saved set
 | Option | Default | What it does |
 | --- | --- | --- |
 | **Extra health** | +10% | More maximum health for the hunter. |
-| **Longer dodge invincibility** | +1 frame | Extra invincibility after a quickstep or roll, in 1/30-second increments. Does not apply to backsteps. |
+| **Longer dodge invincibility** | Off | Extra invincibility after a quickstep or roll, in 1/30-second increments. Does not apply to backsteps. |
 | **Instant ragdoll** | On | An enemy your blade kills goes limp at once. Off: its death animation. |
 | **Ragdoll push** | Normal | How hard your swing throws the body. None: it just falls. |
 | **Light attack stamina** | 80% | Light swing cost. Strong swings cost 100%; low stamina makes them light. |
@@ -182,7 +183,7 @@ Defaults below are for a fresh configuration of this version; existing saved set
 | **Health intensity** | 50% | Strength of the low-health red edge. |
 | **Exhaustion desaturation** | On | Briefly soften colors at exhausted stamina, then fade back. Never full grayscale. |
 | **Stamina intensity** | 50% | Strength of the brief exhaustion effect. |
-| **Shoulder weapon switch** | On | B at right shoulder / Y at left: tap to switch, hold about 0.7 seconds for unarmed. Tap unarmed to restore the remembered weapon. |
+| **Shoulder weapon switch** | On | B at right shoulder / Y at left: tap to switch, hold about 0.4 seconds for unarmed. Tap unarmed to restore the remembered weapon. |
 
 </details>
 
@@ -194,7 +195,7 @@ Defaults below are for a fresh configuration of this version; existing saved set
 | **Solid weapons** | Weapons only | Stop at walls and each other. Weapons only: just each other. |
 | **Grip guide** | On | Hold the right grip to show where your left hand can grab. |
 | **Swing feel** | 100% | Faint feedback during fast swings with both hands on one weapon. |
-| **Wrist-flick reload** | On | After a shot, release the trigger and flick your left wrist firmly in any direction to reload. |
+| **Wrist-flick reload** | On | After a shot, release the trigger. Snap the muzzle up or flick it down more sharply, then let it rebound slightly to reload. |
 | **Blade sounds** | On | Your weapons ring when they meet; draw one along the other to sharpen it. |
 
 </details>

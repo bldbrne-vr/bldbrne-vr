@@ -240,15 +240,15 @@ inline std::vector<Entry> Entries(const Layout& l) {
         }
         e.push_back({"lock_on", "Lock on (tap)", C::ClickR});
         e.push_back({"weapon_switch",
-                     scheme2 ? "D-pad: switch weapon (left / right hand), blood bullets (up), "
+                     scheme2 ? "D-pad: blood bullets (up), "
                                "next item (down); locked on too"
-                             : "Switch weapon (left / right hand)",
+                             : "Weapon switching uses shoulder gestures",
                      C::ClickR, C::StickR, How::Combo});
         e.push_back({"heavy", "Arm the next swing: heavy, charge", C::TriggerR});
         e.push_back({"transform", "Transform the weapon", C::GripR});
     }
     if (!scheme2) {
-        e.push_back({"dpad", "D-pad (weapons, items)", modifier, C::StickR, How::Combo});
+        e.push_back({"dpad", l.classic ? "D-pad (weapons, items)" : "Items / blood bullets (up / down)", modifier, C::StickR, How::Combo});
     }
     e.push_back({"gestures", "Gestures", modifier, C::B, How::Combo});
     // A+B: the game's roll (roll_chord, core/vr/roll_chord.h), held still the grip adjust.
@@ -334,23 +334,36 @@ inline std::string Summary(const Layout& l) {
     return s;
 }
 
+// Two buttons pressed together: "A+B", spaced when a name has more than one word ("D-pad
+// down/right + D-pad up/left", the Steam Frame's), so the plus never runs into a name.
+inline std::string Chord(const std::string& a, const std::string& b) {
+    const bool words = a.find(' ') != std::string::npos || b.find(' ') != std::string::npos;
+    return a + (words ? " + " : "+") + b;
+}
+
 // Text with the controls of the current layout: {move} {turn} the sticks, {move_click}
 // {turn_click} their clicks, {A} {B} {X} {Y} the logical face buttons (the VR page's rows: "How
-// the {turn} turns you.", "Grip adjust ({A}+{B})"). Unknown braces stay as they are.
+// the {turn} turns you.", "Grip adjust ({A}+{B})"), {button:B} and the like a physical one whatever
+// the swap (the summon bell's B). Unknown braces stay as they are.
 template <typename Labeler>
 inline std::string Expand(std::string_view text, bool swap, Labeler label) {
     struct Token {
         std::string_view name;
         Control logical;
+        bool physical{false};
     };
-    static constexpr std::array<Token, 8> tokens{{{"{move}", Control::StickL},
-                                                  {"{turn}", Control::StickR},
-                                                  {"{move_click}", Control::ClickL},
-                                                  {"{turn_click}", Control::ClickR},
-                                                  {"{A}", Control::A},
-                                                  {"{B}", Control::B},
-                                                  {"{X}", Control::X},
-                                                  {"{Y}", Control::Y}}};
+    static constexpr std::array<Token, 12> tokens{{{"{move}", Control::StickL},
+                                                   {"{turn}", Control::StickR},
+                                                   {"{move_click}", Control::ClickL},
+                                                   {"{turn_click}", Control::ClickR},
+                                                   {"{A}", Control::A},
+                                                   {"{B}", Control::B},
+                                                   {"{X}", Control::X},
+                                                   {"{Y}", Control::Y},
+                                                   {"{button:A}", Control::A, true},
+                                                   {"{button:B}", Control::B, true},
+                                                   {"{button:X}", Control::X, true},
+                                                   {"{button:Y}", Control::Y, true}}};
     std::string out;
     out.reserve(text.size() + 16);
     std::size_t i = 0;
@@ -359,7 +372,7 @@ inline std::string Expand(std::string_view text, bool swap, Labeler label) {
         if (text[i] == '{') {
             for (const Token& t : tokens) {
                 if (text.substr(i, t.name.size()) == t.name) {
-                    out += label(Physical(t.logical, swap));
+                    out += label(t.physical ? t.logical : Physical(t.logical, swap));
                     i += t.name.size();
                     matched = true;
                     break;

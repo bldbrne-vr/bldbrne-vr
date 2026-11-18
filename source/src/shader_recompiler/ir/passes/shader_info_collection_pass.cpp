@@ -5,11 +5,27 @@
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/dma_table.h"
 
 namespace Shader::Optimization {
 
 void Visit(Info& info, const IR::Inst& inst) {
     switch (inst.GetOpcode()) {
+    case IR::Opcode::VrMoonShadow: // emit_spirv_moon_shadow.cpp's noise too
+    case IR::Opcode::VrReflection: // emit_spirv_reflections.cpp's jitter
+    case IR::Opcode::VrLightVisibility:
+    case IR::Opcode::VrAmbientOcclusion:
+    case IR::Opcode::VrBounceLight:
+    case IR::Opcode::VrFogLight:
+    case IR::Opcode::VrMoonShafts:
+    case IR::Opcode::VrAirProbe: // air_light.h: their grids and cells
+    case IR::Opcode::VrAirCompute:
+    case IR::Opcode::VrAirApply:
+    case IR::Opcode::VrExposure: // its sample grid and its one updating pixel
+        // Their noise reads the pixel's position (emit_spirv_light_shadow.cpp).
+        info.loads.Set(IR::Attribute::FragCoord, 0);
+        info.loads.Set(IR::Attribute::FragCoord, 1);
+        break;
     case IR::Opcode::GetAttribute:
     case IR::Opcode::GetAttributeU32:
         info.loads.Set(inst.Arg(0).Attribute(), inst.Arg(1).U32());
@@ -162,7 +178,7 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
         }
     }
 
-    if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
+    if (!VideoCore::DmaTable::ShadersMayUse()) {
         info.uses_dma = false;
         info.readconst_types = Info::ReadConstType::None;
     }

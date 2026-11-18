@@ -22,6 +22,7 @@
 #include "core/vr/bloodborne_heal.h"
 #include "core/vr/bloodborne_menu.h"
 #include "core/vr/lamp_channel.h"
+#include "core/vr/soft_save.h"
 #include "core/vr/lamp_travel.h"
 #include "core/vr/bloodborne_vrtile.h"
 #include "core/vr/hook_util.h"
@@ -49,7 +50,7 @@ constexpr u32 OffsetMenuSerial = 0xB18; // +1 on every open and close
 // panel), logged with VR_UI_LOG. MenuMan: +0x54 menu request (7 = the Options menu is about to
 // open), +0x58 text window (4 = an NPC's subtitle, 1..3 = an event or tutorial text), +0x838 /
 // +0x82C an action prompt is shown / its text id. SprjWorldTalkMan: +0x3FF8 an NPC line is playing
-// (also published for talk_guard), +0x400C the talk / menu input cooldown (s). ItemGetMenuMan
+// (also published: the subtitles' HUD floor), +0x400C the talk / menu input cooldown (s). ItemGetMenuMan
 // +0x08: item pickup pop-ups shown.
 constexpr u32 OffsetMenuRequest = 0x54;
 constexpr u32 OffsetTextWindow = 0x58;
@@ -392,6 +393,8 @@ void WatchTextEffects(u8* man) {
                                "banner");
                 continue;
             }
+            if (type == 2) SoftSave::Death();
+            if (type == 1) SoftSave::BossKilled();
             VR::PublishBanner(type);
             LOG_INFO(Core, "VR ui: the game plays a banner: text effect {} {}", type,
                      TextEffectName(type));
@@ -518,7 +521,7 @@ void MenuUpdate(u8* /*player*/) {
               : VR::UiClass::Full,
         named ? g_named_pitch.load(std::memory_order_relaxed) : 0.0f, grid_cell);
     // An NPC's line is playing (SprjWorldTalkMan +0x3FF8, 1 while it plays; anything but 0 or 1
-    // is not trusted): the presenter's talk_guard holds swings back meanwhile. The conversation's
+    // is not trusted): the presenter keeps the subtitles readable meanwhile. The conversation's
     // UI (an NPC subtitle in MenuMan's text window, the talk input cooldown) keeps it going
     // between lines and as it ends (VR::IsNpcTalking: only after a line, plus a grace).
     u8* const talk_man = Read<u8*>(g_base + TalkManRva);

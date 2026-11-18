@@ -49,6 +49,12 @@
 //      Mode 1 then puts the marker, scaled about that box's centre and dimmed, over the rest of
 //      the UI when nothing was drawn after it (the game draws it last, over the target's HP bar),
 //      else under it (core/vr/ui_lock_marker.h has the same math, unit tested).
+//   9  slot sheet (ui_hud_slots, core/vr/ui_slots.h): the HUD widgets the HUD movie draws in rows
+//      of their own above and below the band, copied into the atlas below its halves (where the
+//      build-up meter's strip is otherwise: the meter has its own slot). No veil: the game's dims
+//      cover the stage alone. The clusters' cut-outs give cut-outs 0 and 1 their counts and boxes
+//      at their home rows (the presenter measures them there); the area name's slot and the
+//      banners' rows count their UI (the presenter's "is one up").
 // The game blends in its encoded (sRGB) domain, the compositor in linear light, so alpha comes
 // from a two-point fit, exact over a black and over a white world and for opaque UI, text, black
 // dims and additive glows: 1 - alpha = luma(G(min(k + T, 1)) - G(k)), colour bytes = E(k), with
@@ -64,7 +70,7 @@
 #version 450
 #extension GL_EXT_samplerless_texture_functions : require
 
-#if MODE == 0 || MODE == 4
+#if MODE == 0 || MODE == 4 || MODE == 10 || MODE == 11 || MODE == 12
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #else
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
@@ -72,7 +78,7 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform texture2D k_tex; // K, read through X's component mapping
 layout(set = 0, binding = 1) uniform texture2D w_tex; // W
-#if MODE == 1 || MODE == 5 || MODE == 6 || MODE == 7
+#if MODE == 1 || MODE == 5 || MODE == 6 || MODE == 7 || MODE == 9
 layout(set = 0, binding = 2, rgba8) uniform writeonly image2D atlas_img;
 #endif
 #if MODE == 1 || MODE == 8
@@ -80,7 +86,7 @@ layout(set = 0, binding = 8) uniform texture2D mk_tex; // the lock-on marker alo
 layout(set = 0, binding = 9) uniform texture2D mw_tex; // ... and W (FLAG_MARKER)
 #endif
 layout(set = 0, binding = 3, std430) buffer UiStats {
-    uint words[64];
+    uint words[72];
 } stats;
 #if MODE == 2
 layout(set = 0, binding = 4, rgba8) uniform image2D scene_img; // raw channels, identity view
@@ -135,6 +141,7 @@ const uint FLAG_ACTION_PROMPT = 1u << 20; // explicit game prompt; independent o
 const uint FLAG_CONDITIONS = 1u << 19;   // cut 3 is the build-up meter: into the strip
 const uint FLAG_AREA_NAME = 1u << 23;    // an area name is up: its corner whole on the band
 const uint FLAG_AREA_KEY = 1u << 24;     // ... and its dark backing keyed (KeyAreaName)
+const uint FLAG_SHEET = 1u << 25;        // the slot sheet below the halves (mode 9), no strip
 // The strip's stage columns (VR::Ui::Conditions::MaxRect: x 836 .. 1088): what it clears.
 const float STRIP_STAGE_X0 = 836.0;
 const float STRIP_STAGE_X1 = 1088.0;
@@ -170,6 +177,12 @@ const uint W_STRIP_KD = 38; // float: the spread of luma(dec(K)) in the strips
 const uint W_BOX = 40;      // the content box (band px): min x, min y, max x, max y (40..43)
 const uint W_CUT_BOX = 44;  // each cut-out's content box, 4 words each (44..59)
 const uint W_MARK_BOX = 60; // the lock-on marker's box (band px): min x, min y, max x, max y
+const uint W_SLOT_AREA = 64;   // mode 9: UI pixels in the area name's slot
+const uint W_SLOT_BANNER = 65; // ... in the banners' rows
+const uint W_VERIFY_N = 66;    // mode 11 (VR_UI_RESOLVE_FAST=v): 1 when it compared this frame
+const uint W_VERIFY_BAD = 67;  // ... 1 when mode 0's words differ from its own in any bit
+const uint W_VEIL_ARGS = 68;   // modes 0, 10: the scene veil's groups x, y, z (0 without a veil)
+const uint W_VERIFY_SPLIT = 71; // mode 12: split rows whose fast walk differs (mode 11 zeroes it)
 
 vec3 SrgbToLinear(vec3 c) {
     return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, lessThanEqual(c, vec3(0.04045)));
@@ -450,7 +463,7 @@ void MarkerCompose(ivec2 p, inout vec3 k, inout vec3 t) {
 }
 #endif
 
-#if MODE == 0
+#if MODE == 0 || MODE == 10 || MODE == 11
 
 shared float s_min[256];
 shared float s_max[256];
@@ -459,52 +472,151 @@ shared vec3 s_ksum[256];
 shared float s_kmin[256];
 shared float s_kmax[256];
 shared uint s_n[256];
+shared uint s_hist[64]; // the strips' transmittance luma in 64 bins
+shared float s_ref;     // the fullest bin's middle: the dim's own transmittance
+
+// Edge strips: band x 0..15 and w-16..w-1, y 400..1040 of a 1440 px band (away from every
+// HUD cluster; the menus' own dim covers them).
+ivec2 StripTexel(int p, int y0) {
+    const int col = p % 32;
+    const int row = p / 32;
+    const int bx = col < 16 ? col : pc.band.z - 32 + col;
+    return pc.band.xy + ivec2(bx, y0 + row);
+}
+
+// Mode 0 reads VEIL_AHEAD of a thread's strip pixels before it uses the first (one workgroup does
+// the whole estimate: one fetch at a time left the GPU waiting on each). Every sum still takes its
+// pixels in the order modes 10 and 11 (the original loops) take them, so the words are the same.
+const int VEIL_AHEAD = 8;
 
 void main() {
     const uint i = gl_LocalInvocationIndex;
-    // Edge strips: band x 0..15 and w-16..w-1, y 400..1040 of a 1440 px band (away from every
-    // HUD cluster; the menus' own dim covers them).
     const int y0 = pc.band.w * 400 / 1440;
     const int y1 = pc.band.w * 1040 / 1440;
     const int rows = max(y1 - y0, 1);
     const int total = 32 * rows;
+    if (i < 64u) {
+        s_hist[i] = 0u;
+    }
+    barrier();
+    // 1. Every strip pixel's transmittance into the histogram (and the full spread, for the stats).
     float mn = 1e9;
     float mx = -1e9;
-    vec3 sum = vec3(0.0);
-    vec3 ksum = vec3(0.0);
-    float kmin = 1e9;
-    float kmax = 0.0;
     uint n = 0u;
+#if MODE == 0
+    for (int base = int(i); base < total; base += 256 * VEIL_AHEAD) {
+        vec3 ks[VEIL_AHEAD];
+        vec3 ws[VEIL_AHEAD];
+        for (int u = 0; u < VEIL_AHEAD; ++u) {
+            const int p = base + u * 256;
+            if (p < total) {
+                const ivec2 q = StripTexel(p, y0);
+                ks[u] = texelFetch(k_tex, q, 0).rgb;
+                ws[u] = texelFetch(w_tex, q, 0).rgb;
+            }
+        }
+        for (int u = 0; u < VEIL_AHEAD; ++u) {
+            if (base + u * 256 < total) {
+                const float tl = Luma(Transmittance(ks[u], ws[u]));
+                mn = min(mn, tl);
+                mx = max(mx, tl);
+                atomicAdd(s_hist[clamp(int(tl * 64.0), 0, 63)], 1u);
+                ++n;
+            }
+        }
+    }
+#else
     for (int p = int(i); p < total; p += 256) {
-        const int col = p % 32;
-        const int row = p / 32;
-        const int bx = col < 16 ? col : pc.band.z - 32 + col;
-        const ivec2 q = pc.band.xy + ivec2(bx, y0 + row);
-        const vec3 k = texelFetch(k_tex, q, 0).rgb;
-        const vec3 w = texelFetch(w_tex, q, 0).rgb;
-        const vec3 t = Transmittance(k, w);
-        const float tl = Luma(t);
+        const ivec2 q = StripTexel(p, y0);
+        const float tl =
+            Luma(Transmittance(texelFetch(k_tex, q, 0).rgb, texelFetch(w_tex, q, 0).rgb));
         mn = min(mn, tl);
         mx = max(mx, tl);
-        sum += t;
-        ksum += k;
-        const float kl = Luma(EmissionLinear(k));
-        kmin = min(kmin, kl);
-        kmax = max(kmax, kl);
+        atomicAdd(s_hist[clamp(int(tl * 64.0), 0, 63)], 1u);
         ++n;
     }
+#endif
     s_min[i] = mn;
     s_max[i] = mx;
-    s_sum[i] = sum;
-    s_ksum[i] = ksum;
-    s_kmin[i] = kmin;
-    s_kmax[i] = kmax;
     s_n[i] = n;
     barrier();
+    if (i == 0u) {
+        uint best = 0u;
+        for (uint b = 1u; b < 64u; ++b) {
+            best = s_hist[b] > s_hist[best] ? b : best;
+        }
+        s_ref = (float(best) + 0.5) / 64.0;
+    }
     for (uint stride = 128u; stride > 0u; stride >>= 1) {
         if (i < stride) {
             s_min[i] = min(s_min[i], s_min[i + stride]);
             s_max[i] = max(s_max[i], s_max[i + stride]);
+            s_n[i] += s_n[i + stride];
+        }
+        barrier();
+    }
+    const float spread = s_max[0] - s_min[0];
+    const uint count = s_n[0];
+    const float ref = s_ref;
+    barrier();
+    // 2. The pixels that agree with the dim (within 0.03 of the fullest bin). With S1 the UI is
+    // scaled into the output-size band and a few edge pixels stray; a strict min/max test then
+    // missed the dim and it stayed in the menu as a dark rectangle (the Doll's list, 2026-10-29).
+    vec3 sum = vec3(0.0);
+    vec3 ksum = vec3(0.0);
+    float kmin = 1e9;
+    float kmax = 0.0;
+    uint agree = 0u;
+#if MODE == 0
+    for (int base = int(i); base < total; base += 256 * VEIL_AHEAD) {
+        vec3 ks[VEIL_AHEAD];
+        vec3 ws[VEIL_AHEAD];
+        for (int u = 0; u < VEIL_AHEAD; ++u) {
+            const int p = base + u * 256;
+            if (p < total) {
+                const ivec2 q = StripTexel(p, y0);
+                ks[u] = texelFetch(k_tex, q, 0).rgb;
+                ws[u] = texelFetch(w_tex, q, 0).rgb;
+            }
+        }
+        for (int u = 0; u < VEIL_AHEAD; ++u) {
+            if (base + u * 256 < total) {
+                const vec3 k = ks[u];
+                const vec3 t = Transmittance(k, ws[u]);
+                if (abs(Luma(t) - ref) < 0.03) {
+                    sum += t;
+                    ksum += k;
+                    const float kl = Luma(EmissionLinear(k));
+                    kmin = min(kmin, kl);
+                    kmax = max(kmax, kl);
+                    ++agree;
+                }
+            }
+        }
+    }
+#else
+    for (int p = int(i); p < total; p += 256) {
+        const ivec2 q = StripTexel(p, y0);
+        const vec3 k = texelFetch(k_tex, q, 0).rgb;
+        const vec3 t = Transmittance(k, texelFetch(w_tex, q, 0).rgb);
+        if (abs(Luma(t) - ref) < 0.03) {
+            sum += t;
+            ksum += k;
+            const float kl = Luma(EmissionLinear(k));
+            kmin = min(kmin, kl);
+            kmax = max(kmax, kl);
+            ++agree;
+        }
+    }
+#endif
+    s_sum[i] = sum;
+    s_ksum[i] = ksum;
+    s_kmin[i] = kmin;
+    s_kmax[i] = kmax;
+    s_n[i] = agree;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (i < stride) {
             s_sum[i] += s_sum[i + stride];
             s_ksum[i] += s_ksum[i + stride];
             s_kmin[i] = min(s_kmin[i], s_kmin[i + stride]);
@@ -513,6 +625,7 @@ void main() {
         }
         barrier();
     }
+#if MODE != 11
     if (i < 32u && i > W_STRIP_K) {
         stats.words[i] = 0u; // this frame's counters
     }
@@ -528,27 +641,56 @@ void main() {
     if (i >= W_MARK_BOX && i < W_MARK_BOX + 4u) {
         stats.words[i] = i < W_MARK_BOX + 2u ? 0xFFFFFFFFu : 0u;
     }
+    if (i >= W_SLOT_AREA && i <= W_SLOT_BANNER) {
+        stats.words[i] = 0u;
+    }
+#endif
     if (i == 0u) {
-        const float count = max(float(s_n[0]), 1.0);
-        const vec3 t_mean = s_sum[0] / count;
-        const vec3 k_mean = s_ksum[0] / count;
+        const uint agreeing = s_n[0];
+        const float in_count = max(float(agreeing), 1.0);
+        const vec3 t_mean = s_sum[0] / in_count;
+        const vec3 k_mean = s_ksum[0] / in_count;
         const float mean = Luma(t_mean);
-        const float spread = s_max[0] - s_min[0];
-        const float k_spread = s_kmax[0] - s_kmin[0];
-        // A uniform dim or fade over the whole screen (the strips agree), not a uniform tint
-        // that lets everything through.
-        const bool veil = (pc.flags & FLAG_VEIL) != 0u && s_n[0] > 0u && spread < 0.03 &&
-                          k_spread < 0.01 && mean < 0.97;
-        stats.words[W_VEIL] = floatBitsToUint(veil ? mean : 1.0);
-        stats.words[W_VEIL_ON] = veil ? 1u : 0u;
-        stats.words[W_STRIP_T] = floatBitsToUint(mean);
-        stats.words[W_STRIP_D] = floatBitsToUint(spread);
-        stats.words[W_STRIP_K] = floatBitsToUint(s_kmax[0]);
-        stats.words[W_STRIP_KD] = floatBitsToUint(k_spread);
+        const float k_spread = agreeing > 0u ? s_kmax[0] - s_kmin[0] : 1.0;
+        // A uniform dim or fade over the whole screen (90% of the strips agree, the rest a few
+        // stray pixels), not a uniform tint that lets everything through.
+        const bool veil = (pc.flags & FLAG_VEIL) != 0u && count > 0u &&
+                          float(agreeing) >= 0.9 * float(count) && k_spread < 0.01 &&
+                          mean < 0.97;
+        uint words[16];
+        words[0] = floatBitsToUint(veil ? mean : 1.0);  // W_VEIL
+        words[1] = veil ? 1u : 0u;                       // W_VEIL_ON
+        words[2] = floatBitsToUint(mean);                // W_STRIP_T
+        words[3] = floatBitsToUint(spread);              // W_STRIP_D
+        words[4] = floatBitsToUint(agreeing > 0u ? s_kmax[0] : 0.0); // W_STRIP_K
+        words[5] = floatBitsToUint(k_spread);            // W_STRIP_KD
         for (uint c = 0u; c < 3u; ++c) {
-            stats.words[W_VEIL_T + c] = floatBitsToUint(veil ? t_mean[c] : 1.0);
-            stats.words[W_VEIL_K + c] = floatBitsToUint(veil ? k_mean[c] : 0.0);
+            words[6u + c] = floatBitsToUint(veil ? t_mean[c] : 1.0); // W_VEIL_T
+            words[9u + c] = floatBitsToUint(veil ? k_mean[c] : 0.0); // W_VEIL_K
         }
+        // The scene veil's groups (mode 2's 16 x 16, as a direct dispatch of it would take).
+        words[12] = veil ? (uint(pc.scene_size.x) + 15u) / 16u : 0u; // W_VEIL_ARGS
+        words[13] = veil ? (uint(pc.scene_size.y) + 15u) / 16u : 0u;
+        words[14] = 1u;
+        words[15] = 0u;
+        const uint at[15] = uint[15](W_VEIL, W_VEIL_ON, W_STRIP_T, W_STRIP_D, W_STRIP_K,
+                                     W_STRIP_KD, W_VEIL_T, W_VEIL_T + 1u, W_VEIL_T + 2u, W_VEIL_K,
+                                     W_VEIL_K + 1u, W_VEIL_K + 2u, W_VEIL_ARGS, W_VEIL_ARGS + 1u,
+                                     W_VEIL_ARGS + 2u);
+#if MODE == 11
+        // Mode 0 ran first on the same K and W: every word it wrote, bit for bit.
+        bool same = true;
+        for (uint w = 0u; w < 15u; ++w) {
+            same = same && stats.words[at[w]] == words[w];
+        }
+        stats.words[W_VERIFY_N] = 1u;
+        stats.words[W_VERIFY_BAD] = same ? 0u : 1u;
+        stats.words[W_VERIFY_SPLIT] = 0u; // mode 12 adds its rows later in the frame
+#else
+        for (uint w = 0u; w < 15u; ++w) {
+            stats.words[at[w]] = words[w];
+        }
+#endif
     }
 }
 
@@ -575,6 +717,9 @@ int StripTop() {
 // row and their mips never sample stale memory). The cleared columns reach a mip-2 texel (4 px)
 // and more past the widest cut, on a multiple of 8.
 void StripClear(ivec2 p) {
+    if ((pc.flags & FLAG_SHEET) != 0u) {
+        return; // mode 9 writes and clears those rows
+    }
     const int top = StripTop();
     const int rows = imageSize(atlas_img).y - top;
     if (rows <= 0) {
@@ -835,10 +980,49 @@ void main() {
     }
 }
 
-#elif MODE == 4
+#elif MODE == 4 || MODE == 12
 
 shared uint s_l[1024];
 shared uint s_r[1024];
+
+// A row's runs of mask bits (gaps <= gap bridged), the union of those at least min_width wide.
+struct RowRuns {
+    uint lo;
+    uint hi;
+    bool open;
+    uint start;
+    uint last;
+};
+
+void RowWord(inout RowRuns s, uint wi, uint bits, uint gap, uint min_width) {
+    while (bits != 0u) {
+        const uint x = wi * 32u + uint(findLSB(bits));
+        uint end = x;
+        if (bits == 0xFFFFFFFFu) {
+            end = wi * 32u + 31u; // a full word in one step
+            bits = 0u;
+        } else {
+            bits &= bits - 1u;
+        }
+        if (s.open && x <= s.last + gap + 1u) {
+            s.last = end;
+        } else {
+            if (s.open && s.last - s.start + 1u >= min_width) {
+                s.lo = min(s.lo, s.start);
+                s.hi = max(s.hi, s.last);
+            }
+            s.open = true;
+            s.start = x;
+            s.last = end;
+        }
+    }
+}
+
+// Mode 4 reads a row's mask words SPLIT_AHEAD at a time before it walks them (one workgroup does
+// every row: one read at a time left the GPU waiting on each); each word is still taken in order.
+// Mode 12 (VR_UI_RESOLVE_FAST=v) also walks every row as the original loops did, one read at a
+// time, and counts the rows where the two differ.
+const uint SPLIT_AHEAD = 8u;
 
 void main() {
     const uint i = gl_LocalInvocationIndex;
@@ -848,43 +1032,65 @@ void main() {
     const uint words = MaskWords(dr);
     const uint min_width = SplitMinWidth();
     const uint gap = SplitGap();
+#if MODE == 12
+    uint differ = 0u;
+#endif
     // Per row: the union of its runs at least min_width wide (mask bits, gaps <= gap bridged).
     for (uint r = i; r < rows; r += 256u) {
-        uint lo = 0xFFFFFFFFu;
-        uint hi = 0u;
-        bool open = false;
-        uint start = 0u;
-        uint last = 0u;
-        for (uint wi = 0u; wi < words; ++wi) {
-            uint bits = split.mask[r * words + wi];
-            while (bits != 0u) {
-                const uint x = wi * 32u + uint(findLSB(bits));
-                uint end = x;
-                if (bits == 0xFFFFFFFFu) {
-                    end = wi * 32u + 31u; // a full word in one step
-                    bits = 0u;
-                } else {
-                    bits &= bits - 1u;
-                }
-                if (open && x <= last + gap + 1u) {
-                    last = end;
-                } else {
-                    if (open && last - start + 1u >= min_width) {
-                        lo = min(lo, start);
-                        hi = max(hi, last);
-                    }
-                    open = true;
-                    start = x;
-                    last = end;
-                }
+        RowRuns s = RowRuns(0xFFFFFFFFu, 0u, false, 0u, 0u);
+        for (uint w0 = 0u; w0 < words; w0 += SPLIT_AHEAD) {
+            uint chunk[SPLIT_AHEAD];
+            for (uint u = 0u; u < SPLIT_AHEAD; ++u) {
+                chunk[u] = w0 + u < words ? split.mask[r * words + w0 + u] : 0u;
+            }
+            for (uint u = 0u; u < SPLIT_AHEAD && w0 + u < words; ++u) {
+                RowWord(s, w0 + u, chunk[u], gap, min_width);
             }
         }
-        if (open && last - start + 1u >= min_width) {
-            lo = min(lo, start);
-            hi = max(hi, last);
+        if (s.open && s.last - s.start + 1u >= min_width) {
+            s.lo = min(s.lo, s.start);
+            s.hi = max(s.hi, s.last);
         }
-        s_l[r] = lo;
-        s_r[r] = hi;
+#if MODE == 12
+        {
+            uint lo = 0xFFFFFFFFu;
+            uint hi = 0u;
+            bool open = false;
+            uint start = 0u;
+            uint last = 0u;
+            for (uint wi = 0u; wi < words; ++wi) {
+                uint bits = split.mask[r * words + wi];
+                while (bits != 0u) {
+                    const uint x = wi * 32u + uint(findLSB(bits));
+                    uint end = x;
+                    if (bits == 0xFFFFFFFFu) {
+                        end = wi * 32u + 31u; // a full word in one step
+                        bits = 0u;
+                    } else {
+                        bits &= bits - 1u;
+                    }
+                    if (open && x <= last + gap + 1u) {
+                        last = end;
+                    } else {
+                        if (open && last - start + 1u >= min_width) {
+                            lo = min(lo, start);
+                            hi = max(hi, last);
+                        }
+                        open = true;
+                        start = x;
+                        last = end;
+                    }
+                }
+            }
+            if (open && last - start + 1u >= min_width) {
+                lo = min(lo, start);
+                hi = max(hi, last);
+            }
+            differ += lo != s.lo || hi != s.hi ? 1u : 0u;
+        }
+#endif
+        s_l[r] = s.lo;
+        s_r[r] = s.hi;
     }
     barrier();
     // Dilated over the neighbouring rows (band px), the UI left out of it counted, the mask
@@ -912,12 +1118,13 @@ void main() {
             // Mask bits outside [lo - margin, hi + margin] stay on the rest quad.
             const int in0 = lo <= hi ? int(lo) - int(margin) : 1;
             const int in1 = lo <= hi ? int(hi) + int(margin) : 0;
+#if MODE == 12
+            uint row_out_original = 0u; // the original loop's count, read only (cleared below)
             for (uint wi = 0u; wi < words; ++wi) {
                 const uint bits = split.mask[r * words + wi];
                 if (bits == 0u) {
                     continue;
                 }
-                split.mask[r * words + wi] = 0u;
                 const int w0 = int(wi * 32u);
                 const int a0 = clamp(in0 - w0, 0, 32);
                 const int a1 = clamp(in1 - w0 + 1, 0, 32);
@@ -927,8 +1134,37 @@ void main() {
                     const uint from = a0 >= 32 ? 0u : ~((1u << uint(a0)) - 1u);
                     inside = upto & from;
                 }
-                left_out += uint(bitCount(bits & ~inside));
+                row_out_original += uint(bitCount(bits & ~inside));
             }
+            const uint row_out_before = left_out;
+#endif
+            for (uint c0 = 0u; c0 < words; c0 += SPLIT_AHEAD) {
+                uint chunk[SPLIT_AHEAD];
+                for (uint u = 0u; u < SPLIT_AHEAD; ++u) {
+                    chunk[u] = c0 + u < words ? split.mask[r * words + c0 + u] : 0u;
+                }
+                for (uint u = 0u; u < SPLIT_AHEAD && c0 + u < words; ++u) {
+                    const uint wi = c0 + u;
+                    const uint bits = chunk[u];
+                    if (bits == 0u) {
+                        continue;
+                    }
+                    split.mask[r * words + wi] = 0u;
+                    const int w0 = int(wi * 32u);
+                    const int a0 = clamp(in0 - w0, 0, 32);
+                    const int a1 = clamp(in1 - w0 + 1, 0, 32);
+                    uint inside = 0u;
+                    if (a1 > a0) {
+                        const uint upto = a1 >= 32 ? 0xFFFFFFFFu : (1u << uint(a1)) - 1u;
+                        const uint from = a0 >= 32 ? 0u : ~((1u << uint(a0)) - 1u);
+                        inside = upto & from;
+                    }
+                    left_out += uint(bitCount(bits & ~inside));
+                }
+            }
+#if MODE == 12
+            differ += left_out - row_out_before != row_out_original ? 1u : 0u;
+#endif
         }
         const bool any_hud = lo <= hi;
         if (any_hud) {
@@ -946,6 +1182,9 @@ void main() {
     if (right != 0u) {
         atomicMax(stats.words[W_SPLIT_RIGHT], right);
     }
+#if MODE == 12
+    atomicAdd(stats.words[W_VERIFY_SPLIT], differ);
+#endif
 }
 
 #elif MODE == 5
@@ -1025,6 +1264,20 @@ shared vec3 s_strip_k[32];
 shared vec4 s_veil; // the kept K and W's own veil (T_v luma < 1: the menu's dim got in), K_v
 shared vec3 s_veil_t;
 
+// Menu snapshots contain only the copied rectangle at (0, 0). box is its source
+// origin + valid size for this mode; the fallback uses the whole K/W image. Never
+// sample capacity outside this frame's copy, including veil probes below a short crop.
+void ReadMenuHud(ivec2 p, out vec3 k, out vec3 w) {
+    const ivec2 q = pc.band.xy + p - pc.box.xy;
+    if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, pc.box.zw))) {
+        k = vec3(0.0);
+        w = RawDomain(vec3(pc.grey));
+        return;
+    }
+    k = texelFetch(k_tex, q, 0).rgb;
+    w = texelFetch(w_tex, q, 0).rgb;
+}
+
 void main() {
     const uint li = gl_LocalInvocationIndex;
     if (li < 2u) {
@@ -1045,9 +1298,9 @@ void main() {
     if (li < 32u) {
         const int x = li < 16u ? 4 : pc.band.z - 5;
         const int y = pc.band.w * 250 / 1080 + 6 + int(li % 16u);
-        const ivec2 q = pc.band.xy + ivec2(x, y);
-        const vec3 k = texelFetch(k_tex, q, 0).rgb;
-        s_strip_t[li] = Transmittance(k, texelFetch(w_tex, q, 0).rgb);
+        vec3 k, w;
+        ReadMenuHud(ivec2(x, y), k, w);
+        s_strip_t[li] = Transmittance(k, w);
         s_strip_k[li] = BlendDomain(k);
     }
     barrier();
@@ -1083,9 +1336,8 @@ void main() {
     }
     if (status) {
         // K and W just before the menu's first draw: the HUD alone, under no veil.
-        const ivec2 q = pc.band.xy + p;
-        vec3 k = texelFetch(k_tex, q, 0).rgb;
-        vec3 w = texelFetch(w_tex, q, 0).rgb;
+        vec3 k, w;
+        ReadMenuHud(p, k, w);
         if (s_veil.w > 0.5) {
             // The HUD under a uniform veil: K = K_v + T_v * K_h, T = T_v * T_h (blend domain).
             const vec3 tv = s_veil_t;
@@ -1149,6 +1401,75 @@ void main() {
         atomicMin(stats.words[W_MARK_BOX + 1u], s_mbox[1]);
         atomicMax(stats.words[W_MARK_BOX + 2u], s_mbox[2]);
         atomicMax(stats.words[W_MARK_BOX + 3u], s_mbox[3]);
+    }
+}
+
+#elif MODE == 9
+
+// Sheet row r (from the atlas's row cut[1].x: rows of a half this frame does not show, written
+// over by this pass) is render row cut[0].x + r of the top margin's block while r < cut[0].y,
+// else cut[0].z + r - cut[0].y of the bottom margin's (cut[0].w rows); x as in the band
+// (band.x + x). cut[2], cut[3]: the clusters' cut-outs in the sheet (sheet px), whose rows are
+// cut[1].y rows above their home's; box: the area name's slot (sheet px); scene_size: the
+// banners' rows (sheet px, from .x to .y).
+shared uint s_slot_n[4];
+shared uint s_slot_box[8];
+
+void main() {
+    const uint li = gl_LocalInvocationIndex;
+    if (li < 4u) {
+        s_slot_n[li] = 0u;
+    }
+    if (li < 8u) {
+        s_slot_box[li] = (li & 3u) < 2u ? 0xFFFFFFFFu : 0u;
+    }
+    barrier();
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const int rows = pc.cut[0].y + pc.cut[0].w;
+    if (p.x < pc.band.z && p.y < rows) {
+        const int y = p.y < pc.cut[0].y ? pc.cut[0].x + p.y : pc.cut[0].z + p.y - pc.cut[0].y;
+        const ivec2 q = ivec2(pc.band.x + p.x, y);
+        const vec3 w = texelFetch(w_tex, q, 0).rgb;
+        vec3 k = texelFetch(k_tex, q, 0).rgb;
+        bool saturated;
+        const vec3 t = ReadKT(k, w, saturated);
+        const vec4 px = UiPixelKT(k, t, false);
+        imageStore(atlas_img, ivec2(p.x, pc.cut[1].x + p.y), px);
+        if (px.a > 4.0 / 255.0) {
+            for (uint c = 0u; c < 2u; ++c) {
+                const ivec4 r = pc.cut[2u + c];
+                if (p.x >= r.x && p.y >= r.y && p.x < r.z && p.y < r.w) {
+                    atomicAdd(s_slot_n[c], 1u);
+                    if (px.a > 16.0 / 255.0) {
+                        const uint home_y = uint(p.y + pc.cut[1].y);
+                        atomicMin(s_slot_box[4u * c], uint(p.x));
+                        atomicMin(s_slot_box[4u * c + 1u], home_y);
+                        atomicMax(s_slot_box[4u * c + 2u], uint(p.x));
+                        atomicMax(s_slot_box[4u * c + 3u], home_y);
+                    }
+                }
+            }
+            if (p.x >= pc.box.x && p.y >= pc.box.y && p.x < pc.box.z && p.y < pc.box.w) {
+                atomicAdd(s_slot_n[2], 1u);
+            }
+            if (p.y >= pc.scene_size.x && p.y < pc.scene_size.y) {
+                atomicAdd(s_slot_n[3], 1u);
+            }
+        }
+    }
+    barrier();
+    if (li < 2u && s_slot_n[li] != 0u) {
+        atomicAdd(stats.words[W_CUT0 + li], s_slot_n[li]);
+    }
+    if (li >= 2u && li < 4u && s_slot_n[li] != 0u) {
+        atomicAdd(stats.words[li == 2u ? W_SLOT_AREA : W_SLOT_BANNER], s_slot_n[li]);
+    }
+    if (li < 2u && s_slot_box[4u * li + 2u] >= s_slot_box[4u * li] &&
+        s_slot_box[4u * li] != 0xFFFFFFFFu) {
+        atomicMin(stats.words[W_CUT_BOX + 4u * li], s_slot_box[4u * li]);
+        atomicMin(stats.words[W_CUT_BOX + 4u * li + 1u], s_slot_box[4u * li + 1u]);
+        atomicMax(stats.words[W_CUT_BOX + 4u * li + 2u], s_slot_box[4u * li + 2u]);
+        atomicMax(stats.words[W_CUT_BOX + 4u * li + 3u], s_slot_box[4u * li + 3u]);
     }
 }
 

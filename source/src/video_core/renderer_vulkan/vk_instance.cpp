@@ -5,6 +5,7 @@
 
 #include "video_core/native_stereo/native_stereo.h"
 #include <cstdlib>
+#include <thread>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
@@ -17,10 +18,13 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/openxr_presenter.h"
+#include "video_core/renderer_vulkan/vk_gpu_crash.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_residency.h"
 #include "video_core/renderer_vulkan/vr_dlss_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vr_foveation.h"
 #include "video_core/renderer_vulkan/vr_xr_queue_policy.h"
 
 #include <vk_mem_alloc.h>
@@ -28,6 +32,17 @@
 namespace Vulkan {
 
 namespace {
+
+// VR_VRAM_BUDGET_MB=<MB> (tests only, read once): the budget a smaller card would give, so the
+// texture and buffer caches set their eviction thresholds as they would there (with a VRAM
+// ballast holding the rest of the GPU, a 4 GB card is simulated on a larger one). 0: none.
+u64 TestBudgetCap() {
+    static const u64 cap = [] {
+        const char* test = std::getenv("VR_VRAM_BUDGET_MB");
+        return test && *test ? std::strtoull(test, nullptr, 10) << 20 : u64{0};
+    }();
+    return cap;
+}
 
 std::vector<vk::PhysicalDevice> EnumeratePhysicalDevices(vk::UniqueInstance& instance) {
     auto [devices_result, devices] = instance->enumeratePhysicalDevices();
@@ -110,6 +125,8 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     if (enable_validation) {
         debug_callback = CreateDebugCallback(*instance);
     }
+    // Before the device: its objects' GPU address ranges, for the crash report (vk_gpu_crash.h).
+    address_callback = GpuCrash::AddressMessenger(*instance);
     const std::size_t num_physical_devices = static_cast<u16>(physical_devices.size());
     ASSERT_MSG(num_physical_devices > 0, "No physical devices found");
     LOG_INFO(Render_Vulkan, "Found {} physical devices", num_physical_devices);
@@ -184,6 +201,14 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     format_properties = GetFormatProperties(physical_device);
     properties = physical_device.getProperties();
     memory_properties = physical_device.getMemoryProperties();
+    VR::Graphics::neural_gpu.store(
+        VR::Graphics::Rtx50(properties.vendorID, properties.deviceName.data()) ? 1 : 0);
+    VR::Graphics::amd_gpu.store(properties.vendorID == 0x1002 ? 1 : 0);
+    // The player's DLSS 5 file is checked off this thread; the VR page offers DLSS 5 once it passes.
+    if (VR::Graphics::neural_gpu.load() == 1)
+        std::thread([] { VerifiedNeuralFile(); }).detach();
+    else
+        VR::Graphics::neural_file.store(0);
     CollectDeviceParameters();
     RENDER_DIAGNOSTIC_ONCE("GPU name={} vendor={:#x} device={:#x} driver={} Vulkan={}",
         properties.deviceName.data(), properties.vendorID, properties.deviceID,
@@ -250,6 +275,14 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceVulkan12Properties, vk::PhysicalDeviceVulkan13Properties,
         vk::PhysicalDevicePushDescriptorPropertiesKHR>();
     vk11_props = properties_chain.get<vk::PhysicalDeviceVulkan11Properties>();
+    if (vk11_props.deviceLUIDValid) {
+        std::array<u8, 8> luid{};
+        std::copy_n(vk11_props.deviceLUID.begin(), luid.size(), luid.begin());
+        residency = std::make_unique<Residency::Reader>(luid);
+        LOG_INFO(Render_Vulkan, "Residency: {}", residency->Found()
+                     ? "reading Windows' GPU memory counters every 2 s (the spill watch is on)"
+                     : "no pdh.dll (the spill watch is off)");
+    }
     vk12_props = properties_chain.get<vk::PhysicalDeviceVulkan12Properties>();
     vk13_props = properties_chain.get<vk::PhysicalDeviceVulkan13Properties>();
     push_descriptor_props = properties_chain.get<vk::PhysicalDevicePushDescriptorPropertiesKHR>();
@@ -389,7 +422,92 @@ bool Instance::CreateDevice() {
         feature_chain.get<vk::PhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT>()
             .dynamicRenderingUnusedAttachments &&
         add_extension(VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME);
+    // Fixed foveated rendering (vr_foveation.h), with the shading rate taken from an attachment.
+    // 16x16 texels where the card allows them (else its smallest), and 4x4 fragments only where
+    // the card lists them. Enabled on every card that can, whatever vr.ini foveation says at the
+    // start: the level is live (the VR page), Off only leaves the rate map out of the passes.
+    // VR_FOVEATED (tests) fixes it for the run instead, and VR_FOVEATED=0 keeps the extension out.
+    const char* const foveation_env = std::getenv("VR_FOVEATED");
+    foveation_fixed = Foveation::Fixed(foveation_env);
+    foveation_settings = Foveation::Choose(foveation_env,
+                                           VR::Graphics::foveation.load(std::memory_order_relaxed));
+    if ((foveation_settings.on || !foveation_fixed) &&
+        std::ranges::find(available_extensions, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME) !=
+            available_extensions.end()) {
+        const auto rate_features =
+            physical_device
+                .getFeatures2<vk::PhysicalDeviceFeatures2,
+                              vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>()
+                .get<vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>();
+        const auto rate_props =
+            physical_device
+                .getProperties2<vk::PhysicalDeviceProperties2,
+                                vk::PhysicalDeviceFragmentShadingRatePropertiesKHR>()
+                .get<vk::PhysicalDeviceFragmentShadingRatePropertiesKHR>();
+        // Coarse shading may be restricted for fragment shaders that write depth/stencil or the
+        // sample mask (AMD RDNA 2 and Intel Arc report both on Windows, NVIDIA neither): those
+        // pipelines then ignore the rate map (vk_graphics_pipeline.cpp), the rest are foveated.
+        // A pipeline sample mask is allowed by every card reported so far; a card that restricts
+        // it keeps full rate everywhere.
+        foveation_shader_depth = rate_props.fragmentShadingRateWithShaderDepthStencilWrites;
+        foveation_shader_mask = rate_props.fragmentShadingRateWithShaderSampleMask;
+        if (!rate_props.fragmentShadingRateWithSampleMask) {
+            LOG_WARNING(Render_Vulkan,
+                        "VR foveation: off, the card restricts coarse shading with a sample mask");
+        }
+        if (rate_features.attachmentFragmentShadingRate &&
+            rate_props.fragmentShadingRateWithSampleMask &&
+            add_extension(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)) {
+            foveation = true;
+            const auto lo = rate_props.minFragmentShadingRateAttachmentTexelSize;
+            const auto hi = rate_props.maxFragmentShadingRateAttachmentTexelSize;
+            foveation_texel = {std::clamp(16u, lo.width, hi.width),
+                               std::clamp(16u, lo.height, hi.height)};
+            foveation_layered = rate_props.layeredShadingRateAttachments;
+            const auto [rates_result, rates] = physical_device.getFragmentShadingRatesKHR();
+            if (rates_result == vk::Result::eSuccess)
+                for (const auto& rate : rates)
+                    foveation_4x4 |= rate.fragmentSize == vk::Extent2D{4, 4};
+        }
+        LOG_INFO(Render_Vulkan,
+                 "VR foveation: {} (attachment rates {}, texel {}x{}, layered {}, 4x4 {}, coarse "
+                 "with shader depth/stencil {}, with shader sample mask {}); at the start {} "
+                 "(inner {:.2f}, outer {:.2f}){}",
+                 foveation ? "available" : "unavailable",
+                 bool(rate_features.attachmentFragmentShadingRate), foveation_texel.width,
+                 foveation_texel.height, foveation_layered, foveation_4x4, foveation_shader_depth,
+                 foveation_shader_mask, foveation_settings.on ? "on" : "off",
+                 foveation_settings.inner, foveation_settings.outer,
+                 foveation_fixed ? ", fixed by VR_FOVEATED" : ", live (vr.ini foveation)");
+    }
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    // GPU crash reports (vk_gpu_crash.h): the driver's own fault report (a query made only after
+    // a lost device) wherever the device has it, the checkpoint markers when wanted (NVIDIA).
+    bool device_fault = false;
+    if (std::ranges::find(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME) !=
+        available_extensions.end()) {
+        device_fault = physical_device
+                           .getFeatures2<vk::PhysicalDeviceFeatures2,
+                                         vk::PhysicalDeviceFaultFeaturesEXT>()
+                           .get<vk::PhysicalDeviceFaultFeaturesEXT>()
+                           .deviceFault &&
+                       add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    }
+    gpu_checkpoints = GpuCrash::WantCheckpoints() &&
+                      add_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+    // Every object's GPU address range, told to the instance's address messenger.
+    bool address_report = false;
+    if (address_callback &&
+        std::ranges::find(available_extensions,
+                          VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME) !=
+            available_extensions.end()) {
+        address_report = physical_device
+                             .getFeatures2<vk::PhysicalDeviceFeatures2,
+                                           vk::PhysicalDeviceAddressBindingReportFeaturesEXT>()
+                             .get<vk::PhysicalDeviceAddressBindingReportFeaturesEXT>()
+                             .reportAddressBinding &&
+                         add_extension(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+    }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
 
@@ -411,6 +529,28 @@ bool Instance::CreateDevice() {
     if (!graphics_queue_found) {
         LOG_CRITICAL(Render_Vulkan, "Unable to find graphics and/or present queues.");
         return false;
+    }
+
+    // The buffer arenas (FAST_BUFFER_ARENA, buffer_cache/sparse_pool.h): sparse buffers, with the
+    // graphics queue binding their memory. On by default (2026-11-05); FAST_BUFFER_ARENA=0 turns
+    // them off. A device without sparse buffers keeps ordinary ones, as before.
+    {
+        const char* arena = std::getenv("FAST_BUFFER_ARENA");
+        const bool arena_on = arena == nullptr || arena[0] != '0';
+        // Aliased too: a merge binds the old views' pieces in the new view, and a twin the
+        // view's pieces (VkBufferCreateInfo: SPARSE_ALIASED needs sparseResidencyAliased).
+        sparse_buffers = arena_on && features.sparseBinding &&
+                         features.sparseResidencyBuffer && features.sparseResidencyAliased &&
+                         (family_properties[queue_family_index].queueFlags &
+                          vk::QueueFlagBits::eSparseBinding);
+        if (arena_on) {
+            LOG_INFO(Render_Vulkan, "Buffer arenas: sparse buffers {} (sparseBinding={} "
+                     "sparseResidencyBuffer={} sparseResidencyAliased={} queue={})",
+                     sparse_buffers ? "on" : "UNSUPPORTED", bool(features.sparseBinding),
+                     bool(features.sparseResidencyBuffer), bool(features.sparseResidencyAliased),
+                     bool(family_properties[queue_family_index].queueFlags &
+                          vk::QueueFlagBits::eSparseBinding));
+        }
     }
 
     // VR: the desktop present gets a second queue of the family when it has one
@@ -446,13 +586,23 @@ bool Instance::CreateDevice() {
     // Queue 0 the graphics queue, then the desktop present's, then the runtime's. The runtime's
     // has the graphics queue's priority (1.0, the highest; priorities are only hints, and with
     // equal ones neither goes first); the desktop present's may be lower (low_present).
-    std::array<float, 3> queue_priorities{1.0f, 1.0f, 1.0f};
+    std::array<float, 4> queue_priorities{1.0f, 1.0f, 1.0f, 1.0f};
     if (own_present) {
         queue_priorities[1] = low_present ? 0.0f : 1.0f;
     }
+    // Sparse buffers: their binds on a queue of the family of their own when it has one more
+    // (FAST_SPARSE_OWN_QUEUE, '0' off): a bind on the graphics queue waits for the frames ahead of
+    // it and the GPU idles behind it (30-40 ms load-in frames, 2026-11-05); on its own queue only
+    // the submit that needs the new memory waits for it (SparsePool's semaphore).
+    const u32 queues_with_xr = queues_before + (own_xr.own ? 1u : 0u);
+    {
+        const char* own = std::getenv("FAST_SPARSE_OWN_QUEUE");
+        own_sparse_queue = sparse_buffers && !(own && own[0] == '0') &&
+                           family_properties[queue_family_index].queueCount > queues_with_xr;
+    }
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = queues_before + (own_xr.own ? 1u : 0u),
+        .queueCount = queues_with_xr + (own_sparse_queue ? 1u : 0u),
         .pQueuePriorities = queue_priorities.data(),
     };
 
@@ -477,6 +627,63 @@ bool Instance::CreateDevice() {
         *instance, physical_device, enabled_extensions,
         VR::Graphics::Accepted().upscaler == VR::Graphics::Upscaler::Dlss);
 
+    // FSR 4.1 (AMD's FSR SDK 2.4.0 upscaler, the fsr41 bridge): what AMD's Vulkan backend and its
+    // FP8 / INT8 models use (the extensions its upscaler DLL names), enabled for an FSR 4.1
+    // session only and only where the card has them, so no other session's device changes.
+    // AMD's backend picks AMD device-coherent memory types and loads the KHR-named
+    // memory-requirements command whenever the card offers them, so those are enabled too.
+    const bool fsr41 = VR::Graphics::Accepted().upscaler == VR::Graphics::Upscaler::Fsr41;
+    const auto available = [&](std::string_view extension) {
+        return std::ranges::find(available_extensions, extension) != available_extensions.end();
+    };
+    const auto add_once = [&](std::string_view extension) {
+        if (std::ranges::find_if(enabled_extensions, [&](const char* e) {
+                return extension == e;
+            }) != enabled_extensions.end())
+            return true;
+        return add_extension(extension);
+    };
+    vk::PhysicalDeviceCooperativeMatrixFeaturesKHR fsr41_matrix{};
+    vk::PhysicalDeviceShaderFloat8FeaturesEXT fsr41_float8{};
+    vk::PhysicalDeviceCoherentMemoryFeaturesAMD fsr41_coherent{};
+    if (fsr41) {
+        add_once(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
+        add_once(VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
+        if (available(VK_AMD_BUFFER_MARKER_EXTENSION_NAME))
+            add_once(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+        if (available(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+            fsr41_matrix = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                vk::PhysicalDeviceCooperativeMatrixFeaturesKHR>()
+                .get<vk::PhysicalDeviceCooperativeMatrixFeaturesKHR>();
+            if (!fsr41_matrix.cooperativeMatrix || !add_once(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME))
+                fsr41_matrix = {};
+        }
+        if (available(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) {
+            fsr41_float8 = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                vk::PhysicalDeviceShaderFloat8FeaturesEXT>()
+                .get<vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
+            // Its cooperative-matrix use needs the matrix feature itself.
+            fsr41_float8.shaderFloat8CooperativeMatrix &= fsr41_matrix.cooperativeMatrix;
+            if (!fsr41_float8.shaderFloat8 || !add_once(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME))
+                fsr41_float8 = {};
+        }
+        if (available(VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME)) {
+            fsr41_coherent = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                vk::PhysicalDeviceCoherentMemoryFeaturesAMD>()
+                .get<vk::PhysicalDeviceCoherentMemoryFeaturesAMD>();
+            if (!fsr41_coherent.deviceCoherentMemory ||
+                !add_once(VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME))
+                fsr41_coherent = {};
+        }
+        LOG_INFO(Render_Vulkan,
+                 "FSR 4.1 device: cooperative matrix {}, float8 {} (matrix {}), AMD coherent "
+                 "memory {}",
+                 bool(fsr41_matrix.cooperativeMatrix), bool(fsr41_float8.shaderFloat8),
+                 bool(fsr41_float8.shaderFloat8CooperativeMatrix),
+                 bool(fsr41_coherent.deviceCoherentMemory));
+    }
+    fsr41_matrix.pNext = fsr41_float8.pNext = fsr41_coherent.pNext = nullptr;
+
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
@@ -485,8 +692,9 @@ bool Instance::CreateDevice() {
         vk12_features.storageBuffer8BitAccess && vk12_features.shaderInt8 &&
         vk12_features.shaderFloat16 && vk13_features.shaderIntegerDotProduct;
     if (NativeStereo::Enabled()) {
-        // Native stereo draws both eyes with multiview; every report then says what the card
-        // offers (a right eye left gray on some AMD cards, 2026-10-21).
+        // Native stereo draws both eyes with multiview or, on AMD RX 6000, layer draws;
+        // every report then says what the card offers (a right eye left gray on some AMD cards,
+        // 2026-10-21).
         RENDER_DIAGNOSTIC_ONCE("Native stereo multiview: multiview={} geometry={} tessellation={} "
                                "vendor={:#x} device={:#x} driver={:#x}",
                                bool(vk11_features.multiview),
@@ -494,6 +702,10 @@ bool Instance::CreateDevice() {
                                bool(vk11_features.multiviewTessellationShader),
                                properties.vendorID, properties.deviceID, properties.driverVersion);
     }
+    // Layer draws or multiview, before any pipeline or pass is made, in DIBR sessions too: the
+    // shader cache's profile carries the card's mode (NativeStereo::LayerDrawsMode).
+    NativeStereo::ChooseLayerDraws(properties.vendorID, properties.deviceID,
+                                   properties.deviceName.data(), vk12_features.shaderOutputLayer);
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = 1u,
@@ -531,6 +743,9 @@ bool Instance::CreateDevice() {
                 .shaderFloat64 = features.shaderFloat64,
                 .shaderInt64 = features.shaderInt64,
                 .shaderInt16 = features.shaderInt16,
+                .sparseBinding = sparse_buffers,
+                .sparseResidencyBuffer = sparse_buffers,
+                .sparseResidencyAliased = sparse_buffers,
             },
         },
         vk::PhysicalDeviceVulkan11Features{
@@ -548,9 +763,19 @@ bool Instance::CreateDevice() {
             .shaderSharedInt64Atomics = vk12_features.shaderSharedInt64Atomics,
             .shaderFloat16 = vk12_features.shaderFloat16,
             .shaderInt8 = vk12_features.shaderInt8,
-            .shaderSampledImageArrayNonUniformIndexing = NativeStereo::Enabled() && vk12_features.shaderSampledImageArrayNonUniformIndexing,
-            .shaderStorageBufferArrayNonUniformIndexing = NativeStereo::Enabled() && vk12_features.shaderStorageBufferArrayNonUniformIndexing,
-            .shaderStorageImageArrayNonUniformIndexing = NativeStereo::Enabled() && vk12_features.shaderStorageImageArrayNonUniformIndexing,
+            // FSR 4.1: the descriptor indexing its backend names (VK_EXT_descriptor_indexing).
+            .descriptorIndexing = fsr41 && vk12_features.descriptorIndexing,
+            .shaderUniformBufferArrayNonUniformIndexing = fsr41 && vk12_features.shaderUniformBufferArrayNonUniformIndexing,
+            .shaderSampledImageArrayNonUniformIndexing = (NativeStereo::Enabled() || fsr41) && vk12_features.shaderSampledImageArrayNonUniformIndexing,
+            .shaderStorageBufferArrayNonUniformIndexing = (NativeStereo::Enabled() || fsr41) && vk12_features.shaderStorageBufferArrayNonUniformIndexing,
+            .shaderStorageImageArrayNonUniformIndexing = (NativeStereo::Enabled() || fsr41) && vk12_features.shaderStorageImageArrayNonUniformIndexing,
+            .descriptorBindingSampledImageUpdateAfterBind = fsr41 && vk12_features.descriptorBindingSampledImageUpdateAfterBind,
+            .descriptorBindingStorageImageUpdateAfterBind = fsr41 && vk12_features.descriptorBindingStorageImageUpdateAfterBind,
+            .descriptorBindingStorageBufferUpdateAfterBind = fsr41 && vk12_features.descriptorBindingStorageBufferUpdateAfterBind,
+            .descriptorBindingUpdateUnusedWhilePending = fsr41 && vk12_features.descriptorBindingUpdateUnusedWhilePending,
+            .descriptorBindingPartiallyBound = fsr41 && vk12_features.descriptorBindingPartiallyBound,
+            .descriptorBindingVariableDescriptorCount = fsr41 && vk12_features.descriptorBindingVariableDescriptorCount,
+            .runtimeDescriptorArray = fsr41 && vk12_features.runtimeDescriptorArray,
             .scalarBlockLayout = vk12_features.scalarBlockLayout,
             .uniformBufferStandardLayout = vk12_features.uniformBufferStandardLayout,
             .separateDepthStencilLayouts = vk12_features.separateDepthStencilLayouts,
@@ -563,6 +788,7 @@ bool Instance::CreateDevice() {
             .robustImageAccess = vk13_features.robustImageAccess,
             .shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation,
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
+            .computeFullSubgroups = fsr41 && vk13_features.computeFullSubgroups,
             .synchronization2 = vk13_features.synchronization2,
             .dynamicRendering = vk13_features.dynamicRendering,
             .shaderIntegerDotProduct = vk13_features.shaderIntegerDotProduct,
@@ -571,6 +797,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR{
             .computeDerivativeGroupLinear = derivatives.computeDerivativeGroupLinear,
         },
+        fsr41_matrix,
+        fsr41_float8,
+        fsr41_coherent,
         // Extensions
         vk::PhysicalDeviceCustomBorderColorFeaturesEXT{
             .customBorderColors = true,
@@ -642,10 +871,29 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT{
             .dynamicRenderingUnusedAttachments = true,
         },
+        vk::PhysicalDeviceFragmentShadingRateFeaturesKHR{
+            // Only the attachment rate: the pipelines keep a 1x1 fragment size (vr_foveation.h).
+            .attachmentFragmentShadingRate = true,
+        },
+        vk::PhysicalDeviceFaultFeaturesEXT{
+            .deviceFault = true,
+        },
+        vk::PhysicalDeviceAddressBindingReportFeaturesEXT{
+            .reportAddressBinding = true,
+        },
     };
 
     if (!derivatives.computeDerivativeGroupLinear) {
         device_chain.unlink<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
+    }
+    if (!fsr41_matrix.cooperativeMatrix) {
+        device_chain.unlink<vk::PhysicalDeviceCooperativeMatrixFeaturesKHR>();
+    }
+    if (!fsr41_float8.shaderFloat8) {
+        device_chain.unlink<vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
+    }
+    if (!fsr41_coherent.deviceCoherentMemory) {
+        device_chain.unlink<vk::PhysicalDeviceCoherentMemoryFeaturesAMD>();
     }
     if (!custom_border_color) {
         device_chain.unlink<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>();
@@ -693,6 +941,15 @@ bool Instance::CreateDevice() {
     if (!dynamic_rendering_unused_attachments) {
         device_chain.unlink<vk::PhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT>();
     }
+    if (!foveation) {
+        device_chain.unlink<vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>();
+    }
+    if (!device_fault) {
+        device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
+    }
+    if (!address_report) {
+        device_chain.unlink<vk::PhysicalDeviceAddressBindingReportFeaturesEXT>();
+    }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
@@ -720,6 +977,24 @@ bool Instance::CreateDevice() {
     own_xr_queue = own_xr.own;
     xr_queue_index = own_xr.own ? queues_before : 0u;
     xr_queue = device->getQueue(queue_family_index, xr_queue_index);
+    sparse_queue = own_sparse_queue ? device->getQueue(queue_family_index, queues_with_xr)
+                                    : graphics_queue;
+    {
+        const std::array<GpuCrash::NamedQueue, 4> queues{{
+            {graphics_queue, "graphics (game)"},
+            {present_queue, "desktop present"},
+            {xr_queue, "OpenXR runtime"},
+            {sparse_queue, "sparse binds"},
+        }};
+        GpuCrash::Init(physical_device, *device, device_fault, gpu_checkpoints,
+                       supports_memory_budget, queues);
+        GpuCrash::SetAddressReport(address_report);
+    }
+    if (sparse_buffers) {
+        LOG_INFO(Render_Vulkan, "Buffer arenas: sparse binds on {}", own_sparse_queue
+                 ? fmt::format("a queue of their own (index {})", queues_with_xr)
+                 : std::string{"the graphics queue"});
+    }
     if (OpenXRPresenter::IsRequested()) {
         // Once: which queue the OpenXR runtime submits its work on (OpenXRPresenter's binding).
         LOG_INFO(Render_Vulkan,
@@ -856,10 +1131,18 @@ void Instance::CollectPhysicalMemoryInfo() {
         // If memory budget is not supported, use the size of the heap as the budget.
         total_memory_budget += memory_props.memoryHeaps[i].size;
     }
+    device_local_cap = local_memory - std::min<u64>(local_memory / 8, 1_GB);
     if (!IsIntegrated()) {
         // We reserve some memory for the system.
         const u64 system_memory = std::min<u64>(total_memory_budget / 8, 1_GB);
         total_memory_budget -= system_memory;
+        if (const u64 cap = TestBudgetCap(); cap != 0 && cap < total_memory_budget) {
+            LOG_WARNING(Render_Vulkan,
+                        "VR_VRAM_BUDGET_MB: a memory budget of {} MB for this test (the card "
+                        "gives {} MB)",
+                        cap >> 20, total_memory_budget >> 20);
+            total_memory_budget = cap;
+        }
         return;
     }
     // Leave at least 8 GB for the system on integrated GPUs.
@@ -923,6 +1206,54 @@ void Instance::CollectToolingInfo() const {
         const std::string_view name = tool.name;
         LOG_INFO(Render_Vulkan, "Attached debugging tool: {}", name);
     }
+}
+
+Instance::MemoryBudgetNow Instance::QueryMemoryBudget() const {
+    if (!supports_memory_budget || IsIntegrated()) {
+        return {};
+    }
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
+    vk::PhysicalDeviceMemoryProperties2 props = {
+        .pNext = &memory_budget_props,
+    };
+    physical_device.getMemoryProperties2(&props);
+    MemoryBudgetNow now;
+    for (const size_t heap : valid_heaps) {
+        now.budget += memory_budget_props.heapBudget[heap];
+        now.usage += memory_budget_props.heapUsage[heap];
+    }
+    // Windows' counters (Residency::Reader): memory it moved to system memory still counts in
+    // Vulkan's use but is not resident, and adds to the system-memory use beyond what the game
+    // allocated there itself. Both must show it: memory allocated at a load counts in Vulkan before
+    // its first use makes it resident (1.7 GB "missing" at a load, 2026-11-05), with no system
+    // memory growth.
+    const auto& heaps = props.memoryProperties;
+    for (u32 heap = 0; heap < heaps.memoryHeapCount; ++heap) {
+        if (!(heaps.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+            now.host += memory_budget_props.heapUsage[heap];
+        }
+    }
+    now.resident = now.usage;
+    if (const auto windows = residency ? residency->Read() : std::nullopt) {
+        now.resident = std::min<u64>(now.usage, windows->local);
+        now.non_local = windows->non_local;
+        // FAST_SPILL_WATCH=0 (A/B tests only): the counters are still read and logged, but no
+        // reading reaches the spill watch, so the marks follow Windows' budget alone.
+        static const bool spill_watch = [] {
+            const char* value = std::getenv("FAST_SPILL_WATCH");
+            return value == nullptr || value[0] != '0';
+        }();
+        now.residency_sample = spill_watch ? windows->sample : 0;
+        const u64 missing = now.usage - now.resident;
+        const u64 extra = windows->non_local > now.host ? windows->non_local - now.host : 0;
+        now.spilled = std::min(missing, extra);
+    }
+    // As at the start (CollectPhysicalMemoryInfo): the system's share off, a test's cap on.
+    now.budget -= std::min<u64>(now.budget / 8, 1_GB);
+    if (const u64 cap = TestBudgetCap(); cap != 0) {
+        now.budget = std::min(now.budget, cap);
+    }
+    return now;
 }
 
 u64 Instance::GetDeviceMemoryUsage() const {

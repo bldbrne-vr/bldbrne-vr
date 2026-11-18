@@ -1,3 +1,5 @@
+#include "video_core/fast/b_handler_profile.h"
+#include "video_core/diag_delay.h"
 #include "video_core/flip_order_trace.h"
 // SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
@@ -85,6 +87,18 @@ struct SetWriteHead {
     u64 hash; // FAST_CPU_DRIVER_CALLS_VERIFY: SetWriteCodec::Hash of the caller's writes
 };
 static_assert(sizeof(SetWriteHead) == 24);
+// DescriptorPacket::bulk of a VR_COMPACT_SETS set write (ReplaySetWriteCompact): a CompactHead
+// follows the packet, then the writes' StereoSetCodec encoding, `encoded` bytes long; `count` is
+// the number of writes.
+constexpr u32 SetWriteCompactPacket = 4;
+struct CompactHead {
+    DescriptorHeap* heap;
+    vk::DescriptorSetLayout set_layout;
+    u64 check; // VR_COMPACT_SETS=v: StereoSetCodec::FieldHash of the pairing's writes (0: none)
+    u32 encoded;
+    u32 pad;
+};
+static_assert(sizeof(CompactHead) == 32);
 struct Barrier2Packet {
     vk::DependencyFlags flags;
     u32 memory, buffers, images;
@@ -97,7 +111,20 @@ struct BarrierPacket {
 struct RenderingPacket {
     vk::RenderingInfo info;
     u32 depth, stencil;
+    // Fixed foveated rendering (vr_foveation.h): the pass's shading rate attachment, carried in
+    // the packet (null view: none) so such passes keep the packet path.
+    vk::ImageView rate_view;
+    vk::ImageLayout rate_layout;
+    vk::Extent2D rate_texel;
 };
+// A pass whose only extension is a shading rate attachment (nothing chained after it).
+const vk::RenderingFragmentShadingRateAttachmentInfoKHR* RateAttachment(const void* next) {
+    const auto* base = static_cast<const vk::BaseInStructure*>(next);
+    if (!base || base->sType != vk::StructureType::eRenderingFragmentShadingRateAttachmentInfoKHR ||
+        base->pNext)
+        return nullptr;
+    return static_cast<const vk::RenderingFragmentShadingRateAttachmentInfoKHR*>(next);
+}
 struct ControlPacket {
     u32 kind, bytes;
     u32 records; // FAST_CPU_PUSH_SPLIT_VERIFY: its replay may record (QueueControl)
@@ -328,6 +355,10 @@ bool PushSplitVerify() {
     const unsigned long pauses = std::strtoul(value, nullptr, 10);
     return pauses > 1 ? static_cast<u32>(std::min<unsigned long>(pauses, 1ul << 20)) : 4096u;
 }();
+// The spin as a time budget: the pauses above at a 5800X3D's ~17 ns each (4096: ~70 us). A
+// PAUSE takes ~140 cycles on Intel cores since Skylake against a few on Zen, so a pause count
+// spun several times longer there (bbport and its Windows ports measure the same, 2026-10-23).
+[[maybe_unused]] const u64 g_drain_spin_ns = u64{g_drain_spin_pauses} * 17;
 // FAST_RECORDER_PUBLISH_KB (read once at start-up; 1..4096, default 16): Commit publishes the
 // batch to the replay thread once this many KiB are encoded since the last publish. Smaller
 // batches let the replay follow closer behind (shorter drains) at the cost of more wakes of a
@@ -366,8 +397,107 @@ CommandRecorder::CommandRecorder(vk::CommandBuffer& command, bool allowed)
     : command{command}, allowed{allowed} {
     Configure();
 }
+CommandRecorder::CommandRecorder(vk::CommandBuffer& command, Blob, void* flush_context,
+                                 BlobFlush flush)
+    : command{command}, allowed{true}, blob{true}, blob_context{flush_context},
+      blob_flush{flush} {
+    ring = std::make_unique<std::byte[]>(Capacity);
+    enabled = true; // packets only: never threaded, never replayed here
+}
 CommandRecorder::~CommandRecorder() {
+    if (blob)
+        return; // the scheduler appends a blob before it is destroyed
     Stop();
+}
+namespace {
+// Packets that neither bind nor push nor begin or end a render pass: appending them leaves bit 35's
+// bound state and the held push constants as they were.
+bool BindNeutral(RecorderOpcode opcode) {
+    switch (opcode) {
+    case RecorderOpcode::Padding:
+    case RecorderOpcode::Barrier2:
+    case RecorderOpcode::Barrier:
+    case RecorderOpcode::BeginLabel:
+    case RecorderOpcode::InsertLabel:
+    case RecorderOpcode::endDebugUtilsLabelEXT:
+    case RecorderOpcode::fillBuffer:
+    case RecorderOpcode::copyBuffer:
+    case RecorderOpcode::copyBufferToImage:
+    case RecorderOpcode::copyImageToBuffer:
+    case RecorderOpcode::copyImage:
+    case RecorderOpcode::resolveImage:
+    case RecorderOpcode::blitImage:
+    case RecorderOpcode::clearColorImage:
+    case RecorderOpcode::clearDepthStencilImage:
+    case RecorderOpcode::resetQueryPool:
+    case RecorderOpcode::writeTimestamp2:
+    // A pass begin or end leaves every bind in place (the ring's own never resets them either).
+    case RecorderOpcode::BeginRendering:
+    case RecorderOpcode::endRendering:
+        return true;
+    default:
+        return false;
+    }
+}
+} // namespace
+u64 CommandRecorder::AppendBlob(CommandRecorder& from) {
+    ASSERT(from.blob && !blob && !reserved_bytes && !from.reserved_bytes);
+    const u64 end = from.write_position;
+    if (end == 0)
+        return 0;
+    u64 controls = 0;
+    std::byte* const base = from.ring.get();
+    const bool inline_replay = !Enabled();
+    bool neutral = true;
+    u64 position = 0, packets = 0;
+    while (position < end) {
+        const auto header = *reinterpret_cast<const Header*>(base + position);
+        ASSERT(header.size >= sizeof(Header) && position + header.size <= end);
+        if (header.opcode != RecorderOpcode::Padding) {
+            if (header.opcode == RecorderOpcode::Control) {
+                // A guest signal or replay task records nothing (QueueControl's `records`).
+                ++controls;
+                neutral = neutral &&
+                          !reinterpret_cast<const ControlPacket*>(base + position + sizeof(Header))
+                               ->records;
+            } else {
+                neutral = neutral && BindNeutral(header.opcode);
+            }
+            const u32 payload = header.size - u32(sizeof(Header));
+            if (inline_replay) {
+                // Inline (recorder off, or a raw borrow that drained everything queued): the
+                // packet is recorded now, as a proxy call would be.
+                Replay(header.opcode, base + position + sizeof(Header));
+            } else {
+                std::byte* data = Allocate(header.opcode, payload);
+                std::memcpy(data, base + position + sizeof(Header), payload);
+                Commit();
+                if (header.opcode == RecorderOpcode::Control)
+                    ++control_packets; // FAST bit 56: not a Vulkan command
+            }
+            ++packets;
+        }
+        position += header.size;
+    }
+    if (!neutral) {
+        ResetBinds();
+        ForgetHeldPush();
+        ++blob_resets;
+    }
+    ++blob_appends;
+    blob_packets += packets;
+    blob_bytes += end;
+    blob_inline += inline_replay;
+    if constexpr (Common::Log::Enabled) {
+        if ((blob_appends & 0x3FFFF) == 0)
+            LOG_INFO(Render_Vulkan,
+                     "FAST_CPU_STAGEB_SPLIT blobs: appended={} packets={} bytes={} resets={} "
+                     "inline={}",
+                     blob_appends, blob_packets, blob_bytes, blob_resets, blob_inline);
+    }
+    from.write_position = 0;
+    from.committed_packets = from.control_packets = 0;
+    return controls;
 }
 void CommandRecorder::Configure() {
     const bool next = allowed && FastRender::On(FastRender::RecorderInline);
@@ -436,48 +566,92 @@ void CommandRecorder::Publish() {
     if (!threaded || write_position == last_published)
         return;
     last_published = write_position;
-    published.store(write_position, std::memory_order_release);
-    wake_sequence.fetch_add(1, std::memory_order_release);
-    wake_sequence.notify_one();
+    published.store(write_position, std::memory_order_seq_cst);
+    wake_sequence.fetch_add(1, std::memory_order_seq_cst);
+    // FAST bit 47 (LazyReplayWake): the wake (a call into the system) only when the replay is
+    // asleep or about to be; it flags that before its last look at `published`.
+    if (!FastRender::On(FastRender::LazyReplayWake) ||
+        replay_waiting.load(std::memory_order_seq_cst))
+        wake_sequence.notify_one();
 }
 void CommandRecorder::Run() {
     Common::SetCurrentThreadName("fast:Recorder");
     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+    Common::PreferPerformanceCores();
     FastRender::g_on_recorder = true;
     FastRender::RegisterThread(FastRender::Role::Recorder);
+    // FAST_RECORDER_SPIN_US, else 50 us with 8 or more CPUs to run on and none with fewer: there
+    // the spin takes time the game's threads need. 2026-11-04 in-run A/Bs (Old Yharnam, pairs of
+    // 8 s phases), this spin and stage B's (vk_draw_pipe.h) at 50 us against neither: 8c/16t
+    // +6.2% fps (8 of 8 pairs), 6c/12t +4.1% (8 of 8), 4c/8t +1.9% (8 of 8), 4c/4t -7.1% (7 of
+    // 8 pairs went to neither; stage B's spin alone cost 1.2%). 50 us against 10: +2.1% (6 of 8).
     const auto spin = std::chrono::microseconds([] {
         const char* text = std::getenv("FAST_RECORDER_SPIN_US");
-        return text ? std::clamp(std::atoi(text), 0, 2000) : 10;
+        return text ? std::clamp(std::atoi(text), 0, 2000) : FastRender::ProcessCpus() >= 8 ? 50 : 0;
     }());
+    LOG_INFO(Render_Vulkan, "fast:Recorder idle spin {} us ({} CPUs to run on)", spin.count(),
+             FastRender::ProcessCpus());
+    // The idle spin reads the clock every 64 pauses, as stage B's (vk_draw_pipe.h): reading it
+    // after each pause was most of this thread's time while it had nothing to replay
+    // (2026-11-04, Old Yharnam: ~28% of a core in QueryPerformanceCounter). The spin lasts as
+    // long either way. FAST_RECORDER_SPIN_CLOCK=every, or in-run A/B switch 4 cleared
+    // (FAST_TOGGLE_FILE): the clock after each pause, as before.
+    static const bool clock_every_env = [] {
+        const char* text = std::getenv("FAST_RECORDER_SPIN_CLOCK");
+        return text && std::string_view{text} == "every";
+    }();
+    const auto idle = [this] {
+        return published.load(std::memory_order_acquire) <=
+                   completed.load(std::memory_order_acquire) &&
+               !stopping.load(std::memory_order_relaxed);
+    };
     while (!stopping.load(std::memory_order_acquire)) {
         const u64 end = published.load(std::memory_order_acquire);
         if (completed.load(std::memory_order_acquire) < end) {
             ReplayUntil(end);
             continue;
         }
-        const auto until = std::chrono::steady_clock::now() + spin;
-        while (std::chrono::steady_clock::now() < until &&
-               published.load(std::memory_order_acquire) <=
-                   completed.load(std::memory_order_acquire) &&
-               !stopping.load(std::memory_order_relaxed)) {
+        // In-run A/B switch 5 cleared: no idle spin (straight to the wait), for weak CPUs; 9
+        // cleared: five times as long (fewer sleeps for stage B's publishes to wake).
+        const auto spin_now = !FastRender::AbOn(5) ? std::chrono::microseconds{0}
+                              : FastRender::AbOn(9) ? spin
+                                                    : spin * 5;
+        const auto until = std::chrono::steady_clock::now() + spin_now;
 #ifdef _MSC_VER
-            _mm_pause();
+        if (!clock_every_env && FastRender::AbOn(4)) {
+            for (u32 pauses = 1; spin_now.count() && idle(); ++pauses) {
+                _mm_pause();
+                if ((pauses & 63) == 0 && std::chrono::steady_clock::now() >= until)
+                    break;
+            }
+        } else {
+            while (std::chrono::steady_clock::now() < until && idle())
+                _mm_pause();
+        }
 #else
+        while (std::chrono::steady_clock::now() < until && idle())
             std::this_thread::yield();
 #endif
-        }
         const u32 wake = wake_sequence.load(std::memory_order_acquire);
-        if (stopping.load(std::memory_order_acquire))
+        replay_waiting.store(true, std::memory_order_seq_cst);
+        if (stopping.load(std::memory_order_acquire)) {
+            replay_waiting.store(false, std::memory_order_relaxed);
             break;
-        if (published.load(std::memory_order_acquire) > completed.load(std::memory_order_acquire))
+        }
+        if (published.load(std::memory_order_seq_cst) > completed.load(std::memory_order_acquire)) {
+            replay_waiting.store(false, std::memory_order_relaxed);
             continue;
+        }
         wake_sequence.wait(wake, std::memory_order_acquire);
+        replay_waiting.store(false, std::memory_order_relaxed);
     }
 }
 vk::CommandBuffer RecorderProxy::Raw(std::string_view reason) const {
     return recorder.Raw(reason, site);
 }
 vk::CommandBuffer CommandRecorder::Raw(std::string_view reason, std::source_location site) {
+    if (blob)
+        return blob_flush(blob_context, reason, site, 2);
     ++raw_borrows; // FAST bit 56: the caller may record directly, unseen by the packet counts
     Drain(reason, site);
     raw_borrowed = true;
@@ -487,6 +661,8 @@ vk::CommandBuffer CommandRecorder::Raw(std::string_view reason, std::source_loca
 }
 std::byte* CommandRecorder::Allocate(RecorderOpcode opcode, u32 bytes) {
     ASSERT(enabled && !reserved_bytes);
+    if (blob && write_position + Aligned(sizeof(Header) + bytes) > Capacity)
+        blob_flush(blob_context, "blob_full", std::source_location::current(), 0);
     sample_encode = (++sample_sequence & (FastRender::g_encode_sample_every - 1)) == 0;
     if (sample_encode)
         encode_start = std::chrono::steady_clock::now();
@@ -513,6 +689,15 @@ std::byte* CommandRecorder::Allocate(RecorderOpcode opcode, u32 bytes) {
     }
     return ring.get() + offset + sizeof(Header);
 }
+void CommandRecorder::CopyOut(u64 from, u64 to, std::vector<std::byte>& out) const {
+    out.resize(to - from);
+    for (u64 p = from; p < to;) {
+        const u64 offset = p % Capacity;
+        const u64 n = std::min<u64>(to - p, Capacity - offset);
+        std::memcpy(out.data() + (p - from), ring.get() + offset, n);
+        p += n;
+    }
+}
 void CommandRecorder::Abandon() {
     // The unpublished header is overwritten by the next Allocate; ring padding stays valid.
     ASSERT(reserved_bytes);
@@ -531,10 +716,17 @@ void CommandRecorder::Commit() {
                          .count();
         ++encode_samples;
     }
-    if (threaded && write_position - last_published >= g_publish_bytes) // FAST_RECORDER_PUBLISH_KB
+    // FAST_RECORDER_PUBLISH_KB; FAST bit 49 (PublishSmall): every 4 KB, so the replay keeps up and
+    // a guest-signal wait on stage B finds less to replay (cheap with bit 47's lazy wake).
+    if (threaded && write_position - last_published >=
+                        (FastRender::On(FastRender::PublishSmall) ? 4096u : g_publish_bytes))
         Publish();
 }
 void CommandRecorder::Drain(std::string_view reason, std::source_location site) {
+    if (blob) {
+        blob_flush(blob_context, reason, site, 1); // appended to the ring, which drains
+        return;
+    }
     if (!enabled)
         return;
     const u64 end = write_position;
@@ -551,10 +743,14 @@ void CommandRecorder::Drain(std::string_view reason, std::source_location site) 
     const auto start = std::chrono::steady_clock::now();
     [[maybe_unused]] u64 spin_ns = 0;
 #ifdef _MSC_VER
-    if (g_drain_spin_pauses != 0) {
-        for (u32 spin = 0; spin < g_drain_spin_pauses && done < end; ++spin) {
+    if (g_drain_spin_ns != 0) {
+        // The clock every 64 pauses, as the draw pipe's idle spin (vk_draw_pipe.h).
+        const auto until = start + std::chrono::nanoseconds(g_drain_spin_ns);
+        for (u32 spin = 1; done < end; ++spin) {
             _mm_pause();
             done = completed.load(std::memory_order_acquire);
+            if ((spin & 63) == 0 && std::chrono::steady_clock::now() >= until)
+                break;
         }
         if constexpr (Common::Log::Enabled) {
             spin_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -594,6 +790,7 @@ void CommandRecorder::ReplayUntil(u64 end) {
                     ++replay_census.stamps;
             }
             Replay(header.opcode, at + sizeof(Header));
+            FastRender::DiagDelay::At(FastRender::DiagDelay::R);
         }
         position += header.size;
     }
@@ -861,6 +1058,7 @@ bool CommandRecorder::SkipPushConstants(vk::PipelineLayout layout, vk::ShaderSta
 
 void RecorderProxy::pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages,
                                   u32 offset, u32 size, const void* values) const {
+    FastRender::BProfile::Scope b_profile{FastRender::BProfile::RecPush};
     recorder.ForgetHeldPush(); // FAST_CPU_PUSH_SPLIT: this push may change what it holds
     if (!recorder.Enabled()) {
         recorder.Direct().pushConstants(layout, stages, offset, size, values);
@@ -880,6 +1078,7 @@ void CommandRecorder::EncodePush(vk::PipelineLayout layout, vk::ShaderStageFlags
 }
 void RecorderProxy::pushConstantsSplit(vk::PipelineLayout layout, vk::ShaderStageFlags stages,
                                        u32 split, u32 size, const void* values) const {
+    FastRender::BProfile::Scope b_profile{FastRender::BProfile::RecPush};
     if (!recorder.SplitPushes() || !recorder.Enabled()) {
         pushConstants(layout, stages, 0, size, values); // the whole block, as before
         return;
@@ -1012,6 +1211,7 @@ const char* CommandRecorder::CheckHeldPush(const HeldPush& held, u64 at, u64 raw
 void RecorderProxy::pushDescriptorSetKHR(
     vk::PipelineBindPoint bind_point, vk::PipelineLayout layout, u32 set,
     const vk::ArrayProxy<const vk::WriteDescriptorSet>& writes) const {
+    FastRender::BProfile::Scope b_profile{FastRender::BProfile::RecDescriptors};
     if (!recorder.Enabled()) {
         recorder.Direct().pushDescriptorSetKHR(bind_point, layout, set, writes);
         return;
@@ -1050,6 +1250,7 @@ void RecorderProxy::pushDescriptorSetBulk(
     const vk::ArrayProxy<const vk::WriteDescriptorSet>& writes,
     std::span<const vk::DescriptorBufferInfo> buffers,
     std::span<const vk::DescriptorImageInfo> images) const {
+    FastRender::BProfile::Scope b_profile{FastRender::BProfile::RecDescriptors};
     if (!recorder.Enabled()) {
         recorder.Direct().pushDescriptorSetKHR(bind_point, layout, set, writes);
         return;
@@ -1153,7 +1354,88 @@ bool RecorderProxy::pushDescriptorSetTemplate(
 void RecorderProxy::writeDescriptorSet(DescriptorHeap& heap, vk::DescriptorSetLayout set_layout,
                                        vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
                                        u32 set, std::span<vk::WriteDescriptorSet> writes) const {
+    FastRender::BProfile::Scope b_profile{FastRender::BProfile::RecDescriptors};
     recorder.WriteDescriptorSet(heap, set_layout, bind_point, layout, set, writes, site);
+}
+bool RecorderProxy::Encoding() const {
+    return recorder.Enabled();
+}
+bool RecorderProxy::writeDescriptorSetCompact(DescriptorHeap& heap,
+                                              vk::DescriptorSetLayout set_layout,
+                                              vk::PipelineBindPoint bind_point,
+                                              vk::PipelineLayout layout, u32 set,
+                                              std::span<const vk::WriteDescriptorSet> writes,
+                                              const StereoSetCodec::Rights& rights,
+                                              u64 check) const {
+    FastRender::BProfile::Scope b_profile{FastRender::BProfile::RecDescriptors};
+    return recorder.WriteDescriptorSetCompact(heap, set_layout, bind_point, layout, set, writes,
+                                              rights, check);
+}
+bool CommandRecorder::WriteDescriptorSetCompact(DescriptorHeap& heap,
+                                                vk::DescriptorSetLayout set_layout,
+                                                vk::PipelineBindPoint bind_point,
+                                                vk::PipelineLayout layout, u32 set,
+                                                std::span<const vk::WriteDescriptorSet> writes,
+                                                const StereoSetCodec::Rights& rights, u64 check) {
+    if (!Enabled()) {
+        return false;
+    }
+    const u32 encoded = StereoSetCodec::EncodedBytes(writes, rights);
+    if (encoded == 0) {
+        return false;
+    }
+    if (bind_filter)
+        NoteDescriptorLayout(layout); // as bindDescriptorSets
+    constexpr u32 head_at = Aligned(sizeof(DescriptorPacket));
+    constexpr u32 codec_at = head_at + Aligned(sizeof(CompactHead));
+    auto* data = Allocate(RecorderOpcode::PushDescriptors, codec_at + encoded);
+    const DescriptorPacket packet{layout, bind_point, set, static_cast<u32>(writes.size()),
+                                  SetWriteCompactPacket};
+    std::memcpy(data, &packet, sizeof(packet));
+    const CompactHead head{&heap, set_layout, check, encoded, 0};
+    std::memcpy(data + head_at, &head, sizeof(head));
+    StereoSetCodec::Encode(data + codec_at, writes, rights);
+    Commit();
+    if constexpr (Common::Log::Enabled) {
+        ++set_writes_encoded;
+        set_write_bytes += codec_at + encoded;
+        ReportSetWrites();
+    }
+    return true;
+}
+void CommandRecorder::ReplaySetWriteCompact(const std::byte* data) {
+    const auto& p = *reinterpret_cast<const DescriptorPacket*>(data);
+    constexpr u32 head_at = Aligned(sizeof(DescriptorPacket));
+    constexpr u32 codec_at = head_at + Aligned(sizeof(CompactHead));
+    CompactHead head;
+    std::memcpy(&head, data + head_at, sizeof(head));
+    if (!compact_expanded) {
+        compact_expanded = std::make_unique<StereoSetCodec::Expanded>();
+    }
+    auto& expanded = *compact_expanded;
+    ++compact_replayed;
+    const bool decoded = StereoSetCodec::Decode(data + codec_at, head.encoded, p.count, expanded);
+    // Encoded by WriteDescriptorSetCompact from the same counts: a failure is a broken packet.
+    ASSERT_MSG(decoded, "VR_COMPACT_SETS: a compact set write does not decode");
+    if (head.check != 0) {
+        ++compact_checked;
+        const u64 replayed = StereoSetCodec::FieldHash(expanded.writes);
+        if (replayed != head.check &&
+            (++compact_mismatches <= 16 || (compact_mismatches & 1023) == 0)) {
+            LOG_ERROR(Render_Vulkan,
+                      "VR_COMPACT_SETS verify: set of layout {:#x} ({} writes) expands to hash "
+                      "{:#x}, the pairing's is {:#x}; mismatch #{}",
+                      std::bit_cast<u64>(head.set_layout), p.count, replayed, head.check,
+                      compact_mismatches);
+        }
+    }
+    if ((compact_replayed & 0x3FFFF) == 0 || (head.check != 0 && (compact_checked & 0xFFFF) == 0)) {
+        LOG_INFO(Render_Vulkan, "VR_COMPACT_SETS: {} sets expanded by the replay, {} checked, {} "
+                                "mismatches",
+                 compact_replayed, compact_checked, compact_mismatches);
+    }
+    const vk::DescriptorSet desc_set = HeapWrite(*head.heap, head.set_layout, expanded.writes);
+    command.bindDescriptorSets(p.bind_point, p.layout, p.set, desc_set, {});
 }
 // FAST_CPU_DRIVER_CALLS. The heap needs one thread at a time: the replay's sets come only from
 // packets, and this thread writes a set itself only while nothing is queued (the recorder off, or
@@ -1303,7 +1585,9 @@ void RecorderProxy::beginRendering(const vk::RenderingInfo& info) const {
     recorder.ResetBinds();
     const vk::ArrayProxy<const vk::RenderingAttachmentInfo> colors{info.colorAttachmentCount,
                                                                    info.pColorAttachments};
-    if (info.pNext || HasNext(colors) || (info.pDepthAttachment && info.pDepthAttachment->pNext) ||
+    const auto* rate = RateAttachment(info.pNext);
+    if ((info.pNext && !rate) || HasNext(colors) ||
+        (info.pDepthAttachment && info.pDepthAttachment->pNext) ||
         (info.pStencilAttachment && info.pStencilAttachment->pNext)) {
         Raw("rendering_extension").beginRendering(info);
         return;
@@ -1315,6 +1599,12 @@ void RecorderProxy::beginRendering(const vk::RenderingInfo& info) const {
                                        (colors.size() + depth + stencil) *
                                            Aligned(sizeof(vk::RenderingAttachmentInfo)));
     RenderingPacket packet{info, depth, stencil};
+    packet.info.pNext = nullptr;
+    if (rate) {
+        packet.rate_view = rate->imageView;
+        packet.rate_layout = rate->imageLayout;
+        packet.rate_texel = rate->shadingRateAttachmentTexelSize;
+    }
     packet.info.pColorAttachments = nullptr;
     packet.info.pDepthAttachment = nullptr;
     packet.info.pStencilAttachment = nullptr;
@@ -1399,6 +1689,10 @@ void CommandRecorder::Replay(RecorderOpcode opcode, std::byte* data) {
             ReplaySetWrite(data); // FAST_CPU_DRIVER_CALLS
             break;
         }
+        if (p.bulk == SetWriteCompactPacket) {
+            ReplaySetWriteCompact(data); // VR_COMPACT_SETS
+            break;
+        }
         auto* writes = reinterpret_cast<vk::WriteDescriptorSet*>(data + Aligned(sizeof(p)));
         if (p.bulk) {
             for (u32 i = 0; i < p.count; ++i)
@@ -1448,6 +1742,13 @@ void CommandRecorder::Replay(RecorderOpcode opcode, std::byte* data) {
         const auto stencil = Load<vk::RenderingAttachmentInfo>(tail, p.stencil);
         info.pDepthAttachment = p.depth ? depth.data() : nullptr;
         info.pStencilAttachment = p.stencil ? stencil.data() : nullptr;
+        const vk::RenderingFragmentShadingRateAttachmentInfoKHR rate{
+            .imageView = p.rate_view,
+            .imageLayout = p.rate_layout,
+            .shadingRateAttachmentTexelSize = p.rate_texel,
+        };
+        if (p.rate_view)
+            info.pNext = &rate;
         command.beginRendering(info);
         break;
     }

@@ -7,14 +7,17 @@
 #include "video_core/renderer_vulkan/vr_temporal_profile.h"
 #include "video_core/renderer_vulkan/vr_temporal_images.h"
 #include "video_core/host_shaders/vr_temporal_prepare_comp.h"
+#include "video_core/host_shaders/vr_temporal_prepare8_comp.h"
 #include "video_core/host_shaders/vr_temporal_merge_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/vram_report.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include <vk_mem_alloc.h>
 #include <filesystem>
 #include <fstream>
 #include <cstdlib>
+#include <cstring>
 #include "video_core/renderer_vulkan/vr_temporal_optimizations.h"
 #include "video_core/renderer_vulkan/vr_fsr4_interleave.h"
 #include "video_core/renderer_vulkan/vr_dlss_direct.h"
@@ -57,7 +60,8 @@ VrTemporalImages::~VrTemporalImages() {
     if (descriptors || layout || pipeline)
         scheduler.DeferOperation(
             [d = std::move(descriptors), l = std::move(layout), p = std::move(pipeline),
-             m = std::move(merge_pipeline)]() mutable {
+             m = std::move(merge_pipeline), p8 = std::move(input8_pipeline)]() mutable {
+                p8.reset();
                 m.reset();
                 p.reset();
                 l.reset();
@@ -124,6 +128,9 @@ bool VrTemporalImages::Create(Surface &s, vk::Format format, uint32_t width, uin
                        &image, &s.image.allocation, nullptr) != VK_SUCCESS)
         return false;
     s.image.image = image;
+    VideoCore::VramReport::Name(instance.GetAllocator(), s.image.allocation,
+                                fmt::format("vr temporal {} {}x{}", vk::to_string(format), width,
+                                            height));
     auto view = device.createImageViewUnique({.image = s.image,
                                               .viewType = vk::ImageViewType::e2D,
                                               .format = format,
@@ -136,12 +143,34 @@ bool VrTemporalImages::Create(Surface &s, vk::Format format, uint32_t width, uin
     s.height = height;
     return true;
 }
-bool VrTemporalImages::Allocate(const VrTemporalPair::Plan &plan) {
-    if (allocated == plan && eyes[0][0].image)
+// The provider's output. S1 (whole-frame reconstruction, the default with an upscaler) blits it
+// into the 8-bit composite twin (s1.color, R8G8B8A8Unorm), so DLSS writes it in that format
+// itself: the same quantization, done once by the provider instead of by the blit, at half the
+// memory (2026-10-23: 33 MB at 2000x2160 per eye, 94 MB at PS VR2 3400x3472). RGBA16F otherwise:
+// DLSS 5 (its linear chain), FSR (its bridges and post shaders write half floats), the scene
+// path (merged into the HDR scene), the verify twins (their comparison reads half floats), and
+// VR_UPSCALER_OUTPUT_16F=1 (A/B).
+static vk::Format OutputFormat(const VR::Graphics::Config &accepted,
+                               const VrTemporalPair::Plan &plan) {
+    static const bool force_16f = [] {
+        const char *value = std::getenv("VR_UPSCALER_OUTPUT_16F");
+        return value && *value && *value != '0';
+    }();
+    const bool verify = (plan.provider_flags &
+                         (VrTemporalPair::DlssVerifyTwin | VrTemporalPair::Fsr4VerifyTwin |
+                          VrTemporalPair::Fsr4VerifyInterleave)) != 0;
+    const bool eight_bit = !force_16f && !verify && accepted.upscaler == VR::Graphics::Upscaler::Dlss &&
+                           !accepted.dlss5 && VR::Graphics::S1Output().width != 0;
+    return eight_bit ? vk::Format::eR8G8B8A8Unorm : vk::Format::eR16G16B16A16Sfloat;
+}
+bool VrTemporalImages::Allocate(const VrTemporalPair::Plan &plan, vk::Format output_format,
+                                vk::Format color_format) {
+    if (allocated == plan && allocated_output == output_format &&
+        allocated_color == color_format && eyes[0][3].image)
         return true;
     Release();
-    constexpr std::array formats{vk::Format::eR16G16B16A16Sfloat, vk::Format::eR32Sfloat,
-                                 vk::Format::eR16G16Sfloat, vk::Format::eR16G16B16A16Sfloat};
+    const std::array formats{color_format, vk::Format::eR32Sfloat,
+                             vk::Format::eR16G16Sfloat, output_format};
     // Capability queries occur only on allocation/reconfiguration, never per draw/frame.
     for (auto format : formats) {
         const auto f =
@@ -152,8 +181,11 @@ bool VrTemporalImages::Allocate(const VrTemporalPair::Plan &plan) {
         if ((f & need) != need)
             return false;
     }
+    // Motion and output for every eye. The colour and depth copies are made by EnsureCopies when a
+    // frame first copies into them: with bit 46 the provider reads them in place (S1: both eyes'
+    // colour and the left eye's depth), so they never take memory.
     for (uint32_t eye = 0; eye < plan.views; ++eye)
-        for (uint32_t kind = 0; kind < 4; ++kind) {
+        for (uint32_t kind = 2; kind < 4; ++kind) {
             const auto &s = plan.eyes[eye];
             if (!Create(eyes[eye][kind], formats[kind], kind == 3 ? s.output_width : s.input_width,
                         kind == 3 ? s.output_height : s.input_height)) {
@@ -175,8 +207,82 @@ bool VrTemporalImages::Allocate(const VrTemporalPair::Plan &plan) {
         return false;
     }
     allocated = plan;
+    allocated_output = output_format;
+    allocated_color = color_format;
+    static vk::Format logged{}, logged_color{};
+    if (logged != output_format || logged_color != color_format) {
+        logged = output_format;
+        logged_color = color_format;
+        LOG_BENCHMARK_INFO(Render_Vulkan, "VR temporal: provider output {} ({} bytes per pixel and eye), copied colour {}",
+                 vk::to_string(output_format),
+                 output_format == vk::Format::eR8G8B8A8Unorm ? 4 : 8,
+                 vk::to_string(color_format));
+    }
     return true;
 }
+bool VrTemporalImages::EnsureCopies(const VrTemporalPair::Plan &plan, uint32_t copy_color,
+                                    uint32_t copy_depth) {
+    const std::array formats{allocated_color, vk::Format::eR32Sfloat};
+    for (uint32_t eye = 0; eye < plan.views; ++eye)
+        for (uint32_t kind = 0; kind < 2; ++kind) {
+            const uint32_t copies = kind == 0 ? copy_color : copy_depth;
+            auto &surface = eyes[eye][kind];
+            if (((copies >> eye) & 1u) && !surface.image &&
+                !Create(surface, formats[kind], plan.eyes[eye].input_width,
+                        plan.eyes[eye].input_height))
+                return false;
+        }
+    return true;
+}
+bool VrTemporalImages::InitInput8() {
+    if (input8_attempted)
+        return bool(input8_pipeline);
+    input8_attempted = true;
+    const auto format = vk::Format::eR8G8B8A8Unorm;
+    const auto available = instance.GetPhysicalDevice().getFormatProperties(format).optimalTilingFeatures;
+    const auto needed = vk::FormatFeatureFlagBits::eStorageImage |
+                        vk::FormatFeatureFlagBits::eSampledImage |
+                        vk::FormatFeatureFlagBits::eTransferSrc |
+                        vk::FormatFeatureFlagBits::eTransferDst;
+    if ((available & needed) != needed)
+        return false;
+    const auto device = instance.GetDevice();
+    const auto module = Compile(HostShaders::VR_TEMPORAL_PREPARE8_COMP,
+                                vk::ShaderStageFlagBits::eCompute, device);
+    if (!module)
+        return false;
+    auto result = device.createComputePipelineUnique({},
+        {.stage = {.stage = vk::ShaderStageFlagBits::eCompute, .module = module, .pName = "main"},
+         .layout = *layout});
+    device.destroyShaderModule(module);
+    if (result.result != vk::Result::eSuccess)
+        return false;
+    input8_pipeline = std::move(result.value);
+    return true;
+}
+vk::Format VrTemporalImages::InputColorFormat(const VR::Graphics::Config& accepted,
+                                              const VrTemporalPair::Plan& plan,
+                                              const std::array<Source, 2>& sources) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("FAST_DLSS_INPUT_COLOR8");
+        // Opt out with 0. Raw temporal dumps still expect RGBA16F colour inputs.
+        return (!value || std::strcmp(value, "0") != 0) &&
+               !std::getenv("VR_TEMPORAL_CAPTURE_DIR");
+    }();
+    const auto original = vk::Format::eR16G16B16A16Sfloat;
+    if (!enabled || accepted.upscaler != VR::Graphics::Upscaler::Dlss || accepted.dlss5 ||
+        VR::Graphics::S1Output().width == 0 ||
+        (plan.provider_flags & (VrTemporalPair::DlssVerifyTwin | VrTemporalPair::Fsr4VerifyTwin |
+                                VrTemporalPair::Fsr4VerifyInterleave)))
+        return original;
+    for (uint32_t eye = 0; eye < plan.views; ++eye)
+        if (sources[eye].color_format != vk::Format::eR8G8B8A8Unorm &&
+            sources[eye].color_format != vk::Format::eB8G8R8A8Unorm)
+            return original;
+    // An unsupported format or optional pipeline failure keeps the original path.
+    return InitInput8() ? vk::Format::eR8G8B8A8Unorm : original;
+}
+
 bool VrTemporalImages::Init() {
     if (!instance.GetPhysicalDevice().getFeatures().shaderStorageImageExtendedFormats)
         return false;
@@ -249,7 +355,10 @@ bool VrTemporalImages::Merge(const std::array<vk::ImageView, 2>& scene) {
         const std::array<vk::DescriptorImageInfo,3> infos{{
             {.imageView=*eyes[eye][3].view, .imageLayout=vk::ImageLayout::eGeneral},
             {.imageView=scene[eye], .imageLayout=vk::ImageLayout::eGeneral},
-            {.imageView=from_source ? direct_sources[eye].color : *eyes[eye][0].view,
+            // Unread when bound unused (in place, natively): the output stands in for a colour
+            // copy that was never made (EnsureCopies).
+            {.imageView=from_source ? direct_sources[eye].color
+                         : eyes[eye][0].image ? *eyes[eye][0].view : *eyes[eye][3].view,
              .imageLayout=vk::ImageLayout::eGeneral}}};
         const std::array<vk::WriteDescriptorSet,3> writes{{
             {.dstBinding=0,.descriptorCount=1,.descriptorType=vk::DescriptorType::eSampledImage,.pImageInfo=&infos[0]},
@@ -303,7 +412,11 @@ bool VrTemporalImages::Prepare(const VR::Graphics::Config &accepted, bool provid
             const auto &in = sources[eye];
             direct_request = direct_request && in.color_image && in.depth_image &&
                              in.layer == eye &&
-                             in.color_format == vk::Format::eR16G16B16A16Sfloat &&
+                             // S1's composite X is 8-bit UNORM: the copy stores its normalized
+                             // values exactly, as DLSS reads them in place.
+                             (in.color_format == vk::Format::eR16G16B16A16Sfloat ||
+                              in.color_format == vk::Format::eR8G8B8A8Unorm ||
+                              in.color_format == vk::Format::eB8G8R8A8Unorm) &&
                              (in.depth_format == vk::Format::eD32Sfloat ||
                               in.depth_format == vk::Format::eD32SfloatS8Uint);
         }
@@ -326,7 +439,14 @@ bool VrTemporalImages::Prepare(const VR::Graphics::Config &accepted, bool provid
     // Per eye: copied for the provider (not read in place) or for the verify twin (`copies`).
     const uint32_t copy_color = direct_request ? (copies | (active_mask & ~in_place_color)) : active_mask;
     const uint32_t copy_depth = direct_request ? (copies | (active_mask & ~in_place_depth)) : active_mask;
-    if ((!pipeline && !Init()) || !Allocate(plan)) {
+    if (!pipeline && !Init()) {
+        failed = true;
+        Release();
+        return false;
+    }
+    const auto color_format = InputColorFormat(accepted, plan, sources);
+    if (!Allocate(plan, OutputFormat(accepted, plan), color_format) ||
+        !EnsureCopies(plan, copy_color, copy_depth)) {
         failed = true;
         Release();
         return false;
@@ -340,7 +460,8 @@ bool VrTemporalImages::Prepare(const VR::Graphics::Config &accepted, bool provid
     std::array<Surface *, 10> surfaces{};
     for (uint32_t eye = 0; eye < plan.views; ++eye)
         for (auto &s : eyes[eye])
-            surfaces[n++] = &s;
+            if (s.image) // a colour or depth copy no frame has needed yet does not exist
+                surfaces[n++] = &s;
     if (verify.image) // FAST_UPSCALER_VERIFY/FAST_DLSS_DIRECT_VERIFY twin output
         surfaces[n++] = &verify;
     if (twin_motion.image) // FAST_DLSS_DIRECT_VERIFY twin motion vectors
@@ -378,7 +499,8 @@ bool VrTemporalImages::Prepare(const VR::Graphics::Config &accepted, bool provid
                                             .pImageMemoryBarriers = barriers.data()});
     if (!(copy_color | copy_depth))
         return;
-    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute,
+        allocated_color == vk::Format::eR8G8B8A8Unorm ? *input8_pipeline : *pipeline);
     ScratchPush::Invalidate();
     for (uint32_t eye = 0; eye < plan.views; ++eye) {
         // Bit 46: an input read in place is not copied (1 colour, 2 depth; 3 without the bit).

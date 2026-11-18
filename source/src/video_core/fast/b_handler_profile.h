@@ -31,13 +31,24 @@ enum Category : unsigned {
   Submit,
   Special,
   ComputeHle,
+  // Recording's parts (2026-10-23): descriptor encoding, dynamic state, push constants.
+  RecDescriptors,
+  RecDynamicState,
+  RecPush,
+  // Inside a draw's recording (2026-10-23): the temporal motion preparation, and the VR extras
+  // around the game's draw (UI shadow draws, the probe, VrAfterDraw).
+  RecMotion,
+  RecVrExtra,
+  // FAST_CPU_STAGEB_SPLIT=2: B1 waiting for fast:StageB2 (a sync or every job slot queued).
+  SplitWait,
   Count
 };
 inline constexpr std::array<const char *, Count> names{
     "other",        "replay",     "resources",   "buffers",  "native",
     "vertex_index", "begin",      "recording",   "tasks",    "targets",
     "upload_copy",  "draw_setup", "maintenance", "reselect", "submit",
-    "special",      "compute_hle"};
+    "special",      "compute_hle", "rec_descriptors", "rec_dynamic_state",
+    "rec_push", "rec_motion", "rec_vr_extra", "split_wait"};
 inline std::array<std::atomic<u64>, Count> totals{};
 // Read once at start-up: a plain load per handler and per scope, no guard.
 inline const bool g_enabled = [] {

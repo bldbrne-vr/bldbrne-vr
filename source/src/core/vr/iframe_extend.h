@@ -309,7 +309,7 @@ private:
     float ext_time_{0.0f};
 };
 
-// Lean i-frames (vr.ini lean_iframes_ms, 200 by default): a quick lean of the head (the lean
+// Lean i-frames (vr.ini lean_iframes_ms, 250 by default): a quick lean of the head (the lean
 // detector, core/vr/lean_dodge.h; nothing is pressed, no dodge animation plays) asks for
 // `request` ms of bit 1: that much game time at any frame rate (100 ms: 3 updates at 30 fps, 9 at
 // 90), to the nearest update, as an extension's. The bit is set

@@ -6,6 +6,7 @@
 #include "video_core/native_stereo/native_stereo.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/vram_report.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vr_perf.h"
@@ -150,6 +151,8 @@ TileManager::ScratchBuffer TileManager::GetScratchBuffer(u32 size) {
     const auto result = vmaCreateBuffer(instance.GetAllocator(), &buffer_ci_unsafe, &alloc_info,
                                         &buffer, &allocation, nullptr);
     ASSERT(result == VK_SUCCESS);
+    VramReport::Name(instance.GetAllocator(), allocation,
+                     fmt::format("tile scratch {} MiB", size >> 20));
     NativeStereo::RegisterBuffer(buffer, size, instance.GetAllocator(), false);
     return {buffer, allocation};
 }
@@ -303,7 +306,7 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
     if (NativeStereo::Enabled() && (NativeStereo::ExistingRight(in_buffer) || NativeStereo::ExistingRight(out_buffer))) {
         auto tiled = tiled_buffer_info, linear = linear_buffer_info;
         tiled.buffer = NativeStereo::RightBuffer(scheduler, tiled.buffer, false);
-        linear.buffer = NativeStereo::RightBuffer(scheduler, linear.buffer, !false);
+        linear.buffer = NativeStereo::RightForWrite(scheduler, linear.buffer, linear.offset, linear.range);
         auto writes = set_writes; writes[0].pBufferInfo = &tiled; writes[1].pBufferInfo = &linear;
         NativeStereo::Barrier(scheduler);
         cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, writes);
@@ -433,7 +436,7 @@ void TileManager::TileImageViaBuffer(Image& in_image, std::span<vk::BufferImageC
     cmdbuf.dispatch(dim_x, 1, 1);
     if (NativeStereo::Enabled() && (NativeStereo::ExistingRight(temp_buffer) || NativeStereo::ExistingRight(out_buffer))) {
         auto tiled = tiled_buffer_info, linear = linear_buffer_info;
-        tiled.buffer = NativeStereo::RightBuffer(scheduler, tiled.buffer, true);
+        tiled.buffer = NativeStereo::RightForWrite(scheduler, tiled.buffer, tiled.offset, tiled.range);
         linear.buffer = NativeStereo::RightBuffer(scheduler, linear.buffer, !true);
         auto writes = set_writes; writes[0].pBufferInfo = &tiled; writes[1].pBufferInfo = &linear;
         NativeStereo::Barrier(scheduler);
@@ -447,7 +450,7 @@ void TileManager::TileImageViaBuffer(Image& in_image, std::span<vk::BufferImageC
 // into a linear scratch buffer was ~81% of a resync's GPU time (clinic hall); the
 // 3d5ebf4e direct image-to-buffer copies (vk_rasterizer.cpp IsComputeImageCopy) and the texel
 // buffer resyncs (buffer_cache.cpp SynchronizeBufferFromImage) both come through here. bbport
-// leaves this chain as its next GPU item (docs/parallel_gpu.md:542-548, ROADMAP.md:37): its
+// leaves this chain as its next GPU item: its
 // IsComputeImageCopy (gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp:2824-2893) is
 // upstream's, with no image-sourced case beyond ours.
 namespace {
@@ -769,7 +772,8 @@ bool TileManager::RetileFromImage(Image& in_image, u32 width, u32 height, vk::Bu
         // (made from the left copy when missing; RightBuffer records its own barriers). A mono
         // image gives the right copy the same bytes.
         auto right_tiled = tiled_buffer_info;
-        right_tiled.buffer = NativeStereo::RightBuffer(scheduler, out_buffer, true);
+        right_tiled.buffer = NativeStereo::RightForWrite(scheduler, out_buffer, right_tiled.offset,
+                                                         right_tiled.range);
         auto right_writes = set_writes;
         right_writes[0].pBufferInfo = &right_tiled;
         push.layer = in_image.native_stereo ? 1u : 0u;

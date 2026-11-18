@@ -12,6 +12,7 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -37,10 +38,10 @@ inline constexpr float Ascent24 = 21.1171875f;  // the menu font's ascent at 24 
 inline constexpr float TitleCentreX = 959.6f;   // the page title's field (#104 / StaticText_111020)
 inline constexpr float TitleBaseline = 226.72f; // 204.7 - 1.1 + 2 + ascent
 inline constexpr float HelpCentreX = 961.0f;    // StatusBar/LineHelp
-inline constexpr float HelpBaseline = 791.98f;
+inline constexpr float HelpBaseline = 791.98f + StripBandPx;
 inline constexpr float KeyCentreX = 959.8f; // StatusBar/KeyGuide (letterSpacing 2)
-inline constexpr float KeyTop = 805.8f;
-inline constexpr float KeyBaseline = 805.8f + Ascent24;
+inline constexpr float KeyTop = 805.8f + StripBandPx;
+inline constexpr float KeyBaseline = KeyTop + Ascent24;
 inline constexpr float KeySpacing = 0.0f; // the edit text says 2; the game's key guide is drawn with 0
 inline constexpr float MirrorX = PanelCentreX; // the panel's centre line
 // The tab strip in the title line (ours): the gaps between tabs and to the LT / RT badges. Six
@@ -144,6 +145,51 @@ inline bool PanelOpaque() {
 // piece's own.
 // `shadow`: the piece's footprint only (its texels' alpha) in black at `alpha` (the screen dim).
 // `opaque_core` (with `shadow`): PanelDim, the dim full where the piece is solid.
+// The frame with the sub-tab strip's band (StripBandPx) under the title's rule (Frame[13..19]):
+// Frame[0, 3, 6] (the panel's top), [13..19] and [41..45] (the top ornament) stay; [1, 4, 7] (the
+// panel's middle) and [9, 12] (the texture's upper halves) stretch over the band with the same
+// texture range (their v / u slope scaled, the mapping being affine in stage x / y); every other
+// piece moves StripBandPx lower (its texture offset follows); then [13..19] again, StripBandPx
+// lower: the strip's lower rule. Its pieces keep Frame's order (the backdrop's first 9, the
+// texture's [9..12], the divider's [39..40]).
+inline std::vector<PageArt::Piece> TallFrame() {
+    using PageArt::Piece;
+    std::vector<Piece> out;
+    const int n = static_cast<int>(std::size(PageArt::Frame));
+    const auto shifted = [](Piece p) {
+        p.y0 += StripBandPx;
+        p.y1 += StripBandPx;
+        p.u0 -= p.uy * StripBandPx;
+        p.v0 -= p.vy * StripBandPx;
+        return p;
+    };
+    for (int i = 0; i < n; ++i) {
+        Piece p = PageArt::Frame[i];
+        const bool keep =
+            i == 0 || i == 3 || i == 6 || (i >= 13 && i <= 19) || (i >= 41 && i <= 45);
+        const bool stretch = i == 1 || i == 4 || i == 7 || i == 9 || i == 12;
+        if (stretch) {
+            const float k = (p.y1 - p.y0) / (p.y1 + StripBandPx - p.y0);
+            p.u0 += p.uy * p.y0 * (1.0f - k);
+            p.v0 += p.vy * p.y0 * (1.0f - k);
+            p.uy *= k;
+            p.vy *= k;
+            p.y1 += StripBandPx;
+        } else if (!keep) {
+            p = shifted(p);
+        }
+        out.push_back(p);
+    }
+    for (int i = 13; i <= 19; ++i) {
+        out.push_back(shifted(PageArt::Frame[i]));
+    }
+    return out;
+}
+inline const std::vector<PageArt::Piece>& TallFrameCached() {
+    static const std::vector<PageArt::Piece> frame = TallFrame();
+    return frame;
+}
+
 inline void DrawPiece(Canvas& c, const Assets& assets, const Piece& p, float ox, float oy,
                       bool mirror, float alpha, float clip_x1 = 1e9f, bool shadow = false,
                       bool opaque_core = false) {
@@ -237,6 +283,33 @@ inline float TextWidth(const GameText::GameFont* font, const std::string& text,
     return GameText::LineAdvance(*font, text.c_str(), size_stage * PageScale,
                                  spacing_stage * PageScale) /
            PageScale;
+}
+
+// A help line in one line, or two (wrapped at the space that makes the longer line shortest) when
+// it is wider than `room` at 24 px. Two lines sit HelpLinePitch apart, the second on the baseline.
+inline constexpr float HelpLinePitch = 26.5f;
+inline std::vector<std::string> WrapHelp(const GameText::GameFont* font, const std::string& help,
+                                         float room) {
+    if (TextWidth(font, help) <= room) {
+        return {help};
+    }
+    size_t best = std::string::npos;
+    float best_d = 1e9f;
+    for (size_t i = 1; i + 1 < help.size(); ++i) {
+        if (help[i] != ' ') {
+            continue;
+        }
+        const float d = std::max(TextWidth(font, help.substr(0, i)),
+                                 TextWidth(font, help.substr(i + 1)));
+        if (d < best_d) {
+            best_d = d;
+            best = i;
+        }
+    }
+    if (best == std::string::npos) {
+        return {help};
+    }
+    return {help.substr(0, best), help.substr(best + 1)};
 }
 
 enum class Align { Left, Centre, Right };

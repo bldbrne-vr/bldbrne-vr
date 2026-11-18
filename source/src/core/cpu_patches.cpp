@@ -25,6 +25,7 @@
 #include "common/types.h"
 #include "core/signals.h"
 #include "core/tls.h"
+#include "core/sse4a_substitutes.h"
 #include "cpu_patches.h"
 
 #ifdef _WIN32
@@ -210,10 +211,29 @@ static void GenerateTcbExclusiveOr(void* /* address */, const ZydisDecodedOperan
 #endif
 }
 
-static bool FilterNoSSE4a(const ZydisDecodedOperand*) {
+// VR_SIMULATE_NO_SSE4A=1 (test only; read once): patch as on a CPU without SSE4a (every Intel
+// CPU), so an SSE4a host shows what such a CPU would get. The substitutes run on any x86-64 CPU.
+static const bool g_simulate_no_sse4a = [] {
+    const char* value = std::getenv("VR_SIMULATE_NO_SSE4A");
+    return value && value[0] == '1';
+}();
+// The host's answer, asked once (CPUID): the patch filters ask it per candidate instruction.
+static const bool g_host_has_sse4a = [] {
     Cpu cpu;
-    return !cpu.has(Cpu::tSSE4a);
+    return cpu.has(Cpu::tSSE4a);
+}();
+
+static bool FilterNoSSE4a(const ZydisDecodedOperand*) {
+    return g_simulate_no_sse4a || !g_host_has_sse4a;
 }
+
+// VR_SSE4A_FAST (on unless '0'; read once): the immediate forms of EXTRQ and INSERTQ use the
+// SSE2-only substitutes of core/sse4a_substitutes.h (no flags save, no general registers) instead
+// of the general ones below, which cost ~40-60 cycles each on Intel (pushfq/popfq).
+static const bool g_sse4a_fast = [] {
+    const char* value = std::getenv("VR_SSE4A_FAST");
+    return !(value && value[0] == '0');
+}();
 
 static void GenerateEXTRQ(void* /* address */, const ZydisDecodedOperand* operands,
                           Xbyak::CodeGenerator& c) {
@@ -228,6 +248,11 @@ static void GenerateEXTRQ(void* /* address */, const ZydisDecodedOperand* operan
 
     Xbyak::Xmm xmm_dst = *reinterpret_cast<const Xbyak::Xmm*>(&dst);
 
+    if (immediateForm && g_sse4a_fast) {
+        Sse4a::ExtrqImmediate(c, xmm_dst, u32(operands[1].imm.value.u),
+                              u32(operands[2].imm.value.u));
+        return;
+    }
     if (immediateForm) {
         u8 length = operands[1].imm.value.u & 0x3F;
         u8 index = operands[2].imm.value.u & 0x3F;
@@ -269,7 +294,7 @@ static void GenerateEXTRQ(void* /* address */, const ZydisDecodedOperand* operan
 
         // Writeback to xmm register, extrq instruction says top 64-bits are undefined but zeroed on
         // AMD CPUs
-        c.vmovq(xmm_dst, scratch1);
+        c.movq(xmm_dst, scratch1);
 
         c.pop(scratch2);
         c.pop(scratch1);
@@ -327,7 +352,7 @@ static void GenerateEXTRQ(void* /* address */, const ZydisDecodedOperand* operan
         c.vmovq(scratch1, xmm_dst);
         c.shr(scratch1, cl);
         c.and_(scratch1, mask);
-        c.vmovq(xmm_dst, scratch1);
+        c.movq(xmm_dst, scratch1);
 
         c.pop(mask);
         c.pop(scratch2);
@@ -354,6 +379,11 @@ static void GenerateINSERTQ(void* /* address */, const ZydisDecodedOperand* oper
     Xbyak::Xmm xmm_dst = *reinterpret_cast<const Xbyak::Xmm*>(&dst);
     Xbyak::Xmm xmm_src = *reinterpret_cast<const Xbyak::Xmm*>(&src);
 
+    if (immediateForm && g_sse4a_fast) {
+        Sse4a::InsertqImmediate(c, xmm_dst, xmm_src, u32(operands[2].imm.value.u),
+                                u32(operands[3].imm.value.u));
+        return;
+    }
     if (immediateForm) {
         u8 length = operands[2].imm.value.u & 0x3F;
         u8 index = operands[3].imm.value.u & 0x3F;
@@ -401,7 +431,7 @@ static void GenerateINSERTQ(void* /* address */, const ZydisDecodedOperand* oper
 
         // Insert scratch2 into low 64 bits of dst, upper 64 bits are undefined but zeroed on AMD
         // CPUs
-        c.vmovq(xmm_dst, scratch2);
+        c.movq(xmm_dst, scratch2);
 
         c.pop(mask);
         c.pop(scratch2);
@@ -468,7 +498,7 @@ static void GenerateINSERTQ(void* /* address */, const ZydisDecodedOperand* oper
         c.or_(scratch2, scratch1);
 
         // Upper 64 bits are undefined in insertq but AMD CPUs zero them
-        c.vmovq(xmm_dst, scratch2);
+        c.movq(xmm_dst, scratch2);
 
         c.pop(mask);
         c.pop(index);
@@ -554,6 +584,10 @@ static const std::unordered_map<ZydisMnemonic, std::vector<PatchInfo>> Patches =
 
 static std::once_flag init_flag;
 
+/// The tail of each module's trampoline area kept for ReserveNearCode (whole pages, outside
+/// trampoline_gen's reach).
+constexpr u64 NearCodeSize = 16_KB;
+
 struct PatchModule {
     /// Mutex controlling access to module code regions.
     std::mutex mutex{};
@@ -580,10 +614,21 @@ struct PatchModule {
     /// Prevents repeated generation attempts after the fixed trampoline area is exhausted.
     bool trampoline_exhausted{};
 
+    /// ReserveNearCode's pages (the trampoline area's tail) and how much of them is handed out.
+    u8* near_code;
+    u64 near_code_size;
+    u64 near_code_used{};
+
     PatchModule(u8* module_ptr, const u64 module_size, u8* trampoline_ptr,
                 const u64 trampoline_size)
         : start(module_ptr), end(module_ptr + module_size), patch_gen(module_size, module_ptr),
-          trampoline_gen(trampoline_size, trampoline_ptr) {}
+          trampoline_gen(trampoline_size - NearSize(trampoline_size), trampoline_ptr),
+          near_code(trampoline_ptr + trampoline_size - NearSize(trampoline_size)),
+          near_code_size(NearSize(trampoline_size)) {}
+
+    static constexpr u64 NearSize(u64 trampoline_size) {
+        return trampoline_size >= 4 * NearCodeSize ? NearCodeSize : 0;
+    }
 };
 static std::map<u64, PatchModule> modules;
 
@@ -746,17 +791,6 @@ static std::pair<bool, u64> TryPatch(u8* code, PatchModule* module) {
     return std::make_pair(false, instruction.length);
 }
 
-static bool Is4ByteExtrqOrInsertq(void* code_address) {
-    u8* bytes = (u8*)code_address;
-    if (bytes[0] == 0x66 && bytes[1] == 0x0F && bytes[2] == 0x79) {
-        return true; // extrq
-    } else if (bytes[0] == 0xF2 && bytes[1] == 0x0F && bytes[2] == 0x79) {
-        return true; // insertq
-    } else {
-        return false;
-    }
-}
-
 static void* GetXmmPointer(void* ctx, u8 index) {
 #if defined(_WIN32)
 #define CASE(index)                                                                                \
@@ -819,136 +853,58 @@ static void IncrementRip(void* ctx, u64 length) {
 }
 
 static bool TryExecuteIllegalInstruction(void* ctx, void* code_address) {
-    // We need to decode the instruction to find out what it is. Normally we'd use a fully fleshed
-    // out decoder like Zydis, however Zydis does a bunch of stuff that impact performance that we
-    // don't care about. We can get information about the instruction a lot faster by writing a mini
-    // decoder here, since we know it is definitely an extrq or an insertq. If for some reason we
-    // need to interpret more instructions in the future (I don't see why we would), we can revert
-    // to using Zydis.
-    ZydisMnemonic mnemonic;
-    u8* bytes = (u8*)code_address;
-    if (bytes[0] == 0x66) {
-        mnemonic = ZYDIS_MNEMONIC_EXTRQ;
-    } else if (bytes[0] == 0xF2) {
-        mnemonic = ZYDIS_MNEMONIC_INSERTQ;
-    } else {
-        ZydisDecodedInstruction instruction;
-        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-        const auto status =
-            Common::Decoder::Instance()->decodeInstruction(instruction, operands, code_address);
-        LOG_ERROR(Core, "Unhandled illegal instruction at code address {}: {}",
-                  fmt::ptr(code_address),
-                  ZYAN_SUCCESS(status) ? ZydisMnemonicGetString(instruction.mnemonic)
-                                       : "Failed to decode");
+    ZydisDecodedInstruction instruction;
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+    const auto status =
+        Common::Decoder::Instance()->decodeInstruction(instruction, operands, code_address);
+    if (!ZYAN_SUCCESS(status) || (instruction.mnemonic != ZYDIS_MNEMONIC_EXTRQ &&
+                                  instruction.mnemonic != ZYDIS_MNEMONIC_INSERTQ)) {
         return false;
     }
-
-    ASSERT(bytes[1] == 0x0F && bytes[2] == 0x79);
-
-    // Note: It's guaranteed that there's no REX prefix in these instructions checked by
-    // Is4ByteExtrqOrInsertq
-    u8 modrm = bytes[3];
-    u8 rm = modrm & 0b111;
-    u8 reg = (modrm >> 3) & 0b111;
-    u8 mod = (modrm >> 6) & 0b11;
-
-    ASSERT(mod == 0b11); // Any instruction we interpret here uses reg/reg addressing only
-
-    int dstIndex = reg;
-    int srcIndex = rm;
-
-    switch (mnemonic) {
-    case ZYDIS_MNEMONIC_EXTRQ: {
-        const auto dst = GetXmmPointer(ctx, dstIndex);
-        const auto src = GetXmmPointer(ctx, srcIndex);
-
-        u64 lowQWordSrc;
-        memcpy(&lowQWordSrc, src, sizeof(lowQWordSrc));
-
-        u64 lowQWordDst;
-        memcpy(&lowQWordDst, dst, sizeof(lowQWordDst));
-
-        u64 length = lowQWordSrc & 0x3F;
-        u64 mask;
-        if (length == 0) {
-            length = 64; // for the check below
-            mask = 0xFFFF'FFFF'FFFF'FFFF;
-        } else {
-            mask = (1ULL << length) - 1;
-        }
-
-        u64 index = (lowQWordSrc >> 8) & 0x3F;
-        if (length + index > 64) {
-            // Undefined behavior if length + index is bigger than 64 according to the spec,
-            // we'll warn and continue execution.
-            LOG_TRACE(Core,
-                      "extrq at {} with length {} and index {} is bigger than 64, "
-                      "undefined behavior",
-                      fmt::ptr(code_address), length, index);
-        }
-
-        lowQWordDst >>= index;
-        lowQWordDst &= mask;
-
-        memset((u8*)dst + sizeof(u64), 0, sizeof(u64));
-        memcpy(dst, &lowQWordDst, sizeof(lowQWordDst));
-
-        IncrementRip(ctx, 4);
-
-        return true;
-    }
-    case ZYDIS_MNEMONIC_INSERTQ: {
-        const auto dst = GetXmmPointer(ctx, dstIndex);
-        const auto src = GetXmmPointer(ctx, srcIndex);
-
-        u64 lowQWordSrc, highQWordSrc;
-        memcpy(&lowQWordSrc, src, sizeof(lowQWordSrc));
-        memcpy(&highQWordSrc, (u8*)src + 8, sizeof(highQWordSrc));
-
-        u64 lowQWordDst;
-        memcpy(&lowQWordDst, dst, sizeof(lowQWordDst));
-
-        u64 length = highQWordSrc & 0x3F;
-        u64 mask;
-        if (length == 0) {
-            length = 64; // for the check below
-            mask = 0xFFFF'FFFF'FFFF'FFFF;
-        } else {
-            mask = (1ULL << length) - 1;
-        }
-
-        u64 index = (highQWordSrc >> 8) & 0x3F;
-        if (length + index > 64) {
-            // Undefined behavior if length + index is bigger than 64 according to the spec,
-            // we'll warn and continue execution.
-            LOG_TRACE(Core,
-                      "insertq at {} with length {} and index {} is bigger than 64, "
-                      "undefined behavior",
-                      fmt::ptr(code_address), length, index);
-        }
-
-        lowQWordSrc &= mask;
-        lowQWordDst &= ~(mask << index);
-        lowQWordDst |= lowQWordSrc << index;
-
-        memset((u8*)dst + sizeof(u64), 0, sizeof(u64));
-        memcpy(dst, &lowQWordDst, sizeof(lowQWordDst));
-
-        IncrementRip(ctx, 4);
-
-        return true;
-    }
-    default: {
-        UNREACHABLE();
-    }
+    // Every SSE4a instruction interpreted here costs a CPU exception, each time it runs (on a
+    // CPU without SSE4a: every Intel CPU). The static pass should leave none: count them.
+    static std::atomic<u64> interpreted{};
+    const u64 count = interpreted.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count == 1 || (count & 0xFFFF) == 0) {
+        LOG_BENCHMARK_WARNING(Core, "SSE4a {} at {} interpreted after a CPU exception ({} so far): "
+                                    "the static patching did not cover it",
+                              ZydisMnemonicGetString(instruction.mnemonic), fmt::ptr(code_address),
+                              count);
     }
 
-    UNREACHABLE();
+    const bool insert = instruction.mnemonic == ZYDIS_MNEMONIC_INSERTQ;
+    const auto dst = GetXmmPointer(ctx, operands[0].reg.value - ZYDIS_REGISTER_XMM0);
+    u64 value;
+    memcpy(&value, dst, sizeof(value));
+
+    u64 source = 0;
+    u64 control;
+    const bool immediate = operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE ||
+                           operands[2].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+    if (insert || !immediate) {
+        const auto src = GetXmmPointer(ctx, operands[1].reg.value - ZYDIS_REGISTER_XMM0);
+        memcpy(&source, src, sizeof(source));
+        memcpy(&control, static_cast<u8*>(src) + (insert ? sizeof(u64) : 0), sizeof(control));
+    }
+    if (immediate) {
+        const auto first = insert ? 2 : 1;
+        control =
+            (operands[first].imm.value.u & 0x3F) | ((operands[first + 1].imm.value.u & 0x3F) << 8);
+    }
+    const u64 length = control & 0x3F;
+    const u64 index = (control >> 8) & 0x3F;
+    const u64 mask = length == 0 ? UINT64_MAX : (u64{1} << length) - 1;
+    value =
+        insert ? (value & ~(mask << index)) | ((source & mask) << index) : (value >> index) & mask;
+    memcpy(dst, &value, sizeof(value));
+    memset(static_cast<u8*>(dst) + sizeof(u64), 0, sizeof(u64));
+    IncrementRip(ctx, instruction.length);
+    return true;
 }
 
 static bool TryPatchJit(void* code_address) {
     auto* code = static_cast<u8*>(code_address);
-    auto* module = GetModule(code);
+    auto* module = GetContainingModule(code);
     if (module == nullptr) {
         return false;
     }
@@ -968,6 +924,37 @@ static bool TryPatchJit(void* code_address) {
 // tail decode as port I/O) resumes at the site, on the finished jump. The module's lock waits for
 // a rewrite in progress (the faulting thread can only be at a site being rewritten while the
 // patcher holds it, and the site is recorded before the lock is released).
+u64 CountSse4aLeft(u64 segment_addr, u64 segment_size, std::vector<u64>& samples) {
+    // EXTRQ: 66 0F 78 /0 ib ib, 66 0F 79 /r. INSERTQ: F2 0F 78 /r ib ib, F2 0F 79 /r. Any byte
+    // position where one decodes counts (an upper bound: a match inside another instruction or
+    // data counts too); patched sites now start with a jump and no longer match.
+    const auto* bytes = reinterpret_cast<const u8*>(segment_addr);
+    u64 count = 0;
+    for (u64 i = 0; i + 4 <= segment_size; ++i) {
+        if ((bytes[i] != 0x66 && bytes[i] != 0xF2) || bytes[i + 1] != 0x0F ||
+            (bytes[i + 2] != 0x78 && bytes[i + 2] != 0x79)) {
+            continue;
+        }
+        ZydisDecodedInstruction instruction;
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        const auto status = Common::Decoder::Instance()->decodeInstruction(
+            instruction, operands, const_cast<u8*>(bytes + i), segment_size - i);
+        if (!ZYAN_SUCCESS(status) || (instruction.mnemonic != ZYDIS_MNEMONIC_EXTRQ &&
+                                      instruction.mnemonic != ZYDIS_MNEMONIC_INSERTQ)) {
+            continue;
+        }
+        ++count;
+        if (samples.size() < 16) {
+            samples.push_back(segment_addr + i);
+        }
+    }
+    return count;
+}
+
+bool HostLacksSse4a() {
+    return FilterNoSSE4a(nullptr);
+}
+
 bool RetryAtPatchedSite(void* code_address) {
     auto* code = static_cast<u8*>(code_address);
     auto* module = GetModule(code);
@@ -2281,17 +2268,14 @@ static bool PatchesIllegalInstructionHandler(void* context) {
     void* code_address = Common::GetRip(context);
 #if defined(_WIN32)
     // Windows static guest red-zone protection
-    const bool inspect_short_cpu_patch =
-        !WindowsGuestRedZoneProtection::IsStaticPatchingEnabled() ||
-        GetContainingModule(code_address) != nullptr;
+    const bool inspect_sse4a = !WindowsGuestRedZoneProtection::IsStaticPatchingEnabled() ||
+                               GetContainingModule(code_address) != nullptr;
 #else
-    constexpr bool inspect_short_cpu_patch = true;
+    constexpr bool inspect_sse4a = true;
 #endif
-    if (inspect_short_cpu_patch && // Windows static guest red-zone protection
-        Is4ByteExtrqOrInsertq(code_address)) {
-        // The instruction is not big enough for a relative jump, don't try to patch it and pass it
-        // to our illegal instruction interpreter directly
-        return TryExecuteIllegalInstruction(context, code_address);
+    if (inspect_sse4a && // Windows static guest red-zone protection
+        TryExecuteIllegalInstruction(context, code_address)) {
+        return true;
     } else {
         if (!TryPatchJit(code_address)) {
             ZydisDecodedInstruction instruction;
@@ -2334,6 +2318,21 @@ void RegisterPatchModule(void* module_ptr, u64 module_size, void* trampoline_are
                     std::forward_as_tuple(static_cast<u8*>(module_ptr), module_size,
                                           static_cast<u8*>(trampoline_area_ptr),
                                           trampoline_area_size));
+}
+
+void* ReserveNearCode(const void* code, u64 size) {
+    PatchModule* const module = GetModule(code);
+    if (module == nullptr || static_cast<const u8*>(code) >= module->end || size == 0) {
+        return nullptr;
+    }
+    size = Common::AlignUp(size, 0x1000);
+    std::scoped_lock lock{module->mutex};
+    if (size > module->near_code_size - module->near_code_used) {
+        return nullptr;
+    }
+    u8* const at = module->near_code + module->near_code_used;
+    module->near_code_used += size;
+    return at;
 }
 
 void PrePatchInstructions(u64 segment_addr, u64 segment_size) {

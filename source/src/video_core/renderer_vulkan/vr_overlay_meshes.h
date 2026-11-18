@@ -259,6 +259,7 @@ enum class MeshId : u32 {
     // aux.x = that angle / 90 degrees, aux.y = the glow's opacity profile (0 inside, 1 toward
     // the edges of the view). Open.
     Vignette,
+    MonocularIris,
     Count,
 };
 constexpr u32 MeshCount = static_cast<u32>(MeshId::Count);
@@ -310,7 +311,8 @@ enum class Shade : u32 {
     Unlit = 6,
     // base.rgb at base.a * profile ^ params.z, premultiplied, no lighting or exposure; params.w
     // 0: the mesh's profile (aux.y), 1: a ramp from params.x to params.y degrees off the view
-    // axis (squared smoothstep), 2: a band between them
+    // axis (squared smoothstep), 2: a band between them, 3: headset-fitted edge,
+    // 4: headset-fitted Monocular iris with subtle glass wear
     Vignette = 7,
 };
 
@@ -330,6 +332,7 @@ struct DrawItem {
     Shade shade{};
     Mat4 model{}; // world <- mesh
     Material material{};
+    u8 eye_mask{3}; // bit 0 left, bit 1 right; all existing items remain binocular
 };
 
 // Push constants (vr_overlay.vert/.frag DrawData, std430): exactly 128 bytes.
@@ -487,6 +490,19 @@ struct VignetteVisual {
     float wedge_x{0.0f};
     float wedge_y{1.0f};
     float wedge_power{4.0f};
+    // With wedge_focus: the four corners of what the headset shows instead of one direction: the
+    // status veins (core/vr/status_corners.h Veins; host_shaders/vr_status_veins.glsl) reaching
+    // corner_reach in (fractions of the half-field), a trunk vein_width wide, their heartbeat and
+    // sway by vein_beats (the beat clock, status_corners.h AdvanceBeats). The wedge's x, y and
+    // power are not used.
+    bool corners{false};
+    float corner_reach{0.62f};
+    float vein_width{0.021f};
+    float vein_beats{0.0f};
+    int vein_type{0}; // the status (StatusCorners::Type): its own vessels' shape
+    // The looks zoomed this many times about each corner, into what the lenses show
+    // (StatusCorners::StatusCornerZoomed; 1: as drawn). Its material's params.x.
+    float corner_zoom{1.0f};
     // > 0: fitted to what the headset shows (FrameConstants::field, the stagger vignette and the
     // hit flash with stagger_vignette_fit / hit_vignette_fit): r = 1 at the displayed field's edge
     // in every direction (per-axis angles over that side's half-angle), clear inside fit_inner,

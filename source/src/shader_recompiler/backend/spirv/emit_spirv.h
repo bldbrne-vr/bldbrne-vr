@@ -11,6 +11,7 @@
 namespace Shader::Backend::SPIRV {
 
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
-                                         const IR::Program& program, Bindings& binding);
+                                         const IR::Program& program, Bindings& binding,
+                                         bool merged_eyes = false);
 
 } // namespace Shader::Backend::SPIRV

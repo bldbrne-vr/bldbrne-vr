@@ -9,9 +9,21 @@
 
 #include "video_core/native_stereo/native_stereo.h"
 #include "video_core/native_stereo/lighting_reconstruction.h"
+#include "video_core/renderer_vulkan/vr_shadow_hold.h"
+#include "shader_recompiler/ir/passes/bump_probe.h"
+#include "shader_recompiler/ir/passes/fog_grid.h"
+#include "shader_recompiler/ir/passes/fog_light.h"
+#include "shader_recompiler/ir/passes/particle_air.h"
+#include "shader_recompiler/ir/passes/cinematic_look.h"
+#include "core/vr/live_tune.h"
+#include "shader_recompiler/ir/passes/air_light.h"
+#include "shader_recompiler/ir/passes/bounce_light.h"
+#include "shader_recompiler/ir/passes/moon_shafts.h"
+#include <xxhash.h>
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdio>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
@@ -39,6 +51,16 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "core/vr/aa_mode.h"
+#include "core/vr/game_area.h"
+#include "core/vr/map_objects.h"
+#include "core/vr/muzzle_flash.h"
+#include "core/vr/torch_glow.h"
+#include "video_core/renderer_vulkan/vr_bump_class.h"
+#include "shader_recompiler/ir/passes/body_shadow.h"
+#include "shader_recompiler/ir/passes/light_shadow.h"
+#include "shader_recompiler/ir/passes/ambient_occlusion.h"
+#include "core/vr/lamp_glow.h"
+#include "core/vr/c0000_skeleton.h"
 #include "core/vr/live_tune.h"
 #include "core/vr/vr_session.h"
 #include "shader_recompiler/runtime_info.h"
@@ -46,12 +68,20 @@
 #include "video_core/fast_render.h"
 #include "video_core/fast/drain_audit.h"
 #include "video_core/native_stereo/diag_skip.h"
+#include "video_core/renderer_vulkan/image_copy_tail.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_gpu_pass_profiler.h"
 #include "video_core/renderer_vulkan/vk_constant_ring.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_gpu_crash.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vr_frame_match.h"
+#include "video_core/renderer_vulkan/vr_dispatch_mono.h"
+#include "video_core/renderer_vulkan/vr_merged_eyes.h"
+#include "video_core/ds_ab.h"
+#include "video_core/renderer_vulkan/vr_batch_census.h"
+#include "video_core/renderer_vulkan/vr_draw_census.h"
 #include "video_core/renderer_vulkan/vk_prepared_bindings.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -59,9 +89,10 @@
 #include "video_core/renderer_vulkan/vr_inframe.h"
 #include "video_core/renderer_vulkan/vr_perf.h"
 #include "video_core/renderer_vulkan/vr_render_taa.h"
-#include "video_core/renderer_vulkan/vr_dibr_dlss.h"
+#include "video_core/renderer_vulkan/vr_dibr_upscale.h"
 #include "video_core/renderer_vulkan/vr_smaa.h"
 #include "video_core/renderer_vulkan/vr_temporal_capture.h"
+#include "video_core/renderer_vulkan/vr_temporal_jitter.h"
 #include "video_core/texture_cache/download_log.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/image_view.h"
@@ -76,6 +107,57 @@ namespace Vulkan {
 namespace DA = FastRender::DrainAudit;
 
 namespace {
+// Tests (shader_recompiler/ir/passes/bump_probe.h, VR_BUMP_PROBE=<folder>): a probed program's
+// texture, its first level's bytes as stored (tiled; BC blocks whole), once per address.
+void VrBumpProbe(const Shader::Info& stage, u32 index, const AmdGpu::Image& tsharp,
+                 Core::MemoryManager* memory) {
+    namespace Probe = Shader::Optimization::BumpProbe;
+    const u32 bump = Probe::Find(stage.pgm_hash);
+    if (bump == Probe::NotProbed) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::unordered_set<VAddr> seen;
+    static u32 written = 0;
+    std::scoped_lock lock{mutex};
+    const VAddr address = tsharp.Address();
+    // Up to 1200 textures 256 texels wide or more (the street's own came after 120 of the
+    // hunter's clothes and props in the first try).
+    if (written >= 1200 || tsharp.width + 1 < 256 || !seen.insert(address).second) {
+        return;
+    }
+    const auto fmt = static_cast<u32>(tsharp.data_format);
+    const bool bc8 = fmt == 35 || fmt == 38;                      // BC1, BC4: 8-byte blocks
+    const bool bc16 = fmt == 36 || fmt == 37 || (fmt >= 39 && fmt <= 41); // BC2, 3, 5, 6, 7
+    const u32 block = bc8 || bc16 ? 4 : 1;
+    const u32 bytes = bc8 ? 8 : bc16 ? 16 : fmt == 10 ? 4 : 0;   // Format8_8_8_8 = 10
+    const u32 w = tsharp.width + 1, h = tsharp.height + 1, pitch = tsharp.Pitch();
+    if (bytes == 0) {
+        LOG_INFO(Render_Vulkan, "VR bump probe: shader {:#x} image {}{}: format {} not written",
+                 stage.pgm_hash, index, index == bump ? " (bump)" : "", fmt);
+        return;
+    }
+    const u64 size = std::min<u64>(u64{(pitch + block - 1) / block} * ((h + block - 1) / block) * bytes,
+                                   8ull << 20);
+    if (!memory->IsValidGpuMapping(address, size)) {
+        return;
+    }
+    const std::string path = fmt::format("{}/{:08x}_img{}_{:x}.bin", Probe::Dir(), stage.pgm_hash, index, address);
+    if (std::FILE* const f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(std::bit_cast<const u8*>(address), 1, size, f);
+        std::fclose(f);
+        ++written;
+    }
+    LOG_INFO(Render_Vulkan,
+             "VR bump probe: shader {:#x} image {}{}: {:#x} {}x{} pitch {} format {} num {} "
+             "tiling {} sel {}{}{}{} levels {}..{} -> {}",
+             stage.pgm_hash, index, index == bump ? " (bump)" : "", address, w, h, pitch, fmt,
+             static_cast<u32>(tsharp.num_format), static_cast<u32>(tsharp.tiling_index),
+             static_cast<u32>(tsharp.dst_sel_x), static_cast<u32>(tsharp.dst_sel_y),
+             static_cast<u32>(tsharp.dst_sel_z), static_cast<u32>(tsharp.dst_sel_w),
+             static_cast<u32>(tsharp.base_level), static_cast<u32>(tsharp.last_level), path);
+}
+
 // FAST_CPU_GUARD (on unless '0'; read once at start-up): the constant ring's write guard keeps
 // bbport's rule (FastRender::PendingWriteGuard): only writes still queued refuse a constant, and
 // image downloads are caught on B (VideoCore::DownloadLog). Off: the merged ranges as before.
@@ -89,6 +171,12 @@ const bool g_guard = [] {
 // rule accepts is copied too, and B compares every constant the new rule accepted with the guest
 // bytes it would have read itself, and asks whether it would have read them at all. CE dumps are
 // checked too (FAST_CPU_GUARD_CE_VERIFY).
+// FAST_CPU_COPY_WRITES ('0' off, on by default since 0.5.5; read once):
+// DrawPacket::AddCopyShaderWrites.
+const bool g_copy_writes = [] {
+    const char* value = std::getenv("FAST_CPU_COPY_WRITES");
+    return !(value && value[0] == '0');
+}();
 const bool g_guard_verify = [] {
     const char* value = std::getenv("FAST_CPU_GUARD_VERIFY");
     return g_guard && value && value[0] == '1';
@@ -112,6 +200,38 @@ const bool g_guard_ce_verify = [] {
     const char* value = std::getenv("FAST_CPU_GUARD_CE_VERIFY");
     return g_guard_ce && (g_guard_verify || (value && value[0] == '1'));
 }();
+// FAST_RING_DEDUP=1 (off by default; bbport 0.7 BB_RING_DEDUP): a constant whose bytes the current
+// ring page already holds (same address, size and content; for camera and lighting buffers the
+// same camera) binds that copy and its eye pairs: no second write into the ring's
+// write-combined pages, no second GPU read over the bus, no second stereo pairing on A. Off: the
+// hash and scratch copy cost Stage A 8-17% more cycles per draw than they saved (10-29, 4c/4t to
+// full CPU, no fps change); kept for PCs that are short on memory bandwidth.
+// FAST_RING_DEDUP_VERIFY=1 keeps each slot's bytes and compares them on a hit.
+const bool g_ring_dedup = [] {
+    const char* value = std::getenv("FAST_RING_DEDUP");
+    return value && value[0] == '1';
+}();
+const bool g_ring_dedup_verify = [] {
+    const char* value = std::getenv("FAST_RING_DEDUP_VERIFY");
+    return value && value[0] == '1';
+}();
+struct RingReuse {
+    u64 key{}, address{}, bytes{}, generation{}, ring{}, camera_key{};
+    vk::DescriptorBufferInfo raw{}, left{}, right{};
+    bool flat{}, camera{}, lighting{}, projected{}, mirrored{};
+    std::vector<u8> shadow; // FAST_RING_DEDUP_VERIFY
+};
+constexpr size_t RingReuseSlots = 4096;
+// Stage A only (PrepareConstants), direct-mapped by the content hash.
+std::array<RingReuse, RingReuseSlots>& RingReuseTable() {
+    static auto table = std::make_unique<std::array<RingReuse, RingReuseSlots>>();
+    return *table;
+}
+struct RingDedupStats {
+    u64 hits{}, misses{}, mismatches{}, bytes_saved{};
+} g_ring_dedup_stats;
+// A new ConstantRing restarts its generations: slots of an earlier ring never match.
+u64 g_ring_serial = 0;
 // FAST_CPU_A_HEADROOM (on unless '0'): Stage A takes a render target's footprint for the guard
 // from a memo on its register words (DrawPacket::TargetFootprint) instead of a new ImageInfo
 // (and, for depth, an image view description) every draw.
@@ -146,6 +266,16 @@ const bool g_slim_packet_verify = [] {
     const char* value = std::getenv("FAST_CPU_SLIM_PACKET_VERIFY");
     return g_slim_packet && value && value[0] == '1';
 }();
+// FAST_CPU_SLIM_SIZES=1 (diagnostic): the slim form's bytes by part (EncodeSlim's size pass, stage
+// A), averaged per packet in a line after FAST_CPU_SLIM_PACKET's.
+const bool g_slim_sizes = [] {
+    const char* value = std::getenv("FAST_CPU_SLIM_SIZES");
+    return value && value[0] == '1';
+}();
+constexpr std::array<const char*, 13> SlimPartNames = {
+    "header", "camera", "compute", "constants", "vertex", "deltas", "verify",
+    "stage_ids", "user", "flat", "reads", "resources", "memory"};
+thread_local std::array<u64, 13> t_slim_sizes{};
 } // namespace
 
 class ScratchCapturedInputs {
@@ -159,7 +289,7 @@ public:
             const char* value = std::getenv("VR_DRAW_INPUT_SNAPSHOTS");
             const bool on = value && value[0] == '1';
             if (on)
-                LOG_INFO(Render_Vulkan, "Scratch owned draw inputs enabled (serial validation)");
+                LOG_INFO(Render_Vulkan, "Owned draw inputs enabled (serial validation)");
             return on;
         }();
         if (!enabled)
@@ -398,6 +528,114 @@ struct Rasterizer::DrawPacket {
     }
     void AddWrite(VAddr at, u64 length) {
         if (at && length) constant_writers.push_back({at, length});
+    }
+    // FAST_CPU_COPY_WRITES: the game's copy shader (vk_shader_hle.cpp COPY_SHADER_HASH, run as
+    // buffer copies on B) writes only its copies' destinations, which its control buffer lists
+    // ({dst_idx, src_idx, end} per group, the HLE's own arithmetic); its destination descriptor
+    // covers ~4 GB, which made every constant-engine dump wait for B to drain (2026-10-24).
+    // False: not that shader's destination, or a list that cannot be read (the descriptor then).
+    bool AddCopyShaderWrites(const Shader::Info& stage, const Shader::BufferResource& desc) {
+        static constexpr u64 CopyShaderHash = 0xfefebf9f;
+        if (!g_copy_writes || stage.pgm_hash != CopyShaderHash ||
+            stage.l_stage != Shader::LogicalStage::Compute || stage.buffers.size() < 3 ||
+            &desc != &stage.buffers[2])
+            return false;
+        struct Control {
+            u32 dst_idx, src_idx, end;
+        };
+        const auto ctl = stage.buffers[0].GetSharp(stage);
+        const auto dst = stage.buffers[2].GetSharp(stage);
+        const u32 stride = dst.GetStride();
+        const u32 count = compute.dim_x;
+        const u64 list_bytes = u64(count) * sizeof(Control);
+        if (ctl.GetStride() != sizeof(Control) || !stride || !ctl.base_address ||
+            !dst.base_address || count == 0 || count > 4096 ||
+            Core::Memory::Instance()->ClampRangeSize(ctl.base_address, list_bytes) < list_bytes) {
+            static u32 logged = 0;
+            if (logged++ < 8)
+                LOG_INFO(Render_Vulkan,
+                         "FAST_CPU_COPY_WRITES: list not taken: ctl stride {} base {:#x} dst stride "
+                         "{} base {:#x} groups {}",
+                         ctl.GetStride(), ctl.base_address, stride, dst.base_address, count);
+            return false;
+        }
+        static u32 taken = 0;
+        if (taken++ < 4)
+            LOG_INFO(Render_Vulkan, "FAST_CPU_COPY_WRITES: {} copies to {:#x}+", count,
+                     dst.base_address);
+        const auto* list = reinterpret_cast<const Control*>(ctl.base_address);
+        // The copies' destinations, sorted and merged where less than a page apart (the guards
+        // compare by page at the finest), so a list scattered over gigabytes stays a few ranges.
+        static thread_local std::vector<std::pair<u64, u64>> ranges;
+        ranges.clear();
+        u64 lo = ~u64{0}, hi = 0;
+        for (u32 i = 0; i < count; ++i) {
+            const u32 offset = list[i].dst_idx * stride; // u32, as ExecuteCopyShaderHLE
+            const u32 size = (list[i].end + 1) * stride;
+            if (size) {
+                ranges.emplace_back(dst.base_address + offset, dst.base_address + offset + size);
+                lo = std::min(lo, ranges.back().first);
+                hi = std::max(hi, ranges.back().second);
+            }
+        }
+        static constexpr u64 Page = 4096;
+        // A/B switch 2 (2026-11-02; this sort was ~2% of stage A at 320x240): the written pages
+        // without a sort. The guards compare by page at the finest, so the pages the copies touch,
+        // in runs of consecutive pages, are what they need (the merge below may also join two
+        // runs one untouched page apart: more than written, never less). A span over 64 MiB
+        // takes the sort.
+        if (FastRender::AbOn(2) && !ranges.empty() && hi - lo <= (u64{64} << 20)) {
+            static thread_local std::vector<u64> pages_set;
+            const u64 first_page = lo / Page;
+            const u64 page_count = (hi - 1) / Page - first_page + 1;
+            pages_set.assign((page_count + 63) / 64, 0);
+            for (const auto& [b, e] : ranges) {
+                // Pages [first, last] of this copy, a word at a time.
+                const u64 first = b / Page - first_page, last = (e - 1) / Page - first_page;
+                for (u64 w = first / 64; w <= last / 64; ++w) {
+                    const u64 from = w == first / 64 ? first % 64 : 0;
+                    const u64 to = w == last / 64 ? last % 64 : 63;
+                    const u64 high = to == 63 ? ~u64{0} : (u64{2} << to) - 1;
+                    pages_set[w] |= high & (~u64{0} << from);
+                }
+            }
+            // The runs of set pages, a word at a time (bits past page_count are clear).
+            const size_t words = pages_set.size();
+            u64 p = 0;
+            while (p < page_count) {
+                size_t w = p / 64;
+                u64 word = pages_set[w] & (~u64{0} << (p % 64));
+                while (!word && ++w < words)
+                    word = pages_set[w];
+                if (!word)
+                    break;
+                const u64 start = w * 64 + std::countr_zero(word);
+                w = start / 64;
+                u64 clear = ~pages_set[w] & (~u64{0} << (start % 64));
+                while (!clear && ++w < words)
+                    clear = ~pages_set[w];
+                const u64 stop =
+                    clear ? std::min<u64>(w * 64 + std::countr_zero(clear), page_count) : page_count;
+                AddWrite((first_page + start) * Page, (stop - start) * Page);
+                p = stop;
+            }
+            return true;
+        }
+        std::sort(ranges.begin(), ranges.end());
+        u64 begin = 0, end = 0;
+        for (const auto& [b, e] : ranges) {
+            if (end && b <= end + Page) {
+                end = std::max(end, e);
+                continue;
+            }
+            if (end)
+                AddWrite(begin, end - begin);
+            begin = b;
+            end = e;
+        }
+        if (end)
+            AddWrite(begin, end - begin);
+        return true;
     }
     // An image's footprint as a writer; FAST_CPU_GUARD skips these (bit i: constant_writers[i],
     // the first 64 only: a later one counts as a buffer write, which only refuses more).
@@ -669,8 +907,25 @@ struct Rasterizer::DrawPacket {
                 for (const auto& desc : stage->buffers) {
                     if (prepare_constants) {
                         const auto sharp = desc.GetSharp(*stage);
-                        if (desc.is_written && !desc.IsSpecial())
-                            AddWrite(sharp.base_address, sharp.GetSize());
+                        if (desc.is_written && !desc.IsSpecial()) {
+                            if (!AddCopyShaderWrites(*stage, desc))
+                                AddWrite(sharp.base_address, sharp.GetSize());
+                            if (sharp.GetSize() > (u64{64} << 20)) {
+                                // Diagnostic: the writes PendingWriteGuard calls big (logged once each).
+                                static std::set<std::tuple<u64, u64, u64>> seen;
+                                if (seen.size() < 64 &&
+                                    seen.emplace(stage->pgm_hash, sharp.base_address, sharp.GetSize()).second)
+                                    LOG_INFO(Render_Vulkan,
+                                             "FAST big write: shader {:#x} stage {} binding {} base {:#x} "
+                                             "size {:#x} stride {} records {} mapped {:#x}",
+                                             stage->pgm_hash, static_cast<u32>(stage->l_stage),
+                                             &desc - stage->buffers.data(),
+                                             sharp.base_address, sharp.GetSize(), sharp.GetStride(),
+                                             sharp.num_records,
+                                             Core::Memory::Instance()->ClampRangeSize(
+                                                 sharp.base_address, sharp.GetSize()));
+                            }
+                        }
                         const bool flat = desc.buffer_type == Shader::BufferType::Flatbuf;
                         const u64 bytes = flat ? owned[i].flat.size() * sizeof(u32) : sharp.GetSize();
                         if (bytes && bytes <= 16384 && !desc.is_written &&
@@ -694,7 +949,10 @@ struct Rasterizer::DrawPacket {
                     // These are CPU-side decisions on B, unlike ordinary GPU buffer bindings.
                     const auto size = sharp.GetSize();
                     if (NativeStereo::Enabled() &&
-                        (size == 864 || size == 208 || size == 272 || size == 336 || size == 416) &&
+                        (size == 864 || size == 208 || size == 272 || size == 336 ||
+                         size == 416 ||
+                         (size == 320 &&
+                          stage->pgm_hash == NativeProjection::ReflectionProgram)) &&
                         Core::Memory::Instance()->ClampRangeSize(sharp.base_address, size) ==
                             size) {
                         CaptureMemory(sharp.base_address, size);
@@ -1471,6 +1729,13 @@ struct Rasterizer::DrawPacket {
                          "(verify only) camera_sends={} compute_sends={} constants={} sent={}",
                          slim_packets, slim_bytes / slim_packets, slim_full_bytes / slim_packets,
                          slim_cameras, slim_computes, slim_constants, slim_kept);
+            if (g_slim_sizes && (slim_packets & 65535) == 0) {
+                std::string parts;
+                for (size_t i = 0; i < SlimPartNames.size(); ++i)
+                    parts += fmt::format(" {}={:.0f}", SlimPartNames[i],
+                                         double(t_slim_sizes[i]) / double(slim_packets));
+                LOG_INFO(Render_Vulkan, "FAST_CPU_SLIM_SIZES: bytes/packet by part:{}", parts);
+            }
         }
         return ticket;
     }
@@ -1503,27 +1768,47 @@ struct Rasterizer::DrawPacket {
                   (indexed ? SlimIndexed : 0) | (verify ? SlimVerify : 0) |
                   (regs_reset ? SlimRegsReset : 0) | (send_camera ? SlimCamera : 0) |
                   (send_compute ? SlimCompute : 0);
+        // FAST_CPU_SLIM_SIZES: the size pass adds each part's bytes (the stage parts summed).
+        const bool sizes = g_slim_sizes && output == nullptr;
+        size_t mark = 0;
+        const auto part = [&](size_t i) {
+            if (sizes) {
+                t_slim_sizes[i] += writer.Size() - mark;
+                mark = writer.Size();
+            }
+        };
         value(h);
+        part(0);
         if (send_camera)
             value(camera);
+        part(1);
         if (send_compute)
             value(compute);
+        part(2);
         writer.ArrayIf(constants, SlimKeeps);
+        part(3);
         if (vertex_prepared) {
             words(vertex.attributes);
             words(vertex.bindings);
             words(vertex.guest_buffers);
             words(vertex.ranges);
         }
+        part(4);
         words(deltas);
+        part(5);
         if (verify)
             value(*reference);
+        part(6);
         for (size_t i = 0; i < stage_count; ++i) {
             value(owned[i].owner);
             value(owned[i].program_base);
+            part(7);
             words(owned[i].user);
+            part(8);
             words(owned[i].flat);
+            part(9);
             words(reads[i]);
+            part(10);
             if (resources_prepared) {
                 const auto& r = resources[i];
                 words(r.image_values);
@@ -1536,11 +1821,13 @@ struct Rasterizer::DrawPacket {
                     value(r.key_hash);
                 }
             }
+            part(11);
         }
         for (size_t i = 0; i < memory_count; ++i) {
             value(memory[i].address);
             words(memory[i].words);
         }
+        part(12);
         return writer.Size();
     }
     // Stage B: Decode's results from the slim form, except what B never reads (see the switch);
@@ -1725,7 +2012,7 @@ struct Rasterizer::DrawPacket {
             v.body_cape_hidden != w.body_cape_hidden || v.body_head_hidden != w.body_head_hidden ||
             v.body_shoulder_cut != w.body_shoulder_cut || v.hands_split != w.hands_split ||
             v.hands_split_count != w.hands_split_count || v.cut_code != w.cut_code ||
-            v.probe_selected != w.probe_selected)
+            v.free_eye_cut != w.free_eye_cut || v.probe_selected != w.probe_selected)
             return "vr";
         if (packet_views != full.packet_views || selected != full.selected ||
             constant_page != full.constant_page || constant_downloads != full.constant_downloads ||
@@ -1998,7 +2285,7 @@ struct Rasterizer::DynSkip {
         bool operator==(const NoInputs&) const = default;
     };
     struct ViewportInputs {
-        u32 primitive_type{}, jitter_on{};
+        u32 primitive_type{};
         std::array<u32, 2> jitter{}, inverse{};
         bool operator==(const ViewportInputs&) const = default;
     };
@@ -2190,7 +2477,8 @@ struct Rasterizer::DynSkip {
         });
     }
 
-    void Update(const Rasterizer& r, const GraphicsPipeline* pipeline, bool is_indexed) {
+    void Update(const Rasterizer& r, const GraphicsPipeline* pipeline, bool is_indexed,
+                std::array<float, 2> jitter) {
         auto& state = r.scheduler.GetDynamicState();
         const auto& regs = ScratchDraw::Registers(r.liverpool);
         const bool owned = owner && owner == r.binding_packet && &regs == &owner->registers.regs;
@@ -2203,27 +2491,20 @@ struct Rasterizer::DynSkip {
             NativeProjection::ScreenQuadShader(light_vertex->pgm_hash)) {
             // The light-scissor union depends on the per-eye cameras: always recompute.
             ++bypass;
-            r.UpdateViewportScissorState(pipeline);
+            r.UpdateViewportScissorState(pipeline, jitter);
         } else {
-            const auto& temporal = r.vr_temporal;
-            const bool jitter_on =
-                temporal && temporal->active && !temporal->resolved && r.db_desc.first &&
-                r.db_desc.first == temporal->depth_id &&
-                (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1);
-            const auto jitter = jitter_on ? temporal->scene.Jitter() : std::array<float, 2>{};
             const ViewportInputs inputs{
                 .primitive_type = primitive_type,
-                .jitter_on = jitter_on,
                 .jitter = {std::bit_cast<u32>(jitter[0]), std::bit_cast<u32>(jitter[1])},
                 .inverse = {std::bit_cast<u32>(r.vr_scene_inverse[0]),
                             std::bit_cast<u32>(r.vr_scene_inverse[1])},
             };
             if (!Lookup(0, viewport, inputs, owned, regs, DynSkipViewportRanges)) {
-                r.UpdateViewportScissorState(pipeline);
+                r.UpdateViewportScissorState(pipeline, jitter);
                 viewports = state.viewports;
                 scissors = state.scissors;
             } else if (Verify()) {
-                r.UpdateViewportScissorState(pipeline);
+                r.UpdateViewportScissorState(pipeline, jitter);
                 if (!SameViewports(state.viewports, viewports) ||
                     !std::ranges::equal(state.scissors, scissors)) {
                     Mismatch("viewport", owned);
@@ -2296,6 +2577,7 @@ void Rasterizer::RecordPacket(std::unique_lock<std::recursive_mutex> selection_l
     packet.size = size;
     packet.count = count;
     packet.count_address = count_address;
+    packet.vr.shadow_near = kind == PacketKind::Draw || kind == PacketKind::DrawIndirect ? shadow_near_a : 0u;
     const bool prepare_constants = worker_active && FastRender::On(FastRender::ConstantRing);
     // Bit 32: set by Draw for this draw packet only.
     const PreparedDraw* const reuse_from = std::exchange(packet_prepared, nullptr);
@@ -2312,6 +2594,14 @@ void Rasterizer::RecordPacket(std::unique_lock<std::recursive_mutex> selection_l
         selection_lock.unlock();
     packet.CaptureMemoryContents();
     PrepareConstants(packet, prepare_constants);
+    // A draw into a shadow atlas tile: steadied (vr_shadow_hold.h; its tile's light was seen by
+    // PrepareConstants at the latest now).
+    if (prepare_constants && (kind == PacketKind::Draw || kind == PacketKind::DrawIndirect) && ShadowHold::Active()) {
+        if (const auto snap = ShadowHold::Snap()) {
+            packet.vr.shadow_snapped = true;
+            packet.vr.shadow_snap = *snap;
+        }
+    }
     if (worker_active) {
         u64 ticket;
         if (g_slim_packet) {
@@ -2413,16 +2703,26 @@ void Rasterizer::ConsumePacket(DrawPacket& packet) {
         CheckGuardConstants(packet);
     switch (packet.kind) {
     case PacketKind::FilteredDraw:
+        if (packet.offset == WaterReflectionMark) {
+            WaterReflectionClear();
+            break;
+        }
         FilterDraw();
         break;
     case PacketKind::Draw:
+        vr_shadow_near_clear = packet.vr.shadow_near != 0;
+        vr_shadow_near_serial = packet.vr.shadow_near;
         DrawRecord(static_cast<const GraphicsPipeline*>(packet.selected), packet.indexed,
                    packet.offset);
+        vr_shadow_near_clear = false;
         break;
     case PacketKind::DrawIndirect:
+        vr_shadow_near_clear = packet.vr.shadow_near != 0;
+        vr_shadow_near_serial = packet.vr.shadow_near;
         DrawIndirectRecord(static_cast<const GraphicsPipeline*>(packet.selected), packet.indexed,
                            packet.address, packet.offset, packet.size, packet.count,
                            packet.count_address);
+        vr_shadow_near_clear = false;
         break;
     case PacketKind::Dispatch:
         DispatchDirectRecord(static_cast<const ComputePipeline*>(packet.selected));
@@ -2487,7 +2787,11 @@ void Rasterizer::PrepareConstants(DrawPacket& packet, bool enabled) {
                 constant_writes.Add(address, bytes, UINT64_MAX, OldGuard::KindImage);
     }
     if (!enabled || packet.constants.empty() || packet.constant_unknown) return;
-    if (!constant_ring) constant_ring = std::make_unique<ConstantRing>(instance, scheduler);
+    if (!constant_ring) {
+        constant_ring = std::make_unique<ConstantRing>(instance, scheduler);
+        ++g_ring_serial;
+    }
+    const u64 constant_ring_serial = g_ring_serial;
     const u64 alignment = std::max<u64>(instance.StorageMinAlignment(), instance.NonCoherentAtomSize());
     u64 maximum = 0;
     for (const auto& c : packet.constants) maximum += 3 * (c.bytes + alignment);
@@ -2519,6 +2823,80 @@ void Rasterizer::PrepareConstants(DrawPacket& packet, bool enabled) {
     // writes B has passed.
     constexpr auto pages = FastRender::PendingWriteGuard::Match::Pages;
     constant_candidates += packet.constants.size();
+    // FAST_RING_DEDUP: the camera and lighting buffers' eye pairs depend on the packet's camera as
+    // well (and the mirror flip); hashed once per packet when one is looked up.
+    u64 camera_key = 0;
+    const auto CameraKey = [&] {
+        if (!camera_key)
+            camera_key = XXH3_64bits_withSeed(&packet.camera, sizeof(packet.camera),
+                                              VrMirrorFlip() ? 2 : 1) | 1;
+        return camera_key;
+    };
+    const auto Paired = [](const auto& c) {
+        return !c.flat && (c.bytes == 864 || c.bytes == 208 || c.bytes == 272 || c.bytes == 336 ||
+                           c.bytes == 416);
+    };
+    const auto SlotKey = [](const auto& c, const u8* bytes) {
+        const u64 address = c.flat ? 0 : c.sharp.base_address;
+        return XXH3_64bits_withSeed(bytes, c.bytes, address ^ (c.bytes << 48) ^ u64(c.flat));
+    };
+    // A copy of the same bytes in this ring page: the page is reused only once the GPU is past
+    // every packet that used it, and this packet marks it used as well (constant_page).
+    const auto ReuseRingConstant = [&](auto& c, const u8* bytes) {
+        auto& table = RingReuseTable();
+        const u64 key = SlotKey(c, bytes);
+        RingReuse& slot = table[key & (RingReuseSlots - 1)];
+        const u64 address = c.flat ? 0 : c.sharp.base_address;
+        const bool paired = Paired(c);
+        if (slot.key != key || slot.address != address || slot.bytes != c.bytes ||
+            slot.flat != c.flat || slot.generation != constant_ring->AllocationGeneration() ||
+            slot.ring != constant_ring_serial || (paired && slot.camera_key != CameraKey())) {
+            ++g_ring_dedup_stats.misses;
+            return false;
+        }
+        if (g_ring_dedup_verify && std::memcmp(slot.shadow.data(), bytes, c.bytes) != 0) {
+            if (++g_ring_dedup_stats.mismatches <= 16)
+                LOG_ERROR(Render_Vulkan, "FAST_RING_DEDUP verify: {:#x}+{} hashed equal to a "
+                                         "different copy; a new copy is used",
+                          address, c.bytes);
+            ++g_ring_dedup_stats.misses;
+            return false;
+        }
+        c.raw = slot.raw;
+        c.left = slot.left;
+        c.right = slot.right;
+        c.camera = slot.camera;
+        c.lighting = slot.lighting;
+        c.projected = slot.projected;
+        c.mirrored = slot.mirrored;
+        ++g_ring_dedup_stats.hits;
+        g_ring_dedup_stats.bytes_saved += c.bytes + (c.camera || c.lighting ? 2 * c.bytes : 0);
+        return true;
+    };
+    const auto RememberRingConstant = [&](const auto& c, const u8* bytes) {
+        const u64 key = SlotKey(c, bytes);
+        RingReuse& slot = RingReuseTable()[key & (RingReuseSlots - 1)];
+        slot.key = key;
+        slot.address = c.flat ? 0 : c.sharp.base_address;
+        slot.bytes = c.bytes;
+        slot.flat = c.flat;
+        slot.generation = constant_ring->AllocationGeneration();
+        slot.ring = constant_ring_serial;
+        slot.camera_key = Paired(c) ? CameraKey() : 0;
+        slot.raw = c.raw;
+        slot.left = c.left;
+        slot.right = c.right;
+        slot.camera = c.camera;
+        slot.lighting = c.lighting;
+        slot.projected = c.projected;
+        slot.mirrored = c.mirrored;
+        if (g_ring_dedup_verify)
+            slot.shadow.assign(bytes, bytes + c.bytes);
+    };
+    // A/B switch 1 (FAST_CPU_SPARSE_HOLD): one shared hold of the mapping lock for this draw's
+    // guest copies (the loop never waits for B nor takes the lock exclusively: the ring space is
+    // reserved above).
+    Core::MemoryManager::SparseReadHold sparse_reads{*memory};
     for (auto& c : packet.constants) {
         bool probe = false;
         if (!c.flat) {
@@ -2584,8 +2962,36 @@ void Rasterizer::PrepareConstants(DrawPacket& packet, bool enabled) {
             }
             guest_constants = true;
         }
+        // FAST_RING_DEDUP: the bytes go through a cache-hot scratch copy first; a constant this
+        // ring page already holds (RingReuse) binds that copy and its eye pairs instead.
+        const bool dedup = g_ring_dedup && !probe;
+        const u8* scratch = nullptr;
+        if (dedup) {
+            thread_local std::vector<u8> bytes;
+            bytes.resize(c.bytes);
+            if (c.flat) {
+                std::memcpy(bytes.data(), packet.owned[c.input].flat.data(), c.bytes);
+            } else {
+                const auto* source = ScratchDraw::MemorySource(
+                    reinterpret_cast<const void*>(c.sharp.base_address), c.bytes);
+                if (source == reinterpret_cast<const void*>(c.sharp.base_address))
+                    memory->CopySparseMemory(c.sharp.base_address, bytes.data(), c.bytes);
+                else std::memcpy(bytes.data(), source, c.bytes);
+            }
+            scratch = bytes.data();
+            if (ReuseRingConstant(c, scratch)) {
+                packet.constant_page = constant_ring->Page();
+                ++constant_prepared;
+                // (The same bytes as a draw before: still this draw's light, vr_shadow_hold.h.)
+                if (!c.flat && c.bytes == 864 && ShadowHold::Active()) [[unlikely]]
+                    ShadowHold::LightCamera(reinterpret_cast<const float*>(scratch));
+                continue;
+            }
+        }
         const auto [target, offset] = constant_ring->Map(c.bytes, alignment);
-        if (c.flat) {
+        if (scratch) {
+            std::memcpy(target, scratch, c.bytes);
+        } else if (c.flat) {
             std::memcpy(target, packet.owned[c.input].flat.data(), c.bytes);
         } else {
             const auto* source = ScratchDraw::MemorySource(
@@ -2596,6 +3002,9 @@ void Rasterizer::PrepareConstants(DrawPacket& packet, bool enabled) {
         }
         constant_ring->Commit();
         packet.constant_page = constant_ring->Page();
+        // The stereo pairs read the bytes from the scratch copy when there is one (cached memory,
+        // not the ring's write-combined pages).
+        const auto* floats = reinterpret_cast<const float*>(scratch ? scratch : target);
         if (probe) {
             c.probe = true;
             c.left = {constant_ring->Handle(), offset, c.bytes};
@@ -2604,13 +3013,30 @@ void Rasterizer::PrepareConstants(DrawPacket& packet, bool enabled) {
         }
         ++constant_prepared;
         c.raw = {constant_ring->Handle(), offset, c.bytes};
+        // The moon's shadow atlas held over frames (vr_shadow_hold.h; a test switch): the scene's
+        // camera, and a held frame's cascades replaced by the held atlas' own (the ring's raw
+        // copy too: what binds it unpaired reads the same atlas).
+        std::array<float, 84> held_cascades;
+        const float* lighting_floats = floats;
+        if (ShadowHold::Active() && !c.flat) [[unlikely]] {
+            if (c.bytes == 864) {
+                ShadowHold::Camera(floats);
+                ShadowHold::LightCamera(floats);
+            } else if (c.bytes == 336 && ShadowHold::Cascades(floats, held_cascades.data())) {
+                lighting_floats = held_cascades.data();
+                std::memcpy(target, held_cascades.data(), 336);
+            }
+        }
         if (!c.flat && c.bytes == 864)
-            c.camera = NativeStereo::CameraBuffer(*constant_ring, reinterpret_cast<const float*>(target),
+            c.camera = NativeStereo::CameraBuffer(*constant_ring, floats,
                 alignment, packet.camera, c.left, c.right, &c.projected,
                 VrMirrorFlip() ? &c.mirrored : nullptr);
-        else if (!c.flat && (c.bytes == 208 || c.bytes == 272 || c.bytes == 336 || c.bytes == 416))
-            c.lighting = NativeStereo::LightingBuffer(*constant_ring, reinterpret_cast<const float*>(target),
+        else if (!c.flat && (c.bytes == 208 || c.bytes == 272 || c.bytes == 320 ||
+                             c.bytes == 336 || c.bytes == 416))
+            c.lighting = NativeStereo::LightingBuffer(*constant_ring, lighting_floats,
                 static_cast<u32>(c.bytes), alignment, packet.camera, c.left, c.right);
+        if (dedup)
+            RememberRingConstant(c, scratch);
     }
     // Flat constants are A's own copies of the packet's user data: no download can change them,
     // so a packet with no guest constant needs no check on B.
@@ -2620,12 +3046,16 @@ void Rasterizer::PrepareConstants(DrawPacket& packet, bool enabled) {
         LOG_INFO(Render_Vulkan,
                  "FAST constant prepare: candidates={} prepared={} same_draw={} pending={} gpu_dirty={} "
                  "table_mode={} pending_unknown={} pending_invalid={} pending_range={} pending_table={} "
-                 "pending_big={} guard_ranges={} guard_unknown_adds={}",
+                 "pending_big={} guard_ranges={} guard_unknown_adds={} ring_dedup={} hits={} "
+                 "misses={} saved_mb={:.1f} verify_mismatches={}",
                  constant_candidates, constant_prepared, constant_same_draw_refused,
                  constant_pending_refused, constant_gpu_refused, constant_writes.TableMode(),
                  constant_refused_by[1], constant_refused_by[2], constant_refused_by[3],
                  constant_refused_by[4], constant_refused_by[5], constant_writes.RangeCount(),
-                 constant_writes.UnknownAdds());
+                 constant_writes.UnknownAdds(),
+                 g_ring_dedup ? (g_ring_dedup_verify ? "verify" : "on") : "off",
+                 g_ring_dedup_stats.hits, g_ring_dedup_stats.misses,
+                 double(g_ring_dedup_stats.bytes_saved) / (1 << 20), g_ring_dedup_stats.mismatches);
         const auto at = [&](NewHit hit) { return g.refused_by[static_cast<size_t>(hit)]; };
         LOG_INFO(Render_Vulkan,
                  "FAST_CPU_GUARD: {} new_unknown={} new_invalid={} new_write={} new_page={} "
@@ -2932,6 +3362,43 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
 
 #include "video_core/native_stereo/native_audit.inl"
 
+// FAST_CPU_STAGEB_SPLIT=2: what fast:StageB2 encodes of a plain draw, after the slot's blob.
+struct Rasterizer::SplitDrawJob {
+    Pipeline::Prepared resources; // barriers recorded on stage B (EncodeBarriers)
+    VertexBinds binds;
+    DynamicState dynamic;
+    Shader::PushData push_data;
+    Shader::VrPushData vr_push;
+    const GraphicsPipeline* pipeline{};
+    vk::Pipeline handle;
+    u32 count{}, instances{}, vertex_offset{}, instance_offset{};
+    bool indexed{};
+};
+
+void Rasterizer::SplitEncode(void* context, u32 slot) {
+    auto& r = *static_cast<Rasterizer*>(context);
+    auto& job = r.split_jobs[slot];
+    const auto cmdbuf = r.scheduler.Commands();
+    VideoCore::BufferCache::EncodeVertexBinds(job.binds, cmdbuf);
+    job.pipeline->EncodeResources(job.resources, job.push_data, job.vr_push);
+    auto& tracker = r.scheduler.RingDynamicState();
+    tracker.SetFrom(job.dynamic);
+    tracker.Commit(r.instance, cmdbuf);
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, job.handle);
+    const EyeDraws eyes{.layout = job.pipeline->GetLayout(),
+                        .hud = job.push_data.vr_hud,
+                        .both = job.pipeline->GetGraphicsKey().probe_view_mask == 3 &&
+                                NativeStereo::LayerDraws()};
+    DrawEyes(cmdbuf, eyes, [&] {
+        if (job.indexed) {
+            cmdbuf.drawIndexed(job.count, job.instances, 0, s32(job.vertex_offset),
+                               job.instance_offset);
+        } else {
+            cmdbuf.draw(job.count, job.instances, job.vertex_offset, job.instance_offset);
+        }
+    });
+}
+
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
                        AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, page_manager{this},
@@ -2949,8 +3416,13 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
                 }()} {
     FastRender::Start();
     GpuPassProfiler::Init(instance, scheduler); // FAST_GPU_PASS_PROFILE only
+    // VR_STALL_SAMPLER only (logs-on builds): flat mode has no VR presenter frame to start it.
+    Common::Slow::StartSampler();
     // Bit 40's skip rule in native stereo asks the VR state (Stage A, vk_rasterizer_vr_draws.cpp).
     pipeline_cache.SetVrSkipVeto([this](const Shader::Info* vs) { return VrSkipVeto(vs); });
+    vr_body_maps = std::make_unique<VrBodyMaps>(instance, scheduler); // no buffers until used
+    vr_pyramid = std::make_unique<VrDepthPyramid>(instance, scheduler); // no buffer until used
+    vr_fog_grid = std::make_unique<VrFogGrid>(instance, scheduler);     // nothing until used
     dyn_skip = std::make_unique<DynSkip>();
     const char* temporal_check = std::getenv("VR_TEMPORAL_NATIVE_CHECK");
     // Accepted settings drive the normal path. Native-size AA is a diagnostic override.
@@ -2962,11 +3434,22 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    if (StageBSplitThreadRequested() && scheduler.StageBSplit()) {
+        split_jobs = std::make_unique<SplitDrawJob[]>(Scheduler::SplitSlots);
+        scheduler.StartSplitThread(&Rasterizer::SplitEncode, this);
+    }
 }
 
 Rasterizer::~Rasterizer() {
     published_pipe.store(nullptr, std::memory_order_release);
     draw_pipe.reset(); // Drain and join before destroying caches, packets or scheduler users.
+    scheduler.SplitSync("shutdown"); // fast:StageB2 done with this rasterizer's jobs
+    if (buffer_cache.SparseEnabled()) {
+        // Deferred cleanups hold this rasterizer's caches (normal ones) and the sparse pool
+        // (priority twin releases, which run on the scheduler's thread, outliving the caches):
+        // every one runs while all caches still stand. Members go texture cache first.
+        scheduler.DrainDeferredOperations();
+    }
     GpuPassProfiler::Shutdown(scheduler); // FAST_GPU_PASS_PROFILE only: finishes, frees its pool
     if (constant_ring) {
         scheduler.Finish();
@@ -2985,8 +3468,15 @@ bool Rasterizer::IsDrawTaskPending(u64 ticket) const {
     return pipe && pipe->Pending(ticket);
 }
 
+// FAST_CE_TASK_READS=0: every ordered task counts as reading unlisted guest memory, as before.
+static const bool g_ce_task_reads = [] {
+    const char* value = std::getenv("FAST_CE_TASK_READS");
+    return !value || value[0] != '0';
+}();
+
 u64 Rasterizer::QueueOrderedTask(void (*handler)(void*, std::span<const std::byte>), void* context,
-                                 std::span<const std::byte> packet, bool writes_known) {
+                                 std::span<const std::byte> packet, bool writes_known,
+                                 bool reads_guest) {
     if (!worker_active || !FastRender::On(FastRender::OrderedFenceTasks))
         return false;
     const auto ticket = draw_pipe->PushTask(handler, context, packet);
@@ -2994,10 +3484,23 @@ u64 Rasterizer::QueueOrderedTask(void (*handler)(void*, std::span<const std::byt
         constant_writes.Unknown(ticket);
         pending_writes.Unknown(ticket);
     }
-    // Ordered tasks (DMA, WriteData, submit/finish) may read guest memory they do not list.
-    if (ce.mode) ce.untracked = ticket;
+    // Ordered tasks that may read guest memory they do not list (DMA, flips, the frame end) hold
+    // back later CE dumps until B is past them. Write-only ones (fences, WriteData, query
+    // results, submission retire and idle) do not: their writes go through the write guard.
+    if (ce.mode) {
+        if (reads_guest || !g_ce_task_reads)
+            ce.untracked = ticket;
+        else
+            ++ce.write_only_tasks;
+    }
     return ticket;
 }
+
+// FAST_CPU_CE_TICKET ('1' on, off by default; read once): see CeDumpWait.
+static const bool g_ce_ticket = [] {
+    const char* value = std::getenv("FAST_CPU_CE_TICKET");
+    return value && value[0] == '1';
+}();
 
 bool Rasterizer::CeDumpWait(VAddr address, u64 bytes) {
     static constexpr auto CeTargetedWait = static_cast<FastRender::Bit>(16);
@@ -3035,10 +3538,26 @@ bool Rasterizer::CeDumpWait(VAddr address, u64 bytes) {
             // where the write misses the dumped bytes. Without FAST_CPU_GUARD_CE, or with
             // readbackLinearImages (see g_guard_ce), every covered dump drains in full.
             GuardProgress progress{*this};
-            const bool new_full =
-                g_guard && (!g_guard_ce || texture_cache.ReadsBackLinearImages() ||
-                            pending_writes.Intersects(address, bytes, progress,
-                                                      FastRender::PendingWriteGuard::Match::Pages));
+            using Hit = FastRender::PendingWriteGuard::Hit;
+            const Hit hit = g_guard && g_guard_ce && !texture_cache.ReadsBackLinearImages()
+                                ? pending_writes.Check(address, bytes, progress,
+                                                       FastRender::PendingWriteGuard::Match::Pages)
+                                : Hit::Count;
+            ++ce.guard_hits[static_cast<u32>(hit)];
+            // FAST_CPU_CE_TICKET: a queued write (or untracked task) in these pages needs only
+            // B past it, as the full drain makes sure: wait for the newest such ticket instead.
+            u64 ticket_wait = 0;
+            if (g_ce_ticket && (hit == Hit::Write || hit == Hit::Page || hit == Hit::Big ||
+                                hit == Hit::Unknown)) {
+                ticket_wait = pending_writes.NewestPending(
+                    address, bytes, progress, FastRender::PendingWriteGuard::Match::Pages);
+            }
+            const bool new_full = g_guard && hit != Hit::None &&
+                                  (ticket_wait == 0 || ticket_wait == UINT64_MAX);
+            if (g_guard && !g_guard_verify && !new_full && hit != Hit::None) {
+                ++ce.ticket_waits;
+                ce.wait_ns += draw_pipe->WaitFor(ticket_wait);
+            }
             const bool full =
                 g_guard && !g_guard_verify
                     ? new_full
@@ -3067,11 +3586,16 @@ bool Rasterizer::CeDumpWait(VAddr address, u64 bytes) {
         LOG_INFO(Render_Vulkan,
                  "FAST ce: dumps={} skipped={} waited={} wait_us={} untracked_waits={} full_off={} "
                  "full_mode={} full_box={} full_guard={} notes={} untracked_packets={} "
-                 "untracked_nopipe={} dma={} meta={} imgfmt={} indirect={} huge={} box={:#x}..{:#x}",
+                 "untracked_nopipe={} dma={} meta={} imgfmt={} indirect={} huge={} box={:#x}..{:#x} "
+                 "guard hits none={} unknown={} invalid={} write={} page={} big={} signal_queued={} "
+                 "signal_unwritten={} off={} ticket_waits={} write_only_tasks={}",
                  ce.dumps, ce.skipped, ce.waited, ce.wait_ns / 1000, ce.untracked_waits, ce.full_off,
                  ce.full_mode, ce.full_box, ce.full_guard, ce.notes, ce.untracked_packets,
                  ce.untracked_by[0], ce.untracked_by[1], ce.untracked_by[2], ce.untracked_by[3],
-                 ce.untracked_by[4], ce.untracked_by[5], ce.lo, ce.hi);
+                 ce.untracked_by[4], ce.untracked_by[5], ce.lo, ce.hi, ce.guard_hits[0],
+                 ce.guard_hits[1], ce.guard_hits[2], ce.guard_hits[3], ce.guard_hits[4],
+                 ce.guard_hits[5], ce.guard_hits[6], ce.guard_hits[7], ce.guard_hits[8],
+                 ce.ticket_waits, ce.write_only_tasks);
     return targeted;
 }
 
@@ -3456,8 +3980,10 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         image.binding.is_target = 1u;
     }
 
+    const auto glow_cut = VrGlowDepthCut(pipeline);
+    vr_glow_depth_min = -1.0f;
     if ((regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
-        (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid())) {
+        (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid()) || glow_cut) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& hint = std::as_const(ScratchDraw::DepthExtent(liverpool));
         auto& image_id = db_desc.first;
@@ -3504,10 +4030,50 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
         }
         auto& image = texture_cache.GetImage(image_id);
+        if (glow_cut && !regs.depth_control.depth_enable && !regs.depth_control.stencil_enable) {
+            // Only over the scene the depth belongs to, both of them eye pairs (the glow's blur
+            // into its own small target has the same shaders and registers).
+            const auto& color = texture_cache.GetImage(cb_descs[0].first);
+            if (!image.native_stereo || !color.native_stereo ||
+                color.info.size.width != image.info.size.width ||
+                color.info.size.height != image.info.size.height) {
+                bound_images.pop_back();
+                image_id = {};
+                return;
+            }
+            vr_glow_depth_min = *glow_cut;
+        }
         image.binding.is_target = 1u;
     } else {
         db_desc.first = {};
     }
+}
+
+// Rasterizer::vr_glow_depth_min's draw, before its targets are found: the god rays' composite
+// shaders with colour target 0, a valid depth the game leaves off, native stereo, the depth
+// bounds feature and the camera's projection. The stored depth of a point glow_near_m in front:
+// the game's D3D-style 0..1, z_ndc = f/(f-n) - n*f/((f-n)*z) (vr_stereo_warp_math.h).
+std::optional<float> Rasterizer::VrGlowDepthCut(const GraphicsPipeline* pipeline) const {
+    const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
+    const float near_m = VR::GetSettings().glow_near_m;
+    if (near_m <= 0.0f || !NativeStereo::Enabled() || !instance.IsDepthBoundsSupported() ||
+        !regs.depth_buffer.DepthValid() || !cb_descs[0].first ||
+        (pipeline->GetGraphicsKey().mrt_mask & 1) == 0) {
+        return std::nullopt;
+    }
+    const auto& stages = pipeline->GetStages();
+    const auto* vs = stages[u32(Shader::LogicalStage::Vertex)];
+    const auto* fs = stages[u32(Shader::LogicalStage::Fragment)];
+    if (!vs || !fs || !NativeProjection::GlowRaysComposite(vs->pgm_hash, fs->pgm_hash)) {
+        return std::nullopt;
+    }
+    const auto& record = VR::DrawFrameRecord();
+    const float n = record.near_z, f = record.far_z;
+    if (!record.has_projection || !(n > 0.0f) || !(f > n)) {
+        return std::nullopt;
+    }
+    const float z = std::max(near_m * record.world_scale, n);
+    return std::clamp(f / (f - n) - n * f / ((f - n) * z), 0.0f, 1.0f);
 }
 
 namespace {
@@ -3579,11 +4145,19 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     if (worker_active) {
-        if (!IsRegularDraw()) {
+        if (!IsRegularDraw() || ShadowCellSkipped(true) || GameLampMapSkipped()) {
             RecordPacket({}, nullptr, PacketKind::FilteredDraw);
             return;
         }
-    } else if (!FilterDraw()) {
+        if (WaterReflectionSkipped()) {
+            // Stage B clears its target once a frame (WaterReflectionClear).
+            RecordPacket({}, nullptr, PacketKind::FilteredDraw, false, 0, WaterReflectionMark);
+            return;
+        }
+    } else if (!FilterDraw() || ShadowCellSkipped(true) || GameLampMapSkipped()) {
+        return;
+    } else if (WaterReflectionSkipped()) {
+        WaterReflectionClear();
         return;
     }
 
@@ -3611,6 +4185,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     if (DiagSkip::Skip(pipeline->GetStages())) // FAST_DIAG_SKIP_FILE (diagnostic)
         return;
+    if (WaterReflectionCapped(std::as_const(ScratchDraw::Registers(liverpool)).num_indices,
+                              pipeline))
+        return; // over the water reflection's budget (no packet: nothing to draw)
     VrSkipNoteDraw(pipeline); // bit 40's skip rule: the UI phase starts at the composite
     if (!PrepareVrDraw(pipeline, is_indexed, false, index_offset))
         return;
@@ -3627,7 +4204,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         recording_vr = producer_vr;
         probe_selected = recording_vr.probe_selected;
         selection_lock.unlock();
+        vr_shadow_near_clear = shadow_near_a != 0;
+        vr_shadow_near_serial = shadow_near_a;
         DrawRecord(pipeline, is_indexed, index_offset);
+        vr_shadow_near_clear = false;
     }
 }
 
@@ -4031,6 +4611,110 @@ const GraphicsPipeline* Rasterizer::VrViewPredicted(const GraphicsPipeline* pipe
 // drew. `pipeline` is the one the draw binds: after VrTemporalSelect (DrawRecord; an indirect
 // draw never gets a motion variant). A draw of a planar reflection's pass (VrInMirrorPass, its
 // cameras noted by BindBuffers before this) gets both upside down, as its mirrored camera.
+// The bump map bound for this draw (vr_bump_class.h): its class, from the texture's own bytes the
+// first time its address, size and format are seen (BC1 and BC3 only; any other format, an
+// unmapped range or a texture too small: not a height map), and again when its turn comes
+// (vk_rasterizer.h VrBumpState). Reads at most SampleBlocks blocks.
+void Rasterizer::VrBumpClassify(const Shader::Info& stage, const Shader::ImageResource& desc,
+                                const AmdGpu::Image& tsharp) {
+    // The heights made since the last frame: their images take them at their next use.
+    auto& heights = texture_cache.BumpHeights();
+    if (vr_bump.poll_frame != vr_bump.frame) {
+        vr_bump.poll_frame = vr_bump.frame;
+        vr_bump.ready.clear();
+        heights.Poll(vr_bump.ready);
+        for (const auto& [address, size] : vr_bump.ready) {
+            texture_cache.InvalidateMemory(address, size);
+        }
+    }
+    const u32 fmt = static_cast<u32>(tsharp.data_format);
+    const u32 width = tsharp.width + 1, height = tsharp.height + 1, pitch = tsharp.Pitch();
+    // (Until 2026-11-12 the size's bits were xor-ed over the address' own.)
+    const u64 key = tsharp.Address() * 0x9E3779B97F4A7C15ull ^
+                    (u64{fmt} << 40 | u64{width} << 20 | u64{height});
+    const auto it = vr_bump.classes.find(key);
+    if (it != vr_bump.classes.end() &&
+        (vr_bump.frame < it->second.next || vr_bump.recheck_frame == vr_bump.frame)) {
+        vr_bump.draw_need = it->second.slot < 0 ? it->second.need
+                            : heights.Made(it->second.slot, vr_bump.frame) ? NeedDepth : NeedNone;
+        return;
+    }
+    VrBump::Class c{};
+    const bool bc1 = fmt == 35, bc3 = fmt == 37;
+    const u32 block_bytes = bc1 ? 8 : 16;
+    const u64 bytes = u64{(pitch + 3) / 4} * ((height + 3) / 4) * block_bytes;
+    if ((bc1 || bc3) && width >= 16 && height >= 16 && tsharp.Address() != 0 &&
+        memory->IsValidGpuMapping(tsharp.Address(), bytes)) {
+        c = VrBump::Classify(std::bit_cast<const u8*>(tsharp.Address()), bytes, block_bytes,
+                             bc3 ? 8u : 0u);
+    }
+    // A flat blue: a height from its normals, where they are stonework (bump_height.h; with the
+    // setting on only; VR_BUMP_DERIVE=0, tests: none).
+    static const bool derive = [] {
+        const char* const env = std::getenv("VR_BUMP_DERIVE");
+        return env == nullptr || env[0] != '0';
+    }();
+    s32 slot = -1;
+    bool retry = false;
+    if (c.kind == 1 && derive && vr_bump.depth_m > 0.0f) {
+        const VideoCore::ImageInfo info{tsharp, desc};
+        VideoCore::BumpHeight::Layout layout;
+        if (VideoCore::BumpHeight::Store::Eligible(info, layout) &&
+            memory->IsValidGpuMapping(info.guest_address, info.guest_size)) {
+            slot = heights.Request(info, layout, std::bit_cast<const u8*>(info.guest_address),
+                                   vr_bump.frame);
+            retry = slot < 0;
+        }
+    }
+    const u8 need = c.kind == 2 ? NeedDepth : NeedNone;
+    vr_bump.draw_need = slot < 0 ? need
+                        : heights.Made(slot, vr_bump.frame) ? NeedDepth : NeedNone;
+    const bool again = it != vr_bump.classes.end();
+    const bool changed = again && it->second.need != need;
+    const u64 next = vr_bump.frame + (retry ? BumpRetryFrames
+                                      : again ? BumpRecheckFrames : BumpFirstRecheckFrames);
+    if (again) {
+        vr_bump.recheck_frame = vr_bump.frame;
+        it->second = {need, next, slot};
+    } else {
+        if (vr_bump.classes.size() >= BumpClassesMax) {
+            vr_bump.classes.clear(); // bounded (a long session's every texture): seen again, read again
+        }
+        vr_bump.classes.emplace(key, VrBumpState::Entry{need, next, slot});
+    }
+    if constexpr (Common::Log::Enabled) {
+        static u32 logged = 0;
+        if (changed || (!again && (c.kind == 2 || logged < 64))) {
+            ++logged;
+            LOG_INFO(Render_Vulkan,
+                     "VR bump class: shader {:#x} image {} {:#x} {}x{} format {}: {}{} (scale "
+                     "{:.2f}; faces {:.2f}, joints {:.2f}, black {:.2f}, floor {:.2f})",
+                     stage.pgm_hash, stage.vr_bump_image, tsharp.Address(), width, height, fmt,
+                     VrBump::KindName(c.kind), changed ? " (changed)" : "", c.scale, c.face,
+                     c.joint, c.black, c.floor);
+        }
+    }
+}
+
+// The frame's depth for the raised brickwork (parallax.h BumpGaps): the setting's, 0 when off;
+// VR_BUMP_PARALLAX=<metres> (tests) and the live-tuning key lighting.brick_depth_cm override it.
+// And the class cache's clock.
+void Rasterizer::VrBumpEndFrame() {
+    namespace Tune = Shader::Optimization::BumpGaps;
+    static const float override_m = [] {
+        const char* const env = std::getenv("VR_BUMP_PARALLAX");
+        const float v = env != nullptr ? std::strtof(env, nullptr) : -1.0f;
+        return std::isfinite(v) ? v : -1.0f;
+    }();
+    ++vr_bump.frame;
+    float depth = VR::GetSettings().raised_bricks ? Tune::ParallaxDepthM : 0.0f;
+    if (override_m >= 0.0f) {
+        depth = override_m;
+    }
+    depth = 0.01f * VR::Tune::Get("lighting.brick_depth_cm", 100.0f * depth);
+    vr_bump.depth_m = std::isfinite(depth) ? std::clamp(depth, 0.0f, Tune::MaxDepthM) : 0.0f;
+}
+
 void Rasterizer::VrNativeDrawValues(const GraphicsPipeline* pipeline,
                                     const VR::CameraRecord& record) {
     const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
@@ -4050,7 +4734,28 @@ void Rasterizer::VrNativeDrawValues(const GraphicsPipeline* pipeline,
     if (vr_light_tiles.valid) {
         vr_push.light = vr_light_tiles.bounds;
     }
-    vr_push.SetCut(recording_vr.cut_code);
+    vr_push.SetCut(recording_vr.cut_code, recording_vr.free_eye_cut);
+    // The raised brickwork's depth for this draw (vk_rasterizer.h VrBumpState: by its bump
+    // map's class; a program that reads none keeps what the block holds).
+    if (vr_bump.draw_need != NeedKeep) {
+        vr_bump.pushed_depth = vr_bump.draw_need == NeedDepth ? vr_bump.depth_m : 0.0f;
+    }
+    vr_push.bump_depth = vr_bump.pushed_depth;
+    if constexpr (Common::Log::Enabled) {
+        // (Tests: each fragment program that draws with a depth, once: why it has one.)
+        static std::unordered_set<u64> noted;
+        const auto* frag = pipeline->GetStages()[u32(Shader::LogicalStage::Fragment)];
+        if (vr_push.bump_depth > 0.0f && frag != nullptr && noted.size() < 512 &&
+            noted.insert(frag->pgm_hash ^ (u64{vr_bump.draw_need} << 60) ^
+                         (u64{recording_vr.cut_code != 0} << 62))
+                .second) {
+            LOG_INFO(Render_Vulkan,
+                     "VR bump depth: shader {:#x} depth {:.3f} need {} (0 none, 1 depth, 2 kept) "
+                     "image {} cut {}",
+                     frag->pgm_hash, vr_push.bump_depth, vr_bump.draw_need, frag->vr_bump_image,
+                     recording_vr.cut_code);
+        }
+    }
     // A motion variant reads the buffers it was selected with; every other draw pushes zeros.
     if (pipeline->HasVrMotion()) {
         vr_push.motion_params = vr_motion_buffers.params_address;
@@ -4058,12 +4763,1997 @@ void Rasterizer::VrNativeDrawValues(const GraphicsPipeline* pipeline,
     }
 }
 
+// Layer draws: the draw about to be recorded, its pipeline and vr_hud final (DrawEyes records its
+// right eye's copy). Both eyes as the pass and the pipeline decide: the pipeline's key.
+void Rasterizer::NoteEyeDraws(const GraphicsPipeline* pipeline, float hud) {
+    eye_draws = {.layout = pipeline->GetLayout(),
+                 .hud = hud,
+                 .both = pipeline->GetGraphicsKey().probe_view_mask == 3 &&
+                         NativeStereo::LayerDraws()};
+}
+
 bool Rasterizer::VrMirrorFlip() const {
     return NativeStereo::MirrorFlip() && pipeline_cache.UsesVrPushData();
 }
 
+static_assert(Shader::Optimization::FogLight::BrightLights == 32, "vk_rasterizer.h VrFogState::bright");
+
+// Over the dim line (fog_light.h FillLuminance), or a light the game spawned that was over it
+// within BrightHoldFrames and is BrightKeepLuminance or more now: its peak decides, not each
+// frame's flicker. The map's own lights take the plain line at no cost, and so does a spawned one
+// at BrightTrackLuminance or more (far over the line: it never dips under, and remembering it
+// would push the lanterns out of BrightLights, as the candles and lamp glows of Cathedral Ward
+// did); one near the line takes one look through BrightLights (and follows it: a lantern walks).
+bool Rasterizer::VrBrightLately(const float* l, const std::array<float, 12>& m, float lum) {
+    namespace Fog = Shader::Optimization::FogLight;
+    const bool now = lum >= Fog::FillLuminance;
+    if (Fog::IsMapLight(l[7]) || lum < Fog::BrightKeepLuminance || lum >= Fog::BrightTrackLuminance) {
+        return now;
+    }
+    std::array<float, 3> world;
+    for (u32 r = 0; r < 3; ++r) {
+        world[r] = m[4 * r] * l[0] + m[4 * r + 1] * l[1] + m[4 * r + 2] * l[2] + m[4 * r + 3];
+    }
+    const u64 frame = vr_fog.frame;
+    VrFogState::BrightLight* same = nullptr;
+    VrFogState::BrightLight* oldest = &vr_fog.bright[0];
+    for (VrFogState::BrightLight& e : vr_fog.bright) {
+        if (e.frame != 0 &&
+            std::abs(e.reach_k - l[3]) <= Fog::BrightSameReach * std::max(e.reach_k, l[3])) {
+            const float dx = e.world[0] - world[0], dy = e.world[1] - world[1],
+                        dz = e.world[2] - world[2];
+            if (dx * dx + dy * dy + dz * dz < Fog::SameM * Fog::SameM) {
+                same = &e;
+                break;
+            }
+        }
+        if (e.frame < oldest->frame) {
+            oldest = &e;
+        }
+    }
+    if (now) {
+        *(same != nullptr ? same : oldest) = {world, l[3], frame};
+        return true;
+    }
+    if (same != nullptr && frame - same->frame <= Fog::BrightHoldFrames) {
+        same->world = world;
+        return true;
+    }
+    return false;
+}
+
 // The draw's screen is its screen scissor's size: a reflection's pass has one of its own (the sewer
 // water's: half the eye images, 728x788 of 1456x1576).
+void Rasterizer::VrFogCapture(u64 pgm_hash, const float* source, u32 size, bool guest,
+                              const Shader::Optimization::FogLight::ListView& draw_view) {
+    using NativeProjection::LightList;
+    const LightList list = NativeProjection::LightListFor(pgm_hash, size);
+    // A planar reflection's lights are in its mirrored camera's view. (A spot light's list: the
+    // lights on the camera only; its first 16 dwords are a point light's.)
+    if (list.kind == NativeProjection::LightKind::None || size > LightList::MaxBytes ||
+        VrInMirrorPass()) {
+        return;
+    }
+    namespace Fog = Shader::Optimization::FogLight;
+    namespace LightTune = Shader::Optimization::LightShadow;
+    std::scoped_lock lock{vr_fog.mutex};
+    const auto* paired = draw_view.Resolve(vr_fog.view, vr_fog.view_frame, vr_fog.frame);
+    if (paired == nullptr) {
+        vr_scene.draw_slots_valid = false;
+        return; // reflection, or no camera for this frame; a later valid list can still contribute
+    }
+    std::array<float, LightList::MaxBytes / sizeof(float)> lights;
+    std::memcpy(lights.data(), guest ? ScratchDraw::MemorySource(source, size) : source, size);
+    // This list's lights are in its own camera's view (its light208, bound just before it): a snap
+    // turn can leave it 30 degrees from the AO pass's for a frame.
+    const auto& list_view = *paired;
+    // This draw's lights' map slots (light_shadow.h SceneMaps::DrawSlotsAt), for its lamp shader:
+    // each light's world place against the slots' lamps (within 5 cm, reach within 2%).
+    if (VrSceneMaskOn()) {
+        const VrShadowCpuScope timed{0};
+        namespace Scene = LightTune::SceneMaps;
+        vr_scene.draw_slots.fill(0u);
+        const auto& m = list_view;
+        for (u32 k = 0; k < std::min<u32>(list.count, Scene::DrawLights); ++k) {
+            const float* l = lights.data() + list.Stride() * k;
+            if (list.kind == NativeProjection::LightKind::Spot || !(l[3] > 0.0f)) {
+                vr_scene.draw_slots[k / 4] |= 255u << (8 * (k % 4));
+                continue;
+            }
+            float w[3];
+            for (u32 r = 0; r < 3; ++r) {
+                w[r] = m[4 * r] * l[0] + m[4 * r + 1] * l[1] + m[4 * r + 2] * l[2] + m[4 * r + 3];
+            }
+            u32 best = 255u; // (checked: none)
+            float best_d2 = Scene::SlotKeepM * Scene::SlotKeepM;
+            for (u32 j = 0; j < vr_scene.count; ++j) {
+                const auto& lamp = vr_scene.chosen[j];
+                const float dx = lamp.world[0] - w[0], dy = lamp.world[1] - w[1], dz = lamp.world[2] - w[2];
+                const float d2 = dx * dx + dy * dy + dz * dz;
+                // (Its reach within KeepReachShare, as the slot's own keep: a candle or a fire
+                // pulses its reach a few percent, and at 2% its shadow went out those frames.)
+                if ((vr_scene.flags[j] & Scene::SlotUsed) && d2 < best_d2 &&
+                    std::abs(lamp.k - l[3]) <= Scene::KeepReachShare * lamp.k) {
+                    best = j + 1u;
+                    best_d2 = d2;
+                }
+            }
+            vr_scene.draw_slots[k / 4] |= best << (8 * (k % 4));
+        }
+        vr_scene.draw_slots_valid = true;
+        vr_scene.draw_slots_pgm = pgm_hash;
+    }
+    // (Diagnostics, VR_LIGHT_AUDIT=<file>: every 3rd frame's lists, each light where it is in the
+    // camera's view and in the world.)
+    if (static const char* const audit_path = std::getenv("VR_LIGHT_AUDIT"); audit_path) {
+        static std::FILE* audit = std::fopen(audit_path, "w");
+        static u32 audit_lines = 0;
+        if (audit && vr_fog.view_frame % 3 == 0 && audit_lines < 400000) {
+            const auto& m = list_view;
+            std::fprintf(audit, "%llu %s %llx cam %.3f %.3f %.3f fwd %.3f %.3f %.3f",
+                         static_cast<unsigned long long>(vr_fog.view_frame),
+                         list.kind == NativeProjection::LightKind::Spot         ? "spot"
+                         : list.kind == NativeProjection::LightKind::CubeShadow ? "cube"
+                                                                                : "point",
+                         static_cast<unsigned long long>(pgm_hash), m[3], m[7], m[11], m[2], m[6],
+                         m[10]);
+            for (u32 k = 0; k < list.count; ++k) {
+                const float* l = lights.data() + list.Stride() * k;
+                float w[3];
+                for (u32 r = 0; r < 3; ++r) {
+                    w[r] = m[4 * r] * l[0] + m[4 * r + 1] * l[1] + m[4 * r + 2] * l[2] + m[4 * r + 3];
+                }
+                std::fprintf(audit, " | v %.3f %.3f %.3f w %.3f %.3f %.3f k %.5f rgb %.3f %.3f %.3f t %.3f",
+                             l[0], l[1], l[2], w[0], w[1], w[2], l[3], l[4], l[5], l[6], l[7]);
+                // (The rest of the record, as bits: what else tells lights apart.)
+                std::fputs(" x", audit);
+                for (u32 d = 8; d < list.Stride(); ++d) {
+                    std::fprintf(audit, " %08x", std::bit_cast<u32>(l[d]));
+                }
+            }
+            std::fputc('\n', audit);
+            if (++audit_lines % 64 == 0) {
+                std::fflush(audit);
+            }
+        }
+    }
+    // (The game's own shadowed lamps: their first 16 dwords are a point light's; they take part
+    // like one.)
+    // The lights the game keeps on the camera (light_shadow.h AttachedFromM): every light more
+    // than AttachedFromM from the eye is a candidate where it is seen (its place in the camera's
+    // view, its reach and colour); a candidate seen again at that place (AttachedSameM, the same
+    // reach and colour within 2%) on AttachedSightings frames once the camera has moved
+    // AttachedMoveM or turned AttachedTurn since it was first seen there is one. (The game lists
+    // such a light only where its small reach touches the picture: a few frames in many.) A camera
+    // that has not moved decides nothing; a world-fixed light moved with the camera cannot match.
+    auto& att = vr_attached;
+    if (att.frame != vr_fog.view_frame) {
+        att.frame = vr_fog.view_frame;
+        att.view = vr_fog.view;
+        att.no_cast_count = 0;
+        // Every 60 frames: the cells not seen for AttachedForgetFrames go (the world's lamps
+        // leave one at each place they pass through while the camera moves).
+        if (att.frame - att.pruned >= 60) {
+            att.pruned = att.frame;
+            std::erase_if(att.candidates, [&](const auto& kv) {
+                return att.frame - kv.second.last_frame > LightTune::AttachedForgetFrames;
+            });
+            att.confirmed_dirty = true;
+        }
+    }
+    const auto moved_since = [&](const std::array<float, 12>& then) {
+        float move = 0.0f, turn = 0.0f;
+        for (u32 r = 0; r < 3; ++r) {
+            const float d = att.view[4 * r + 3] - then[4 * r + 3];
+            move += d * d;
+            for (u32 c = 0; c < 3; ++c) {
+                turn = std::max(turn, std::abs(att.view[4 * r + c] - then[4 * r + c]));
+            }
+        }
+        return move >= LightTune::AttachedMoveM * LightTune::AttachedMoveM ||
+               turn >= LightTune::AttachedTurn;
+    };
+    const auto same_light = [](const VrAttached::Candidate& c, const float* l) {
+        const float dx = l[0] - c.pos[0], dy = l[1] - c.pos[1], dz = l[2] - c.pos[2];
+        const auto close = [](float x, float y) {
+            return std::abs(x - y) <= 0.02f * std::max(std::abs(x), std::abs(y)) + 1e-6f;
+        };
+        return dx * dx + dy * dy + dz * dz < LightTune::AttachedSameM * LightTune::AttachedSameM &&
+               close(l[3], c.reach) && close(l[4], c.colour[0]) && close(l[5], c.colour[1]) &&
+               close(l[6], c.colour[2]);
+    };
+    for (u32 k = 0; k < list.count; ++k) {
+        const float* l = lights.data() + list.Stride() * k;
+        if (!std::all_of(l, l + 7, [](float v) { return std::isfinite(v); }) || !(l[3] > 0.0f) ||
+            !(l[4] + l[5] + l[6] > 0.0f)) {
+            continue;
+        }
+        // Over the dim line, or a spawned light bright lately (the glow's and the grey and blue
+        // lights' shadows' test: VrBrightLately).
+        const bool bright = VrBrightLately(l, list_view, 0.3f * l[4] + 0.6f * l[5] + 0.1f * l[6]);
+        // The lights that cast no shadow (light_shadow.h NoCastLights): this frame's place.
+        {
+            const auto& m = list_view;
+            float w[3];
+            for (u32 r = 0; r < 3; ++r) {
+                w[r] = m[4 * r] * l[0] + m[4 * r + 1] * l[1] + m[4 * r + 2] * l[2] + m[4 * r + 3];
+            }
+            // The scene maps' candidates (light_shadow.h SceneMaps): a lamp our rules let cast,
+            // within NearLightM, not held (the torch, the Hand Lantern march), scored by the
+            // share of the view its light ball covers; once per lamp a frame.
+            if (VrSceneMapsOn() && list.kind != NativeProjection::LightKind::Spot) {
+                const VrShadowCpuScope timed{1};
+                const float dist = std::sqrt(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
+                const float reach = 1.0f / std::sqrt(l[3]);
+                const float lum = 0.3f * l[4] + 0.6f * l[5] + 0.1f * l[6];
+                const bool warm = l[4] > LightTune::WarmShare * l[6];
+                const bool casts =
+                    list.kind == NativeProjection::LightKind::CubeShadow ||
+                    (warm && lum >= LightTune::DimMinLuminance && reach <= LightTune::WarmReachM) ||
+                    (!warm && reach <= LightTune::ShadowFillReachM && bright);
+                const auto near_pick = [&](const LightTune::NoCastLight& pick) {
+                    const float dx = w[0] - pick.x, dy = w[1] - pick.y, dz = w[2] - pick.z;
+                    return dx * dx + dy * dy + dz * dz <= LightTune::NoCastSameM * LightTune::NoCastSameM &&
+                           std::abs(l[3] - pick.k) <= LightTune::NoCastShare * pick.k + 1e-4f;
+                };
+                att.RefreshConfirmed();
+                const bool kept_on_camera = std::ranges::any_of(att.confirmed, [&](const auto& c) {
+                    return same_light(c, l);
+                });
+                // (Held lights too with the mask: nothing else gives them shadows now.)
+                const bool held_ok = dist > LightTune::HeldOutM || LightTune::SceneMaps::Mask();
+                // (With the mask: out to its own range by its reach, never past NearLightM, fading over
+                // the last RangeFadeShare of it: light_shadow.h RangePerReach.)
+                namespace SceneTune = LightTune::SceneMaps;
+                const float near_m = SceneTune::Mask() ? std::clamp(reach * SceneTune::RangePerReach, SceneTune::RangeMinM, LightTune::NearLightM)
+                                                       : LightTune::NearLightM;
+                const float fade_m = SceneTune::Mask() ? near_m * SceneTune::RangeFadeShare : LightTune::NearFadeM;
+                if (casts && dist <= near_m && held_ok &&
+                    std::ranges::none_of(LightTune::NoCastLights, near_pick) && !kept_on_camera &&
+                    std::ranges::none_of(vr_scene.building, [&](const VrScene::Lamp& o) {
+                        return std::abs(o.world[0] - w[0]) + std::abs(o.world[1] - w[1]) +
+                                   std::abs(o.world[2] - w[2]) < 0.02f;
+                    })) {
+                    const float at = std::max(dist, 0.5f);
+                    // Its shadow's strength: the lamp shaders' rule (a game-shadowed lamp in full; a
+                    // warm one in over DimFadeLuminance; a grey or blue one over BrightFadeLuminance),
+                    // fading in over NearFadeM as you come within NearLightM.
+                    const auto ramp = [](float x, float from, float to) {
+                        return std::clamp((x - from) / (to - from), 0.0f, 1.0f);
+                    };
+                    const bool warm_casts = warm && lum >= LightTune::DimMinLuminance &&
+                                            reach <= LightTune::WarmReachM;
+                    const float strength =
+                        list.kind == NativeProjection::LightKind::CubeShadow ? 1.0f
+                        : warm_casts ? ramp(lum, LightTune::DimMinLuminance,
+                                            LightTune::DimMinLuminance + LightTune::DimFadeLuminance)
+                        : warm ? 0.0f
+                        : !Fog::IsMapLight(l[7])
+                            ? ramp(lum, Fog::BrightKeepLuminance - LightTune::SpawnedFadeLuminance,
+                                   Fog::BrightKeepLuminance)
+                            : ramp(lum, Fog::FillLuminance - LightTune::BrightFadeLuminance, Fog::FillLuminance);
+                    const float fade = std::clamp((near_m - dist) / fade_m, 0.0f, 1.0f);
+                    // Its clearance: the holder's hand (ClearM) within arm's reach, blending out to
+                    // its fixture's (by its reach) from HeldInM to HeldOutM.
+                    const float fixture =
+                        LightTune::ReachOld()
+                            ? std::max(LightTune::ClearFixtureM, reach * LightTune::ClearPerRadius)
+                            : LightTune::FixtureClearM(reach);
+                    const float t = std::clamp((dist - LightTune::HeldInM) / (LightTune::HeldOutM - LightTune::HeldInM),
+                                               0.0f, 1.0f);
+                    const float held_out = t * t * (3.0f - 2.0f * t);
+                    const float clear = LightTune::ClearM + (fixture - LightTune::ClearM) * held_out;
+                    // (A held light first: the one you carry lights everything near you.)
+                    // ... times its shadow's strength (a lamp fading out at 30..40 m, or a dim one,
+                    // never takes a slot from a candle near you: Oedon had 18 lamps for 16 slots, 4
+                    // of them past 30 m, and the nearest swapped in and out at the cut).
+                    const float score = held_out < 1.0f ? 2.0f
+                                                        : std::min(1.0f, reach * reach / (at * at)) *
+                                                              std::max(strength * fade, 0.01f);
+                    vr_scene.building.push_back({{w[0], w[1], w[2]}, l[3], score, strength * fade, clear, held_out < 1.0f});
+                }
+            }
+            const auto close = [](float x, float want) {
+                return std::abs(x - want) <= LightTune::NoCastShare * std::abs(want) + 1e-4f;
+            };
+            for (const auto& pick : LightTune::NoCastLights) {
+                const float dx = w[0] - pick.x, dy = w[1] - pick.y, dz = w[2] - pick.z;
+                if (dx * dx + dy * dy + dz * dz > LightTune::NoCastSameM * LightTune::NoCastSameM ||
+                    !close(l[3], pick.k) || !close(l[4], pick.r) || !close(l[5], pick.g) ||
+                    !close(l[6], pick.b)) {
+                    continue;
+                }
+                const bool known = std::any_of(
+                    att.no_cast.begin(), att.no_cast.begin() + att.no_cast_count, [&](const auto& n) {
+                        return std::abs(n[0] - l[0]) + std::abs(n[1] - l[1]) + std::abs(n[2] - l[2]) <
+                               1e-3f;
+                    });
+                if (!known && att.no_cast_count < att.no_cast.size()) {
+                    att.no_cast[att.no_cast_count++] = {l[0], l[1], l[2], l[3]};
+                }
+            }
+        }
+        // (The lights on the camera: beyond arm's reach only.)
+        const float eye2 = l[0] * l[0] + l[1] * l[1] + l[2] * l[2];
+        bool on_camera_list = false;
+        if (eye2 > LightTune::AttachedFromM * LightTune::AttachedFromM) {
+            // Its cell: the place in AttachedSameM steps; a light on a cell's border (the one on
+            // the camera sits at 2.02 and 4.12 m: rounding moves it across) is looked for in the
+            // neighbouring cells too.
+            const auto cell_of = [](float v) { return s32(std::floor(v / LightTune::AttachedSameM)); };
+            const auto key_of = [](s32 x, s32 y, s32 z) {
+                return u64(u32(x) & 0x1FFFFFu) | (u64(u32(y) & 0x1FFFFFu) << 21) |
+                       (u64(u32(z) & 0x1FFFFFu) << 42);
+            };
+            const s32 cx = cell_of(l[0]), cy = cell_of(l[1]), cz = cell_of(l[2]);
+            const u64 key = key_of(cx, cy, cz);
+            auto it = att.candidates.find(key);
+            for (s32 dx = -1; dx <= 1 && (it == att.candidates.end() || !same_light(it->second, l)); ++dx) {
+                for (s32 dy = -1; dy <= 1 && (it == att.candidates.end() || !same_light(it->second, l)); ++dy) {
+                    for (s32 dz = -1; dz <= 1; ++dz) {
+                        const auto near_it = att.candidates.find(key_of(cx + dx, cy + dy, cz + dz));
+                        if (near_it != att.candidates.end() && same_light(near_it->second, l)) {
+                            it = near_it;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (it != att.candidates.end() && !same_light(it->second, l)) {
+                // Another light in the cell (its reach or colour): the cell takes the newest.
+                att.confirmed_dirty |= it->second.attached;
+                it->second = {{l[0], l[1], l[2]}, l[3], {l[4], l[5], l[6]}, att.view, att.frame, 1u, false};
+                it = att.candidates.end();
+            } else if (it != att.candidates.end()) {
+                auto* const c = &it->second;
+                if (c->last_frame != att.frame) {
+                    c->last_frame = att.frame;
+                    ++c->sightings;
+                    if (!c->attached && c->sightings >= LightTune::AttachedSightings &&
+                        moved_since(c->first_view)) {
+                        c->attached = true;
+                        att.confirmed_dirty = true;
+                        if constexpr (Common::Log::Enabled) {
+                            static u32 logged = 0;
+                            if (logged++ < 8) {
+                                LOG_INFO(Render_Vulkan,
+                                         "VR lamp shadows: a light kept on the camera at "
+                                         "({:.2f} {:.2f} {:.2f}), reach k {:.4f}, rgb {:.2f} {:.2f} "
+                                         "{:.2f} ({} sightings): it casts no shadow",
+                                         l[0], l[1], l[2], l[3], l[4], l[5], l[6], c->sightings);
+                            }
+                        }
+                    }
+                }
+                on_camera_list = c->attached;
+            } else if (att.candidates.size() < LightTune::AttachedCandidates) {
+                att.candidates.emplace(key, VrAttached::Candidate{{l[0], l[1], l[2]}, l[3],
+                                                                  {l[4], l[5], l[6]}, att.view,
+                                                                  att.frame, 1u, false});
+            }
+        }
+        // (A spot light: the rest is the point lights' and the game's shadowed lamps'.)
+        if (list.kind == NativeProjection::LightKind::Spot) {
+            continue;
+        }
+        // Removed (vr.ini camera_fill_light off): no light in the air either.
+        if (on_camera_list && !VrCameraFillKept()) {
+            continue;
+        }
+        // His body maps' lamps (vr_body_maps.h): every light bright enough to shadow, once; the
+        // MaxLights nearest the camera (a street lists a hundred and more, the torch in his hand
+        // anywhere among them). A save lamp's glow as VR_LAMP_GLOW makes it (core/vr/lamp_glow.h).
+        const float glow =
+            VR::LampGlow::Boost() > 1.0f &&
+                    VR::LampGlow::IsGlow(l[4], l[5], l[6],
+                                         std::sqrt(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]))
+                ? VR::LampGlow::Boost()
+                : 1.0f;
+        // The lamp shadows' rule (light_shadow.h WarmShare): a warm light from DimMinLuminance,
+        // any other from FillLuminance and never the camera's (the game's grey light: a torch
+        // held that close is warm, and casts).
+        const float cast_lum = glow * (0.3f * l[4] + 0.6f * l[5] + 0.1f * l[6]);
+        const bool warm_light = l[4] > Shader::Optimization::LightShadow::WarmShare * l[6];
+        const bool on_camera = l[0] * l[0] + l[1] * l[1] + l[2] * l[2] <
+                               Shader::Optimization::LightShadow::HeldInM *
+                                   Shader::Optimization::LightShadow::HeldInM;
+        const bool cast_bright = bright || cast_lum >= Fog::FillLuminance;
+        if (!on_camera_list &&
+            (warm_light ? cast_lum >= Shader::Optimization::LightShadow::DimMinLuminance
+                        : !on_camera && cast_bright)) {
+            const float d2 = l[0] * l[0] + l[1] * l[1] + l[2] * l[2];
+            const auto& m = list_view;
+            std::array<float, 3> world;
+            for (u32 r = 0; r < 3; ++r) {
+                world[r] = m[4 * r] * l[0] + m[4 * r + 1] * l[1] + m[4 * r + 2] * l[2] +
+                           m[4 * r + 3];
+            }
+            if (std::ranges::none_of(vr_body.building, [&](const VrBody::Light& b) {
+                    return b.world == world && b.reach == l[3];
+                })) {
+                if (vr_body.building.size() < VrBody::MaxLights) {
+                    vr_body.building.push_back(
+                        {world, l[3], {glow * l[4], glow * l[5], glow * l[6]}, d2, cast_bright});
+                } else {
+                    auto farthest = std::ranges::max_element(
+                        vr_body.building, {}, &VrBody::Light::camera2);
+                    if (farthest->camera2 > d2) {
+                        *farthest = {world, l[3], {glow * l[4], glow * l[5], glow * l[6]}, d2,
+                                     cast_bright};
+                    }
+                }
+            }
+        }
+        if (vr_fog.building.size() >= Fog::CaptureLights || Fog::IsWideLight(l[3]) || !bright) {
+            // The torch in his hand (fog_grid.h Lamps::Held*): a warm, bright light the game spawned
+            // beside the eye, too wide for the air's list. Kept for the fog grid alone.
+            {
+                namespace Lamps = Shader::Optimization::FogGrid::Lamps;
+                const float lum = 0.3f * l[4] + 0.6f * l[5] + 0.1f * l[6];
+                if (!Fog::IsMapLight(l[7]) && l[3] > 0.0f && lum >= Lamps::HeldLuminance &&
+                    l[4] > LightTune::WarmShare * l[6] &&
+                    l[0] * l[0] + l[1] * l[1] + l[2] * l[2] < Lamps::HeldNearM * Lamps::HeldNearM) {
+                    const auto& m = list_view;
+                    for (u32 r = 0; r < 3; ++r) {
+                        vr_fog.held_world[r] = m[4 * r] * l[0] + m[4 * r + 1] * l[1] + m[4 * r + 2] * l[2] + m[4 * r + 3];
+                    }
+                    vr_fog.held_reach = l[3];
+                    vr_fog.held_colour = {l[4], l[5], l[6]};
+                    vr_fog.held_frame = vr_fog.frame;
+                }
+            }
+            if constexpr (Common::Log::Enabled) {
+                // (Tests, VR_AIR_DIAG=1: a light the game spawned beside the eye that counts as a
+                // fill and lights no air: the torch in his hand?)
+                static const bool diag = [] {
+                    const char* const env = std::getenv("VR_AIR_DIAG");
+                    return env != nullptr && env[0] == '1';
+                }();
+                static u32 seen = 0;
+                if (diag && !Shader::Optimization::FogLight::IsMapLight(l[7]) &&
+                    l[0] * l[0] + l[1] * l[1] + l[2] * l[2] < 4.0f && seen++ % 600 == 0 && seen < 12000) {
+                    LOG_INFO(Render_Vulkan,
+                             "VR fog light: left out near the eye: at ({:.2f} {:.2f} {:.2f}) r {:.2f} m colour "
+                             "({:.2f} {:.2f} {:.2f}) word {:.1f}, {} captured",
+                             l[0], l[1], l[2], l[3] > 0.0f ? 1.0f / std::sqrt(l[3]) : -1.0f, l[4], l[5], l[6], l[7],
+                             vr_fog.building.size());
+                }
+            }
+            continue; // a fill light lights no air (and the frame keeps CaptureLights)
+        }
+        // A light lights several tiles: one list per tile it reaches. Its bits' hash in an open
+        // table (256 slots for at most CaptureLights: never full; 0 is an empty slot).
+        u64 key = 0xcbf29ce484222325ull;
+        for (u32 c = 0; c < 4; ++c) {
+            key = (key ^ std::bit_cast<u32>(l[c])) * 0x100000001b3ull;
+        }
+        key |= 1;
+        auto& keys = vr_fog.building_keys;
+        u32 slot = u32(key ^ (key >> 29)) & (keys.size() - 1);
+        bool known = false;
+        while (keys[slot] != 0) {
+            if (keys[slot] == key) {
+                known = true;
+                break;
+            }
+            slot = (slot + 1) & (keys.size() - 1);
+        }
+        if (!known) {
+            keys[slot] = key;
+            VrFogLight f{{l[0], l[1], l[2]}, l[3], {l[4], l[5], l[6]}};
+            // Where it is in the world: this frame's light pass camera (VrFogCaptureView).
+            const auto& m = list_view;
+            for (u32 r = 0; r < 3; ++r) {
+                f.world[r] = m[4 * r] * l[0] + m[4 * r + 1] * l[1] + m[4 * r + 2] * l[2] +
+                             m[4 * r + 3];
+            }
+            f.map = Shader::Optimization::FogLight::IsMapLight(l[7]);
+            vr_fog.building.push_back(f);
+        }
+    }
+}
+
+// The frame's camera from the scene's own camera block (864 bytes: its world-to-view rows 8..19),
+// at the frame's first draw that binds one. 2026-11-15, the user in the headset: lamp shadows
+// "move around when I rotate my head, if I translate they are steady". The pass that traces them
+// (the AO pass, the shadow mask's) comes before the frame's first light pass, binds no light208,
+// and so put the lamps on the camera of the frame BEFORE (160 of 160 uploads measured): every
+// traced shadow turned by what the head turned in a frame. The light pass's own camera, when it
+// comes, is the same one (the views-apart count says when it is not).
+void Rasterizer::VrFogCaptureSceneView(const float* c) {
+    // A perspective camera of the scene's own size (not a light's, not a lamp's cube face).
+    if (!(c[66] == 1.f && c[67] == 0.f && c[4] > 600.f && c[5] > 300.f)) {
+        return;
+    }
+    const float* const r = c + 8;
+    const float det = r[0] * (r[5] * r[10] - r[6] * r[9]) - r[1] * (r[4] * r[10] - r[6] * r[8]) +
+                      r[2] * (r[4] * r[9] - r[5] * r[8]);
+    if (!(det > 0.9f && det < 1.1f)) {
+        return; // a mirror's, or no rigid view
+    }
+    std::array<float, 12> view;
+    for (u32 i = 0; i < 3; ++i) {
+        for (u32 j = 0; j < 3; ++j) {
+            view[4 * i + j] = r[4 * j + i];
+        }
+        view[4 * i + 3] = -(r[i] * r[3] + r[4 + i] * r[7] + r[8 + i] * r[11]);
+    }
+    for (const float v : view) {
+        if (!std::isfinite(v)) {
+            return;
+        }
+    }
+    // A reflection's camera (FogLight::IsFramesView): a proper camera too (determinant 1: the test
+    // above passes it), drawn before the scene's own, so it was the frame's first scene camera and
+    // became the frame's camera with water_reflections on; the pass tracker (VrInMirrorPass) learns
+    // of the reflection's pass from this very draw's camera, after the caller asked it. Its place
+    // is not the frame's render camera's.
+    if (const VR::CameraRecord rec = VR::DrawFrameRecord();
+        !Shader::Optimization::FogLight::MirrorViewsByPassOnly() && rec.id != 0 && rec.has_render_position &&
+        !Shader::Optimization::FogLight::IsFramesView(view.data(), rec.render_position.x, rec.render_position.y,
+                                                      rec.render_position.z)) {
+        return;
+    }
+    std::scoped_lock lock{vr_fog.mutex};
+    if (vr_fog.view_frame == vr_fog.frame) {
+        return;
+    }
+    vr_fog.view = view;
+    vr_fog.view_frame = vr_fog.frame;
+}
+
+void Rasterizer::VrFogCaptureView(const float* source, u32 size, bool guest, bool frame_candidate,
+                                  Shader::Optimization::FogLight::ListView& draw_view) {
+    if (VrInMirrorPass()) {
+        draw_view.Reject();
+        return;
+    }
+    std::array<float, 16> view;
+    std::memcpy(view.data(),
+                (guest ? static_cast<const float*>(ScratchDraw::MemorySource(source, size))
+                       : source) + 32,
+                sizeof(view));
+    if (!NativeProjection::AffineView(view.data())) {
+        return; // not a camera's view to world (its rotation, then 0 0 0 1)
+    }
+    // A reflection's camera by its place (FogLight::IsFramesView), whatever the pass tracker said
+    // above: never the frame's camera, and its lists never the frame's lights.
+    const VR::CameraRecord rec = VR::DrawFrameRecord();
+    const bool mirror =
+        !Shader::Optimization::FogLight::MirrorViewsByPassOnly() && rec.id != 0 && rec.has_render_position &&
+        !Shader::Optimization::FogLight::IsFramesView(view.data(), rec.render_position.x, rec.render_position.y,
+                                                      rec.render_position.z);
+    if (mirror) {
+        draw_view.Reject();
+        return;
+    }
+    draw_view.Set(view.data());
+    if (!frame_candidate) {
+        return; // spot/cube light208: paired with its list, never replaces the frame camera
+    }
+    std::scoped_lock lock{vr_fog.mutex};
+    if constexpr (Common::Log::Enabled) {
+        std::copy_n(view.begin(), 12, vr_fog.last_list_view.begin());
+    }
+    if (vr_fog.view_frame == vr_fog.frame) {
+        if constexpr (Common::Log::Enabled) {
+            float apart = 0.0f;
+            for (u32 i = 0; i < 12; ++i) {
+                apart = std::max(apart, std::abs(view[i] - vr_fog.view[i]) / (i % 4 == 3 ? 1.0f : 0.02f));
+            }
+            if (apart > 1.0f && vr_fog.views_apart_frame != vr_fog.frame) {
+                vr_fog.views_apart_frame = vr_fog.frame;
+                ++vr_fog.views_apart;
+            }
+        }
+        return; // the frame's first: the AO pass's, the pixels' camera
+    }
+    std::copy_n(view.begin(), 12, vr_fog.view.begin());
+    vr_fog.view_frame = vr_fog.frame;
+}
+
+// His body maps (vr_body_maps.h), at the frame's first lamp draw (a lamp program declares the
+// maps' buffer), outside its render pass: the lamps whose light reaches him (the last light pass's
+// list, in the world: a frame late, as the lamps' own lights are drawn), the strongest MaxMaps,
+// each a frame aimed at him.
+void Rasterizer::VrBodyMapsBeforeDraw(const GraphicsPipeline* pipeline) {
+    namespace Body = Shader::Optimization::BodyShadow;
+    namespace Fog = Shader::Optimization::FogLight;
+    namespace LightTune = Shader::Optimization::LightShadow;
+    // (Its fragment stage's buffers: a bit worked out once a pipeline, not a scan every draw.)
+    if (!(pipeline->VrFsBuffers() & Pipeline::VrFsBodyMaps) || !Body::Enabled() ||
+        !Body::MapsEnabled() || !vr_body_maps || !VrLampShadowsOn() || !VR::IsEnabled() || VrInMirrorPass()) {
+        return;
+    }
+    const VR::CameraRecord rec = VR::DrawFrameRecord();
+    if (rec.id == 0 || vr_body.maps_frame == rec.id) {
+        return;
+    }
+    vr_body.maps_frame = rec.id;
+    // Why a frame has no maps (the first few, then one in 600).
+    static u32 why_count = 0;
+    const auto why = [&](const char* reason, size_t n) {
+        if constexpr (Common::Log::Enabled) {
+            if (why_count < 8 || why_count % 600 == 0) {
+                LOG_INFO(Render_Vulkan, "VR body maps: frame {}: none ({}, {})", rec.id, reason, n);
+            }
+            ++why_count;
+        }
+    };
+    if (!vr_body_maps->Prepare() || !rec.has_player_position) {
+        why("not ready or no player", 0);
+        return;
+    }
+    std::array<VR::Vec3, VR::PlayerBoneCount> bones{};
+    if (!VR::RecordPlayerBones(rec.id, bones)) {
+        why("no bones", 0);
+        return;
+    }
+    const double units = rec.world_scale > 0.0f ? rec.world_scale : 1.0;
+    // His sphere (relative to his origin): his bones' box, a coat and a hat around them.
+    std::array<double, 3> lo{1e30, 1e30, 1e30}, hi{-1e30, -1e30, -1e30};
+    for (const auto& bone : bones) {
+        const double p[3] = {bone.x, bone.y, bone.z};
+        for (u32 c = 0; c < 3; ++c) {
+            lo[c] = std::min(lo[c], p[c]);
+            hi[c] = std::max(hi[c], p[c]);
+        }
+    }
+    std::array<double, 3> centre{};
+    double radius = 0.0;
+    for (u32 c = 0; c < 3; ++c) {
+        centre[c] = 0.5 * (lo[c] + hi[c]);
+        radius += (hi[c] - lo[c]) * (hi[c] - lo[c]);
+    }
+    radius = 0.5 * std::sqrt(radius) + 0.35 * units;
+    if (!std::isfinite(radius) || radius > 3.0 * units) {
+        why("body too big", 0);
+        return;
+    }
+    struct Candidate {
+        std::array<double, 3> at{};
+        double weight{};
+    };
+    std::vector<Candidate> candidates;
+    // The nearest listed light (logs): its distance from his middle, reach, brightness.
+    double near_d = 1e30, near_reach = 0.0, near_lum = 0.0;
+    {
+        // The last frame's lights (VrEndFrame keeps them, in the world): a frame late.
+        std::scoped_lock lock{vr_fog.mutex};
+        for (const auto& f : vr_body.lights) {
+            const double lum = 0.3 * f.colour[0] + 0.6 * f.colour[1] + 0.1 * f.colour[2];
+            const double reach = f.reach > 0.0f ? 1.0 / std::sqrt(double(f.reach)) : 0.0;
+            const std::array<double, 3> at{f.world[0] - rec.player_position.x,
+                                           f.world[1] - rec.player_position.y,
+                                           f.world[2] - rec.player_position.z};
+            const double dx = at[0] - centre[0], dy = at[1] - centre[1], dz = at[2] - centre[2];
+            const double d2 = dx * dx + dy * dy + dz * dz;
+            if (std::sqrt(d2) < near_d) {
+                near_d = std::sqrt(d2);
+                near_reach = reach;
+                near_lum = lum;
+            }
+            // The lamp shadows' own rule (light_shadow.h WarmShare): a warm light from
+            // DimMinLuminance and WarmReachM (a dim one when he is within DimNearShare of its
+            // reach), any other bright and narrow.
+            const bool warm = f.colour[0] > LightTune::WarmShare * f.colour[2];
+            const bool bright = f.bright || lum >= Fog::FillLuminance;
+            const bool casts =
+                reach > 0.0 &&
+                (warm ? lum >= LightTune::DimMinLuminance && reach <= LightTune::WarmReachM * units
+                      : bright && reach <= LightTune::ShadowFillReachM * units);
+            if (!casts) {
+                continue;
+            }
+            // (The share of its reach a dim one's shadows cover: light_shadow.h DimShareLuminance.)
+            const double share =
+                LightTune::DimNearShare +
+                (1.0 - LightTune::DimNearShare) *
+                    std::clamp((lum - LightTune::DimShareLuminance) /
+                                   (Fog::FillLuminance - LightTune::DimShareLuminance),
+                               0.0, 1.0);
+            const double reaches = share * reach;
+            if (d2 > (reaches + radius) * (reaches + radius)) {
+                continue;
+            }
+            const double weight = lum * std::max(0.05, 1.0 - d2 / (reach * reach));
+            bool same = false;
+            for (Candidate& c : candidates) {
+                const double ex = c.at[0] - at[0], ey = c.at[1] - at[1], ez = c.at[2] - at[2];
+                if (ex * ex + ey * ey + ez * ez < 0.09 * units * units) {
+                    c.weight = std::max(c.weight, weight);
+                    same = true;
+                    break;
+                }
+            }
+            if (!same) {
+                candidates.push_back({at, weight});
+            }
+        }
+    }
+    std::ranges::sort(candidates, [](const Candidate& a, const Candidate& b) {
+        return a.weight > b.weight;
+    });
+    // The lamps his shadow comes from (body_shadow.h BodyLampsAt): the strongest three at him.
+    vr_body.top_count = 0;
+    for (const Candidate& c : candidates) {
+        if (vr_body.top_count == vr_body.top.size()) {
+            break;
+        }
+        vr_body.top[vr_body.top_count++] = {c.at[0] + rec.player_position.x,
+                                            c.at[1] + rec.player_position.y,
+                                            c.at[2] + rec.player_position.z};
+    }
+    vr_body.top_frame = rec.id;
+    std::array<VrBodyMaps::Lamp, VrBodyMaps::MaxMaps> lamps{};
+    u32 count = 0;
+    for (const Candidate& c : candidates) {
+        if (count == VrBodyMaps::MaxMaps) {
+            break;
+        }
+        std::array<double, 3> z{centre[0] - c.at[0], centre[1] - c.at[1], centre[2] - c.at[2]};
+        const double d = std::sqrt(z[0] * z[0] + z[1] * z[1] + z[2] * z[2]);
+        if (!(d > 0.01 * units)) {
+            continue;
+        }
+        for (double& v : z) {
+            v /= d;
+        }
+        std::array<double, 3> up{0.0, 1.0, 0.0};
+        if (std::abs(z[1]) > 0.95) {
+            up = {1.0, 0.0, 0.0};
+        }
+        std::array<double, 3> x{up[1] * z[2] - up[2] * z[1], up[2] * z[0] - up[0] * z[2],
+                                up[0] * z[1] - up[1] * z[0]};
+        const double xl = std::sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
+        for (double& v : x) {
+            v /= xl;
+        }
+        const std::array<double, 3> y{z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2],
+                                      z[0] * x[1] - z[1] * x[0]};
+        // The frustum fitted to his bones as the lamp sees them (each with a margin for the coat
+        // and the hat round it): his whole body on the map, as many texels as it can have.
+        // Inside him (the torch in his hand) his holding hand is left out by the near plane.
+        constexpr double pi = 3.14159265358979;
+        constexpr double widest = 80.0 * pi / 180.0, narrowest = 5.0 * pi / 180.0;
+        const bool outside = d > radius;
+        double half = narrowest;
+        for (const auto& bone : bones) {
+            const double v[3] = {bone.x - c.at[0], bone.y - c.at[1], bone.z - c.at[2]};
+            const double len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            if (len < Body::CarryM * units) {
+                continue; // the hand that holds it
+            }
+            const double cosine = std::clamp((v[0] * z[0] + v[1] * z[1] + v[2] * z[2]) / len,
+                                             -1.0, 1.0);
+            half = std::max(half, std::acos(cosine) + std::atan(0.35 * units / len));
+        }
+        half = std::min(half, widest);
+        VrBodyMaps::Lamp& lamp = lamps[count++];
+        lamp.origin = c.at;
+        lamp.axes = {x[0], x[1], x[2], y[0], y[1], y[2], z[0], z[1], z[2]};
+        lamp.f = float(1.0 / std::tan(half));
+        lamp.near_z = float(outside ? std::max(d - radius, 0.05 * units) : Body::CarryM * units);
+    }
+    if (count == 0) {
+        size_t listed = 0;
+        {
+            std::scoped_lock lock{vr_fog.mutex};
+            listed = vr_body.lights.size();
+        }
+        if constexpr (Common::Log::Enabled) {
+            if (why_count < 8 || why_count % 600 == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "VR body maps: the nearest light {:.2f} from his middle (reach {:.2f}, "
+                         "lum {:.2f}); his middle ({:.2f} {:.2f} {:.2f}) r {:.2f}, units {:.3f}, "
+                         "origin ({:.2f} {:.2f} {:.2f})",
+                         near_d, near_reach, near_lum, centre[0], centre[1], centre[2], radius,
+                         units, rec.player_position.x, rec.player_position.y,
+                         rec.player_position.z);
+            }
+        }
+        why("no lamp reaches him; lights listed", listed);
+        return;
+    }
+    scheduler.EndRendering();
+    const bool recorded = vr_body_maps->Record(scheduler.Commands(), rec.id, {lamps.data(), count});
+    // VR_BODY_MAPS_DUMP=1 (tests): where his bones fall on map 0 (texels), beside the dump.
+    static const bool dump_bones = [] {
+        const char* const env = std::getenv("VR_BODY_MAPS_DUMP");
+        return env != nullptr && env[0] == '1';
+    }();
+    static u32 bones_built = 0;
+    if (dump_bones && recorded && bones_built++ % 300 == 150) {
+        const auto& lamp = lamps[0];
+        double lo_x = 1e9, lo_y = 1e9, hi_x = -1e9, hi_y = -1e9;
+        for (const auto& bone : bones) {
+            const double v[3] = {bone.x - lamp.origin[0], bone.y - lamp.origin[1],
+                                 bone.z - lamp.origin[2]};
+            double q[3];
+            for (u32 r = 0; r < 3; ++r) {
+                q[r] = lamp.axes[3 * r] * v[0] + lamp.axes[3 * r + 1] * v[1] +
+                       lamp.axes[3 * r + 2] * v[2];
+            }
+            if (q[2] <= 0.0) {
+                continue;
+            }
+            const double tx = (q[0] / q[2] * lamp.f * 0.5 + 0.5) * VrBodyMaps::MapSize;
+            const double ty = (q[1] / q[2] * lamp.f * 0.5 + 0.5) * VrBodyMaps::MapSize;
+            lo_x = std::min(lo_x, tx);
+            lo_y = std::min(lo_y, ty);
+            hi_x = std::max(hi_x, tx);
+            hi_y = std::max(hi_y, ty);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "VR body maps: built {}: his bones on map 0 at texels x {:.0f}..{:.0f}, y "
+                 "{:.0f}..{:.0f}",
+                 bones_built, lo_x, hi_x, lo_y, hi_y);
+    }
+    if constexpr (Common::Log::Enabled) {
+        static u32 logged = 0;
+        if (logged < 12 && (++logged % 3) == 1) {
+            LOG_INFO(Render_Vulkan, "VR body maps: frame {}: {} lamp(s) near him, maps {}", rec.id,
+                     count, recorded ? "built" : "not built (no complete capture)");
+        }
+    }
+}
+
+// The game's fill light ahead of the camera kept (vr.ini camera_fill_light; the live key
+// lighting.camera_fill overrides it, tests).
+bool Rasterizer::VrCameraFillKept() const {
+    return VR::Tune::Get("lighting.camera_fill", VR::GetSettings().camera_fill_light ? 1.0f : 0.0f) >=
+           0.5f;
+}
+
+// The lamp shadows' blocker grid (light_shadow.h Grid): made and cleared to zero (every voxel
+// empty) once, outside a render pass, before the first lamp draw whose program declares it.
+void Rasterizer::VrShadowGridBeforeDraw(const GraphicsPipeline* pipeline) {
+    namespace Grid = Shader::Optimization::LightShadow::Grid;
+    if (vr_grid_ready || !Grid::Enabled() || !VrLampShadowsOn() || !VR::IsEnabled()) {
+        return;
+    }
+    const auto* fs = pipeline->GetStages()[u32(Shader::LogicalStage::Fragment)];
+    if (fs == nullptr || std::ranges::none_of(fs->buffers, [](const auto& buffer) {
+            return buffer.buffer_type == Shader::BufferType::VrShadowGrid;
+        })) {
+        return;
+    }
+    constexpr u64 bytes = u64(Grid::BufferWords) * sizeof(u32); // the cells and the block stamps
+    vr_grid_buffer = std::make_unique<VideoCore::Buffer>(
+        instance, scheduler, VideoCore::MemoryUsage::DeviceLocal, 0, VideoCore::AllFlags, bytes);
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.Commands();
+    NativeStereo::Barrier(scheduler);
+    cmdbuf.fillBuffer(vr_grid_buffer->Handle(), 0, bytes, 0u);
+    NativeStereo::Barrier(scheduler);
+    vr_grid_ready = true;
+    LOG_INFO(Render_Vulkan, "VR lamp shadows: blocker grid {}x{}x{} of {} m ({} KiB)", Grid::SideX,
+             Grid::SideY, Grid::SideZ, Grid::VoxelM, bytes >> 10);
+}
+
+// The hunter's capsules (body_shadow.h): his bones this frame (VR::RecordPlayerBones: world axes
+// minus his origin, game units) on to the light pass's flat camera (VrFogCaptureView), once a
+// frame; none (valid 0) without his bones, the camera or in a mirror's pass.
+u32 Rasterizer::VrBodyUpload(std::span<u32> out, u64 pgm_hash) {
+    namespace Body = Shader::Optimization::BodyShadow;
+    namespace C = VR::Body::C0000;
+    static_assert(Body::BufferDwords == std::tuple_size_v<decltype(vr_body.data)>);
+    const VrShadowCpuScope timed{4};
+    const auto bytes = static_cast<u32>(Body::BufferDwords * sizeof(u32));
+    // (VR_MARCH_OPT 64: no memset first: the copy below writes every word; one lock for the
+    // sections that need vr_fog's, not one each.)
+    const bool opt_cpu = Shader::Optimization::LightShadow::SceneMaps::Opt(64);
+    if (!opt_cpu) {
+        std::ranges::fill(out, 0u);
+    }
+    if (!Body::Enabled() || VrInMirrorPass() || !VR::IsEnabled()) {
+        if (opt_cpu) {
+            std::ranges::fill(out, 0u);
+        }
+        return bytes;
+    }
+    const VR::CameraRecord rec = VR::DrawFrameRecord();
+    if (vr_body.frame != rec.id) {
+        vr_body.frame = rec.id;
+        vr_body.data.fill(0u);
+        std::array<VR::Vec3, VR::PlayerBoneCount> bones{};
+        std::array<float, 12> view{};
+        bool have_view = false;
+        {
+            std::scoped_lock lock{vr_fog.mutex};
+            have_view = vr_fog.view_frame != 0;
+            view = vr_fog.view;
+        }
+        if (rec.id != 0 && rec.has_player_position && have_view &&
+            VR::RecordPlayerBones(rec.id, bones)) {
+            const float units = rec.world_scale > 0.0f ? rec.world_scale : 1.0f;
+            const auto to_view = [&](const VR::Vec3& b) {
+                const std::array<float, 3> d{rec.player_position.x + b.x - view[3],
+                                             rec.player_position.y + b.y - view[7],
+                                             rec.player_position.z + b.z - view[11]};
+                return std::array<float, 3>{view[0] * d[0] + view[4] * d[1] + view[8] * d[2],
+                                            view[1] * d[0] + view[5] * d[1] + view[9] * d[2],
+                                            view[2] * d[0] + view[6] * d[1] + view[10] * d[2]};
+            };
+            const VR::Vec3 neck = bones[C::Neck], head = bones[C::Head];
+            const VR::Vec3 crown{head.x + 0.9f * (head.x - neck.x), head.y + 0.9f * (head.y - neck.y),
+                                 head.z + 0.9f * (head.z - neck.z)};
+            struct Limb {
+                VR::Vec3 a, b;
+                float radius_m;
+            };
+            const std::array<Limb, Body::MaxCapsules> limbs{{
+                {bones[C::L_Thigh], bones[C::L_Calf], 0.095f},
+                {bones[C::L_Calf], bones[C::L_Foot], 0.065f},
+                {bones[C::R_Thigh], bones[C::R_Calf], 0.095f},
+                {bones[C::R_Calf], bones[C::R_Foot], 0.065f},
+                {bones[C::Pelvis], bones[C::Spine1], 0.15f},
+                {bones[C::Spine1], neck, 0.16f},
+                {neck, crown, 0.09f},
+                {bones[C::L_Clavicle], bones[C::R_Clavicle], 0.08f},
+                {bones[C::L_UpperArm], bones[C::L_Forearm], 0.055f},
+                {bones[C::L_Forearm], bones[C::L_Hand], 0.045f},
+                {bones[C::R_UpperArm], bones[C::R_Forearm], 0.055f},
+                {bones[C::R_Forearm], bones[C::R_Hand], 0.045f},
+            }};
+            std::array<float, 3> lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+            bool finite = true;
+            for (u32 k = 0; k < Body::MaxCapsules; ++k) {
+                const auto a = to_view(limbs[k].a), b = to_view(limbs[k].b);
+                const u32 base = Body::HeaderDwords + k * Body::CapsuleDwords;
+                for (u32 c = 0; c < 3; ++c) {
+                    finite = finite && std::isfinite(a[c]) && std::isfinite(b[c]);
+                    lo[c] = std::min({lo[c], a[c], b[c]});
+                    hi[c] = std::max({hi[c], a[c], b[c]});
+                    vr_body.data[base + c] = std::bit_cast<u32>(a[c]);
+                    vr_body.data[base + 4 + c] = std::bit_cast<u32>(b[c]);
+                }
+                vr_body.data[base + 3] = std::bit_cast<u32>(limbs[k].radius_m * units);
+            }
+            const std::array<float, 3> centre{0.5f * (lo[0] + hi[0]), 0.5f * (lo[1] + hi[1]),
+                                              0.5f * (lo[2] + hi[2])};
+            const float radius = 0.5f * std::sqrt((hi[0] - lo[0]) * (hi[0] - lo[0]) +
+                                                  (hi[1] - lo[1]) * (hi[1] - lo[1]) +
+                                                  (hi[2] - lo[2]) * (hi[2] - lo[2])) +
+                                 0.2f * units;
+            // Sane: a body some 0.5 to 3 m across, within 6 m of the camera.
+            const float span_m = 2.0f * radius / units;
+            const float away_m = std::sqrt(centre[0] * centre[0] + centre[1] * centre[1] +
+                                           centre[2] * centre[2]) / units;
+            if (finite && span_m > 0.4f && span_m < 4.0f && away_m < 6.0f) {
+                const float half = NativeStereo::Enabled() ? 0.5f * NativeStereo::Ipd(rec) * rec.world_scale : 0.0f;
+                vr_body.data[0] = Body::MaxCapsules;
+                vr_body.data[1] = std::bit_cast<u32>(half);
+                vr_body.data[2] = 1u;
+                vr_body.data[3] = std::bit_cast<u32>(units);
+                for (u32 c = 0; c < 3; ++c) {
+                    vr_body.data[4 + c] = std::bit_cast<u32>(centre[c]);
+                }
+                vr_body.data[7] = std::bit_cast<u32>(radius);
+                // His body maps built for this frame (vr_body_maps.h): each lamp in this flat view,
+                // and this view to the lamp's frame (q = A (world - player - origin)).
+                const auto built = vr_body_maps ? vr_body_maps->Maps(rec.id)
+                                                : std::array<VrBodyMaps::Built, VrBodyMaps::MaxMaps>{};
+                const std::array<double, 3> cam{view[3], view[7], view[11]};
+                const std::array<double, 3> player{rec.player_position.x, rec.player_position.y,
+                                                   rec.player_position.z};
+                for (u32 k = 0; k < Body::MaxMaps && k < built.size(); ++k) {
+                    if (!built[k].valid) {
+                        continue;
+                    }
+                    const auto& lamp = built[k].lamp;
+                    const u32 h = Body::MapsAt + k * Body::MapDwords;
+                    const auto lamp_view = to_view(VR::Vec3{float(lamp.origin[0]),
+                                                            float(lamp.origin[1]),
+                                                            float(lamp.origin[2])});
+                    vr_body.data[h + 0] = 1u;
+                    vr_body.data[h + 1] = built[k].base;
+                    vr_body.data[h + 2] = std::bit_cast<u32>(lamp.f);
+                    vr_body.data[h + 3] = std::bit_cast<u32>(lamp.near_z);
+                    for (u32 c = 0; c < 3; ++c) {
+                        vr_body.data[h + 4 + c] = std::bit_cast<u32>(lamp_view[c]);
+                    }
+                    vr_body.data[h + 7] = VrBodyMaps::MapSize;
+                    for (u32 r = 0; r < 3; ++r) {
+                        double row[4]{};
+                        for (u32 j = 0; j < 3; ++j) {
+                            const double a = lamp.axes[3 * r + j];
+                            for (u32 m = 0; m < 3; ++m) {
+                                row[m] += a * view[4 * j + m];
+                            }
+                            row[3] += a * (cam[j] - player[j] - lamp.origin[j]);
+                        }
+                        for (u32 m = 0; m < 4; ++m) {
+                            vr_body.data[h + 8 + 4 * r + m] = std::bit_cast<u32>(float(row[m]));
+                        }
+                    }
+                }
+            } else {
+                vr_body.data.fill(0u);
+            }
+            if constexpr (Common::Log::Enabled) {
+                static u32 logged = 0;
+                if (logged < 20 && (++logged % 4) == 1) {
+                    LOG_INFO(Render_Vulkan,
+                             "VR body shadow: {} capsules, sphere ({:.2f} {:.2f} {:.2f}) r {:.2f}, "
+                             "{:.2f} m across, {:.2f} m from the camera{}",
+                             vr_body.data[2] ? Body::MaxCapsules : 0u, centre[0], centre[1],
+                             centre[2], radius, span_m, away_m, vr_body.data[2] ? "" : " (refused)");
+                }
+            }
+        }
+    }
+    // The blocker grid's header (light_shadow.h Grid, body_shadow.h GridAt), whatever his body's
+    // state: once a frame, while the grid exists and the light pass's flat view is known.
+    if (vr_grid_ready && vr_grid_header != rec.id) {
+        namespace Grid = Shader::Optimization::LightShadow::Grid;
+        vr_grid_header = rec.id;
+        std::array<float, 12> view{};
+        bool have_view = false;
+        {
+            std::scoped_lock lock{vr_fog.mutex};
+            have_view = vr_fog.view_frame != 0;
+            view = vr_fog.view;
+        }
+        const u32 g = Body::GridAt;
+        std::fill_n(vr_body.data.begin() + g, Body::GridDwords, 0u);
+        if (have_view && rec.id != 0) {
+            const float units = rec.world_scale > 0.0f ? rec.world_scale : 1.0f;
+            const float half =
+                NativeStereo::Enabled() ? 0.5f * NativeStereo::Ipd(rec) * rec.world_scale : 0.0f;
+            // Stamps 1 .. StampMask (0: empty).
+            vr_grid_counter = vr_grid_counter % Grid::StampMask + 1u;
+            // Live keys (tests): lighting.grid=0 turns it off; lighting.shadow_thick_cm sets
+            // the march's blocker thickness (0: light_shadow.h ThickM).
+            vr_body.data[g + 0] = VR::Tune::Get("lighting.grid", 1.0f) >= 0.5f ? 1u : 0u;
+            vr_body.data[g + 7] = std::bit_cast<u32>(
+                std::clamp(VR::Tune::Get("lighting.shadow_thick_cm", 0.0f), 0.0f, 200.0f) * 0.01f *
+                units);
+            vr_body.data[g + 1] = vr_grid_counter;
+            vr_body.data[g + 2] = std::bit_cast<u32>(Grid::VoxelM * units);
+            vr_body.data[g + 3] = u32(Grid::LifeS * Grid::FramesPerS);
+            vr_body.data[g + 4] = std::bit_cast<u32>(half);
+            vr_body.data[g + 5] = std::bit_cast<u32>(Grid::NearSkipM * units);
+            vr_body.data[g + 6] = std::bit_cast<u32>(units);
+            for (u32 k = 0; k < 12; ++k) {
+                vr_body.data[g + 8 + k] = std::bit_cast<u32>(view[k]);
+            }
+        }
+    }
+    // (Opt 64: vr_fog's lock once for the three sections below.)
+    std::unique_lock sections_lock{vr_fog.mutex, std::defer_lock};
+    if (opt_cpu) {
+        sections_lock.lock();
+    }
+    // The lights the game keeps on the camera (body_shadow.h AttachedAt): those seen lately.
+    {
+        namespace LightTune = Shader::Optimization::LightShadow;
+        const u32 a = Body::AttachedAt;
+        std::fill_n(vr_body.data.begin() + a, Body::AttachedDwords, 0u);
+        std::unique_lock lock{vr_fog.mutex, std::defer_lock};
+        if (!opt_cpu) {
+            lock.lock();
+        }
+        u32 n = 0;
+        vr_attached.RefreshConfirmed();
+        for (const u64 key : vr_attached.confirmed_keys) {
+            const auto found = vr_attached.candidates.find(key);
+            if (n == LightTune::AttachedCameraSlots) {
+                break;
+            }
+            if (found == vr_attached.candidates.end() || !found->second.attached ||
+                vr_attached.frame - found->second.last_frame > LightTune::AttachedForgetFrames) {
+                continue;
+            }
+            const auto& c = found->second;
+            for (u32 i = 0; i < 3; ++i) {
+                vr_body.data[a + 4 + 4 * n + i] = std::bit_cast<u32>(c.pos[i]);
+            }
+            vr_body.data[a + 4 + 4 * n + 3] = std::bit_cast<u32>(c.reach);
+            ++n;
+        }
+        // Then this frame's NoCastLights (an empty slot's reach 0 matches nothing).
+        for (u32 j = 0; j < vr_attached.no_cast_count && vr_attached.frame == vr_fog.view_frame; ++j) {
+            for (u32 i = 0; i < 4; ++i) {
+                vr_body.data[a + 4 + 4 * (LightTune::AttachedCameraSlots + j) + i] =
+                    std::bit_cast<u32>(vr_attached.no_cast[j][i]);
+            }
+        }
+        vr_body.data[a] = n == 0 && vr_attached.no_cast_count == 0 ? 0u : LightTune::AttachedMax;
+        vr_body.data[a + 1] = std::bit_cast<u32>(
+            NativeStereo::Enabled() ? 0.5f * NativeStereo::Ipd(rec) * rec.world_scale : 0.0f);
+        // Removed too unless vr.ini camera_fill_light (the live key lighting.camera_fill).
+        vr_body.data[a + 2] = VrCameraFillKept() ? 0u : 1u;
+    }
+    // The lamps his shadow comes from (body_shadow.h BodyLampsAt), this frame's, on to its flat
+    // view; none listed (0): any lamp, as before.
+    {
+        const u32 bl = Body::BodyLampsAt;
+        std::fill_n(vr_body.data.begin() + bl, Body::BodyLampsDwords, 0u);
+        std::unique_lock lock{vr_fog.mutex, std::defer_lock};
+        if (!opt_cpu) {
+            lock.lock();
+        }
+        // (Picked at this frame's first lamp draw. A frame's passes need not carry the same
+        // camera record, air_light.h FrameSlack: a neighbour's still counts as this frame's.)
+        if (Shader::Optimization::AirLight::FrameNear(vr_body.top_frame, VR::DrawFrameRecord().id) &&
+            vr_fog.view_frame != 0) {
+            const auto& m = vr_fog.view;
+            for (u32 j = 0; j < vr_body.top_count; ++j) {
+                const auto& w = vr_body.top[j];
+                const double d[3] = {w[0] - m[3], w[1] - m[7], w[2] - m[11]};
+                for (u32 c = 0; c < 3; ++c) {
+                    vr_body.data[bl + 4 + 4 * j + c] =
+                        std::bit_cast<u32>(float(m[c] * d[0] + m[4 + c] * d[1] + m[8 + c] * d[2]));
+                }
+            }
+            vr_body.data[bl] = vr_body.top_count;
+        }
+    }
+    // The scene maps' slots (body_shadow.h SlotsAt; light_shadow.h SceneMaps): the chosen lamps
+    // on to this frame's flat view, only once this frame's maps were cleared (the AO pass
+    // writes them), none in a mirror's pass.
+    {
+        namespace Scene = Shader::Optimization::LightShadow::SceneMaps;
+        const u32 sa = Body::SlotsAt;
+        std::fill_n(vr_body.data.begin() + sa, Body::SlotsDwords, 0u);
+        std::unique_lock lock{vr_fog.mutex, std::defer_lock};
+        if (!opt_cpu) {
+            lock.lock();
+        }
+        // Live keys (tests, A/B in one run): lighting.scene_maps=0 lists no slots (every lamp
+        // marches), lighting.scene_grid=0 keeps the grid out of the cubes (header SlotsAt + 1).
+        if (VrSceneMapsOn() && vr_scene.buffer && vr_fog.view_frame != 0 &&
+            // (Cleared at this frame's AO pass, whose record a lamp draw need not share: a
+            // neighbour's counts, air_light.h FrameSlack. The cubes' half is the one that clear
+            // took: the clearing record's, the same as this draw's whenever the two agree.)
+            Shader::Optimization::AirLight::FrameNear(vr_scene.cleared_frame, VR::DrawFrameRecord().id) &&
+            VR::Tune::Get("lighting.scene_maps", 1.0f) >= 0.5f) {
+            vr_body.data[sa + 1] = VR::Tune::Get("lighting.scene_grid", 1.0f) >= 0.5f ? 1u : 0u;
+            vr_body.data[sa + 2] = u32(vr_scene.cleared_frame & 1u);
+            vr_body.data[sa + 3] = vr_scene.mask ? vr_scene.mask_pixels : 0u;
+            const auto& m = vr_fog.view;
+            for (u32 r = 0; r < 3; ++r) {
+                for (u32 c = 0; c < 3; ++c) {
+                    vr_body.data[sa + 4 + 3 * r + c] = std::bit_cast<u32>(m[4 * r + c]);
+                }
+            }
+            // (VR_MARCH_OPT 16: SlotHis where his shadow comes from the slot's lamp, BodyVisibility's
+            // own test made here: the lamp in the flat view within MapMatchM of one of his lamps,
+            // written above; none listed: every lamp. Once a frame: the slots, his lamps and the
+            // view are the frame's; at every lamp draw it cost ~1 us a frame.)
+            if (Scene::Opt(16)) {
+                const std::array<u64, 5> his_key{VR::DrawFrameRecord().id, vr_body.top_frame,
+                                                 vr_body.top_count, vr_scene.count, vr_fog.view_frame};
+                if (his_key != vr_scene.his_key) {
+                    vr_scene.his_key = his_key;
+                    vr_scene.his_mask = 0;
+                    const u32 bl = Body::BodyLampsAt;
+                    const u32 listed = vr_body.data[bl];
+                    const float units = std::max(std::bit_cast<float>(vr_body.data[3]), 1e-3f);
+                    const float tolerance = Body::MapMatchM * units;
+                    for (u32 j = 0; j < vr_scene.count && j < 32; ++j) {
+                        const auto& lamp = vr_scene.chosen[j];
+                        const float d[3] = {lamp.world[0] - m[3], lamp.world[1] - m[7], lamp.world[2] - m[11]};
+                        bool his = listed == 0;
+                        float flat[3];
+                        for (u32 c = 0; c < 3; ++c) {
+                            flat[c] = m[c] * d[0] + m[4 + c] * d[1] + m[8 + c] * d[2];
+                        }
+                        for (u32 h = 0; h < listed && h < Body::BodyLamps && !his; ++h) {
+                            float dd = 0.0f;
+                            for (u32 c = 0; c < 3; ++c) {
+                                const float v = flat[c] - std::bit_cast<float>(vr_body.data[bl + 4 + 4 * h + c]);
+                                dd += v * v;
+                            }
+                            his = std::sqrt(dd) < tolerance;
+                        }
+                        vr_scene.his_mask |= his ? (1u << j) : 0u;
+                    }
+                }
+            }
+            for (u32 j = 0; j < vr_scene.count; ++j) {
+                const auto& lamp = vr_scene.chosen[j];
+                const u32 e = sa + Scene::SlotHeader + Scene::SlotDwords * j;
+                const float d[3] = {lamp.world[0] - m[3], lamp.world[1] - m[7], lamp.world[2] - m[11]};
+                for (u32 c = 0; c < 3; ++c) {
+                    vr_body.data[e + c] = std::bit_cast<u32>(d[c]);
+                }
+                vr_body.data[e + 3] = std::bit_cast<u32>(lamp.k);
+                vr_body.data[e + 4] = std::bit_cast<u32>(lamp.strength);
+                // (VR_MARCH_OPT 16: SlotHis where his shadow comes from this lamp, BodyVisibility's own
+                // test once here: the lamp in the flat view within MapMatchM of one of his lamps,
+                // written above; none listed: every lamp.)
+                u32 flags = vr_scene.flags[j];
+                if (Scene::Opt(16) && ((vr_scene.his_mask >> j) & 1u) != 0) {
+                    flags |= Scene::SlotHis;
+                }
+                // (High lamp shadows: the frame's heroes, picked with the slots.)
+                if (((vr_scene.hero_mask >> j) & 1u) != 0) {
+                    flags |= Scene::SlotHero;
+                }
+                vr_body.data[e + 5] = flags;
+                vr_body.data[e + 6] = std::bit_cast<u32>(lamp.clear);
+                // Its trace's reach from the eye (light_shadow.h TraceFarLevels): the dial's; at
+                // least the first level over its first TraceNewFrames frames (no whole cube yet).
+                const float trace_m = vr_scene.age[j] < Scene::TraceNewFrames
+                                          ? std::max(vr_scene.dial.reach_m, Scene::TraceFarLevels[0])
+                                          : vr_scene.dial.reach_m;
+                vr_body.data[e + 7] = std::bit_cast<u32>(trace_m);
+                // The march's step scale (light_shadow.h StepDial; 1 without it).
+                vr_body.data[e + 11] = std::bit_cast<u32>(
+                    Scene::StepDial() ? Scene::StepDialScale[std::min(vr_scene.step_dial.level, Scene::StepDialLevels - 1)]
+                                      : 1.0f);
+                // Where its lamp was when last frame's cube was made (a moving light's cube is a
+                // frame behind it).
+                const auto& was = vr_scene.prev[j];
+                const float dp[3] = {was[0] - m[3], was[1] - m[7], was[2] - m[11]};
+                for (u32 c = 0; c < 3; ++c) {
+                    vr_body.data[e + 8 + c] = std::bit_cast<u32>(dp[c]);
+                }
+            }
+            // (Live key, tests: lighting.scene_slots caps the slots used, 1..Slots.)
+            vr_body.data[sa] = std::min<u32>(
+                vr_scene.count,
+                u32(std::clamp(VR::Tune::Get("lighting.scene_slots", float(Scene::Slots)), 1.0f, float(Scene::Slots))));
+            if constexpr (Common::Log::Enabled) {
+                // Whether the camera the slots are put on is this frame's (the AO pass's 208-byte
+                // buffer, VrFogCaptureView, binds before this one).
+                static u32 n = 0;
+                // (Diagnostics, to go: which programs get a frame-old camera, and how far it is
+                // from the newest light pass camera seen.)
+                static u32 old_ao = 0, old_other = 0, new_ao = 0, new_other = 0;
+                static u64 old_hash = 0;
+                static float old_turn = 0.0f;
+                const bool is_ao = Shader::Optimization::AmbientOcclusion::IsAoProgram(pgm_hash);
+                const bool fresh_view = vr_fog.view_frame == vr_fog.frame;
+                (fresh_view ? (is_ao ? new_ao : new_other) : (is_ao ? old_ao : old_other))++;
+                if (!fresh_view) {
+                    old_hash = pgm_hash;
+                }
+                {
+                    float apart = 0.0f;
+                    for (u32 i = 0; i < 11; ++i) {
+                        if (i % 4 != 3) {
+                            apart = std::max(apart, std::abs(vr_fog.last_list_view[i] - vr_fog.view[i]));
+                        }
+                    }
+                    old_turn = std::max(old_turn, apart);
+                }
+                if (n++ % 4000 == 0) {
+                    LOG_INFO(Render_Vulkan,
+                             "VR scene shadow maps: {} slots, camera {}; uploads with this frame's camera: AO {} others {}; "
+                             "with a frame-old one: AO {} others {} (last program {:#x}); the slots' camera and the newest "
+                             "light pass camera differ by up to {:.4f} (rotation terms); frames whose light pass camera "
+                             "was another than the slots': {}",
+                             vr_scene.count, fresh_view ? "this frame's" : "a frame old", new_ao, new_other, old_ao, old_other,
+                             old_hash, old_turn, vr_fog.views_apart);
+                    old_ao = old_other = new_ao = new_other = 0;
+                    old_turn = 0.0f;
+                }
+            }
+        }
+    }
+    if (sections_lock.owns_lock()) {
+        sections_lock.unlock();
+    }
+    // Tests (body_shadow.h ProbeAt): light classes muted or moved for their shadows, live.
+    {
+        const u32 p = Body::ProbeAt;
+        std::fill_n(vr_body.data.begin() + p, Body::ProbeDwords, 0u);
+        const auto mask = [](const char* key) {
+            return static_cast<u32>(std::clamp(VR::Tune::Get(key, 0.0f), 0.0f, 15.0f));
+        };
+        vr_body.data[p] = mask("lighting.mute_cast");
+        vr_body.data[p + 1] = std::bit_cast<u32>(0.01f * std::clamp(VR::Tune::Get("lighting.nudge_x", 0.0f), -500.0f, 500.0f));
+        vr_body.data[p + 2] = std::bit_cast<u32>(0.01f * std::clamp(VR::Tune::Get("lighting.nudge_y", 0.0f), -500.0f, 500.0f));
+        vr_body.data[p + 3] = std::bit_cast<u32>(0.01f * std::clamp(VR::Tune::Get("lighting.nudge_z", 0.0f), -500.0f, 500.0f));
+        vr_body.data[p + 4] = mask("lighting.nudge_sel");
+    }
+    std::copy_n(vr_body.data.begin(), std::min<size_t>(out.size(), vr_body.data.size()), out.begin());
+    if (opt_cpu && out.size() > vr_body.data.size()) {
+        std::fill(out.begin() + vr_body.data.size(), out.end(), 0u);
+    }
+    // This draw's lights' slots (VrFogCapture, this draw's list: bound before this buffer); none
+    // otherwise (its lights cast none rather than another draw's).
+    {
+        namespace Scene = Shader::Optimization::LightShadow::SceneMaps;
+        std::scoped_lock lock{vr_fog.mutex};
+        const bool valid = vr_scene.draw_slots_valid && vr_scene.draw_slots_pgm == pgm_hash;
+        for (u32 j = 0; j < Scene::DrawSlotWords && Body::SlotsAt + Scene::DrawSlotsAt + j < out.size(); ++j) {
+            out[Body::SlotsAt + Scene::DrawSlotsAt + j] = valid ? vr_scene.draw_slots[j] : 0u;
+        }
+        vr_scene.draw_slots_valid = false;
+        if constexpr (Common::Log::Enabled) {
+            // (How many draws had their lights' slots from the CPU, how many match on the GPU.)
+            static u32 with = 0, without = 0, frames = 0;
+            static u64 last = 0;
+            (valid ? with : without) += pgm_hash != 0 ? 1u : 0u;
+            if (const u64 f = VR::DrawFrameRecord().id; f != last) {
+                last = f;
+                if (++frames % 900 == 0) {
+                    LOG_INFO(Render_Vulkan, "VR shadow mask: {} lamp draws with their slots from the CPU, {} matched on the GPU (900 frames)",
+                             with, without);
+                    with = without = 0;
+                }
+            }
+        }
+    }
+    return bytes;
+}
+
+u32 Rasterizer::VrFogUpload(std::span<u32> out) {
+    namespace Fog = Shader::Optimization::FogLight;
+    namespace AirLight = Shader::Optimization::AirLight;
+    std::ranges::fill(out, 0u);
+    std::scoped_lock lock{vr_fog.mutex};
+    // The light pass came since the last composite: its lights are this composite's (and the
+    // next one's in this frame: the other eye, until the flip).
+    if (!vr_fog.building.empty()) {
+        vr_fog.ready.swap(vr_fog.building);
+        vr_fog.building.clear();
+        vr_fog.building_keys.fill(0);
+    }
+    if (!vr_fog.on || VrInMirrorPass()) {
+        return Fog::BufferDwords * sizeof(u32);
+    }
+    // The lamp memory needs this frame's camera (the light pass's); without one, the frame's
+    // own list as it is.
+    const bool memory = vr_fog.view_frame == vr_fog.frame;
+    if (!memory && vr_fog.ready.empty()) {
+        return Fog::BufferDwords * sizeof(u32);
+    }
+    const bool update_memory = memory && vr_fog.memory_frame != vr_fog.frame;
+    const VR::MapObjects::Table* const objects =
+        update_memory && Fog::Fixtures()
+            ? VR::MapObjects::Of(static_cast<u16>(VR::GameArea::Slot().load(std::memory_order_relaxed) >> 16))
+            : nullptr;
+    // Lights within MergeM of each other as one (a candle cluster): colours summed, at their
+    // light-weighted centre, the widest reach.
+    auto& merged = vr_fog.merged;
+    std::array<u8, Fog::CaptureLights> previous_member;
+    const auto captured = std::min(vr_fog.ready.size(), previous_member.size());
+    const auto merge_lights = [&]<bool Packed>() {
+        Fog::MergeCenters centers;
+        merged.clear();
+        for (u32 i = 0; i < captured; ++i) {
+            const VrFogLight& f = vr_fog.ready[i];
+            const float lum = 0.3f * f.colour[0] + 0.6f * f.colour[1] + 0.1f * f.colour[2];
+            const bool on_lantern = objects && !f.map && VR::MapObjects::HasLanternReach(f.reach) &&
+                                    objects->On(f.world[0], f.world[1], f.world[2]);
+            u32 index;
+            if constexpr (Packed) {
+                index = centers.Find(merged, f.position, on_lantern);
+            } else {
+                const auto first = std::ranges::find_if(merged, [&](const VrFogCluster& cluster) {
+                    const auto& p = cluster.light.position;
+                    const float dx = p[0] - f.position[0], dy = p[1] - f.position[1], dz = p[2] - f.position[2];
+                    return dx * dx + dy * dy + dz * dz < Fog::MergeM * Fog::MergeM &&
+                           cluster.light.on_lantern == on_lantern;
+                });
+                index = static_cast<u32>(first - merged.begin());
+            }
+            if (index == merged.size()) {
+                previous_member[i] = Fog::EndMember;
+                merged.push_back({f, std::max(lum, 1e-4f), static_cast<u8>(i)});
+                merged.back().light.on_lantern = on_lantern;
+                if constexpr (Packed) {
+                    centers.Set(index, f.position);
+                }
+                continue;
+            }
+            auto& cluster = merged[index];
+            previous_member[i] = cluster.last_member;
+            cluster.last_member = static_cast<u8>(i);
+            VrFogLight& group = cluster.light;
+            float& w = cluster.weight;
+            const float t = std::max(lum, 1e-4f) / (w + std::max(lum, 1e-4f));
+            for (u32 c = 0; c < 3; ++c) {
+                group.position[c] += (f.position[c] - group.position[c]) * t;
+                group.world[c] += (f.world[c] - group.world[c]) * t;
+                group.colour[c] += f.colour[c];
+            }
+            group.reach = std::min(group.reach, f.reach);
+            group.map = group.map || f.map;
+            if constexpr (Packed) {
+                centers.Set(index, group.position);
+            }
+            w += std::max(lum, 1e-4f);
+        }
+    };
+    if (update_memory || !memory) {
+        // Last time's cluster count only selects the search algorithm. Both return the
+        // first eligible cluster in this capture. Later composites reuse the lamp memory.
+        if (merged.size() >= Fog::MergeCenters::PackedFrom) {
+            merge_lights.template operator()<true>();
+        } else {
+            merge_lights.template operator()<false>();
+        }
+    }
+    const auto distance2 = [](const std::array<float, 3>& a, const std::array<float, 3>& b) {
+        const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+        return dx * dx + dy * dy + dz * dz;
+    };
+    const auto& view = vr_fog.view;
+    const std::array<float, 3> camera{view[3], view[7], view[11]};
+    // The lamp memory (fog_light.h), once a frame: the listed lights found again in the world,
+    // faded in; the others held or faded out.
+    if (update_memory) {
+        const auto now = std::chrono::steady_clock::now();
+        // Bounded: a hitch or a menu without the scene is not the lights being gone.
+        const float dt =
+            vr_fog.memory_frame == 0
+                ? 0.0f
+                : std::clamp(std::chrono::duration<float>(now - vr_fog.memory_time).count(),
+                             0.0f, 0.1f);
+        vr_fog.memory_time = now;
+        vr_fog.memory_frame = vr_fog.frame;
+        vr_fog.memory_dt = dt;
+        if (distance2(camera, vr_fog.memory_camera) > Fog::JumpM * Fog::JumpM) {
+            vr_fog.memory.clear();
+        }
+        vr_fog.memory_camera = camera;
+        for (VrFogRemembered& m : vr_fog.memory) {
+            m.seen = false;
+        }
+        for (const VrFogCluster& group : merged) {
+            const VrFogLight& f = group.light;
+            const float radius = 1.0f / std::sqrt(f.reach);
+            VrFogRemembered* same = nullptr;
+            float nearest = Fog::SameM * Fog::SameM;
+            for (VrFogRemembered& m : vr_fog.memory) {
+                const float d2 = distance2(m.world, f.world);
+                if (!m.seen && d2 < nearest &&
+                    std::abs(radius - m.radius) <= Fog::SameRadius * std::max(radius, m.radius) &&
+                    (!m.fixture || (!f.map && VR::MapObjects::HasLanternReach(f.reach))) &&
+                    (!f.on_lantern || (!m.map && VR::MapObjects::HasLanternReach(m.reach)))) {
+                    same = &m;
+                    nearest = d2;
+                }
+            }
+            bool created = false;
+            if (same == nullptr && vr_fog.memory.size() < Fog::MemoryLights) {
+                same = &vr_fog.memory.emplace_back();
+                created = true;
+            } else if (same == nullptr) {
+                created = true;
+                // Full: a listed light takes the place of the faintest one not listed (the
+                // frame lists fewer than the memory holds, so there is one; never drop the
+                // light in your hand for an old lamp).
+                for (VrFogRemembered& m : vr_fog.memory) {
+                    if (!m.seen && (same == nullptr || m.weight < same->weight ||
+                                    (m.weight == same->weight && m.unseen > same->unseen))) {
+                        same = &m;
+                    }
+                }
+                if (same != nullptr) {
+                    *same = VrFogRemembered{};
+                }
+            }
+            if (same != nullptr) {
+                const bool clustered = previous_member[group.last_member] != Fog::EndMember;
+                const u8 owner = Fog::HaloMember(vr_fog.ready, previous_member, group.last_member,
+                                                 created ? f.world : same->halo_world);
+                const auto& halo = vr_fog.ready[owner].world;
+                // A replacement wick must earn its own source votes.
+                if (!created && f.map && (clustered || same->clustered) && AirLight::Sources() &&
+                    distance2(halo, same->halo_world) >= AirLight::SourceMatchM * AirLight::SourceMatchM) {
+                    same->source = 0.0f;
+                    same->sourced = false;
+                    same->flame = 0.0f;
+                }
+                same->halo_world = halo;
+                same->clustered = clustered;
+                // Its flicker: the brightness's running mean and mean change (FlickerS).
+                const float lum = 0.3f * f.colour[0] + 0.6f * f.colour[1] + 0.1f * f.colour[2];
+                if (same->weight <= 0.0f && same->age <= 0.0f) {
+                    same->lum_mean = lum; // new: no change yet
+                    same->lum_dev = 0.0f;
+                    same->steady = f.colour;
+                } else {
+                    const float a = dt / (dt + Fog::FlickerS);
+                    same->lum_dev += a * (std::abs(lum - same->lum_mean) - same->lum_dev);
+                    same->lum_mean += a * (lum - same->lum_mean);
+                    const float s = dt / (dt + Fog::SteadyS);
+                    for (u32 c = 0; c < 3; ++c) {
+                        same->steady[c] += s * (f.colour[c] - same->steady[c]);
+                    }
+                }
+                same->world = f.world;
+                same->reach = f.reach;
+                same->radius = radius;
+                same->colour = f.colour;
+                same->map = f.map;
+                {
+                    const Fog::Fixture next = Fog::FixtureNext(
+                        {same->fixture, same->strayed}, f.map, objects != nullptr, f.on_lantern);
+                    same->fixture = next.is;
+                    same->strayed = next.strayed;
+                }
+                same->seen = true;
+                // A light the game spawned, born beside the eye: a shot. The muzzle flash is lit
+                // where it was born (FogLight's Muzzle*), not more than once in MuzzleHoldS.
+                // OFF by default since 2026-11-12 night (fog_light.h MuzzleFromLists): the game
+                // drops a wall lantern (a spawned light too) while it is out of view and lists it
+                // anew as it comes back, which lit a shot's flash beside you every time (the user:
+                // "When a new light appears, the screen glows ... as if the light is figuring
+                // itself out"). The guns publish their shots (core/vr/muzzle_flash.h).
+                if (Fog::MuzzleFromLists() && created && !f.map && !same->fixture &&
+                    distance2(f.world, camera) < Fog::MuzzleNearM * Fog::MuzzleNearM &&
+                    (!vr_fog.muzzle_on ||
+                     std::chrono::duration<float>(now - vr_fog.muzzle_t0).count() > Fog::MuzzleHoldS)) {
+                    vr_fog.muzzle_world = f.world;
+                    vr_fog.muzzle_t0 = now;
+                    vr_fog.muzzle_on = true;
+                }
+            }
+        }
+        static const bool flames_only = [] {
+            const char* const env = std::getenv("VR_FOG_FLAMES");
+            return env == nullptr || env[0] != '0';
+        }();
+        // No flame, no halo (air_light.h Sources): the votes the scene's copy gave a few frames
+        // ago, counted into the remembered lights.
+        const bool air_sources = AirLight::Sources();
+        if (air_sources) {
+            VrAirFrame(VR::DrawFrameRecord().id);
+            VrAirSourceVotes();
+        }
+        for (VrFogRemembered& m : vr_fog.memory) {
+            // A flame (it flickers) or a light the game spawned lights the air; a map light
+            // that holds steady (a mood light) fades out of it (FogLight::FlameFlicker).
+            // (A spawned light at once: a shot's flash must not wait.)
+            if (!flames_only || VR::Tune::Get("lighting.flames_only", 1.0f) < 0.5f || !m.map) {
+                m.flame = 1.0f;
+            } else if (air_sources ? m.sourced
+                                   : (m.lum_dev > Fog::FlameFlicker * std::max(m.lum_mean, 1e-3f) ||
+                                      !Fog::IsMoodLight(m.reach, m.colour[0], m.colour[2]))) {
+                m.flame = std::min(1.0f, m.flame + dt / Fog::FlameInS);
+            } else {
+                m.flame = std::max(0.0f, m.flame - dt / Fog::FlameOutS);
+            }
+            if (m.seen) {
+                m.unseen = 0.0f;
+                m.age += dt;
+                // A spawned light (a shot's flash, a torch) at once; the map's lamps and its
+                // fixtures (a lantern's flame: FogLight::FixtureNext) fade in.
+                m.weight = std::min(
+                    1.0f, m.weight + dt / (m.map || m.fixture ? Fog::FadeInS : Fog::FlashInS));
+                continue;
+            }
+            m.unseen += dt;
+            const bool held = (m.map || m.fixture) &&
+                              (m.unseen < Fog::HoldS ||
+                               distance2(camera, m.world) < Fog::HoldNearM * Fog::HoldNearM);
+            if (!held) {
+                // A flash goes as fast as it came; a carried torch slowly.
+                const bool flash = !m.map && !m.fixture && m.age < Fog::FlashLifeS;
+                m.weight -= dt / (flash ? Fog::FlashOutS : Fog::FadeOutS);
+            }
+        }
+        std::erase_if(vr_fog.memory,
+                      [](const VrFogRemembered& m) { return !m.seen && m.weight <= 0.0f; });
+    }
+    // The candidates: the remembered lights where this frame's camera sees them (the inverse of
+    // its rigid view to world), each by its weight; or the frame's list as it is.
+    using Candidate = VrFogCandidate;
+    std::vector<Candidate>& candidates = vr_fog.candidates;
+    candidates.clear();
+    if (memory) {
+        const auto into_view = [&](const std::array<float, 3>& world) {
+            const std::array<float, 3> d{world[0] - view[3], world[1] - view[7], world[2] - view[11]};
+            std::array<float, 3> p{};
+            for (u32 c = 0; c < 3; ++c) {
+                p[c] = view[c] * d[0] + view[4 + c] * d[1] + view[8 + c] * d[2];
+            }
+            return p;
+        };
+        candidates.reserve(vr_fog.memory.size());
+        for (VrFogRemembered& m : vr_fog.memory) {
+            if (m.weight <= 0.0f ||
+                (m.flame <= 0.0f && !Shader::Optimization::AirLight::Sources())) {
+                continue;
+            }
+            const auto p = into_view(m.world);
+            // (A lamp's or a fixture's halo breathes gently round its colour's mean:
+            // FogLight::HaloColour.)
+            candidates.push_back({p, m.reach,
+                                  (m.map || m.fixture) && Fog::SteadyHalo() ? Fog::HaloColour(m.steady, m.colour)
+                                                                           : m.colour,
+                                  m.weight * m.flame, 0.0f, &m, m.weight,
+                                  m.clustered ? into_view(m.halo_world) : p});
+        }
+    } else {
+        candidates.reserve(merged.size());
+        for (const VrFogCluster& group : merged) {
+            const VrFogLight& f = group.light;
+            const u8 owner = Fog::HaloMember(vr_fog.ready, previous_member, group.last_member, f.world);
+            candidates.push_back({f.position, f.reach, f.colour, 1.0f, 0.0f, nullptr, 0.0f,
+                                  vr_fog.ready[owner].position});
+        }
+    }
+    // The strongest MaxLights: brightness times reach over distance, by weight; one drawn last
+    // frame counts KeepChosen times.
+    const auto score = [](const Candidate& f) {
+        const float lum = 0.3f * f.colour[0] + 0.6f * f.colour[1] + 0.1f * f.colour[2];
+        const float d = std::sqrt(f.position[0] * f.position[0] + f.position[1] * f.position[1] +
+                                  f.position[2] * f.position[2]);
+        const float keep = f.remembered && f.remembered->chosen ? Fog::KeepChosen : 1.0f;
+        // (One without a glow of its own ranks behind every one with: by its smoke's weight.)
+        return keep * std::max(f.weight, 1e-3f * f.smoke) * lum / std::sqrt(f.reach) / std::max(d, 1.0f);
+    };
+    std::vector<const Candidate*>& order = vr_fog.order;
+    order.clear();
+    for (Candidate& c : candidates) {
+        c.score = score(c);
+        order.push_back(&c);
+    }
+    const u32 total = u32(order.size());
+    const u32 count = std::min(total, Fog::MaxLights);
+    std::partial_sort(order.begin(), order.begin() + count, order.end(),
+                      [](const Candidate* a, const Candidate* b) { return a->score > b->score; });
+    // The lights with a glow of their own first (their order kept): the glow's loop ends after
+    // them (the count's high half), only the pixels that vote on the sources go on to the rest.
+    const u32 glow_count = static_cast<u32>(
+        std::stable_partition(order.begin(), order.begin() + count,
+                              [](const Candidate* c) { return c->weight > 0.0f; }) -
+        order.begin());
+    for (VrFogRemembered& m : vr_fog.memory) {
+        m.chosen = false;
+    }
+    for (u32 k = 0; k < count; ++k) {
+        if (order[k]->remembered) {
+            order[k]->remembered->chosen = true;
+        }
+    }
+    if (memory && Shader::Optimization::AirLight::Sources()) {
+        VrAirSourceList(count, order.data());
+    }
+    const VR::CameraRecord rec = VR::DrawFrameRecord();
+    const float half = NativeStereo::Enabled() ? 0.5f * NativeStereo::Ipd(rec) * rec.world_scale : 0.0f;
+    out[0] = count | (glow_count << 16);
+    out[1] = std::bit_cast<u32>(std::isfinite(half) ? half : 0.0f);
+    out[2] = std::bit_cast<u32>(VR::Tune::Get("lighting.air", vr_fog.density));
+    // Flames fill the room (FogLight::FillStrength; VR_FLAME_FILL overrides it).
+    static const float fill_strength = [] {
+        const char* const env = std::getenv("VR_FLAME_FILL");
+        return env ? std::clamp(static_cast<float>(std::atof(env)), 0.0f, 1.0f) : Fog::FillStrength;
+    }();
+    out[3] = std::bit_cast<u32>(VR::Tune::Get("lighting.fill", fill_strength));
+    // Shadowed air (FogLight::AirLamps): the strongest lamps from AirNearM to AirFarM of the eye
+    // march their shadows (never the lantern in your hand); each one's share fades over
+    // AirFadeS, moved once a frame (this runs for both eyes' composites).
+    static const bool air_shadows = [] {
+        const char* const env = std::getenv("VR_AIR_SHADOWS");
+        return env == nullptr || env[0] != '0';
+    }();
+    const bool shadow_step = vr_fog.shadow_frame != vr_fog.frame;
+    vr_fog.shadow_frame = vr_fog.frame;
+    u32 shadowed = 0;
+    // The fog grid lights the mist with these lights itself (fog_grid.h Lamps): it takes the ones
+    // with a glow of their own, and the halo's extras for the mist are left out.
+    const bool grid_lamps =
+        Shader::Optimization::FogGrid::Enabled() && Shader::Optimization::FogGrid::Lamps::Mode() != 0;
+    vr_fog.grid_light_count = 0;
+    vr_fog.grid_flash = false;
+    vr_fog.grid_lights_frame = vr_fog.frame;
+    for (u32 k = 0; k < count; ++k) {
+        const Candidate& f = *order[k];
+        u32* d = out.data() + Fog::HeaderDwords + Fog::LightDwords * k;
+        // The hunter's own lantern lights the haze all round the eye: a share of it.
+        const float eye_distance = std::sqrt(f.position[0] * f.position[0] +
+                                             f.position[1] * f.position[1] +
+                                             f.position[2] * f.position[2]);
+        // (A small light keeps a small glow: fog_light.h SmallLightM; reach is 1 / radius^2.)
+        const float small = std::min(1.0f, 1.0f / std::max(f.reach * Fog::SmallLightM * Fog::SmallLightM, 1e-6f));
+        const float share = f.weight * small * Fog::NearEyeShare(eye_distance);
+        float shadow = 0.0f;
+        if (air_shadows && f.remembered != nullptr &&
+            VR::Tune::Get("lighting.air_shadows", 1.0f) >= 0.5f) {
+            VrFogRemembered& m = *f.remembered;
+            const bool want = shadowed < Fog::AirLamps && eye_distance >= Fog::AirNearM &&
+                              eye_distance <= Fog::AirFarM;
+            shadowed += want ? 1u : 0u;
+            if (shadow_step) {
+                const float move = vr_fog.memory_dt / Fog::AirFadeS;
+                m.shadow = want ? std::min(1.0f, m.shadow + move) : std::max(0.0f, m.shadow - move);
+            }
+            shadow = m.shadow;
+        }
+        // The air's colour (Fog::AirColour): a very bright light capped, its hue a share greyer.
+        const auto air = Fog::AirColour(f.colour);
+        // In the mist (air_light.h Mist::LampGlow): a lamp standing in it lights more of it.
+        float in_mist = 1.0f;
+        if (k < vr_air.widen.size()) {
+            vr_air.widen[k] = 1.0f;
+            vr_air.widen_count = count;
+        }
+        if (grid_lamps && k < glow_count && k + 1 < vr_fog.grid_lights.size()) {
+            vr_fog.grid_lights[vr_fog.grid_light_count++] = {
+                f.position,
+                f.reach,
+                {f.weight * small * air[0], f.weight * small * air[1], f.weight * small * air[2]},
+                Shader::Optimization::FogGrid::Lamps::CoreM2};
+        }
+        if (f.remembered != nullptr && vr_air.ground_valid && Shader::Optimization::AirLight::Mist::Enabled() &&
+            vr_air.mist_carry_frame != ~0ull) { // (the mist's numbers were made: with the cells or the fog grid)
+            namespace Mist = Shader::Optimization::AirLight::Mist;
+            const float over = std::max(f.remembered->world[1] - vr_air.ground, 0.0f);
+            const float height = std::clamp(VR::Tune::Get("lighting.mist_height", Mist::HeightM), 0.2f, 30.0f);
+            const float density = std::clamp(VR::Tune::Get("lighting.mist", Mist::Density), 0.0f, 2.0f);
+            // (With the fog grid's lamps, fog_grid.h Lamps, the mist round a lamp is lit there: no
+            // extra glow and no wider reach here. What a lamp seen THROUGH the mist gets back stays.)
+            const float layer = grid_lamps ? 0.0f
+                                           : std::exp(-over / height) * std::min(density / Mist::Density, 2.0f) *
+                                                 vr_air_aim.open_sky * vr_air.area_share;
+            in_mist += std::clamp(VR::Tune::Get("lighting.mist_lamp", Mist::LampGlow), 0.0f, 4.0f) * layer;
+            // Nearer lamps more (Mist::NearGlow), and all of them wider in the air (LampWide).
+            const float near_share = std::clamp((Mist::NearGlowOutM - eye_distance) /
+                                                    (Mist::NearGlowOutM - Mist::NearGlowInM), 0.0f, 1.0f);
+            in_mist += std::clamp(VR::Tune::Get("lighting.mist_near_glow", Mist::NearGlow), 0.0f, 4.0f) *
+                       near_share * near_share * (3.0f - 2.0f * near_share) * layer;
+            if (k < vr_air.widen.size()) {
+                vr_air.widen[k] =
+                    1.0f + std::clamp(VR::Tune::Get("lighting.mist_lamp_wide", Mist::LampWide), 0.0f, 3.0f) * layer;
+            }
+            // Seen through the mist (Mist::FarGlow): the layer's mean along the way from the eye
+            // (its height over the ground) to the light, times the way's length and the density.
+            const float eye_over = std::max(view[7] - vr_air.ground, 0.0f);
+            const float rise = over - eye_over;
+            const float mean = std::abs(rise) < 1e-2f
+                                   ? std::exp(-eye_over / height)
+                                   : height * (std::exp(-eye_over / height) - std::exp(-over / height)) / rise;
+            const float way = std::min(eye_distance, std::clamp(VR::Tune::Get("lighting.mist_far", Mist::FarM), 5.0f, 300.0f));
+            const float tau = density * vr_air_aim.open_sky * Mist::BanksMean * std::max(mean, 0.0f) *
+                              std::max(way - Mist::NearStartM, 0.0f);
+            in_mist += std::clamp(VR::Tune::Get("lighting.mist_far_glow", Mist::FarGlow), 0.0f, 8.0f) *
+                       (1.0f - std::exp(-tau));
+        }
+        const auto& halo = f.halo_position;
+        const std::array<float, 8> values{halo[0], halo[1], halo[2], f.reach,
+                                          share * in_mist * air[0], share * in_mist * air[1],
+                                          share * in_mist * air[2], shadow};
+        for (u32 c = 0; c < values.size(); ++c) {
+            d[c] = std::bit_cast<u32>(values[c]);
+        }
+    }
+    if constexpr (Common::Log::Enabled) {
+        // Every 600th upload with lights (about 10 s), 40 at most: the strongest six.
+        static u32 uploads = 0, logs = 0;
+        if (count > 0 && uploads++ % 600 == 0 && logs < 40) {
+            ++logs;
+            std::string lights;
+            for (u32 k = 0; k < std::min(count, 6u); ++k) {
+                const Candidate& f = *order[k];
+                const VrFogRemembered* const m = f.remembered;
+                lights += fmt::format(
+                    " [({:.1f} {:.1f} {:.1f}) r {:.1f} m ({:.2f} {:.2f} {:.2f}) {} flicker {:.3f} "
+                    "flame {:.2f}]",
+                    f.halo_position[0], f.halo_position[1], f.halo_position[2], 1.0f / std::sqrt(f.reach),
+                    f.colour[0], f.colour[1], f.colour[2],
+                    m && m->map ? "map" : m && m->fixture ? "fixture" : "spawned",
+                    m ? m->lum_dev / std::max(m->lum_mean, 1e-3f) : -1.0f, m ? m->flame : -1.0f);
+            }
+            LOG_INFO(Render_Vulkan,
+                     "VR fog light: {} of {} light(s), {} remembered, camera ({:.1f} {:.1f} "
+                     "{:.1f}), render camera ({:.1f} {:.1f} {:.1f}), half shift {:.4f}, density {}:{}",
+                     count, total, vr_fog.memory.size(), camera[0], camera[1], camera[2],
+                     rec.render_position.x, rec.render_position.y, rec.render_position.z, half,
+                     vr_fog.density, lights);
+        }
+    }
+    // The torch in his hand lights the mist too (fog_grid.h Lamps::Held*; the capture kept it).
+    if (grid_lamps && memory && vr_fog.held_frame == vr_fog.frame &&
+        vr_fog.grid_light_count + 1 < vr_fog.grid_lights.size()) {
+        namespace Lamps = Shader::Optimization::FogGrid::Lamps;
+        const float share = std::clamp(VR::Tune::Get("lighting.grid_held", Lamps::HeldShare), 0.0f, 8.0f);
+        if (share > 0.0f) {
+            const std::array<float, 3> d{vr_fog.held_world[0] - view[3], vr_fog.held_world[1] - view[7],
+                                         vr_fog.held_world[2] - view[11]};
+            std::array<float, 3> p{};
+            for (u32 c = 0; c < 3; ++c) {
+                p[c] = view[c] * d[0] + view[4 + c] * d[1] + view[8 + c] * d[2];
+            }
+            // (Its own hue, not the air's greyer one: a warm light in the cold mist. As bright as
+            // the air colour would be.)
+            auto air = Fog::AirColour(vr_fog.held_colour);
+            {
+                const auto& c = vr_fog.held_colour;
+                const float lum = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
+                const float air_lum = 0.2126f * air[0] + 0.7152f * air[1] + 0.0722f * air[2];
+                if (lum > 1e-4f) {
+                    air = {c[0] * air_lum / lum, c[1] * air_lum / lum, c[2] * air_lum / lum};
+                }
+            }
+            vr_fog.grid_lights[vr_fog.grid_light_count++] = {
+                p, vr_fog.held_reach, {share * air[0], share * air[1], share * air[2]}, Lamps::HeldCoreM2};
+        }
+    }
+    // A shot the gun published (muzzle_flash.h): the flash at its muzzle, now (the light lists may
+    // never show the shot's own light: a candle-lit hall fills them first).
+    {
+        std::array<float, 3> where{};
+        if (VR::MuzzleFlash::Take(vr_fog.muzzle_seen, where)) {
+            vr_fog.muzzle_world = where;
+            vr_fog.muzzle_t0 = std::chrono::steady_clock::now();
+            vr_fog.muzzle_on = true;
+        }
+    }
+    // The muzzle flash's block: its view position (this frame's camera), reach, colour times its
+    // envelope, 1 while it shines (FogLight's Muzzle*).
+    if (vr_fog.muzzle_on) {
+        const float age =
+            std::chrono::duration<float>(std::chrono::steady_clock::now() - vr_fog.muzzle_t0).count();
+        if (age > Fog::MuzzleLifeS || !memory) {
+            vr_fog.muzzle_on = age <= Fog::MuzzleLifeS && vr_fog.muzzle_on;
+        } else {
+            const float hold = VR::Tune::Get("lighting.muzzle_hold", Fog::MuzzleHoldS);
+            const float fade = std::max(VR::Tune::Get("lighting.muzzle_fade", Fog::MuzzleFadeS), 1e-3f);
+            const float envelope = age < hold ? 1.0f : std::exp(-(age - hold) / fade);
+            const float intensity = VR::Tune::Get("lighting.muzzle", Fog::MuzzleIntensity) * envelope;
+            const std::array<float, 3> d{vr_fog.muzzle_world[0] - view[3],
+                                         vr_fog.muzzle_world[1] - view[7],
+                                         vr_fog.muzzle_world[2] - view[11]};
+            u32* const mz = out.data() + Fog::MuzzleDword;
+            for (u32 c = 0; c < 3; ++c) {
+                mz[c] = std::bit_cast<u32>(view[c] * d[0] + view[4 + c] * d[1] + view[8 + c] * d[2]);
+                mz[4 + c] = std::bit_cast<u32>(Fog::MuzzleColour[c] * intensity);
+            }
+            const float radius = std::max(VR::Tune::Get("lighting.muzzle_radius", Fog::MuzzleRadiusM), 0.5f);
+            mz[3] = std::bit_cast<u32>(1.0f / (radius * radius));
+            mz[7] = std::bit_cast<u32>(Fog::MuzzleSoftM2); // its core (above 0.5: it shines)
+            // The flash lights the mist too (fog_grid.h Lamps): the last of the grid's lights.
+            if (grid_lamps && vr_fog.grid_light_count < vr_fog.grid_lights.size()) {
+                const float share = std::clamp(
+                    VR::Tune::Get("lighting.grid_flash", Shader::Optimization::FogGrid::Lamps::FlashShare), 0.0f,
+                    8.0f);
+                if (share > 0.0f) {
+                    vr_fog.grid_lights[vr_fog.grid_light_count++] = {
+                        {std::bit_cast<float>(mz[0]), std::bit_cast<float>(mz[1]), std::bit_cast<float>(mz[2])},
+                        1.0f / (radius * radius),
+                        {Fog::MuzzleColour[0] * intensity * share, Fog::MuzzleColour[1] * intensity * share,
+                         Fog::MuzzleColour[2] * intensity * share},
+                        Fog::MuzzleSoftM2};
+                    vr_fog.grid_flash = true;
+                }
+            }
+        }
+    }
+    // The torch held up (torch_glow.h): when no flash shines, a gentle glow at its flame, a share
+    // of the game's own torch light (the remembered light nearest the flame) reaching further.
+    std::array<float, 3> flame{};
+    int flame_level = 0;
+    if (memory && !vr_fog.muzzle_on && VR::TorchGlow::Take(Fog::TorchFreshS, flame, flame_level)) {
+        const VrFogRemembered* torch = nullptr;
+        float nearest = Fog::TorchMatchM * Fog::TorchMatchM;
+        for (const VrFogRemembered& m : vr_fog.memory) {
+            const float d2 = distance2(m.world, flame);
+            if (m.seen && m.reach > 0.0f && d2 < nearest) {
+                torch = &m;
+                nearest = d2;
+            }
+        }
+        if (torch != nullptr) {
+            const bool high = flame_level >= 2;
+            const float share = (high ? Fog::TorchShareHigh : Fog::TorchShareRaised) *
+                                VR::Tune::Get("lighting.torch_glow", 1.0f);
+            const float grow = (high ? Fog::TorchRangeHigh : Fog::TorchRangeRaised) - 1.0f;
+            const float range = 1.0f + grow * VR::Tune::Get("lighting.torch_range", 1.0f);
+            const float radius = std::max(torch->radius * range, 0.5f);
+            const std::array<float, 3> d{flame[0] - view[3], flame[1] - view[7], flame[2] - view[11]};
+            u32* const mz = out.data() + Fog::MuzzleDword;
+            for (u32 c = 0; c < 3; ++c) {
+                mz[c] = std::bit_cast<u32>(view[c] * d[0] + view[4 + c] * d[1] + view[8 + c] * d[2]);
+                mz[4 + c] = std::bit_cast<u32>(torch->colour[c] * share);
+            }
+            mz[3] = std::bit_cast<u32>(1.0f / (radius * radius));
+            mz[7] = std::bit_cast<u32>(Fog::TorchSoftM2);
+        }
+    }
+    // Lit smoke (particle_air.h): this frame's strongest lights and the camera's world-to-view
+    // rows, for the particle draws after this composite (they only copy it: VrParticleUpload).
+    if (memory) {
+        namespace Air = Shader::Optimization::ParticleAir;
+        static const float strength = [] {
+            const char* const env = std::getenv("VR_PARTICLE_AIR_STRENGTH");
+            return env ? std::clamp(static_cast<float>(std::atof(env)), 0.0f, 4.0f)
+                       : Air::Strength;
+        }();
+        auto& p = vr_fog.particle;
+        std::ranges::fill(p, 0u);
+        // Not the light in your hand (within NearEyeM: your lantern lit all the mist round you
+        // grey, 2026-11-11 pictures): the strongest others, as the air has them.
+        u32 lights = 0;
+        // (With the sources, air_light.h: a light without a glow of its own lights the smoke
+        // too, so the strongest by the smoke's own weight, their colour not times the flame.)
+        std::array<std::pair<float, u32>, Fog::MaxLights> by_smoke;
+        for (u32 k = 0; k < count; ++k) {
+            const Candidate& f = *order[k];
+            const float lum = 0.3f * f.colour[0] + 0.6f * f.colour[1] + 0.1f * f.colour[2];
+            const float dist = std::sqrt(f.position[0] * f.position[0] + f.position[1] * f.position[1] +
+                                         f.position[2] * f.position[2]);
+            const float weight = std::max(f.weight, f.smoke);
+            by_smoke[k] = {weight * lum / std::sqrt(f.reach) / std::max(dist, 1.0f), k};
+        }
+        std::sort(by_smoke.begin(), by_smoke.begin() + count,
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        for (u32 j = 0; j < count && lights < Air::MaxLights; ++j) {
+            const u32 k = by_smoke[j].second;
+            const Candidate& f = *order[k];
+            const auto& [x, y, z] = f.position;
+            // (Eased in from NearEyeInM to NearEyeOutM: fog_light.h NearEyeEase.)
+            const float near_ease = Fog::NearEyeEase(std::sqrt(x * x + y * y + z * z));
+            if (near_ease <= 0.0f) {
+                continue;
+            }
+            u32* const to = p.data() + Air::HeaderDwords + Air::LightDwords * lights;
+            to[0] = std::bit_cast<u32>(x);
+            to[1] = std::bit_cast<u32>(y);
+            to[2] = std::bit_cast<u32>(z);
+            to[3] = std::bit_cast<u32>(f.reach);
+            const auto air = Fog::AirColour(f.colour);
+            const float weight = std::max(f.weight, f.smoke) * near_ease;
+            for (u32 c = 0; c < 3; ++c) {
+                to[4 + c] = std::bit_cast<u32>(weight * air[c]);
+            }
+            // Its core: a light with a glow of its own (a flame at its place) the usual one, one
+            // without the soft one (particle_air.h SoftCoreM).
+            const bool flame = f.remembered == nullptr || f.weight > 0.5f * f.smoke;
+            const float core = flame ? Air::CoreM : Air::SoftCoreM;
+            to[7] = std::bit_cast<u32>(core * core);
+            ++lights;
+        }
+        p[0] = lights;
+        p[1] = std::bit_cast<u32>(VR::Tune::Get("lighting.smoke", strength));
+        for (u32 r = 0; r < 3; ++r) {
+            p[Air::RowsDword + 4 * r + 0] = std::bit_cast<u32>(view[r]);
+            p[Air::RowsDword + 4 * r + 1] = std::bit_cast<u32>(view[4 + r]);
+            p[Air::RowsDword + 4 * r + 2] = std::bit_cast<u32>(view[8 + r]);
+        }
+        vr_fog.particle_dwords = Air::HeaderDwords + Air::LightDwords * lights;
+        vr_fog.particle_frame = vr_fog.frame;
+    }
+    return Fog::BufferDwords * sizeof(u32); // (the muzzle block after the lights)
+}
+
+static_assert(Shader::Optimization::ParticleAir::BufferDwords == 80, "vr_fog.particle's size");
+static_assert(Shader::Optimization::ParticleAir::LightDwords ==
+                  Shader::Optimization::FogLight::LightDwords,
+              "lit smoke copies the air's light records");
+
+u32 Rasterizer::VrParticleUpload(std::span<u32> out) {
+    namespace Air = Shader::Optimization::ParticleAir;
+    std::ranges::fill(out, 0u); // no lights: the smoke as the game draws it
+    if (VrInMirrorPass()) {
+        return Air::HeaderDwords * sizeof(u32);
+    }
+    std::scoped_lock lock{vr_fog.mutex};
+    if (!vr_fog.on || vr_fog.particle_frame != vr_fog.frame || vr_fog.particle_dwords == 0) {
+        return Air::HeaderDwords * sizeof(u32);
+    }
+    std::copy_n(vr_fog.particle.begin(), vr_fog.particle_dwords, out.begin());
+    return vr_fog.particle_dwords * sizeof(u32);
+}
+
+// The stand-in of a written buffer of ours that is not made yet (`which`: the shadow mask, the
+// scene maps, the blocker grid): its own small buffer of zeros. Never a range of the shared stream
+// buffer: native stereo gives a buffer a shader may write a right-eye twin, and a twin of the
+// stream buffer leaves the right eye reading stale cameras and lights. The air's cells had it on
+// 2026-11-14 (the moonlight off); these three had it whenever our ambient occlusion ran without
+// the lamp shadows, in multiview and in layers: the right eye another picture in every frame
+// (found 2026-11-17, when 0.9.6 made that a default for the smaller cards).
+vk::DescriptorBufferInfo Rasterizer::VrWrittenStandIn(u32 which, u64 bytes) {
+    constexpr u64 Bytes = 64;
+    ASSERT(which < vr_written_none.size() && bytes <= Bytes);
+    auto& none = vr_written_none[which];
+    if (!none) [[unlikely]] {
+        none = std::make_unique<VideoCore::Buffer>(instance, scheduler, VideoCore::MemoryUsage::Stream, 0,
+                                                   VideoCore::AllFlags, Bytes);
+        std::memset(none->mapped_data.data(), 0, none->mapped_data.size());
+    }
+    return {none->Handle(), 0, bytes};
+}
+
 bool Rasterizer::VrInMirrorPass() const {
     if (vr_mirror.screen[0] == 0) {
         return false; // no reflection's pass: one load
@@ -4139,11 +6829,817 @@ void Rasterizer::VrMirrorAhead() {
     }
 }
 
+namespace {
+// The shadow atlas cells whose draws are not drawn (Rasterizer::ShadowCellSkipped): vr.ini
+// shadows_far=reduced (the default) skips the farthest cascade, the bottom-right quarter of the
+// 2x2 cascade atlas (its 4x4 cell 3,3: the Sewers' cascades sit at 1,1 / 3,1 / 1,3 / 3,3, by
+// VR_DRAW_BREAKDOWN). VR_SHADOW_SKIP_CELLS (tests, read once) names cells instead, "col,row"
+// pairs separated by ';' ("none" for none).
+const std::optional<u32> g_shadow_skip_cells = []() -> std::optional<u32> {
+    const char* value = std::getenv("VR_SHADOW_SKIP_CELLS");
+    if (!value) {
+        return std::nullopt;
+    }
+    u32 mask = 0;
+    for (const char* p = value; *p;) {
+        int col = -1, row = -1;
+        if (std::sscanf(p, "%d,%d", &col, &row) == 2 && col >= 0 && col < 4 && row >= 0 && row < 4)
+            mask |= 1u << (row * 4 + col);
+        p = std::strchr(p, ';');
+        if (!p)
+            break;
+        ++p;
+    }
+    return mask;
+}();
+// Fewer shadows when busy (vr.ini shadows_busy): the game frame's draws counted on Stage A before
+// any is skipped (FastRender::NoteDraw), judged at each frame end (FlushFrameEnd, an ordered task:
+// Stage B's thread when the pipe runs, so the answer is atomic) against shadows_busy_on/_off.
+u64 g_busy_frame_start = 0; // FlushFrameEnd's thread only
+u32 g_busy_streak = 0;      // frames in a row on the other side of the threshold
+std::atomic<bool> g_busy{false};
+// Steady, not flickering (a cascade appearing and going is visible): on after 5 busy frames in a
+// row, off only after 90 calm ones (a second at 90 Hz).
+constexpr u32 BusyOnFrames = 5, BusyOffFrames = 90;
+void UpdateBusyShadows() {
+    const auto& s = VR::GetSettings();
+    const u64 now = FastRender::g_counters.draws.load(std::memory_order_relaxed);
+    const u64 draws = now - g_busy_frame_start;
+    g_busy_frame_start = now;
+    const bool was = g_busy.load(std::memory_order_relaxed);
+    const bool other = was ? draws < u64(s.shadows_busy_off) : draws > u64(s.shadows_busy_on);
+    g_busy_streak = other ? g_busy_streak + 1 : 0;
+    bool busy = was;
+    if (!s.shadows_busy) {
+        busy = false;
+    } else if (g_busy_streak >= (was ? BusyOffFrames : BusyOnFrames)) {
+        busy = !was;
+        g_busy_streak = 0;
+    }
+    g_busy.store(busy, std::memory_order_relaxed);
+    if (busy != was) {
+        static u32 logged = 0;
+        if (++logged <= 64 || (logged & 1023) == 0)
+            LOG_INFO(Render_Vulkan, "Fewer shadows when busy: {} at {} draws (change #{})",
+                     busy ? "on" : "off", draws, logged);
+    }
+}
+} // namespace
+
+// The scene shadow maps (light_shadow.h SceneMaps): made at the first draw that declares them;
+// the frame's first draw that writes them (the AO pass) clears them outside its pass, the frame's
+// first that reads them (a lamp draw) waits for those writes.
+void Rasterizer::VrSceneMapsBeforeDraw(const GraphicsPipeline* pipeline) {
+    namespace Scene = Shader::Optimization::LightShadow::SceneMaps;
+    // (Neither the maps nor a mask it reads first: a bit worked out once a pipeline, no scan.)
+    if (!(pipeline->VrFsBuffers() & (Pipeline::VrFsSceneMaps | Pipeline::VrFsShadowMaskRead)) ||
+        !VrSceneMapsOn() || !VR::IsEnabled() || VrInMirrorPass()) {
+        return;
+    }
+    const auto* fs = pipeline->GetStages()[u32(Shader::LogicalStage::Fragment)];
+    if (fs == nullptr) {
+        return;
+    }
+    auto it = std::ranges::find(fs->buffers, Shader::BufferType::VrSceneMaps,
+                                &Shader::BufferResource::buffer_type);
+    if (it == fs->buffers.end()) {
+        // (A lamp draw with the mask reads it only: the frame's first waits for the AO pass.)
+        it = std::ranges::find(fs->buffers, Shader::BufferType::VrShadowMask,
+                               &Shader::BufferResource::buffer_type);
+        if (it == fs->buffers.end() || it->is_written) {
+            return;
+        }
+    }
+    constexpr u64 bytes = u64(Scene::Texels) * sizeof(u32); // a half: one frame's cubes
+    if (!vr_scene.buffer) {
+        vr_scene.buffer = std::make_unique<VideoCore::Buffer>(
+            instance, scheduler, VideoCore::MemoryUsage::DeviceLocal, 0, VideoCore::AllFlags, 2 * bytes);
+        LOG_INFO(Render_Vulkan, "VR scene shadow maps: {} cubes of {}x{} a face, two frames ({} KiB)",
+                 Scene::Slots, Scene::Side, Scene::Side, (2 * bytes) >> 10);
+    }
+    const u64 frame = VR::DrawFrameRecord().id;
+    if (it->is_written) {
+        if (vr_scene.cleared_frame == frame) {
+            return;
+        }
+        // The mask (the AO pass writes it): made once, for this pass's size (both eyes); a larger
+        // pass later writes none (the lamps cast none) rather than past its end.
+        // The mask (the AO pass writes it): for this pass's size (both eyes); made anew, larger,
+        // when a pass outgrows it (the old one freed once the GPU is past it); never shrunk.
+        if (Scene::Mask()) {
+            const auto& screen = std::as_const(ScratchDraw::Registers(liverpool)).screen_scissor;
+            const u32 pixels = std::min(std::max(screen.GetWidth(), 1u) * std::max(screen.GetHeight(), 1u) * 2u,
+                                        Scene::MaskMaxPixels);
+            if (!vr_scene.mask || pixels > vr_scene.mask_pixels) {
+                if (vr_scene.mask) {
+                    scheduler.DeferOperation([old = std::move(vr_scene.mask)]() mutable { old.reset(); });
+                }
+                const u64 mask_bytes = (u64(Scene::MaskHeader) + u64(pixels) * Scene::MaskWords) * sizeof(u32);
+                vr_scene.mask = std::make_unique<VideoCore::Buffer>(
+                    instance, scheduler, VideoCore::MemoryUsage::DeviceLocal, 0, VideoCore::AllFlags, mask_bytes);
+                vr_scene.mask_pixels = pixels;
+                LOG_INFO(Render_Vulkan, "VR shadow mask: {}x{} a eye, {} slots ({} KiB)", screen.GetWidth(),
+                         screen.GetHeight(), Scene::Slots, mask_bytes >> 10);
+            }
+        }
+        // Only the slots this frame uses (the shaders never go past its count; a slot taken anew is
+        // fresh, its lookups skipped until its cube is this frame's): less to clear on a weak GPU.
+        std::scoped_lock lock{vr_fog.mutex};
+        const u64 used = std::min<u64>(vr_scene.count, Scene::Slots) * u64(Scene::SlotTexels) * sizeof(u32);
+        scheduler.EndRendering();
+        NativeStereo::Barrier(scheduler);
+        // (The old march in the mask reads no cubes: none cleared.)
+        if (used != 0 && !(Scene::Mask() && Scene::MarchMode() && Scene::TraceAll())) {
+            scheduler.Commands().fillBuffer(vr_scene.buffer->Handle(), (frame & 1u) * bytes, used, Scene::Empty);
+        }
+        NativeStereo::Barrier(scheduler);
+        vr_scene.cleared_frame = frame;
+
+    } else {
+        if (vr_scene.barrier_frame == frame) {
+            return;
+        }
+        vr_scene.barrier_frame = frame;
+        scheduler.EndRendering();
+        NativeStereo::Barrier(scheduler);
+    }
+}
+
+// The depth pyramid (vr_depth_pyramid.h, light_shadow.h SceneMaps::Pyramid): before the frame's
+// first AO pass whose program reads it, the depth that pass samples (its image as the draw binds
+// it: the same texture cache entry and view, both eyes), outside the render pass.
+void Rasterizer::VrPyramidBeforeDraw(const GraphicsPipeline* pipeline) {
+    namespace Scene = Shader::Optimization::LightShadow::SceneMaps;
+    // (Its fragment stage's buffers: a bit worked out once a pipeline, not a scan every draw.)
+    if (!(pipeline->VrFsBuffers() & Pipeline::VrFsDepthPyramid) || !vr_pyramid ||
+        !Scene::Pyramid() || !VrSceneMaskOn() || !VR::IsEnabled() || VrInMirrorPass()) {
+        return;
+    }
+    const auto* fs = pipeline->GetStages()[u32(Shader::LogicalStage::Fragment)];
+    const u64 frame = VR::DrawFrameRecord().id;
+    if (frame == 0 || vr_pyramid_frame == frame) {
+        return;
+    }
+    vr_pyramid_frame = frame;
+    vr_pyramid_ready = false;
+    const u32 index = fs->vr_light_shadow.depth_image & 0xFFFFu;
+    if (index >= fs->images.size()) {
+        return;
+    }
+    const auto& res = fs->images[index];
+    const AmdGpu::Image tsharp = res.GetSharp(*fs);
+    if (tsharp.Address() == 0 || tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid ||
+        !memory->IsValidGpuMapping(tsharp.Address(), 0)) {
+        return;
+    }
+    VideoCore::TextureCache::ImageDesc desc = TextureDescFor(tsharp, res);
+    VideoCore::ImageId image_id = texture_cache.FindImage(desc);
+    auto* image = &texture_cache.GetImage(image_id);
+    if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
+        image_id = depth_image_id;
+        image = &texture_cache.GetImage(image_id);
+    }
+    auto& view = texture_cache.FindTexture(image_id, desc);
+    scheduler.EndRendering();
+    TransitTexture(*image, false, desc.view_info.range);
+    const vk::ImageView left = *view.image_view;
+    const vk::ImageView right = view.native_right ? *view.native_right : left;
+    vr_pyramid_ready = vr_pyramid->Record(scheduler.Commands(), left, right,
+                                          image->backing->state.layout, tsharp.width + 1,
+                                          tsharp.height + 1);
+    if constexpr (Common::Log::Enabled) {
+        static u32 logged = 0;
+        if (logged++ < 3) {
+            LOG_INFO(Render_Vulkan, "VR depth pyramid: frame {}: {}x{} (format {}), both eyes {}, {}",
+                     frame, tsharp.width + 1, tsharp.height + 1, u32(tsharp.GetDataFmt()),
+                     view.native_right ? "apart" : "one view", vr_pyramid_ready ? "built" : "not built");
+        }
+    }
+}
+
+// The other casters (light_shadow.h SceneMaps::Caster*): this frame's enemies and NPCs near him
+// (VR::RecordShadowCasters) on to the world's axes from this frame's camera; a body whose sphere
+// lies in view stays out (the screen splat has its real outline).
+const std::array<u32, 452>& Rasterizer::VrShadowCastersUpload() {
+    namespace Scene = Shader::Optimization::LightShadow::SceneMaps;
+    static_assert(Scene::CasterDwords == 452 && VR::ShadowCasters::MaxCapsules <= Scene::CasterCapsules &&
+                  VR::ShadowCasters::MaxBodies <= Scene::CasterBodies);
+    // (Without the lamp shadows nothing reads them: none, as made, no upkeep. 2026-11-17.)
+    if (!VrSceneMaskOn()) {
+        return vr_scene.casters;
+    }
+    const VR::CameraRecord rec = VR::DrawFrameRecord();
+    if (vr_scene.casters_frame == rec.id) {
+        return vr_scene.casters;
+    }
+    vr_scene.casters_frame = rec.id;
+    const VrShadowCpuScope timed{3};
+    vr_scene.casters.fill(0u);
+    VR::ShadowCasters in;
+    std::array<float, 12> m{};
+    {
+        std::scoped_lock lock{vr_fog.mutex};
+        if (vr_fog.view_frame == 0) {
+            return vr_scene.casters;
+        }
+        m = vr_fog.view;
+    }
+    if (!VR::RecordShadowCasters(rec.id, in)) {
+        return vr_scene.casters;
+    }
+    const auto rel = [&](const VR::Vec3& v) {
+        return std::array<float, 3>{v.x - m[3], v.y - m[7], v.z - m[11]};
+    };
+    auto& out = vr_scene.casters;
+    const auto put = [&](u32 at, float v) { out[at] = std::bit_cast<u32>(v); };
+    u32 bodies = 0, capsules = 0;
+    for (u32 b = 0; b < std::min(in.body_count, Scene::CasterBodies); ++b) {
+        const auto range = in.bodies[b];
+        if (range.count == 0 || range.first + range.count > in.capsule_count) {
+            continue;
+        }
+        // Its sphere: round its capsules' ends.
+        float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+        for (u32 c = range.first; c < range.first + range.count; ++c) {
+            const auto& cap = in.capsules[c];
+            for (const auto& e : {rel(cap.a), rel(cap.b)}) {
+                for (u32 i = 0; i < 3; ++i) {
+                    lo[i] = std::min(lo[i], e[i] - cap.radius);
+                    hi[i] = std::max(hi[i], e[i] + cap.radius);
+                }
+            }
+        }
+        const float centre[3] = {0.5f * (lo[0] + hi[0]), 0.5f * (lo[1] + hi[1]), 0.5f * (lo[2] + hi[2])};
+        const float radius = 0.5f * std::sqrt((hi[0] - lo[0]) * (hi[0] - lo[0]) + (hi[1] - lo[1]) * (hi[1] - lo[1]) +
+                                              (hi[2] - lo[2]) * (hi[2] - lo[2]));
+        if (!std::isfinite(radius) || radius > 20.0f) {
+            continue;
+        }
+        // In view (the flat view's +z ahead; 50 degrees each way, the sphere wholly inside): left out.
+        float f[3];
+        for (u32 c = 0; c < 3; ++c) {
+            f[c] = m[c] * centre[0] + m[4 + c] * centre[1] + m[8 + c] * centre[2];
+        }
+        // In view by the eyes' own field of view (each axis' narrower side: an edge case counts as
+        // out of view, where a capsule shadow beats none).
+        float tx = 10.0f, ty = 10.0f;
+        for (const auto& fov : rec.eye_fov) {
+            tx = std::min({tx, std::tan(std::abs(fov.angle_left)), std::tan(std::abs(fov.angle_right))});
+            ty = std::min({ty, std::tan(std::abs(fov.angle_up)), std::tan(std::abs(fov.angle_down))});
+        }
+        if (!(tx > 0.1f && tx < 10.0f) || !(ty > 0.1f && ty < 10.0f)) {
+            tx = ty = 1.0f; // (no field of view: 45 degrees each way)
+        }
+        const float ahead = f[2] - radius;
+        const bool in_view = ahead > 0.0f && std::abs(f[0]) + radius < ahead * tx && std::abs(f[1]) + radius < ahead * ty;
+        // (In view: its sphere only, flagged, for the grid to leave it out; no capsules.)
+        const u32 first = capsules;
+        (void)in_view; // (in view too: their capsules sit inside their outline, which the screen casts)
+        for (u32 c = range.first; c < range.first + range.count && capsules < Scene::CasterCapsules; ++c) {
+            const auto& cap = in.capsules[c];
+            const auto a = rel(cap.a), bb = rel(cap.b);
+            const u32 at = Scene::CasterCapsulesAt + 8 * capsules++;
+            put(at, a[0]);
+            put(at + 1, a[1]);
+            put(at + 2, a[2]);
+            put(at + 3, cap.radius);
+            put(at + 4, bb[0]);
+            put(at + 5, bb[1]);
+            put(at + 6, bb[2]);
+        }
+        const u32 at = Scene::CasterBodiesAt + 8 * bodies++;
+        put(at, centre[0]);
+        put(at + 1, centre[1]);
+        put(at + 2, centre[2]);
+        put(at + 3, radius);
+        out[at + 4] = first;
+        out[at + 5] = capsules - first;
+        out[at + 6] = 0u;
+    }
+    out[0] = capsules;
+    out[1] = bodies;
+    if constexpr (Common::Log::Enabled) {
+        // (Tests: who casts, every 300 frames.)
+        static u32 logged = 0;
+        if ((logged++ % 300) == 0) {
+            std::string line;
+            for (u32 b = 0; b < bodies; ++b) {
+                const u32 at = Scene::CasterBodiesAt + 8 * b;
+                const auto g = [&](u32 i) { return std::bit_cast<float>(out[at + i]); };
+                // (... and where it is in the camera's view: right of it, ahead of it.)
+                const auto view = [&](u32 c) { return m[c] * g(0) + m[4 + c] * g(1) + m[8 + c] * g(2); };
+                line += fmt::format(" | {} caps at {:.1f} {:.1f} {:.1f} r {:.1f} (right {:.1f} ahead {:.1f})", out[at + 5], g(0), g(1),
+                                    g(2), g(3), view(0), view(2));
+            }
+            LOG_INFO(Render_Vulkan, "VR shadow casters: {} bodies, {} capsules{}", bodies, capsules, line);
+        }
+    }
+    {
+        float tx = 10.0f, ty = 10.0f;
+        for (const auto& fov : rec.eye_fov) {
+            tx = std::min({tx, std::tan(std::abs(fov.angle_left)), std::tan(std::abs(fov.angle_right))});
+            ty = std::min({ty, std::tan(std::abs(fov.angle_up)), std::tan(std::abs(fov.angle_down))});
+        }
+        if (!(tx > 0.1f && tx < 10.0f) || !(ty > 0.1f && ty < 10.0f)) {
+            tx = ty = 0.0f; // (none: the grid's voxels all cast)
+        }
+        put(2, tx);
+        put(3, ty);
+    }
+    return vr_scene.casters;
+}
+
+// The game's lamp shadow maps (2026-11-12 night: "skip them when our shadows are on"):
+// a game-shadowed lamp shader of ours reads them as lit (light_shadow_pass.cpp), so the draws
+// into them (the per-face clear, any scenery, the blur) are skipped once that shader has bound
+// them. One our pass did not take never notes its maps: they are drawn as ever.
+void Rasterizer::NoteGameLampMap(VAddr address) {
+    std::scoped_lock lock{vr_lamp_maps_mutex};
+    if (std::ranges::find(vr_lamp_maps, address) == vr_lamp_maps.end() && vr_lamp_maps.size() < 64) {
+        vr_lamp_maps.push_back(address);
+        vr_lamp_map_count.store(static_cast<u32>(vr_lamp_maps.size()), std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan, "VR lamp shadows: the game's lamp shadow map at {:#x} is no longer "
+                                "drawn ({} known)",
+                 address, vr_lamp_maps.size());
+    }
+}
+
+bool Rasterizer::GameLampMapSkipped() {
+    // VR_LAMP_MAP_SKIP=0 (tests): drawn as ever.
+    static const bool on = [] {
+        const char* const env = std::getenv("VR_LAMP_MAP_SKIP");
+        return env == nullptr || env[0] != '0';
+    }();
+    if (!on || vr_lamp_map_count.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
+    const auto& cb = regs.color_buffers[0];
+    if (!cb) {
+        return false;
+    }
+    const VAddr address = cb.Address();
+    bool skip;
+    {
+        std::scoped_lock lock{vr_lamp_maps_mutex};
+        skip = std::ranges::find(vr_lamp_maps, address) != vr_lamp_maps.end();
+    }
+    if constexpr (Common::Log::Enabled) {
+        if (skip && ++vr_lamp_maps_skipped % 20000 == 0) {
+            LOG_INFO(Render_Vulkan, "VR lamp shadows: {} draws into the game's lamp shadow maps skipped",
+                     vr_lamp_maps_skipped);
+        }
+    }
+    return skip;
+}
+
+bool Rasterizer::ShadowCellSkipped(bool can_confine) {
+    shadow_near_a = 0;
+    if constexpr (Common::Log::Enabled) {
+        // Test diagnostics (VR_SHADOW_CELL_LOG): every square 2048..8192 depth target's draws by
+        // the 4x4 cell of their viewport centre, with the viewport's size and the depth clears
+        // among them, logged every 20000 such draws: the atlas layout per area, and whether a
+        // skipped cell is cleared by the game.
+        static const bool diag = std::getenv("VR_SHADOW_CELL_LOG") != nullptr;
+        if (diag) {
+            const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
+            const auto& db = regs.depth_buffer;
+            const u32 w = db.Pitch(), h = db.Height();
+            if (db.DepthValid() && w >= 2048 && w <= 8192 && w == h) {
+                struct Cell { u64 draws{}, clears{}; float half_w{}, half_h{}; u64 target{}; };
+                static std::array<Cell, 16> cells{};
+                static u64 total = 0;
+                const auto& vp = regs.viewports[0];
+                const int col = std::clamp(int(vp.xoffset * 4.0f / w), 0, 3);
+                const int row = std::clamp(int(vp.yoffset * 4.0f / h), 0, 3);
+                auto& c = cells[row * 4 + col];
+                ++c.draws;
+                c.clears += regs.depth_render_control.depth_clear_enable ? 1 : 0;
+                c.half_w = vp.xscale;
+                c.half_h = vp.yscale;
+                c.target = db.DepthAddress();
+                if (++total % 20000 == 0) {
+                    std::string text;
+                    for (int i = 0; i < 16; ++i) {
+                        if (cells[i].draws)
+                            text += fmt::format(" [{},{}: {} draws, {} clears, vp {:.0f}x{:.0f}, "
+                                                "target {:#x}]",
+                                                i % 4, i / 4, cells[i].draws, cells[i].clears,
+                                                2 * cells[i].half_w, 2 * std::abs(cells[i].half_h),
+                                                cells[i].target);
+                    }
+                    LOG_INFO(Render_Vulkan, "Shadow cell diag ({}x{}):{}", w, h, text);
+                    cells = {};
+                }
+            }
+        }
+    }
+    // The atlas held over frames (vr_shadow_hold.h; a test switch): every draw into it left out.
+    if (ShadowHold::Active()) [[unlikely]] {
+        ShadowHold::NoCell();
+        const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
+        const auto& db = regs.depth_buffer;
+        if (db.DepthValid()) {
+            const u32 width = db.Pitch(), height = db.Height();
+            if (width >= 2048 && width <= 8192 && width == height) {
+                const auto& hold_vp = regs.viewports[0];
+                const u32 hold_cell = u32(std::clamp(int(hold_vp.yoffset * 4.0f / height), 0, 3)) * 4u +
+                                      u32(std::clamp(int(hold_vp.xoffset * 4.0f / width), 0, 3));
+                const bool whole_atlas = 2.0f * std::abs(hold_vp.xscale) >= 0.99f * float(width);
+                const auto hold_verdict = ShadowHold::SkipDraw(whole_atlas, hold_cell);
+                if (hold_verdict != ShadowHold::Verdict::Skip && !whole_atlas && regs.viewport_control.xoffset_enable &&
+                    regs.viewport_control.xscale_enable && regs.viewport_control.yoffset_enable &&
+                    regs.viewport_control.yscale_enable && !regs.IsClipDisabled()) {
+                    ShadowHold::CellDraw(hold_cell, {hold_vp.xoffset, hold_vp.xscale, hold_vp.yoffset, hold_vp.yscale}, width);
+                }
+                switch (hold_verdict) {
+                case ShadowHold::Verdict::Skip:
+                    return true;
+                case ShadowHold::Verdict::NearClear:
+                    // (Every draw into a near cascade of a held frame, direct or indirect. Until
+                    // 2026-11-18 only the first direct one had the mark: one not recorded after
+                    // all, its pipeline not ready or left out by the VR draw rules, took it along,
+                    // and the next such draw cleared the whole atlas, the held cascades with it.)
+                    shadow_near_a = ShadowHold::HeldFrame();
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+    }
+    // Busy frames (shadows_busy): the farthest cascade and the next one, cells 3,3 and 1,3.
+    const u32 cells = g_shadow_skip_cells ? *g_shadow_skip_cells
+                      : g_busy.load(std::memory_order_relaxed) ? (1u << 15) | (1u << 13)
+                      : VR::GetSettings().shadows_far_reduced ? (1u << 15)
+                                                              : 0u;
+    if (cells == 0) {
+        return false;
+    }
+    // Stage A, registers only: a square depth target of 2048..8192 (a shadow atlas) and the
+    // viewport centre's cell of its 4x4 grid.
+    const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
+    const auto& db = regs.depth_buffer;
+    if (!db.DepthValid()) {
+        return false;
+    }
+    const u32 width = db.Pitch(), height = db.Height();
+    if (width < 2048 || width > 8192 || width != height) {
+        return false;
+    }
+    const auto& vp = regs.viewports[0];
+    const int col = std::clamp(int(vp.xoffset * 4.0f / width), 0, 3);
+    const int row = std::clamp(int(vp.yoffset * 4.0f / height), 0, 3);
+    return (cells >> (row * 4 + col)) & 1;
+}
+
+namespace {
+// Water reflections off (vr.ini water_reflections=0):
+// the game's planar water reflection is the scene mirrored below the water plane, drawn into its
+// own half-size target by the only draws that clip (distances its vertex shaders export,
+// PA_CL_VS_OUT_CNTL, or the user clip planes, PA_CL_CLIP_CNTL): Old Yharnam ~120-200 a frame
+// (~8% of stage B), the sewers 10-25. The frame's scene target gets a few clipping draws too (1-4
+// a frame among ~100 others) and keeps them: only a target whose draws are mostly clipping ones
+// (at least 8, more than twice its others, counts halved as they grow) loses them; its other
+// draws stay. sRGB colour targets never count: the game paints a bloodied character's blood into
+// its own 8-bit sRGB texture (256 or 512 square) with clipping draws too (the
+// GXFlver_*_Bloody_*_Pnt shaders); taken for reflections, those were left out and cleared every
+// frame, and the Bloody shaders then drew the character black or flat grey (players with water
+// reflections off, 2026-11-04). The reflection itself is 512x576, R16G16B16A16 float in Old
+// Yharnam and R8G8B8A8 unorm in the sewers. Stage A's thread only (Draw, DrawIndirect).
+class WaterTargets {
+public:
+    bool LeaveOut(u64 address, bool clip) {
+        // Only targets that took a clipping draw are kept (the scene target and the reflections:
+        // a frame draws into many more targets than the table holds).
+        Target* t = Find(address, clip);
+        if (!t) {
+            return false;
+        }
+        (clip ? t->clip : t->other)++;
+        if (t->clip + t->other >= 4096) {
+            t->clip /= 2;
+            t->other /= 2;
+        }
+        const bool reflection = t->clip >= 8 && t->clip > 2 * t->other;
+        if (reflection != t->reflection) {
+            t->reflection = reflection;
+            static u32 logged = 0;
+            if (++logged <= 32 || (logged & 1023) == 0)
+                LOG_INFO(Render_Vulkan,
+                         "Water reflections off: target {:#x} {} ({} clipping draws, {} others)",
+                         address, reflection ? "is a reflection, its clipping draws left out"
+                                             : "is drawn again",
+                         t->clip, t->other);
+        }
+        return clip && reflection;
+    }
+
+private:
+    struct Target {
+        u64 address{};
+        u32 clip{};
+        u32 other{};
+        bool reflection{};
+    };
+    Target* Find(u64 address, bool add) {
+        Target* fewest = &targets[0];
+        for (auto& t : targets) {
+            if (t.address == address)
+                return &t;
+            if (t.clip + t.other < fewest->clip + fewest->other)
+                fewest = &t;
+        }
+        if (!add)
+            return nullptr;
+        *fewest = Target{.address = address}; // the least used one makes way
+        return fewest;
+    }
+    std::array<Target, 8> targets{};
+};
+WaterTargets g_water_targets;
+} // namespace
+
+namespace {
+// Water reflections on, capped (2026-11-11: "cap them to 92 draws max?", then "72!!", then 64 once actors stay outside it; "64
+// draws as the cap"): the planar
+// reflection's cost is its draws' CPU work (~5 us each; Old Yharnam ~120-200 a frame, the sewers
+// 10-25), not the GPU's. A frame keeps at most `cap` of them, the biggest first: each draw's
+// index count goes to a histogram (powers of two), and the last frame's histogram sets this
+// frame's floor, the smallest size whose draws and every bigger one fit the cap; draws below it
+// are left out, and once `cap` are kept, the rest too. The sky dome, walls, buildings and big props
+// stay (and cover the target: the game draws it whole every frame, so nothing stale is left
+// where a small prop was); small clutter, which the ripples blur anyway, goes. The sewers stay
+// whole. An indirect draw (its count unknown) counts as the biggest. No clear: the kept draws
+// cover the target as the game's do. VR_WATER_DRAWS=<cap> (0: every draw).
+class WaterBudget {
+public:
+    bool Keep(u32 indices, u64 frame, u32 cap) {
+        if (frame != frame_) {
+            // The floor bucket: the biggest ones all fit, and of the floor's own only as many as
+            // are left of the cap (`boundary_`), so the cap is filled, biggest first.
+            u32 sum = 0;
+            floor_ = 0;
+            boundary_ = cap;
+            for (int b = 32; b >= 0; --b) {
+                if (sum + hist_[b] > cap) {
+                    floor_ = u32(b);
+                    boundary_ = cap - sum;
+                    break;
+                }
+                sum += hist_[b];
+            }
+            last_total_ = total_;
+            last_dropped_ = dropped_;
+            hist_.fill(0);
+            kept_ = dropped_ = total_ = in_floor_ = 0;
+            frame_ = frame;
+        }
+        const u32 bucket = u32(std::bit_width(indices)); // 0..32
+        ++hist_[bucket];
+        ++total_;
+        const bool fits = bucket > floor_ || (bucket == floor_ && in_floor_ < boundary_);
+        if (!fits || kept_ >= cap) {
+            ++dropped_;
+            return false;
+        }
+        in_floor_ += bucket == floor_ ? 1u : 0u;
+        ++kept_;
+        return true;
+    }
+    u32 Floor() const {
+        return floor_;
+    }
+    u32 LastTotal() const {
+        return last_total_;
+    }
+    u32 LastDropped() const {
+        return last_dropped_;
+    }
+
+private:
+    std::array<u32, 33> hist_{};
+    u32 floor_{}, boundary_{~0u}, in_floor_{}, kept_{}, dropped_{}, total_{}, last_total_{},
+        last_dropped_{};
+    u64 frame_{~0ull};
+};
+WaterBudget g_water_budget;
+} // namespace
+
+// A character's draw (its vertex stage reads a bone palette of 640 bytes or more:
+// vk_rasterizer_temporal.cpp HasCharacterSkeleton's test, Motion::ClassifyBuffer).
+static bool WaterCharacterDraw(const GraphicsPipeline* pipeline) {
+    const auto& vs = pipeline->GetStage(Shader::LogicalStage::Vertex);
+    for (const auto& resource : vs.buffers) {
+        if (resource.IsSpecial()) {
+            continue;
+        }
+        const auto buffer = resource.GetSharp(vs);
+        const u32 size = buffer.Valid() ? u32(buffer.GetSize()) : 0u;
+        if (buffer.GetStride() == 16 && size >= 640 && size != 864 && size <= 16384) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Rasterizer::WaterReflectionCapped(u32 indices, const GraphicsPipeline* pipeline) {
+    static const u32 cap = [] {
+        const char* const env = std::getenv("VR_WATER_DRAWS");
+        return env ? u32(std::strtoul(env, nullptr, 10)) : 64u; // the tester, 2026-11-11: 64 (actors outside it)
+    }();
+    const u32 live_cap = static_cast<u32>(VR::Tune::Get("water.cap", static_cast<float>(cap)));
+    if (!VR::GetSettings().water_reflections || live_cap == 0) {
+        return false;
+    }
+    const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
+    const auto& cb0 = regs.color_buffers[0];
+    if (!cb0 || (cb0.GetNumberFmt() == AmdGpu::NumberFormat::Srgb && FastRender::AbOn(11))) {
+        return false; // an sRGB target is never the reflection (the blood paint is)
+    }
+    const bool clip = regs.vs_output_control.clip_distance_enable != 0 ||
+                      regs.clipper_control.user_clip_plane_enable != 0;
+    if (!g_water_targets.LeaveOut(cb0.Address(), clip)) {
+        return false; // not a reflection's clipping draw
+    }
+    // Enemies, NPCs and hunters wading always stay in the water (2026-11-11: "make
+    // sure actors (enemies and npcs) are included"), outside the budget.
+    static std::atomic<u64> actor_draws{0};
+    if (WaterCharacterDraw(pipeline)) {
+        actor_draws.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const bool keep = g_water_budget.Keep(indices, VR::DrawFrameRecord().id, live_cap);
+    if constexpr (Common::Log::Enabled) {
+        static u32 frames = 0;
+        static u64 last = 0;
+        const u64 id = VR::DrawFrameRecord().id;
+        if (id != last) {
+            last = id;
+            if (++frames % 900 == 1) { // about every 10 s
+                LOG_INFO(Render_Vulkan,
+                         "Water reflections capped at {}: last frame {} reflection draws, {} left "
+                         "out ({} character draws kept so far, outside the cap); this frame's floor "
+                         "{} indices",
+                         cap, g_water_budget.LastTotal(), g_water_budget.LastDropped(),
+                         actor_draws.load(std::memory_order_relaxed),
+                         g_water_budget.Floor() == 0 ? 0u : (1u << (g_water_budget.Floor() - 1)));
+            }
+        }
+    }
+    return !keep;
+}
+
+bool Rasterizer::WaterReflectionSkipped() {
+    if (VR::GetSettings().water_reflections) {
+        return false;
+    }
+    const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
+    const auto& cb0 = regs.color_buffers[0];
+    if (!cb0 || (cb0.GetNumberFmt() == AmdGpu::NumberFormat::Srgb && FastRender::AbOn(11))) {
+        return false; // an sRGB target is never the reflection (the blood paint is)
+    }
+    const bool clip = regs.vs_output_control.clip_distance_enable != 0 ||
+                      regs.clipper_control.user_clip_plane_enable != 0;
+    const bool left_out = g_water_targets.LeaveOut(cb0.Address(), clip);
+    if constexpr (Common::Log::Enabled) {
+        // Test diagnostics (VR_WATER_SKIP_LOG): each target and shader pair left out, once, with
+        // the target's size and format, to tell the planar reflection from other clipping draws.
+        static const bool diag = std::getenv("VR_WATER_SKIP_LOG") != nullptr;
+        if (diag && left_out) {
+            static std::unordered_set<u64> seen;
+            const auto hash_of = [&](u32 stage) -> u64 {
+                const auto* pgm = regs.ProgramForStage(stage);
+                return pgm && pgm->Address<u32*>()
+                           ? AmdGpu::SearchBinaryInfo(pgm->Address<u32*>()).shader_hash
+                           : 0;
+            };
+            const u64 vs = hash_of(static_cast<u32>(Shader::Stage::Vertex));
+            const u64 ps = hash_of(static_cast<u32>(Shader::Stage::Fragment));
+            if (seen.size() < 512 && seen.insert(cb0.Address() ^ (vs << 20) ^ (ps << 40)).second) {
+                const auto& db = regs.depth_buffer;
+                LOG_INFO(Render_Vulkan,
+                         "Water skip diag: target {:#x} {}x{} slices {} fmt {}/{} vs {:#x} ps {:#x} "
+                         "depth {} {}x{}",
+                         cb0.Address(), cb0.Pitch(), cb0.Height(), cb0.NumSlices(),
+                         u32(cb0.GetDataFmt()), u32(cb0.GetNumberFmt()), vs, ps,
+                         db.DepthValid() ? "yes" : "no", db.Pitch(), db.Height());
+            }
+        }
+    }
+    return left_out;
+}
+
+namespace {
+// Water reflections off: the frame number on Stage B's thread (FlushFrameEnd) and the frame each
+// reflection target was last cleared in.
+u64 g_water_frame = 1;
+std::array<std::pair<u64, u64>, 4> g_water_cleared{}; // target address, frame
+} // namespace
+
+// A left-out reflection draw: the frame's first one into its target clears it (to 0, both eyes).
+// The game never clears the reflection (no fast clear: its draws cover it every frame), so with
+// them left out the water read whatever was drawn last, the first frame's few draws, frozen.
+// Stage B (the draw's registers).
+void Rasterizer::WaterReflectionClear() {
+    static u64 left_out = 0, cleared = 0;
+    ++left_out;
+    const auto& col_buf = std::as_const(ScratchDraw::Registers(liverpool)).color_buffers[0];
+    if (!col_buf) {
+        return;
+    }
+    const u64 address = col_buf.Address();
+    auto* slot = &g_water_cleared[0];
+    for (auto& entry : g_water_cleared) {
+        if (entry.first == address) {
+            slot = &entry;
+            break;
+        }
+        if (entry.second < slot->second) {
+            slot = &entry; // the one cleared longest ago makes way
+        }
+    }
+    if (slot->first == address && slot->second == g_water_frame) {
+        return;
+    }
+    *slot = {address, g_water_frame};
+    VideoCore::TextureCache::ImageDesc desc(col_buf,
+                                            std::as_const(ScratchDraw::ColorExtents(liverpool))[0]);
+    const auto image_id = texture_cache.FindImage(desc);
+    texture_cache.FindRenderTarget(image_id, desc);
+    texture_cache.GetImage(image_id).Clear(vk::ClearValue{}, desc.view_info.range);
+    if (++cleared <= 4 || (cleared & 0xFFF) == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Water reflections off: target {:#x} cleared ({} reflection draws left out, {} "
+                 "clears)",
+                 address, left_out, cleared);
+    }
+}
+
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset) {
+    // VR_FRAME_MATCH: the recorder packets this draw commits, at any return.
+    // With FAST_B_PROFILE: the draw's own stage B ticks by category (start and end snapshots).
+    struct FrameMatchBlob {
+        const Scheduler* scheduler;
+        u64 from;
+        std::array<u64, FastRender::BProfile::Count> start{};
+        static std::array<u64, FastRender::BProfile::Count> Snapshot() {
+            auto ticks = FastRender::BProfile::state.ticks;
+            if (FastRender::BProfile::state.active)
+                ticks[FastRender::BProfile::state.current] +=
+                    Common::FencedRDTSC() - FastRender::BProfile::state.last;
+            return ticks;
+        }
+        ~FrameMatchBlob() {
+            if (!scheduler)
+                return;
+            std::array<u64, FastRender::BProfile::Count> spent{};
+            if (FastRender::BProfile::Enabled()) {
+                const auto end = Snapshot();
+                for (size_t i = 0; i < spent.size(); ++i)
+                    spent[i] = end[i] - start[i];
+            }
+            FrameMatch::Get().Blob(scheduler->RecorderView(), from, spent.data(), spent.size());
+        }
+    } frame_match_blob{FrameMatch::Enabled() ? &scheduler : nullptr,
+                       FrameMatch::Enabled() ? scheduler.RecorderView().WritePosition() : 0};
+    // VR_DRAW_CENSUS: this draw's stage B cycles, added to its pass shape at any return.
+    struct CensusTicks {
+        u64 start;
+        ~CensusTicks() {
+            if (start)
+                DrawCensus::Get().AddTicks(Common::FencedRDTSC() - start);
+        }
+    } census_ticks{DrawCensus::Enabled() ? Common::FencedRDTSC() : 0};
+    if (FrameMatch::Enabled() && FastRender::BProfile::Enabled())
+        frame_match_blob.start = FrameMatchBlob::Snapshot();
     FastRender::BProfile::Scope b_detail{FastRender::BProfile::DrawSetup};
+    EyeSpecVariants::g_draw_mask.pipeline = nullptr; // VR_EYE_SPEC: only this draw's own binding
     recording_view_mask = pipeline->GetGraphicsKey().probe_view_mask;
     const auto& regs = ScratchDraw::Registers(liverpool);
     AssertRecordingOwner();
+    // AbOn(12): the bind memo entries BindTextures will look up for this draw's stages (their keys
+    // made on A), asked for now; the render state and the buffers come first.
+    if (binding_packet && binding_packet->resources_prepared &&
+        pipeline == binding_packet->selected && FastRender::AbOn(12) &&
+        PerfMemo::g_switches.Get().bind_memo) {
+        for (size_t i = 0; i < binding_packet->stage_count; ++i) {
+            const auto& prepared = binding_packet->resources[i];
+            if (prepared.keyed)
+                bind_memo.Prefetch(prepared.key, prepared.key_hash);
+        }
+    }
+    if (vr_warp) {
+        VrBodyMapsBeforeDraw(pipeline);
+        VrShadowGridBeforeDraw(pipeline);
+        VrSceneMapsBeforeDraw(pipeline);
+        VrFogGridBeforeDraw(pipeline);
+        VrAirBeforeDraw(pipeline);
+        VrPyramidBeforeDraw(pipeline);
+    }
+    // FAST_CPU_STAGEB_SPLIT stage 1: what this draw resolves (targets, resources,
+    // barriers, uploads) records into a blob, appended to the ring before the submit check below.
+    Scheduler::ResolveBlob resolve_blob{scheduler};
     if (vr_warp) {
         vr_aa_action = VrAaDecide(pipeline, false);
         if (vr_aa_action == static_cast<u8>(VR::Aa::Action::Skip))
@@ -4189,32 +7685,114 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     }
     if (vr_temporal_enabled)
         VrTemporalBeforeDraw(pipeline, false, is_indexed, index_offset);
+    if (FrameMatch::Enabled()) {
+        std::array<u32, AmdGpu::NUM_COLOR_BUFFERS + 1> targets{};
+        for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb)
+            targets[cb] = cb_descs[cb].first.index;
+        targets.back() = db_desc.first.index;
+        FrameMatch::Get().Note(pipeline, pipeline->GetStages(), targets.data(), targets.size());
+    }
+    repeat.allowed = true; // FAST_CPU_REPEAT_DRAW
     if (!BindResources(pipeline)) {
         return;
     }
     auto state = BeginRendering(pipeline);
+    if (DrawCensus::Enabled()) [[unlikely]] {
+        // The shadow atlas cell as ShadowCellSkipped finds it (a square 2048..8192 depth target).
+        int cell = -1;
+        if (regs.depth_buffer.DepthValid()) {
+            const u32 w = regs.depth_buffer.Pitch(), h = regs.depth_buffer.Height();
+            if (w >= 2048 && w <= 8192 && w == h) {
+                const auto& vp = regs.viewports[0];
+                cell = std::clamp(int(vp.yoffset * 4.0f / h), 0, 3) * 4 +
+                       std::clamp(int(vp.xoffset * 4.0f / w), 0, 3);
+            }
+        }
+        DrawCensus::Get().Note(state.width, state.height, state.num_color_attachments,
+                               state.depth_stencil_attachment.image_view != vk::ImageView{},
+                               state.probe_view_mask, cell,
+                               [&](Shader::LogicalStage want) -> u64 {
+                                   for (const auto* stage : pipeline->GetStages())
+                                       if (stage && stage->l_stage == want)
+                                           return stage->pgm_hash; // the guest program's hash
+                                   return 0;
+                               }(Shader::LogicalStage::Vertex),
+                               [&](Shader::LogicalStage want) -> u64 {
+                                   for (const auto* stage : pipeline->GetStages())
+                                       if (stage && stage->l_stage == want)
+                                           return stage->pgm_hash;
+                                   return 0;
+                               }(Shader::LogicalStage::Fragment));
+    }
     VrNativeAudit(pipeline, &state);
     if (vr_temporal_enabled)
         pipeline = VrTemporalSelect(pipeline, state);
+    // FAST_CPU_STAGEB_SPLIT=2 (stage 3): a plain draw's encode half goes to fast:StageB2 as the
+    // slot's job, its blob kept open for the barriers and the pass begin (stage B owns the pass).
+    // Draws with VR extras of their own stay here: their first use of the command stream waits
+    // until B2 has caught up (Scheduler::SplitSync).
+    SplitDrawJob* const job = [&]() -> SplitDrawJob* {
+        if (!scheduler.SplitThreaded() || GpuPassProfiler::For(scheduler) != nullptr)
+            return nullptr;
+        if (vr_shadow_near_clear && vr_shadow_near_serial != vr_shadow_near_done)
+            return nullptr; // (its clear goes into this pass, before its draw)
+        if (vr_warp && vr_aa_action != 0)
+            return nullptr;
+        if (vr_ui_layer && vr_ui.armed && !vr_ui.incomplete)
+            return nullptr;
+        if (vr_warp && is_indexed &&
+            (probe_selected || recording_vr.hands_split || recording_vr.body_split ||
+             recording_vr.split))
+            return nullptr;
+        return &split_jobs[scheduler.SplitSlot()];
+    }();
     // Before anything of this draw is bound into the command buffer (vertex buffers, descriptors,
     // dynamic state): its transitions and uploads so far go with the submitted part.
+    if (!job) {
+        resolve_blob.Close(); // FAST_CPU_STAGEB_SPLIT: the resolve part ends here
+    }
     MaybeSubmitMidFrame(state);
     // VR aa_mode=smaa: the game's FXAA draw, its images bound, replaced by SMAA.
     if (vr_warp && vr_aa_action != 0 && VrAaReplace(pipeline, state)) {
         ResetBindings();
         return;
     }
-    // VR UI layer: this UI colour draw is also drawn into K and W (before the game's own).
+    // VR UI layer: this UI colour draw is also drawn into K and W (before the game's own); their
+    // depth/stencil twin is made ready before this draw's binds.
     const bool ui_shadow = vr_ui_layer && VrUiPrepare(pipeline, state);
+    if (ui_shadow) {
+        VrUiDepthBefore(pipeline, state);
+    }
+    const bool ui_mask = vr_ui_layer && VrUiMaskPrepare(pipeline, state, ui_shadow);
 
     u64 motion_geometry{};
+    // FAST_CPU_STAGEB_SPLIT stage 2: the binds resolved into split_binds, then encoded from it
+    // (=2: into the job, encoded on B2).
+    Vulkan::VertexBinds* const binds =
+        job ? &job->binds : scheduler.StageBSplit() ? &split_binds : nullptr;
+    if (binds) {
+        binds->Clear();
+    }
+    // FAST_CPU_VERTEX_STREAM (buffer_cache.cpp): what a non-indexed draw fetches, its vkCmdDraw
+    // arguments below (the split job's and the UI layer's shadow and mask draws repeat them).
+    std::optional<VideoCore::VertexFetch> fetch;
+    if (!is_indexed) {
+        const auto [first_vertex, first_instance] = GetDrawOffsets(
+            regs, pipeline->GetStage(Shader::LogicalStage::Vertex), pipeline->GetFetchShader());
+        fetch = VideoCore::VertexFetch{first_vertex, regs.num_indices, first_instance,
+                                       regs.num_instances.NumInstances()};
+    }
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers,
                                    pipeline->HasVrMotion() ? &motion_geometry : nullptr,
                                    binding_packet && binding_packet->vertex_prepared &&
                                            binding_packet->selected == pipeline
-                                       ? &binding_packet->vertex_view : nullptr);
+                                       ? &binding_packet->vertex_view : nullptr,
+                                   binds, fetch ? &*fetch : nullptr);
     if (is_indexed) {
-        buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
+        buffer_cache.BindIndexBuffer(index_offset, buffer_barriers, binds);
+    }
+    if (binds && !job) {
+        VideoCore::BufferCache::EncodeVertexBinds(*binds, scheduler.Commands());
     }
     {
         const u64 vs_hash = pipeline->GuestShaderKey(Shader::LogicalStage::Vertex);
@@ -4272,16 +7850,60 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
         g_draw_noalloc ? GetDrawOffsets(regs, vs_info, fetch_shader)
                        : GetDrawOffsets(regs, vs_info, // FAST_CPU_DRAW_NOALLOC=0: the copy
                                         std::optional<Shader::Gcn::FetchShaderData>{fetch_shader});
+    if (pipeline->HasVrCapture()) {
+        // Body maps (vr_body_maps.h): this draw of his stores its positions; a draw the frame
+        // cannot take reads the disabled entry 0 (it stores nothing) of the same buffers.
+        const u64 frame = VR::DrawFrameRecord().id;
+        u32 param = 0;
+        u64 params = 0, positions = 0;
+        VrBodyMaps::Draw draw = recording_vr.capture_draw;
+        draw.vertex_offset = vertex_offset;
+        draw.first_instance = instance_offset;
+        if (!recording_vr.capture ||
+            !vr_body_maps->AddDraw(frame, draw, param, params, positions)) {
+            vr_body_maps->Disabled(params, positions);
+            param = 0;
+        }
+        push_data.vr_hud = Shader::VrMotion::PackPush(u32(push_data.vr_hud), param);
+        vr_push.motion_params = params;
+        vr_push.motion_positions = positions;
+    } else if (recording_vr.capture_missed) {
+        vr_body_maps->Missed(VR::DrawFrameRecord().id);
+    }
     if (pipeline->HasVrMotion()) {
+        FastRender::BProfile::Scope b_motion{FastRender::BProfile::RecMotion};
         const u32 motion = VrTemporalPrepareDraw(pipeline, motion_geometry, is_indexed,
                                                  index_offset, vertex_offset, instance_offset);
         push_data.vr_hud = Shader::VrMotion::PackPush(u32(push_data.vr_hud), motion);
     }
     vr_push.scene_inverse = vr_scene_inverse;
-    pipeline->BindResources(set_writes, buffer_barriers, push_data, vr_push, NativeHandles());
-    UpdateDynamicState(pipeline, is_indexed);
+    if (job) {
+        // =2: the pairing into the job; its barriers end the pass here, the rest goes to B2.
+        pipeline->PairResources(set_writes, buffer_barriers, NativeHandles(), nullptr,
+                                job->resources);
+        pipeline->EncodeBarriers(job->resources.barriers);
+        job->resources.barriers.clear();
+        job->push_data = push_data;
+        job->vr_push = vr_push;
+    } else if (scheduler.StageBSplit()) {
+        // FAST_CPU_STAGEB_SPLIT stage 2: the pairing into an owned copy, then the encode from it.
+        pipeline->PairResources(set_writes, buffer_barriers, NativeHandles(), nullptr,
+                                split_resources);
+        pipeline->EncodeResources(split_resources, push_data, vr_push);
+    } else {
+        pipeline->BindResources(set_writes, buffer_barriers, push_data, vr_push, NativeHandles(),
+                                nullptr, {buffer_infos.data(), buffer_infos.size()},
+                                {image_infos.data(), image_infos.size()});
+    }
+    // VR_EYE_SPEC: this draw's shared buffer bindings, as its own pairing just made them (the job
+    // and split paths pair elsewhere: they bind the base pipeline).
+    const vk::Pipeline eye_handle =
+        EyeSpecVariants::Bound(pipeline, static_cast<const Pipeline*>(pipeline));
+    UpdateDynamicState(pipeline, is_indexed, false, job ? &job->dynamic : nullptr);
+    NoteEyeDraws(pipeline, push_data.vr_hud);
 
     if (vr_warp && is_indexed && probe_selected) {
+        FastRender::BProfile::Scope b_extra{FastRender::BProfile::RecVrExtra};
         VrProbeDraw(pipeline, state, s32(vertex_offset), instance_offset);
     }
     // The UI layer's shadow draws (K and W): before the game's draw, or (FAST_GPU_PASS_MERGE,
@@ -4297,7 +7919,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     };
     const bool shadow_after = ui_shadow && VrUiShadowAfter(pipeline, state);
     if (ui_shadow && !shadow_after) {
-        VrUiShadowDraw(pipeline, state, VrDrawCall::Of(issue), false);
+        FastRender::BProfile::Scope b_extra{FastRender::BProfile::RecVrExtra};
+        VrUiShadowDraw(pipeline, state, VrDrawCall::Of(issue), false, ui_mask);
+    }
+    if (ui_mask && !ui_shadow) {
+        FastRender::BProfile::Scope b_extra{FastRender::BProfile::RecVrExtra};
+        VrUiMaskReplay(pipeline, state, VrDrawCall::Of(issue));
     }
     if (SkipNoopDraw(pipeline, state, is_indexed, ui_shadow)) {
         // Bit 54: no pass, pipeline or draw for a draw that cannot write memory.
@@ -4306,36 +7933,197 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
             VrAfterDraw(pipeline, state);
         }
         ResetBindings();
+        repeat.valid = false;
         return;
     }
     if (GpuPassProfiler* const profiler = GpuPassProfiler::For(scheduler);
         profiler != nullptr && scheduler.WillBeginRendering(state)) [[unlikely]] {
         LabelGpuPass(*profiler, pipeline, state); // FAST_GPU_PASS_PROFILE, bit 38
     }
+    {
+        // The lamp shadows' mask pass (the game's AO pass) at a finer rate than the foveation's
+        // (light_shadow.h MaskFoveaInner); every other pass as the foveation has it.
+        const auto* const mask_fs = pipeline->GetStages()[static_cast<size_t>(Shader::LogicalStage::Fragment)];
+        // (... and the two half-size passes that make the depth it reads, the linear depth
+        // 0x01ae5388 and the depth shrink 0xe820ee9d: traced finely over depth drawn in the
+        // foveation's blocks, every surface in the ring was a staircase that shadowed itself,
+        // a dark ring from the foveation's edge outward. The user saw it in a test run, 2026-11-15.)
+        const bool mask_pass =
+            mask_fs != nullptr && VrSceneMaskOn() &&
+            (Shader::Optimization::AmbientOcclusion::IsAoProgram(mask_fs->pgm_hash) ||
+             mask_fs->pgm_hash == 0x01ae5388u || mask_fs->pgm_hash == 0xe820ee9du);
+        // (Live key lighting.shadow_fovea, in steps of 0.02: each value is a rate map of its own.)
+        float mask_floor = 0.0f;
+        if (mask_pass) {
+            mask_floor = std::round(std::clamp(VR::Tune::Get("lighting.shadow_fovea",
+                                                             Shader::Optimization::LightShadow::SceneMaps::MaskFoveaInner()),
+                                               0.0f, 4.0f) *
+                                    50.0f) /
+                         50.0f;
+        }
+        scheduler.SetFoveationInnerFloor(mask_floor);
+    }
     scheduler.BeginRendering(state);
+    VrShadowNearClear(state, regs.depth_clear);
+    if (GpuCrash::CheckpointsOn()) [[unlikely]] {
+        const auto& hashes = pipeline->GetGraphicsKey().stage_hashes;
+        GpuCrash::NoteDraw(hashes[static_cast<size_t>(Shader::LogicalStage::Vertex)],
+                           hashes[static_cast<size_t>(Shader::LogicalStage::Fragment)]);
+    }
+    if (BatchCensus::Enabled()) [[unlikely]] {
+        NoteBatchCensus(pipeline, state, is_indexed, index_offset);
+    }
 
-    const auto cmdbuf = scheduler.Commands();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
-
-    if (is_indexed) {
+    // FAST_GPU_PASS_PROFILE_DRAWS=1: each lamp draw's own GPU time (its shader and its number
+    // among that shader's draws this frame).
+    if (GpuPassProfiler* const profiler = GpuPassProfiler::For(scheduler);
+        profiler != nullptr && GpuPassProfiler::DrawsOn()) [[unlikely]] {
+        const auto* const fs_info = pipeline->GetStages()[static_cast<size_t>(
+            Shader::LogicalStage::Fragment)];
+        const u64 ps = fs_info != nullptr ? fs_info->pgm_hash : 0;
+        const auto layout = NativeProjection::LightListLayout(ps);
+        if (fs_info != nullptr && layout.kind != NativeProjection::LightKind::None) {
+            if (lamp_draw_frame != profiler->FrameNo()) {
+                lamp_draw_frame = profiler->FrameNo();
+                lamp_draw_seen.clear();
+            }
+            const u32 nth = lamp_draw_seen[ps]++;
+            const u64 key = GpuPassProfiler::Mix(GpuPassProfiler::Mix(0x1A4D'0000'0001ull, ps), nth);
+            const u32 views = std::max(1, std::popcount(u32(state.probe_view_mask)));
+            profiler->StampDraw(key, u32(views), GpuPassProfiler::Group::Scene, [&] {
+                return fmt::format("lamp draw ps {:08x} ({} {} light(s)) #{}", ps,
+                                   NativeProjection::Name(layout.kind), layout.count, nth);
+            });
+        }
+    }
+    if (job) {
+        // =2: the pass begin went into the blob; B2 binds and draws (SplitEncode).
+        job->pipeline = pipeline;
+        job->handle = pipeline->Handle();
+        job->indexed = is_indexed;
+        job->count = regs.num_indices;
+        job->instances = regs.num_instances.NumInstances();
+        job->vertex_offset = u32(vertex_offset);
+        job->instance_offset = instance_offset;
+        scheduler.SplitSubmit(true);
+    } else if (is_indexed) {
+        const auto cmdbuf = scheduler.Commands();
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, eye_handle);
         if (!vr_warp || !VrDrawCapeSplit(cmdbuf, regs.num_instances.NumInstances(),
                                          s32(vertex_offset), instance_offset)) {
-            cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
-                               s32(vertex_offset), instance_offset);
+            // VR_EXP_DRAW_SPLIT=1 (GPU timing experiment only): a G-buffer triangle list drawn as
+            // two draws of its halves, same state: the GPU's cost of one more draw.
+            static const bool exp_split = [] {
+                const char* v = std::getenv("VR_EXP_DRAW_SPLIT");
+                return v && v[0] == '1';
+            }();
+            const u32 count = regs.num_indices;
+            const bool split = exp_split && state.num_color_attachments == 6 && count >= 6 &&
+                               regs.primitive_type == AmdGpu::PrimitiveType::TriangleList;
+            if (exp_split && state.num_color_attachments == 6) {
+                static u64 split_draws = 0, kept_draws = 0;
+                ++(split ? split_draws : kept_draws);
+                if (((split_draws + kept_draws) & 0xFFFF) == 0)
+                    LOG_INFO(Render_Vulkan,
+                             "VR_EXP_DRAW_SPLIT: {} G-buffer draws split, {} not (primitive {})",
+                             split_draws, kept_draws, static_cast<u32>(regs.primitive_type));
+            }
+            DrawEyes(cmdbuf, eye_draws, [&] {
+                if (split) {
+                    const u32 half = count / 6 * 3;
+                    cmdbuf.drawIndexed(half, regs.num_instances.NumInstances(), 0,
+                                       s32(vertex_offset), instance_offset);
+                    cmdbuf.drawIndexed(count - half, regs.num_instances.NumInstances(), half,
+                                       s32(vertex_offset), instance_offset);
+                    return;
+                }
+                cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
+                                   s32(vertex_offset), instance_offset);
+            });
         }
     } else {
-        cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
-                    instance_offset);
+        const auto cmdbuf = scheduler.Commands();
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, eye_handle);
+        DrawEyes(cmdbuf, eye_draws, [&] {
+            cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
+                        instance_offset);
+        });
     }
     if (shadow_after) {
-        VrUiShadowDraw(pipeline, state, VrDrawCall::Of(issue), true);
+        FastRender::BProfile::Scope b_extra{FastRender::BProfile::RecVrExtra};
+        VrUiShadowDraw(pipeline, state, VrDrawCall::Of(issue), true, ui_mask);
     }
     DebugState.IncDrawCall();
     if (vr_warp) {
+        FastRender::BProfile::Scope b_extra{FastRender::BProfile::RecVrExtra};
         VrAfterDraw(pipeline, state);
     }
 
     ResetBindings();
+    // FAST_CPU_REPEAT_DRAW: what this draw recorded is the next draw's starting point; anything
+    // recorded before the next draw's BindResources makes it miss.
+    repeat.uses_end = scheduler.CommandUses();
+}
+
+// VR_BATCH_CENSUS (vr_batch_census.h): this draw's identity at each batching level, right after its
+// pass begin (the bindings, push data and dynamic state are this draw's).
+void Rasterizer::NoteBatchCensus(const GraphicsPipeline* pipeline, const RenderState& state,
+                                 bool is_indexed, u32 index_offset) {
+    using BatchCensus::Mix;
+    using BatchCensus::MixBytes;
+    const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
+    BatchCensus::DrawKey k;
+    k.pass = scheduler.PassBegins();
+    k.pipeline = reinterpret_cast<u64>(static_cast<VkPipeline>(pipeline->Handle()));
+    u64 material = k.pipeline;
+    for (const auto& info : image_infos) {
+        material = Mix(material, reinterpret_cast<u64>(static_cast<VkSampler>(info.sampler)));
+        material = Mix(material, reinterpret_cast<u64>(static_cast<VkImageView>(info.imageView)));
+        material = Mix(material, u64(info.imageLayout));
+    }
+    k.material = material;
+    u64 buffers = 0, offsets = 0;
+    for (const auto& info : buffer_infos) {
+        buffers = Mix(buffers, reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)));
+        buffers = Mix(buffers, info.range);
+        offsets = Mix(offsets, info.offset);
+    }
+    k.buffers = buffers;
+    k.offsets = offsets;
+    const auto& d = scheduler.GetDynamicState();
+    u64 dyn = 0;
+    for (const auto& v : d.viewports)
+        dyn = MixBytes(dyn, &v, sizeof(v));
+    for (const auto& s : d.scissors)
+        dyn = MixBytes(dyn, &s, sizeof(s));
+    const std::array<u64, 12> flags{
+        u64(d.depth_test_enabled) | u64(d.depth_write_enabled) << 1 |
+            u64(d.depth_bounds_test_enabled) << 2 | u64(d.depth_bias_enabled) << 3 |
+            u64(d.stencil_test_enabled) << 4 | u64(d.primitive_restart_enable) << 5,
+        u64(d.depth_compare_op),
+        std::bit_cast<u32>(d.depth_bias_constant) | u64(std::bit_cast<u32>(d.depth_bias_slope)) << 32,
+        u64(d.stencil_front_ops.compare_op) | u64(d.stencil_front_ops.pass_op) << 8 |
+            u64(d.stencil_front_ops.fail_op) << 16 | u64(d.stencil_front_ops.depth_fail_op) << 24,
+        u64(d.stencil_front_reference) | u64(d.stencil_front_write_mask) << 32,
+        u64(d.stencil_front_compare_mask) | u64(d.stencil_back_reference) << 32,
+        u64(d.stencil_back_write_mask) | u64(d.stencil_back_compare_mask) << 32,
+        u64(d.stencil_back_ops.compare_op) | u64(d.stencil_back_ops.pass_op) << 8 |
+            u64(d.stencil_back_ops.fail_op) << 16 | u64(d.stencil_back_ops.depth_fail_op) << 24,
+        u64(static_cast<VkCullModeFlags>(d.cull_mode)) | u64(d.front_face) << 8,
+        std::bit_cast<u32>(d.blend_constants[0]) | u64(std::bit_cast<u32>(d.blend_constants[1])) << 32,
+        std::bit_cast<u32>(d.blend_constants[2]) | u64(std::bit_cast<u32>(d.blend_constants[3])) << 32,
+        std::bit_cast<u32>(d.depth_bounds_min) | u64(std::bit_cast<u32>(d.depth_bounds_max)) << 32};
+    dyn = MixBytes(dyn, flags.data(), sizeof(flags));
+    for (const auto& mask : d.color_write_masks)
+        dyn = Mix(dyn, u64(static_cast<VkColorComponentFlags>(mask)));
+    k.dynamic = dyn;
+    k.user_data = MixBytes(0, push_data.ud_regs.data(), sizeof(push_data.ud_regs));
+    k.index_type = is_indexed ? 1 + static_cast<u32>(regs.index_buffer_type.index_type) : 0;
+    k.index_addr = is_indexed ? regs.index_base_address.Address() + index_offset : 0;
+    k.instances = regs.num_instances.NumInstances();
+    k.indices = regs.num_indices;
+    k.gbuffer = state.num_color_attachments == 6;
+    BatchCensus::Get().Note(k);
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -4350,11 +8138,19 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
     if (worker_active) {
-        if (!IsRegularDraw()) {
+        if (!IsRegularDraw() || ShadowCellSkipped() || GameLampMapSkipped()) {
             RecordPacket({}, nullptr, PacketKind::FilteredDraw);
             return;
         }
-    } else if (!FilterDraw()) {
+        if (WaterReflectionSkipped()) {
+            // Stage B clears its target once a frame (WaterReflectionClear).
+            RecordPacket({}, nullptr, PacketKind::FilteredDraw, false, 0, WaterReflectionMark);
+            return;
+        }
+    } else if (!FilterDraw() || ShadowCellSkipped() || GameLampMapSkipped()) {
+        return;
+    } else if (WaterReflectionSkipped()) {
+        WaterReflectionClear();
         return;
     }
 
@@ -4370,6 +8166,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
     if (DiagSkip::Skip(pipeline->GetStages())) // FAST_DIAG_SKIP_FILE (diagnostic)
         return;
+    if (WaterReflectionCapped(~0u, pipeline))
+        return; // over the water reflection's budget
     VrSkipNoteDraw(pipeline);
     if (!PrepareVrDraw(pipeline, is_indexed, true, 0))
         return;
@@ -4380,17 +8178,53 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         recording_vr = producer_vr;
         probe_selected = recording_vr.probe_selected;
         selection_lock.unlock();
+        vr_shadow_near_clear = shadow_near_a != 0;
+        vr_shadow_near_serial = shadow_near_a;
         DrawIndirectRecord(pipeline, is_indexed, arg_address, offset, stride, max_count,
                            count_address);
+        vr_shadow_near_clear = false;
     }
+}
+
+// The shadow atlas held over frames (vr_shadow_hold.h): the first draw into a near cascade that
+// a held frame really records clears the near cascades' part of the atlas (its top half, or the
+// top left quarter with one near cascade), in its own pass, just begun.
+void Rasterizer::VrShadowNearClear(const RenderState& state, float depth) {
+    if (!vr_shadow_near_clear || vr_shadow_near_serial == vr_shadow_near_done ||
+        state.depth_stencil_attachment.image_view == vk::ImageView{}) [[likely]] {
+        return;
+    }
+    vr_shadow_near_done = vr_shadow_near_serial;
+    vk::ClearAttachment near_clear{.aspectMask = vk::ImageAspectFlagBits::eDepth};
+    near_clear.clearValue.depthStencil = vk::ClearDepthStencilValue{.depth = depth, .stencil = 0};
+    const vk::ClearRect near_rect{
+        .rect = vk::Rect2D{vk::Offset2D{0, 0},
+                           vk::Extent2D{static_cast<u32>(ShadowHold::NearTiles() >= 2 ? state.width : state.width / 2),
+                                        static_cast<u32>(state.height / 2)}},
+        .baseArrayLayer = 0,
+        .layerCount = 1,
+    };
+    scheduler.Commands().clearAttachments(near_clear, near_rect);
 }
 
 void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                                     VAddr arg_address, u32 offset, u32 stride, u32 max_count,
                                     VAddr count_address) {
     FastRender::BProfile::Scope b_detail{FastRender::BProfile::DrawSetup};
+    EyeSpecVariants::g_draw_mask.pipeline = nullptr; // VR_EYE_SPEC: only this draw's own binding
     recording_view_mask = pipeline->GetGraphicsKey().probe_view_mask;
     AssertRecordingOwner();
+    if (vr_warp) {
+        VrBodyMapsBeforeDraw(pipeline);
+        VrShadowGridBeforeDraw(pipeline);
+        VrSceneMapsBeforeDraw(pipeline);
+        VrFogGridBeforeDraw(pipeline);
+        VrAirBeforeDraw(pipeline);
+        VrPyramidBeforeDraw(pipeline);
+    }
+    // FAST_CPU_STAGEB_SPLIT stage 1: what this draw resolves (targets, resources,
+    // barriers, uploads) records into a blob, appended to the ring before the submit check below.
+    Scheduler::ResolveBlob resolve_blob{scheduler};
     if (vr_warp) {
         vr_aa_action = VrAaDecide(pipeline, true);
         if (vr_aa_action == static_cast<u8>(VR::Aa::Action::Skip))
@@ -4439,16 +8273,30 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     }
     const auto state = BeginRendering(pipeline);
     VrNativeAudit(pipeline, &state);
+    resolve_blob.Close(); // FAST_CPU_STAGEB_SPLIT: the resolve part ends here
     MaybeSubmitMidFrame(state);
-    // VR UI layer: this UI colour draw is also drawn into K and W (before the game's own).
+    // VR UI layer: this UI colour draw is also drawn into K and W (before the game's own); their
+    // depth/stencil twin is made ready before this draw's binds.
     const bool ui_shadow = vr_ui_layer && VrUiPrepare(pipeline, state);
+    if (ui_shadow) {
+        VrUiDepthBefore(pipeline, state);
+    }
+    const bool ui_mask = vr_ui_layer && VrUiMaskPrepare(pipeline, state, ui_shadow);
 
+    Vulkan::VertexBinds* const binds = scheduler.StageBSplit() ? &split_binds : nullptr;
+    if (binds) {
+        binds->Clear();
+    }
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers, nullptr,
                                    binding_packet && binding_packet->vertex_prepared &&
                                            binding_packet->selected == pipeline
-                                       ? &binding_packet->vertex_view : nullptr);
+                                       ? &binding_packet->vertex_view : nullptr,
+                                   binds);
     if (is_indexed) {
-        buffer_cache.BindIndexBuffer(0, buffer_barriers);
+        buffer_cache.BindIndexBuffer(0, buffer_barriers, binds);
+    }
+    if (binds) {
+        VideoCore::BufferCache::EncodeVertexBinds(*binds, scheduler.Commands());
     }
     {
         const u64 vs_hash = pipeline->GuestShaderKey(Shader::LogicalStage::Vertex);
@@ -4521,9 +8369,19 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
 
     FastRender::BProfile::Scope b_recording{FastRender::BProfile::Recording};
     vr_push.scene_inverse = vr_scene_inverse;
-    pipeline->BindResources(set_writes, buffer_barriers, push_data, vr_push, NativeHandles());
-    UpdateDynamicState(pipeline, is_indexed);
-    if (ui_shadow) {
+    if (scheduler.StageBSplit()) {
+        // FAST_CPU_STAGEB_SPLIT stage 2: the pairing into an owned copy, then the encode from it.
+        pipeline->PairResources(set_writes, buffer_barriers, NativeHandles(), nullptr,
+                                split_resources);
+        pipeline->EncodeResources(split_resources, push_data, vr_push);
+    } else {
+        pipeline->BindResources(set_writes, buffer_barriers, push_data, vr_push, NativeHandles(),
+                                nullptr, {buffer_infos.data(), buffer_infos.size()},
+                                {image_infos.data(), image_infos.size()});
+    }
+    UpdateDynamicState(pipeline, is_indexed, true);
+    NoteEyeDraws(pipeline, push_data.vr_hud);
+    if (ui_shadow || ui_mask) {
         const auto issue = [&](RecorderProxy cb) {
             if (is_indexed) {
                 if (count_address != 0) {
@@ -4540,7 +8398,11 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
             }
         };
         // Always before the game's draw here (FAST_GPU_PASS_MERGE swaps only direct draws).
-        VrUiShadowDraw(pipeline, state, VrDrawCall::Of(issue), false);
+        if (ui_shadow) {
+            VrUiShadowDraw(pipeline, state, VrDrawCall::Of(issue), false, ui_mask);
+        } else {
+            VrUiMaskReplay(pipeline, state, VrDrawCall::Of(issue));
+        }
     }
     if (SkipNoopDraw(pipeline, state, is_indexed, ui_shadow)) {
         // Bit 54: no pass, pipeline or draw; the argument buffers' barriers are already recorded.
@@ -4556,32 +8418,43 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         LabelGpuPass(*profiler, pipeline, state); // FAST_GPU_PASS_PROFILE, bit 38
     }
     scheduler.BeginRendering(state);
+    VrShadowNearClear(state, std::as_const(ScratchDraw::Registers(liverpool)).depth_clear);
+    if (GpuCrash::CheckpointsOn()) [[unlikely]] {
+        const auto& hashes = pipeline->GetGraphicsKey().stage_hashes;
+        GpuCrash::NoteDraw(hashes[static_cast<size_t>(Shader::LogicalStage::Vertex)],
+                           hashes[static_cast<size_t>(Shader::LogicalStage::Fragment)]);
+    }
 
     // We can safely ignore both SGPR UD indices and results of fetch shader parsing, as vertex and
     // instance offsets will be automatically applied by Vulkan from indirect args buffer.
 
     const auto cmdbuf = scheduler.Commands();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics,
+                        EyeSpecVariants::Bound(pipeline, static_cast<const Pipeline*>(pipeline)));
 
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
 
-        if (count_address != 0) {
-            cmdbuf.drawIndexedIndirectCount(buffer->Handle(), base, count_buffer->Handle(),
-                                            count_base, max_count, stride);
-        } else {
-            cmdbuf.drawIndexedIndirect(buffer->Handle(), base, max_count, stride);
-        }
+        DrawEyes(cmdbuf, eye_draws, [&] {
+            if (count_address != 0) {
+                cmdbuf.drawIndexedIndirectCount(buffer->Handle(), base, count_buffer->Handle(),
+                                                count_base, max_count, stride);
+            } else {
+                cmdbuf.drawIndexedIndirect(buffer->Handle(), base, max_count, stride);
+            }
+        });
         DebugState.IncDrawCall();
     } else {
         ASSERT(sizeof(VkDrawIndirectCommand) == stride);
 
-        if (count_address != 0) {
-            cmdbuf.drawIndirectCount(buffer->Handle(), base, count_buffer->Handle(), count_base,
-                                     max_count, stride);
-        } else {
-            cmdbuf.drawIndirect(buffer->Handle(), base, max_count, stride);
-        }
+        DrawEyes(cmdbuf, eye_draws, [&] {
+            if (count_address != 0) {
+                cmdbuf.drawIndirectCount(buffer->Handle(), base, count_buffer->Handle(),
+                                         count_base, max_count, stride);
+            } else {
+                cmdbuf.drawIndirect(buffer->Handle(), base, max_count, stride);
+            }
+        });
         DebugState.IncDrawCall();
     }
     if (vr_warp) {
@@ -4628,11 +8501,18 @@ void Rasterizer::LabelGpuPass(GpuPassProfiler& profiler, const GraphicsPipeline*
             colors += formats[cb] != vk::Format::eUndefined ? vk::to_string(formats[cb])
                                                              : std::string{"-"};
         }
-        return fmt::format("pass {}x{}{} [{}] depth {} vs {:08x} ps {:08x}", state.width,
+        // (The lamp shadows' two hosts, for the tools: the game's AO pass (the shadow mask's
+        // march) and a pass that begins with a lamp shader's draw (the lamp draws).)
+        const char* const tag =
+            Shader::Optimization::AmbientOcclusion::IsAoProgram(ps_hash) ? " {AO pass}"
+            : ps != nullptr && ps->vr_light_shadow.on && ps->vr_light_shadow.count != 0
+                ? " {lamp draws}"
+                : "";
+        return fmt::format("pass {}x{}{} [{}] depth {} vs {:08x} ps {:08x}{}", state.width,
                            state.height, state.probe_view_mask != 0 ? " multiview" : "", colors,
                            depth != vk::Format::eUndefined ? vk::to_string(depth)
                                                            : std::string{"-"},
-                           vs_hash, ps_hash);
+                           vs_hash, ps_hash, tag);
     });
 }
 
@@ -4659,7 +8539,8 @@ EyeOverlap::Check* Rasterizer::EyeOverlapBegin(const Shader::Info& cs) {
             }
         }
     }
-    check.collect = check.reason == Reason::Taken && EyeOverlap::VerifyPeriod() != 0;
+    check.collect = check.reason == Reason::Taken &&
+                    (EyeOverlap::VerifyPeriod() != 0 || MergedEyes::VerifyPeriod() != 0);
     return &check;
 }
 
@@ -4688,8 +8569,8 @@ namespace {
 // destroyed: its scratch buffers must not outlive the device in a static destructor at exit.
 struct EyeOverlapVerifyState {
     std::mutex sample_mutex;
-    std::unordered_set<u64> seen;
-    u64 taken{};
+    std::unordered_set<u64> seen, merged_seen; // VR_MERGED_EYES=v samples on its own
+    u64 taken{}, merged_taken{};
     std::atomic<bool> in_flight{false}; // cleared by the deferred comparison
     // Replaced only while no sample is in flight; a pending comparison keeps its own references.
     std::shared_ptr<VideoCore::Buffer> saved, old_order, swapped;
@@ -4704,8 +8585,9 @@ EyeOverlapVerifyState& EyeOverlapVerifyStateOf() {
 // its pipeline, descriptors and pre-barriers are recorded; record_eye(eye) pushes that eye's
 // constants and records its dispatch. The caller records the closing barrier.
 template <typename RecordEye>
-bool Rasterizer::EyeOverlapVerify(const Shader::Info& cs, const RecordEye& record_eye) {
-    const u32 period = EyeOverlap::VerifyPeriod();
+bool Rasterizer::EyeOverlapVerify(const Shader::Info& cs, const RecordEye& record_eye,
+                                  const std::function<void()>* merged) {
+    const u32 period = merged ? MergedEyes::VerifyPeriod() : EyeOverlap::VerifyPeriod();
     if (period == 0) {
         return false;
     }
@@ -4713,13 +8595,16 @@ bool Rasterizer::EyeOverlapVerify(const Shader::Info& cs, const RecordEye& recor
     {
         // The first taken dispatch of every shader, then every period-th.
         std::scoped_lock lock{state.sample_mutex};
-        if (!state.seen.insert(cs.pgm_hash).second && ++state.taken % period != 0) {
+        auto& seen = merged ? state.merged_seen : state.seen;
+        auto& taken = merged ? state.merged_taken : state.taken;
+        if (!seen.insert(cs.pgm_hash).second && ++taken % period != 0) {
             return false;
         }
     }
-    auto& stats = EyeOverlap::g_stats;
-    const auto skip = [&stats] {
-        stats.verify_skipped.fetch_add(1, std::memory_order_relaxed);
+    auto& skipped = merged ? MergedEyes::g_stats.verify_skipped
+                           : EyeOverlap::g_stats.verify_skipped;
+    const auto skip = [&skipped] {
+        skipped.fetch_add(1, std::memory_order_relaxed);
         return false;
     };
     if (state.in_flight.load(std::memory_order_acquire)) {
@@ -4836,9 +8721,13 @@ bool Rasterizer::EyeOverlapVerify(const Shader::Info& cs, const RecordEye& recor
     barrier();
     restore(saved);
     barrier();
-    record_eye(1); // swapped: right, barrier, left
-    barrier();
-    record_eye(0);
+    if (merged) {
+        (*merged)(); // both eyes in one launch
+    } else {
+        record_eye(1); // swapped: right, barrier, left
+        barrier();
+        record_eye(0);
+    }
     barrier();
     save(state.swapped->Handle());
     const vk::MemoryBarrier2 to_host{
@@ -4863,11 +8752,16 @@ bool Rasterizer::EyeOverlapVerify(const Shader::Info& cs, const RecordEye& recor
                          target.region.imageSubresource.baseArrayLayer, bool(target.image)});
     }
     scheduler.DeferOperation([a = state.old_order, b = state.swapped, spans = std::move(spans),
-                              total, hash = cs.pgm_hash] {
-        auto& stats = EyeOverlap::g_stats;
+                              total, hash = cs.pgm_hash, is_merged = merged != nullptr] {
+        auto& verify_skipped = is_merged ? MergedEyes::g_stats.verify_skipped
+                                         : EyeOverlap::g_stats.verify_skipped;
+        auto& verify_ok =
+            is_merged ? MergedEyes::g_stats.verify_ok : EyeOverlap::g_stats.verify_ok;
+        auto& verify_mismatch = is_merged ? MergedEyes::g_stats.verify_mismatch
+                                          : EyeOverlap::g_stats.verify_mismatch;
         auto& in_flight = EyeOverlapVerifyStateOf().in_flight;
         if (a->mapped_data.size() < total || b->mapped_data.size() < total) {
-            stats.verify_skipped.fetch_add(1, std::memory_order_relaxed);
+            verify_skipped.fetch_add(1, std::memory_order_relaxed);
             in_flight.store(false, std::memory_order_release);
             return;
         }
@@ -4892,16 +8786,17 @@ bool Rasterizer::EyeOverlapVerify(const Shader::Info& cs, const RecordEye& recor
             }
         }
         if (first == spans.size()) {
-            stats.verify_ok.fetch_add(1, std::memory_order_relaxed);
+            verify_ok.fetch_add(1, std::memory_order_relaxed);
         } else {
-            const u64 n = stats.verify_mismatch.fetch_add(1, std::memory_order_relaxed) + 1;
+            const u64 n = verify_mismatch.fetch_add(1, std::memory_order_relaxed) + 1;
             if (n <= 16 || n % 256 == 0) {
                 const auto& span = spans[first];
                 LOG_ERROR(Render_Vulkan,
-                          "FAST dispatch_eye_overlap verify: cs {:08x}: {} bytes differ between "
-                          "the old and the swapped eye order, first in target {}/{} ({}) at "
-                          "byte {}, mismatch #{}",
-                          hash, differing, first, spans.size(),
+                          "{} verify: cs {:08x}: {} bytes differ between the two launches and "
+                          "{}, first in target {}/{} ({}) at byte {}, mismatch #{}",
+                          is_merged ? "VR merged eyes" : "FAST dispatch_eye_overlap", hash,
+                          differing, is_merged ? "the merged one" : "the swapped eye order",
+                          first, spans.size(),
                           span.image ? fmt::format("image level {} layer {}", span.level,
                                                    span.layer)
                                      : std::string{"buffer range"},
@@ -4989,7 +8884,15 @@ void Rasterizer::DispatchDirectRecord(const ComputePipeline* pipeline) {
     EyeOverlap::Check* const eye_overlap = EyeOverlapBegin(cs); // bit 53, null when off
     // Compute pushes PushData alone (no VR values after it).
     pipeline->BindResources(set_writes, buffer_barriers, push_data, {}, NativeHandles(),
-                            eye_overlap);
+                            eye_overlap, {buffer_infos.data(), buffer_infos.size()},
+                            {image_infos.data(), image_infos.size()});
+    // VR_DISPATCH_MONO=d: whether both eyes of this dispatch do the same work (set_writes now
+    // holds the paired writes).
+    if (DispatchMono::Mode() == 'd' && NativeStereo::Enabled()) [[unlikely]] {
+        DispatchMono::Get().Note(cs.pgm_hash, cs_program.dim_x * cs_program.dim_y * cs_program.dim_z,
+                                 DispatchMono::Classify(cs, pipeline->NativeWritableBindings(),
+                                                        set_writes));
+    }
 
     const auto cmdbuf = scheduler.Commands();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
@@ -5005,7 +8908,39 @@ void Rasterizer::DispatchDirectRecord(const ComputePipeline* pipeline) {
                              sizeof(eye_push), &eye_push);
         cmdbuf.dispatch(dim_x, dim_y, cs_program.dim_z);
     };
-    if (eyes_overlap && EyeOverlapVerify(cs, record_eye)) {
+    // VR_MERGED_EYES (vr_merged_eyes.h): a taken pair of one group deep, without screen
+    // rectangles, in one launch once its variant is built (until then: asked for, two launches).
+    vk::Pipeline merged_handle{};
+    if (MergedEyes::Variant* const merged = eyes_overlap ? pipeline->Merged() : nullptr;
+        merged && cs_program.dim_z == 1 && vr_rect_groups[0] == 0 && vr_rect_groups[1] == 0 &&
+        !cs.vr_screen_rect.Valid()) {
+        const auto state = merged->state.load(std::memory_order_acquire);
+        if (state == MergedEyes::State::Ready) {
+            merged_handle = *merged->pipeline;
+        } else if (state == MergedEyes::State::None) {
+            auto none = MergedEyes::State::None;
+            merged->state.compare_exchange_strong(none, MergedEyes::State::Wanted,
+                                                  std::memory_order_acq_rel);
+        }
+        if (state != MergedEyes::State::Failed) {
+            MergedEyes::NoteDispatch(bool(merged_handle));
+        }
+    }
+    if (merged_handle) {
+        // Its layout is defined like the pipeline's: the descriptors and push constants
+        // recorded with pipeline->GetLayout() serve it. The eye is the group's z (vr_hud unread).
+        const std::function<void()> record_merged = [&] {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, merged_handle);
+            ScratchPush::Invalidate();
+            cmdbuf.pushConstants(pipeline->GetLayout(), vk::ShaderStageFlagBits::eCompute, 0u,
+                                 sizeof(push_data), &push_data);
+            cmdbuf.dispatch(dim_x, dim_y, 2u);
+        };
+        if (!EyeOverlapVerify(cs, record_eye, &record_merged)) {
+            record_merged();
+        }
+        NativeStereo::Barrier(scheduler);
+    } else if (eyes_overlap && EyeOverlapVerify(cs, record_eye)) {
         NativeStereo::Barrier(scheduler);
     } else {
         cmdbuf.dispatch(dim_x, dim_y, cs_program.dim_z);
@@ -5100,7 +9035,8 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     EyeOverlap::Check* const eye_overlap = EyeOverlapBegin(cs); // bit 53, null when off
     // Compute pushes PushData alone (no VR values after it).
     pipeline->BindResources(set_writes, buffer_barriers, push_data, {}, NativeHandles(),
-                            eye_overlap);
+                            eye_overlap, {buffer_infos.data(), buffer_infos.size()},
+                            {image_infos.data(), image_infos.size()});
 
     const auto cmdbuf = scheduler.Commands();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
@@ -5157,8 +9093,20 @@ u64 Rasterizer::Flush() {
 }
 
 void Rasterizer::FlushFrameEnd() {
+    if (FrameMatch::Enabled())
+        FrameMatch::Get().FrameEnd();
+    if (DrawCensus::Enabled())
+        DrawCensus::Get().FrameEnd();
+    if (BatchCensus::Enabled())
+        BatchCensus::Get().FrameEnd();
+    if (DsAb::Alternating())
+        DsAb::Get().FrameEnd();
+    buffer_cache.RetileFrameEnd(); // VR_RETILE_DEFER=m
+    UpdateBusyShadows();
+    ++g_water_frame; // Water reflections off: each target cleared once a frame
     DrainDrawPipe(DrawPipe::RasterizerEntry);
     scheduler.FlushFrameEnd();
+    frame_end_tick = scheduler.CurrentTick() - 1; // DeferGuestFlush: this frame's last submitted
 }
 
 void Rasterizer::Finish() {
@@ -5284,6 +9232,65 @@ void Rasterizer::MaybeSubmitMidFrame(const RenderState& next_state) {
     ++midframe_submits;
 }
 
+// A/B switch 3 (FAST_GUEST_FLUSH_DEFER=0 off; 2026-11-02): Liverpool's flushes at the end of a
+// guest submission (SignalIdle, the last RetireSubmission) under bit 62's busy rule. In the VR mock
+// (2000x2160 DLSS, GPU-bound) they were 10.4 of the 14.7 submissions per game frame
+// (VR_SUBMIT_CENSUS), each a queue boundary of 20-50 us GPU idle. With FAST_CPU_SIGNAL_AT_REPLAY
+// the replay writes the guest signals at their packets, so these submissions only hand the work
+// to the GPU sooner: while the GPU still runs the last one submitted, the work stays in the open
+// command buffer for the next cut (a pass switch, the flip, the frame end or a Wait()), and the
+// replay tasks queued after it run where they did (SignalsWritten still checks their signals).
+// Held only while the GPU still runs the previous game frame (its last tick at FlushFrameEnd):
+// then it has that frame's rest and this frame's submitted part queued. These flushes come when
+// the guest queue runs empty, so the stage may idle after one; a paced frame's GPU finishes the
+// previous frame early in this one, and its flushes late in the frame are taken as before (held
+// on any GPU work alone, a 90 Hz run left work unsubmitted while the GPU ran dry). Taken as
+// before too: in the other signal modes (a submission's replay writes the signals), with bit 62
+// or gpu_submit_ms off, or past the busy cap. Deferral is only on B: before its last queued
+// packet is released it submits any still-open deferred tick. This keeps a quiet producer from
+// stranding work, and keeps the flush within Drain/Wait's ownership boundary.
+bool Rasterizer::DeferGuestFlush() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("FAST_GUEST_FLUSH_DEFER");
+        return !(value && value[0] == '0');
+    }();
+    if (!FastRender::IsStageB() || !enabled || !FastRender::AbOn(3) ||
+        g_signal_mode != SignalPolicy::Mode::AtReplay ||
+        !FastRender::On(SubmitCadence) || VR::GetSettings().gpu_submit_ms <= 0.0f) {
+        return false;
+    }
+    auto& s = submit_cadence;
+    if (scheduler.RecordingTime() >=
+        std::chrono::duration<float, std::milli>(SubmitCadenceBusyMs())) {
+        ++s.guest_cap;
+        return false;
+    }
+    MasterSemaphore& semaphore = *scheduler.GetMasterSemaphore();
+    const auto now = std::chrono::steady_clock::now();
+    if (semaphore.IsFree(frame_end_tick) || (now - cadence_poll >= SubmitCadencePoll() && [&] {
+                                                 cadence_poll = now;
+                                                 ++s.polls;
+                                                 semaphore.Refresh();
+                                                 return semaphore.IsFree(frame_end_tick);
+                                             }())) {
+        ++s.guest_idle;
+        return false;
+    }
+    ++s.guest_deferred;
+    scheduler.NoteDeferredCut();
+    guest_deferred_tick = scheduler.CurrentTick();
+    draw_pipe->BeforeIdle(+[](void* context) {
+        auto& self = *static_cast<Rasterizer*>(context);
+        const u64 tick = std::exchange(self.guest_deferred_tick, 0);
+        if (tick == self.scheduler.CurrentTick()) {
+            if (g_task_publish)
+                self.scheduler.PublishRecorder();
+            self.scheduler.Flush();
+        }
+    });
+    return true;
+}
+
 void Rasterizer::ReportSubmitCadence() {
     auto& s = submit_cadence;
     const auto waits = scheduler.TakeOpenTickWaits();
@@ -5293,11 +9300,13 @@ void Rasterizer::ReportSubmitCadence() {
              "FAST submit_cadence: bit={} frames={} submits/f={:.2f} midframe/f={:.2f}; bit off: "
              "cuts={} (gpu known idle {}); bit on: eligible={} (pass switches past gpu_submit_ms) "
              "taken idle={} cap={} fallback signals={} deferred={} ({:.2f}/f) polls/f={:.2f} "
-             "busy_ms={:.2f}; open_tick_flushes={} on_deferred_tick={}; verify={} verify_idle={}",
+             "busy_ms={:.2f}; open_tick_flushes={} on_deferred_tick={}; verify={} verify_idle={}; "
+             "guest flushes held={:.2f}/f taken caught_up={:.2f}/f cap={:.2f}/f",
              FastRender::On(SubmitCadence) ? 1 : 0, s.frames, s.submits / frames,
              s.midframe / frames, s.old_cuts, s.old_idle_known, eligible, s.idle, s.cap, s.signals,
              s.deferred, s.deferred / frames, s.polls / frames, SubmitCadenceBusyMs(), waits.flushes,
-             waits.deferred, s.verified, s.verify_idle);
+             waits.deferred, s.verified, s.verify_idle, s.guest_deferred / frames,
+             s.guest_idle / frames, s.guest_cap / frames);
     const u64 sequence = s.verify_sequence;
     s = {};
     s.verify_sequence = sequence;
@@ -5348,8 +9357,10 @@ void Rasterizer::OnSubmit() {
         buffer_cache.ProcessFaultBuffer();
     }
     texture_cache.ProcessDownloadImages();
-    texture_cache.RunGarbageCollector(VR::TakeTransitionTextureCleanupRequest());
-    buffer_cache.RunGarbageCollector();
+    // A warp, a death or a new map: both caches clean up after it (the same request).
+    const u64 transition_request = VR::TakeTransitionTextureCleanupRequest();
+    texture_cache.RunGarbageCollector(transition_request);
+    buffer_cache.RunGarbageCollector(transition_request);
 }
 
 // Fast bit 25: native stereo right handles carried through binding instead of registry lookups
@@ -5377,7 +9388,207 @@ static const u64 g_resource_prep_force_fallback_every = [] {
     return v ? std::strtoull(v, nullptr, 0) : 0ULL;
 }();
 
+// FAST_CPU_REPEAT_DRAW (vk_rasterizer.h RepeatDraw), read once at start-up.
+static const char g_repeat_draw = [] {
+    const char* value = std::getenv("FAST_CPU_REPEAT_DRAW");
+    return value && (value[0] == '1' || value[0] == 'v') ? value[0] : '0';
+}();
+
+bool Rasterizer::RepeatKey(const Pipeline* pipeline, std::array<u32, 9>& targets,
+                           Shader::PushData& base) {
+    repeat_flat.clear();
+    for (const auto* stage : pipeline->GetStages()) {
+        if (stage) {
+            const auto flat = stage->FlatUserData();
+            repeat_flat.push_back(u32(flat.size()));
+            repeat_flat.insert(repeat_flat.end(), flat.begin(), flat.end());
+        }
+    }
+    targets.fill(0);
+    for (u32 cb = 0; cb < 8; ++cb)
+        targets[cb] = cb_descs[cb].first.index;
+    targets[8] = db_desc.first.index;
+    base = MakeUserData(std::as_const(ScratchDraw::Registers(liverpool)));
+    auto& r = repeat;
+    // The first condition that fails, counted (logged with the hits).
+    const u32 why = !r.valid                   ? 0
+                    : r.pipeline != pipeline   ? 1
+                    : r.flat != repeat_flat    ? 2
+                    : r.targets != targets     ? 3
+                    : std::memcmp(&r.base, &base, sizeof(base)) != 0 ? 4
+                    : r.uses_end != scheduler.CommandUses() ? 5
+                    : r.faults != FastRender::g_fault_epoch.load(std::memory_order_acquire) ? 6
+                    : r.texture_epoch != texture_cache.RegistryEpoch() ? 7
+                    : r.buffer_epoch != buffer_cache.CopyMemoEpoch()   ? 8
+                    : r.perf_epoch != PerfMemo::Epoch()                ? 9
+                    : r.buffer_gen != NativeStereo::BufferGeneration() ||
+                              r.view_gen != NativeStereo::ViewGeneration()
+                        ? 10
+                        : 11;
+    ++r.why[why];
+    if constexpr (Common::Log::Enabled) {
+        if ((++r.keys & 0xFFFF) == 0)
+            LOG_INFO(Render_Vulkan,
+                     "FAST_CPU_REPEAT_DRAW: {} keys, hits {}; misses: invalid {} pipeline {} "
+                     "user data {} targets {} push {} recorded {} fault {} images {} buffers {} "
+                     "perf {} stereo {}; stored {} verified {} mismatches {}",
+                     r.keys, r.why[11], r.why[0], r.why[1], r.why[2], r.why[3], r.why[4],
+                     r.why[5], r.why[6], r.why[7], r.why[8], r.why[9], r.why[10], r.stored,
+                     r.verified, r.mismatches);
+    }
+    return why == 11;
+}
+
+void Rasterizer::RepeatRestore() {
+    const auto& r = repeat;
+    // The infos go back to the same arrays (static_vector: the same addresses), so the
+    // remembered writes and hints point at them as they did.
+    image_infos = r.image_infos;
+    buffer_infos = r.buffer_infos;
+    set_writes = r.writes;
+    set_write_index = r.set_write_index;
+    buffer_barriers.clear();
+    stereo_handles = r.stereo_handles;
+    buffer_hints = r.buffer_hints;
+    view_hints = r.view_hints;
+    barrier_hints.clear();
+    native_handles = r.native_handles;
+    push_data = r.push;
+    // The binding flags BindTextures sets (BeginRendering's feedback check reads them).
+    for (const auto id : r.bound_images)
+        texture_cache.GetImage(id).binding.is_bound = 1u;
+    bound_images = r.bound_images;
+}
+
+void Rasterizer::RepeatStore(const Pipeline* pipeline, const std::array<u32, 9>& targets,
+                             const Shader::PushData& base) {
+    auto& r = repeat;
+    r.pipeline = pipeline;
+    std::swap(r.flat, repeat_flat);
+    r.targets = targets;
+    r.base = base;
+    r.push = push_data;
+    r.writes.assign(set_writes.begin(), set_writes.end());
+    r.set_write_index = set_write_index;
+    r.image_infos = image_infos;
+    r.buffer_infos = buffer_infos;
+    r.bound_images = bound_images;
+    r.stereo_handles = stereo_handles;
+    r.buffer_hints = buffer_hints;
+    r.view_hints = view_hints;
+    r.native_handles = native_handles;
+    r.valid = true; // uses_end: at the end of the draw (DrawRecord)
+    r.uses_end = ~u64{0};
+    ++r.stored;
+}
+
+const char* Rasterizer::RepeatCompare() const {
+    const auto& r = repeat;
+    if (r.writes.size() != set_writes.size() || r.set_write_index != set_write_index)
+        return "write count";
+    for (size_t i = 0; i < set_writes.size(); ++i) {
+        const auto& a = r.writes[i];
+        const auto& b = set_writes[i];
+        if (a.dstBinding != b.dstBinding || a.dstArrayElement != b.dstArrayElement ||
+            a.descriptorCount != b.descriptorCount || a.descriptorType != b.descriptorType ||
+            a.pImageInfo != b.pImageInfo || a.pBufferInfo != b.pBufferInfo)
+            return "write";
+    }
+    if (r.image_infos.size() != image_infos.size() ||
+        !std::equal(image_infos.begin(), image_infos.end(), r.image_infos.begin()))
+        return "image infos";
+    if (r.buffer_infos.size() != buffer_infos.size() ||
+        !std::equal(buffer_infos.begin(), buffer_infos.end(), r.buffer_infos.begin()))
+        return "buffer infos";
+    if (!buffer_barriers.empty())
+        return "barriers";
+    if (std::memcmp(&r.push, &push_data, sizeof(push_data)) != 0)
+        return "push data";
+    if (r.bound_images.size() != bound_images.size() ||
+        !std::equal(bound_images.begin(), bound_images.end(), r.bound_images.begin()))
+        return "bound images";
+    if (r.stereo_handles != stereo_handles || r.buffer_hints.size() != buffer_hints.size() ||
+        r.view_hints.size() != view_hints.size() ||
+        std::memcmp(r.buffer_hints.data(), buffer_hints.data(),
+                    buffer_hints.size() * sizeof(buffer_hints[0])) != 0 ||
+        std::memcmp(r.view_hints.data(), view_hints.data(),
+                    view_hints.size() * sizeof(view_hints[0])) != 0)
+        return "hints";
+    return nullptr;
+}
+
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
+    // FAST_CPU_REPEAT_DRAW: only DrawRecord's call may take or leave the remembered bindings.
+    const bool repeat_allowed = g_repeat_draw != '0' && repeat.allowed;
+    repeat.allowed = false;
+    std::array<u32, 9> repeat_targets;
+    Shader::PushData repeat_base;
+    bool repeat_hit = false;
+    if (!repeat_allowed) {
+        repeat.valid = false;
+    } else {
+        repeat_hit = RepeatKey(pipeline, repeat_targets, repeat_base);
+        if (repeat_hit && g_repeat_draw == '1') {
+            resource_bindings = nullptr;
+            FastRender::BProfile::Scope b_profile{FastRender::BProfile::Resources};
+            Perf::NextDraw();
+            vr_mirror_pipeline = pipeline;
+            vr_mirror_noted = vr_mirror_looked = false;
+            RepeatRestore();
+            ++repeat.hits;
+            if constexpr (Common::Log::Enabled) {
+                if (((repeat.hits + repeat.misses) & 0x7FFFF) == 0)
+                    LOG_INFO(Render_Vulkan, "FAST_CPU_REPEAT_DRAW: hits {} misses {} stored {}",
+                             repeat.hits, repeat.misses, repeat.stored);
+            }
+            return true;
+        }
+        repeat.misses += repeat_hit ? 0 : 1;
+    }
+    const u64 repeat_uses = scheduler.CommandUses();
+    // The epochs from before the resolve: a change during it makes the next draw resolve too.
+    const u64 epoch_faults = FastRender::g_fault_epoch.load(std::memory_order_acquire);
+    const u64 epoch_texture = texture_cache.RegistryEpoch();
+    const u64 epoch_buffer = buffer_cache.CopyMemoEpoch();
+    const u32 epoch_perf = PerfMemo::Epoch();
+    const u64 epoch_buffer_gen = NativeStereo::BufferGeneration();
+    const u64 epoch_view_gen = NativeStereo::ViewGeneration();
+    const bool full = BindResourcesFull(pipeline);
+    if (!repeat_allowed)
+        return full;
+    if (repeat_hit) {
+        // Verify: the full path ran; it must agree and must have recorded nothing.
+        ++repeat.verified;
+        const char* what = scheduler.CommandUses() != repeat_uses ? "recorded" : RepeatCompare();
+        if (what) {
+            ++repeat.mismatches;
+            if (repeat.mismatches <= 64 || (repeat.mismatches & 1023) == 0)
+                LOG_ERROR(Render_Vulkan,
+                          "FAST_CPU_REPEAT_DRAW verify: {} differs (mismatch #{} of {} checked)",
+                          what, repeat.mismatches, repeat.verified);
+        }
+        if constexpr (Common::Log::Enabled) {
+            if ((repeat.verified & 0xFFFF) == 0)
+                LOG_INFO(Render_Vulkan, "FAST_CPU_REPEAT_DRAW verify: {} checked, {} mismatches",
+                         repeat.verified, repeat.mismatches);
+        }
+    }
+    const auto& writes = pipeline->Writes();
+    if (full && !pipeline->IsCompute() && !writes.dma && !writes.buffers && !writes.images) {
+        RepeatStore(pipeline, repeat_targets, repeat_base);
+        repeat.faults = epoch_faults;
+        repeat.texture_epoch = epoch_texture;
+        repeat.buffer_epoch = epoch_buffer;
+        repeat.perf_epoch = epoch_perf;
+        repeat.buffer_gen = epoch_buffer_gen;
+        repeat.view_gen = epoch_view_gen;
+    } else {
+        repeat.valid = false;
+    }
+    return full;
+}
+
+bool Rasterizer::BindResourcesFull(const Pipeline* pipeline) {
     resource_bindings = nullptr;
     FastRender::BProfile::Scope b_profile{FastRender::BProfile::Resources};
     AssertRecordingOwner();
@@ -5390,42 +9601,16 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // eye barrier; noted under native stereo whatever the bit, so the bit may flip at any time.
     const bool small_read_direct = FastRender::On(VideoCore::BufferCache::SmallReadDirect);
     const bool note_eye_writes = NativeStereo::Enabled() && !pipeline->IsCompute();
-    const bool writes_memory = (small_read_direct || note_eye_writes) && [pipeline] {
-        for (const auto* stage : pipeline->GetStages()) {
-            if (!stage) {
-                continue;
-            }
-            if (stage->uses_dma) {
-                return true;
-            }
-            for (const auto& desc : stage->buffers) {
-                if (desc.is_written) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }();
+    const auto& stage_writes = pipeline->Writes();
+    const bool writes_memory =
+        (small_read_direct || note_eye_writes) && (stage_writes.dma || stage_writes.buffers);
     buffer_cache.SetSmallReadDirect(small_read_direct && !writes_memory);
     // Bit 53 also needs a draw's storage image writes (bit 33 does not: they are not buffers). An
     // image bound both sampled and written takes TransitTexture's force_general path, whose
     // tracked access (ShaderRead | ColorAttachment*) has no write flag, so a later game dispatch
     // binding it the same way gets no transition barrier: only the middle eye barrier then orders
     // the draw's layer-1 accesses before the right dispatch.
-    if (note_eye_writes && !eye_unordered_writes &&
-        (writes_memory || [pipeline] {
-            for (const auto* stage : pipeline->GetStages()) {
-                if (!stage) {
-                    continue;
-                }
-                for (const auto& image : stage->images) {
-                    if (image.is_written) {
-                        return true;
-                    }
-                }
-            }
-            return false;
-        }())) {
+    if (note_eye_writes && !eye_unordered_writes && (writes_memory || stage_writes.images)) {
         eye_unordered_writes = true;
     }
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
@@ -5456,11 +9641,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // The resync memo (vr_perf.h): a new draw's bindings. A raw-memory (DMA) shader may write any
     // buffer: every memo is invalid from here.
     Perf::NextDraw();
-    for (const auto* stage : pipeline->GetStages()) {
-        if (stage && stage->uses_dma) {
-            Perf::NoteDma();
-            break;
-        }
+    if (stage_writes.dma) {
+        Perf::NoteDma();
     }
 
     bool uses_dma = false;
@@ -5565,6 +9747,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
 Rasterizer::CopyBuffers Rasterizer::ObtainCopyBuffers(VAddr src_addr, u32 src_size, VAddr dst_addr,
                                                       u32 dst_size) {
+    // VR_RETILE_DEFER: perf_copy_memo's hits bind without ObtainBuffer.
+    buffer_cache.MaterializeRetiles(src_addr, src_size, VideoCore::BufferCache::RetileHleCopy);
+    buffer_cache.MaterializeRetiles(dst_addr, dst_size, VideoCore::BufferCache::RetileHleCopy);
     if (!PerfMemo::g_switches.Get().copy_memo) {
         const auto [src, src_offset] = buffer_cache.ObtainBuffer(src_addr, src_size, false);
         const auto [dst, dst_offset] = buffer_cache.ObtainBuffer(dst_addr, dst_size, true);
@@ -5585,6 +9770,10 @@ Rasterizer::CopyBuffers Rasterizer::ObtainCopyBuffers(VAddr src_addr, u32 src_si
         copy_memo.Find(key, cache_epoch, src_track, dst_track, memo_epoch);
     if (found && !PerfMemo::CheckMode()) {
         ++copy_counters.hits;
+        buffer_cache.MarkUsed(VideoCore::BufferId{found->src_buffer});
+        buffer_cache.MarkUsed(VideoCore::BufferId{found->dst_buffer});
+        // Bound for writing without ObtainBuffer: the motion snapshots there are stale.
+        buffer_cache.NoteMotionWrite(dst_addr, dst_size);
         return {&buffer_cache.GetBuffer(VideoCore::BufferId{found->src_buffer}), found->src_offset,
                 &buffer_cache.GetBuffer(VideoCore::BufferId{found->dst_buffer}), found->dst_offset};
     }
@@ -5934,6 +10123,14 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
         return reject("buffer sizes differ or dim_x != size / 256");
     }
 
+    const auto identity_dword = [](const AmdGpu::Buffer& b) {
+        const auto fmt = b.GetNumberFmt();
+        return b.GetStride() == 4 && b.GetDataFmt() == AmdGpu::DataFormat::Format32 &&
+               (fmt == AmdGpu::NumberFormat::Float || fmt == AmdGpu::NumberFormat::Uint ||
+                fmt == AmdGpu::NumberFormat::Sint) &&
+               b.dst_sel_x == 4 && !b.swizzle_enable && !b.add_tid_enable;
+    };
+
     // Find images the buffer alias
     const auto image0_id = texture_cache.FindImageFromRange(buf0.base_address, buf0.GetSize());
     if (!image0_id) {
@@ -5947,13 +10144,6 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
         // Audited shader 3d5ebf4e: one formatted dword load/store per invocation,
         // guarded by SGPR10. Only replace complete, non-overlapping, identity copies.
         auto& source = texture_cache.GetImage(image0_id);
-        const auto identity_dword = [](const AmdGpu::Buffer& b) {
-            const auto fmt = b.GetNumberFmt();
-            return b.GetStride() == 4 && b.GetDataFmt() == AmdGpu::DataFormat::Format32 &&
-                   (fmt == AmdGpu::NumberFormat::Float || fmt == AmdGpu::NumberFormat::Uint ||
-                    fmt == AmdGpu::NumberFormat::Sint) &&
-                   b.dst_sel_x == 4 && !b.swizzle_enable && !b.add_tid_enable;
-        };
         const u64 bytes = buf0.GetSize();
         if (direct_buffer && NativeStereo::Enabled() && info.pgm_hash == 0x3d5ebf4e &&
             !desc0.is_written && desc1.is_written && identity_dword(buf0) && identity_dword(buf1) &&
@@ -5965,9 +10155,7 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
             (buf1.base_address + bytes <= buf0.base_address ||
              buf0.base_address + bytes <= buf1.base_address)) {
             const auto& mip = source.info.mips_layout[0];
-            const auto [destination, offset] =
-                buffer_cache.ObtainBuffer(buf1.base_address, bytes, true, true);
-            vk::BufferImageCopy region{
+            const vk::BufferImageCopy region{
                 .bufferOffset = 0,
                 .bufferRowLength = mip.pitch,
                 .bufferImageHeight = mip.height,
@@ -5979,10 +10167,17 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
                 .imageOffset = {0, 0, 0},
                 .imageExtent = {source.info.size.width, source.info.size.height, 1},
             };
-            NativeStereo::Barrier(scheduler);
-            texture_cache.GetTileManager().TileImage(source, std::span{&region, 1},
-                                                     destination->Handle(), offset, bytes);
-            NativeStereo::Barrier(scheduler);
+            // VR_RETILE_DEFER: nothing reads these destinations in play (0 reads in ~3,000
+            // copies, Old Yharnam and the lamp, 2026-10-31): the re-tile waits for a reader.
+            if (!buffer_cache.DeferImageRetile(buf1.base_address, bytes, image0_id, region)) {
+                const auto [destination, offset] =
+                    buffer_cache.ObtainBuffer(buf1.base_address, bytes, true, true);
+                auto copy = region;
+                NativeStereo::Barrier(scheduler);
+                texture_cache.GetTileManager().TileImage(source, std::span{&copy, 1},
+                                                         destination->Handle(), offset, bytes);
+                NativeStereo::Barrier(scheduler);
+            }
             texture_cache.InvalidateMemoryFromGPU(buf1.base_address, bytes);
             // FAST bit 39 copy-chain probe (counters only; the re-tile above reads the image
             // itself with the bit on): is this destination uploaded into an image again?
@@ -6006,10 +10201,55 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     VideoCore::Image& image0 = texture_cache.GetImage(image0_id);
     VideoCore::Image& image1 = texture_cache.GetImage(image1_id);
     if (image0.info.guest_size != image1.info.guest_size ||
-        image0.info.pitch != image1.info.pitch || image0.info.guest_size != buf0.GetSize() ||
-        image0.info.num_bits != image1.info.num_bits) {
-        return reject("the two images differ in size, pitch or bits, or image 0's size is not "
-                      "the buffer's");
+        image0.info.pitch != image1.info.pitch || image0.info.num_bits != image1.info.num_bits) {
+        return reject("the two images differ in size, pitch or bits");
+    }
+
+    u32 tail_bytes = 0;
+    if (image0.info.guest_size != buf0.GetSize()) {
+        const auto tail = ImageCopyTailBytes(buf0.base_address, buf1.base_address,
+                                            image0.info.guest_size, buf0.GetSize());
+        // Unlike the existing exact-size path, only widen the audited identity-copy
+        // shader. SGPR10 bounds its stores; a partial dispatch must stay on the GPU.
+        if (!tail || info.pgm_hash != 0x3d5ebf4e || desc0.is_written || !desc1.is_written ||
+            !identity_dword(buf0) || !identity_dword(buf1) ||
+            buf0.GetNumberFmt() != buf1.GetNumberFmt() ||
+            info.UserData().size() <= 10 || info.UserData()[10] < buf0.GetSize() / 4 ||
+            cs_pgm.dim_y != 1 || cs_pgm.dim_z != 1) {
+            return reject("not a complete padded identity copy");
+        }
+        const auto& a = image0.info;
+        const auto& b = image1.info;
+        // Keep the new path to matching single-mip, single-sample colour images.
+        // A byte copy between different tiled layouts is not an image copy.
+        if (image0.native_stereo != image1.native_stereo ||
+            a.type != AmdGpu::ImageType::Color2D || a.type != b.type || a.size != b.size ||
+            a.pixel_format != b.pixel_format || a.resources != b.resources ||
+            a.resources.levels != 1 || a.resources.layers != 1 || a.size.depth != 1 ||
+            a.num_samples != 1 || b.num_samples != 1 ||
+            a.props.is_depth || b.props.is_depth || a.props.has_stencil || b.props.has_stencil ||
+            a.props.is_block || b.props.is_block || a.tile_mode != b.tile_mode ||
+            a.array_mode != b.array_mode || a.bank_swizzle != b.bank_swizzle ||
+            a.alt_tile != b.alt_tile || a.props.is_pow2 != b.props.is_pow2 ||
+            a.mips_layout[0].size != a.guest_size || b.mips_layout[0].size != b.guest_size ||
+            a.mips_layout[0].offset != 0 || b.mips_layout[0].offset != 0 ||
+            a.mips_layout[0].pitch != b.mips_layout[0].pitch ||
+            a.mips_layout[0].height != b.mips_layout[0].height) {
+            return reject("padded copy image layouts differ or are unsupported");
+        }
+        // The extra bytes must be buffer data, not part of another cached image.
+        // Otherwise the general shader path must handle its image coherence too.
+        bool aliases_image = false;
+        for (const auto address : {buf0.base_address + a.guest_size,
+                                   buf1.base_address + a.guest_size}) {
+            texture_cache.ForEachImageInRegion(
+                address, *tail,
+                [&](VideoCore::ImageId, VideoCore::Image&) { aliases_image = true; });
+        }
+        if (aliases_image) {
+            return reject("padded copy tail aliases an image");
+        }
+        tail_bytes = *tail;
     }
 
     // Perform image copy
@@ -6025,6 +10265,20 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     }
     dst_image.flags |= VideoCore::ImageFlagBits::GpuModified;
     dst_image.flags &= ~VideoCore::ImageFlagBits::Dirty;
+    ++dst_image.write_serial;
+    if (tail_bytes != 0) {
+        // bbport copies the padding separately. Use our existing buffer tracking
+        // and stereo copy so right-eye data and GPU-written bytes stay intact.
+        const VAddr src_tail = src_image.info.guest_address + src_image.info.guest_size;
+        const VAddr dst_tail = dst_image.info.guest_address + dst_image.info.guest_size;
+        const auto [src, src_offset, dst, dst_offset] =
+            ObtainCopyBuffers(src_tail, tail_bytes, dst_tail, tail_bytes);
+        NativeStereo::Barrier(scheduler);
+        NativeStereo::Copy(scheduler, src->Handle(), dst->Handle(),
+                           vk::BufferCopy{src_offset, dst_offset, tail_bytes});
+        NativeStereo::Barrier(scheduler);
+        texture_cache.InvalidateMemoryFromGPU(dst_tail, tail_bytes);
+    }
     return true;
 }
 
@@ -6323,6 +10577,13 @@ void Rasterizer::ProbeClearReject(const Shader::Info& info, const char* why) {
              info.images.size(), why, details);
 }
 
+// FAST_MIP0_CLEAR=0 (read once at start-up) refuses first-level clears of mipped images again
+// (IsComputeImageClear), for A/B.
+static const bool g_mip0_clear = [] {
+    const char* value = std::getenv("FAST_MIP0_CLEAR");
+    return value == nullptr || value[0] != '0';
+}();
+
 bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     if (!pipeline->IsCompute()) {
         return false;
@@ -6371,9 +10632,22 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
         return reject(ClearRefusal::NoImage, "no image at buffer 1's address");
     }
 
-    // Image clear must be valid
+    // Image clear must be valid: the whole image, or (g_mip0_clear) exactly the first level of a
+    // mipped image at its own address. Wet streets (2026-11-11): every frame the game clears
+    // level 0 of the reflection trace's target (700x756 RGBA16F, 7 levels in a 1024x1024 chain:
+    // 8 MiB of 0xaaae00), which was refused here, filled as bytes in both eyes and marked the
+    // image GpuDirty, so binding it re-uploaded all 7 levels of both eyes (~0.2 ms a frame of
+    // fill, detile and copy, and two more pipeline breaks) for a picture the trace then wrote
+    // whole. Now level 0 of both eyes is cleared on the GPU and the other levels kept. Not over a
+    // pending CPU upload (Dirty): that upload must still reach the other levels.
     VideoCore::Image& image1 = texture_cache.GetImage(image1_id);
-    if (image1.info.guest_size != buf1.GetSize() || image1.info.num_bits != buf1_bpp ||
+    const bool whole = image1.info.guest_size == buf1.GetSize();
+    const bool first_level = !whole && g_mip0_clear && image1.info.resources.levels > 1 &&
+                             image1.info.guest_address == buf1.base_address &&
+                             image1.info.mips_layout[0].offset == 0 &&
+                             image1.info.mips_layout[0].size == buf1.GetSize() &&
+                             False(image1.flags & VideoCore::ImageFlagBits::Dirty);
+    if ((!whole && !first_level) || image1.info.num_bits != buf1_bpp ||
         image1.info.props.is_depth) {
         return reject(ClearRefusal::Image,
                       "the image at buffer 1 differs in size or bits, or is depth");
@@ -6389,7 +10663,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     const vk::ClearValue clear = {
         .color = {.float32 = std::array<float, 4>{values[0], values[1], values[2], values[3]}},
     };
-    const VideoCore::SubresourceRange range = {
+    VideoCore::SubresourceRange range = {
         .base =
             {
                 .level = 0,
@@ -6397,6 +10671,9 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
             },
         .extent = image1.info.resources,
     };
+    if (first_level) {
+        range.extent.levels = 1; // every layer (both eyes), level 0 only
+    }
     Common::MemoryWriteTrace::Event("compute.image.clear", buf1.base_address, buf1.GetSize(),
         info.pgm_hash, Common::MemoryWriteTrace::SourceWord(values, 16));
     image1.Clear(clear, range);
@@ -6550,7 +10827,9 @@ bool Rasterizer::IsComputeClearFill(const Pipeline* pipeline) {
         return fallback(FillFallback::Layout); // the dispatch's binding repeats the calls above
     }
     const vk::Buffer left = dst_buffer->Handle();
-    const vk::Buffer right = NativeStereo::RightBuffer(scheduler, left, true); // left when mono
+    // The cleared range the right eye's own (a sparse view's twin shares the rest); left when
+    // mono.
+    const vk::Buffer right = NativeStereo::RightForWrite(scheduler, left, offset, bytes);
     const bool paired = right && right != left;
 
     // A sample's windows: the filled bytes [offset, verify_end) with up to ClearVerifyGuard bytes
@@ -6857,8 +11136,8 @@ private:
     u32 begin = 0, end = 0;
 };
 
-// FAST_CPU_CB_MEMO (on unless '0', native stereo only; read once at start-up, a plain load per
-// use): BindBuffers finds a stage's prepared constants in one pass over the packet's
+// FAST_CPU_CB_MEMO (on unless '0', flat and DIBR too since 2026-11-01; read once at start-up, a
+// plain load per use): BindBuffers finds a stage's prepared constants in one pass over the packet's
 // (DrawPacket::Constant scanned them all again for every buffer), and asks once per stage what
 // no buffer of it can change: the depth image's shared shadow test (its LRU touch does nothing
 // after the first one of a tick) and the asymmetric projection.
@@ -6882,8 +11161,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     FastRender::BProfile::Scope b_profile{FastRender::BProfile::Buffers};
     ScratchProfile::Cpu scratch_cpu(9, "Rasterizer::BindBuffers");
     buffer_bindings.clear();
-    std::array<const DrawPacket::ConstantBinding*, Shader::NUM_BUFFERS> prepared{};
-    const bool cb_memo = g_cb_memo && NativeStereo::Enabled(); // flat mode: as before
+    std::array<const DrawPacket::ConstantBinding*, Shader::NUM_BUFFERS> prepared;
+    const bool cb_memo = g_cb_memo;
     const bool cb_verify = cb_memo && g_cb_memo_verify;
     static thread_local CbMemoStats cb_stats;
     const auto cb_mismatch = [&](const char* what, u32 index, auto memo, auto full) {
@@ -6910,6 +11189,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         ScratchProfile::Cpu scratch_lookup(16, "BindBuffers::ResolveRanges");
         for (const auto& desc : stage.buffers) {
             const u32 index = static_cast<u32>(buffer_bindings.size());
+            // Every used slot is initialized before lookup; unused tail slots are never read.
+            prepared[index] = nullptr;
             const auto vsharp = resource_bindings ? resource_bindings->buffer_values[index]
                                                  : desc.GetSharp(stage);
             if (binding_packet) {
@@ -6964,6 +11245,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     bool light_view_paired = false;
     float light_view_scale = 0.f;
     float light_view_ipd = 0.f;
+    Shader::Optimization::FogLight::ListView fog_draw_view;
     // Second pass to re-bind buffers that were updated after binding
     for (u32 i = 0; i < buffer_bindings.size(); i++) {
         const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
@@ -6984,42 +11266,71 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         if (shared_shadow && !desc.IsSpecial() && !desc.is_written && size == 864) {
             const auto* scene = static_cast<const float*>(
                 ScratchDraw::MemorySource(reinterpret_cast<const void*>(vsharp.base_address), 864));
-            ASSERT_MSG(scene[66] == 0.f && scene[67] == 1.f,
-                       "Shared shadow experiment encountered a non-orthographic camera");
+            // A perspective camera in the shared atlas (a spot light's shadow: entering Ludwig's
+            // arena, player report 2026-11-07) was an ASSERT, which ended the game. A light's view
+            // is the same for both eyes, so the atlas stays shared; noted once, never fatal. The
+            // statement keeps the assert's shape (do / if / the same test), so this hot function's
+            // renderer PGO profile still applies.
+            do {
+                if (!(scene[66] == 0.f && scene[67] == 1.f)) [[unlikely]] {
+                    LOG_DEBUG(Render_Vulkan, "VR native shared shadow: a perspective camera");
+                    NativeStereo::SharedShadowPerspective(scene[66], scene[67]);
+                }
+            } while (false);
         }
         NativeStereo::CameraConstants temporal_camera;
         const VideoCore::Buffer* owner = nullptr; // bit 25: the buffer this descriptor names
         const bool capture_temporal = vr_temporal && vr_temporal->gbuffer &&
                                       stage.l_stage == Shader::LogicalStage::Vertex &&
-                                      vr_temporal->scene.Objects();
+                                      vr_temporal->scene.Active();
         const auto* constant = prepared[i];
         constant_bind_hits += constant != nullptr;
         bool projection_paired = false, mirrored = false;
         vk::DescriptorBufferInfo native_camera;
+        // (The cheap tests first: most buffers are not a camera block. Every term before the
+        // pairing call is a plain test, so the order changes nothing else.)
         const bool camera =
-            NativeStereo::Enabled() &&
+            size == 864 && NativeStereo::Enabled() &&
             (stage.l_stage == Shader::LogicalStage::Compute || recording_view_mask != 0) &&
-            !desc.IsSpecial() && !desc.is_written && size == 864 &&
+            !desc.IsSpecial() && !desc.is_written &&
             (constant ? constant->camera : NativeStereo::CameraBuffer(
                 buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream),
                 reinterpret_cast<const float*>(vsharp.base_address), alignment,
                 VR::DrawFrameRecord(), native_camera, capture_temporal ? &temporal_camera : nullptr,
                 &projection_paired, mirror_flip ? &mirrored : nullptr));
+        // The frame's camera for the lamp shadows' slots (VrFogCaptureSceneView): the first scene
+        // camera block bound this frame.
+        if (size == 864 && !desc.IsSpecial() && !desc.is_written && vr_fog.view_frame != vr_fog.frame &&
+            recording_view_mask != 0 && stage.l_stage != Shader::LogicalStage::Compute &&
+            VrSceneMapsOn() && !VrInMirrorPass() &&
+            (constant || !buffer_cache.IsRegionGpuModified(vsharp.base_address, size))) [[unlikely]] {
+            VrFogCaptureSceneView(constant ? reinterpret_cast<const float*>(constant_ring->mapped_data.data() +
+                                                                           constant->raw.offset)
+                                           : static_cast<const float*>(ScratchDraw::MemorySource(
+                                                 reinterpret_cast<const void*>(vsharp.base_address), 864)));
+        }
         if (camera && constant) {
             ++constant_pair_hits;
             native_camera = constant->left;
             projection_paired = constant->projected;
             mirrored = constant->mirrored;
             NativeStereo::RegisterCameraPair(constant->left, constant->right);
-            if (capture_temporal) {
-                std::memcpy(temporal_camera[0].data(), constant_ring->mapped_data.data() + constant->left.offset, 864);
-                std::memcpy(temporal_camera[1].data(), constant_ring->mapped_data.data() + constant->right.offset, 864);
-            }
         }
         if (camera && capture_temporal) {
             const auto& viewport = ScratchDraw::Registers(liverpool).viewports[0];
-            vr_temporal->scene.CaptureCamera(temporal_camera, viewport.xscale < 0 ? -1.f : 1.f,
-                                             viewport.yscale < 0 ? -1.f : 1.f);
+            const float xs = viewport.xscale < 0 ? -1.f : 1.f;
+            const float ys = viewport.yscale < 0 ? -1.f : 1.f;
+            if (constant) {
+                // Same ring bytes as the previous copies, consumed immediately by the scene.
+                using CameraBytes = VrTemporalScene::CameraBytes;
+                const auto ring_bytes = std::as_bytes(constant_ring->mapped_data);
+                vr_temporal->scene.CaptureCameraBytes(
+                    CameraBytes{ring_bytes.subspan(constant->left.offset, 864)},
+                    CameraBytes{ring_bytes.subspan(constant->right.offset, 864)},
+                    xs, ys);
+            } else {
+                vr_temporal->scene.CaptureCamera(temporal_camera, xs, ys);
+            }
         }
         if (camera)
             native_paired_buffers |= u64{1} << i;
@@ -7027,7 +11338,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             native_projected_buffers |= u64{1} << i;
         if (camera && stage.l_stage != Shader::LogicalStage::Compute && !vr_mirror_noted)
             VrMirrorCamera(mirrored, vsharp.base_address);
-        const bool light_size = size == 208 || size == 272 || size == 336 || size == 416;
+        // (320: the game's reflections, NativeProjection::ReflectionLayout; that program only.)
+        const bool light_size =
+            size == 208 || size == 272 || size == 336 || size == 416 ||
+            (size == 320 && stage.pgm_hash == NativeProjection::ReflectionProgram);
         // A light of a planar reflection's pass (VrInMirrorPass): paired here upside down, also
         // when Stage A paired it (A does not know the pass), from A's copy of its bytes. Its draw's
         // camera is noted first (VrMirrorAhead): it may bind after the light.
@@ -7120,6 +11434,69 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                          : reinterpret_cast<const float*>(vsharp.base_address),
                 u32(size), alignment, constant == nullptr, stage.pgm_hash, light_view_scale,
                 light_view_ipd, native_camera);
+        // Light in the air (fog_light.h): the light pass's camera (its light208 buffer, before
+        // its list), for where its lights are in the world ...
+        if (i == 0 && size == 208 && (vr_fog.on || Shader::Optimization::BodyShadow::Enabled()) &&
+            stage.l_stage == Shader::LogicalStage::Fragment && !desc.IsSpecial() && !desc.is_written) {
+            const auto kind = NativeProjection::LightListLayout(stage.pgm_hash).kind;
+            const bool frame_candidate = kind == NativeProjection::LightKind::Point ||
+                (kind == NativeProjection::LightKind::None && VrSceneMapsOn() &&
+                 Shader::Optimization::AmbientOcclusion::IsAoProgram(stage.pgm_hash));
+            if ((kind != NativeProjection::LightKind::None || frame_candidate) &&
+                (constant || !buffer_cache.IsRegionGpuModified(vsharp.base_address, size))) {
+                VrFogCaptureView(constant ? reinterpret_cast<const float*>(
+                                                constant_ring->mapped_data.data() + constant->raw.offset)
+                                          : reinterpret_cast<const float*>(vsharp.base_address),
+                                 u32(size), constant == nullptr, frame_candidate, fog_draw_view);
+            }
+        }
+        // ... and the frame's point lights, from the light pass's lists (the fog's, and his body
+        // maps' lamps: vr_body_maps.h).
+        if (i == 1 && (vr_fog.on || Shader::Optimization::BodyShadow::Enabled()) &&
+            stage.l_stage == Shader::LogicalStage::Fragment &&
+            !desc.IsSpecial() && !desc.is_written &&
+            NativeProjection::LightListFor(stage.pgm_hash, size).kind !=
+                NativeProjection::LightKind::None &&
+            (constant || !buffer_cache.IsRegionGpuModified(vsharp.base_address, size)))
+            VrFogCapture(stage.pgm_hash,
+                         constant ? reinterpret_cast<const float*>(constant_ring->mapped_data.data() +
+                                                                   constant->raw.offset)
+                                  : reinterpret_cast<const float*>(vsharp.base_address),
+                         u32(size), constant == nullptr, fog_draw_view);
+        // Moonlight in the air (moon_shafts.h): the shadow pass's cascades, the directional
+        // light's light sets (their buffer 0, the game's own bytes).
+        // (The cascades also without the moonlight in the air, for the air pass's lamp glow: the
+        // scene copy takes each eye's matrices from them. Until 2026-11-14 they were captured
+        // only with the moonlight on, and with it off no lamp had a glow at all.)
+        // (Buffer 0 of a fragment program first: Halos() is a function-local static, its guard read
+        // at every buffer of every draw until 2026-11-17.)
+        if (i == 0 && stage.l_stage == Shader::LogicalStage::Fragment &&
+            (vr_moon.on || (vr_fog.on && Shader::Optimization::AirLight::Halos())) &&
+            !desc.IsSpecial() && !desc.is_written &&
+            (Shader::Optimization::MoonShafts::IsShadowProgram(stage.pgm_hash) ||
+             (vr_moon.on && Shader::Optimization::MoonShafts::IsDirLightProgram(stage.pgm_hash)))) {
+            if (Shader::Optimization::MoonShafts::IsDirLightProgram(stage.pgm_hash)) {
+                // The GPU writes the table: the composite binds it as this pass does.
+                VrMoonCaptureSets(vsharp, u32(size));
+            } else if (constant || !buffer_cache.IsRegionGpuModified(vsharp.base_address, size)) {
+                VrMoonCaptureCascades(
+                    constant ? reinterpret_cast<const float*>(constant_ring->mapped_data.data() +
+                                                              constant->raw.offset)
+                             : reinterpret_cast<const float*>(vsharp.base_address),
+                    u32(size), constant == nullptr);
+            }
+        }
+        // The air pass's mist (air_light.h Mist): this frame's view to world, from the reflections
+        // pass's own buffer (the half-size host's: its rows 32..43).
+        if (vr_moon.on && i == 0 && size == 320 && stage.l_stage == Shader::LogicalStage::Fragment &&
+            !desc.IsSpecial() && !desc.is_written &&
+            Shader::Optimization::AirLight::IsHalfProgram(stage.pgm_hash) &&
+            (constant || !buffer_cache.IsRegionGpuModified(vsharp.base_address, size))) {
+            VrAirCaptureView(constant ? reinterpret_cast<const float*>(constant_ring->mapped_data.data() +
+                                                                       constant->raw.offset)
+                                      : reinterpret_cast<const float*>(vsharp.base_address),
+                             u32(size), constant == nullptr);
+        }
         if (g_camera_audit && NativeStereo::AsymmetricProjection() && !desc.IsSpecial() &&
             !desc.is_written &&
             (size == 864 || size == 208 || size == 272 || size == 336 || size == 416) &&
@@ -7143,6 +11520,220 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
                 const u32 ubo_size = stage.FlatUserData().size() * sizeof(u32);
                 const u64 offset = vk_buffer.Copy(stage.FlatUserData().data(), ubo_size, alignment);
+                buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+            } else if (desc.buffer_type == Shader::BufferType::VrGrade) {
+                const float strength = VR::IsEnabled() ? VR::Tune::Get("lighting.grade", 0.01f * VR::GetSettings().cinematic_look) : 0.0f;
+                // Float 15: the tone map's filmic highlights (cinematic_look.h FilmicShare).
+                const float filmic = VR::IsEnabled() ? VR::Tune::Get("lighting.filmic", VR::GetSettings().filmic_highlights ? Shader::Optimization::CinematicLook::FilmicShare : 0.0f) : 0.0f;
+                // Floats 16..20: eye adaptation (cinematic_look.h), its followers' shares from this
+                // frame's time (once a frame: the grade and the tone map both bind this buffer).
+                namespace Look = Shader::Optimization::CinematicLook;
+                static u64 adapt_id = ~0ull;
+                static auto adapt_time = std::chrono::steady_clock::now();
+                static float adapt_dt = 1.0f / 90.0f;
+                const u64 frame_id = VR::DrawFrameRecord().id;
+                if (frame_id != adapt_id) {
+                    const auto now = std::chrono::steady_clock::now();
+                    adapt_dt = adapt_id == ~0ull ? 1.0f / 90.0f
+                                                 : std::clamp(std::chrono::duration<float>(now - adapt_time).count(), 0.0f, 0.1f);
+                    adapt_time = now;
+                    adapt_id = frame_id;
+                }
+                Look::Adaptation adapt{};
+                adapt.strength = VR::IsEnabled() && VR::GetSettings().eye_adaptation
+                                     ? VR::Tune::Get("lighting.adapt", Look::AdaptStrength)
+                                     : 0.0f;
+                adapt.fast = 1.0f - std::exp(-adapt_dt / Look::FastS);
+                adapt.slow = 1.0f - std::exp(-adapt_dt / std::max(VR::Tune::Get("lighting.adapt_up_s", Look::SlowS), 0.05f));
+                adapt.slow_down = 1.0f - std::exp(-adapt_dt / std::max(VR::Tune::Get("lighting.adapt_down_s", Look::SlowDownS), 0.05f));
+                adapt.stops = VR::Tune::Get("lighting.adapt_stops", Look::MaxStops);
+                adapt.threshold = VR::Tune::Get("lighting.adapt_threshold", Look::ThresholdStops);
+                adapt.frame = static_cast<u32>(frame_id);
+                // A muzzle flash is not daylight: the levels hold still while one shines (v25, the
+                // Grand Cathedral: the adaptation took a shot for a step outside and brightened the
+                // flash to white for half a second).
+                if (vr_fog.muzzle_on &&
+                    std::chrono::duration<float>(std::chrono::steady_clock::now() - vr_fog.muzzle_t0).count() <=
+                        Shader::Optimization::FogLight::MuzzleLifeS) {
+                    adapt.fast = 0.0f;
+                    adapt.slow = 0.0f;
+                    adapt.slow_down = 0.0f;
+                }
+                // Tests (VR_EYE_ADAPT_LOG=1): the state four times a second (current and adapted
+                // levels in stops, the exposure they give), read back from the host-visible
+                // state buffer (a frame or two old).
+                static const bool adapt_log = [] {
+                    const char* const env = std::getenv("VR_EYE_ADAPT_LOG");
+                    return env != nullptr && env[0] == '1';
+                }();
+                static auto adapt_logged = std::chrono::steady_clock::now();
+                if (adapt_log && vr_adapt_buffer &&
+                    std::chrono::steady_clock::now() - adapt_logged > std::chrono::milliseconds(250)) {
+                    adapt_logged = std::chrono::steady_clock::now();
+                    const auto* const st = reinterpret_cast<const float*>(vr_adapt_buffer->mapped_data.data());
+                    const u32 slot = (static_cast<u32>(frame_id) & 1u) * 2u;
+                    const float cur = st[slot], ada = st[slot + 1];
+                    const float gap = cur - ada;
+                    const float past = std::max(std::abs(gap) - adapt.threshold, 0.0f) * (gap < 0.0f ? -1.0f : 1.0f);
+                    const auto* const su = reinterpret_cast<const u32*>(st);
+                    LOG_INFO(Render_Vulkan, "VR eye adaptation: current {:.2f} adapted {:.2f} stops, gap {:+.2f}, exposure x{:.2f} "
+                             "(frame {}, valid {}, claimed {}, counts {} {} {})",
+                             cur, ada, gap, std::exp2(std::clamp(adapt.strength * past, -adapt.stops, adapt.stops)),
+                             static_cast<u32>(frame_id), su[4], su[5], su[9], su[11], su[13]);
+                }
+                auto grade = Look::Params(strength, filmic, adapt);
+                // The ambient light's level (cinematic_look.h AmbientFloat; the ambient composite).
+                // (The Forbidden Woods a little darker of their own: cinematic_look.h WoodsAmbient.)
+                const bool in_woods = VR::GameArea::Slot().load(std::memory_order_relaxed) >> 16 == 0x1B00u;
+                grade[Look::AmbientFloat] =
+                    VR::IsEnabled() ? std::clamp(VR::Tune::Get("lighting.ambient", in_woods ? Look::WoodsAmbientNow() : 1.0f),
+                                                 0.0f, 2.0f)
+                                    : 1.0f;
+                auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+                const u32 size = static_cast<u32>(sizeof(grade));
+                const u64 offset = vk_buffer.Copy(grade.data(), size, alignment);
+                buffer_infos.emplace_back(vk_buffer.Handle(), offset, size);
+            } else if (desc.buffer_type == Shader::BufferType::VrFogLights) {
+                auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+                std::array<u32, Shader::Optimization::FogLight::BufferDwords> fog;
+                const u32 ubo_size = VrFogUpload(fog);
+                VrAirWiden(fog, stage.pgm_hash);
+                const u64 offset = vk_buffer.Copy(fog.data(), ubo_size, alignment);
+                buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+            } else if (desc.buffer_type == Shader::BufferType::VrAdaptation) {
+                // Eye adaptation's state: one small buffer for every frame (its contents carry
+                // over), host-visible like the GDS buffer the game's own atomics use, zeroed once.
+                namespace Look = Shader::Optimization::CinematicLook;
+                if (!vr_adapt_buffer) {
+                    vr_adapt_buffer = std::make_unique<VideoCore::Buffer>(
+                        instance, scheduler, VideoCore::MemoryUsage::Stream, 0, VideoCore::AllFlags,
+                        Look::AdaptDwords * sizeof(u32));
+                    std::memset(vr_adapt_buffer->mapped_data.data(), 0,
+                                vr_adapt_buffer->mapped_data.size());
+                }
+                buffer_infos.emplace_back(vr_adapt_buffer->Handle(), 0,
+                                          Look::AdaptDwords * sizeof(u32));
+            } else if (desc.buffer_type == Shader::BufferType::VrBodyMaps) {
+                // His body maps (vr_body_maps.h): the module's buffer once it exists; until then a
+                // stream range of the same size the header marks unused (valid 0).
+                if (vr_body_maps && vr_body_maps->Ready()) {
+                    buffer_infos.emplace_back(vr_body_maps->MapsBuffer(), 0,
+                                              VrBodyMaps::MapsBytes());
+                } else {
+                    auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+                    static const std::array<u32, 4> none{};
+                    const u64 offset = vk_buffer.Copy(none.data(), sizeof(none), alignment);
+                    buffer_infos.emplace_back(vk_buffer.Handle(), offset, sizeof(none));
+                }
+            } else if (desc.buffer_type == Shader::BufferType::VrShadowCasters) {
+                auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+                const auto& casters = VrShadowCastersUpload();
+                const u32 bytes = static_cast<u32>(casters.size() * sizeof(u32));
+                const u64 offset = vk_buffer.Copy(casters.data(), bytes, alignment);
+                buffer_infos.emplace_back(vk_buffer.Handle(), offset, bytes);
+            } else if (desc.buffer_type == Shader::BufferType::VrShadowMask) {
+                // The shadow mask (light_shadow.h SceneMaps::Mask) once made; until then a stream
+                // range of zeros the size of its header and one pixel (a lamp shader's loads stay
+                // inside it; its size, 0, says no mask: lit; the capacity, 0, keeps the AO out).
+                if (vr_scene.mask) {
+                    buffer_infos.emplace_back(
+                        vr_scene.mask->Handle(), 0,
+                        (u64(Shader::Optimization::LightShadow::SceneMaps::MaskHeader) +
+                         u64(vr_scene.mask_pixels) * Shader::Optimization::LightShadow::SceneMaps::MaskWords) *
+                            sizeof(u32));
+                } else {
+                    buffer_infos.push_back(VrWrittenStandIn(
+                        0, (u64(Shader::Optimization::LightShadow::SceneMaps::MaskHeader) +
+                            Shader::Optimization::LightShadow::SceneMaps::MaskWords + 1) *
+                               sizeof(u32)));
+                }
+            } else if (desc.buffer_type == Shader::BufferType::VrSceneMaps) {
+                // The scene shadow maps (light_shadow.h SceneMaps) once made; until then a small
+                // stand-in (the header's slot count stays 0: nothing reads or writes it).
+                if (vr_scene.buffer) {
+                    buffer_infos.emplace_back(
+                        vr_scene.buffer->Handle(), 0,
+                        2 * u64(Shader::Optimization::LightShadow::SceneMaps::Texels) * sizeof(u32));
+                } else {
+                    buffer_infos.push_back(VrWrittenStandIn(1, 4 * sizeof(u32)));
+                }
+            } else if (desc.buffer_type == Shader::BufferType::VrDepthPyramid) {
+                // The depth pyramid (vr_depth_pyramid.h) recorded for this frame; else a stand-in
+                // of zeros (its header's size 0: the march reads no pyramid).
+                // (Recorded before the frame's first AO draw; a later one may carry a
+                // neighbouring camera record: air_light.h FrameSlack.)
+                if (vr_pyramid && vr_pyramid_ready &&
+                    Shader::Optimization::AirLight::FrameNear(vr_pyramid_frame, VR::DrawFrameRecord().id)) {
+                    buffer_infos.emplace_back(vr_pyramid->Buffer(), 0, vr_pyramid->Bytes());
+                } else {
+                    auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+                    static const std::array<u32, VrDepthPyramid::HeaderWords> none{};
+                    const u64 offset = vk_buffer.Copy(none.data(), sizeof(none), alignment);
+                    buffer_infos.emplace_back(vk_buffer.Handle(), offset, sizeof(none));
+                }
+            } else if (desc.buffer_type == Shader::BufferType::VrShadowGrid) {
+                // The blocker grid (light_shadow.h Grid) once made; until then a small stand-in:
+                // the header (VrBodyUpload) keeps the grid off, nothing reads or writes it.
+                if (vr_grid_ready && vr_grid_buffer) {
+                    buffer_infos.emplace_back(
+                        vr_grid_buffer->Handle(), 0,
+                        u64(Shader::Optimization::LightShadow::Grid::BufferWords) * sizeof(u32));
+                } else {
+                    buffer_infos.push_back(VrWrittenStandIn(2, 4 * sizeof(u32)));
+                }
+            } else if (desc.buffer_type == Shader::BufferType::VrBodyCapsules) {
+                auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+                std::array<u32, Shader::Optimization::BodyShadow::BufferDwords> body;
+                const u32 ubo_size = VrBodyUpload(body, stage.pgm_hash);
+                const u64 offset = vk_buffer.Copy(body.data(), ubo_size, alignment);
+                buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+            } else if (desc.buffer_type == Shader::BufferType::VrParticleLights) {
+                auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+                std::array<u32, Shader::Optimization::ParticleAir::BufferDwords> lights;
+                const u32 ubo_size = VrParticleUpload(lights);
+                const u64 offset = vk_buffer.Copy(lights.data(), ubo_size, alignment);
+                buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+            } else if (desc.buffer_type == Shader::BufferType::VrAir) {
+                // The air pass (air_light.h): this draw's part and its camera.
+                auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+                std::array<u32, Shader::Optimization::AirLight::ParamDwords> air;
+                const u32 ubo_size = VrAirUpload(air, stage);
+                const u64 offset = vk_buffer.Copy(air.data(), ubo_size, alignment);
+                buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+            } else if (desc.buffer_type == Shader::BufferType::VrAirCells) {
+                // Its cells once made; until then a few zeros in a buffer of their own (the
+                // parameters name one cell). Never a range of the shared stream buffer: the
+                // compute hosts declare the cells written, and native stereo gives a written
+                // buffer a right-eye twin; a twin of the stream buffer left the right eye reading
+                // stale cameras and lights (2026-11-14: the right eye's picture garbage whenever a
+                // host bound the stand-in, e.g. with the moonlight off).
+                if (vr_air.cells) {
+                    buffer_infos.emplace_back(vr_air.cells->Handle(), 0, vr_air.cells_words * sizeof(u32));
+                } else {
+                    if (!vr_air.cells_none) {
+                        vr_air.cells_none = std::make_unique<VideoCore::Buffer>(
+                            instance, scheduler, VideoCore::MemoryUsage::Stream, 0, VideoCore::AllFlags,
+                            4 * sizeof(u32));
+                        std::memset(vr_air.cells_none->mapped_data.data(), 0,
+                                    vr_air.cells_none->mapped_data.size());
+                    }
+                    buffer_infos.emplace_back(vr_air.cells_none->Handle(), 0, 4 * sizeof(u32));
+                }
+            } else if (desc.buffer_type == Shader::BufferType::VrFogGrid) {
+                // The fog grid (fog_grid.h): the last one built, or its stand-in.
+                buffer_infos.emplace_back(VrFogGridBuffer());
+            } else if (desc.buffer_type == Shader::BufferType::VrAirProbe) {
+                // The moon's colour probe: one small host-visible buffer (the eye adaptation's way).
+                VrAirProbeBuffer();
+                buffer_infos.emplace_back(vr_air.probe->Handle(), 0,
+                                          u64(Shader::Optimization::AirLight::ProbeSlots) *
+                                              Shader::Optimization::AirLight::ProbeSlotDwords * sizeof(u32));
+            } else if (desc.buffer_type == Shader::BufferType::VrMoonShafts) {
+                auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+                std::array<u32, Shader::Optimization::MoonShafts::BufferDwords> moon;
+                const u32 ubo_size = VrMoonUpload(moon);
+                VrAirMoon(moon, stage.pgm_hash);
+                const u64 offset = vk_buffer.Copy(moon.data(), ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
@@ -7207,6 +11798,22 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
             if (desc.is_written && desc.is_formatted) {
                 texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
+            }
+        }
+        if constexpr (Common::Log::Enabled) {
+            // A written buffer of ours in the shared stream buffer would give that buffer a
+            // right-eye twin (VrWrittenStandIn): said once, in the log builds' test runs.
+            if (desc.IsSpecial() && desc.is_written && NativeStereo::Enabled() &&
+                desc.buffer_type != Shader::BufferType::SharedMemory &&
+                buffer_infos.back().buffer ==
+                    buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream).Handle()) [[unlikely]] {
+                static std::atomic<bool> said{false};
+                if (!said.exchange(true)) {
+                    LOG_ERROR(Render_Vulkan,
+                              "VR written stand-in: buffer {} of shader {:#x} (type {}) is a range of the "
+                              "stream buffer; the right eye will read stale data",
+                              i, stage.pgm_hash, static_cast<u32>(desc.buffer_type));
+                }
             }
         }
 
@@ -7615,6 +12222,28 @@ bool Rasterizer::BindTexturesFromMemoFast(const BindMemo::Entry& entry,
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     ScratchProfile::Cpu scratch_cpu(10, "Rasterizer::BindTextures");
+    // Moonlight in the air (moon_shafts.h): the shadow pass's atlas, the light composite's.
+    if (vr_moon.on && stage.l_stage == Shader::LogicalStage::Fragment &&
+        Shader::Optimization::MoonShafts::IsShadowProgram(stage.pgm_hash)) [[unlikely]] {
+        VrMoonCaptureAtlas(stage);
+    }
+    // The air pass (air_light.h): the moon's shadow pass's eye depth and picture, the composite's.
+    if ((vr_moon.on || vr_fog.on) && stage.l_stage == Shader::LogicalStage::Fragment &&
+        (Shader::Optimization::MoonShafts::IsShadowProgram(stage.pgm_hash) ||
+         Shader::Optimization::BounceLight::IsCompositeProgram(stage.pgm_hash))) [[unlikely]] {
+        VrAirCapture(stage);
+    }
+    // The bump map's class for this draw (a G-buffer program with one: BumpHeightPass).
+    if (stage.l_stage == Shader::LogicalStage::Fragment) {
+        vr_bump.draw_need = NeedKeep;
+        if (stage.vr_bump_image < stage.images.size()) {
+            const auto& desc = stage.images[stage.vr_bump_image];
+            const auto tsharp = resource_bindings
+                                    ? resource_bindings->image_values[stage.vr_bump_image].sharp
+                                    : desc.GetSharp(stage);
+            VrBumpClassify(stage, desc, tsharp);
+        }
+    }
     image_bindings.clear();
     const u32 first_image_idx = image_infos.size();
 
@@ -7748,6 +12377,17 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image_descriptor_array_sizes.push_back(1);
             rememberable = false; // the mapping may become valid
             continue;
+        }
+        if (Shader::Optimization::BumpProbe::Dir() != nullptr &&
+            stage.l_stage == Shader::LogicalStage::Fragment) [[unlikely]] {
+            VrBumpProbe(stage, static_cast<u32>(&image_desc - stage.images.data()), tsharp, memory);
+        }
+        // (A lamp's shadow map: a small array of at least six layers, a cube's faces; never one
+        // of the full-size targets the same shader also reads.)
+        if (stage.vr_light_shadow.game_shadowed &&
+            tsharp.GetType() == AmdGpu::ImageType::Color2DArray && tsharp.NumLayers() >= 6 &&
+            tsharp.width + 1 <= 512u && tsharp.height + 1 <= 512u) [[unlikely]] {
+            NoteGameLampMap(tsharp.Address());
         }
 
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
@@ -7992,7 +12632,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         begin_memo = std::make_unique<BeginMemo>();
     auto& memo = *begin_memo;
     if (((memo.hits + memo.misses) & 65535) == 65535)
-        LOG_INFO(Render_Vulkan, "Scratch begin-state memo: {} hits / {} misses / {} checked",
+        LOG_INFO(Render_Vulkan, "Begin-state memo: {} hits / {} misses / {} checked",
                  memo.hits, memo.misses, memo.checked);
     const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
     const auto& pipeline_key = pipeline->GetGraphicsKey();
@@ -8027,7 +12667,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         if (g_begin_memo_check) {
             const auto reference = BeginRenderingFull(pipeline);
             ASSERT_MSG(reference == memo.state && !attachment_feedback_loop,
-                       "Scratch begin-state memo differs from full render state");
+                       "Begin-state memo differs from full render state");
             ++memo.checked;
         }
         if (resumed) {
@@ -8286,7 +12926,7 @@ RenderState Rasterizer::PassMemoVerifyHit(const GraphicsPipeline* pipeline) {
     const auto reference = BeginRenderingFull(pipeline);
     const bool same_state = reference == memo.state && !attachment_feedback_loop;
     ASSERT_MSG(!g_begin_memo_check || same_state,
-               "Scratch begin-state memo differs from full render state");
+               "Begin-state memo differs from full render state");
     const bool same = same_state && epoch == texture_cache.RegistryEpoch() &&
                       meta_epoch == texture_cache.MetaClearEpoch() && before == seen();
     ++memo.verified;
@@ -8402,10 +13042,14 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         }();
 
         const auto slice = image_view.info.range.base.layer;
+        // (The shadow atlas held over frames, vr_shadow_hold.h: a held frame's first draw into
+        // the nearest cascade must not clear the whole atlas, as the pending meta clear would:
+        // the other cascades keep their picture, and DrawRecord clears the nearest's quarter.)
         const bool is_depth_clear =
-            (regs.depth_render_control.depth_clear_enable && regs.depth_control.depth_enable &&
-             regs.depth_control.depth_write_enable) ||
-            texture_cache.IsMetaCleared(htile_address, slice);
+            !vr_shadow_near_clear &&
+            ((regs.depth_render_control.depth_clear_enable && regs.depth_control.depth_enable &&
+              regs.depth_control.depth_write_enable) ||
+             texture_cache.IsMetaCleared(htile_address, slice));
         const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
         texture_cache.TouchMeta(htile_address, slice, false);
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
@@ -8585,6 +13229,12 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool emulator_write,
     buffer_cache.InvalidateMemory(addr, size, emulator_write, protection_only);
     texture_cache.InvalidateMemory(addr, size);
     return true;
+}
+
+void Rasterizer::NoteFreshRange(VAddr addr, u64 size) {
+    if (IsMapped(addr, size)) {
+        buffer_cache.NoteFreshRange(addr, size);
+    }
 }
 
 bool Rasterizer::InvalidateWriteFaultPage(VAddr addr) {
@@ -8789,23 +13439,77 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     }
 }
 
-void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
+void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed,
+                                    bool indirect, DynamicState* deferred) const {
+    FastRender::BProfile::Scope b_profile{FastRender::BProfile::RecDynamicState};
     ScratchProfile::Cpu scratch_dynamic(29, "Rasterizer::UpdateDynamicState");
+    // FAST_CPU_STAGEB_SPLIT stage 2: the draw's values go into split_dynamic (resolve side; it
+    // keeps the game's last values), then the command buffer's tracker takes them through its
+    // setters and commits what differs (encode side).
+    const bool split = scheduler.StageBSplit();
+    if (split) {
+        if (!split_dynamic) {
+            split_dynamic = std::make_unique<DynamicState>();
+        }
+        scheduler.SetDesiredDynamic(split_dynamic.get());
+    }
+    // Decide once for both the viewport and its memo key. Indirect arguments are GPU-owned;
+    // CPU counts left by a previous draw must not turn scene jitter off for this one.
+    std::array<float, 2> jitter{};
+    if (vr_temporal && vr_temporal->active && !vr_temporal->resolved && db_desc.first &&
+        db_desc.first == vr_temporal->depth_id) {
+        const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
+        jitter = TemporalDrawJitter(indirect, regs.num_indices, regs.num_instances.NumInstances(),
+                                    vr_temporal->scene.Jitter());
+    } else if (vr_dibr_upscale && db_desc.first && VR::DibrFrameActive()) {
+        // The DIBR upscaler (vr_dibr_upscale.h): the same viewport jitter for the draws into a
+        // depth of its input size (the centre's scene, not shadow maps, probes or light grids).
+        const VR::TaaJitter frame_jitter = VR::FrameTaaJitter();
+        if (frame_jitter.on && frame_jitter.viewport) {
+            const auto& depth = db_desc.second.info; // the bound depth's own description
+            if (depth.size.width == frame_jitter.width &&
+                depth.size.height == frame_jitter.height) {
+                const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
+                jitter = TemporalDrawJitter(indirect, regs.num_indices,
+                                            regs.num_instances.NumInstances(),
+                                            {frame_jitter.px_x, frame_jitter.px_y});
+            }
+        }
+    }
     if (FastRender::On(DynStateSkip)) {
-        dyn_skip->Update(*this, pipeline, is_indexed);
+        dyn_skip->Update(*this, pipeline, is_indexed, jitter);
     } else {
-        UpdateViewportScissorState(pipeline);
+        UpdateViewportScissorState(pipeline, jitter);
         UpdateDepthStencilState();
         UpdatePrimitiveState(is_indexed);
     }
     UpdateRasterizationState();
     UpdateColorBlendingState(pipeline);
+    if (vr_glow_depth_min >= 0.0f) {
+        // After the depth state (DynSkip keeps the game's own): no depth test or write, as the
+        // game draws it, and the bounds test keeps the glow over the far scene and the sky.
+        auto& glow_state = scheduler.GetDynamicState();
+        glow_state.SetDepthBoundsTestEnabled(true);
+        glow_state.SetDepthBounds(vr_glow_depth_min, 1.0f);
+    }
 
+    if (split) {
+        scheduler.SetDesiredDynamic(nullptr);
+        if (deferred) {
+            *deferred = *split_dynamic; // =2: fast:StageB2 commits it (SplitEncode)
+            return;
+        }
+        auto& tracker = scheduler.RingDynamicState();
+        tracker.SetFrom(*split_dynamic);
+        tracker.Commit(instance, scheduler.Commands());
+        return;
+    }
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.Commit(instance, scheduler.Commands());
 }
 
-void Rasterizer::UpdateViewportScissorState(const GraphicsPipeline* pipeline) const {
+void Rasterizer::UpdateViewportScissorState(const GraphicsPipeline* pipeline,
+                                           std::array<float, 2> jitter) const {
     const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
 
     const auto combined_scissor_value_tl = [](s16 scr, s16 win, s16 gen, s16 win_offset) {
@@ -8890,15 +13594,19 @@ void Rasterizer::UpdateViewportScissorState(const GraphicsPipeline* pipeline) co
 
             viewport.x = xoffset - xscale;
             viewport.y = yoffset - yscale;
-            if (vr_temporal && vr_temporal->active && !vr_temporal->resolved && db_desc.first &&
-                db_desc.first == vr_temporal->depth_id &&
-                (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
-                const auto jitter = vr_temporal->scene.Jitter();
-                viewport.x += jitter[0] * vr_scene_inverse[0];
-                viewport.y += jitter[1] * vr_scene_inverse[1];
-            }
+            viewport.x += jitter[0] * vr_scene_inverse[0];
+            viewport.y += jitter[1] * vr_scene_inverse[1];
             viewport.width = xscale * 2.0f;
             viewport.height = yscale * 2.0f;
+            if (i == 0 && recording_vr.shadow_snapped) [[unlikely]] {
+                // A shadow atlas tile, steadied (vr_shadow_hold.h): moved by less than a texel
+                // and a little smaller about its centre.
+                const auto& snap = recording_vr.shadow_snap;
+                viewport.x = xoffset + snap[0] - xscale * snap[2];
+                viewport.y = yoffset + snap[1] - yscale * snap[3];
+                viewport.width = xscale * snap[2] * 2.0f;
+                viewport.height = yscale * snap[3] * 2.0f;
+            }
         }
 
         viewport.x /= vr_scene_inverse[0];

@@ -16,7 +16,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <string>
+#include "common/frame_timeline.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "common/types.h"
@@ -35,11 +37,16 @@ enum Kind : u32 {
     BufferAlloc,
     StereoTwin,
     ImageAlloc,
+    SparseView, // SparsePool::CreateView (the buffer, the lock, the binds queued)
+    SlabAlloc,  // SparsePool: a slab's vkAllocateMemory (under the pool's lock)
+    SparseBind, // SparsePool::SubmitBinds: the vkQueueBindSparse call
+    PoolWait,   // SparsePool: a caller waiting for the pool's lock (only when it was taken)
     Count
 };
 inline constexpr std::array<const char*, Count> Names{
     "file read", "map", "unmap", "protect", "pool commit", "guest invalidate", "create buffer",
-    "texture upload", "buffer alloc", "stereo twin", "image alloc"};
+    "texture upload", "buffer alloc", "stereo twin", "image alloc", "sparse view",
+    "slab alloc", "sparse bind", "pool lock wait"};
 
 /// Logs-on builds: each tracked thread group's CPU time since the previous call (GetThreadTimes),
 /// as " | label ms" parts when `report` (slow_scope.cpp; empty elsewhere).
@@ -49,6 +56,11 @@ std::string ThreadTimes(bool report);
 /// once; RequestSamples writes the samples of the last `ms` to stall_samples.txt.
 void StartSampler();
 void RequestSamples(double ms);
+/// True on the stall sampler's own thread. The guest fault handler leaves that thread's faults to
+/// its __except (a stack read while unwinding a suspended thread), so it never waits for the very
+/// thread the sampler holds suspended (2026-10-24: a page-protection fault there drained the draw
+/// pipe behind the suspended stage B and froze the game).
+bool OnSamplerThread() noexcept;
 
 #ifdef BBVR_NO_LOGS
 class Scope {
@@ -100,8 +112,19 @@ private:
 };
 
 /// The presenter, at each game frame it gets (`ms`: the interval since the previous one): a frame
-/// over 30 ms logs what each kind took since the previous frame (at most 300 lines).
+/// over 30 ms (VR_SLOW_FRAME_MS, read once) logs what each kind took since the previous frame and
+/// its flip's timeline (Common::FrameTimeline), at most 300 lines (VR_SLOW_FRAME_LINES).
 inline void FrameBoundary(double ms) {
+    static const double slow_ms = [] {
+        const char* value = std::getenv("VR_SLOW_FRAME_MS");
+        const double v = value != nullptr ? std::atof(value) : 0.0;
+        return v > 0.0 ? v : 30.0;
+    }();
+    static const u32 max_lines = [] {
+        const char* value = std::getenv("VR_SLOW_FRAME_LINES");
+        const int v = value != nullptr ? std::atoi(value) : 0;
+        return v > 0 ? static_cast<u32>(v) : 300u;
+    }();
     static std::array<u64, Count> last_ns{}, last_calls{}, last_bytes{};
     std::array<u64, Count> ns{}, calls{}, bytes{};
     for (u32 k = 0; k < Count; ++k) {
@@ -111,7 +134,7 @@ inline void FrameBoundary(double ms) {
     }
     StartSampler();
     static u32 logged = 0;
-    const bool report = ms > 30.0 && logged < 300;
+    const bool report = ms > slow_ms && logged < max_lines;
     if (report) {
         RequestSamples(ms);
     }
@@ -128,9 +151,10 @@ inline void FrameBoundary(double ms) {
                                  static_cast<double>(ns[k] - last_ns[k]) * 1e-6, n,
                                  (bytes[k] - last_bytes[k]) >> 10);
         }
-        LOG_WARNING(Debug, "SLOW FRAME {:.1f} ms (summed across threads):{} || thread CPU ms:{}", ms,
-                    parts.empty() ? std::string{" nothing timed"} : parts,
-                    threads.empty() ? std::string{" (not sampled yet)"} : threads);
+        LOG_WARNING(Debug, "SLOW FRAME {:.1f} ms (summed across threads):{} || thread CPU ms:{}{}",
+                    ms, parts.empty() ? std::string{" nothing timed"} : parts,
+                    threads.empty() ? std::string{" (not sampled yet)"} : threads,
+                    FrameTimeline::Report());
     }
     last_ns = ns;
     last_calls = calls;

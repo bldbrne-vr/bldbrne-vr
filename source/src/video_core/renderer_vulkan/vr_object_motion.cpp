@@ -9,6 +9,7 @@
 #include <cstring>
 #include "video_core/native_stereo/profile_scopes.h"
 #include "video_core/renderer_vulkan/vr_temporal_optimizations.h"
+#include "video_core/vram_report.h"
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -47,17 +48,25 @@ bool Buffer(const Instance& instance, uint64_t bytes, bool host, vk::Buffer& buf
     if (vmaCreateBuffer(instance.GetAllocator(), &info, &memory, &raw, &allocation, &details) !=
         VK_SUCCESS)
         return false;
+    VideoCore::VramReport::Name(instance.GetAllocator(), allocation,
+                                fmt::format("vr object motion buffer {} MiB", bytes >> 20));
     buffer = raw;
     if (mapped)
         *mapped = details.pMappedData;
     address = instance.GetDevice().getBufferAddress({.buffer = buffer});
     return address && (!host || details.pMappedData);
 }
-constexpr vk::ImageSubresourceRange Range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 2};
 } // namespace
 VrObjectMotion::VrObjectMotion(const Instance& i, Scheduler& s) : instance(i), scheduler(s) {}
 VrObjectMotion::~VrObjectMotion() {
     Release();
+}
+void VrObjectMotion::SetViews(uint32_t count) {
+    count = count == 1 ? 1u : 2u;
+    if (count == views)
+        return;
+    Release();
+    views = count;
 }
 void VrObjectMotion::Release() {
     for (auto& target : targets)
@@ -97,8 +106,13 @@ bool VrObjectMotion::Init() {
         vk::FormatFeatureFlagBits::eColorAttachment | vk::FormatFeatureFlagBits::eSampledImage;
     if ((support & required) != required)
         return false;
-    if (!position_capacity) position_capacity = TemporalOptimizations() ? 4u << 20 : PositionsPerEye;
-    history = std::make_unique<VrObjectMotionState>(position_capacity);
+    // The DIBR centre starts smaller (heavy_sewers outgrew 1M positions once, 2026-10-25): 64 MB,
+    // not 134, on the 8 GB cards DIBR is for; exhaustion doubles it as for native stereo.
+    if (!position_capacity)
+        position_capacity = views == 1                ? 2u << 20
+                            : TemporalOptimizations() ? 4u << 20
+                                                      : PositionsPerEye;
+    history = std::make_unique<VrObjectMotionState>(position_capacity, views);
     LOG_INFO(Render_Vulkan,"VR temporal history: capacity={} positions/eye, bytes={}", position_capacity,history->PositionBytes());
     void* data{};
     if (!Buffer(instance,
@@ -172,7 +186,7 @@ uint32_t VrObjectMotion::Prepare(const Motion::Draw& draw) {
     const auto p = history->Prepare(draw, scheduler.CurrentTick());
     if (history->Stats().exhausted != exhausted) {
         grow_pending = true;
-        return 0; // Refuse this incomplete frame; rebuild a larger history next frame.
+        return 0; // Camera motion for this draw; rebuild a larger history next frame.
     }
     if (p.index)
         std::copy(p.eyes.begin(), p.eyes.end(), mapped + p.index);
@@ -222,21 +236,23 @@ VrObjectMotion::Target* VrObjectMotion::GetTarget(uint32_t w, uint32_t h) {
          .format = vk::Format::eR32G32B32A32Sfloat,
          .extent = {w, h, 1},
          .mipLevels = 1,
-         .arrayLayers = 2,
+         .arrayLayers = views,
          .samples = vk::SampleCountFlagBits::e1,
          .tiling = vk::ImageTiling::eOptimal,
          .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
          .initialLayout = vk::ImageLayout::eUndefined});
-    auto view = device.createImageViewUnique({.image = slot->image,
-                                              .viewType = vk::ImageViewType::e2DArray,
-                                              .format = vk::Format::eR32G32B32A32Sfloat,
-                                              .subresourceRange = Range});
-    if (view.result != vk::Result::eSuccess) {
-        Retire(*slot);
-        return nullptr;
+    if (views == 2) {
+        auto view = device.createImageViewUnique({.image = slot->image,
+                                                  .viewType = vk::ImageViewType::e2DArray,
+                                                  .format = vk::Format::eR32G32B32A32Sfloat,
+                                                  .subresourceRange = Range()});
+        if (view.result != vk::Result::eSuccess) {
+            Retire(*slot);
+            return nullptr;
+        }
+        slot->array_view = std::move(view.value);
     }
-    slot->array_view = std::move(view.value);
-    for (uint32_t eye = 0; eye < 2; ++eye) {
+    for (uint32_t eye = 0; eye < views; ++eye) {
         auto v = device.createImageViewUnique(
             {.image = slot->image,
              .viewType = vk::ImageViewType::e2D,
@@ -254,7 +270,7 @@ VrObjectMotion::Target* VrObjectMotion::GetTarget(uint32_t w, uint32_t h) {
     return slot;
 }
 bool VrObjectMotion::Attach(RenderState& state) {
-    if (!active || state.probe_view_mask != 3 || !state.width || !state.height ||
+    if (!active || state.probe_view_mask != (views == 2 ? 3u : 0u) || !state.width || !state.height ||
         state.num_color_attachments > Shader::VrMotion::Output ||
         state.color_attachments[Shader::VrMotion::Output].image_view)
         return false;
@@ -263,7 +279,7 @@ bool VrObjectMotion::Attach(RenderState& state) {
         return false;
     auto& attachment = state.color_attachments[Shader::VrMotion::Output];
     attachment = {};
-    attachment.image_view = *t->array_view;
+    attachment.image_view = views == 2 ? *t->array_view : *t->eye_views[0];
     attachment.image_layout = vk::ImageLayout::eColorAttachmentOptimal;
     if (!t->written || t->layout != attachment.image_layout) {
         scheduler.EndRendering();
@@ -278,7 +294,7 @@ bool VrObjectMotion::Attach(RenderState& state) {
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = t->image,
-            .subresourceRange = Range};
+            .subresourceRange = Range()};
         RecordBarrier(scheduler, {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier},
                 [&] { return scheduler.CommandBuffer(); });
         attachment.is_clear = !t->written;
@@ -304,11 +320,11 @@ std::array<vk::ImageView, 2> VrObjectMotion::PrepareRead(uint32_t w, uint32_t h)
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .image = t.image,
-                .subresourceRange = Range};
+                .subresourceRange = Range()};
             RecordBarrier(scheduler, {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier},
                     [&] { return scheduler.CommandBuffer(); });
             t.layout = vk::ImageLayout::eGeneral;
-            return {*t.eye_views[0], *t.eye_views[1]};
+            return {*t.eye_views[0], views == 2 ? *t.eye_views[1] : vk::ImageView{}};
         }
     return {};
 }

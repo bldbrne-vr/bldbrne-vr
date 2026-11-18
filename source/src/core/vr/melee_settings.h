@@ -80,7 +80,7 @@ struct MeleeSettings {
     bool bite{true};        // the blade bites: the hand lags the controller for a moment on a hit
     bool whoosh{true};      // the weapon's swing sound at the commit
     bool trail{true};       // the blade trail effect while the window is open
-    float charge_s{1.0f};   // right trigger held this long: a charged swing (0.35 s: heavy)
+    float charge_s{1.25f};  // right trigger held this long: a charged swing (0.36 s: heavy)
     // A swing begun while a kept stagger (or, with dodge_attack=0, a dodge) has not yet handed
     // the attack back waits this long for the game's attack window, then opens its attack on the
     // swing under way (core/vr/melee_window.h SwingBuffer); later: refused (the deny tick). 0 =
@@ -122,6 +122,20 @@ struct MeleeSettings {
     // 2026-10-15). 2: off.
     int budget_quick_charges{3};
     float budget_quick_s{0.64f};
+    // A swing that hit nothing gives its charges back as it ends, so the next one registers; the
+    // game's stamina and the trigger's charge stay spent (2026-11-11). 0: a miss uses
+    // them like a hit (before).
+    bool budget_miss_refund{true};
+    // The Blade of Mercy and Rakuyo split (core/vr/dual_blades.h; the tester, 2026-11-09): each
+    // hand its own budget of dual_charges at the game's own pace and each hit x dual_damage_pct
+    // (dual_hands=0: both hands share the right hand's, at full damage); rubbing the blades
+    // together dual_sharpen_rubs times hones both, the next hit of each x (1 + dual_sharpen_pct).
+    bool dual_hands{true};
+    int dual_charges{2};
+    float dual_damage_pct{75.0f};
+    bool dual_sharpen{true};
+    int dual_sharpen_rubs{4};
+    float dual_sharpen_pct{30.0f};
     // The physical plunge (core/vr/plunge.h; 2026-10-12, not yet tried in the game): a swing
     // while the hunter falls keeps its attack until he lands (+0.15 s), so the blade you hold out
     // hits what you land on; after a fall at least melee_plunge_min_drop_m deep its hits deal
@@ -131,6 +145,21 @@ struct MeleeSettings {
     float plunge_min_drop_m{1.2f};
     float plunge_damage{1.35f}; // (1.5 until 2026-10-16: the tester)
     float plunge_hold_s{2.5f}; // the attack never held longer than this after it opened
+    // Bullet deflection (core/vr/bullet_deflect.h, bloodborne_deflect.cpp; 2026-10-31, not yet
+    // tried in the game): an enemy's bullet meeting the right weapon bounces off it (the swing
+    // turns it its way) and becomes the hunter's. Only a swat sends it back at the shooter
+    // (2026-11-02, bullet_deflect.h ReturnChance): 8 in 10 when its bounce heads within
+    // deflect_snap_deg of him, less and less to none at deflect_return_deg (0 = never). A bullet
+    // sent back is steered at him on its way; any other is drawn a little back toward the line
+    // it came in on (BackPull) and kept deflect_snap_deg clear of him. deflect_margin_cm
+    // catches a bullet this much short of the blade; projectiles wider than deflect_max_radius_m
+    // (boulders, fireballs) are never deflected.
+    bool deflect{true};
+    int deflect_stamina{15}; // passive impact; 0 free, committed swats never pay twice
+    float deflect_snap_deg{20.0f};
+    float deflect_return_deg{45.0f};
+    float deflect_margin_cm{5.0f};
+    float deflect_max_radius_m{0.3f};
 };
 
 MeleeSettings& GetMeleeSettings();

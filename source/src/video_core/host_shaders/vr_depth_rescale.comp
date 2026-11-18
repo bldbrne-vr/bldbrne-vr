@@ -1,0 +1,63 @@
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+#version 450
+
+// VrDepthRescale (vr_depth_rescale.h): one depth or stencil aspect, nearest-scaled between two
+// tightly packed buffers (copyImageToBuffer / copyBufferToImage layout: texels by row, rows by
+// layer), with vkCmdBlitImage's nearest rule. A texel is 1, 2 or 4 bytes; every invocation writes
+// one destination word, so narrow texels never share a write. Offsets are in words.
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Source {
+    uint src[];
+};
+layout(std430, binding = 1) writeonly buffer Destination {
+    uint dst[];
+};
+
+layout(push_constant) uniform Push {
+    uvec2 src_size;
+    uvec2 dst_size;
+    uint layers;
+    uint bytes; // per texel: 1, 2 or 4
+    uint src_offset;
+    uint dst_offset;
+    uint words;  // destination words
+    uint stride; // invocations per row of workgroups (the dispatch is folded into 2D)
+} push;
+
+uint Texel(uint texel) {
+    const uint byte = texel * push.bytes;
+    const uint word = src[push.src_offset + byte / 4];
+    if (push.bytes == 4) {
+        return word;
+    }
+    const uint shift = (byte % 4) * 8;
+    return (word >> shift) & (push.bytes == 2 ? 0xffffu : 0xffu);
+}
+
+void main() {
+    const uint word = gl_GlobalInvocationID.y * push.stride + gl_GlobalInvocationID.x;
+    if (word >= push.words) {
+        return;
+    }
+    const uint per_layer = push.dst_size.x * push.dst_size.y;
+    const uint per_word = 4 / push.bytes;
+    uint value = 0;
+    for (uint i = 0; i < per_word; ++i) {
+        const uint texel = word * per_word + i;
+        if (texel >= per_layer * push.layers) {
+            break;
+        }
+        const uint layer = texel / per_layer;
+        const uint rest = texel - layer * per_layer;
+        const uint y = rest / push.dst_size.x;
+        const uint x = rest - y * push.dst_size.x;
+        // The texel whose area holds the destination texel's centre.
+        const uint sx = min((2 * x + 1) * push.src_size.x / (2 * push.dst_size.x), push.src_size.x - 1);
+        const uint sy = min((2 * y + 1) * push.src_size.y / (2 * push.dst_size.y), push.src_size.y - 1);
+        const uint s = (layer * push.src_size.y + sy) * push.src_size.x + sx;
+        value |= Texel(s) << (i * push.bytes * 8);
+    }
+    dst[push.dst_offset + word] = value;
+}

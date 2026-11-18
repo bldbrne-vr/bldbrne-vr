@@ -52,6 +52,8 @@ const float PI = 3.14159265;
 // Reflections see a brighter environment than the diffuse ambient (metal would read as black).
 const float EnvBoost = 3.0;
 
+#include "vr_status_veins.glsl"
+
 float DistributionGGX(float NoH, float a) {
     const float a2 = a * a;
     const float d = NoH * NoH * (a2 - 1.0) + 1.0;
@@ -234,12 +236,13 @@ void main() {
         // very edges).
         float profile = clamp(in_aux.y, 0.0, 1.0);
         const int vmode = int(dd.params.w + 0.5);
+        float glass_sheen = 0.0;
         if (vmode != 0) {
             // Its own profile by the angle off the view axis (aux.x = degrees / 90): the low-HP
             // dark (1: clear inside params.x, full from params.y, squared smoothstep) or the
             // rally's rim (2: a band between them, soft at both ends).
             const float angle = in_aux.x * 90.0;
-            if (vmode == 3) {
+            if (vmode == 3 || vmode == 4) {
                 // Fitted to what the headset shows (fd.field, the eyes' union): per-axis angles
                 // off the view axis over that side's half-angle, r = 1 at the displayed edge in
                 // every direction; clear inside params.x, full from params.y. The ring's own
@@ -250,7 +253,23 @@ void main() {
                 const vec2 ang = degrees(atan(t));
                 const vec2 q = vec2(ang.x / max(ang.x < 0.0 ? f.x : f.y, 1.0),
                                     ang.y / max(ang.y > 0.0 ? f.z : f.w, 1.0));
-                profile = smoothstep(dd.params.x, dd.params.y, length(q));
+                const float radius = length(q);
+                profile = smoothstep(dd.params.x, dd.params.y, radius);
+                if (vmode == 4) {
+                    // A few fixed flecks and a worn inner rim. This shades only the existing
+                    // Monocular iris mesh: no scene sample, texture, or additional pass.
+                    const vec2 d0 = q - vec2(-0.23, 0.12);
+                    const vec2 d1 = q - vec2(0.18, -0.17);
+                    const vec2 d2 = q - vec2(0.07, 0.25);
+                    const float dust = 0.065 * (1.0 - smoothstep(0.00002, 0.00022, dot(d0, d0))) +
+                                       0.045 * (1.0 - smoothstep(0.00001, 0.00014, dot(d1, d1))) +
+                                       0.035 * (1.0 - smoothstep(0.00001, 0.00012, dot(d2, d2)));
+                    // The worn rim follows the opening (params.x: the clear radius; 0.32 gave
+                    // the original 0.26 .. 0.40 band).
+                    glass_sheen = 0.07 * smoothstep(dd.params.x - 0.06, dd.params.x - 0.01, radius) *
+                                  (1.0 - smoothstep(dd.params.x + 0.02, dd.params.x + 0.08, radius));
+                    profile = max(profile, dust + glass_sheen);
+                }
             } else if (vmode == 1) {
                 const float t = smoothstep(dd.params.x, dd.params.y, angle);
                 profile = t * t;
@@ -262,18 +281,44 @@ void main() {
         if (dd.params.z != 1.0) {
             profile = pow(profile, max(dd.params.z, 0.01));
         }
+        vec3 col = dd.base.rgb;
         if (dd.emissive.w > 0.0) {
             // The directional hit flash (core/vr/hit_direction.h RingWeight): weighted toward
             // emissive.xy around the view axis (x right, y up), a wedge of power emissive.z and
             // focus emissive.w (0 = the plain ring). The ring's own plane is the model's xy.
             const vec3 rel = transpose(mat3(dd.model)) * (in_world - dd.model[3].xyz);
-            const float len = length(rel.xy);
-            const float c = len > 1e-6 ? dot(rel.xy / len, dd.emissive.xy) : 0.0;
-            const float wedge = pow(max(0.5 + 0.5 * c, 0.0), max(dd.emissive.z, 0.01));
-            profile *= (1.0 - dd.emissive.w) + dd.emissive.w * wedge;
+            if (dd.emissive.z < 0.0) {
+                // The four corners of what the headset shows (the status build-ups,
+                // core/vr/status_corners.h): the status's own look in each corner of its fitted
+                // field (per-side half-angles, as vmode 3), reaching emissive.x in, its beat clock
+                // emissive.y; its own colours; nothing else of the ring.
+                const vec2 t = rel.xy / max(dot(dd.model[0].xyz, dd.model[0].xyz), 1e-8);
+                const vec4 f = fd.field.x > 1.0 ? fd.field : vec4(54.0, 54.0, 44.0, 55.0);
+                const vec2 ang = degrees(atan(t));
+                const vec2 q = vec2(ang.x / max(ang.x < 0.0 ? f.x : f.y, 1.0),
+                                    ang.y / max(ang.y > 0.0 ? f.z : f.w, 1.0));
+                // -emissive.z: the status (whole part) and the veins' width (the fraction);
+                // params.x: the zoom into what the lenses show (StatusCornerZoomed).
+                const float kind = floor(-dd.emissive.z);
+                const vec4 look = StatusCornerZoomed(q, dd.params.x, dd.emissive.x, dd.emissive.y,
+                                                     -dd.emissive.z - kind, int(kind));
+                profile = look.a;
+                col = look.rgb;
+            } else {
+                const float len = length(rel.xy);
+                const float c = len > 1e-6 ? dot(rel.xy / len, dd.emissive.xy) : 0.0;
+                const float wedge = pow(max(0.5 + 0.5 * c, 0.0), max(dd.emissive.z, 0.01));
+                profile *= (1.0 - dd.emissive.w) + dd.emissive.w * wedge;
+            }
         }
         const float a = dd.base.a * profile * clamp(dd.extra.z, 0.0, 1.0);
-        out_color = vec4(dd.base.rgb * a, a);
+        if (vmode == 4) {
+            const vec3 sheen = vec3(0.16, 0.13, 0.09) * glass_sheen * dd.base.a *
+                               clamp(dd.extra.z, 0.0, 1.0);
+            out_color = vec4(dd.base.rgb * a + sheen, a);
+        } else {
+            out_color = vec4(col * a, a);
+        }
         return;
     }
     const vec3 V = normalize(fd.eye_pos[eye].xyz - in_world);

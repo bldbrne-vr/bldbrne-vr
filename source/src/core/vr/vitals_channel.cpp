@@ -6,6 +6,8 @@
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
+#include <atomic>
+
 #include "core/vr/inframe.h"
 #include "core/vr/seqlock.h"
 #include "core/vr/vitals_channel.h"
@@ -15,6 +17,7 @@ namespace VR::Vitals {
 namespace {
 
 SeqLock<Status> g_status;
+std::atomic<std::int64_t> g_bullets_short_ns{0};
 SeqLock<GaugeState> g_gauge;
 SeqLock<Beat> g_beat;
 
@@ -28,6 +31,14 @@ void PublishStatus(const Status& status) {
 
 bool LatestStatus(Status& out) {
     return g_status.Load(out);
+}
+
+void NoteBulletsShort(std::int64_t steady_ns) {
+    g_bullets_short_ns.store(steady_ns, std::memory_order_relaxed);
+}
+
+std::int64_t BulletsShortNs() {
+    return g_bullets_short_ns.load(std::memory_order_relaxed);
 }
 
 void PublishGauge(const GaugeState& state) {

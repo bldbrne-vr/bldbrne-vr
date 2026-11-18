@@ -14,12 +14,15 @@
 
 #include "common/alignment.h"
 #include "common/slow_scope.h"
+#include "video_core/fast_render.h"
+#include "video_core/vram_report.h"
 #include "common/assert.h"
 #include "video_core/vma_fallback.h"
 #include "common/logging/log.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/read_barrier_logic.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/openxr_presenter.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -55,6 +58,11 @@ std::string_view BufferTypeName(MemoryUsage type) {
 //           per clinic frame).
 //   shadow: the GPU's BAR, written through a cached copy that goes into the BAR in one sequential
 //           memcpy before each submit of the scheduler (StreamBuffer::FlushShadow).
+//   auto (the launcher's): shadow when a headset session can start (OpenXR requested, and its
+//           runtime found a head-mounted system with the Vulkan instance, before this buffer);
+//           cached otherwise: a flat run saves the shadow's second copy and has GPU time to spare
+//           for the PCIe reads (320x240 Old Yharnam, release build: +3.9% standing, +1.5% panning
+//           on average, medians +4.7% / +4.1%).
 StreamMemoryMode GetStreamMemoryMode() {
     static const StreamMemoryMode mode = [] {
         const char* v = std::getenv("VR_STREAM_MEM");
@@ -66,6 +74,13 @@ StreamMemoryMode GetStreamMemoryMode() {
         }
         if (v && std::strcmp(v, "shadow") == 0) {
             return StreamMemoryMode::Shadow;
+        }
+        if (v && std::strcmp(v, "auto") == 0) {
+            const bool vr = Vulkan::OpenXRPresenter::IsRequested() &&
+                            Vulkan::OpenXRPresenter::IsRuntimeAvailable();
+            LOG_INFO(Render_Vulkan, "VR stream: auto -> {} ({})", vr ? "shadow" : "cached",
+                     vr ? "a headset session can start" : "a flat run");
+            return vr ? StreamMemoryMode::Shadow : StreamMemoryMode::Cached;
         }
         return StreamMemoryMode::Default;
     }();
@@ -113,11 +128,42 @@ UniqueBuffer::~UniqueBuffer() {
     }
 }
 
+UniqueBuffer::Released UniqueBuffer::Release() {
+    if (!buffer) {
+        return {};
+    }
+    NativeStereo::ForgetBuffer(buffer);
+    const Released out{allocator, buffer, allocation};
+    buffer = vk::Buffer{};
+    allocation = VK_NULL_HANDLE;
+    native_entry = nullptr;
+    return out;
+}
+
+void UniqueBuffer::DestroyReleased(const Released& released) {
+    if (released.buffer) {
+        vmaDestroyBuffer(released.allocator, released.buffer, released.allocation);
+    }
+}
+
 void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usage,
                           VmaAllocationInfo* out_alloc_info, bool host_cached) {
     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+    // FAST_BUFFER_POOLED_MB (default 0 = off; read once): BDA buffers below this size come from
+    // VMA's blocks (the allocator is made with BUFFER_DEVICE_ADDRESS, so every block can give a
+    // device address) instead of a dedicated allocation each, which costs ~0.2 ms apiece and
+    // makes area loads create 50-100 of them in one frame (sewers, 2026-10-24). Larger buffers
+    // stay dedicated, so freeing them still hands their memory back.
+    static const u64 pooled_below = [] {
+        const char* value = std::getenv("FAST_BUFFER_POOLED_MB");
+        return value ? u64(std::strtoull(value, nullptr, 10)) << 20 : u64{0};
+    }();
+    // FAST bit 52 (PooledBuffers): the same below 64 MB, switchable in a run.
+    const u64 pooled = pooled_below ? pooled_below
+                                    : FastRender::On(FastRender::PooledBuffers) ? u64{64} << 20
+                                                                               : u64{0};
     const VmaAllocationCreateFlags bda_flag =
-        with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+        with_bda && buffer_ci.size >= pooled ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
     // host_cached: mapped, cached system memory (StreamMemoryMode::Cached).
     const VmaAllocationCreateInfo alloc_ci = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag |
@@ -146,6 +192,11 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
                vk::to_string(vk::Result{result}));
     buffer = vk::Buffer{unsafe_buffer};
+    if (VramReport::Enabled()) {
+        VramReport::Name(allocator, allocation,
+                         fmt::format("buf usage{} {} MiB{}", static_cast<int>(usage),
+                                     buffer_ci.size >> 20, host_cached ? " cached" : ""));
+    }
     slow_alloc.reset();
     Common::Slow::Scope slow_twin{Common::Slow::StereoTwin, buffer_ci.size};
     native_entry = NativeStereo::RegisterBuffer(buffer, buffer_ci.size, allocator, usage == MemoryUsage::Stream || usage == MemoryUsage::Upload);
@@ -174,6 +225,11 @@ Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
 
     const auto device = instance->GetDevice();
     Vulkan::SetObjectName(device, Handle(), "Buffer {:#x}:{:#x}", cpu_addr, size_bytes);
+    if (VramReport::Enabled() && cpu_addr)
+        VramReport::Name(instance->GetAllocator(), buffer.allocation,
+                         fmt::format("buf usage{} {} MiB guest {:#x} handle {:#x}",
+                                     static_cast<int>(usage), size_bytes >> 20, cpu_addr,
+                                     reinterpret_cast<u64>(static_cast<VkBuffer>(Handle()))));
 
     // Map it if it is host visible.
     VkMemoryPropertyFlags property_flags{};
@@ -182,6 +238,26 @@ Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
         mapped_data = std::span<u8>{std::bit_cast<u8*>(alloc_info.pMappedData), size_bytes};
     }
     is_coherent = property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+}
+
+Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_, VAddr cpu_addr_,
+               u64 size_bytes_, vk::Buffer view, SparsePool* pool, std::vector<u32>&& pieces)
+    : cpu_addr{cpu_addr_}, sparse_view{true}, sparse_pieces{std::move(pieces)},
+      size_bytes{size_bytes_}, instance{&instance_},
+      scheduler{&scheduler_}, usage{MemoryUsage::DeviceLocal},
+      buffer{instance->GetDevice(), instance->GetAllocator()} {
+    // No allocation of its own: vmaDestroyBuffer with a null allocation destroys only the buffer.
+    buffer.allocation = VK_NULL_HANDLE;
+    buffer.buffer = view;
+    // Its twin shares the view's pieces, except blocks the right eye writes (NativeStereo).
+    buffer.native_entry = NativeStereo::RegisterSparseView(view, size_bytes,
+                                                           instance->GetAllocator(), pool, cpu_addr);
+    buffer.bda_addr = instance->GetDevice().getBufferAddress(vk::BufferDeviceAddressInfo{
+        .buffer = view,
+    });
+    ASSERT_MSG(buffer.bda_addr != 0, "Failed to get a sparse view's device address");
+    Vulkan::SetObjectName(instance->GetDevice(), Handle(), "Sparse view {:#x}:{:#x}", cpu_addr,
+                          size_bytes);
 }
 
 namespace {
@@ -371,7 +447,7 @@ void Buffer::Fill(u64 offset, u32 num_bytes, u32 value) {
         .size = num_bytes,
     };
     // FAST bit 63 (vk_transfer_eye_barriers.h): one barrier pair names both eyes' buffers.
-    if (Vulkan::TransferEyeBarriers::On()) {
+    if (Vulkan::TransferEyeBarriers::On() && !NativeStereo::IsSparseTwin(buffer)) {
         if (const auto right = NativeStereo::ExistingRight(buffer)) {
             using namespace Vulkan::TransferEyeBarriers;
             if (right == buffer.buffer) {
@@ -407,9 +483,13 @@ void Buffer::Fill(u64 offset, u32 num_bytes, u32 value) {
         .pBufferMemoryBarriers = &pre_barrier,
     });
     cmdbuf.fillBuffer(buffer, offset, num_bytes, value);
-    if (auto right = NativeStereo::ExistingRight(buffer)) {
+    vk::Buffer right{};
+    const auto own = NativeStereo::RightOwnRanges(buffer, offset, num_bytes, right);
+    if (right && right != buffer.buffer && !own.empty()) {
         NativeStereo::Barrier(*scheduler);
-        cmdbuf.fillBuffer(right, offset, num_bytes, value);
+        for (const auto& [at, size] : own) {
+            cmdbuf.fillBuffer(right, at, size, value);
+        }
         NativeStereo::Barrier(*scheduler);
     }
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{

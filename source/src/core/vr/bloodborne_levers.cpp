@@ -6,6 +6,7 @@
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -19,14 +20,17 @@
 #include "core/vr/bloodborne_levers.h"
 #include "core/vr/summon_bell.h"
 #include "core/vr/body_frame.h"
+#include "core/vr/chest_open.h"
 // Before hook_util.h: its xbyak brings <windows.h>, whose `near` macro would eat members here.
 #include "core/vr/lever_acquisition.h"
+#include "core/vr/lever_animation.h"
 #include "core/vr/lever_audio.h"
 #include "core/vr/hook_util.h"
 #include "core/vr/lever_channel.h"
 #include "core/vr/lever_models.h"
 #include "core/vr/lever_pose_edit.h"
 #include "core/vr/lever_settings.h"
+#include "core/vr/vr_session.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -196,6 +200,28 @@ bool Object(u32 handle, u64 &address, std::array<u8, 0x2E0> &object) {
     address = objects + static_cast<u64>(index) * 0x2E0;
     return Copy(address, object.data(), object.size());
 }
+// Object's inverse: the handle of the map object at `address`, from the slot of the object
+// manager's tables that holds it (max when none does).
+u32 HandleOf(u64 address) {
+    u64 manager{}, blocks{};
+    s32 block_count{};
+    if (!ReadAt(reinterpret_cast<u64>(g_base) + ObjectManRva, manager) ||
+        !ReadAt(manager + 0x20, block_count) || block_count <= 0 || block_count > 256 ||
+        !ReadAt(manager + 0x28, blocks) || !Hook::Plausible(reinterpret_cast<u8 *>(blocks)))
+        return std::numeric_limits<u32>::max();
+    for (s32 b = 0; b < block_count; ++b) {
+        const u64 entry = blocks + static_cast<u64>(b) * 0x1F8;
+        u64 objects{};
+        s32 object_count{};
+        if (!ReadAt(entry + 0xC8, object_count) || object_count <= 0 || object_count > 0x100000 ||
+            !ReadAt(entry + 0xD0, objects) || address < objects || (address - objects) % 0x2E0)
+            continue;
+        const u64 index = (address - objects) / 0x2E0;
+        if (index < static_cast<u64>(object_count))
+            return (static_cast<u32>(b) << 20) | static_cast<u32>(index);
+    }
+    return std::numeric_limits<u32>::max();
+}
 
 // Game-thread adapter. Kept behind the development switch until rendered interaction
 // and original gameplay completion have been validated together.
@@ -260,6 +286,9 @@ struct Offer {
     const L::Model *model{};
     float angle{};  // where its handle stands when offered: 0 at rest, a parked capstan's angle
     bool parked{};  // a parked capstan (`parked` below): the hold resumes its bone
+    // A scripted lever (lever_models.h `button`): no action row; `row` holds its object's address,
+    // `block`, `param` and `state` stay 0, and its completion answers its action button (Fire).
+    bool scripted{};
 };
 Offer offer;
 L::PoseEdit edit;
@@ -316,6 +345,70 @@ bool InteractionBlocked(u32 mask) {
     using Query = u32(PS4_SYSV_ABI *)();
     return (reinterpret_cast<Query>(g_base + BlockedRva)() & mask) != 0;
 }
+// A scripted lever's prompt (lever_models.h `button`): the script-prompt gate bumps `seen` each
+// pass the game offers it, hidden or not, which it does only while the hunter stands in its zone.
+// Sampled under the busy guard (every tick of a scripted hold): true when it moved within `window`.
+constexpr s64 ScriptArmNs = 750'000'000;  // armed and grabbable (CheckArmed asks twice a second)
+constexpr s64 ScriptFireNs = 100'000'000; // a completed pull answers it: offered a few frames ago
+u64 script_seen{};
+s64 script_seen_ns{};
+bool ScriptOffered(s64 now, s64 window) {
+    const auto seen =
+        std::atomic_ref<u64>(L::Channel().script_verdict.seen).load(std::memory_order_acquire);
+    if (seen != script_seen) {
+        script_seen = seen;
+        script_seen_ns = now;
+    }
+    return script_seen_ns > 0 && now >= script_seen_ns && now - script_seen_ns <= window;
+}
+// A scripted lever's completion: the gate's next pass at its prompt answers its action button, as
+// the game's own press there would (the condition its event script waits on is met: its cutscene
+// and flags follow), only while the game offers that prompt now. Out of its zone, a completed pull
+// returns to rest without an event. One answer: one the gate has not taken within ScriptTakeNs
+// (the hunter left the zone in between) is withdrawn, never answered later.
+constexpr s64 ScriptTakeNs = 250'000'000;
+u64 fire_object{};
+s64 fire_ns{};
+bool Fire(const L::Command &command, s64 now) {
+    const char *name = offer.model ? offer.model->name : "?";
+    if (!offer.model || !L::Scripted(*offer.model) || !ScriptOffered(now, ScriptFireNs)) {
+        ReportCompletion(command, false);
+        LOG_INFO(Core, "VR lever development: complete handle={:#x} ({}) not dispatched: the game "
+                       "does not offer its action button here now (the hunter is outside its zone)",
+                 command.id, name);
+        return false;
+    }
+    std::atomic_ref<u64>(L::Channel().script_verdict.fire)
+        .store(offer.pose.object, std::memory_order_release);
+    fire_object = offer.pose.object;
+    fire_ns = now;
+    ReportCompletion(command, true);
+    VR::LeverAudio::PublishPull(now); // its clunk (core/vr/lever_audio.h)
+    LOG_INFO(Core, "VR lever development: complete handle={:#x} generation={} ({}): its action "
+                   "button {} is answered on the game's next pass",
+             command.id, command.generation, name, offer.model->button);
+    return true;
+}
+// Whether the gate took the answer (logged once), or withdraws it after ScriptTakeNs. Under the
+// busy guard.
+void ExpireFire(s64 now) {
+    if (!fire_ns)
+        return;
+    std::atomic_ref<u64> fire(L::Channel().script_verdict.fire);
+    auto pending = fire_object;
+    if (fire.load(std::memory_order_acquire) == pending && now - fire_ns <= ScriptTakeNs)
+        return;
+    if (fire.compare_exchange_strong(pending, 0, std::memory_order_acq_rel))
+        LOG_INFO(Core, "VR lever development: object {:#x}: its action button answer withdrawn, "
+                       "not taken within {} ms (the hunter left its zone)",
+                 fire_object, ScriptTakeNs / 1'000'000);
+    else
+        LOG_INFO(Core, "VR lever development: object {:#x}: the game took its action button "
+                       "({:.0f} ms): its event runs",
+                 fire_object, static_cast<double>(now - fire_ns) / 1e6);
+    fire_ns = 0;
+    fire_object = 0;
+}
 bool Complete(const L::Command &command) {
     attempted_completion = command.serial; // never retry an irreversible dispatch
     if (g_motion_test) {
@@ -331,6 +424,8 @@ bool Complete(const L::Command &command) {
                  command.id);
         return false;
     }
+    if (offer.scripted)
+        return Fire(command, NowNs());
     u64 rows{};
     u32 actor_handle{};
     if (!ReadAt(offer.block + 0x90, rows) || offer.row < rows ||
@@ -367,7 +462,9 @@ struct Guard {
 };
 
 bool ReadPoseStorage(const std::array<u8, 0x2E0> &object, Pose &pose) {
-    if (Field<s32>(object, 0x208) != -1)
+    if (!L::AnimationAllowsRestCheck(Field<s32>(object, 0x208), Field<u64>(object, 0x290),
+                                     Field<u32>(object, 0x20C),
+                                     [](u64 at, auto& value) { return ReadAt(at, value); }))
         return false;
     pose.controller = Field<u64>(object, 0x290);
     pose.model = Field<u64>(object, 0x270);
@@ -380,10 +477,10 @@ bool ReadPoseStorage(const std::array<u8, 0x2E0> &object, Pose &pose) {
     // pose node; 1D34460/1D34710 read its mapped model-space bones for the mesh.
     pose.matrix_node = Field<u64>(object, 0x2A0);
     pose.mapping = Field<u64>(object, 0x298);
-    // The lever models have 3 or 4 Havok bones (core/vr/lever_models.h); which mapping is a
-    // lever's own is checked with its names and rest pose in Bind.
+    // The lever models have 2 to 4 Havok bones (core/vr/lever_models.h; the Chalice turning
+    // levers 2); which mapping is a lever's own is checked with its names and rest pose in Bind.
     const s32 count = Field<s32>(hka, 0x10);
-    if (count < 3 || count > static_cast<s32>(L::MaxBones) || Field<s32>(hka, 0x20) != count ||
+    if (count < 2 || count > static_cast<s32>(L::MaxBones) || Field<s32>(hka, 0x20) != count ||
         Field<s32>(hka, 0x30) != count)
         return false;
     pose.count = static_cast<u32>(count);
@@ -437,8 +534,11 @@ void LogUnmatched(const L::Skeleton &skeleton, const Pose &pose,
         if (!L::SameBones(model, skeleton))
             continue;
         for (size_t a = 0; a < model.actions.size(); ++a) {
-            if (model.actions[a] == 0 || model.actions[a] != action ||
-                g_unmatched_logged[m * 3 + a].exchange(true, std::memory_order_relaxed))
+            // A scripted lever is bound with no row (action 0): logged in its first slot.
+            const bool listed = L::Scripted(model)
+                                    ? a == 0 && action == 0
+                                    : model.actions[a] != 0 && model.actions[a] == action;
+            if (!listed || g_unmatched_logged[m * 3 + a].exchange(true, std::memory_order_relaxed))
                 continue;
             const auto &lever = locals[model.lever];
             // Every ancestor of the lever bone (the root alone for a lever stick; o353010's root
@@ -600,6 +700,7 @@ struct RecentLever {
     L::Rig rig{};
     bool armed{};
     float angle{}; // where its handle stands (a parked capstan's bar)
+    bool scripted{}; // a scripted lever: `row` holds its object's address, no block or rows
 };
 RecentLever recent;
 // The action-block array and this block's rows as the game has them now; the actor identity.
@@ -623,6 +724,23 @@ bool LiveIdentity(u64 row, u64 block, u64 actor, RecentLever &out) {
     out.actor = actor;
     return true;
 }
+// A scripted lever's identity (lever_models.h `button`; no action tables): its object as the object
+// manager's tables hold it (HandleOf) and the actor. `row` holds the object's address, its key for
+// the armed lever and for demotions.
+bool ScriptedIdentity(u64 object, u64 actor, RecentLever &out) {
+    out = {};
+    if (!actor || !ReadAt(actor, out.actor_vtable) ||
+        !Hook::Plausible(reinterpret_cast<u8 *>(out.actor_vtable)) ||
+        !ReadAt(actor + 8, out.actor_handle) || out.actor_handle == 0xFFFFFFFF)
+        return false;
+    out.handle = HandleOf(object);
+    if (out.handle == std::numeric_limits<u32>::max())
+        return false;
+    out.row = object;
+    out.actor = actor;
+    out.scripted = true;
+    return true;
+}
 bool Selectable(s32 state) { return state != 3 && state != 4; } // 13AE09A skips [Run] and [End]
 
 // A refused physical attempt brings this lever's normal prompt and button back for a while.
@@ -634,9 +752,30 @@ void Demote(u64 row, u32 handle, s64 until) {
     channel.PromptChanged(); // next selection pass reclassifies (and keeps the prompt)
 }
 
+// Out of reach (lever_acquisition.h OutOfReach): the stem's lowest grip rises above the XR side's
+// reach through the pull. Logged once per lever instance (the last few remembered), with both
+// heights, so a headset log shows why a lever kept its prompt. Under the busy guard.
+std::array<u32, 4> reach_noted{0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+size_t reach_noted_next = 0;
+bool BeyondReach(const L::Rig &rig, u32 handle, s32 action, const L::Model *model) {
+    const float top = L::Channel().reach_top.load(std::memory_order_acquire);
+    if (!L::OutOfReach(rig, top))
+        return false;
+    if (std::find(reach_noted.begin(), reach_noted.end(), handle) == reach_noted.end()) {
+        reach_noted[reach_noted_next] = handle;
+        reach_noted_next = (reach_noted_next + 1) % reach_noted.size();
+        LOG_INFO(Core, "VR lever: handle={:#x} row {} ({}) out of reach: its stem's lowest grip "
+                       "rises to y={:.2f} through the pull, a hand reaches y={:.2f} (game units): "
+                       "the game's own prompt and button",
+                 handle, action, model ? model->name : "?", L::LowestGripTop(rig), top);
+    }
+    return true;
+}
+
 // Native gate's host classifier: called on a different selected row/object, a legacy serial
 // change, a prompt change or a due recheck. Hides the prompt only when this exact instance's
-// rig binds, a hand can pull it now and the game's tables hold it (or while it is held).
+// rig binds, a hand can pull it now and reach its stem, and the game's tables hold it (or while
+// it is held).
 void Classify(u64 row, u64 actor, u64 block) {
     auto &channel = L::Channel();
     auto &verdict = channel.verdict;
@@ -680,6 +819,8 @@ void Classify(u64 row, u64 actor, u64 block) {
         why = "no rig measured for this model and row, or not at rest";
     else if (!L::Recent(ready, now, L::ReadyNs))
         why = "no hand can pull it now: virtual screen, third person, or body or hands untracked";
+    else if (!held && BeyondReach(rig, handle, action, model))
+        why = "out of reach: no hand takes its stem through the whole pull from where you stand";
     else if (!LiveIdentity(row, block, actor, seen))
         why = "not found in the game's action tables, so it cannot be armed";
     const bool binds = why == nullptr;
@@ -800,6 +941,67 @@ void Selected(u64 row, u64 actor, u64 block, const char *path = "selected") {
                           : std::string{});
 }
 
+// Selected for the armed scripted lever (lever_models.h `button`): its object re-read and bound
+// at rest, its prompt offered here (the hunter in its zone). No action row, state or permission:
+// its event script decides whether its button is answered. The same request and replies.
+void SelectedScripted(const RecentLever &seen, const char *path) {
+    if (!g_runtime_enabled)
+        return;
+    Guard guard;
+    if (!guard.acquired || edit.Owned() || L::Channel().work.load(std::memory_order_acquire))
+        return;
+    const auto request = L::Channel().acquire.exchange(0, std::memory_order_acq_rel);
+    if (!request)
+        return;
+    const auto now = NowNs();
+    if (!L::Fresh(request, now))
+        return;
+    offer_request = request;
+    Offer next{};
+    next.row = seen.row;
+    next.actor = seen.actor;
+    next.handle = seen.handle;
+    next.scripted = true;
+    const char *rejected = nullptr;
+    bool demote = true;
+    if (L::Channel().prompt_state.Demoted(seen.row, seen.handle, now)) {
+        rejected = "its normal prompt and button are back for now (a refused pull)";
+        demote = false;
+    } else if (!ScriptOffered(now, ScriptArmNs)) {
+        rejected = "the game does not offer its action button here (outside its zone)";
+        demote = false;
+    } else if (!ReadPose(seen.handle, next.pose) || next.pose.object != seen.row)
+        rejected = "object pose unavailable or animating";
+    else if (!Bind(next.pose, next.binding, next.rig, &next.model, 0, &next.angle, &next.parked) ||
+             !L::Scripted(*next.model))
+        rejected = "unsupported rig or non-rest pose";
+    else if (!ReadAt(seen.actor + 8, next.actor_handle) ||
+             next.actor_handle != seen.actor_handle)
+        rejected = "actor unavailable";
+    if (rejected) {
+        LOG_INFO(Core, "VR lever development: request={} ({}) rejected: {} handle={:#x} (scripted)",
+                 request, path, rejected, seen.handle);
+        if (demote)
+            Demote(seen.row, seen.handle, now + L::RejectedNs);
+        ClearOffer();
+        L::Channel().PublishOffer({now, {}, request});
+        return;
+    }
+    next.generation = offer.scripted && offer.row == next.row && offer.handle == next.handle &&
+                              offer.actor_handle == next.actor_handle &&
+                              SamePose(offer.pose, next.pose)
+                          ? offer.generation
+                          : ++generation;
+    offer = next;
+    PublishOffer(now);
+    const auto grip = L::HandleAt(offer.rig, offer.angle);
+    LOG_INFO(Core,
+             "VR lever development: offer request={} ({}) handle={:#x} generation={} model={} "
+             "pivot=({:.3f},{:.3f},{:.3f}) grip=({:.3f},{:.3f},{:.3f}) (its action button {})",
+             request, path, offer.handle, offer.generation, offer.model->name, offer.rig.pivot.x,
+             offer.rig.pivot.y, offer.rig.pivot.z, grip.x, grip.y, grip.z, offer.model->button);
+}
+
 RecentLever ArmedLever() {
     Guard guard; // Classify (selection thread) writes it under the same guard
     return guard.acquired ? recent : RecentLever{};
@@ -809,6 +1011,9 @@ RecentLever ArmedLever() {
 // the same rows; other blocks streaming in or out (the array's count) do not matter.
 bool StillInPlace(const RecentLever &seen) {
     RecentLever live{};
+    if (seen.scripted) // its object still in the same slot, the same actor
+        return ScriptedIdentity(seen.row, seen.actor, live) && live.handle == seen.handle &&
+               live.actor_vtable == seen.actor_vtable && live.actor_handle == seen.actor_handle;
     return LiveIdentity(seen.row, seen.block, seen.actor, live) && live.rows == seen.rows &&
            live.row_count == seen.row_count && live.handle == seen.handle &&
            live.actor_vtable == seen.actor_vtable && live.actor_handle == seen.actor_handle;
@@ -864,7 +1069,10 @@ void ServiceArmed() {
         Unserved(request, "the game blocks interaction now (a menu, dialog, talk or event)");
         return;
     }
-    Selected(seen.row, seen.actor, seen.block, "armed");
+    if (seen.scripted)
+        SelectedScripted(seen, "armed");
+    else
+        Selected(seen.row, seen.actor, seen.block, "armed");
 }
 
 // The actor 13ADCC0 runs its selection and permission checks for (its r15 at 13AE171/13AE195):
@@ -975,7 +1183,8 @@ void Scan() {
                 float angle{};
                 pose.handle = handle;
                 if (!ReadPoseStorage(object, pose) ||
-                    !Bind(pose, binding, rig, &model, action, &angle))
+                    !Bind(pose, binding, rig, &model, action, &angle) ||
+                    BeyondReach(rig, handle, action, model))
                     continue;
                 const auto metres = L::Scaled(rig, to_m);
                 const float reach = L::ScanReach(metres, head, hands, where.tracked);
@@ -1040,10 +1249,21 @@ void CheckArmed() {
     L::BoneBinding binding{};
     L::Rig rig{};
     float angle{};
+    const L::Model *model = nullptr;
     const char *why = nullptr;
+    const auto now = NowNs();
     if (!L::Enabled())
         why = "physical levers off";
-    else if (!Row(seen.row, seen.block, param, handle, state, &action))
+    else if (seen.scripted) {
+        // Its prompt offered here (the hunter in its zone): only there does its button answer.
+        ExpireFire(now);
+        if (!ReadPose(seen.handle, pose) || pose.object != seen.row)
+            why = "animating";
+        else if (!Bind(pose, binding, rig, &model, 0, &angle) || !L::Scripted(*model))
+            why = "not at rest";
+        else if (!ScriptOffered(now, ScriptArmNs))
+            why = "the game does not offer its action button here (outside its zone)";
+    } else if (!Row(seen.row, seen.block, param, handle, state, &action))
         why = "no longer a lever row";
     else if (!Selectable(state))
         why = "used or running";
@@ -1051,7 +1271,10 @@ void CheckArmed() {
         why = "animating";
     else if (!Bind(pose, binding, rig, nullptr, action, &angle))
         why = "not at rest";
-    const auto now = NowNs();
+    // Out of reach from where the hunter stands now (armed from higher up, say, as he landed):
+    // its prompt is the game's again (the selection classifier keeps it).
+    if (!why && BeyondReach(rig, seen.handle, action, model))
+        why = "out of reach from where you stand";
     // a refused pull gave it back to the game's button: no hand pull meanwhile, so the
     // game's own pull never meets a held lever.
     if (!why && channel.prompt_state.Demoted(seen.row, seen.handle, now))
@@ -1066,6 +1289,88 @@ void CheckArmed() {
         recent.angle = angle;
     }
     channel.PublishNearby({now, recent.handle, recent.rig, armed, recent.angle});
+}
+// The script-prompt gate's host classifier (lever_prompt.h ScriptVerdict), on the thread that runs
+// the event scripts: the game offers action button `button` at `object` (a scripted lever's root
+// bone named it; or the gate's verdict for it is due again). Hides its prompt and button only for
+// a scripted lever (lever_models.h `button`) whose rig binds at rest there, on its own button, a
+// hand able to pull it now and its prompt not given back by a refused pull; and arms it, as the
+// selection classifier arms a row lever: its pull answers that button (Fire). Anything else keeps
+// the game's prompt. Its zone is the game's own: it is offered only while the hunter stands there.
+void ScriptPrompt(u64 object, u32 button) {
+    auto &channel = L::Channel();
+    auto &verdict = channel.script_verdict;
+    const auto serial = channel.prompt_serial.load(std::memory_order_acquire);
+    std::atomic_ref<u64>(verdict.seen).fetch_add(1, std::memory_order_acq_rel); // offered now
+    Guard guard;
+    if (!guard.acquired) { // the scheduler owns the lever state now: ask again next pass
+        if (verdict.object != object || verdict.button != button)
+            verdict.bound = 0;
+        verdict.object = object;
+        verdict.button = button;
+        verdict.serial = serial;
+        verdict.recheck = 1;
+        return;
+    }
+    const auto now = NowNs();
+    ExpireFire(now);
+    ScriptOffered(now, 0);
+    const auto ready = channel.hand_pull_ready.load(std::memory_order_acquire);
+    const bool held = (edit.Owned() || channel.work.load(std::memory_order_acquire)) &&
+                      offer.scripted && offer.row == object;
+    Pose pose{};
+    L::BoneBinding binding{};
+    L::Rig rig{};
+    const L::Model *model = nullptr;
+    float angle{};
+    RecentLever seen{};
+    const char *why = nullptr;
+    if (!L::Enabled())
+        why = "physical levers off";
+    else if (!ScriptedIdentity(object, SelectionActor(), seen))
+        why = "not in the game's object tables, or no player";
+    else if (!ReadPose(seen.handle, pose) || pose.object != object)
+        why = "object pose unavailable or animating";
+    else if (!held && (!Bind(pose, binding, rig, &model, 0, &angle) || !L::Scripted(*model)))
+        why = "no rig measured for this model, or not at rest";
+    else if (!held && model->button != static_cast<s32>(button))
+        why = "another action button at it";
+    else if (!L::Recent(ready, now, L::ReadyNs))
+        why = "no hand can pull it now: virtual screen, third person, or body or hands untracked";
+    else if (!held && BeyondReach(rig, seen.handle, static_cast<s32>(button), model))
+        why = "out of reach: no hand takes its stem through the whole pull from where you stand";
+    const auto next = L::Decide({}, channel.prompt_state, object, seen.handle, L::Enabled(),
+                                why == nullptr, held, 0, serial, now);
+    if (next.bound && !held) {
+        seen.ns = now;
+        seen.rig = rig;
+        seen.armed = true;
+        seen.angle = angle;
+        if (recent.row != seen.row || recent.handle != seen.handle || !recent.armed)
+            LOG_INFO(Core, "VR lever: handle={:#x} ({}) armed at its action button {}: grabbable "
+                           "while you stay in its zone",
+                     seen.handle, model->name, button);
+        recent = seen;
+        channel.PublishNearby({now, seen.handle, rig, true, angle});
+    }
+    if (next.bound != verdict.bound || object != verdict.object || button != verdict.button) {
+        // Once per change of the offered lever or its verdict, never per pass.
+        if (next.bound)
+            LOG_INFO(Core, "VR lever: handle={:#x} action button {} ({}): pulled by hand, prompt "
+                           "hidden",
+                     seen.handle, button, held ? "held" : model->name);
+        else
+            LOG_INFO(Core, "VR lever: object {:#x} action button {}: normal prompt kept ({})",
+                     object, button,
+                     why                                                      ? why
+                     : channel.prompt_state.Demoted(object, seen.handle, now) ? "a refused pull: for now"
+                                                                              : "off");
+    }
+    verdict.object = object;
+    verdict.button = button;
+    verdict.serial = serial;
+    verdict.recheck = next.recheck;
+    verdict.bound = next.bound;
 }
 // Temporary rehearsal only: one bounded lookup on a fresh squeeze, independent of
 // the game's selected prompt and row state. Never changes action state or permission.
@@ -1239,9 +1544,12 @@ void Update(u64 queue, u64 objects) {
     Guard guard;
     if (!guard.acquired)
         return;
+    ExpireFire(NowNs());
     L::Command command{};
     if (!L::Channel().Read(command))
         return;
+    if (offer.scripted)
+        ScriptOffered(NowNs(), 0); // sampled every tick of its hold: Fire asks how recently
     Pose pose{};
     std::array<u8, 0x2E0> object{};
     if (!offer.handle || command.id != offer.handle || command.generation != offer.generation ||
@@ -1306,14 +1614,16 @@ void Update(u64 queue, u64 objects) {
             refused = "the hand's command went stale (no XR update within 150 ms)";
         else if (!angle_valid)
             refused = "its angle left the lever's stops";
-        else if (!Row(offer.row, offer.block, param, handle, state) || param != offer.param ||
-                 handle != offer.handle)
+        // (A scripted lever has no action row, state or permission: its event script decides.)
+        else if (!offer.scripted &&
+                 (!Row(offer.row, offer.block, param, handle, state) || param != offer.param ||
+                  handle != offer.handle))
             refused = "its action row changed";
-        else if (state != offer.state)
+        else if (!offer.scripted && state != offer.state)
             refused = "its action state changed";
         else if (!ReadAt(offer.actor + 8, actor_handle) || actor_handle != offer.actor_handle)
             refused = "the player changed";
-        else if (!g_motion_test && !Permitted(offer.row, offer.actor))
+        else if (!offer.scripted && !g_motion_test && !Permitted(offer.row, offer.actor))
             refused = "the game's permission refused it";
     }
     const bool allowed = (wants_hold || wants_complete || resume_settle) && !refused;
@@ -1408,10 +1718,12 @@ void Update(u64 queue, u64 objects) {
         if (settling_commit) {
             // Revalidate immediately before the one irreversible dispatch. Permission
             // at grab time is not authority to activate a changed action later.
-            const bool permitted = L::Enabled() && Row(offer.row, offer.block, param, handle, state) &&
-                param == offer.param && handle == offer.handle && state == offer.state &&
+            const bool permitted = L::Enabled() &&
+                (offer.scripted || (Row(offer.row, offer.block, param, handle, state) &&
+                                    param == offer.param && handle == offer.handle &&
+                                    state == offer.state)) &&
                 ReadAt(offer.actor + 8, actor_handle) && actor_handle == offer.actor_handle &&
-                (g_motion_test || Permitted(offer.row, offer.actor));
+                (offer.scripted || g_motion_test || Permitted(offer.row, offer.actor));
             const bool accepted = permitted && Complete(command);
             if (reported_completion != command.serial) ReportCompletion(command, false);
             if (accepted && offer.model && L::StaysAtStop(*offer.model)) {
@@ -1708,6 +2020,10 @@ void PS4_SYSV_ABI Pose(u64 object, u64 node) noexcept {
     }
 }
 
+namespace Chest {
+void ServeLead();
+}
+
 void PS4_SYSV_ABI UpdateObjects(u64 queue, u64 objects) noexcept {
     try {
         LiveLever::MotionRequest();
@@ -1716,6 +2032,7 @@ void PS4_SYSV_ABI UpdateObjects(u64 queue, u64 objects) noexcept {
         LiveLever::CheckArmed();
         LiveLever::Scan();
         LiveLever::ServiceArmed();
+        Chest::ServeLead();
     } catch (...) {
     }
     if (!g_diagnostics)
@@ -1772,15 +2089,170 @@ void PS4_SYSV_ABI Selected(u64 row, u64 actor, u64 block) noexcept {
         // Diagnostics must never unwind into guest code.
     }
 }
+void PS4_SYSV_ABI ScriptPrompt(u64 object, u32 button) noexcept {
+    try {
+        if (g_runtime_enabled)
+            LiveLever::ScriptPrompt(object, button);
+    } catch (...) {
+    }
+}
 void PS4_SYSV_ABI Permission(u64 row, u64 actor, u32 allowed) noexcept {
     try {
         Observe("permission", row, actor, allowed != 0);
     } catch (...) {
     }
 }
+// Chests, coffins, doors and gates in first-person VR (core/vr/chest_open.h): the main player's own
+// event record for one is changed before the game reads it: no hunter animation, no walk onto it,
+// the lid's or the door's own clip kept.
+namespace Chest {
+namespace C = VR::ChestOpen;
+// The main player's handle (WorldChrMan +0x60, its +0x08); 0xFFFFFFFF when unreadable.
+u32 MainPlayerHandle() {
+    u64 world{}, player{};
+    u32 handle{};
+    if (!ReadAt(reinterpret_cast<u64>(g_base) + WorldChrManRva, world) ||
+        !ReadAt(world + 0x60, player) || !Hook::Plausible(reinterpret_cast<u8 *>(player)) ||
+        !ReadAt(player + 8, handle))
+        return 0xFFFFFFFF;
+    return handle;
+}
+
+// The door whose own clip goes on past its wait for the hunter's push (C::LeadStart): armed from
+// its event, served from the object update once its new clip has started (the object's clip slot
+// changed) and played its first frame. The flag lets the update skip everything while no door
+// waits (read by the update's native gate too); the event and the update are both on the game's
+// main thread.
+struct Lead {
+    u32 handle{0xFFFFFFFF}; // the door's object
+    u32 slot{};             // its clip slot (+0x20C) when its event came: its new clip's differs
+    s32 clip{-1};           // the event's object clip (logs)
+    s32 row{};
+    float start{};
+    s64 armed_ns{};
+};
+Lead g_lead;
+std::atomic<u8> g_lead_armed{};
+// Its clip starts within a frame or two of its event; a door whose clip never did is let go.
+constexpr s64 LeadWindowNs = 3'000'000'000;
+
+void ArmLead(u32 handle, s32 row, s32 clip) {
+    const float start = C::LeadStart(row, clip);
+    u64 address{};
+    std::array<u8, 0x2E0> object{};
+    if (start <= 0.0f || handle == 0xFFFFFFFF || !Object(handle, address, object))
+        return;
+    g_lead = {handle, Field<u32>(object, 0x20C), clip, row, start, LiveLever::NowNs()};
+    g_lead_armed.store(1, std::memory_order_release);
+}
+
+// The Havok control of the clip in the object's slot, as the game reaches it to set a clip's time
+// (0x15A28A0, 0x1844060): the controller at +0x290, its slots at +8, 0x78 bytes each, picked by
+// the low half of +0x20C and checked by the whole of it; a playing slot's +0x4C is not 0; the
+// control at the slot's +8, the clip's time at its +0xC.
+bool ClipControl(const std::array<u8, 0x2E0> &object, u64 &control) {
+    const u64 controller = Field<u64>(object, 0x290);
+    const u32 slot_handle = Field<u32>(object, 0x20C);
+    u32 count{}, identity{}, active{};
+    u64 slots{};
+    if (!Hook::Plausible(reinterpret_cast<u8 *>(controller)) || !ReadAt(controller, count) ||
+        (slot_handle & 0xFFFF) >= count || !ReadAt(controller + 8, slots) ||
+        !Hook::Plausible(reinterpret_cast<u8 *>(slots)))
+        return false;
+    const u64 slot = slots + static_cast<u64>(slot_handle & 0xFFFF) * 0x78;
+    return ReadAt(slot, identity) && identity == slot_handle && ReadAt(slot + 0x4C, active) &&
+           active != 0 && ReadAt(slot + 8, control) &&
+           Hook::Plausible(reinterpret_cast<u8 *>(control), 4);
+}
+
+// The object update (every game frame): the armed door's clip goes on to its start, once.
+void ServeLead() {
+    if (!g_lead_armed.load(std::memory_order_acquire))
+        return;
+    const Lead lead = g_lead;
+    const auto drop = [&](const char *why) {
+        g_lead_armed.store(0, std::memory_order_release);
+        LOG_INFO(Core, "VR open: door clip of row {} left as the game made it ({})", lead.row, why);
+    };
+    if (LiveLever::NowNs() - lead.armed_ns > LeadWindowNs)
+        return drop("its clip never started");
+    u64 address{}, control{};
+    std::array<u8, 0x2E0> object{};
+    if (!Object(lead.handle, address, object))
+        return drop("its object is gone");
+    if (Field<u32>(object, 0x20C) == lead.slot || Field<s32>(object, 0x208) < 0)
+        return; // its own clip has not started yet
+    float time{};
+    if (!ClipControl(object, control) || !ReadAt(control + 0xC, time) || !std::isfinite(time) ||
+        !(time > 0.0f))
+        return; // not playing yet, or its first frame (and any sound at 0 s) still to come
+    if (!C::MoveOn(time, lead.start))
+        return drop("its clip is past its wait already");
+    if (!LiveLever::Writable(control + 0xC, sizeof(float)))
+        return drop("its clip's time cannot be written");
+    std::memcpy(reinterpret_cast<void *>(control + 0xC), &lead.start, sizeof(float));
+    g_lead_armed.store(0, std::memory_order_release);
+    LOG_INFO(Core,
+             "VR open: door clip {} (event clip {}) of row {} went on from {:.2f} s to {:.2f} s "
+             "(its wait for the hunter's push)",
+             Field<s32>(object, 0x208), lead.clip, lead.row, time, lead.start);
+}
+
+void RewriteEvent(u64 block, u64 record, u32 remote) {
+    if (remote)
+        return; // another player's: the game's own
+    // One read decides for every other object action: the hunter's animation the game is about
+    // to play (its ObjActParam row's, as the mock showed for every kind).
+    C::Record event{};
+    if (!Copy(record, event.data(), sizeof(event)))
+        return;
+    const C::Kind kind = C::KindOf(event[C::EvHunterAnim]);
+    if (kind == C::Kind::None || static_cast<u32>(event[C::EvActor]) != MainPlayerHandle())
+        return; // not a chest or a door, or not the hunter's own (an NPC's): the game's own
+    const VR::Settings &settings = VR::GetSettings();
+    const C::Reason reason = C::Decide(settings.vr_interactions,
+                                       {.vr_enabled = VR::IsEnabled(),
+                                        .display_auto = VR::GetDisplayMode() == VR::DisplayMode::Auto,
+                                        .immersive = VR::IsImmersive(),
+                                        .first_person = VR::IsFirstPerson(),
+                                        .flat = VR::CinematicFlat()});
+    const bool writable =
+        reason == C::Reason::Instant && LiveLever::Writable(record, sizeof(event));
+    if (writable) {
+        const C::Record ours = C::Rewrite(event);
+        std::memcpy(reinterpret_cast<void *>(record), ours.data(), sizeof(ours));
+    }
+    // Its action row (bounded reads): the ObjActParam id and the object's handle.
+    s32 count{}, action{};
+    u64 rows{};
+    u32 handle{0xFFFFFFFF};
+    if (ReadAt(block + 0x98, count) && count > 0 && count <= 65536 && event[C::EvIndex] >= 0 &&
+        event[C::EvIndex] < count && ReadAt(block + 0x90, rows) &&
+        Hook::Plausible(reinterpret_cast<u8 *>(rows))) {
+        const u64 row = rows + static_cast<u64>(event[C::EvIndex]) * 0x140;
+        ReadAt(row + 0x80, action);
+        ReadAt(row + 0x58, handle);
+    }
+    if (writable && kind == C::Kind::Door)
+        ArmLead(handle, action, event[C::EvObjectClip]);
+    if constexpr (Common::Log::Enabled) {
+        LOG_INFO(Core,
+                 "VR open: {} param {} handle {:#x} (hunter animation a000_{}): {} | event {} {} "
+                 "{} {:#x} {} {} {} {}",
+                 C::KindName(kind), action, handle, event[C::EvHunterAnim],
+                 reason == C::Reason::Instant && !writable
+                     ? "its event cannot be changed: the game's animation"
+                     : C::WhyAnimated(reason),
+                 event[0], event[1], event[2], static_cast<u32>(event[3]), event[4], event[5],
+                 event[6], event[7]);
+    }
+}
+} // namespace Chest
+
 void PS4_SYSV_ABI Event(u64 block, u64 record, u32 remote) noexcept {
     try {
         LiveLever::RewriteEvent(block, record, remote);
+        Chest::RewriteEvent(block, record, remote);
         if (!g_diagnostics)
             return;
         std::array<s32, 8> event{};
@@ -2001,6 +2473,10 @@ void InstallLeverProbe(VAddr base, u64 size) {
         code->mov(rax, reinterpret_cast<u64>(&g_update_probe_active));
         code->cmp(byte[rax], 0);
         code->jne(active);
+        // A door opened without the hunter, its clip still to go on past its wait (ServeLead).
+        code->mov(rax, reinterpret_cast<u64>(&Chest::g_lead_armed));
+        code->cmp(byte[rax], 0);
+        code->jne(active);
         if (runtime_enabled) {
             code->mov(rax, reinterpret_cast<u64>(&Lever::Channel().work));
             code->cmp(byte[rax], 0);
@@ -2066,17 +2542,45 @@ void InstallLeverProbe(VAddr base, u64 size) {
                                            c.mov(rdi, r14);
                                            c.mov(rsi, rbx);
                                        });
-        // No host callback, search, or cached target: inspect only the object the
-        // game has already resolved and found in range for this script prompt (an EMEVD
-        // action button: a used lever's "Device is not currently operable", a lift's call).
-        // Ordinary launches hide it only on the lever a physical hold or settle owns right now:
-        // a used or unrigged lever has no hand pull, so it keeps the game's prompt and button.
+        // Inspect only the object the game has already resolved and found in range for this
+        // script prompt (an EMEVD action button: a used lever's "Device is not currently
+        // operable", a lift's call, a scripted lever's pull). r14 is the condition: its +0x28 the
+        // ActionButtonParam row, its +0x10 bit 0 met (144E7D4 sets it when the button is pressed
+        // at the shown prompt). Ordinary launches hide it on the lever a physical hold or settle
+        // owns right now (a used or unrigged lever has no hand pull, so it keeps the game's prompt
+        // and button), and on a scripted lever (lever_models.h `button`: no ObjActParam row, its
+        // event script waits on this button) the host classifier finds a hand can pull, whose
+        // completed pull answers its button once (`fire`). Its verdict (lever_prompt.h
+        // ScriptVerdict) asks the host only for a new scripted object or button (its root bone
+        // names it: one 8-byte compare per scripted model), a prompt change or a due recheck.
         // Motion-only rehearsal (which pulls used levers by hand) hides it on the o240001
         // skeleton, as before.
-        code->align(16);
-        void *script_prompt = const_cast<u8 *>(code->getCurr());
+        void *script_prompt = nullptr;
         if (runtime_enabled && !motion_test) {
-            Xbyak::Label original, suppress;
+            using SV = Lever::ScriptVerdict;
+            const auto script_at = reinterpret_cast<u64>(&Lever::Channel().script_verdict);
+            Xbyak::Label original, suppress, decide, bound, answer, other, ask;
+            // Back from the host classifier: its verdict for this very object and button.
+            code->align(16);
+            void *script_finish = const_cast<u8 *>(code->getCurr());
+            code->pushfq();
+            code->push(rax);
+            code->push(rdx);
+            code->mov(rdx, script_at);
+            code->cmp(qword[rdx + offsetof(SV, object)], r12);
+            code->jne(original);
+            code->mov(eax, dword[r14 + 0x28]);
+            code->cmp(dword[rdx + offsetof(SV, button)], eax);
+            code->jne(original);
+            code->jmp(decide);
+            void *script_callback = Hook::EmitHostCallStubWith(
+                *code, reinterpret_cast<void *>(&ScriptPrompt), ScriptPromptBytes.data(), 0,
+                reinterpret_cast<u64>(script_finish), [](auto &c) {
+                    c.mov(rdi, r12);
+                    c.mov(esi, dword[r14 + 0x28]);
+                });
+            code->align(16);
+            script_prompt = const_cast<u8 *>(code->getCurr());
             code->pushfq();
             code->push(rax);
             code->push(rdx);
@@ -2085,9 +2589,80 @@ void InstallLeverProbe(VAddr base, u64 size) {
             code->je(original);
             code->test(r12, r12);
             code->jz(original);
+            code->mov(rdx, script_at);
+            code->cmp(qword[rdx + offsetof(SV, object)], r12);
+            code->jne(other);
+            code->mov(eax, dword[r14 + 0x28]);
+            code->cmp(dword[rdx + offsetof(SV, button)], eax);
+            code->jne(other);
+            // The scripted lever the host decided, its prompt offered now (the hunter in its
+            // zone): a completed pull's answer first; a hold hides it; a prompt change or a due
+            // recheck asks the host (as the selection gate's countdown does).
+            code->lock();
+            code->inc(qword[rdx + offsetof(SV, seen)]);
+            code->cmp(qword[rdx + offsetof(SV, fire)], r12);
+            code->je(answer);
             code->mov(rax, reinterpret_cast<u64>(&Lever::Channel().held_object));
             code->cmp(qword[rax], r12);
             code->je(suppress);
+            code->mov(rax, reinterpret_cast<u64>(&Lever::Channel().prompt_serial));
+            code->mov(rax, qword[rax]);
+            code->cmp(qword[rdx + offsetof(SV, serial)], rax);
+            code->jne(ask);
+            code->sub(word[rdx + offsetof(SV, recheck)], 1);
+            code->jbe(ask);
+            code->jmp(bound);
+            code->L(decide);
+            code->cmp(qword[rdx + offsetof(SV, fire)], r12);
+            code->je(answer);
+            code->L(bound);
+            code->cmp(byte[rdx + offsetof(SV, bound)], 0);
+            code->je(original);
+            code->jmp(suppress);
+            // Its button answered once, as the game's own press at the prompt (144E7D4).
+            code->L(answer);
+            code->mov(qword[rdx + offsetof(SV, fire)], 0);
+            code->pop(rdx);
+            code->pop(rax);
+            code->popfq();
+            code->or_(byte[r14 + 0x10], 1);
+            code->db(0xFF); code->db(0x25); code->dd(0);
+            code->dq(base + 0x144E7D9);
+            // Any other object: the lever a hold owns (a row lever's used-lever prompt), or a
+            // scripted lever's root bone, which asks the host.
+            code->L(other);
+            code->mov(rax, reinterpret_cast<u64>(&Lever::Channel().held_object));
+            code->cmp(qword[rax], r12);
+            code->je(suppress);
+            code->mov(rax, ptr[r12 + 0x290]); // animation controller
+            code->test(rax, rax);
+            code->jz(original);
+            code->mov(rax, ptr[rax + 0x20]); // pose node
+            code->test(rax, rax);
+            code->jz(original);
+            code->mov(rax, ptr[rax + 0x38]); // skeleton
+            code->test(rax, rax);
+            code->jz(original);
+            code->cmp(dword[rax + 0x30], 3);
+            code->jb(original);
+            code->cmp(dword[rax + 0x30], static_cast<u32>(Lever::MaxBones));
+            code->ja(original);
+            code->mov(rax, ptr[rax + 0x28]); // bones
+            code->test(rax, rax);
+            code->jz(original);
+            code->mov(rax, ptr[rax]); // hkStringPtr root bone name
+            code->and_(rax, -2);
+            code->test(rax, rax);
+            code->jz(original);
+            for (const auto &m : Lever::Models) {
+                if (!Lever::Scripted(m))
+                    continue;
+                u64 root{}; // its name and NUL in one qword (WellFormed: at most 7 characters)
+                std::memcpy(&root, m.bones[0], Lever::NameLength(m.bones[0]) + 1);
+                code->mov(rdx, root);
+                code->cmp(qword[rax], rdx);
+                code->je(ask);
+            }
             code->L(original);
             code->pop(rdx);
             code->pop(rax);
@@ -2095,6 +2670,12 @@ void InstallLeverProbe(VAddr base, u64 size) {
             code->db(ScriptPromptBytes.data(), ScriptPromptBytes.size());
             code->db(0xFF); code->db(0x25); code->dd(0);
             code->dq(base + ScriptPromptRva + ScriptPromptBytes.size());
+            code->L(ask);
+            code->pop(rdx);
+            code->pop(rax);
+            code->popfq();
+            code->db(0xFF); code->db(0x25); code->dd(0);
+            code->dq(reinterpret_cast<u64>(script_callback));
             code->L(suppress);
             code->pop(rdx);
             code->pop(rax);
@@ -2102,6 +2683,8 @@ void InstallLeverProbe(VAddr base, u64 size) {
             code->db(0xFF); code->db(0x25); code->dd(0);
             code->dq(base + 0x144E7D9); // normal no-interaction epilogue
         } else if (runtime_enabled) {
+            code->align(16);
+            script_prompt = const_cast<u8 *>(code->getCurr());
             Xbyak::Label original, suppress;
             code->pushfq();
             code->push(rax);
@@ -2146,6 +2729,8 @@ void InstallLeverProbe(VAddr base, u64 size) {
             code->db(0xFF); code->db(0x25); code->dd(0);
             code->dq(base + 0x144E7D9); // normal no-interaction epilogue
         } else {
+            code->align(16);
+            script_prompt = const_cast<u8 *>(code->getCurr());
             code->db(ScriptPromptBytes.data(), ScriptPromptBytes.size());
             code->db(0xFF); code->db(0x25); code->dd(0);
             code->dq(base + ScriptPromptRva + ScriptPromptBytes.size());

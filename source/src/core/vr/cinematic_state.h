@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 
 #include "common/types.h"
@@ -82,8 +83,9 @@ enum class Category : u8 {
     Item,     // a canned item use through our own Square: the Shaman Bone Blade's stab (ItemUseGate)
     LevelUp,  // the Doll's Level Up: the hunter kneels before her while the menu is up
     FogGate,  // walking through a fog gate (a000_101130; the tester, 2026-10-18: in VR)
+    LampLight, // lighting a lamp the first time (a000_101170): with Scenes on a screen only
 };
-constexpr size_t CategoryCount = 11;
+constexpr size_t CategoryCount = 12;
 
 constexpr s64 Millis = 1'000'000; // nanoseconds
 // Returning lasts the fade plus this, so the projection can fade in before Off.
@@ -150,6 +152,8 @@ inline const char* CategoryName(Category category) {
         return "levelup";
     case Category::FogGate:
         return "foggate";
+    case Category::LampLight:
+        return "lamplight";
     }
     return "?";
 }
@@ -205,6 +209,13 @@ constexpr Category ClassifyEvent(s32 id) {
     }
     if (id == 101130) {
         return Category::FogGate; // through a fog gate (the Blood-starved Beast's, 2026-10-18 log)
+    }
+    if (id == 101170) {
+        // Lighting a lamp the first time (common event 7100): it follows Scenes on a screen, as
+        // doors and ladders do (2026-11-06: "Lighting the lamp, not fine, we need that
+        // immersive"); resting, travel and the Hunter's Dream from a lamp stay Lamps, flat even
+        // with Scenes on a screen off ("Rest/travel should always be 3rd person").
+        return Category::LampLight;
     }
     if ((id >= 101160 && id <= 101171) || id == 101190) {
         return Category::Lamps;
@@ -534,7 +545,7 @@ constexpr s32 LadderMaxHp = 100'000; // a larger maximum HP reading is not plaus
 struct LadderConfig {
     bool combat_exit{true};           // an attack, a blocked climb or damage returns to VR
     s64 enter_delay_ns{500 * Millis}; // climbing this long after getting on before going flat
-    s64 min_flat_ns{1500 * Millis};   // a climb predicted to be flat for less stays in VR
+    s64 min_flat_ns{1000 * Millis};   // a climb predicted to be flat for less stays in VR
     s64 exit_lead_ns{450 * Millis};   // back to VR this long before the dismount (0 = at it)
     s64 reenter_ns{1000 * Millis};    // no flat period sooner than this after the last one
     s64 fade_ns{100 * Millis};        // the fade of a ladder flat period (0 = hard cut)
@@ -969,13 +980,17 @@ private:
 };
 
 struct Config {
-    bool enabled{true}; // cinematic=1
+    // cinematic=1 (the launcher's Scenes on a screen). Off, only Lamps (resting, travel, the
+    // Hunter's Dream from a lamp, the get-up on arriving at one) still goes flat (the user,
+    // 2026-11-06: "Rest/travel should always be 3rd person"); everything else stays in VR.
+    bool enabled{true};
     bool vr_grab_attacks{false}; // a victim throw also overrides overlapping event/item signals
     // Per category (index = Category; None is unused, Ladder is cinematic_ladder, Item is
     // cinematic_item, LevelUp is cinematic_levelup: off, the Doll's kneel stays in VR; FogGate is
-    // cinematic_foggate: off, the walk through a fog gate stays in VR).
+    // cinematic_foggate: off, the walk through a fog gate stays in VR; LampLight is
+    // cinematic_lamps too, but only with `enabled`: off, lighting a lamp stays in VR).
     std::array<bool, CategoryCount> categories{true, true, true, true, true, true,
-                                               true, true, true, false, false};
+                                               true, true, true, false, false, true};
     s64 fade_ns{150 * Millis}; // the fade to black on the way in; 0 = hard cut
     // The way back: the screen cuts to black and first-person VR fades in over this long (0 =
     // hard cut). Negative = the old way: the screen dims over fade_ns, VR fades in over fade_ns,
@@ -990,6 +1005,12 @@ struct Config {
     s64 throw_timeout_ns{20'000 * Millis}; // a throw state this old is ignored until it clears
     LadderConfig ladder{};
 };
+
+// Whether a category's animation goes flat: its own setting, and Scenes on a screen (`enabled`)
+// for all but Lamps.
+constexpr bool Flat(const Config& cfg, Category category) {
+    return cfg.categories[CategoryIndex(category)] && (cfg.enabled || category == Category::Lamps);
+}
 
 // One main-player update's readings. A signal that is not valid counts as off.
 struct Signals {
@@ -1215,7 +1236,7 @@ public:
 
         // Ladders: the gate decides; on a ladder the escape hatch lasts until the hunter is off it.
         step.ladder = ladder.Update(now, s.ladder, s.hp_valid, s.hp, s.hp_max, cfg.ladder,
-                                    cfg.enabled && cfg.categories[CategoryIndex(Category::Ladder)],
+                                    Flat(cfg, Category::Ladder),
                                     allowed && (phase != Phase::Off || can_enter));
         if (escape && ladder.InSession()) {
             ladder.Suppress(now);
@@ -1225,17 +1246,14 @@ public:
         const bool ladder_part = ladder.Flat();
 
         const bool throw_part =
-            throw_on && !latch_throw && cfg.categories[CategoryIndex(throw_category)];
-        const bool event_part =
-            event_on && !latch_event && cfg.categories[CategoryIndex(event_category)];
-        const bool item_part =
-            item_now && !latch_item && cfg.categories[CategoryIndex(Category::Item)];
+            throw_on && !latch_throw && Flat(cfg, throw_category);
+        const bool event_part = event_on && !latch_event && Flat(cfg, event_category);
+        const bool item_part = item_now && !latch_item && Flat(cfg, Category::Item);
         // Suppress from the first verified victim state, including alignment. Waiting
         // for throw_on's debounce lets an overlapping event start fading to flat first.
         const bool vr_grab = cfg.vr_grab_attacks && !throw_stuck &&
                              (ts == 2 || ts == 4 || ts == 6);
-        const bool other = cfg.enabled && !suppressed && !vr_grab &&
-                           (throw_part || event_part || item_part);
+        const bool other = !suppressed && !vr_grab && (throw_part || event_part || item_part);
         raw = !vr_grab && (other || ladder_part);
         if (load_ns >= 0 && !raw && (throw_on || event_on || item_now)) {
             load_ns = -1; // the arrival plays in VR (its category off): nothing to wait for
@@ -1602,13 +1620,16 @@ inline float Brightness(Phase phase, s64 in_phase_ns, s64 fade_ns, bool content_
 class Fader {
 public:
     // `phase_start`: when `phase` was entered (identifies the phase instance); `fade_ns`: the
-    // fade that phase runs with (Machine::PhaseFade).
+    // fade that phase runs with (Machine::PhaseFade). `black` (LadderSkip::black): the screen
+    // this period would show stays black (Flat and FadeBack at 0), and what follows fades in
+    // from black.
     float Update(Phase phase, s64 phase_start, s64 now, s64 fade_ns, bool content_immersive,
-                 s64 since_switch_ns, bool projection_expected = true) {
+                 s64 since_switch_ns, bool projection_expected = true, bool black = false) {
         if (!seen) {
             entry = FreshEntry(phase);
         } else if (phase != seen_phase || phase_start != seen_start) {
-            if (seen_phase == Phase::Flat && phase == Phase::Returning) {
+            if ((seen_phase == Phase::Flat && phase == Phase::Returning) ||
+                (seen_black && (seen_phase == Phase::Flat || seen_phase == Phase::FadeBack))) {
                 entry = 0.0f; // straight from the screen: a cut to black, VR fades in from it
             } else if (seen_phase == Phase::FadeOut || seen_phase == Phase::FadeBack) {
                 // A fade down depends on time only: its exact level when the next phase began.
@@ -1622,8 +1643,10 @@ public:
         seen_phase = phase;
         seen_start = phase_start;
         seen_fade = fade_ns;
-        level = Brightness(phase, now - phase_start, fade_ns, content_immersive, since_switch_ns,
-                           entry, projection_expected);
+        seen_black = black && (phase == Phase::Flat || phase == Phase::FadeBack);
+        level = seen_black ? 0.0f
+                           : Brightness(phase, now - phase_start, fade_ns, content_immersive,
+                                        since_switch_ns, entry, projection_expected);
         return level;
     }
 
@@ -1633,11 +1656,54 @@ public:
 
 private:
     bool seen{false};
+    bool seen_black{false};
     Phase seen_phase{Phase::Off};
     s64 seen_start{0};
     s64 seen_fade{0};
     float entry{1.0f};
     float level{1.0f};
 };
+
+// cinematic_ladder_skip (the tester's 2026-11-06 "rather than showing them in flat mode, the moment
+// it would transition to flat -- just skip it (screen fade out then fade back in) and the hunter
+// is like right at the top (where flat mode would end)"): a ladder's flat period stays black
+// (Fader's `black`); behind it the hunter climbs on by himself, the stick held his way and the
+// dodge button with it (the game's fast climb up, its slide down), his climbing clips at `speed`
+// times the game's pace, and VR fades back in where the flat view would end. Back in VR he keeps
+// climbing to the dismount when the gate came back ahead of it (`lead`: its "lead" exit, within
+// LadderSkipLeadNs); a fight, a fall, death or any other exit hands the stick straight back.
+struct LadderSkip {
+    bool black{false}; // the screen stays black
+    s8 climb{0};       // +1 / -1: the stick held up / down with the dodge button; 0: yours
+    float rate{1.0f};  // the hunter's animation speed (his climbing clips only, while black)
+};
+constexpr s64 LadderSkipLeadNs = 2000 * Millis;
+constexpr float LadderSkipMaxSpeed = 6.0f;
+
+// The clips the skip speeds up: the steps, the slide and the pauses between them.
+constexpr bool IsLadderClimb(LadderClip clip) {
+    return clip == LadderClip::Up || clip == LadderClip::FastUp || clip == LadderClip::Down ||
+           clip == LadderClip::Slide || clip == LadderClip::Idle;
+}
+
+inline LadderSkip LadderSkipOf(bool enabled, float speed, Phase phase, Category source,
+                               const LadderOut& ladder, bool lead) {
+    LadderSkip s{};
+    if (!enabled || source != Category::Ladder) {
+        return s;
+    }
+    s.black = phase == Phase::Flat || phase == Phase::FadeBack;
+    const LadderClip clip = ClassifyLadderClip(ladder.clip);
+    const bool climbing = ladder.session && !ladder.mounting && !ladder.suppressed &&
+                          (ladder.dir == 1 || ladder.dir == -1) &&
+                          (ladder.clip < 0 || IsLadderClimb(clip));
+    if (climbing && (phase == Phase::Flat || lead)) {
+        s.climb = static_cast<s8>(ladder.dir);
+        if (s.black && std::isfinite(speed)) {
+            s.rate = std::clamp(speed, 1.0f, LadderSkipMaxSpeed);
+        }
+    }
+    return s;
+}
 
 } // namespace VR::Cinematic

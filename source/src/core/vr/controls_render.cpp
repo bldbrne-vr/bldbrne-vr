@@ -30,21 +30,24 @@ namespace {
 const float CentreX = Canvas::ToX(TitleCentreX); // 786.1: the title's and the key guide's centre
 constexpr float ArtW = 240.0f;                    // one controller's box (240 x 470)
 constexpr float ArtGap = 12.0f;                   // from the centre line to each controller
-constexpr float ArtY = 227.3f;
+// The page is one band taller than the movie (the settings page's sub-tab strip, vr_page_render.h):
+// the content sits half of it lower (centred between the rules), the quiet line all of it.
+constexpr float BandShift = 0.5f * Page::StripBandPx * Page::PageScale; // image px
+constexpr float ArtY = 227.3f + BandShift;
 constexpr float LabelInset = 292.4f;              // the text's edge from the centre line
-constexpr float FirstBaseline = 247.3f;           // the first callout
-constexpr float LastBaseline = 667.3f;            // the sixth (the mock's pitch: 84)
+constexpr float FirstBaseline = 247.3f + BandShift; // the first callout
+constexpr float LastBaseline = 667.3f + BandShift;  // the sixth (the mock's pitch: 84)
 constexpr float MaxPitch = 140.0f;
 constexpr float SubDy = 31.0f;                    // the sub-line under the title
 constexpr float TitlePx = 32.0f;                  // 24 stage px
 constexpr float SubPx = 26.0f;                    // 19.5 stage px: the smallest text here
-constexpr float NoteY = 749.3f;                   // the quiet line above the help rule
+constexpr float NoteY = 749.3f + 2.0f * BandShift;  // the quiet line above the help rule
 constexpr float HelpWidthMax = 1000.0f;           // stage px, then the help wraps to two lines
 constexpr float ColumnAvail = 312.0f;             // a callout's text: to the frame's ornament rules
 
 // The Gestures tab: two columns of pictogram + title + sub.
 constexpr float PictoSize = 96.0f;
-constexpr float GestureTop = 214.0f;
+constexpr float GestureTop = 214.0f + BandShift;
 constexpr float GesturePitch = 128.0f;
 
 // Ink (the mock's).
@@ -100,7 +103,8 @@ float FitPx(const GameText::GameFont* font, const std::string& s, float px, floa
 
 // ---- The controllers in line art ---------------------------------------------------------------
 
-using Lights = std::array<Lit, 7>; // by Part
+using Lights = std::array<Lit, PartCount>;                  // by Part
+using Anchors = std::array<std::optional<Pt>, PartCount>; // by Part
 
 struct Pen {
     Canvas& c;
@@ -150,12 +154,51 @@ void FaceButton(Pen& pen, const GameText::GameFont* font, float bx, float by, fl
     }
 }
 
-// Quest Touch (also Touch Plus, HP Reverb G2, PICO, the simple controller): the mock's drawing,
-// seen from the front and a little above: the oval top face (the stick on the inner side, two
-// buttons on the outer one), the trigger paddle under the face's front, the grip on the
-// handle's inner side, the tapered handle bending in toward its end.
+// A PS VR2 face button: the cap with its symbol drawn in lines (the game's font has no
+// triangle, circle, square or cross).
+enum class Mark : std::uint8_t { Triangle, Circle, Square, Cross };
+void MarkButton(Pen& pen, const GameText::GameFont* font, float bx, float by, float r, Mark mark,
+                Lit lit) {
+    FaceButton(pen, font, bx, by, r, {}, lit);
+    const Pt c = pen.P(bx, by);
+    const Rgb ink = lit == Lit::Pressed ? LetterLit : Letter;
+    const float s = r * 0.56f, y = c.y - 0.5f, k = 0.85f; // the cap's tilt
+    switch (mark) {
+    case Mark::Triangle:
+        Stroke(pen.c, {{c.x, y - s * k}, {c.x + s, y + s * 0.7f * k}, {c.x - s, y + s * 0.7f * k}},
+               true, 2.2f, ink, 1.0f);
+        break;
+    case Mark::Circle:
+        Stroke(pen.c, Ellipse(c.x, y, s, s * k), true, 2.2f, ink, 1.0f);
+        break;
+    case Mark::Square: {
+        const float h = s * 0.8f;
+        Stroke(pen.c, {{c.x - h, y - h * k}, {c.x + h, y - h * k}, {c.x + h, y + h * k},
+                       {c.x - h, y + h * k}},
+               true, 2.2f, ink, 1.0f);
+        break;
+    }
+    case Mark::Cross: {
+        const float h = s * 0.8f;
+        Stroke(pen.c, {{c.x - h, y - h * k}, {c.x + h, y + h * k}}, false, 2.2f, ink, 1.0f);
+        Stroke(pen.c, {{c.x + h, y - h * k}, {c.x - h, y + h * k}}, false, 2.2f, ink, 1.0f);
+        break;
+    }
+    }
+}
+
+// The face buttons DrawTouch draws: Touch's letters, the Steam Frame's d-pad and ABXY, or the PS VR2
+// Sense controllers' symbols.
+enum class Faces : std::uint8_t { Touch, Frame, Sense };
+
+// Quest Touch (also Touch Plus, HP Reverb G2, PICO, the simple controller; the Steam Frame and PS
+// VR2 Sense with their own face buttons): the mock's drawing, seen from the front and a little
+// above: the oval top face (the stick on the inner side, two buttons on the outer one), the
+// trigger paddle under the face's front, the grip on the handle's inner side, the tapered handle
+// bending in toward its end.
 void DrawTouch(Pen& pen, const GameText::GameFont* font, const Lights& lit, bool right,
-               std::array<std::optional<Pt>, 7>& anchors, bool frame = false) {
+               Anchors& anchors, Faces faces = Faces::Touch) {
+    const bool frame = faces == Faces::Frame;
     Canvas& c = pen.c;
     constexpr float Rot = 7.0f; // the face's outer side sits a little lower
     const float lw = 3.2f;
@@ -215,6 +258,11 @@ void DrawTouch(Pen& pen, const GameText::GameFont* font, const Lights& lit, bool
         FaceButton(pen, font, 141, 86, 12.0f, right ? "X" : ">", Lit::Off);
         FaceButton(pen, font, 189, 86, 12.0f, right ? "B" : "<",
                    right ? L(lit, Part::ButtonHigh) : Lit::Off);
+    } else if (faces == Faces::Sense) {
+        MarkButton(pen, font, 150, 104, 17.0f, right ? Mark::Cross : Mark::Square,
+                   L(lit, Part::ButtonLow));
+        MarkButton(pen, font, 178, 70, 17.0f, right ? Mark::Circle : Mark::Triangle,
+                   L(lit, Part::ButtonHigh));
     } else {
         FaceButton(pen, font, 150, 104, 17.0f, right ? "A" : "X", L(lit, Part::ButtonLow));
         FaceButton(pen, font, 178, 70, 17.0f, right ? "B" : "Y", L(lit, Part::ButtonHigh));
@@ -245,7 +293,7 @@ void DrawTouch(Pen& pen, const GameText::GameFont* font, const Lights& lit, bool
 // Valve Index: a tall handle with its strap along the back, a narrow head: the stick at the top,
 // the racetrack trackpad under it, A and B beside the pad, the trigger under the head.
 void DrawIndex(Pen& pen, const GameText::GameFont* font, const Lights& lit, bool right,
-               std::array<std::optional<Pt>, 7>& anchors) {
+               Anchors& anchors) {
     Canvas& c = pen.c;
     const float lw = 3.0f;
     // The strap: a loop along the outer side of the handle.
@@ -311,7 +359,7 @@ void DrawIndex(Pen& pen, const GameText::GameFont* font, const Lights& lit, bool
 // HTC Vive wand: the sensor ring on top, a long handle with the round trackpad near its top, the
 // menu button above the pad, the grip buttons on both sides, the trigger underneath.
 void DrawVive(Pen& pen, const GameText::GameFont* font, const Lights& lit, bool right,
-              std::array<std::optional<Pt>, 7>& anchors) {
+              Anchors& anchors) {
     Canvas& c = pen.c;
     (void)font;
     (void)right;
@@ -376,7 +424,7 @@ void DrawVive(Pen& pen, const GameText::GameFont* font, const Lights& lit, bool 
 // Windows Mixed Reality: the LED ring round the top, the stick and the trackpad side by side on
 // the top face, the menu button, the trigger, the grip button.
 void DrawWmr(Pen& pen, const GameText::GameFont* font, const Lights& lit, bool right,
-             std::array<std::optional<Pt>, 7>& anchors) {
+             Anchors& anchors) {
     Canvas& c = pen.c;
     (void)font;
     (void)right;
@@ -437,12 +485,162 @@ void DrawWmr(Pen& pen, const GameText::GameFont* font, const Lights& lit, bool r
     anchors[static_cast<size_t>(Part::Grip)] = pen.P(78, 258);
 }
 
+// A gamepad (a gamepad play style): both halves of one pad, seen from the front, meeting on the
+// centre line (each half's x from the centre outward, as the controllers' Pen mirrors them; x =
+// -ArtGap is the centre line). The triggers behind the shoulders, the bumpers on them, the face
+// buttons and the right stick on the right, the D-pad and the left stick on the left (an Xbox
+// pad's left stick above its D-pad and its right stick below the face buttons; a PlayStation
+// one's sticks both low), View and Menu (Xbox) or the touchpad, Share and Options between them.
+constexpr float PadDy = 40.0f; // the pad's top below ArtY
+
+void PadStick(Pen& pen, float x, float y, Lit lit) {
+    Canvas& c = pen.c;
+    const Poly base = pen.E(x, y, 24, 21);
+    FillPoly(c, base, Dark, 1.0f);
+    Stroke(c, base, true, 2.2f, Ink2, 1.0f);
+    const Poly cap = pen.E(x, y - 3.0f, 17, 15);
+    PartGlow(c, cap, lit, 9.0f);
+    FillPoly(c, cap, FillOf(lit, Cap), 1.0f);
+    Stroke(c, cap, true, 2.6f, EdgeOf(lit, Ink), 1.0f);
+    Stroke(c, pen.E(x, y - 3.0f, 9, 8), true, 1.2f,
+           lit == Lit::Pressed ? Rgb{1.0f, 226 / 255.0f, 170 / 255.0f} : Ring, 1.0f);
+}
+
+void PadDpad(Pen& pen, float x, float y, Lit lit) {
+    constexpr float W = 8.0f, R = 23.0f; // an arm's half width, the cross's half length
+    const Poly cross = pen.Map({{x - W, y - R}, {x + W, y - R}, {x + W, y - W}, {x + R, y - W},
+                                {x + R, y + W}, {x + W, y + W}, {x + W, y + R}, {x - W, y + R},
+                                {x - W, y + W}, {x - R, y + W}, {x - R, y - W}, {x - W, y - W}});
+    PartGlow(pen.c, cross, lit, 9.0f);
+    FillPoly(pen.c, cross, FillOf(lit, Button), 1.0f);
+    Stroke(pen.c, cross, true, 2.4f, EdgeOf(lit, Ink), 1.0f);
+}
+
+void DrawGamepad(Canvas& c, const GameText::GameFont* font, const Lights& lit_l,
+                 const Lights& lit_r, Anchors& anchors_l, Anchors& anchors_r, bool xbox) {
+    Pen left{c, CentreX - ArtGap - ArtW, ArtY + PadDy, true};
+    Pen right{c, CentreX + ArtGap, ArtY + PadDy, false};
+    const float lw = 3.2f;
+    const float sx_face = 160.0f, sy_face = 160.0f; // the upper cluster (face buttons, Xbox's left stick)
+    const float sx_low = xbox ? 104.0f : 88.0f, sy_low = xbox ? 214.0f : 218.0f; // the lower one
+    // 1. The triggers, behind the shoulders.
+    for (Pen* pen : {&left, &right}) {
+        const Lit l = L(pen == &left ? lit_l : lit_r, Part::Trigger);
+        const Poly t = pen->Map(RoundRect(118, 50, 200, 96, 16));
+        PartGlow(c, t, l);
+        FillPoly(c, t, FillOf(l, Rgb{36 / 255.0f, 34 / 255.0f, 31 / 255.0f}), 1.0f);
+        Stroke(c, t, true, lw, EdgeOf(l, Ink), 1.0f);
+    }
+    // 2. The body: filled whole, its outline open along the centre line (the halves meet there).
+    const Poly half{{-12, 100}, {30, 96},  {90, 94},   {150, 96},  {196, 106}, {222, 128},
+                    {234, 164}, {240, 212}, {240, 260}, {232, 304}, {216, 340}, {194, 356},
+                    {170, 350}, {154, 328}, {136, 286}, {112, 260}, {70, 252},  {24, 254},
+                    {-12, 256}};
+    const Poly grip{{196, 210}, {240, 212}, {240, 260}, {232, 304}, {216, 340}, {194, 356},
+                    {176, 340}, {190, 280}};
+    for (Pen* pen : {&left, &right}) {
+        const Poly body = pen->Map(half);
+        FillPoly(c, body, Body, 1.0f);
+        Hatch(c, pen->Map(grip), 8.0f / 1.41421356f, 1.3f, HatchInk, 150.0f / 255.0f);
+        Stroke(c, body, false, lw, Ink, 1.0f);
+    }
+    // 3. The bumpers on the shoulders.
+    for (Pen* pen : {&left, &right}) {
+        const Lit l = L(pen == &left ? lit_l : lit_r, Part::Grip);
+        const Poly b = pen->Map(RoundRect(104, 84, 206, 106, 11));
+        PartGlow(c, b, l, 10.0f);
+        FillPoly(c, b, FillOf(l, Rgb{42 / 255.0f, 40 / 255.0f, 36 / 255.0f}), 1.0f);
+        Stroke(c, b, true, 2.6f, EdgeOf(l, Ink2), 1.0f);
+    }
+    // 4. Between the halves: View and Menu (Xbox), or the touchpad with Share and Options.
+    const Lit view = L(lit_l, Part::Menu), menu = L(lit_r, Part::Menu);
+    if (xbox) {
+        for (Pen* pen : {&left, &right}) {
+            const Lit l = pen == &left ? view : menu;
+            const Pt m = pen->P(30, 146);
+            const Poly b = Ellipse(m.x, m.y, 10.0f, 10.0f);
+            PartGlow(c, b, l, 7.0f);
+            FillPoly(c, b, FillOf(l, Button), 1.0f);
+            Stroke(c, b, true, 2.0f, EdgeOf(l, Ink2), 1.0f);
+            const Rgb mark = l == Lit::Pressed ? LetterLit : Letter;
+            if (pen == &right) { // Menu: three bars
+                for (const float k : {-3.5f, 0.0f, 3.5f}) {
+                    Stroke(c, {{m.x - 4.5f, m.y + k}, {m.x + 4.5f, m.y + k}}, false, 1.2f, mark,
+                           1.0f);
+                }
+            } else { // View: two overlapping windows
+                Stroke(c, Place(RoundRect(-5, -4, 2, 2, 1), m.x, m.y), true, 1.2f, mark, 1.0f);
+                Stroke(c, Place(RoundRect(-2, -1, 5, 5, 1), m.x, m.y), true, 1.2f, mark, 1.0f);
+            }
+        }
+        // The guide button on the centre line (nothing of the game's: drawn, never lit).
+        const Pt g = right.P(-12, 118);
+        Stroke(c, Ellipse(g.x, g.y, 13.0f, 13.0f), true, 2.0f, Ink2, 1.0f);
+    } else {
+        // The touchpad: one plate across the centre line, drawn from the left half (x -84 .. 60:
+        // 72 to either side of the centre).
+        const Poly pad = left.Map(RoundRect(-84, 104, 60, 170, 10));
+        PartGlow(c, pad, view, 12.0f);
+        FillPoly(c, pad, FillOf(view, Face), 1.0f);
+        Stroke(c, pad, true, 2.4f, EdgeOf(view, Ink), 1.0f);
+        for (Pen* pen : {&left, &right}) {
+            const Lit l = pen == &left ? Lit::Off : menu; // Share: nothing of the game's
+            const Poly b = pen->Map(RoundRect(70, 100, 82, 122, 6));
+            PartGlow(c, b, l, 7.0f);
+            FillPoly(c, b, FillOf(l, Button), 1.0f);
+            Stroke(c, b, true, 2.0f, EdgeOf(l, Ink2), 1.0f);
+        }
+    }
+    // 5. The sticks, the D-pad and the face buttons.
+    PadStick(right, sx_low, sy_low, L(lit_r, Part::Stick));
+    if (xbox) {
+        PadStick(left, sx_face, sy_face, L(lit_l, Part::Stick));
+        PadDpad(left, sx_low, sy_low, L(lit_l, Part::Pad));
+    } else {
+        PadDpad(left, sx_face, sy_face, L(lit_l, Part::Pad));
+        PadStick(left, sx_low, sy_low, L(lit_l, Part::Stick));
+    }
+    constexpr float Gap = 25.0f, R = 13.0f;
+    const Lit top = L(lit_r, Part::ButtonHigh), bottom = L(lit_r, Part::ButtonLow),
+              west = L(lit_r, Part::FaceLeft), east = L(lit_r, Part::FaceRight);
+    if (xbox) {
+        FaceButton(right, font, sx_face, sy_face - Gap, R, "Y", top);
+        FaceButton(right, font, sx_face + Gap, sy_face, R, "B", east);
+        FaceButton(right, font, sx_face, sy_face + Gap, R, "A", bottom);
+        FaceButton(right, font, sx_face - Gap, sy_face, R, "X", west);
+    } else {
+        MarkButton(right, font, sx_face, sy_face - Gap, R, Mark::Triangle, top);
+        MarkButton(right, font, sx_face + Gap, sy_face, R, Mark::Circle, east);
+        MarkButton(right, font, sx_face, sy_face + Gap, R, Mark::Cross, bottom);
+        MarkButton(right, font, sx_face - Gap, sy_face, R, Mark::Square, west);
+    }
+    // 6. Where the leader lines end.
+    for (Pen* pen : {&left, &right}) {
+        Anchors& a = pen == &left ? anchors_l : anchors_r;
+        a[static_cast<size_t>(Part::Trigger)] = pen->P(166, 60);
+        a[static_cast<size_t>(Part::Grip)] = pen->P(192, 95);
+    }
+    anchors_l[static_cast<size_t>(Part::Menu)] = xbox ? left.P(30, 146) : left.P(22, 137);
+    anchors_r[static_cast<size_t>(Part::Menu)] = xbox ? right.P(30, 146) : right.P(76, 111);
+    anchors_l[static_cast<size_t>(Part::Stick)] =
+        xbox ? left.P(sx_face, sy_face - 3.0f) : left.P(sx_low, sy_low - 3.0f);
+    anchors_l[static_cast<size_t>(Part::Pad)] = xbox ? left.P(sx_low, sy_low) : left.P(sx_face, sy_face);
+    anchors_r[static_cast<size_t>(Part::Stick)] = right.P(sx_low, sy_low - 3.0f);
+    anchors_r[static_cast<size_t>(Part::ButtonHigh)] = right.P(sx_face, sy_face - Gap);
+    anchors_r[static_cast<size_t>(Part::FaceRight)] = right.P(sx_face + Gap, sy_face);
+    anchors_r[static_cast<size_t>(Part::ButtonLow)] = right.P(sx_face, sy_face + Gap);
+    anchors_r[static_cast<size_t>(Part::FaceLeft)] = right.P(sx_face - Gap, sy_face);
+}
+
 void DrawController(Canvas& c, const GameText::GameFont* font, Family f, bool right, float ox,
-                    float oy, const Lights& lit, std::array<std::optional<Pt>, 7>& anchors) {
+                    float oy, const Lights& lit, Anchors& anchors) {
     Pen pen{c, ox, oy, !right};
     switch (f) {
     case Family::Frame:
-        DrawTouch(pen, font, lit, right, anchors, true);
+        DrawTouch(pen, font, lit, right, anchors, Faces::Frame);
+        return;
+    case Family::Sense:
+        DrawTouch(pen, font, lit, right, anchors, Faces::Sense);
         return;
     case Family::Index:
         DrawIndex(pen, font, lit, right, anchors);
@@ -455,6 +653,7 @@ void DrawController(Canvas& c, const GameText::GameFont* font, Family f, bool ri
         return;
     case Family::Touch:
     case Family::Simple:
+    case Family::Gamepad: // (Render draws it whole: DrawGamepad)
         break;
     }
     DrawTouch(pen, font, lit, right, anchors);
@@ -599,31 +798,6 @@ void DrawPicto(Canvas& c, Picto p, float x, float y, Lit lit, const GameText::Ga
 
 // ---- Text helpers ------------------------------------------------------------------------------
 
-// The help line in one or two lines (wrapped at the space nearest the middle).
-std::vector<std::string> WrapHelp(const GameText::GameFont* font, const std::string& help) {
-    if (TextWidth(font, help) <= HelpWidthMax) {
-        return {help};
-    }
-    size_t best = std::string::npos;
-    float best_d = 1e9f;
-    for (size_t i = 1; i + 1 < help.size(); ++i) {
-        if (help[i] != ' ') {
-            continue;
-        }
-        const float w1 = TextWidth(font, help.substr(0, i));
-        const float w2 = TextWidth(font, help.substr(i + 1));
-        const float d = std::max(w1, w2);
-        if (d < best_d) {
-            best_d = d;
-            best = i;
-        }
-    }
-    if (best == std::string::npos) {
-        return {help};
-    }
-    return {help.substr(0, best), help.substr(best + 1)};
-}
-
 // The selection glow behind a callout (the mock's warm band): a vertical Gaussian round the
 // title's middle, ramped in along x over the text.
 void Band(Canvas& g, float x0, float x1, float cy, float strength) {
@@ -653,7 +827,7 @@ struct Slot {
 
 std::vector<Slot> Slots(const View& v) {
     std::vector<Slot> out(v.callouts.size());
-    const bool gestures = v.tab == static_cast<int>(Tab::Gestures);
+    const bool gestures = v.gestures;
     for (const bool right : {false, true}) {
         std::vector<size_t> col;
         for (size_t i = 0; i < v.callouts.size(); ++i) {
@@ -691,7 +865,7 @@ struct Box {
 };
 Box CalloutBox(const View& v, const Slot& s, const Callout& c, const GameText::GameFont* font) {
     const float w = std::max(TextW(font, c.title, TitlePx), TextW(font, c.sub, SubPx));
-    const bool gestures = v.tab == static_cast<int>(Tab::Gestures);
+    const bool gestures = v.gestures;
     if (gestures) {
         const float px = s.x - PictoSize - 20.0f;
         return {px - 6.0f, s.baseline - 50.0f, s.x + std::max(w, 200.0f) + 8.0f,
@@ -705,25 +879,28 @@ Box CalloutBox(const View& v, const Slot& s, const Callout& c, const GameText::G
 // The page's frame without its rows: the game's Environment page with the row rules, the column
 // divider and the rows' grain left out (the Brightness page's open middle).
 bool InControlsFrame(const PageArt::Piece& p) {
-    return !(p.y0 >= 250.0f && p.y1 <= 625.0f && p.y1 > 271.0f);
+    // (The content area's pieces, the settings page's band under the title's rule included.)
+    return !(p.y0 >= 250.0f && p.y1 <= 625.0f + Page::StripBandPx && p.y1 > 271.0f);
 }
 
 } // Anonymous namespace
 
 View MakeView(const Model& model, const Page::Glyphs& glyphs) {
     View v;
-    for (const char* t : TabNames) {
+    for (const char* t : model.TabNamesNow()) {
         v.tabs.emplace_back(t);
     }
     v.tab = static_cast<int>(model.GetTab());
     v.family = model.GetFamily();
+    v.gestures = model.ShowsGestures();
+    v.pad_xbox = model.GetConfig().gamepad_xbox;
     v.parts = model.Parts();
     v.callouts = model.Callouts();
     v.lights = model.Lights();
     v.focus = model.Focus();
     v.hover = model.Hover();
     v.help = model.Help();
-    v.note = Note(model.GetTab(), model.GetConfig(), model.GetFamily());
+    v.note = model.NoteNow();
     v.glyphs = glyphs;
     v.keys = {{Page::KeyGlyph::DpadUD, "Select"},
               {Page::KeyGlyph::PrevNext, "Page"},
@@ -778,11 +955,12 @@ bool Render(const Page::Assets& assets, const View& v, Page::Image& page_out,
         if (cache_atlas != assets.common3.rgba || cache.size() != page.px.size()) {
             // The page's panel exactly (vr_page_render.cpp): its middle opaque in VR, its soft
             // edges the game's (PanelDim; VR_PAGE_SEE_THROUGH=1: the game's dim everywhere).
+            const auto& frame = Page::Draw::TallFrameCached();
             for (int i = 0; i < PageArt::FrameBackdropCount; ++i) {
-                DrawPiece(page, assets, PageArt::Frame[i], 0.0f, 0.0f, false,
+                DrawPiece(page, assets, frame[static_cast<size_t>(i)], 0.0f, 0.0f, false,
                           PageArt::ScreenDimAlpha, 1e9f, true, PanelOpaque());
             }
-            for (const PageArt::Piece& p : PageArt::Frame) {
+            for (const PageArt::Piece& p : frame) {
                 if (InControlsFrame(p)) {
                     DrawPiece(page, assets, p, 0.0f, 0.0f, false, 1.0f);
                 }
@@ -799,27 +977,31 @@ bool Render(const Page::Assets& assets, const View& v, Page::Image& page_out,
 
     const auto slots = Slots(v);
     const auto lit_of = [&](size_t i) { return i < v.lights.size() ? v.lights[i] : Lit::Off; };
-    const bool gestures = v.tab == static_cast<int>(Tab::Gestures);
+    const bool gestures = v.gestures;
 
     // 3. The controllers (Gameplay, Menus) and the leader lines to their parts.
-    std::array<std::array<std::optional<Pt>, 7>, 2> anchors{};
+    std::array<Anchors, 2> anchors{};
     if (!gestures) {
-        for (const bool right : {false, true}) {
-            Lights lights{};
-            for (size_t i = 0; i < v.callouts.size(); ++i) {
-                const Callout& c = v.callouts[i];
-                if (c.part < 0 || c.part >= static_cast<int>(v.parts.size())) {
-                    continue;
-                }
-                const DrawnPart& d = v.parts[static_cast<size_t>(c.part)];
-                if (d.right == right) {
-                    Lit& l = lights[static_cast<size_t>(d.part)];
-                    l = std::max(l, lit_of(i));
-                }
+        std::array<Lights, 2> lights{}; // by side
+        const auto light = [&](int part, Lit lit) {
+            if (part >= 0 && part < static_cast<int>(v.parts.size())) {
+                const DrawnPart& d = v.parts[static_cast<size_t>(part)];
+                Lit& l = lights[d.right ? 1 : 0][static_cast<size_t>(d.part)];
+                l = std::max(l, lit);
             }
-            const float ox = right ? CentreX + ArtGap : CentreX - ArtGap - ArtW;
-            DrawController(page, font, v.family, right, ox, ArtY, lights,
-                           anchors[right ? 1 : 0]);
+        };
+        for (size_t i = 0; i < v.callouts.size(); ++i) {
+            light(v.callouts[i].part, lit_of(i));
+            light(v.callouts[i].part2, lit_of(i));
+        }
+        if (v.family == Family::Gamepad) {
+            DrawGamepad(page, font, lights[0], lights[1], anchors[0], anchors[1], v.pad_xbox);
+        } else {
+            for (const bool right : {false, true}) {
+                const float ox = right ? CentreX + ArtGap : CentreX - ArtGap - ArtW;
+                DrawController(page, font, v.family, right, ox, ArtY, lights[right ? 1 : 0],
+                               anchors[right ? 1 : 0]);
+            }
         }
     }
 
@@ -926,11 +1108,12 @@ bool Render(const Page::Assets& assets, const View& v, Page::Image& page_out,
 
     // 6. The quiet line, the help (one or two lines) and the key guide.
     Text(page, font, v.note, CentreX, NoteY, Align::Centre, NoteInk, SubPx);
-    const auto lines = WrapHelp(font, v.help);
+    const auto lines = WrapHelp(font, v.help, HelpWidthMax);
     if (lines.size() == 1) {
         DrawText(page, font, lines[0], HelpCentreX, HelpBaseline, Align::Centre, HelpKhaki);
     } else {
-        DrawText(page, font, lines[0], HelpCentreX, HelpBaseline - 26.5f, Align::Centre, HelpKhaki);
+        DrawText(page, font, lines[0], HelpCentreX, HelpBaseline - HelpLinePitch, Align::Centre,
+                 HelpKhaki);
         DrawText(page, font, lines[1], HelpCentreX, HelpBaseline, Align::Centre, HelpKhaki);
     }
     DrawKeyGuide(page, assets, v.keys, v.glyphs);

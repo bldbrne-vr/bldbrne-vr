@@ -4,16 +4,27 @@
 #include <algorithm>
 #include <codecvt>
 #include <cstdlib>
+#include <cstring>
+#include <initializer_list>
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
 #include <fstream>
 #include <sstream>
 #include <set>
+#include "core/vr/bloodborne_frame_rate.h"
 #include "core/vr/graphics_resolution.h"
+#include "common/render_diagnostic.h"
 #include "core/vr/near_code.h"
 #include "core/vr/vr_session.h"
+#include "shader_recompiler/ir/passes/light_shadow.h"
 #include "video_core/native_stereo/native_stereo.h"
 #include <string>
 #include <nlohmann/json.hpp>
 #include <pugixml.hpp>
+#include <SDL3/SDL_filesystem.h>
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
@@ -176,28 +187,79 @@ static VR::Graphics::Extent TemplateResolution(pugi::xml_document& doc, std::str
     return {width, height};
 }
 
+// DIBR: whether the chosen upscaler can start, so the centre is only shrunk for one that will
+// reconstruct it (a refused provider would leave the small render, enlarged, all session). DLSS:
+// its early start succeeded (an NVIDIA RTX device and its files); FSR: its bridge is installed.
+static bool DibrProviderCanStart(const VR::Graphics::Config& config) {
+    if (config.upscaler == VR::Graphics::Upscaler::Dlss) {
+        const int early = VR::Graphics::dlss_early.load(std::memory_order_relaxed);
+        if (early == 0)
+            LOG_WARNING(Loader, "VR resolution: DIBR keeps its full-size render: DLSS cannot "
+                        "start (no NVIDIA RTX device or its files)");
+        return early != 0;
+    }
+    const bool fsr31 = config.upscaler == VR::Graphics::Upscaler::Fsr31;
+    const bool fsr41 = config.upscaler == VR::Graphics::Upscaler::Fsr41;
+    std::filesystem::path dir;
+    if (const char* p = std::getenv(fsr41 ? "VR_FSR41_DIR" : fsr31 ? "VR_FSR31_DIR" : "VR_FSR4_DIR");
+        p && *p)
+        dir = p;
+    else if (const char* base = SDL_GetBasePath(); base)
+        dir = std::filesystem::path(base) / (fsr41 ? "fsr41" : fsr31 ? "fsr31" : "fsr4");
+    else
+        return true; // unknown: the renderer reports a refusal
+    std::error_code error;
+    const bool installed = std::filesystem::is_regular_file(
+        dir / (fsr41 ? "vr_fsr41_stereo.dll" : fsr31 ? "vr_fsr31_stereo.dll" : "vr_fsr4_stereo.dll"),
+        error);
+    if (!installed)
+        LOG_WARNING(Loader, "VR resolution: DIBR keeps its full-size render: {} is not installed",
+                    VR::Graphics::UpscalerName(config.upscaler));
+    return installed;
+}
+
 // Adapt only the complete, enabled Kyo-derived VR allocation template in memory.
 // The XML on disk is never modified. Guest code is patched before its first instruction.
 // APP_VER 01.00 or 01.09: the same 1.09 executable (the launcher checks it and gives the launch
 // copy of the patch file the game's own APP_VER).
 static void ApplyHeadsetResolution(pugi::xml_document& doc, std::string_view version) {
     const bool dibr = VR::IsEnabled() && !std::getenv("VR_NATIVE_STEREO");
-    // The isolated DLSS experiment supplies its own input-resolution patch and output size.
-    const char* experiment = std::getenv("VR_DIBR_DLSS");
-    if (dibr && experiment && std::string_view(experiment) == "1") return;
     if ((!NativeStereo::AsymmetricProjection() && !dibr) ||
         (version != "01.00" && version != "01.09"))
         return;
     const auto config = VR::Graphics::Accepted();
     const bool fixed = !dibr && std::getenv("VR_NATIVE_FIXED_RESOLUTION") != nullptr;
     // S1: the whole template at the upscaler's input size (DLSS 5: its neural working size).
-    const bool s1 = !dibr && config.upscaler != VR::Graphics::Upscaler::Off && WholeFrameRequested();
-    if (fixed && !s1) return;
+    // DIBR (stereo_mode 2) with DLSS, FSR 4 or FSR 3.1.5: the centre render at the input size,
+    // reconstructed once to the output before the DIBR warp (vr_dibr_upscale.cpp).
+    const auto stereo = VR::GetStereo();
+    const bool dibr_upscale = dibr && stereo.stereo && stereo.mode == 2 &&
+                              VR::Graphics::DibrUpscaleAllowed() &&
+                              VR::Graphics::DibrUpscaleSupports(config) &&
+                              DibrProviderCanStart(config);
+    const bool s1 = dibr ? dibr_upscale
+                         : config.upscaler != VR::Graphics::Upscaler::Off && WholeFrameRequested();
+    if (fixed && !s1) {
+        const auto fixed_size = TemplateResolution(doc, version);
+        VR::Graphics::SetGameExtent(fixed_size);
+        RENDER_DIAGNOSTIC_ONCE("VR resolution: fixed template size {}x{} (VR_NATIVE_FIXED_RESOLUTION)",
+                               fixed_size.width, fixed_size.height);
+        return;
+    }
     const auto output = fixed ? TemplateResolution(doc, version)
                               : VR::Graphics::OutputResolution(
                                     VR::Graphics::Headset(0), VR::Graphics::Headset(1),
                                     config.scale_percent, VR::Graphics::HeadsetLimit());
-    if (!output.width || !output.height) return;
+    if (!output.width || !output.height) {
+        // render-diagnostics.txt (kept in releases): no headset size at boot (the session was not up
+        // yet, or no limit), so the patch keeps its own size, unchecked against the headset.
+        const auto l = VR::Graphics::Headset(0), r = VR::Graphics::Headset(1);
+        const auto limit = VR::Graphics::HeadsetLimit();
+        RENDER_DIAGNOSTIC_ONCE("VR resolution: not set at boot (headset L {}x{} R {}x{}, eye limit "
+                               "{}x{}); the patch keeps its own size", l.width, l.height, r.width,
+                               r.height, limit.width, limit.height);
+        return;
+    }
     const auto target = s1 ? VR::Graphics::WholeFrameResolution(output, config) : output;
     std::vector<std::pair<pugi::xml_node, std::string>> edits;
     std::set<uint32_t> addresses;
@@ -230,15 +292,18 @@ static void ApplyHeadsetResolution(pugi::xml_document& doc, std::string_view ver
     if (invalid || edits.size() != 20) {
         LOG_WARNING(Loader, "VR resolution: complete audited VR resolution/light-grid template "
                     "not found ({} of 20 values); keeping the supplied patch", edits.size());
+        RENDER_DIAGNOSTIC_ONCE("VR resolution: audited template not found ({} of 20 values); the "
+                               "patch keeps its own size", edits.size());
         return;
     }
     for (auto& [line, value] : edits) line.attribute("Value").set_value(value.c_str());
+    VR::Graphics::SetGameExtent(target);
     if (s1) {
         VR::Graphics::SetS1(output, config);
-        LOG_BENCHMARK_INFO(Loader, "VR resolution: S1 (FAST bit 51) whole frame {}x{} per eye, "
+        LOG_BENCHMARK_INFO(Loader, "VR resolution: S1 (FAST bit 51) whole frame {}x{} {}, "
                  "reconstructed by {} preset {} (scale {:.2f}) to {}x{} after the composite; "
                  "provider OFF or scale changes require restart",
-                 target.width, target.height,
+                 target.width, target.height, dibr ? "DIBR centre" : "per eye",
                  VR::Graphics::Neural(config)                     ? "DLSS 5"
                  : VR::Graphics::UpscalerName(config.upscaler),
                  int(VR::Graphics::EffectiveProfile(config)),
@@ -251,6 +316,12 @@ static void ApplyHeadsetResolution(pugi::xml_document& doc, std::string_view ver
              "{}x{} (8-pixel alignment, {}); scale changes require restart",
              left.width, left.height, right.width, right.height, config.scale_percent,
              target.width, target.height, dibr ? "DIBR center render" : "shared multiview extent");
+    const auto limit = VR::Graphics::HeadsetLimit();
+    RENDER_DIAGNOSTIC_ONCE("VR resolution: applied, game {}x{} output {}x{} ({}; headset L {}x{} R "
+                           "{}x{}, scale {:+}%, eye limit {}x{})", target.width, target.height,
+                           output.width, output.height, s1 ? "upscaled" : "native", left.width,
+                           left.height, right.width, right.height, config.scale_percent,
+                           limit.width, limit.height);
 }
 
 // The Model LOD patch's mov ecx, imm32 (b9 <bias> 90) in the game's code, once it is applied.
@@ -342,6 +413,119 @@ static void ApplyLodBias(pugi::xml_document& doc) {
     }
 }
 
+static bool IsIntelCpu() {
+    int regs[4]{};
+#ifdef _MSC_VER
+    __cpuid(regs, 0);
+#else
+    __cpuid(0, regs[0], regs[1], regs[2], regs[3]);
+#endif
+    char vendor[13]{};
+    std::memcpy(vendor, &regs[1], 4);
+    std::memcpy(vendor + 4, &regs[3], 4);
+    std::memcpy(vendor + 8, &regs[2], 4);
+    return std::string_view(vendor) == "GenuineIntel";
+}
+
+// Two community fixes for the 1.09 executable (the only one the launcher accepts, whether its
+// metadata says 01.00 or 01.09), added in memory so every patch file gets them. A patch file that
+// already names one keeps its own entry. From bbport (deadinside28/bloodborne_pc
+// patches/Bloodborne.xml, scripts/patches.py), sites checked against the 1.09 eboot:
+// - "Larger GX Per-Frame Command Heap": the two per-frame GX command heaps get 1 MiB instead of
+//   256 KiB (`mov edx, 0x40000` -> 0x100000 at both call sites); a full heap made the game write
+//   through NULL after 28-70 minutes (bbport #162). VR_GX_HEAP=0 leaves it out.
+// - "Intel Black Tonemap Fix" (Kyo): the tone mapping's colour grading always runs (a 6-byte
+//   `je` NOPed). On Intel CPUs the game's approximate float instructions (RCPPS/RSQRTPS) give other
+//   results than the PS4's AMD CPU, the flag gating the grading comes out wrong and the picture
+//   turns dark or black (DLC areas most). On by default on Intel only, as bbport does;
+//   VR_INTEL_TONEMAP_FIX=1 / 0 forces it on / off.
+static void ApplyBuiltInFixes(pugi::xml_document& doc, std::string_view version) {
+    if (version != "01.00" && version != "01.09")
+        return;
+    auto patch = doc.child("Patch");
+    if (!patch)
+        return;
+    const auto present = [&](std::string_view name) {
+        for (auto metadata : patch.children("Metadata"))
+            if (std::string_view(metadata.attribute("Name").value()) == name)
+                return true;
+        return false;
+    };
+    const auto add = [&](const char* name, const char* author,
+                         std::initializer_list<std::pair<const char*, const char*>> lines) {
+        if (present(name))
+            return;
+        auto metadata = patch.append_child("Metadata");
+        metadata.append_attribute("Title").set_value("Bloodborne");
+        metadata.append_attribute("Name").set_value(name);
+        metadata.append_attribute("Author").set_value(author);
+        metadata.append_attribute("PatchVer").set_value("1.0");
+        metadata.append_attribute("AppVer").set_value(std::string(version).c_str());
+        metadata.append_attribute("AppElf").set_value("eboot.bin");
+        metadata.append_attribute("isEnabled").set_value("true");
+        auto list = metadata.append_child("PatchList");
+        for (const auto& [address, value] : lines) {
+            auto line = list.append_child("Line");
+            line.append_attribute("Type").set_value("bytes");
+            line.append_attribute("Address").set_value(address);
+            line.append_attribute("Value").set_value(value);
+        }
+    };
+    const char* gx = std::getenv("VR_GX_HEAP");
+    const bool gx_heap = !(gx && gx[0] == '0');
+    if (gx_heap)
+        add("Larger GX Per-Frame Command Heap", "bbport",
+            {{"0x02595c0a", "00001000"}, {"0x02595c47", "00001000"}});
+    const char* forced = std::getenv("VR_INTEL_TONEMAP_FIX");
+    const bool intel = IsIntelCpu();
+    const bool tonemap = forced && (forced[0] == '0' || forced[0] == '1') ? forced[0] == '1' : intel;
+    if (tonemap)
+        add("Intel Black Tonemap Fix", "Kyo", {{"0x025843e5", "909090909090"}});
+    // Our lamp shadows on (light_shadow.h Enabled, the rule the shaders are made with): the
+    // game's own shadowed lamps off (its render setting "dynamic light shadows", read once while
+    // its renderer is built). Those group up to four lamps in shaders whose lamps after the first
+    // ours did not reach, with shadow maps that come out empty here: a lamp moved into one as you
+    // walked lost every shadow (2026-11-12, Iosefka's clinic: the table's shadow went one step
+    // closer). Off, every lamp is drawn by the plain lamp shaders, all of whose lamps ours shadow;
+    // their cube maps' clears, blurs and computes go too.
+    static const char* const light_shadows_override = std::getenv("VR_LIGHT_SHADOWS");
+    const bool our_shadows = Shader::Optimization::LightShadow::Enabled(
+        VR::IsEnabled(), VR::GetSettings().light_shadows,
+        VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off, light_shadows_override);
+    // (Undone the same night for the user's option B: the game's routing marks which lamps to
+    // shadow; in those shaders ours shadow every lamp and the game's maps read as lit
+    // (light_shadow_pass.cpp). VR_GAME_LAMP_SHADOWS_OFF=1 (tests): the switch-off as it was.)
+    static const char* const off_env = std::getenv("VR_GAME_LAMP_SHADOWS_OFF");
+    if (our_shadows && off_env && off_env[0] == '1')
+        add("VR: the game's shadowed lamps off (lamp shadows on)", "bloodborne-vr",
+            {{"0x026C2538", "00"}});
+    LOG_BENCHMARK_INFO(Loader,
+                       "Built-in fixes: GX command heap 1 MiB {}, Intel tonemap fix {} ({} CPU), "
+                       "game's shadowed lamps {}",
+                       gx_heap ? "on" : "off", tonemap ? "on" : "off", intel ? "Intel" : "non-Intel",
+                       our_shadows && off_env && off_env[0] == '1' ? "off (test)"
+                       : our_shadows                              ? "on, ours in their shaders"
+                                                                  : "on");
+}
+
+// vr.ini frame_hooks (core/vr/bloodborne_frame_rate.h): the game's frame rate by hooks in its
+// code, which need the game's own code at the frame pacer and the main loop's step. The
+// community's frame rate patches (60 FPS++ and its kin, the Sprint Fix) and our limiter pin edit
+// that code, so they are left out, as bbport does.
+static void ApplyFrameHooks(pugi::xml_document& doc) {
+    if (!VR::Bloodborne::FrameHooksRequested())
+        return;
+    for (auto metadata : doc.child("Patch").children("Metadata")) {
+        const std::string_view name = metadata.attribute("Name").value();
+        if (!metadata.attribute("isEnabled").as_bool() ||
+            !(name.find("FPS") != std::string_view::npos || name.starts_with("VR limiter") ||
+              name.starts_with("Sprint Fix")))
+            continue;
+        metadata.attribute("isEnabled").set_value("false");
+        LOG_BENCHMARK_INFO(Loader, "Frame rate hooks: patch \"{}\" left out", name);
+    }
+}
+
 void ApplyPatchesFromXML(std::filesystem::path path) {
     pugi::xml_document doc;
     pugi::xml_parse_result result = doc.load_file(path.c_str());
@@ -352,6 +536,8 @@ void ApplyPatchesFromXML(std::filesystem::path path) {
     if (result) {
         ApplyHeadsetResolution(doc, app_version);
         ApplyLodBias(doc);
+        ApplyBuiltInFixes(doc, app_version);
+        ApplyFrameHooks(doc);
         auto patchXML = doc.child("Patch");
         for (pugi::xml_node_iterator it = patchXML.children().begin();
              it != patchXML.children().end(); ++it) {

@@ -5,6 +5,8 @@
 #include "common/assert.h"
 #include "common/div_ceil.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/ir/passes/light_shadow.h"
+#include "shader_recompiler/eye_spec.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -12,6 +14,9 @@
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 
+#include <algorithm>
+#include <tuple>
+#include <cstdlib>
 #include <numbers>
 #include <string_view>
 
@@ -68,9 +73,10 @@ void Name(EmitContext& ctx, Id object, std::string_view format_str, Args&&... ar
 } // Anonymous namespace
 
 EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_info_, Info& info_,
-                         Bindings& binding_)
+                         Bindings& binding_, bool merged_eyes_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
       profile{profile_}, stage{info.stage}, l_stage{info.l_stage}, binding{binding_} {
+    merged_eyes = merged_eyes_ && runtime_info.native_stereo && l_stage == LogicalStage::Compute;
     if (info.uses_dma || VertexMotion()) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
@@ -179,32 +185,124 @@ void EmitContext::DefineArithmeticTypes() {
 
 Id EmitContext::NativeEyeIndex() {
     if (!runtime_info.native_stereo) return u32_zero_value;
+    if (Sirit::ValidId(eye_override)) return eye_override;
     if (l_stage == LogicalStage::Compute) {
+        if (merged_eyes) {
+            return OpCompositeExtract(U32[1], OpLoad(U32[3], workgroup_id), 2u);
+        }
         const Id ptr = OpAccessChain(TypePointer(spv::StorageClass::PushConstant, F32[1]),
                                     push_data_block, ConstU32(PushData::VrHudIndex));
         return OpConvertFToU(U32[1], OpLoad(F32[1], ptr));
     }
+    if (NativeLayerDraws()) {
+        const Id ptr = OpAccessChain(TypePointer(spv::StorageClass::PushConstant, F32[1]),
+                                     push_data_block, ConstU32(PushData::VrHudIndex));
+        return OpShiftRightLogical(U32[1], OpBitcast(U32[1], OpLoad(F32[1], ptr)),
+                                   ConstU32(31u));
+    }
     return runtime_info.native_multiview ? OpLoad(U32[1], probe_view_index) : u32_zero_value;
+}
+Id EmitContext::NativeHud(Id hud) {
+    return NativeLayerDraws() ? OpFAbs(F32[1], hud) : hud;
+}
+// VR_EXP_EYE_INDEX (GPU timing experiment only, never a default): how graphics stages select
+// an eye's descriptor. '0': always the left eye's (constant index, no NonUniform; the right eye
+// draws with the left eye's resources, so its image is wrong); 'u': the view index without the
+// NonUniform decoration (undefined by the spec if a subgroup mixes views); 'x': the view index
+// ANDed with vr_hud's sign bit, 0 in a multiview draw that is not TAA-jittered but unknown to the
+// driver's compiler, NonUniform kept: the left eye's resources for both views (as '0') through a
+// dynamic index (as unset), which separates the cost of the indexing from the effect of two views
+// reading the same memory; 'b' / 'i': '0' for buffers only / images only (the other kind as
+// always); 'c': '0' for buffers except those of a size the eyes pair (864: cameras; 208, 272,
+// 336, 416: lights), images as always; 'B': compute stages' buffers the left eye's (graphics as
+// always); 'f': graphics stages select descriptors by the subgroup's first lane's view index
+// (subgroup-uniform; NonUniform kept; wrong only where a subgroup mixes views). Unset: as always.
+static char ExpEyeIndex() {
+    static const char mode = [] {
+        const char* v = std::getenv("VR_EXP_EYE_INDEX");
+        const std::string_view modes = "0uxbicBf";
+        return v && v[0] && modes.find(v[0]) != std::string_view::npos ? v[0] : '\0';
+    }();
+    return mode;
+}
+bool EmitContext::ExpEyeGraphics() const {
+    return ExpEyeIndex() != '\0' && ExpEyeIndex() != 'x' && ExpEyeIndex() != 'f' &&
+           l_stage != LogicalStage::Compute;
+}
+Id EmitContext::DescriptorEyeIndex() {
+    if (ExpEyeIndex() == 'x' && l_stage != LogicalStage::Compute && runtime_info.native_multiview &&
+        !NativeLayerDraws()) {
+        const Id ptr = OpAccessChain(TypePointer(spv::StorageClass::PushConstant, F32[1]),
+                                     push_data_block, ConstU32(PushData::VrHudIndex));
+        const Id sign = OpShiftRightLogical(U32[1], OpBitcast(U32[1], OpLoad(F32[1], ptr)),
+                                            ConstU32(31u));
+        return OpBitwiseAnd(U32[1], NativeEyeIndex(), sign);
+    }
+    if (ExpEyeIndex() == 'f' && l_stage != LogicalStage::Compute && runtime_info.native_multiview &&
+        !NativeLayerDraws()) {
+        AddCapability(spv::Capability::GroupNonUniform);
+        AddCapability(spv::Capability::GroupNonUniformBallot);
+        return OpGroupNonUniformBroadcastFirst(U32[1], ConstU32(u32(spv::Scope::Subgroup)),
+                                               NativeEyeIndex());
+    }
+    return NativeEyeIndex();
 }
 Id EmitContext::NativeBufferPointer(Id type, Id buffer, Id member, Id index) {
     if (!runtime_info.native_stereo) return OpAccessChain(type, buffer, member, index);
-    const Id ptr = OpAccessChain(type, buffer, NativeEyeIndex(), member, index);
-    Decorate(ptr, spv::Decoration::NonUniform);
+    const char mode = ExpEyeGraphics() ? ExpEyeIndex() : '\0';
+    const bool paired_size =
+        std::any_of(exp_pair_buffers.begin(), exp_pair_buffers.end(),
+                    [&](const Id& candidate) { return candidate.value == buffer.value; });
+    const bool left = mode == '0' || mode == 'b' || (mode == 'c' && !paired_size) ||
+                      (ExpEyeIndex() == 'B' && l_stage == LogicalStage::Compute);
+    Id slot = u32_zero_value;
+    if (!left) {
+        std::tie(slot, index) = EyeSpecAccess(buffer, DescriptorEyeIndex(), index);
+    }
+    const Id ptr = OpAccessChain(type, buffer, slot, member, index);
+    if (!ExpEyeGraphics()) Decorate(ptr, spv::Decoration::NonUniform);
     return ptr;
+}
+std::pair<Id, Id> EmitContext::EyeSpecAccess(Id buffer, Id eye, Id index) {
+    for (const auto& v : eye_spec_vars) {
+        if (v.var != buffer.value) {
+            continue;
+        }
+        auto& marker = eye_spec_markers[v.marker_index];
+        ++marker.uses;
+        const Id shared = OpIEqual(U1[1], marker.marker, ConstU32(1u));
+        const Id slot = OpSelect(U32[1], shared, u32_zero_value, eye);
+        if (!Sirit::ValidId(marker.delta)) {
+            return {slot, index};
+        }
+        // The stride and size in this alias's elements; a stride of 0 leaves the index as it is.
+        ++marker.delta_uses;
+        ++marker.size_uses;
+        const Id shift = ConstU32(v.shift);
+        const Id stride = OpShiftRightLogical(
+            U32[1], OpSelect(U32[1], shared, marker.delta, u32_zero_value), shift);
+        const Id size = OpShiftRightLogical(U32[1], marker.size, shift);
+        const Id moved = OpIAdd(U32[1], index, OpIMul(U32[1], NativeEyeIndex(), stride));
+        const Id in_range = OpLogicalOr(U1[1], OpIEqual(U1[1], stride, u32_zero_value),
+                                        OpULessThan(U1[1], index, size));
+        return {slot, OpSelect(U32[1], in_range, moved, ConstU32(0xFFFFFFFFu))};
+    }
+    return {eye, index};
 }
 Id EmitContext::NativeImagePointer(Id type, Id image, Id lod) {
     if (!runtime_info.native_stereo) return image;
-    Id index = NativeEyeIndex();
+    const char mode = ExpEyeGraphics() ? ExpEyeIndex() : '\0';
+    Id index = mode == '0' || mode == 'i' ? u32_zero_value : DescriptorEyeIndex();
     if (Sirit::ValidId(lod)) index = OpIAdd(U32[1], OpIMul(U32[1], lod, ConstU32(2u)), index);
     const Id ptr = OpAccessChain(TypePointer(spv::StorageClass::UniformConstant, type), image, index);
-    Decorate(ptr, spv::Decoration::NonUniform);
+    if (!ExpEyeGraphics()) Decorate(ptr, spv::Decoration::NonUniform);
     return ptr;
 }
 Id EmitContext::NativeNonUniform(Id resource) {
     // NonUniform does not propagate from the descriptor access chain. Decorate the
     // image/sampled image consumed by an image instruction, or the texel pointer
     // consumed by an atomic, so selecting a resource by ViewIndex is portable.
-    if (runtime_info.native_stereo) {
+    if (runtime_info.native_stereo && !ExpEyeGraphics()) {
         Decorate(resource, spv::Decoration::NonUniform);
     }
     return resource;
@@ -227,7 +325,7 @@ void EmitContext::DefineInterfaces() {
         AddCapability(spv::Capability::SampledImageArrayNonUniformIndexing);
         AddCapability(spv::Capability::StorageImageArrayNonUniformIndexing);
     }
-    if (runtime_info.native_multiview) {
+    if (runtime_info.native_multiview && !NativeLayerDraws()) {
         AddCapability(spv::Capability::MultiView);
         probe_view_index = DefineVariable(U32[1], spv::BuiltIn::ViewIndex, spv::StorageClass::Input);
         if (l_stage == LogicalStage::Fragment) Decorate(probe_view_index, spv::Decoration::Flat);
@@ -356,9 +454,13 @@ void EmitContext::DefineWorkgroupIndex() {
     const Id num_workgroups{OpLoad(U32[3], num_workgroups_id)};
     const Id num_workgroups_x{OpCompositeExtract(U32[1], num_workgroups, 0)};
     const Id num_workgroups_y{OpCompositeExtract(U32[1], num_workgroups, 1)};
+    const Id flat_xy{OpIAdd(U32[1], workgroup_x, OpIMul(U32[1], workgroup_y, num_workgroups_x))};
+    // Merged eyes: z is the eye, the game's dispatch is one group deep.
     workgroup_index_id =
-        OpIAdd(U32[1], OpIAdd(U32[1], workgroup_x, OpIMul(U32[1], workgroup_y, num_workgroups_x)),
-               OpIMul(U32[1], workgroup_z, OpIMul(U32[1], num_workgroups_x, num_workgroups_y)));
+        merged_eyes ? flat_xy
+                    : OpIAdd(U32[1], flat_xy,
+                             OpIMul(U32[1], workgroup_z,
+                                    OpIMul(U32[1], num_workgroups_x, num_workgroups_y)));
     Name(workgroup_index_id, "workgroup_index");
 }
 
@@ -400,6 +502,19 @@ void EmitContext::DefineInputs() {
         if (runtime_info.native_light_scissor || FragmentMotion() || info.loads.GetAny(IR::Attribute::FragCoord) ||
             runtime_info.fs_info.vr_cut != 0) {
             frag_coord = DefineVariable(F32[4], spv::BuiltIn::FragCoord, spv::StorageClass::Input);
+        }
+        // The lamp shadows' AO pass (it writes the shadow mask): its fragment's size, for the
+        // pixels a coarse fragment covers (light_shadow.h SceneMaps).
+        if (profile.supports_fragment_shading_rate &&
+            std::ranges::any_of(info.buffers, [](const auto& b) {
+                return (b.buffer_type == BufferType::VrShadowMask ||
+                        b.buffer_type == BufferType::VrAirCells) &&
+                       b.is_written;
+            })) {
+            AddCapability(spv::Capability::FragmentShadingRateKHR);
+            AddExtension("SPV_KHR_fragment_shading_rate");
+            shading_rate = DefineVariable(U32[1], spv::BuiltIn::ShadingRateKHR, spv::StorageClass::Input);
+            Decorate(shading_rate, spv::Decoration::Flat);
         }
         // A cut permutation of VrPushData learns per draw whether back faces are cut.
         if (info.loads.Get(IR::Attribute::IsFrontFace) ||
@@ -518,7 +633,7 @@ void EmitContext::DefineInputs() {
     }
     case LogicalStage::Compute:
         if (info.loads.GetAny(IR::Attribute::WorkgroupIndex) ||
-            info.loads.GetAny(IR::Attribute::WorkgroupId)) {
+            info.loads.GetAny(IR::Attribute::WorkgroupId) || merged_eyes) {
             workgroup_id =
                 DefineVariable(U32[3], spv::BuiltIn::WorkgroupId, spv::StorageClass::Input);
         }
@@ -634,7 +749,7 @@ void EmitContext::DefineVertexBlock() {
         output_point_size =
             DefineVariable(F32[1], spv::BuiltIn::PointSize, spv::StorageClass::Output);
     }
-    if (info.stores.GetAny(IR::Attribute::RenderTargetIndex)) {
+    if (info.stores.GetAny(IR::Attribute::RenderTargetIndex) || NativeLayerOutput()) {
         output_layer = DefineVariable(U32[1], spv::BuiltIn::Layer, spv::StorageClass::Output);
     }
     if (info.stores.GetAny(IR::Attribute::ViewportIndex)) {
@@ -824,7 +939,8 @@ void EmitContext::DefinePushDataBlock() {
     if (scene_constants) { fields.push_back(F32[1]); fields.push_back(F32[1]); }
     if (vr_push) {
         fields.insert(fields.end(),
-                      {F32[1], F32[1], F32[4], F32[4], F32[4], F32[4], U32[2], U32[2]});
+                      {F32[1], F32[1], F32[4], F32[4], F32[4], F32[4], U32[2], U32[2], F32[1],
+                       F32[1]});
     }
     const Id struct_type{Name(TypeStruct(fields), "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
@@ -869,6 +985,8 @@ void EmitContext::DefinePushDataBlock() {
         MemberName(struct_type, VrPushData::LightIndex + 1, "vr_light_right");
         MemberName(struct_type, VrPushData::MotionIndex, "vr_motion_params");
         MemberName(struct_type, VrPushData::MotionIndex + 1, "vr_motion_positions");
+        MemberName(struct_type, VrPushData::BumpDepthIndex, "vr_bump_depth");
+        MemberName(struct_type, VrPushData::BumpDepthIndex + 1, "vr_bump_scale");
         MemberDecorate(struct_type, VrPushData::CutNearIndex, spv::Decoration::Offset,
                        VrPushData::CutNearOffset);
         MemberDecorate(struct_type, VrPushData::CutScaleIndex, spv::Decoration::Offset,
@@ -885,6 +1003,10 @@ void EmitContext::DefinePushDataBlock() {
                        VrPushData::MotionOffset);
         MemberDecorate(struct_type, VrPushData::MotionIndex + 1, spv::Decoration::Offset,
                        VrPushData::MotionOffset + 8u);
+        MemberDecorate(struct_type, VrPushData::BumpDepthIndex, spv::Decoration::Offset,
+                       VrPushData::BumpOffset);
+        MemberDecorate(struct_type, VrPushData::BumpDepthIndex + 1, spv::Decoration::Offset,
+                       VrPushData::BumpOffset + 4u);
     }
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
@@ -924,6 +1046,42 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, u32 elem_shift
         break;
     case BufferType::ClipPlanes:
         Name(id, "clip_planes");
+        break;
+    case BufferType::VrFogLights:
+        Name(id, "vr_fog_lights");
+        break;
+    case BufferType::VrMoonShafts:
+        Name(id, "vr_moon_shafts");
+        break;
+    case BufferType::VrParticleLights:
+        Name(id, "vr_particle_lights");
+        break;
+    case BufferType::VrAdaptation:
+        Name(id, "vr_adaptation");
+        break;
+    case BufferType::VrBodyCapsules:
+        Name(id, "vr_body_capsules");
+        break;
+    case BufferType::VrBodyMaps:
+        Name(id, "vr_body_maps");
+        break;
+    case BufferType::VrShadowGrid:
+        Name(id, "vr_shadow_grid");
+        break;
+    case BufferType::VrSceneMaps:
+        Name(id, "vr_scene_maps");
+        break;
+    case BufferType::VrShadowMask:
+        Name(id, "vr_shadow_mask");
+        break;
+    case BufferType::VrShadowCasters:
+        Name(id, "vr_shadow_casters");
+        break;
+    case BufferType::VrDepthPyramid:
+        Name(id, "vr_depth_pyramid");
+        break;
+    case BufferType::VrFogGrid:
+        Name(id, "vr_fog_grid");
         break;
     case BufferType::BdaPagetable:
         Name(id, "bda_pagetable");
@@ -976,6 +1134,40 @@ void EmitContext::DefineBuffers() {
         if (True(desc.used_types & IR::Type::U8)) {
             spv_buffer.Alias(PointerType::U8) =
                 DefineBuffer(desc.is_written, 0, desc.buffer_type, U8);
+        }
+        // The game's buffers, and the read-only flattened user data and clip planes (both eyes'
+        // descriptors are the same upload when nothing gives them a twin).
+        const bool eye_spec_type =
+            desc.buffer_type == BufferType::Guest ||
+            ((desc.buffer_type == BufferType::Flatbuf ||
+              desc.buffer_type == BufferType::ClipPlanes) &&
+             !desc.is_written);
+        if (eye_spec_type && runtime_info.native_stereo && l_stage != LogicalStage::Compute &&
+            EyeSpec::Enabled() && binding.unified < EyeSpec::MaxBindings) {
+            const u32 marker_index = static_cast<u32>(eye_spec_markers.size());
+            EyeSpecMarker marker{binding.unified, Constant(U32[1], EyeSpec::Magic + binding.unified),
+                                 0};
+            if (!desc.is_written && desc.buffer_type == BufferType::Guest) {
+                marker.delta = Constant(U32[1], EyeSpec::MagicDelta + binding.unified);
+                marker.size = Constant(U32[1], EyeSpec::MagicSize + binding.unified);
+            }
+            eye_spec_markers.push_back(marker);
+            static constexpr std::array<u32, u32(PointerType::NumAlias)> shifts{0, 1, 2, 2, 3, 3};
+            for (u32 a = 0; a < spv_buffer.aliases.size(); ++a) {
+                if (Sirit::ValidId(spv_buffer.aliases[a].id)) {
+                    eye_spec_vars.push_back({spv_buffer.aliases[a].id.value, marker_index, shifts[a]});
+                }
+            }
+        }
+        if (desc.buffer_type == BufferType::Guest) {
+            const u32 size = buf_sharp.GetSize();
+            if (size == 864 || size == 208 || size == 272 || size == 336 || size == 416) {
+                for (const auto& alias : spv_buffer.aliases) {
+                    if (Sirit::ValidId(alias.id)) {
+                        exp_pair_buffers.push_back(alias.id);
+                    }
+                }
+            }
         }
         ++binding.unified;
     }

@@ -109,6 +109,9 @@ inline void DiffRuntime(const Shader::RuntimeInfo& a, const Shader::RuntimeInfo&
         out.Add("native_projection");
     }
     Field(out, "native_light_scissor", a.native_light_scissor, b.native_light_scissor);
+    Field(out, "vr_light_shadows", a.vr_light_shadows, b.vr_light_shadows);
+    Field(out, "vr_ambient_occlusion", a.vr_ambient_occlusion, b.vr_ambient_occlusion);
+    Field(out, "vr_composite_light", a.vr_composite_light, b.vr_composite_light);
     if (a.native_light_bounds != b.native_light_bounds) {
         out.Add("native_light_bounds");
     }
@@ -237,13 +240,20 @@ inline void DiffSpec(const Shader::StageSpecialization& existing,
     if (existing.fmasks != wanted.fmasks) {
         out.Add("fmasks");
     }
-    // As the comparison: no bound resource on either side, the rest is not compared.
-    if (existing.bitset.none() && wanted.bitset.none()) {
+    // Descriptor-free stages can still read push constants at a compiled register offset.
+    const bool none_bound = existing.bitset.none() && wanted.bitset.none();
+    if (none_bound && !existing.info->HasDescriptors()) {
+        if (!existing.info->ud_mask.MatchesStart(existing.start.user_data, wanted.start.user_data)) {
+            out.Add("start.user_data");
+        }
         return;
     }
     Field(out, "start.unified", existing.start.unified, wanted.start.unified);
     Field(out, "start.buffer", existing.start.buffer, wanted.start.buffer);
     Field(out, "start.user_data", existing.start.user_data, wanted.start.user_data);
+    if (none_bound) {
+        return;
+    }
     // Only the sharps the wanted permutation binds (its bitset), as the comparison.
     u32 binding = 0;
     for (size_t i = 0; i < existing.buffers.size(); ++i) {

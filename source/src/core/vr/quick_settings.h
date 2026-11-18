@@ -54,6 +54,10 @@ struct QuickSettings {
     // menu), 2 both. Vials stay right; pocket/chest follow equipped quick slots 1/2.
     int holster_mode{2};
     bool holster_haptics{true};
+    // The left hand over the right shoulder draws a vial (holsters.h ShoulderSlot; the user
+    // 2026-10-26: a third way beside the pouch and the arc), in the shoulder switch's own zone of
+    // the right shoulder (ShoulderSwitch::ZoneAt). With body slots on.
+    bool shoulder_vial{true};
     float holster_height_cm{0.0f}, holster_width_cm{0.0f}, holster_forward_cm{0.0f};
     float holster_reach_cm{12.0f}; // (10 until 2026-10-14: the tester, "+2 cm")
     bool belt_vial{true};
@@ -72,6 +76,18 @@ struct QuickSettings {
     // How the hand picks a card: hovering it with the fist (0), or pointing the hand from where
     // the arc opened toward it, from 7 cm out (1, a pie: no need to reach the card).
     bool pick_sector{false};
+    // quick_arc_pick=fan (the default from 2026-10-27):
+    // the items you carry on a fan round the left controller (on the arc's crescent above the
+    // hand: radius_m, span_deg), picked by the direction the hand moves from where it opened (all
+    // but the lowest third round the hand); pulled toward you or pushed away: closed, nothing
+    // taken. hover is the old arc of cards ("Boxes" on the VR page).
+    bool pick_fan{true};
+    // quick_fan_style: the fan's look (vr_inframe.frag ShadeFanFn). 0 lancet ("Fan A": gothic
+    // panes, iron mullions, candle-lit glass), 1 brass ("Fan B": an engraved brass rim with ticks
+    // and studs, an ember glow).
+    int fan_style{0};
+    // The one-time hover -> fan migration ran (a vr.ini written before carries the old default).
+    bool fan_seen{false};
     // A squeeze just after the hand left a card still takes it (ms) ...
     float grace_ms{150.0f};
     // ... and one with no card lit takes the card clearly nearest the hand, up to this x the
@@ -230,6 +246,43 @@ struct QuickSettings {
     float music_box_grab_cm{6.0f};
     float music_box_turns{1.0f};
     float music_box_replay_s{4.9f};
+    // Pick, then use (the tester's 2026-10-30 request; left_scheme=2): the trigger on a card picks
+    // the item up and never uses it at the pull. Kept down from the pick it goes on as before (a
+    // ring starts filling, a throwable flies when let go, a hunter tool is used after
+    // tap_use_ms); let go, the item stays in the hand, and the trigger pressed again uses it (a
+    // ring starts again and must be held full, a throwable is held to be thrown, a tool is used).
+    // Only the grip puts it back. 0 = as before (let go: back on the arc; tools at the pull).
+    bool tap_pick{true};
+    float tap_use_ms{300.0f};
+    // The grip holds (the tester's 2026-10-30 layout; left_scheme=2): the grip opens the fan, the
+    // grip on a card takes the item and holds it while it stays squeezed, as a body pocket's; the
+    // trigger uses it (the crush is the trigger hard), a throwable flies when the grip is let go,
+    // and letting go of anything else puts it back. The trigger with the fan open is the gun. An
+    // item put back unused within fan_return_ms of its take (a wrong pick) brings the fan back
+    // for the next one; one used (used up, thrown, a tool used) or held longer leaves it closed
+    // (0: never back; the tester, 2026-11-06). 0 = the trigger takes (tap_pick above).
+    bool grip_hold{true};
+    float fan_return_ms{3000.0f};
+    // The one-time 6 s -> 3 s migration ran (a vr.ini written before carries the old default).
+    bool fan_return_seen{false};
+    // The grip in the air opens the fan once squeezed this long (the tester's 2026-11-01 pick: a
+    // hand closing on its own opens nothing); 0 = at the squeeze. Y and X open it at once.
+    float grip_open_ms{80.0f};
+    // The hunter tools stay in the hand after their use (out of sight while the game's own use
+    // animation plays), ready for the next one. 0 = they go away after a use.
+    bool tool_keep{true};
+    // The hunter tools' acts, with the trigger: the Madaras Whistle at your mouth, the Old Hunter
+    // Bone crushed (the grip hard; with grip_hold the trigger hard), A Call Beyond gathered with
+    // the trigger and raised above your head, Tiny Tonitrus and the Executioner's Gloves swung
+    // down (or slashed forward and down), the Blacksky Eye pointed as a gun (held to your eye: its
+    // meteor where you look).
+    // 0 = the trigger alone. (The Accursed Brew is a throwable: Classify.)
+    bool tool_gestures{true};
+    // No use animations for the hunter tools: your act is the use (the whistle at your mouth: the
+    // snake comes), the game's own effect at once from the tool in his hand, its own sounds, at
+    // the tool's own pace (as fast as the game's animation would allow, never faster). 0 = the
+    // game's own use animation.
+    bool tool_direct{true};
     // Throwables: swing and let go of the grip; the game's own projectile flies with your hand's
     // release velocity. 0 = they are used like the rest (select + Square: the game's own throw).
     bool throws{true};
@@ -279,23 +332,26 @@ struct QuickSettings {
     float throw_cap_knee{0.7f};
     // Locked on: the throw's yaw (only) is turned this share toward the target when it points
     // within throw_assist_deg of it (knives throw_assist_knife_deg), fading out toward the edge.
-    // (The tester's 30%, 2026-10-07 morning; 0.26 the night before, 0.27 on 10-06, 0.22 before.)
-    float throw_assist{0.30f};
+    // (32.5% since 2026-10-24, "2-3% more help"; the user's 30% on 10-07 morning, 0.26 the night
+    // before, 0.27 on 10-06, 0.22 before.)
+    float throw_assist{0.325f};
     float throw_assist_deg{9.0f};
     float throw_assist_knife_deg{15.0f};
     // Not locked on, every throw but the knives (Molotovs, oil, pebbles, ...): the same yaw-only
     // turn, this share, toward the game's lock-on candidate whose heading is nearest the throw's
     // (PickYawTarget: the knife assist's list), within throw_assist_deg; 0 = lock-on only. (The
-    // user's 2026-10-07 answer: "the regular throws yes"; the gun stays lock-on only.)
-    float throw_assist_unlocked{0.26f};
+    // user's 2026-10-07 answer: "the regular throws yes"; the gun stays lock-on only. 0.285 since
+    // 2026-10-24, was 0.26.)
+    float throw_assist_unlocked{0.285f};
     // Throwing and Poison Knives (KnifeAssist; 0 = the yaw assist above, lock-on only): the
     // throw's direction, yaw AND pitch, is turned this share of the way toward the direction that
     // drops onto the target's lock-on point at the throw's own speed (gravity compensated), at full
     // strength while it points within knife_assist_deg of that, fading to none at 4/3 of it. The
     // target: the lock-on target, else the game's lock-on candidate nearest the throw's line
-    // (locked on or not). The speed is never changed. (0.85 since 2026-10-07: "much stronger just
-    // for the throwing knives"; 0.70 on 10-06 still missed a knife 14 degrees off at 7.5 m.)
-    float knife_assist{0.85f};
+    // (locked on or not). The speed is never changed. (0.875 since 2026-10-24, "2-3% more help";
+    // 0.85 since 10-07: "much stronger just for the throwing knives"; 0.70 on 10-06 still missed
+    // a knife 14 degrees off at 7.5 m.)
+    float knife_assist{0.875f};
     float knife_assist_deg{15.0f};
     // ... plus the hunter's own horizontal velocity (1 = a throw while running carries his speed)
     float throw_inherit_motion{1.0f};
@@ -319,6 +375,10 @@ struct QuickSettings {
     // (4 m: 2 until 2026-10-16, the tester: +2 m) ...
     float molotov_burst_radius_m{4.0f};
     bool molotov_burst_ground{true};
+    // The burst and fire a Molotov of yours makes where it lands or hits (its impact child)
+    // reaches this many times its own radius (the flames keep their size); 1 = the game's own
+    // (2026-10-25: a little bigger).
+    float molotov_fire_scale{1.5f};
     // The release pulse on the left hand scales with the launch speed (a lob a light tick, a hard
     // throw a long strong one); 0 = the same pulse for every throw.
     bool throw_haptic_scale{true};

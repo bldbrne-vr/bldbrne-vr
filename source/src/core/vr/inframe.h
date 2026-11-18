@@ -79,6 +79,15 @@ enum class MeshId : std::uint16_t {
     RubPaperBolt,  // Bolt Paper: the same scrap, its own material
     PhantasmShell, // the Empty Phantasm Shell
     HunterMark, RegisterBook, LeagueBook, BeckoningBell, ChoirBell, BeastPellet, AshUrn, UmbilicalCord, // reused goods geometry with item-specific materials
+    MessengerSkull, MessengerChunks, // refined relic; one prefractured mesh for its brief use cue
+    TinyTonitrus, ExecutionerGloves, // original single-mesh hunter relics
+    TonitrusBridge, // bounded three-ribbon discharge; Unlit, uv.x = -2070
+    AugurSpray, // one bounded analytic blood burst; Unlit, uv.x = -2000
+    // The Blacksky Eye (core/vr/blacksky_eye.h): our eyeball and its clear cornea, drawn after
+    // it; Shade::Goods with uv = (5, time s, the pupil's radius, the shot's flash).
+    BlackskyEye, BlackskyCornea,
+    Cylinder, // a unit cylinder along +Y, radius 1, y 0 .. 1 (debug: the solid weapons' capsules)
+    Cigarette, CigarettePacket,
     Count,
 };
 
@@ -123,6 +132,13 @@ enum class Shade : std::uint8_t {
            // emissive.rgb = the grab's glow; uv.x = 1 selects Queenly Blood on a coldblood mesh
     NativeLiquid, // native bottle + texture: Syringe chamber/plane data; emissive.z = profile
                   // (1 blue elixir, 2 lead elixir, 3 blood cocktail), w = grip y
+    // quick_arc_pick=fan's segment (vr_inframe.frag ShadeFanFn) on a Quad in the fan's plane, its
+    // y out from the hand along the segment's middle: radius uv.y to 1 (of its outer radius),
+    // uv.x radians either side of the middle (uv.z that middle's direction, uv.w the icons'
+    // radius); color = (lit glow, deny flash, selected, opacity); emissive = (quick_fan_style,
+    // the fan's ends on its sides, how far the quad reaches past them, 0). The last shade the
+    // shader's 4 bits hold.
+    Fan,
 };
 
 // Texture of an item.
@@ -135,6 +151,14 @@ struct Item {
     MeshId mesh{MeshId::Quad};
     Shade shade{Shade::Unlit};
     Tex tex{Tex::None};
+    float model_frame{0.0f};  // animated model frame; zero is the stored/rest pose
+    float model_blend_frame{-1.0f}; // >=0: scaled-bone skinning, optional second pose
+    float model_blend_weight{};
+    // Nonzero (one cut's replacement models/blood): items of a group are drawn all or none, each
+    // model uploaded first (never a piece shown part by part).
+    std::uint32_t group{0};
+    bool upload_only{false}; // staged sever group: prepare models, never draw or write depth
+    bool reveal_first{false}; // acknowledge the complete first draw, even if offscreen
     std::uint32_t tex_key{0}; // Icon: the EquipParamGoods iconId; Label: index into labels;
                               // Model (mesh and texture): the model id
     std::array<float, 4> color{1.0f, 1.0f, 1.0f, 1.0f}; // linear rgb, a = opacity
@@ -148,6 +172,8 @@ struct Item {
     // write), after the other items: the part of the hovered card the hunter's own fist hides,
     // shown through it (a copy of the card's items, faded in with the hover).
     bool xray{false};
+    bool translucent{false}; // depth-tested, but never writes depth (cosmetic smoke)
+    bool keep_charge_color{false}; // the A Call Beyond held in the hand
     // Depth-tested as if this much nearer to the camera (game units; its pixels stay where they
     // are): the gauge on the wrist draws over the sleeve it rests on (a cuff, a gauntlet that
     // bulges a little past it) and is still hidden by what is really in front of it (the right
@@ -158,11 +184,27 @@ struct Item {
     // placed for to this one (Carry), so it stays on the hand the frame shows. False: placed in
     // your play space or the world (the arc's cards, a ring where an item was used).
     bool hand{false};
+    // The held Monocular remains visible to the free eye, but must not cover the optical view.
+    bool hide_from_monocular_eye{false};
+    // A candle (the Hand Lantern lit, core/vr/hand_lantern.h). Shade::Model: its light inside
+    // the model (emissive.x its strength, in place of the grab's glow). Shade::Card on a Quad:
+    // its flame (uv.x its strength, uv.y its height, 1 = as drawn), not a card.
+    bool candle{false};
+    // Textured glove: emissive.xyz carries bounded cloth lag, .w the summon flash.
+    // Model frame carries charge; stored copies leave this false and stay at rest.
+    bool soft_glove{false};
     // Optional conservative view-space bounding sphere (xyz, radius in game units).
     // Radius <= 0 keeps legacy behavior. Holsters use this to skip wholly off-screen groups
     // before texture/probe/depth work; visible geometry and materials are unchanged.
     std::array<float, 4> cull_sphere{};
 };
+
+// Negative bolt width identifies the small arcs attached to the charged tool;
+// the positive-width ground bridge is already positioned in carried world space.
+inline bool IsTonitrusChargeArc(const Item& item) {
+    return item.mesh == MeshId::TonitrusBridge && item.shade == Shade::Unlit &&
+           item.uv[0] == -2070.0f && item.uv[2] < 0.0f;
+}
 
 // Side planes of the actual render projection, with a small guard band. Unknown projection
 // or bounds always keep the item. Testing a sphere (not just its centre) prevents edge popping.
@@ -250,6 +292,9 @@ struct Label {
 
 // Room for three stocked holsters plus the arc, its occlusion copies, and held props.
 constexpr std::uint32_t MaxItems = 96;
+// Renderer-only: the ordinary UI budget plus the independently bounded sever list.
+// Producer/ring storage stays at MaxItems; UI growth cannot evict a committed cut.
+constexpr std::uint32_t MaxRenderItems = 2 * MaxItems;
 constexpr std::uint32_t MaxLabels = 12;
 
 // Who built a list (each camera record can have one of each; Take merges them, the vitals first:
@@ -257,6 +302,7 @@ constexpr std::uint32_t MaxLabels = 12;
 enum class Producer : std::uint8_t {
     Quick = 0,  // the quick-item arc, the held items, markers (bloodborne_quickitems.cpp)
     Vitals = 1, // the Blood Gauge (bloodborne_vitals.cpp)
+    Sever = 2,  // a Beast Claw's severed pieces in the world (bloodborne_sever.cpp)
     Count,
 };
 
@@ -277,24 +323,46 @@ struct ProbeResult {
     std::array<float, MaxProbe> scene_z{}; // the scene's view depth at its pixel (<= 0: none)
 };
 
-struct List {
+template <std::size_t Capacity>
+struct ItemList {
     std::uint64_t record{0};
     std::int64_t steady_ns{0};
     std::uint32_t count{0};
-    std::array<Item, MaxItems> items{};
+    std::array<Item, Capacity> items{};
     std::uint32_t label_count{0};
     std::array<Label, MaxLabels> labels{};
     float exposure{1.0f}; // the items' brightness (inframe_exposure); the key light is head-relative
+    float world_gray{}; // A Call Beyond gathering in this camera record
+    float world_bright{}; // ... how much it lifts the gray world (vr.ini call_beyond_bright)
+    float world_flash{};  // ... its flare to the stars' light once raised (0..1)
+    float world_storm{};  // Tonitrus' strike: lightning's flash over the world (0..1; no gray)
     Producer producer{Producer::Quick};
     Probe probe{};
 
     // Appends (false when full).
     bool Add(const Item& item) {
-        if (count >= MaxItems) {
+        if (count >= Capacity) {
             return false;
         }
         items[count++] = item;
         return true;
+    }
+    template <std::size_t Other>
+    void CopyFrom(const ItemList<Other>& from) {
+        record = from.record;
+        steady_ns = from.steady_ns;
+        count = std::min({from.count, static_cast<std::uint32_t>(Capacity),
+                          static_cast<std::uint32_t>(Other)});
+        std::copy_n(from.items.begin(), count, items.begin());
+        label_count = from.label_count;
+        labels = from.labels;
+        exposure = from.exposure;
+        world_gray = from.world_gray;
+        world_bright = from.world_bright;
+        world_flash = from.world_flash;
+        world_storm = from.world_storm;
+        producer = from.producer;
+        probe = from.probe;
     }
     // A label's index (or -1 when the table is full).
     int AddLabel(const char* utf8, std::uint8_t px = 48) {
@@ -311,10 +379,13 @@ struct List {
         return static_cast<int>(label_count++);
     }
 };
+using List = ItemList<MaxItems>;
+using RenderList = ItemList<MaxRenderItems>;
 
 // Stable compaction preserves draw order and label indices. The renderer calls this before
 // ending the game render pass or copying scene color/depth for a wholly invisible list.
-inline std::uint32_t CullInvisible(List& list, float vfov, float aspect,
+template <std::size_t Capacity>
+inline std::uint32_t CullInvisible(ItemList<Capacity>& list, float vfov, float aspect,
                                    float eye_half_width = 0.0f,
                                    float horizontal_extent = 1.0f, float vertical_extent = 1.0f) {
     // Enclose both native eyes: their separation and off-axis frusta. Keep one shared
@@ -534,11 +605,17 @@ inline bool RebaseList(const List& from, const List* to, const ReView& rv,
 }
 // GPU thread: the lists of `record` merged (false: none, nothing to draw for that frame).
 bool Take(std::uint64_t record, List& out);
+// Rendering uses independent UI/sever capacity; the legacy bounded merge above is
+// retained for callers explicitly requesting a producer-size list.
+bool Take(std::uint64_t record, RenderList& out);
 // GPU thread: a depth probe's answer; any thread: the newest one.
 void PublishProbe(const ProbeResult& result);
 bool LatestProbe(ProbeResult& out);
 // GPU thread: a list of `record` is waiting (cheap; a frame without one skips the target tracking).
 bool Has(std::uint64_t record);
+// GPU thread: the Tonitrus flash `record`'s quick list asks for (List::world_storm; 0: none), read
+// before the frame takes it (the temporal resolve comes before the frame's items).
+float StormFor(std::uint64_t record);
 // The newest record a list is waiting for (0: none); logs-on diagnostics.
 std::uint64_t NewestRecord();
 
@@ -553,9 +630,14 @@ void NoteMiss();
 // GPU thread: a submitted list was drawn into its frame / the renderer turned itself off.
 void NoteDrawn();
 void NoteDisabled();
+// GPU thread: a list taken for a frame the renderer can draw into, but nothing of it in view (the
+// pouches on your hips while you look up): not a refusal, Available()'s 30 start again.
+void NoteNothingInView();
 // Presenter: what is submitted is shown. False once the renderer turned itself off, or after 30
 // lists in a row were submitted and none drawn (the game's frame is not one it can draw into);
-// tried again 20 s later.
+// tried again 20 s later. Lists with nothing in view are left out (NoteNothingInView): until
+// 2026-11-03 they counted, and half a second of looking away from your body put the arc, the
+// pouches and the shoulder vial away for 20 s.
 bool Available();
 
 } // namespace VR::InFrame

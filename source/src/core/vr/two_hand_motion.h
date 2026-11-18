@@ -53,25 +53,30 @@ class BladeMotion {
 public:
     BladeSample Step(bool active, bool tracked, std::int64_t ns, std::uint64_t space,
                      int family, int style, const Pose& weapon, Vec3 local_tip,
-                     Vec3 local_lever, Vec3 head) {
+                     Vec3 local_lever, Vec3 head, Vec3 grip_shift = {}) {
         BladeSample out{};
         out.active = active;
         out.ns = ns;
         out.weapon = weapon;
         out.head = head;
         if (!active || !tracked || !Body::IsFinite(weapon.p) || !Body::IsFinite(weapon.q) ||
-            !Body::IsFinite(local_tip) || !Body::IsFinite(local_lever) || !Body::IsFinite(head)) {
+            !Body::IsFinite(local_tip) || !Body::IsFinite(local_lever) || !Body::IsFinite(head) ||
+            !Body::IsFinite(grip_shift)) {
             Reset();
             return out;
         }
         const Quat q = Body::Normalize(weapon.q);
-        out.tip = weapon.p + Body::Rotate(q, local_tip);
-        out.lever = weapon.p + Body::Rotate(q, local_lever);
+        // Sliding changes the weapon's origin relative to the controller, not its
+        // geometry. Differentiate the displayed points including that translation,
+        // but compare the unshifted points below to detect actual geometry changes.
+        out.tip = weapon.p + Body::Rotate(q, local_tip + grip_shift);
+        out.lever = weapon.p + Body::Rotate(q, local_lever + grip_shift);
         const double dt = static_cast<double>(ns - ns_) * 1e-9;
         const bool same = have_ && space == space_ && family == family_ && style == style_ &&
                           dt >= 0.001 && dt <= 0.05 &&
                           Body::Length(local_tip - local_tip_) < 0.002f &&
                           Body::Length(local_lever - local_lever_) < 0.002f &&
+                          Body::Length(grip_shift - grip_shift_) < 0.10f &&
                           Body::AngleBetween(weapon.q, weapon_.q) < 60.0f * Body::Deg &&
                           Body::Length(head - head_) < 0.3f;
         if (same) {
@@ -102,6 +107,7 @@ public:
         lever_ = out.lever;
         local_tip_ = local_tip;
         local_lever_ = local_lever;
+        grip_shift_ = grip_shift;
         head_ = head;
         return out;
     }
@@ -112,7 +118,7 @@ private:
     std::uint64_t space_{};
     int family_{-1}, style_{-1};
     Pose weapon_{};
-    Vec3 tip_{}, lever_{}, local_tip_{}, local_lever_{}, head_{};
+    Vec3 tip_{}, lever_{}, local_tip_{}, local_lever_{}, head_{}, grip_shift_{};
 };
 
 class SwingHum {

@@ -24,4 +24,10 @@ class Scheduler;
 // timestamps (never waits for the GPU).
 void GpuFrameTimerMark(Scheduler& scheduler, const Instance& instance);
 
+// The last game frame read back: its GPU busy time (ms; -1 before the first), and how many frames
+// have been read so far (`frames`, when given). The lamp shadows' trace dial (light_shadow.h
+// SceneMaps::Dial, with the shadow mask) turns the timer on without VR_GPU_TIMING; the `VR gpu
+// frame:` lines stay VR_GPU_TIMING's.
+float LastGpuFrameMs(unsigned* frames = nullptr);
+
 } // namespace Vulkan

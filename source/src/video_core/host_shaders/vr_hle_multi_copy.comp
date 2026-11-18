@@ -1,0 +1,36 @@
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+#version 450
+
+// FAST_HLE_MULTI_COPY (vk_shader_hle.cpp): one copy shader call's regions in one dispatch, after
+// bbport's buffer_multi_copy.comp, but across all of the call's (source, destination) buffer
+// pairs. One workgroup per region; offsets and sizes in dwords, relative to the bound ranges.
+// The pair index is the same for the whole workgroup, so the array index is dynamically uniform.
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Source {
+    uint data[];
+} src[8];
+layout(std430, binding = 1) writeonly buffer Destination {
+    uint data[];
+} dst[8];
+// x: source dword, y: destination dword, z: dwords, w: pair.
+layout(std430, binding = 2) readonly buffer Regions {
+    uvec4 regions[];
+};
+
+layout(push_constant) uniform Push {
+    uint count;
+} push;
+
+void main() {
+    const uint index = gl_WorkGroupID.x;
+    if (index >= push.count) {
+        return;
+    }
+    const uvec4 region = regions[index];
+    const uint pair = region.w;
+    for (uint i = gl_LocalInvocationID.x; i < region.z; i += 64) {
+        dst[pair].data[region.y + i] = src[pair].data[region.x + i];
+    }
+}

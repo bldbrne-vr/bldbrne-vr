@@ -14,7 +14,8 @@
 namespace VR::Assists {
 
 inline constexpr int DefaultHpBonus = 10;
-inline constexpr int DefaultDodgeFrames = 1;
+// Off for a new vr.ini since 0.9.4 (2026-11-08); a written one keeps its own.
+inline constexpr int DefaultDodgeFrames = 0;
 
 class LiveSettings {
 public:

@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <span>
+#include <vector>
 
 #include "common/types.h"
 
@@ -68,8 +69,20 @@ struct RedZonePatchResult {
 void RegisterPatchModule(void* module_ptr, u64 module_size, void* trampoline_area_ptr,
                          u64 trampoline_area_size);
 
+/// Whole pages (`size` rounded up) of read-write-execute memory within a near jump (rel32) of
+/// `code`'s module, for a hook stub that a 5-byte jump in the module reaches; nullptr if `code` is
+/// in no registered module or the module's reserve (16 KB) is used up. Never freed.
+void* ReserveNearCode(const void* code, u64 size);
+
 /// Applies CPU patches that need to be done before beginning executions.
 void PrePatchInstructions(u64 segment_addr, u64 segment_size);
+
+/// Whether SSE4a instructions are substituted (a host without SSE4a, or VR_SIMULATE_NO_SSE4A=1).
+bool HostLacksSse4a();
+
+/// SSE4a encodings still present in an executable segment (after patching: the ones a CPU without
+/// SSE4a would interpret after an exception every time they run), up to 16 sample addresses.
+u64 CountSse4aLeft(u64 segment_addr, u64 segment_size, std::vector<u64>& samples);
 
 /// Whether a fault at `code_address` is exactly at a site the CPU patcher rewrote, so the thread
 /// can resume there (core/patch_fault.h: a torn fetch of a site being rewritten). Waits for a

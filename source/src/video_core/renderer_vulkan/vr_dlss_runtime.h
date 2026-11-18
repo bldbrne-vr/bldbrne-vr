@@ -13,6 +13,9 @@
 #include "video_core/renderer_vulkan/vr_dlss_session.h"
 
 namespace Vulkan {
+// The player's own DLSS 5 file (core/vr/dlss5_file.h), checked once (it hashes about 160 MB) and
+// cached; sets VR::Graphics::neural_file. Empty: none, or not NVIDIA's signed file.
+std::filesystem::path VerifiedNeuralFile();
 // The bridge/NGX API is process-wide. Vulkan setup and the renderer owner serialize
 // these calls. No file lookup, DLL load or NGX initialization occurs per draw.
 class VrDlssRuntime {

@@ -309,7 +309,9 @@ inline void CentreAreaName(HudSegments& hud, float centre_x = AreaNameCenterX,
 // and 2): which of the blade, a gun and your own hand / arm / body are in front, each checked on
 // its own (HudInFront*). What it fades to:
 //  - level 3: 10% (what you read or aim with there: a far layer over it would hide it);
-//  - the HP and echoes clusters: level 2 15%, level 1 `blade_alpha` (ui_hud_blade_alpha, 45%);
+//  - the HP cluster: level 2 15%, level 1 `blade_alpha` (ui_hud_blade_alpha, 45%);
+//  - the echoes / insight counters (`counters`): gone (0%) for anything in front of them, the
+//    hands included (2026-10-23: a glance looking down; covered, they go away);
 //  - the lower group (`lower`: the action prompts, item pickups, subtitles and the boss bar) while
 //    it holds something to read (`reading`, VR::IsHudTextUp: an action prompt, a text window, an
 //    NPC line, an item pop-up, or not known): `blade_alpha` for a weapon, the blade (not while an
@@ -322,14 +324,18 @@ inline void CentreAreaName(HudSegments& hud, float centre_x = AreaNameCenterX,
 // 1: the piece does not fade.
 constexpr float HudFadeLevel3Alpha = 0.1f;
 constexpr float HudFadeLevel2Alpha = 0.15f;
+constexpr float HudFadeCountersAlpha = 0.0f;
 constexpr u32 HudInFrontBlade = 1u; // the blade of the weapon in the right hand
 constexpr u32 HudInFrontGun = 2u;   // a gun the game reports in the left hand (along its barrel)
 constexpr u32 HudInFrontOwn = 4u;   // your own hand, wrist, forearm, upper arm or torso
 
 constexpr float HudFadeFloor(u32 level, u32 parts, bool lower, bool talking, bool reading,
-                             float blade_alpha, float lower_alpha) {
+                             float blade_alpha, float lower_alpha, bool counters = false) {
     if (level == 0) {
         return 1.0f;
+    }
+    if (counters) {
+        return HudFadeCountersAlpha;
     }
     if (level >= 3) {
         return HudFadeLevel3Alpha;
@@ -405,6 +411,9 @@ enum class CountersPos : s32 {
     LowerMiddle = 0,
     Corner = 1,
     Raised = 2,
+    // Under the HP / stamina / items cluster (status_left), smaller (ui_counters_under_scale),
+    // wherever that cluster is (after ID-Gamer's third-person-gamepad patch).
+    UnderStatus = 3,
 };
 
 // The HP / stamina / vials / bullets / quick-item cluster (status_left) in gameplay. With the
@@ -506,6 +515,34 @@ inline void PlaceTray(HudSegments& hud, bool left, bool counters, float left_rig
     }
 }
 
+// UnderStatus: the counters' content under the HP cluster's, their top `gap_deg` below its
+// content bottom (the quick item's box), at the cluster's deg per px x `scale`. centre: centred
+// under the HP cluster's default content width; otherwise left-aligned with it. x_deg moves them
+// right (+) or left.
+inline void PlaceCountersUnderStatus(HudSegments& hud, float scale, float gap_deg,
+                                     bool centre = true, float x_deg = 0.0f) {
+    if (hud.count <= CountersSegment || hud.count <= StatusLeftSegment) {
+        return;
+    }
+    const Segment& l = hud.segment[StatusLeftSegment];
+    Segment& r = hud.segment[CountersSegment];
+    const float ls = l.deg_per_px;
+    const float s = ls * std::clamp(scale, 0.25f, 2.5f);
+    const float left_deg = l.yaw_deg - (0.5f * (l.rect.x0 + l.rect.x1) - HudLeftContentX) * ls;
+    const float bottom_deg =
+        l.row_pitch_deg + (0.5f * (l.rect.y0 + l.rect.y1) - HudContentBottomY) * ls;
+    const float top = bottom_deg - std::max(gap_deg, 0.0f);
+    r.deg_per_px = s;
+    float x0 = left_deg; // the counters' content left end (degrees)
+    if (centre) {
+        const float hp_mid = left_deg + 0.5f * (HudLeftContentRightDefaultX - HudLeftContentX) * ls;
+        x0 = hp_mid - 0.5f * (HudRightContentX - CountersContentLeftX) * s;
+    }
+    x0 += x_deg;
+    r.yaw_deg = x0 + (0.5f * (r.rect.x0 + r.rect.x1) - CountersContentLeftX) * s;
+    r.row_pitch_deg = top - (0.5f * (r.rect.y0 + r.rect.y1) - CountersContentTopY) * s;
+}
+
 // The HP cluster's right end used by the tray: follows the measured content (stage px, <= 0 none)
 // while the cluster is not in the tray, only grows while it is (nothing moves while you read it).
 struct TrayLatch {
@@ -575,9 +612,10 @@ struct ScreenWideState {
 };
 
 // One measured gameplay frame (`seq`: its frame number; a frame already taken is skipped).
-// Returns whether `on` changed.
+// `off_frames`: ScreenWideOffFrames for the game's frame rate (the fades last as long in time at
+// any rate: VR::GameFramesAt60). Returns whether `on` changed.
 constexpr bool StepScreenWide(ScreenWideState& st, u64 seq, u64 border_ui_px, u32 band_width,
-                              u32 band_height) {
+                              u32 band_height, u32 off_frames = ScreenWideOffFrames) {
     if (seq == st.seq) {
         return false;
     }
@@ -591,7 +629,7 @@ constexpr bool StepScreenWide(ScreenWideState& st, u64 seq, u64 border_ui_px, u3
         st.low = 0;
     } else if (share >= ScreenWideOff) {
         st.low = 0;
-    } else if (++st.low >= ScreenWideOffFrames) {
+    } else if (++st.low >= off_frames) {
         st.on = false;
         st.low = 0;
     }

@@ -15,12 +15,31 @@
 // mixer plays what it did before.
 //  - the blades' grind loop (core/vr/grind_audio.h);
 //  - the Beast Cutter's closing CHDING (core/vr/whip_audio.h MakeCutterClose);
-//  - a lever pulled by hand: its clunk (core/vr/lever_audio.h, from a map bank).
+//  - a lever pulled by hand: its clunk (core/vr/lever_audio.h, from a map bank);
+//  - the Madaras Whistle's call (core/vr/whistle_audio.h), and how long it is blown;
+//  - the squeezed Augur's blood splash and the swallow, cut short (core/vr/item_audio.h Cut);
+//  - the Boom Hammer's furnace started by hand: its flint snap, the snap with a fwomp, its
+//    growl's loop (core/vr/furnace_audio.h);
+//  - A Call Beyond raised: the game's own call from where its stars launch
+//    (core/vr/quick_use_audio.h CallSample);
+//  - a melee attack held to its full charge: the game's charge flash, cut short
+//    (core/vr/charge_audio.h);
+//  - Tonitrus charged: a thunderclap layered from the game's own (core/vr/thunder_audio.h).
 namespace VR::GameSounds {
 
 void LoadAsync(); // once; any thread after the game's files are mounted
 std::span<const char> GrindLoop();
 std::span<const char> CutterClose();
 std::span<const char> LeverClunk();
+std::span<const char> WhistleCall();
+float WhistleCallS(); // Required mouth hold (audible call minus 100 ms); 0 until decoded
+std::span<const char> AugurSplash();
+std::span<const char> Gulp();
+std::span<const char> FurnaceSnap();
+std::span<const char> FurnaceWhoomph();
+std::span<const char> FurnaceGrowl();
+std::span<const char> BeyondCall();
+std::span<const char> ChargeReady();
+std::span<const char> ThunderClap();
 
 } // namespace VR::GameSounds

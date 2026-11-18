@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <memory>
+#include <vector>
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 
@@ -16,6 +18,10 @@ struct Archive;
 }
 
 namespace Vulkan {
+
+namespace MergedEyes {
+struct Variant;
+}
 
 class Instance;
 class Scheduler;
@@ -50,8 +56,20 @@ public:
                     vk::ShaderModule module, SerializationSupport& sdata, bool preloading);
     ~ComputePipeline();
 
+    /// The descriptor set layout of a compute program (native stereo: pairs).
+    static std::vector<vk::DescriptorSetLayoutBinding> LayoutBindings(const Shader::Info& info);
+
+    /// VR_MERGED_EYES (vr_merged_eyes.h): this pipeline's both-eyes variant, null when off.
+    MergedEyes::Variant* Merged() const noexcept {
+        return merged.get();
+    }
+    const std::shared_ptr<MergedEyes::Variant>& MergedShared() const noexcept {
+        return merged;
+    }
+
 private:
     ComputePipelineKey compute_key;
+    std::shared_ptr<MergedEyes::Variant> merged;
 };
 
 } // namespace Vulkan

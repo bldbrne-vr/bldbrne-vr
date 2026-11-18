@@ -16,11 +16,13 @@ public:
     enum class Result { Disabled, Unavailable, Pending, Ready, Failed };
     // bridge_flags: what an ABI 2 bridge accepts (its VrFsr4GetStereoFlags export; a bridge
     // without one knows only VR_FSR4_FLAG_OPTIMIZED_POST). `pair_bridge`: the bridge's optional
-    // lockstep entry (VR_FSR4_PAIR_EXPORT, FAST bit 45).
+    // lockstep entry (VR_FSR4_PAIR_EXPORT, FAST bit 45). FSR 4.1 also prepares every view together
+    // during configuration; its mandatory export is checked by VrFsr4Runtime.
     explicit VrFsr4Session(const VrFsr4Api* bridge,
                            uint32_t bridge_flags = VR_FSR4_FLAG_OPTIMIZED_POST,
-                           const VrFsr4PairApi* pair_bridge = nullptr)
-        : api(bridge), offered(bridge_flags), pair_api(pair_bridge) {}
+                           const VrFsr4PairApi* pair_bridge = nullptr,
+                           VrFsr41PrepareViewsFn prepare_views = nullptr)
+        : api(bridge), offered(bridge_flags), pair_api(pair_bridge), prepare_views(prepare_views) {}
     ~VrFsr4Session() {
         assert(!eyes[0].handle && !eyes[1].handle && !twin.handle);
     }
@@ -28,7 +30,9 @@ public:
     VrFsr4Session& operator=(const VrFsr4Session&) = delete;
     Result Activate(const VR::Graphics::Config& accepted, bool supported) {
         requested = VR::Graphics::IsFsr(accepted.upscaler);
-        profile = uint32_t(accepted.fsr4);
+        // The bridge's profile (FsrProfile), as the pair's descriptions carry it: Ultra
+        // Performance creates the Performance model, so the saved id 3 would refuse it.
+        profile = VR::Graphics::FsrProfile(accepted.fsr4);
         // An ABI 1 bridge reads the first four VrFsr4Desc members and has no flags.
         eligible = supported && api && (api->abi == VR_FSR4_ABI || api->abi == VR_FSR4_ABI_V1) &&
                    api->Create && api->Evaluate && api->Completed && api->Release && api->Problem;
@@ -50,9 +54,11 @@ public:
     bool SupportsFencedSpd() const {
         return SupportsFlags() && (offered & VR_FSR4_FLAG_FENCED_SPD) != 0;
     }
+    // 1: the DIBR centre view (eye 0 only); 2: native stereo. Set before the eyes are created.
+    void SetViews(unsigned count) { views = count == 1 ? 1u : 2u; }
     bool CanProduceMotion() const {
-        return Active() && eyes[0].handle && eyes[1].handle && eyes[0].profile == profile &&
-               eyes[1].profile == profile;
+        const auto ready = [&](const Eye& eye) { return eye.handle && eye.profile == profile; };
+        return Active() && ready(eyes[0]) && (views == 1 || ready(eyes[1]));
     }
     Result Create(unsigned eye, VkDevice device, VkPhysicalDevice physical, const wchar_t* assets,
                   const VrFsr4Desc& desc) {
@@ -87,6 +93,25 @@ public:
             return Result::Failed;
         }
         Track(eyes[eye], frame.ticket);
+        return Result::Ready;
+    }
+    // FSR 4.1 selects one provider for the entire pair before either view can record work.
+    // Called only during configuration, on the initialization worker; other bridges do nothing.
+    Result Prepare(const std::array<std::array<uint32_t, 2>, 2>& input) {
+        if (!prepare_views)
+            return Result::Ready;
+        if (!CanProduceMotion())
+            return Result::Unavailable;
+        std::array<VrFsr41PrepareView, 3> group{};
+        for (unsigned eye = 0; eye < views; ++eye)
+            group[eye] = {eyes[eye].handle, input[eye][0], input[eye][1]};
+        unsigned count = views;
+        if (twin.handle)
+            group[count++] = {twin.handle, input[0][0], input[0][1]};
+        if (prepare_views(group.data(), count) != 1) {
+            failed = true;
+            return Result::Failed;
+        }
         return Result::Ready;
     }
     // FAST bit 45: the bridge records both eyes' dispatches interleaved under shared barriers
@@ -224,7 +249,13 @@ public:
                 if (text && *text)
                     return text;
             }
-        return api->Problem(nullptr);
+        // Without a context only a bridge that answers for none is asked (SetContextFreeProblem).
+        return context_free_problem ? api->Problem(nullptr) : "";
+    }
+    /// Whether the bridge's Problem takes a null context (its own failure before any): the FSR 4
+    /// and FSR 4.1 bridges do; the FSR 3.1.5 bridge reads its context through it (a crash).
+    void SetContextFreeProblem(bool answers) {
+        context_free_problem = answers;
     }
 
 private:
@@ -249,10 +280,13 @@ private:
     const VrFsr4Api* api{};
     uint32_t offered{}; // VR_FSR4_FLAG_* the bridge accepts (ABI 2)
     const VrFsr4PairApi* pair_api{};
+    VrFsr41PrepareViewsFn prepare_views{};
     std::array<Eye, 2> eyes{};
     Eye twin{};
     uint64_t completed{};
     uint32_t profile{};
+    unsigned views{2};
     bool requested{}, eligible{}, failed{}, twin_valid{};
+    bool context_free_problem{true};
 };
 } // namespace Vulkan

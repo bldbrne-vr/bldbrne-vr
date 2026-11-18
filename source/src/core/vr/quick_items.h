@@ -8,7 +8,19 @@
 
 #pragma once
 
+#include "core/vr/hand_lantern.h"
+#include "core/vr/cigarette.h"
+#include "core/vr/shaman_blade.h"
+#include "core/vr/call_beyond.h"
+#include "core/vr/quick_use_audio.h"
+#include "core/vr/blacksky_eye.h"
+#include "core/vr/old_hunter_bone.h"
+#include "core/vr/augur.h"
+#include "core/vr/augur_creature.h"
+#include "core/vr/beast_roar.h"
+#include "core/vr/hunter_relics.h"
 #include "core/vr/holsters.h"
+#include "core/vr/monocular.h"
 #include "core/vr/reviewed_item_grips.h"
 #include <algorithm>
 #include <array>
@@ -189,6 +201,12 @@ constexpr GoodsClass Classify(std::int32_t goods) {
         return {Throw, ThrowClass::Bottle, 180, 3, MeshKind::Bottle};
     case 1410: // Shining Coins
         return {Throw, ThrowClass::Coin, 300, 3, MeshKind::Pebble};
+    case 2130: // Accursed Brew: its curse (the skull, bullet 470) thrown as a Molotov is (the
+               // user's 2026-11-01 "actually throwable, and used once only, like an item"; the
+               // game's 2 bullets a throw)
+        return {Throw, ThrowClass::Bottle, 470, 3, MeshKind::Token};
+    case 1412: // Hand Lantern: its use toggles SpEffect 2010 (lit), no animation (custom VR)
+        return {Instant, ThrowClass::None, -1, -1, MeshKind::Token};
     default:
         break;
     }
@@ -255,16 +273,78 @@ struct HeldLook {
 inline constexpr std::uint8_t GripNeck = 1, GripHandle = 2, GripBall = 3, GripWide = 4,
                               GripFlask = 5, GripPinch = 6, GripVial = 7, GripBottle = 8,
                               GripCup = 9, GripTray = 10, GripCradle = 11, GripBook = 12,
-                              GripHookPinch = 13, GripRubPinch = 14;
+                              GripHookPinch = 13, GripRubPinch = 14, GripCigarette = 15;
 // The fist's channel in dummy 3 (FFX 173's offset: where the game's own vial sits).
 inline constexpr std::array<float, 3> GripCentre{0.0f, -0.02f, 0.025f};
 
 constexpr HeldLook HeldLookOf(std::int32_t goods) {
+    if (goods == Cigarette::Goods)
+        return {-1, GripCigarette, 1.0f, 0.0f, 0.0f, 0.0f, 72.0f, .067f, .079f, .008f};
     if (const auto* p = ItemGrips::Find(goods)) {
         return {p->model, p->kind, p->scale, p->hold, p->pitch, p->yaw, p->roll,
                 p->lift, p->out, p->side, p->fit, p->pivot_x, p->pivot_z};
     }
     return {-1, GripPinch, 1, 0};
+}
+
+// A model stored on a body mount (the chest, the hip pocket) as the coat would hold it: its longest
+// side upright along the mount's up, its thinnest into the body along the mount's back, the third
+// across. The game's models of the hunter tools mostly lie along their depth (Tiny Tonitrus
+// 0.07 x 0.07 x 0.27 m, Beast Roar 0.24 x 0.18 x 0.48, the Gloves 0.15 x 0.12 x 0.33, the Shaman
+// Bone Blade 0.01 x 0.07 x 0.21), so with the model's axes on the mount's they stood straight out
+// of the chest (the tester's 2026-11-01 "it is angled forward, it should be rotated so it matches
+// the hunter's chest nicely"). A model upright and flat enough already (its height within 80% of
+// its longest side, its depth within 125% of its thinnest: a bottle, a near cube) is kept as
+// modelled. `to[i]` the mount axis model axis i lies along (0 right, 1 up, 2 back), `sign[i]` its
+// direction there (an odd turn flips the across axis: right-handed still).
+struct MountTurn {
+    std::array<std::uint8_t, 3> to{0, 1, 2};
+    std::array<float, 3> sign{1.0f, 1.0f, 1.0f};
+    [[nodiscard]] bool Turned() const {
+        return to[0] != 0 || to[1] != 1 || to[2] != 2;
+    }
+};
+inline MountTurn MountTurnOf(const std::array<float, 3>& size) {
+    MountTurn t{};
+    int longest = 0, thinnest = 0;
+    for (int i = 1; i < 3; ++i) {
+        if (size[static_cast<std::size_t>(i)] > size[static_cast<std::size_t>(longest)]) {
+            longest = i;
+        }
+        if (size[static_cast<std::size_t>(i)] < size[static_cast<std::size_t>(thinnest)]) {
+            thinnest = i;
+        }
+    }
+    if (longest == thinnest || !(size[static_cast<std::size_t>(thinnest)] > 0.0f) ||
+        (size[1] >= 0.8f * size[static_cast<std::size_t>(longest)] &&
+         size[2] <= 1.25f * size[static_cast<std::size_t>(thinnest)])) {
+        return t;
+    }
+    const int across = 3 - longest - thinnest;
+    t.to[static_cast<std::size_t>(longest)] = 1;
+    t.to[static_cast<std::size_t>(thinnest)] = 2;
+    t.to[static_cast<std::size_t>(across)] = 0;
+    const int inversions = (t.to[0] > t.to[1]) + (t.to[0] > t.to[2]) + (t.to[1] > t.to[2]);
+    if (inversions % 2 == 1) {
+        t.sign[static_cast<std::size_t>(across)] = -1.0f;
+    }
+    return t;
+}
+
+// Large chest contents fit a shallow envelope, independently of their held size. Dimensions
+// are in mount axes AFTER MountTurnOf: width, height, depth. Uniform scaling preserves the
+// model's proportions; the holder, seat and pickup centre use the same resulting dimensions.
+inline float StoredFitScale(int slot, const std::array<float, 3>& dimensions, float body_size) {
+    if (slot != 2 || !(body_size > 0.0f))
+        return 1.0f;
+    constexpr std::array<float, 3> limits{.12f, .18f, .06f};
+    float fit = 1.0f;
+    for (size_t i = 0; i < limits.size(); ++i) {
+        const float limit = limits[i] * body_size;
+        if (dimensions[i] > limit)
+            fit = std::min(fit, limit / dimensions[i]);
+    }
+    return fit;
 }
 
 // Launch speed per class: a factor on the gain (a light knife or stone leaves the fingers faster
@@ -2233,10 +2313,11 @@ private:
         bool placed{false};
         V3 dir{0.0f, 0.0f, -1.0f}; // the blade's direction (unit; known when placed)
     };
-    // The window's samples: quick_wipe_window_ms goes to 2 s, at the game's 60 rendered frames a
-    // second (bb-vr's 60 FPS patch; 48 held 0.8 s there and quietly cut a longer window short).
-    // The walk back over them is a few ns each: < 1 us a sample.
-    std::array<Sample, 128> samples_{};
+    // The window's samples: quick_wipe_window_ms goes to 2 s, one sample a rendered game frame
+    // (48 held 0.8 s at 60 fps and quietly cut a longer window short; 128 held only 1.07 s at the
+    // 120 fps frame_hooks allow). 512: 2 s up to 256 fps. The walk back over them is a few ns
+    // each: < 1 us a sample.
+    std::array<Sample, 512> samples_{};
     std::size_t count_{0};
     double held_since_{0.0};
     bool touching_{false};
@@ -2287,7 +2368,7 @@ constexpr HoldKind HoldOf(std::int32_t goods) {
     case 205:  // Small Resonant Bell
     case 225:  // Sinister Resonant Bell
     case 700:  // Tiny Music Box
-    case 2090: // Shaman Bone Blade (a canned use: shown flat, CannedOf)
+    case 2090: // Native classification; the VR controller uses physical blade contact instead.
         return HoldKind::Rite;
     case 705:  // Queenly Blood
     case 704:  // Blood Dreg
@@ -2330,6 +2411,8 @@ constexpr bool HoldAnimAgrees(HoldKind k, std::int32_t use_anim) {
 
 // ---- Canned item uses: shown flat (cinematic_item) ------------------------------------------------
 
+// Native animation metadata, retained for vanilla/cinematic compatibility. The physical VR
+// Shaman path bypasses this route (UpdateHolding + ShamanBlade::Contact).
 // The items whose game use is a full-body attack that only lands as the game plays it: the Shaman
 // Bone Blade (goodsUseAnim 25, the behaviour's UseItem_25: a000_100370, a stab at the enemy in
 // front; its effect, bullet 310, lands only if the stab hits). Their use is never ours (no
@@ -2353,7 +2436,8 @@ constexpr bool CannedAnimAgrees(std::int32_t goods, std::int32_t use_anim) {
 // Every goods of 1.09 a quick slot can hold and use (the goods dump: type 0, a use), for the
 // start's classification log and the tests (130, 131: the Vileblood Register and the League
 // Staff, the covenants' own: used at the pull).
-inline constexpr std::array<std::int32_t, 73> QuickUsableGoods{
+inline constexpr std::array<std::int32_t, 74> QuickUsableGoods{
+    Cigarette::Goods,
     100,  111,  120,  130,  131,  200,  205,  225,  700,  701,  702,  703,  704,  705,  706,  1000,
     1100, 1101, 1110, 1120, 1200, 1201, 1210, 1220, 1230, 1240, 1250, 1251, 1260, 1270, 1300, 1310,
     1320, 1330, 1400, 1410, 1411, 1412, 1500, 1501, 1510, 1511, 1512, 1513, 1514, 1515, 1516, 1517,
@@ -2388,6 +2472,7 @@ inline float HoldHum(float progress) {
 // plain hold (the cords on purpose: a once-a-playthrough act that changes the ending).
 enum class GestureKind : std::uint8_t { None, Crush, Shake };
 inline constexpr std::int32_t ChoirBell = 2050;
+inline constexpr std::int32_t Monocular = 1411; // Config::optic
 constexpr bool IsBellItem(std::int32_t goods) {
     return goods == 200 || goods == 205 || goods == 225 || goods == ChoirBell;
 }
@@ -2433,6 +2518,185 @@ constexpr bool StabAnimAgrees(std::int32_t use_anim) {
     return use_anim == 28;
 }
 
+// ---- Hunter tools in the hand (quick_tap_pick, quick_tool_keep, quick_tool_gestures) ------------
+
+// The user's 2026-10-30 request: a tap of the trigger on a card only picks the item up; the
+// trigger held on from that pick (tap_use_s) or pressed again uses it, so a tool can be aimed or
+// brought where its use belongs first. The hunter tools are not spent: after their use they stay
+// in the hand (ToolKeepOf) for the next one, and some wait for a natural act with the trigger
+// (ToolGestureOf, from the goods params' goodsUseAnim: 18 the Choir Bell, 19 Beast Roar, 20 Old
+// Hunter Bone, 21 the Augur, 22 A Call Beyond, 23 Tiny Tonitrus, 24 Executioner's Gloves, 6
+// Messenger's Gift, 30 Blacksky Eye, 31 Accursed Brew, 32 Madaras Whistle). Their use is still
+// the game's own (select + Square, its animation). The Shaman Bone Blade's stab is shown flat
+// (CannedOf): it goes away as before.
+constexpr bool ToolKeepOf(std::int32_t goods) {
+    switch (goods) {
+    case 2000: // Augur of Ebrietas
+    case 2010: // A Call Beyond
+    case 2020: // Beast Roar
+    case 2050: // Choir Bell
+    case 2060: // Old Hunter Bone
+    case 2070: // Tiny Tonitrus
+    case 2080: // Executioner's Gloves
+    case 2110: // Messenger's Gift
+    case 2120: // Blacksky Eye
+    case 2140: // Madaras Whistle
+        return true;
+    default:
+        return false;
+    }
+}
+// A hunter tool (the kept ones and the Shaman Bone Blade): quick_tap_pick never uses one by the
+// pull that picked it, even kept down (2026-10-30: a tool is picked, aimed or brought
+// where it belongs, and then used by a pull of its own; the items to use at once go on from the
+// pick).
+constexpr bool HunterToolOf(std::int32_t goods) {
+    return ToolKeepOf(goods) || goods == 2090; // (the Shaman Bone Blade)
+}
+//  - Mouth: the Madaras Whistle is blown: at the mouth (MouthGate) with the trigger.
+//  - Crush: the Old Hunter Bone is crushed in the fist, as a coldblood (CrushGate: the grip hard
+//    with the trigger held; left_scheme=1 and quick_grip_hold: the trigger hard).
+//  - Raise: A Call Beyond is held up above the eyes with the trigger (quick_tool_direct: the
+//    trigger held through its gathering, ToolUse::windup_ms, wherever the hand is, then raised;
+//    let go before it calls, it is lost).
+//  - Swing: Tiny Tonitrus and the Executioner's Gloves are brought down with the trigger held:
+//    a downward move or a forward slash downward (SwingGate; the tester's 2026-11-01 "I cannot hit
+//    the ground, in VR it might hit the floor ... with enough leeway": the Gloves' slam to 55 cm
+//    below the eyes and the Tonitrus' 1.8 m/s strike before, neither used in that day's run).
+//  - Eye: the Blacksky Eye is pointed and fired by the trigger as a gun is (the tester's 2026-11-01
+//    "let's make it be easy, like a gun"), from the hand where it points; held up to your eye
+//    (EyeGate) its meteor flies where you look, from the eye (the 2026-10-30 "from the dark depths
+//    of one's pupil").
+// The others (the Augur, Beast Roar, Messenger's Gift) are pointed and used by the trigger alone.
+enum class ToolGesture : std::uint8_t { None, Mouth, Crush, Raise, Swing, Eye };
+constexpr ToolGesture ToolGestureOf(std::int32_t goods) {
+    switch (goods) {
+    case 2140:
+        return ToolGesture::Mouth;
+    case 2060:
+        return ToolGesture::Crush;
+    case 2010:
+        return ToolGesture::Raise;
+    case 2070:
+    case 2080:
+        return ToolGesture::Swing;
+    case 2120:
+        return ToolGesture::Eye;
+    default:
+        return ToolGesture::None;
+    }
+}
+constexpr const char* ToolGestureName(ToolGesture g) {
+    switch (g) {
+    case ToolGesture::Mouth:
+        return "mouth";
+    case ToolGesture::Crush:
+        return "crush";
+    case ToolGesture::Raise:
+        return "raise";
+    case ToolGesture::Swing:
+        return "swing";
+    case ToolGesture::Eye:
+        return "eye";
+    default:
+        return "trigger";
+    }
+}
+// What the player is told to do with it (the grab's log line). `grip_holds`: the grip holds the
+// item (quick_grip_hold), so the crush is the trigger's.
+constexpr const char* ToolGestureHint(ToolGesture g, bool grip_holds = false) {
+    switch (g) {
+    case ToolGesture::Mouth:
+        return "bring it to your mouth and hold the trigger to blow it";
+    case ToolGesture::Crush:
+        return grip_holds ? "squeeze the trigger hard to crush it"
+                          : "hold the trigger and squeeze the grip hard to crush it";
+    case ToolGesture::Raise:
+        return "hold the trigger until it has gathered, then raise it above your head";
+    case ToolGesture::Swing:
+        return "hold the trigger and swing it down (or slash forward and down)";
+    case ToolGesture::Eye:
+        return "point it and pull the trigger (held up to your eye: where you look)";
+    default:
+        return "point it and pull the trigger";
+    }
+}
+// The Madaras Whistle (Config::whistle_s: blown through its call) and its call's state.
+constexpr std::int32_t WhistleGoods = 2140;
+enum class WhistleState : std::uint8_t { Off, Blowing, Done };
+struct ToolConfig {
+    float raise_m{0.05f};    // Raise: the hand this far above the eyes
+    float swing_mps{1.0f};   // Swing: the hand moving down (against the head) this fast ...
+    float swing_down{0.5f};  // ... at least this share of its speed downward (60 deg of down)
+    float swing_drop_m{0.08f}; // ... after this much of a downward stroke
+    float swing_keep_s{0.20f}; // a swing just before the trigger (or a frame's gap) still counts
+    float busy_min_s{0.25f}; // after a use, back in the hand once the game's use is over ...
+    float busy_max_s{10.0f}; // ... and put away if it never is
+};
+
+// ToolGesture::Swing: a stroke downward, straight down or slashing forward (or to the side) and
+// down, of the hand against the head (crouching does not swing). The stroke is measured from its
+// velocity (the controller's own): it runs while the hand goes down at swing_mps or faster (at
+// least half of its speed downward), its length summed; a swing once that fast part has gone
+// swing_drop_m (a slow lowering never counts toward it, so a frame's tracking jump at its end is no
+// swing). It counts for swing_keep_s after (the trigger pressed just after the stroke, a dropped
+// frame), and once only (Consume).
+class SwingGate {
+public:
+    void Reset() {
+        run_m_ = 0.0f;
+        seen_t_ = -1.0;
+        last_t_ = -1.0;
+        peak_ = 0.0f;
+    }
+    // `v` the hand's velocity against the head (m/s, +Y up), `valid` both known this frame.
+    void Update(const ToolConfig& k, double t, V3 v, bool valid) {
+        const float dt =
+            last_t_ >= 0.0 ? static_cast<float>(std::clamp(t - last_t_, 0.0, 0.05)) : 0.0f;
+        last_t_ = t;
+        if (!valid) {
+            run_m_ = 0.0f;
+            return;
+        }
+        const float speed = Length(v);
+        const float down = -v.y;
+        if (down >= k.swing_mps && down >= k.swing_down * speed) {
+            run_m_ += down * dt;
+        } else {
+            run_m_ = 0.0f;
+        }
+        if (run_m_ >= k.swing_drop_m) {
+            if (seen_t_ < 0.0 || t - seen_t_ > k.swing_keep_s) {
+                peak_ = 0.0f;
+            }
+            seen_t_ = t;
+            peak_ = std::max(peak_, speed);
+            drop_m_ = run_m_;
+        }
+    }
+    [[nodiscard]] bool Ready(const ToolConfig& k, double t) const {
+        return seen_t_ >= 0.0 && t - seen_t_ <= k.swing_keep_s + 1e-6;
+    }
+    void Consume() {
+        seen_t_ = -1.0;
+        run_m_ = 0.0f;
+        peak_ = 0.0f;
+    }
+    [[nodiscard]] float Peak() const {
+        return peak_;
+    }
+    [[nodiscard]] float Drop() const {
+        return drop_m_;
+    }
+
+private:
+    float run_m_{0.0f};
+    double seen_t_{-1.0};
+    double last_t_{-1.0};
+    float peak_{0.0f};
+    float drop_m_{0.0f};
+};
+
 // ---- The use sounds (quick_use_sounds) ----------------------------------------------------------
 
 // The tester's 2026-10-06 "and they should play a sound when activated": an item used at once (the
@@ -2466,6 +2730,7 @@ constexpr bool StabAnimAgrees(std::int32_t use_anim) {
 struct UseSound {
     std::int32_t id{-1};      // SoundType 1 ('c'): PlaySound's type 1 (0xA with the table's flag)
     std::int32_t after_ms{0}; // after the use's first sound
+    std::int8_t type{1};      // the TAE's SoundType (5: the 's' effect sounds of the DLC tools)
 };
 struct UseSounds {
     std::int32_t clip{-1}; // the use clip (a00.tae animation id), -1 unknown
@@ -2519,14 +2784,20 @@ inline constexpr std::int32_t InjectSound = 100080;  // the Blood Vial clip's st
 inline constexpr std::int32_t BloodSound = 5480;     // ... and its blood, 33 ms later
 inline constexpr std::int32_t CrushSound = 100180;   // the Vermin clip's crush in the fist
 inline constexpr std::int32_t ArmWhooshSound = 750;  // the Blood Vial clip's arm whoosh
+// Played by us, not the game (core/vr/item_audio.h, the tester's 2026-11-04 "a splash sound when the
+// augur is squeezed. A gulp when it is swallowed"): a use sound of this type, its id the clip.
+inline constexpr std::int8_t OwnSoundType = 0;
+inline constexpr std::int32_t OwnSplash = 0; // ItemAudio::Splash: the game's blood splash, cut short
+inline constexpr std::int32_t OwnGulp = 1;   // ItemAudio::Gulp: the game's swallow, alone
 // What an item used at once with that goodsUseAnim plays (count 0: nothing).
 constexpr UseSounds UseSoundsOf(std::int32_t use_anim) {
     UseSounds u{};
     u.clip = UseClipOf(use_anim);
     switch (use_anim) {
-    case 0: // eat: no sound of its own
+    case 0: // eat: no sound of its own; the swallow alone (ours: the whole drinking sound until
+            // 2026-11-04, "the gulp sound is not good")
         u.count = 1;
-        u.sound[0] = {SwallowSound, 0};
+        u.sound[0] = {OwnGulp, 0, OwnSoundType};
         break;
     case 1: // the blade wipe: no sound of its own
         u.count = 1;
@@ -2567,8 +2838,116 @@ constexpr UseSounds UseSoundsOf(std::int32_t use_anim) {
     return u;
 }
 
+// quick_tool_direct (the tester's 2026-10-30 "I do not want to play custom use animations ... we
+// are the ones who whistle and then the big snakes appear"): a hunter tool used with no
+// animation: the game's own UseGoods at once, as its clip's event 65 calls it (the music box's
+// crank does the same: its effect matched the game's own use in the mock), with the clip's own
+// dummy and the clip's own sounds. From a00.tae (c0000.anibnd), each clip's event 65 dummy and its
+// first cancel window (event 320: the game's own time between two uses, kept as the tool's pace
+// so that skipping the animation never makes it faster); the clips' event 96 effects (their
+// 2000xx model in the hand, the whistle's 201051 breath, the roar's 202002) are not spawned.
+// The hand's dummy, where most tools' clips launch (event 65's 17).
+inline constexpr std::int8_t ToolHandDummy = 17;
+// L_Hand, the palm: where a thrown item or a left-hand gun's bullet starts, so it follows the
+// drawn hand. The squeezed Augur's tentacles burst from it (eaten, they keep the clip's 17).
+inline constexpr std::int8_t ToolPalmDummy = 3;
+struct ToolUse {
+    std::int32_t clip{-1};   // its use clip (a00), -1: not used this way
+    std::int8_t dmy{-1};     // the dummy UseGoods gets (the clip's event 65)
+    std::int16_t rate_ms{0}; // from one use to the next (the clip's first cancel)
+    // The clip's wind-up: its start to event 65 (A Call Beyond's gathering is held this long).
+    std::int16_t windup_ms{0};
+    // The clip's event 96 effect that is the use itself, spawned with it (-1: none): Beast Roar's
+    // roar (202002 at dummy 220, its sound s202002 with it; its bullet 390 is only the push round
+    // the hand, the 2026-11-01 headset run: two uses, 2 bullets each, nothing seen or heard). The
+    // other clips' effects are the tool's model in the hand (2000xx: ours is drawn) or a breath.
+    std::int32_t ffx{-1};
+    std::int16_t ffx_dmy{-1};
+};
+constexpr ToolUse ToolUseOf(std::int32_t goods) {
+    switch (goods) {
+    case 2000:
+        return {100330, 17, 2833, 633}; // Augur of Ebrietas (a21)
+    case 2010:
+        return {100340, 17, 3600, 1167}; // A Call Beyond (a22)
+    case 2020:
+        return {100310, 17, 1500, 333, 202002, 220}; // Beast Roar (a19)
+    case 2050:
+        return {100300, 3, 2833, 1167}; // Choir Bell (a18)
+    case 2060:
+        return {100320, 17, 1833, 633}; // Old Hunter Bone (a20)
+    case 2070:
+        return {100350, 17, 2467, 1033}; // Tiny Tonitrus (a23)
+    case 2080:
+        return {100360, 17, 2333, 833}; // Executioner's Gloves (a24)
+    case 2110:
+        return {100150, 17, 2300, 1400}; // Messenger's Gift (a6)
+    case 2120:
+        return {100380, 59, 1667, 933}; // Blacksky Eye (a30)
+    case 2140:
+        return {100400, 11, 2167, 1033}; // Madaras Whistle (a32)
+    default:
+        return {};
+    }
+}
+// Their clips' own sounds (the base game's tools have none in the TAE: their sounds come with
+// their bullets). Those before event 65 play at the use; the Choir Bell's toll is the shake's own.
+constexpr UseSounds ToolSoundsOf(std::int32_t goods) {
+    UseSounds u{};
+    u.clip = ToolUseOf(goods).clip;
+    u.own = true;
+    switch (goods) {
+    case VR::Augur::Goods:
+        // Added physical squeeze cue, not a voice: c000100180 resolves to the single
+        // /mushi_tsubushi (Vermin crush) sample in sprj_main.fev, with the game's blood splash
+        // cut short (ours) as the splatter bursts from the fist. No c100181 follow-up.
+        u.own = false;
+        u.count = 2;
+        u.sound[0] = {CrushSound, VR::Augur::CrunchMs, 1};
+        u.sound[1] = {OwnSplash, VR::Augur::CrunchMs, OwnSoundType};
+        break;
+    case 2050: // Choir Bell: c5480 and s7031 at 1.667 s (event 65 at 1.167)
+        u.count = 2;
+        u.sound[0] = {BloodSound, 500, 1};
+        u.sound[1] = {7031, 500, 5};
+        break;
+    case 2110: // Messenger's Gift: s202013 at 1.333 s (event 65 at 1.4)
+        u.count = 1;
+        u.sound[0] = {202013, 0, 5};
+        break;
+    case 2120: // Blacksky Eye: s100381 at the clip's start
+        u.count = 1;
+        u.sound[0] = {100381, 0, 5};
+        break;
+    case 2140: // Madaras Whistle: s202052, the whistle, at 0.967 s (event 65 at 1.033)
+        u.count = 1;
+        u.sound[0] = {202052, 0, 5};
+        break;
+    default:
+        break;
+    }
+    return u;
+}
+
+// The Augur eaten (its cue's use_anim: 0, the eating clip's): the gulp at once, as a pill (the
+// user's 2026-11-04 "augur eaten = the gulp right away"); no crunch, no splash (no splatter in the
+// headset either).
+constexpr UseSounds AugurEatenSounds() {
+    UseSounds u{};
+    u.clip = ToolUseOf(VR::Augur::Goods).clip;
+    u.count = 1;
+    u.sound[0] = {OwnGulp, VR::Augur::CrunchMs, OwnSoundType};
+    return u;
+}
+
 // Physical VR actions can differ from the native animation without changing item effects.
 constexpr UseSounds UseSoundsForGoods(std::int32_t goods, std::int32_t use_anim) {
+    if (goods == VR::Augur::Goods && use_anim == 0) {
+        return AugurEatenSounds();
+    }
+    if (ToolUseOf(goods).clip >= 0) {
+        return ToolSoundsOf(goods); // quick_tool_direct: only used so (its clip's own otherwise)
+    }
     return UseSoundsOf(BloodDrinkOf(goods) ? 10 : goods == QueenlyBlood ? 9 : use_anim);
 }
 
@@ -2881,6 +3260,7 @@ struct Slot {
     std::int32_t icon{-1};    // EquipParamGoods iconId
     std::int32_t ffx{-1};     // the game's held model (HeldFfx), -1 none
     bool usable{false};       // the game's CanUseGoods
+    std::int32_t cost{0};     // the Quicksilver Bullets a use costs (EquipParamGoods +0x60)
     [[nodiscard]] bool Empty() const {
         return goods < 0 || qty <= 0;
     }
@@ -2896,6 +3276,9 @@ struct Snapshot {
     std::int32_t override_idx{-1}; // an item picked in the inventory menu is pending (>= 0)
     bool busy{false};              // an item is being used (the game's own, or a menu flow)
     bool alive{true};
+    // The bullets a hunter tool's cost is paid from: the Blood Bullets (taken first) and the
+    // Quicksilver Bullets, together; -1 not known (then nothing is refused for it).
+    std::int32_t bullets{-1};
     [[nodiscard]] int Count() const {
         int n = 0;
         for (const Slot& s : slot) {
@@ -2905,10 +3288,18 @@ struct Snapshot {
     }
 };
 
+// A hunter tool the hunter cannot pay for now (its cost above the bullets carried): never taken
+// (the tester's 2026-11-01 "if we cannot use a tool because we have no bullets, then we should not
+// be able to grab it to begin with"); its card shows it (dimmed, its cost in red).
+inline bool ShortOfBullets(const Snapshot& s, const Slot& slot) {
+    return !slot.Empty() && slot.cost > 0 && s.bullets >= 0 && s.bullets < slot.cost;
+}
+
 enum class Action : std::uint8_t { None, Use, Throw };
 
 // Presenter -> site A: one request at a time (a new serial replaces an untaken one).
 struct Request {
+    ShamanBlade::Contact blade_contact{};
     std::uint32_t serial{0};
     std::int64_t steady_ms{0};
     std::int8_t select{-1}; // slot to select in the game (its HUD), -1 none
@@ -2924,7 +3315,25 @@ struct Request {
     // quick_music_box_crank: the Tiny Music Box played by its crank (core/vr/music_box.h): the
     // game's UseGoods at once (its bullet, no animation) and its tune.
     std::uint8_t crank{0};
+    // quick_tool_direct: a hunter tool used by its act, with no animation (ToolUseOf: UseGoods
+    // with its clip's dummy, `dmy`; never consumed, its clip's own sounds).
+    std::uint8_t tool{0};
+    // ... its sound already played by us (the whistle's call, Config::whistle_s): none from the
+    // game side.
+    std::uint8_t voiced{0};
+    // ... where its first launch goes (ToolAimBy; tool_aim): as the tool's aim says, or where you
+    // look (the Blacksky Eye held to your eye).
+    std::uint8_t aim{0};
+    // Explicit charged stroke (Tonitrus) or aim ray (the squeezed Augur), in LOCAL tracking
+    // space; game side maps it once to world.
+    std::array<float,3> tool_direction{};
+    std::array<float,3> tool_origin{}; // Gloves: validated landing in game world units
 };
+// Request::aim. Hand: along the controller's aim ray at the squeeze's end (tool_direction), no
+// gaze snap (the squeezed Augur, launched from the palm: ToolPalmDummy).
+// GloveContact: the charged Executioner's Gloves met an enemy in the hand: the spirits at it
+// from there (tool_origin the glove, tool_direction toward the enemy).
+enum class ToolAimBy : std::uint8_t { Default, Gaze, Swing, Landing, BladeContact, Hand, GloveContact };
 
 enum class Outcome : std::uint8_t {
     None,
@@ -2969,6 +3378,24 @@ enum class SceneState : std::uint8_t { Closed, Open, Holding };
 
 // Presenter -> render-camera hook (seqlock), every input frame.
 struct Scene {
+    Cigarette::Puff cigarette_puff{};
+    // The cigarette in the hand: how near the mouth point it came (metres; -1:
+    // none in the hand), the frames of this hold and how many of them could smoke, its puffs.
+    float cigarette_near{-1.0f};
+    std::uint32_t cigarette_frames{}, cigarette_ready{}, cigarette_puffs{};
+    Cigarette::Toss cigarette_toss{}; // the last cigarette thrown away (held or not since)
+    Cigarette::Puff cigarette_notice{}; // Kos Lights given: its card, where the eyes looked
+    std::int64_t augur_charge_ns{}; // current squeeze or pending cast only
+    std::int64_t roar_charge_ns{};  // Beast Roar: the clench (charge) or its pending roar only
+    std::int64_t blade_active_ns{};
+    std::uint32_t blade_stroke{};
+    // The Executioner's Gloves gathered in the hand (0: not): the render tick checks them against
+    // the enemies (a contact fires them, Input::glove_contact); `glove_charge` the gathering's serial.
+    std::int64_t glove_armed_ns{};
+    std::uint32_t glove_charge{};
+    HunterRelics::DropRequest relic_drop{};
+    CallBeyond::State call_beyond{};
+    std::int64_t held_session_ns{}; // cosmetic use cues must belong to the current take/press
     Holsters::Layout holsters{};
     bool holsters_enabled{false};
     std::int64_t holsters_ns{0};
@@ -2989,6 +3416,18 @@ struct Scene {
     std::int64_t hold_from_ns{0};
     float hold_s{0.0f};
     std::int64_t hold_done_ns{0};
+    // ... drawn (false: a hunter tool's charge or call, timed as before; the tool itself shows
+    // it: the tester's 2026-11-03 "visually the ring should go away for these").
+    bool hold_ring{true};
+    // quick_arc_pick=fan: this open is a fan (the render hook draws the arc's cards round the
+    // frame's origin, PlaceFan, with its separators; no arm wait), its upright frame (FanFrame,
+    // LOCAL) and its pick: the slot lit (-1 none), and the hand pulled out of the fan (dismissing).
+    bool fan{false};
+    std::array<float, 3> fan_origin{};
+    std::array<float, 3> fan_right{1.0f, 0.0f, 0.0f};
+    std::array<float, 3> fan_forward{0.0f, 0.0f, -1.0f};
+    std::int8_t fan_slot{-1};
+    bool fan_out{false};
 };
 
 inline bool ShowStoredItem(const Scene& scene, const Slot& slot, int index) {
@@ -3035,6 +3474,7 @@ struct Layout {
     int n{0};
     std::array<V3, SlotCount> card{}; // centres
     V3 pivot{};                       // the hand the arc opened around
+    V3 eye{};                         // the eyes when it opened: the cards face it, fixed
     V3 right{1.0f, 0.0f, 0.0f};       // arc plane axes
     V3 up{0.0f, 1.0f, 0.0f};          // 12 o'clock in the arc's plane
     V3 toward{0.0f, 0.0f, 1.0f};      // the plane's normal, from the arc toward the eyes
@@ -3050,6 +3490,7 @@ inline Layout PlaceArc(int n, V3 palm, V3 eye, const LayoutConfig& c) {
     constexpr float MaxTiltDeg = 50.0f;
     Layout l{};
     l.n = std::clamp(n, 0, SlotCount);
+    l.eye = eye;
     V3 pivot = palm;
     pivot.y = std::clamp(pivot.y, eye.y - 0.55f - c.radius_m * 0.5f, eye.y - 0.05f - c.radius_m);
     V3 flat = eye - pivot;
@@ -3216,7 +3657,275 @@ inline int PickSector(const Layout& l, V3 hand, int current, float dead_m = 0.07
     return k;
 }
 
+/// ---- The fan (quick_arc_pick=fan) --------------------
+
+// The arc's cards (the slots in use when it opened, on PlaceArc's crescent above the hand) picked
+// by the direction the hand moves from where the fan opened (a pie: never a reach), read in an
+// upright frame (up is gravity's, right and forward level). Each card takes the directions nearest
+// its own and the end cards reach 30 degrees below level, so the lowest third round the hand is off
+// the cards (left_scheme=2: the gun there). (Out to level only, a move straight across to an end
+// card ran along its edge and any dip lost it: the user's headset run of 2026-10-26.) The fan is
+// drawn in one plane leaning back toward the eyes (PlaceFan: up to 40 degrees; PlaceArc's 50, where
+// all 18 openings of the 10-24 headset logs were); read in that plane, a straight up move counted
+// only 64% (77% of it went "out of the plane"), hence the upright frame. (The six fixed directions
+// all round the hand before it, the same day, felt too big in the headset: the user.)
+inline constexpr float FanEnterM = 0.04f;   // a pick from 4 cm out of the centre ...
+inline constexpr float FanClearM = 0.03f;   // ... none again back within 3 cm
+inline constexpr float FanHystDeg = 7.0f;   // a neighbour once this far past the boundary
+inline constexpr float FanOutM = 0.14f;     // pulled toward you or pushed away this far ...
+inline constexpr float FanOutHoldS = 0.09f; // ... for this long: dismissed, nothing taken
+inline constexpr float FanBackM = 0.11f;    // back within this: in the fan again
+inline constexpr float FanEdgeDeg = 120.0f; // the end cards reach this far round (below level)
+
+// The cards' directions of a fan of `n` (radians from 12 o'clock, + toward the viewer's right):
+// PlaceArc's own spacing (c.span_deg end to end, at most c.max_step_deg apart, centred on 12
+// o'clock), so the cards drawn and the directions read are one.
+struct FanDirections {
+    int n{0};
+    std::array<float, SlotCount> angle{};
+    float step{0.0f}; // between neighbours (radians; 0 for a single card)
+};
+inline FanDirections FanDirectionsOf(int n, const LayoutConfig& c) {
+    constexpr float Deg = 3.14159265f / 180.0f;
+    FanDirections d{};
+    d.n = std::clamp(n, 0, SlotCount);
+    d.step = d.n > 1 ? std::min(c.max_step_deg, c.span_deg / static_cast<float>(d.n - 1)) * Deg
+                     : 0.0f;
+    for (int i = 0; i < d.n; ++i) {
+        d.angle[static_cast<std::size_t>(i)] =
+            (static_cast<float>(i) - 0.5f * static_cast<float>(d.n - 1)) * d.step;
+    }
+    return d;
+}
+
+// Card k's directions: from half way to its left neighbour to half way to its right one, the end
+// cards' out to FanEdgeDeg; widened by `margin` (radians) on both sides.
+inline bool FanCovers(const FanDirections& d, int k, float a, float margin) {
+    constexpr float Edge = FanEdgeDeg * (3.14159265f / 180.0f);
+    if (k < 0 || k >= d.n) {
+        return false;
+    }
+    const auto at = [&d](int i) { return d.angle[static_cast<std::size_t>(i)]; };
+    const float lo = k > 0 ? 0.5f * (at(k - 1) + at(k)) : -Edge;
+    const float hi = k < d.n - 1 ? 0.5f * (at(k) + at(k + 1)) : Edge;
+    return a >= lo - margin && a <= hi + margin;
+}
+
+// The card whose directions hold `a` (0 = 12 o'clock, + = the viewer's right), -1 off the cards
+// (the lowest third, past FanEdgeDeg).
+inline int FanNearest(const FanDirections& d, float a) {
+    for (int k = 0; k < d.n; ++k) {
+        if (FanCovers(d, k, a, 0.0f)) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+// An opening's upright frame (LOCAL): `origin` the left controller's grip at the open, `forward`
+// level from the eyes toward it (away from you), `right` level (the viewer's right), `up` +Y.
+struct FanFrame {
+    bool valid{false};
+    V3 origin{};
+    V3 right{1.0f, 0.0f, 0.0f};
+    V3 up{0.0f, 1.0f, 0.0f};
+    V3 forward{0.0f, 0.0f, -1.0f};
+};
+
+// The frame of a fan opened with the grip at `hand` and the eyes at `head` looking along
+// `head_forward` (LOCAL). A hand within 8 cm of under the eyes (at the chin) gives no direction
+// of its own: the head's level forward then (-Z if that is straight down too). No wrist: its turn
+// never enters.
+inline FanFrame MakeFanFrame(V3 hand, V3 head, V3 head_forward) {
+    FanFrame f{};
+    f.valid = true;
+    f.origin = hand;
+    V3 level = hand - head;
+    level.y = 0.0f;
+    if (Length(level) < 0.08f) {
+        level = {head_forward.x, 0.0f, head_forward.z};
+    }
+    f.forward = Normalize(level, {0.0f, 0.0f, -1.0f});
+    f.right = Cross(f.forward, f.up);
+    return f;
+}
+
+// The hand's offset from the origin in the frame (m): x right, y up, z away from you.
+struct FanOffset {
+    float x{0.0f};
+    float y{0.0f};
+    float z{0.0f};
+};
+inline FanOffset FanOffsetOf(const FanFrame& f, V3 hand) {
+    const V3 d = hand - f.origin;
+    return {Dot(d, f.right), Dot(d, f.up), Dot(d, f.forward)};
+}
+
+struct FanPick {
+    int card{-1};        // the card pointed at (layout index), -1 none (the centre, off the cards)
+    bool out{false};     // pulled toward you or pushed away past FanOutM: no pick ...
+    bool dismiss{false}; // ... for FanOutHoldS: the fan closes, nothing taken
+    FanOffset at{};
+};
+
+// One opening's pick, frame by frame: none until the hand is FanEnterM out of the centre, then
+// the card whose directions hold its own (none past FanEdgeDeg), kept until the hand is FanHystDeg
+// past its boundary (a neighbour's then, or none) or back within FanClearM (none). Out of the fan
+// (|z| past FanOutM) there is no pick; back within FanBackM it counts again, from the centre's
+// rule.
+class FanSelector {
+public:
+    void Reset() {
+        card_ = -1;
+        out_ = false;
+        out_since_ = -1.0;
+    }
+    FanPick Update(const FanFrame& f, const FanDirections& d, V3 hand, double t) {
+        FanPick p{};
+        p.at = FanOffsetOf(f, hand);
+        const float depth = std::abs(p.at.z);
+        if (!out_ && depth > FanOutM) {
+            out_ = true;
+            out_since_ = t;
+        } else if (out_ && depth < FanBackM) {
+            out_ = false;
+            out_since_ = -1.0;
+        }
+        if (out_) {
+            card_ = -1;
+            p.out = true;
+            p.dismiss = t - out_since_ >= FanOutHoldS - 1e-6;
+            return p;
+        }
+        const float r = std::sqrt(p.at.x * p.at.x + p.at.y * p.at.y);
+        const float a = std::atan2(p.at.x, p.at.y);
+        if (r < (card_ >= 0 ? FanClearM : FanEnterM)) {
+            card_ = -1;
+        } else if (!FanCovers(d, card_, a, FanHystDeg * (3.14159265f / 180.0f))) {
+            card_ = FanNearest(d, a);
+        }
+        p.card = card_;
+        return p;
+    }
+    [[nodiscard]] int Card() const {
+        return card_;
+    }
+
+private:
+    int card_{-1};
+    bool out_{false};
+    double out_since_{-1.0};
+};
+
+// The fan's drawing (LOCAL): card k on a circle of c.radius_m round the frame's origin at its
+// direction (FanDirectionsOf), in one plane leaning back toward the eyes by FanTiltShare of the
+// line of sight's elevation (up to FanMaxTiltDeg; the whole of it, up to 50, until 2026-10-27: the
+// user found it "too flattened, like leaning backwards"), its right the frame's (level); every card
+// shares that plane's facing (`toward`): no card turns to the eyes on its own. The centre is kept
+// between 0.55 m and 0.05 m below the eyes as PlaceArc keeps it, and pushed back along the plane's
+// normal until no card is nearer the eyes than min_eye_m. The pick stays the frame's (from the
+// origin, upright).
+inline constexpr float FanTiltShare = 0.8f;
+inline constexpr float FanMaxTiltDeg = 40.0f;
+inline Layout PlaceFan(const FanFrame& f, const FanDirections& d, V3 eye, const LayoutConfig& c) {
+    Layout l{};
+    l.n = d.n;
+    l.eye = eye;
+    V3 pivot = f.origin;
+    pivot.y = std::clamp(pivot.y, eye.y - 0.55f - c.radius_m * 0.5f, eye.y - 0.05f - c.radius_m);
+    const V3 sight = eye - pivot;
+    const float level = std::max(Length(V3{sight.x, 0.0f, sight.z}), 1e-3f);
+    const float tilt = std::clamp(FanTiltShare * std::atan2(sight.y, level), 0.0f,
+                                  FanMaxTiltDeg * (3.14159265f / 180.0f));
+    l.right = f.right;
+    l.toward = f.forward * -std::cos(tilt) + V3{0.0f, 1.0f, 0.0f} * std::sin(tilt);
+    l.up = Cross(l.toward, l.right);
+    l.step_rad = d.step;
+    for (int k = 0; k < l.n; ++k) {
+        const float a = d.angle[static_cast<std::size_t>(k)];
+        l.card[static_cast<std::size_t>(k)] =
+            pivot + l.right * (std::sin(a) * c.radius_m) + l.up * (std::cos(a) * c.radius_m);
+    }
+    for (int pass = 0; pass < 16; ++pass) {
+        float push = 0.0f;
+        for (int k = 0; k < l.n; ++k) {
+            const float distance = Length(l.card[static_cast<std::size_t>(k)] - eye);
+            if (distance < c.min_eye_m) {
+                push = std::max(push, c.min_eye_m - distance + 0.005f);
+            }
+        }
+        if (push <= 0.0f) {
+            break;
+        }
+        pivot = pivot - l.toward * push;
+        for (int k = 0; k < l.n; ++k) {
+            l.card[static_cast<std::size_t>(k)] = l.card[static_cast<std::size_t>(k)] -
+                                                  l.toward * push;
+        }
+    }
+    l.pivot = pivot;
+    return l;
+}
+
+// The fan as it is drawn: PlaceFan, then just behind the hand that opened it, so the hunter's
+// fist stays in front of the fan as it moves toward an item (at the hand's own depth the lit
+// segment veiled the fist). The render hook draws this; the pick reads its cards
+// (FanReadDirections).
+inline constexpr float FanBehindHandM = 0.04f;
+inline Layout PlaceFanDrawn(const FanFrame& f, const FanDirections& d, V3 eye,
+                            const LayoutConfig& c) {
+    Layout l = PlaceFan(f, d, eye, c);
+    const V3 behind = l.toward * -FanBehindHandM;
+    l.pivot = l.pivot + behind;
+    for (int k = 0; k < l.n; ++k) {
+        l.card[static_cast<std::size_t>(k)] = l.card[static_cast<std::size_t>(k)] + behind;
+    }
+    return l;
+}
+
+// The directions the hand reads its cards at: each drawn card's centre seen from the frame's
+// origin in the upright frame the pick reads (FanSelector). The fan leans back toward the eyes and
+// sits below and behind the hand, so a card drawn at d.angle reads further out to the side than
+// that: at a 45 degree lean the second card of six (drawn at -45) read -64, inside the end card's
+// directions (out from -60), and coming from the end card its hysteresis kept the end card lit
+// over it, while coming from the right the second card's own kept it lit there (the user's
+// 2026-11-01 "easy to pick when going right to left, but hard when going left to right"). Read
+// where each card is drawn, each card's directions are round its own centre again. Not strictly
+// in order (a degenerate frame): the drawn directions.
+inline FanDirections FanReadDirections(const FanFrame& f, const Layout& drawn,
+                                       const FanDirections& d) {
+    constexpr float Edge = FanEdgeDeg * (3.14159265f / 180.0f);
+    FanDirections r = d;
+    if (!f.valid || drawn.n != d.n) {
+        return d;
+    }
+    for (int k = 0; k < d.n; ++k) {
+        const FanOffset o = FanOffsetOf(f, drawn.card[static_cast<std::size_t>(k)]);
+        r.angle[static_cast<std::size_t>(k)] = std::atan2(o.x, o.y);
+    }
+    for (int k = 0; k < d.n; ++k) {
+        const float a = r.angle[static_cast<std::size_t>(k)];
+        if (!std::isfinite(a) || std::abs(a) > Edge - 0.2f ||
+            (k > 0 && !(a > r.angle[static_cast<std::size_t>(k - 1)]))) {
+            return d;
+        }
+    }
+    return r;
+}
+
 // ---- The arc's controller (presenter input thread) -------------------------------------------
+
+// The charging tool's vibration grain (Output::ToolCharge::kind; the presenter's QuickToolFeel).
+enum class ToolFeel : std::uint8_t { None, Augur, Roar, Tonitrus, Gloves, CallBeyond };
+static_assert(static_cast<std::uint8_t>(ToolFeel::CallBeyond) == UseAudioCallBeyond);
+inline ToolFeel ToolFeelOf(std::int32_t goods) {
+    return goods == Augur::Goods               ? ToolFeel::Augur
+           : goods == BeastRoar::Goods         ? ToolFeel::Roar
+           : goods == HunterRelics::Tonitrus   ? ToolFeel::Tonitrus
+           : goods == HunterRelics::Gloves     ? ToolFeel::Gloves
+           : goods == CallBeyond::Goods        ? ToolFeel::CallBeyond
+                                               : ToolFeel::None;
+}
 
 enum class Haptic : std::uint8_t {
     None,
@@ -3242,10 +3951,38 @@ enum class Haptic : std::uint8_t {
     BellStrike, // quick_use_shake: a stroke of the bell counted (the clapper's clack)
     BellToll,   // ... rung (a full strike, then a decaying hum with a beat in it)
     Inject,     // quick_use_stab: the game took the stabbed blood (the vial's THUMP, both hands)
+    Charged,    // Tiny Tonitrus charged: a crackle, strike now
+    Thunder,    // ... struck: a crack, then the thunder rolling off
+    Roar,       // Beast Roar clenched to the full: the burst (a deep blow, then a shuddering roll)
+    // A hunter tool's use taken by the game, each its own feel (ToolUseHaptic; the user's
+    // 2026-11-04 "re-examine the vibration of when tools are used"):
+    Spirits,   // the Executioner's Gloves landed: the spirits burst up (a heavy blow, rolling)
+    Stars,     // A Call Beyond called: a deep push, the stars shimmering away
+    Meteor,    // the Blacksky Eye fired: a sharp kick, a short tail
+    Tentacles, // the Augur's tentacles out: a wet slap and a squirm
 };
+// The feel of a use the game took for `goods` (Haptic::Use for all but the tools above).
+inline Haptic ToolUseHaptic(std::int32_t goods) {
+    return goods == HunterRelics::Gloves ? Haptic::Spirits
+           : goods == CallBeyond::Goods  ? Haptic::Stars
+           : goods == BlackskyEye::Goods ? Haptic::Meteor
+           : goods == Augur::Goods       ? Haptic::Tentacles
+                                         : Haptic::Use;
+}
 
 struct Config {
     bool enabled{true}; // quick_arc and quick_items
+    // quick_arc_pick=fan: an open is a fan (FanSelector on the left controller's own pose,
+    // read at the open: never the render hook's hover, never waiting for the arm to pick) of the
+    // arc's cards (fan_span_deg: quick_arc_span_deg, as the render hook places them). Its lit slot
+    // is the hover in both schemes; the late-hover and nearest-card fallbacks (made for the hover's
+    // lag) are off; scheme 1's quick draw stays; scheme 2's trigger in the centre, off the cards
+    // (below the hand) or out of the fan is the gun. The hand lost longer than fan_lost_s, or the
+    // play space moved: closed.
+    bool fan{false};
+    float fan_lost_s{0.10f};
+    float fan_span_deg{150.0f};
+    float fan_radius_m{0.18f}; // the render hook's (quick_arc_radius_m, seated x0.875)
     float hold_press{0.75f};
     float hold_release{0.45f};
     float use_press{0.75f};
@@ -3346,7 +4083,7 @@ struct Config {
     int holster_mode{0};
     bool holster_haptics{true};
     // y_menu (the presenter: SteamVR by default): Y's tap is the game's menu, not the arc, so the
-    // grip opens the arc in holster_mode=1 too (there it otherwise only draws from the slots).
+    // grip still respects No Grip (holster_mode=1); other menu shortcuts remain available.
     bool y_menu{false};
     // left_scheme=2, after the review of 2026-10-05:
     //  - The grip with an item in the hand puts it back only with the hand still: not when the
@@ -3420,9 +4157,62 @@ struct Config {
     // (Input::crank_play: the game's UseGoods at once, Request::crank) and Output::crank_box frees
     // the right hand meanwhile. Off: held to use (the ring, then the game's animation).
     bool crank{false};
+    // The Monocular (goods 1411) is looked through by holding it to an eye (the presenter's
+    // optic: native stereo with asymmetric eyes, or DIBR). There its trigger does nothing (no
+    // use, no gun), so the game's own monocular view never takes over (2026-10-30).
+    // Off: used at the pull (Square: the game's view).
+    bool optic{false};
+    // quick_tap_pick (left_scheme=2; the tester's 2026-10-30 request): the trigger on a card picks
+    // the item up and never uses it at the pull. Kept down from that pick it goes on as before (a
+    // ring starts filling, a throwable flies when let go, a usable is used once held tap_use_s);
+    // let go, the item rests in the hand (the ring back to empty, a slow let-go of a throwable
+    // too), and the trigger pressed again uses it (a ring starts again and must be held full, a
+    // throwable is held to be thrown). Only the grip puts it back (or Y, X, the game keeping the
+    // arm); food and drink are still used at the mouth, the papers on the blade, with or without
+    // the trigger. Off: as before (let go: back on the arc; usables at the pull).
+    bool tap_pick{false};
+    float tap_use_s{0.30f};
+    // quick_grip_hold (left_scheme=2, quick_tap_pick; the tester's 2026-10-30 layout): the grip
+    // opens the arc, the grip on a card takes the item and holds it while it stays squeezed (as a
+    // body pocket's); the trigger uses it (a ring fills while it is held, a tool's act, the crush
+    // is the trigger hard), a throwable flies when the grip is let go, and letting go of anything
+    // else puts it back. The trigger off an item is always the gun (the arc closes). An item put
+    // back within fan_return_s of its take (a wrong pick) brings the arc back for the next one;
+    // one used (used up, thrown, a kept tool used) or held longer leaves it closed (the user,
+    // 2026-11-06). Off: the trigger takes (quick_tap_pick).
+    bool grip_hold{false};
+    float fan_return_s{3.0f};
+    // quick_grip_open_ms (left_scheme=2): the grip in the air opens the arc once squeezed this
+    // long (the tester's 2026-11-01 pick, 80 ms: a hand closing on its own opens nothing); 0 = at
+    // the squeeze. Y and X open it at once.
+    float grip_open_s{0.0f};
+    // quick_tool_keep: a hunter tool (ToolKeepOf) stays in the hand after its use, hidden while the
+    // game's own use animation plays (its own model is in his hand then), back once it is over;
+    // used again as above. Off: it goes away after its use.
+    bool tool_keep{false};
+    // quick_tool_gestures: the tools that wait for an act with the trigger (ToolGestureOf).
+    bool tool_gestures{false};
+    // quick_tool_direct: a hunter tool's use has no animation (ToolUseOf: the game's UseGoods at
+    // once, its clip's dummy and sounds, Request::tool); the next use waits for the tool's own
+    // pace (ToolUse::rate_ms). It stays in sight in the hand throughout. Off: the game's own use
+    // (select + Square, its animation).
+    bool tool_direct{false};
+    ToolConfig tool_cfg{};
+    // quick_tool_direct: the Madaras Whistle's call (the game's own hebi_hue, core/vr/
+    // whistle_audio.h), required hold (100 ms less than its audible length); 0 until decoded
+    // (or never: used at once with the game's own sound, as before). The call plays from the
+    // moment it is blown and the trigger is held at the mouth; let go or away before the hold
+    // completes, it stops and nothing is used.
+    // On completion the game's UseGoods, with the sound playing out: the snake comes up 0.4 s
+    // later (its bullet 480's life; the tester's 2026-10-30 "delay the snake like 0.4s").
+    float whistle_s{0.0f};
 };
 
 struct Input {
+    bool blade_motion_valid{false};
+    ShamanBlade::Contact blade_contact{};
+    ShamanBlade::Contact glove_contact{}; // the gathered Gloves met an enemy (`stroke`: its charge)
+    HunterRelics::DropPlan relic_drop{};
     double t{0.0}; // seconds, monotonic
     float dt{0.0f};
     // Gameplay in VR with the motion controls: no game menu, virtual screen, cinematic, Menu held
@@ -3440,16 +4230,26 @@ struct Input {
     bool arc_tap{false};
     const char* arc_tap_by{"L3"}; // ... and its name for the log (left_scheme=2: "Y", its tap)
     bool x_edge{false};     // X pressed this frame (the vial)
+    // left_scheme=2: X pressed this frame as the fan's (the caller's choice at the press, where
+    // the fan can answer; x_edge is then false): a Y press for the arc, as Y's tap is (open,
+    // close, put an item away, disarm a vial).
+    bool x_fan{false};
     bool trigger_latch{false}; // the gun trigger's own latch (L2) is on
     float grip{0.0f};
     float trigger{0.0f};
     bool hand_valid{false};
+    bool vial_pose_valid{false}; // pickup/holding grace only; never feeds the motion histories
     V3 hand_p{};
     V3 hand_v{};
     float hand_w{0.0f};       // the left controller's angular speed (rad/s)
     float pose_lead_s{0.0f};  // the hand's pose is predicted this far ahead of `t` (display time)
     V3 hand_wv{};             // ... as a vector (rad/s, LOCAL)
     Qt hand_q{};              // the left grip's orientation (LOCAL)
+    // The left controller's aim pose (the runtime's own pointing ray for that controller, as a
+    // laser pointer follows it), its orientation (LOCAL), located only while the Augur is in the
+    // hand: its squeeze bursts along it. Not valid: the grip's forward stands in.
+    bool aim_valid{false};
+    Qt aim_q{};
     bool shoulder_valid{false};
     V3 shoulder{};            // the player's left shoulder, estimated from the head (LOCAL)
     // The left grip located at the input's own time `t` as well (the runtime's freshest estimate,
@@ -3470,8 +4270,17 @@ struct Input {
     bool at_hip{false};
     int holster_assignment{0}; // hovered case: 0 none, 1 vial, 2..7 equipped slots
     bool holster_entered{false};
+    int holster_near_assignment{0}; // within 4 cm of a pocket's hover boundary
+    std::uint32_t holster_late_mask{0}; // assignments within 2 cm of that boundary
+    std::uint32_t holster_space{0};
+    bool holster_targets_fresh{false};
     int carried_vials{-1}; // unknown leaves the existing injection check authoritative
     bool vial_busy{false};
+    // ... of that, only a vial armed in the hand or its injection pending: X's own rule for a new
+    // vial. A vial's pocket (the hip pouch, the shoulder, the belt) draws whenever X could arm one,
+    // so right after a heal (the drained vial still shown) a reach for the next one gets a full
+    // vial at once, as X does (2026-10-26: a player's pouch kept the drained one).
+    bool vial_held{false};
     // left_scheme=2: this frame a swing went out or a leap / dodge started (`combat_why` names it):
     // the open arc closes. `trigger_raw`: the trigger's analog value even while a context switch
     // holds it back (`trigger` reads 0 then): a trigger held is a clench, the grip opens nothing.
@@ -3479,12 +4288,28 @@ struct Input {
     const char* combat_why{""};
     // A dodge or a leap started this frame (quick_hold_use: the ring filling is cancelled).
     bool dodge{false};
+    // The game would take an item use now (core/vr/anim_classes.h GateOut::items_ok, its item
+    // window): a hunter tool used with no animation waits for it (not mid-attack, mid-roll or in a
+    // stagger: a momentary act then is a deny, a held one waits; a call or a gathering is lost).
+    bool items_ok{true};
     float trigger_raw{0.0f};
     // quick_use_mouth: the mouth point (MouthPoint, LOCAL) and the head's velocity (the hand's
     // speed at the mouth is measured against it); false: no head pose, nothing is eaten.
     bool mouth_valid{false};
     V3 mouth{};
     V3 head_v{};
+    // The item in the hand to each of your eyes (m; 0 left, 1 right), as the Monocular's optic
+    // measures it: from the drawn item's centre (else the grip) to the headset's own eye poses
+    // (ToolGesture::Eye); `eye_tracked`: the controller tracked (held against the headset it
+    // often is not). False: no head or eye poses.
+    bool eye_valid{false};
+    std::array<float, 2> eye_d{};
+    bool eye_tracked{true};
+    // The eyes (LOCAL) and the head's forward (unit, LOCAL): a fan's frame faces you from them
+    // (MakeFanFrame); false: no head pose (the frame then faces -Z from the hand).
+    bool head_valid{false};
+    V3 head_p{};
+    V3 head_forward{0.0f, 0.0f, -1.0f};
     // quick_use_wipe: the newest paper-against-blade sample (WipeContact; `wipe_fresh`: younger
     // than WipeConfig::stale_s), and the two-handed grip holding the handle (the left hand is on
     // it: no wipe until it lets go).
@@ -3494,6 +4319,9 @@ struct Input {
     // A successful handle/hilt acquisition this frame. An empty arc yields to the weapon
     // before processing item selection or another menu-open input.
     bool weapon_grab{false};
+    bool corpse_grab{false}; // fresh bare-hand contact with a grabbable corpse, or holding one
+    // Cigarette::gift_serial: a new value, Kos Lights just reached the inventory.
+    std::uint32_t cigarette_gift{0};
     // quick_use_stab: the stab item in the hand went into a stab zone this frame (the presenter's
     // tracking of the Blood Vial's zones), and which ("wrist", "torso", "lap").
     bool stab{false};
@@ -3534,6 +4362,9 @@ struct Output {
     std::int32_t held_goods{-1}; // the hunter's left hand should hold this goods ...
     std::int32_t held_ffx{-1};   // ... with this effect (-1: our mesh only)
     bool disarm_vial{false};
+    // A hunter tool refused for want of bullets this frame (ShortOfBullets: not taken, or not
+    // used): the presenter plays the magic denial cue and the wrist's counter flashes red.
+    bool no_bullets{false};
     // left_scheme=2: the grip at the left hip drew a Blood Vial (the presenter arms it as X does),
     // and the grip's squeeze edge this frame (the presenter logs where the hand was).
     bool draw_vial{false};
@@ -3555,7 +4386,20 @@ struct Output {
     // (HoldHum; 0: none: the presenter's continuous level for the hand while it is above 0).
     float hold_progress{-1.0f};
     float hold_hum{0.0f};
+    // A hunter tool charging in the left hand (the presenter's QuickToolFeel): which one, its
+    // charge (0..1) and whether it is full and waiting. The vibration quickens and firms as it
+    // gathers, in the tool's own grain (the tester's 2026-11-04 "becoming faster, becoming
+    // stronger"); kind 0: none this frame.
+    struct ToolCharge {
+        std::uint8_t kind{0}; // ToolFeel
+        float progress{0.0f};
+        bool full{false};
+    } tool_charge{};
     float use_whoosh{-1.0f}; // < 0: silent; 0..1: hold/squeeze audio build-up
+    // Config::whistle_s: the Madaras Whistle's call, + 1 per blow (0: none yet), and where it is
+    // (core/vr/whistle_audio.h plays it: Blowing from its start, Off stops it, Done plays it out).
+    std::uint64_t whistle_id{0};
+    WhistleState whistle{WhistleState::Off};
     // quick_use_stab: a stab item is in the hand, waiting for a stab (the presenter tracks the
     // zones while this is on), and + 1 per take (its zones start again: not after a refusal).
     bool stab_item{false};
@@ -3624,24 +4468,76 @@ public:
             c.stack = false;
             c.trigger_parry = false;
         }
+        // quick_grip_hold is pick-then-use with the grip holding (the item rests in the hand
+        // between uses).
+        if (c.grip_hold && c.left_scheme == 2) {
+            c.tap_pick = true;
+        }
 
         out = {};
         steady_ns_ = static_cast<std::int64_t>(in.t * 1e9);
+        if (in.cigarette_gift != cigarette_gift_seen_) {
+            // Kos Lights given (the wheelchair ride, else the patch's first load): a thump on
+            // both hands and its card a little ahead of where you look, as the game's item popup.
+            cigarette_gift_seen_ = in.cigarette_gift;
+            const V3 ahead = Normalize({in.head_forward.x, 0.0f, in.head_forward.z}, {0, 0, -1});
+            const bool head_ok = in.head_valid && std::isfinite(in.head_p.x) &&
+                                 std::isfinite(in.head_p.y) && std::isfinite(in.head_p.z);
+            cigarette_notice_ = {};
+            if (head_ok) {
+                cigarette_notice_ = {steady_ns_, {in.head_p.x, in.head_p.y, in.head_p.z},
+                                     {ahead.x, ahead.y, ahead.z}, in.holster_space};
+            }
+            out.Haptics(Haptic::Ignite);
+            out.Log("Kos Lights received");
+        }
+        if (cigarette_notice_.ns > 0 && steady_ns_ - cigarette_notice_.ns < Cigarette::NoticeNs &&
+            in.head_valid && std::isfinite(in.head_p.x) && std::isfinite(in.head_p.y) &&
+            std::isfinite(in.head_p.z) && std::isfinite(in.dt)) {
+            // The card goes with him and turns with the view (Cigarette::NoticeTurnS).
+            const V3 now_ahead = Normalize({in.head_forward.x, 0.0f, in.head_forward.z}, {0, 0, -1});
+            const V3 was{cigarette_notice_.forward.x, cigarette_notice_.forward.y,
+                         cigarette_notice_.forward.z};
+            const float k = 1.0f - std::exp(-std::max(in.dt, 0.0f) / Cigarette::NoticeTurnS);
+            const V3 ahead = Normalize(was + (now_ahead - was) * k, now_ahead);
+            cigarette_notice_.origin = {in.head_p.x, in.head_p.y, in.head_p.z};
+            cigarette_notice_.forward = {ahead.x, ahead.y, ahead.z};
+            cigarette_notice_.space = in.holster_space;
+        }
         // Not updated for a while (a menu, the screen, the headset off): what is held now was held
         // then; no edge from it (the arc would open, a vial be drawn, on the first frame back).
-        if (last_t_ >= 0.0 && in.t - last_t_ > c.resync_gap_s) {
+        // An active vial decision expires sooner: a gap longer than its fist window cannot
+        // establish whether the buttons completed a clench while input was not being sampled.
+        const double input_gap = in.t - last_t_;
+        const bool vial_input_gap = (vial_trigger_pending_ || vial_fist_wait_) &&
+                                    c.fist_s > 0.0f && input_gap > c.fist_s;
+        if (last_t_ >= 0.0 && (input_gap > c.resync_gap_s || vial_input_gap)) {
+            if (vial_trigger_pending_ || vial_fist_wait_) {
+                l2_fresh_needed_ = l2_fresh_needed_ || in.trigger_latch;
+                parry_t_ = -1.0;
+                vial_trigger_pending_ = vial_fist_wait_ = false;
+            }
             grip_on_ = grip_was_ = in.grip >= c.hold_press;
             trigger_on_ = trigger_was_ = in.trigger >= c.use_press;
             l2_was_ = in.trigger_latch;
             y_down_ = in.y;
             putback_pending_ = false;
+            grip_open_t_ = -1.0;
         }
         last_t_ = in.t;
-        if (!in.gameplay || !in.hand_valid)
+        const bool vial_pose = in.hand_valid || in.vial_pose_valid;
+        if (!in.gameplay ||
+            (!vial_pose && !holster_timing_.VialPending(in.t, in.grip > c.hold_release)))
             holster_grip_ready_ = false;
         else if (in.grip <= c.hold_release)
             holster_grip_ready_ = true;
 
+        if (held_goods_ == HunterRelics::Gloves) {
+            const V3 relative=in.hand_p-in.head_p;
+            glove_release_.Update(hold_from_base_ns_,in.holster_space,in.t,
+                in.gameplay && in.body && in.hand_valid && in.head_valid,
+                {relative.x,relative.y,relative.z});
+        } else glove_release_.Reset();
         const bool y_press = in.y && !y_down_;
         y_down_ = in.y;
         // quick_arc_l3: a tap of the left stick click is a Y press for the arc wherever the arc
@@ -3651,8 +4547,10 @@ public:
                          (phase_ != Phase::Idle || (in.body && in.snapshot_fresh));
         out.tap_taken = tap;
         out.tap_outside = in.arc_tap && !in.gameplay;
-        const bool y_edge = y_press || tap;
-        toggle_by_ = y_press ? "Y" : in.arc_tap_by;
+        const bool x_tap = in.x_fan && in.gameplay && c.enabled &&
+                           (phase_ != Phase::Idle || (in.body && in.snapshot_fresh));
+        const bool y_edge = y_press || tap || x_tap;
+        toggle_by_ = y_press ? "Y" : x_tap ? "X" : in.arc_tap_by;
         // A sample faster than any hand (throw_max_hand_speed: a tracking jump) is not kept; the
         // first few while an item is in the hand are logged.
         const auto plausible = [&](V3 v, const char* which) {
@@ -3710,7 +4608,8 @@ public:
                 s.now_valid = in.hand_now_valid;
                 s.p_now = in.hand_p_now;
                 s.v_now = in.hand_v_now;
-                s.grip = c.left_scheme == 2 ? in.trigger : in.grip; // what lets go of the item
+                // what lets go of the item
+                s.grip = c.left_scheme == 2 && !grip_held_ ? in.trigger : in.grip;
                 trace_.Push(s);
             }
         }
@@ -3731,8 +4630,17 @@ public:
         bool grip_edge = grip_on_ && !grip_was_;
         const bool grip_release = !grip_on_ && grip_was_;
         grip_was_ = grip_on_;
+        if (!grip_on_) {
+            corpse_grip_claimed_ = false;
+            vial_grip_claimed_ = false;
+            vial_fist_wait_ = false;
+        }
         if (grip_edge) {
             grip_edge_t_ = in.t;
+        }
+        if (!grip_on_ && grip_open_t_ >= 0.0) {
+            grip_open_t_ = -1.0;
+            out.Log("grip let go before quick_grip_open_ms: no arc");
         }
         trigger_on_ = trigger_on_ ? in.trigger > c.hold_release : in.trigger >= c.use_press;
         bool trigger_edge = trigger_on_ && !trigger_was_;
@@ -3751,8 +4659,146 @@ public:
         const bool l2_edge = in.trigger_latch && !l2_was_;
         l2_was_ = in.trigger_latch;
         latch_now_ = in.trigger_latch;
+        // The trigger held as the gun's (past 45% or its latch since before the grip's squeeze,
+        // by more than PocketClenchS): a body pocket's item waits. One that came down with the
+        // squeeze (2026-11-10: "difficulty grabbing from the chest in tense
+        // situations": the whole hand clenched) is the hand closing, and the pocket takes it; the
+        // item never uses that pull (l2_fresh_needed_, trigger_fist_).
+        const bool trigger_held = in.trigger_latch || in.trigger_raw >= 0.45f;
+        if (!trigger_held) {
+            trigger_held_t_ = -1.0;
+        } else if (trigger_held_t_ < 0.0) {
+            trigger_held_t_ = in.t;
+        }
+        const bool trigger_aims =
+            trigger_held && !(trigger_held_t_ >= grip_edge_t_ - PocketClenchS);
         if (!in.trigger_latch) {
             l2_fresh_needed_ = false; // the gun trigger was let go: the next pull is the gun's
+        }
+        if (vial_fist_wait_) {
+            if (!in.gameplay || !c.enabled || in.t - grip_edge_t_ > c.fist_s) {
+                vial_fist_wait_ = false;
+            } else if (latch_now_) {
+                HoldTriggerBack(); // grip reached its threshold a frame before the trigger
+                vial_fist_wait_ = false;
+            }
+        }
+        // A bare-hand corpse grab owns the squeeze, including its delayed fan-open
+        // timer and a fan which opened before the game published contact. Do not
+        // steal a held item or vial. Loss of contact never replays the same squeeze.
+        if (in.corpse_grab && in.gameplay && in.body && in.hand_valid && grip_on_ &&
+            !in.vial_busy && !in.two_hand && !in.weapon_grab &&
+            (phase_ == Phase::Idle || phase_ == Phase::Open)) {
+            corpse_grip_claimed_ = true;
+        }
+        if (corpse_grip_claimed_) {
+            y_square_ = false;
+            grip_open_t_ = -1.0;
+            fan_return_until_ = 0.0;
+            regrab_slot_ = -1;
+            regrab_l2_wait_ = false;
+            holster_timing_.Reset();
+            cigarette_drag_.Reset();
+            cigarette_puff_ = {};
+            if (vial_trigger_pending_) HoldTriggerBack();
+            vial_trigger_pending_ = vial_fist_wait_ = false;
+            if (phase_ == Phase::Open) Close(out, "bare hand gripping a corpse");
+            out.tap_taken = tap;
+            out.block_l2 = l2_fresh_needed_;
+            Publish(out);
+            return;
+        }
+        // Run before any early return so a menu, tracking loss, weapon ownership or
+        // blocked use cannot leave a buffered squeeze waiting to fire on recovery.
+        std::array<std::int32_t, SlotCount * 2> holster_identity{};
+        for (int i = 0; i < SlotCount; ++i) {
+            const auto& slot = in.snapshot.slot[i];
+            holster_identity[2 * i] = slot.Empty() || !slot.usable ? -1 : slot.goods;
+            holster_identity[2 * i + 1] = slot.inv_idx;
+        }
+        if (holster_identity != holster_identity_ || in.holster_space != holster_space_ ||
+            c.holster_mode != holster_mode_) {
+            if (vial_trigger_pending_) {
+                HoldTriggerBack();
+                vial_trigger_pending_ = false;
+            }
+            holster_timing_.Reset();
+            holster_identity_ = holster_identity;
+            cigarette_drag_.Reset();
+            cigarette_puff_ = {};
+            holster_space_ = in.holster_space;
+            holster_mode_ = c.holster_mode;
+        }
+        // Right after a heal only a vial's pocket can take a squeeze (PocketBusy).
+        const bool items_free = !in.snapshot.busy && !in.vial_busy;
+        const int nearby_pocket =
+            in.holster_assignment > 0 ? in.holster_assignment : in.holster_near_assignment;
+        const bool vial_pending = holster_timing_.VialPending(in.t, grip_on_);
+        const bool vial_pocket = nearby_pocket == 1 || (nearby_pocket == 0 && vial_pending);
+        const bool pocket_free = items_free || (vial_pocket && !in.vial_held);
+        const bool holster_context =
+            c.holster_mode && c.enabled && in.gameplay && holster_grip_ready_ && in.body &&
+            in.snapshot_fresh && in.snapshot.alive && pocket_free && !in.two_hand &&
+            !in.weapon_grab && in.arm_weight >= c.arm_min && !y_edge && !in.y &&
+            !(c.belt_vial && in.at_hip) && (phase_ == Phase::Idle || phase_ == Phase::Open);
+        const bool holster_can_assist =
+            holster_context && in.holster_targets_fresh &&
+            (vial_pocket ? vial_pose : in.hand_valid) &&
+            (vial_pocket || (!in.combat && !trigger_aims));
+        // At a vial, a grip already closing uses the arc's existing bounded fist decision.
+        // A trigger alone (grip at rest) keeps its immediate gun path.
+        const bool vial_trigger_lead =
+            holster_can_assist && vial_pocket && l2_edge && !grip_on_ && in.grip >= c.fist_grip;
+        if (vial_trigger_lead) {
+            vial_trigger_pending_ = true;
+            parry_t_ = in.t;
+            parry_fist_ = false; // this partial grip must not inherit an earlier squeeze's fist
+            holster_timing_.Reset();
+        }
+        if (vial_trigger_pending_) {
+            if (!holster_context || !vial_pose || !in.holster_targets_fresh) {
+                vial_trigger_pending_ = false;
+                HoldTriggerBack(); // never replay a pending pull after a context/tracking loss
+            } else if (GunPull(c, in, false, out)) {
+                vial_trigger_pending_ = false;
+                if (phase_ == Phase::Open) {
+                    panic_l2_ = true;
+                    Close(out, "trigger (gun, no vial squeeze)");
+                    panic_l2_ = false;
+                }
+            } else if (parry_t_ < 0.0) {
+                vial_trigger_pending_ = false; // the trigger was released before a full squeeze
+            } else {
+                regrab_slot_ = -1;
+                regrab_l2_wait_ = false;
+                grip_open_t_ = -1.0;
+                if (grip_on_) {
+                    ClaimVialGrip();
+                } else {
+                    out.block_l2 = true;
+                    Publish(out);
+                    return;
+                }
+            }
+        }
+        Holsters::GrabTiming::Result assisted{};
+        if (holster_can_assist) {
+            assisted = holster_timing_.Update(in.t, grip_edge, grip_on_, in.holster_assignment,
+                                              in.holster_near_assignment, in.holster_late_mask);
+        } else if (holster_context && vial_pocket && vial_pending &&
+                   (!vial_pose || !in.holster_targets_fresh)) {
+            assisted = holster_timing_.Update(in.t, false, grip_on_, 0, 0, 0, false);
+        } else {
+            holster_timing_.Reset();
+        }
+        if (assisted.reserved && vial_pocket)
+            ClaimVialGrip();
+        if (assisted.reserved && !assisted.assignment) {
+            grip_edge = false; // a near-pocket squeeze cannot also open/close the arc
+            grip_open_t_ = -1.0;
+            // Stack regrab reads the held grip and its timestamp, not grip_edge.
+            // The pocket owns this intention even if its reservation later expires.
+            regrab_slot_ = -1;
         }
         if (in.weapon_grab && in.gameplay && WeaponGrabAvailable(phase_)) {
             if (phase_ == Phase::Open) {
@@ -3777,6 +4823,14 @@ public:
             trigger_hold_ = false;
             trigger_let_go = true;
         }
+        // quick_tap_pick: the item resting in the hand and the trigger pressed again: it is held
+        // by it again (a ring starts again, a throwable waits for its release, a usable is used:
+        // PullTick).
+        // (quick_grip_hold: a throwable is the grip's; the trigger on it is nothing.)
+        if (scheme2 && c.tap_pick && resting_ && trigger_edge && phase_ == Phase::Holding &&
+            !(grip_held_ && Throwable(c))) {
+            Press(in, out);
+        }
         out.grip_edge = scheme2 && grip_edge;
         // left_scheme=2, the belt vial: a squeeze with the hand at the left hip draws a Blood
         // Vial and never opens the arc, the hand free (the arc may be open, a throw in flight);
@@ -3785,7 +4839,7 @@ public:
             (phase_ == Phase::Idle || phase_ == Phase::Open ||
              (phase_ == Phase::Waiting && thrown_))) {
             grip_edge = false;
-            if (in.vial_busy) {
+            if (in.vial_held) {
                 out.Haptics(Haptic::Empty);
                 out.Log("grip at the hip: a vial is already in the hand");
             } else if (in.trigger_latch || in.trigger_raw >= 0.45f) {
@@ -3823,6 +4877,7 @@ public:
         }
 
         if (!in.gameplay || !c.enabled) {
+            grip_open_t_ = -1.0;
             if (phase_ != Phase::Idle) {
                 Reset(out, in.gameplay ? "quick_arc off" : "context");
                 l2_fresh_needed_ = l2_fresh_needed_ || in.trigger_latch; // the item's pull
@@ -3839,7 +4894,9 @@ public:
             Reset(out, "dead");
         }
 
-        if (holster_held_ && !in.hand_valid &&
+        // (Not the Monocular looked through, Config::optic: never thrown, and held against the
+        // headset the controller often loses its tracking, 2026-10-30.)
+        if (holster_held_ && !in.hand_valid && !optic_item_ &&
             (phase_ == Phase::Holding || phase_ == Phase::Committing)) {
             Reset(out, "pouch item tracking lost");
             out.block_l2 = l2_fresh_needed_;
@@ -3847,28 +4904,39 @@ public:
             return; // never throw using a stale velocity after losing the controller
         }
         const bool free_hand = phase_ == Phase::Idle || phase_ == Phase::Open;
-        if (c.holster_mode && in.holster_entered && c.holster_haptics && free_hand && in.hand_valid &&
-            in.body && !in.vial_busy && !in.combat && in.arm_weight >= c.arm_min) {
+        if (!assisted.assignment && c.holster_mode && in.holster_entered && c.holster_haptics &&
+            free_hand && in.hand_valid && in.body && !PocketBusy(in, in.holster_assignment) &&
+            !in.combat && in.arm_weight >= c.arm_min) {
             out.Haptics(Haptic::Detent);
         }
-        if (c.holster_mode && grip_edge && in.holster_assignment > 0 && free_hand) {
+        const int holster_pick = assisted.assignment ? assisted.assignment
+                                : grip_edge ? in.holster_assignment : 0;
+        if (c.holster_mode && holster_pick > 0 && free_hand) {
             grip_edge = false; // an empty/unavailable case never opens the menu
+            grip_open_t_ = -1.0;
             regrab_slot_ = -1;
-            if (!holster_grip_ready_ || !in.body || !in.hand_valid || !in.snapshot_fresh ||
-                !in.snapshot.alive || in.snapshot.busy || in.vial_busy || in.combat || in.two_hand ||
-                in.arm_weight < c.arm_min || in.trigger_latch || in.trigger_raw >= 0.45f) {
+            const bool vial_pick = holster_pick == 1;
+            if (vial_pick)
+                ClaimVialGrip();
+            if (!holster_grip_ready_ || !in.body || !(vial_pick ? vial_pose : in.hand_valid) ||
+                (vial_pick && !in.holster_targets_fresh) || !in.snapshot_fresh ||
+                !in.snapshot.alive || PocketBusy(in, holster_pick) || in.two_hand ||
+                in.arm_weight < c.arm_min ||
+                (!vial_pick && (in.combat || trigger_aims))) {
                 out.Haptics(Haptic::Deny);
-            } else if (in.holster_assignment == 1 && in.carried_vials == 0) {
+            } else if (holster_pick == 1 && in.carried_vials == 0) {
                 out.Haptics(Haptic::Empty);
-            } else if (in.holster_assignment == 1) {
+            } else if (holster_pick == 1) {
                 out.draw_vial = true;
                 out.vial_grip_release = c.hold_release;
                 if (phase_ == Phase::Open)
                     Close(out, "blood vial case");
             } else {
-                const int slot = in.holster_assignment - 2;
+                const int slot = holster_pick - 2;
                 if (slot < 0 || slot >= SlotCount || in.snapshot.slot[slot].Empty()) {
                     out.Haptics(Haptic::Empty);
+                } else if (ShortOfBullets(in.snapshot, in.snapshot.slot[slot])) {
+                    RefuseShort(in, out, slot, "the body pocket");
                 } else if (!in.snapshot.slot[slot].usable) {
                     out.Haptics(Haptic::Deny);
                 } else {
@@ -3876,6 +4944,11 @@ public:
                     c.left_scheme = 1;
                     c.stack = false;
                     c.trigger_parry = false;
+                    // A clench's pull (the trigger already down at the grab: trigger_aims let it
+                    // through) is the fist's: nothing uses it, neither the pocket's ring nor a
+                    // tool's charge, until it is let go and pulled again (review, 2026-11-10: a
+                    // Hunter's Mark held clenched 1.5 s would have been used).
+                    trigger_fist_ = trigger_fist_ || trigger_on_;
                     Grab(c, in, out, slot, "body pouch", "held by grip");
                 }
             }
@@ -3884,10 +4957,15 @@ public:
             Publish(out);
             return; // no use or release in the same frame as the grab
         }
-        // Slots replaces grip-to-menu; the Y/L3 menu remains an explicit fallback (with y_menu Y
-        // is the game's menu: the grip stays the arc's opener).
-        if (c.holster_mode == 1 && phase_ == Phase::Idle && !c.y_menu)
+        // No Grip disables only idle grip-to-menu on every runtime. Body grabs above
+        // and grip interactions with an open menu/held item remain unchanged.
+        if (c.holster_mode == 1 && phase_ == Phase::Idle) {
             grip_edge = false;
+            grip_open_t_ = -1.0; // also cancel a squeeze armed before a live mode change
+        }
+        if (phase_ != Phase::Idle) {
+            grip_open_t_ = -1.0; // opened (Y, X), a pocket's item: that squeeze opens nothing
+        }
 
         switch (phase_) {
         case Phase::Idle:
@@ -3908,7 +4986,7 @@ public:
             }
             break;
         case Phase::Holding:
-        case Phase::Committing:
+        case Phase::Committing: {
             // left_scheme=2: the grip puts the item back on the arc (it stays open), with the hand
             // still (PutBack2: a clench during a throw is none); the trigger let go is the
             // release, through the same path as the grip's opening in scheme 1. (quick_use_crush:
@@ -3916,16 +4994,54 @@ public:
             // quick_use_stab: on a blood to stab it is the needle's fist, as with the Blood Vial
             // (a clench before the stab, the hand still, never puts it back: let go of the
             // trigger for that).)
-            if (scheme2 &&
-                PutBack2(c, in, out, grip_edge && gesture_ != GestureKind::Crush && !stab_item_,
+            // (quick_tap_pick: resting in the hand, the trigger let go, the grip is the put-back
+            // whatever the item; a crush is the grip with the trigger held.)
+            // (quick_tap_pick: taken with the grip held, letting go of it is the put-back, as a
+            // squeeze is for one taken without it.)
+            const bool grip_let_go = grip_take_held_ && grip_release;
+            if (grip_release) {
+                grip_take_held_ = false;
+            }
+            // (quick_tap_pick: the Hand Lantern's trigger, pressed again, is its switch.)
+            const bool lantern_edge =
+                scheme2 && c.tap_pick && trigger_edge && held_goods_ == HandLantern::Goods;
+            // quick_grip_hold: the grip holds it. Let go, a throwable flies (Release: slowly, it
+            // goes back) and anything else goes back, at once (an open hand holds nothing: no
+            // clench rule), wherever it is (the hold's, the whistle's, the gathering's end with
+            // it); the trigger uses it, its letting go is the rest between uses.
+            if (grip_held_) {
+                const bool throwable = Throwable(c);
+                // Kos Lights: the hand opening with a flick throws the cigarette away (UpdateHolding).
+                const bool toss = grip_release && held_goods_ == Cigarette::Goods;
+                // The Executioner's Gloves gathered to the full: the hand opening throws them as
+                // the trigger's letting go does (ChargeTick's drop: tossed or dropped, the spirits
+                // where they land); flying, letting go never puts them back (GloveFlung).
+                const bool glove = GloveFlung(grip_release);
+                if (!grip_on_ && !release_pending_ && !(throwable && grip_release) && !toss &&
+                    !glove) {
+                    FanBack(c, in, out, "the grip let go: put back", true);
+                    break;
+                }
+                UpdateHolding(c, in, out, y_edge,
+                              throwable || toss || (glove && grip_release) ? grip_release
+                                                                           : trigger_let_go,
+                              lantern_edge, l2_edge);
+                break;
+            }
+            if (scheme2 && PutBack2(c, in, out,
+                                    (grip_edge || grip_let_go) && !stab_item_ &&
+                                        (resting_ || pick_wait_ ||
+                                         (gesture_ != GestureKind::Crush &&
+                                                      tool_gesture_ != ToolGesture::Crush)),
                                     trigger_let_go)) {
                 break;
             }
             // (left_scheme=2: the trigger holds the item, its pull is no use: an item to eat or
             // drink is used at the mouth.)
             UpdateHolding(c, in, out, y_edge, scheme2 ? trigger_let_go : grip_release,
-                          scheme2 ? false : trigger_edge, l2_edge);
+                          scheme2 ? lantern_edge : trigger_edge, l2_edge);
             break;
+        }
         case Phase::Waiting:
             UpdateWaiting(c, in, out);
             break;
@@ -3951,6 +5067,14 @@ public:
         }
         out.block_l2 = (item_phase && !panic_l2_) || l2_fresh_needed_ || regrab_l2_wait_;
         panic_l2_ = false;
+        if (blow_t_ >= 0.0 && (phase_ != Phase::Holding || held_goods_ != WhistleGoods ||
+                               resting_ || tool_busy_)) {
+            StopBlow(out, "put away"); // the whistle's call stops with it
+        }
+        if (charge_t_ >= 0.0 && (phase_ != Phase::Holding || resting_ || tool_busy_)) {
+            StopCharge(out, "put away"); // so does a gathering
+        }
+        ReadyGlow(c, in, out);
         Publish(out);
     }
 
@@ -3966,17 +5090,32 @@ public:
     // A context switch (screen, menu, recenter, profile): close and put away silently; held
     // buttons are the caller's business.
     void Cancel(Output& out, const char* why) {
+        if (vial_trigger_pending_)
+            HoldTriggerBack();
+        vial_trigger_pending_ = false;
+        vial_fist_wait_ = false;
+        holster_timing_.Reset(); // a reservation can exist while the arc is already Idle
+        holster_grip_ready_ = false;
         if (phase_ != Phase::Idle) {
             Reset(out, why);
         }
     }
 
 private:
-    void Open(const Config& c, const Input& in, Output& out) {
+    // `feel`: its unfurl's vibration (none for the fan back by itself after a quick use:
+    // FanReturnTick).
+    void Open(const Config& c, const Input& in, Output& out, bool feel = true) {
         const int n = in.snapshot.Count();
         if (n == 0) {
             out.Haptics(Haptic::Empty);
             out.Log(std::string{toggle_by_} + ": no quick items equipped");
+            return;
+        }
+        // A fan opens round the controller itself: without its pose there is nothing to open round
+        // (never the hunter's fist instead).
+        if (c.fan && !in.hand_valid) {
+            out.Haptics(Haptic::Empty);
+            out.Log(std::string{toggle_by_} + ": no fan (the left controller is not tracked)");
             return;
         }
         if (in.vial_armed) {
@@ -3988,6 +5127,14 @@ private:
                 cards_ |= static_cast<std::uint8_t>(1u << k);
             }
         }
+        fan_ = c.fan;
+        fan_span_deg_ = c.fan_span_deg;
+        fan_radius_m_ = c.fan_radius_m;
+        if (fan_) {
+            FanBegin(in);
+        }
+        fan_return_until_ = 0.0;
+        grip_open_t_ = -1.0;
         ++open_serial_;
         Enter(Phase::Open);
         open_t_ = in.t;
@@ -4006,9 +5153,111 @@ private:
         pull_slot_ = -1;
         last_dwelled_ = false;
         reopen_until_ = 0.0;
-        out.Haptics(Haptic::Unfurl);
+        if (feel) {
+            out.Haptics(Haptic::Unfurl);
+        }
         out.Log("OPEN n=" + std::to_string(n) + " sel=" + std::to_string(in.snapshot.selected) +
-                (toggle_by_[0] == 'Y' ? "" : std::string{" by "} + toggle_by_));
+                (toggle_by_[0] == 'Y' ? "" : std::string{" by "} + toggle_by_) +
+                (fan_ ? FanFrameText() : std::string{}));
+    }
+
+    // ---- quick_arc_pick=fan ----------------------------------------------------------------
+
+    // A fan's frame round the controller where it is now (an open, or the fan back after an
+    // item went back or a throw: there round the hand again, a new placement), and its cards: the
+    // slots in use when it opened (cards_), in slot order, as the render hook lays them out.
+    void FanBegin(const Input& in) {
+        fan_frame_ = MakeFanFrame(in.hand_p, in.head_valid ? in.head_p : in.hand_p,
+                                    in.head_forward);
+        int n = 0;
+        for (int k = 0; k < SlotCount; ++k) {
+            if ((cards_ & (1u << k)) != 0) {
+                fan_card_slot_[static_cast<std::size_t>(n++)] = static_cast<std::int8_t>(k);
+            }
+        }
+        LayoutConfig layout{};
+        layout.span_deg = fan_span_deg_;
+        layout.radius_m = fan_radius_m_;
+        fan_drawn_dirs_ = FanDirectionsOf(n, layout);
+        // Read where the render hook draws the cards (PlaceFanDrawn from the same frame, the
+        // eyes now: FanReadDirections).
+        fan_dirs_ = in.head_valid ? FanReadDirections(fan_frame_,
+                                                      PlaceFanDrawn(fan_frame_, fan_drawn_dirs_,
+                                                                    in.head_p, layout),
+                                                      fan_drawn_dirs_)
+                                  : fan_drawn_dirs_;
+        fan_sel_.Reset();
+        fan_pick_ = {};
+        fan_space_ = in.holster_space;
+        fan_seen_t_ = in.t;
+    }
+
+    // The slot of the fan's card `card` (layout index), -1 none.
+    [[nodiscard]] int FanSlot(int card) const {
+        return card >= 0 && card < fan_dirs_.n ? fan_card_slot_[static_cast<std::size_t>(card)]
+                                               : -1;
+    }
+
+    std::string FanFrameText() const {
+        char text[200];
+        int at = std::snprintf(text, sizeof(text),
+                               " | FAN at (%.3f,%.3f,%.3f) facing (%.2f,%.2f) LOCAL, read at",
+                               fan_frame_.origin.x, fan_frame_.origin.y, fan_frame_.origin.z,
+                               fan_frame_.forward.x, fan_frame_.forward.z);
+        for (int k = 0; k < fan_dirs_.n && at > 0 && at < static_cast<int>(sizeof(text)); ++k) {
+            at += std::snprintf(text + at, sizeof(text) - static_cast<std::size_t>(at), " %.0f",
+                                fan_dirs_.angle[static_cast<std::size_t>(k)] *
+                                    (180.0f / 3.14159265f));
+        }
+        return text;
+    }
+
+    // The fan's pick this frame (Open, either scheme): the lit slot (-1 none), or -2 when it
+    // closed (pulled out of the fan for FanOutHoldS, the hand lost, the play space moved). A
+    // pick change and every dismissal are logged with the hand's offset in the frame.
+    int FanHover(const Config& c, const Input& in, Output& out) {
+        if (in.holster_space != fan_space_) {
+            Close(out, "fan: the play space moved");
+            return -2;
+        }
+        if (!in.hand_valid) {
+            fan_pick_.card = -1;
+            if (in.t - fan_seen_t_ > c.fan_lost_s) {
+                Close(out, "fan: the left controller lost");
+                return -2;
+            }
+            return -1;
+        }
+        fan_seen_t_ = in.t;
+        const int was = FanSlot(fan_pick_.card);
+        const bool was_out = fan_pick_.out;
+        fan_pick_ = fan_sel_.Update(fan_frame_, fan_dirs_, in.hand_p, in.t);
+        const int slot = FanSlot(fan_pick_.card);
+        if (slot != was || fan_pick_.out != was_out) {
+            char text[128];
+            const float deg = std::atan2(fan_pick_.at.x, fan_pick_.at.y) * (180.0f / 3.14159265f);
+            std::snprintf(text, sizeof(text),
+                          "fan slot %d -> %d%s (card %d of %d; x %.1f y %.1f z %.1f cm, %.0f deg)",
+                          was, slot, fan_pick_.out ? " OUT" : "", fan_pick_.card, fan_dirs_.n,
+                          100.0f * fan_pick_.at.x, 100.0f * fan_pick_.at.y,
+                          100.0f * fan_pick_.at.z, deg);
+            out.Log(text);
+        }
+        if (fan_pick_.dismiss) {
+            Close(out, "fan: pulled away");
+            return -2;
+        }
+        return slot;
+    }
+
+    // What a squeeze or pull on the fan saw, for the log.
+    std::string FanDetail(const Input& in) const {
+        char text[120];
+        std::snprintf(text, sizeof(text), "+%d ms | fan slot %d (x %.1f y %.1f z %.1f cm)",
+                      static_cast<int>(std::lround((in.t - open_t_) * 1000.0)),
+                      FanSlot(fan_pick_.card), 100.0f * fan_pick_.at.x, 100.0f * fan_pick_.at.y,
+                      100.0f * fan_pick_.at.z);
+        return text;
     }
 
     // What a squeeze saw, for the log: `+<ms since the open> ms | hover <slot>, nearest <slot> m
@@ -4091,7 +5340,8 @@ private:
             grip_armed_ = true;
         }
         // Only your own hand hovers and takes: never the game's animation sweeping the arm
-        // through the cards (a dodge, a hit), nor the hand as the arc unfolds around it.
+        // through the cards (a dodge, a hit), nor the hand as the arc unfolds around it. (The
+        // fan: the controller's own pose picks at once; the take still waits for the arm.)
         const bool arm = in.arm_weight >= c.arm_min;
         const bool live = in.hover_fresh && in.hover.open_serial == open_serial_ && in.hover.placed;
         // The arc unfolds from its placement (later than the open when it waited for the arm).
@@ -4100,7 +5350,13 @@ private:
                 ? std::max(open_t_, static_cast<double>(in.hover.placed_ns) * 1e-9)
                 : open_t_;
         const bool settled = in.t - placed_t >= c.hover_delay_s;
-        const std::int32_t hovered = live && arm && settled ? in.hover.slot : -1;
+        int fan_hover = -1;
+        if (fan_ && (fan_hover = FanHover(c, in, out)) == -2) {
+            return;
+        }
+        const std::int32_t hovered = fan_                   ? fan_hover
+                                     : live && arm && settled ? in.hover.slot
+                                                              : -1;
         if (hovered != hover_slot_) {
             if (hovered >= 0) {
                 out.Haptics(hovered_any_ ? Haptic::Detent : Haptic::FirstDetent);
@@ -4151,7 +5407,9 @@ private:
                 // squeeze's own pull); else the one clearly nearest it.
                 if (hovered >= 0) {
                     slot = hovered;
-                    via = "hover";
+                    via = fan_ ? "fan" : "hover";
+                } else if (fan_) {
+                    // (No late or nearest card: the fan's pick has no lag to make up for.)
                 } else if (last_hover_ >= 0 && in.t - hover_lost_t_ <= c.late_hover_s) {
                     slot = last_hover_;
                     via = "late hover";
@@ -4176,12 +5434,18 @@ private:
             const bool have = slot >= 0 && slot < SlotCount &&
                               !in.snapshot.slot[static_cast<std::size_t>(slot)].Empty();
             const char* gate = !arm      ? "the game has the arm"
+                               : fan_   ? nullptr
                                : !live   ? "no fresh hover"
                                : !settled ? "the arc is unfolding"
                                           : nullptr;
+            if (have && ShortOfBullets(in.snapshot, in.snapshot.slot[static_cast<std::size_t>(slot)])) {
+                squeeze_ = false;
+                RefuseShort(in, out, slot, via);
+                return;
+            }
             if (have) {
                 squeeze_ = false;
-                Grab(c, in, out, slot, via, SqueezeDetail(in, hovered));
+                Grab(c, in, out, slot, via, fan_ ? FanDetail(in) : SqueezeDetail(in, hovered));
                 return;
             }
             if (gate != nullptr && in.t - squeeze_t_ < c.grab_wait_s) {
@@ -4192,9 +5456,12 @@ private:
             } else {
                 squeeze_ = false;
                 out.Haptics(Haptic::Empty);
+                if (fan_ && hovered >= 0) {
+                    pulse(hovered, true); // an empty slot of the fan: its card flashes
+                }
                 out.Log(std::string{"grip on no card"} + (gate != nullptr ? " (" : "") +
                         (gate != nullptr ? gate : "") + (gate != nullptr ? ")" : "") + " " +
-                        SqueezeDetail(in, hovered));
+                        (fan_ ? FanDetail(in) : SqueezeDetail(in, hovered)));
             }
         }
         if (hovered >= 0) {
@@ -4205,10 +5472,42 @@ private:
         }
     }
 
-    // `feel`: the grab's haptics (left_scheme=2's use at the pull plays its own light tick).
-    void Grab(const Config& c, const Input& in, Output& out, std::int32_t slot, const char* via,
-              const std::string& detail = {}, bool feel = true) {
+    // A hunter tool the hunter cannot pay for (ShortOfBullets): not taken; the deny tick and the
+    // card's deny flash (the hand stays empty: on the fan it stays open for another).
+    void RefuseShort(const Input& in, Output& out, std::int32_t slot, const char* via) {
         const Slot& s = in.snapshot.slot[static_cast<std::size_t>(slot)];
+        out.Haptics(Haptic::Deny);
+        out.no_bullets = true;
+        pulse(slot, true);
+        char text[160];
+        std::snprintf(text, sizeof(text),
+                      "deny slot %d goods=%d (%s): it costs %d bullets, %d carried: not taken",
+                      static_cast<int>(slot), s.goods, via, s.cost, in.snapshot.bullets);
+        out.Log(text);
+    }
+
+    bool HeldShortOfBullets(const Input& in) const {
+        return in.snapshot_fresh && held_slot_ >= 0 && held_slot_ < SlotCount &&
+               in.snapshot.slot[static_cast<std::size_t>(held_slot_)].goods == held_goods_ &&
+               ShortOfBullets(in.snapshot, in.snapshot.slot[static_cast<std::size_t>(held_slot_)]);
+    }
+
+    // `feel`: the grab's haptics (left_scheme=2's use at the pull plays its own light tick).
+    // `by_grip`: quick_grip_hold's take (the grip holds it from now).
+    void Grab(const Config& c, const Input& in, Output& out, std::int32_t slot, const char* via,
+              const std::string& detail = {}, bool feel = true, bool by_grip = false) {
+        const Slot& s = in.snapshot.slot[static_cast<std::size_t>(slot)];
+        grip_held_ = by_grip;
+        cigarette_drag_.Reset();
+        cigarette_puff_ = {};
+        cigarette_near_ = -1.0f;
+        cigarette_frames_ = cigarette_ready_ = cigarette_puffs_ = 0;
+        take_t_ = in.t;
+        used_since_take_ = false;
+        fan_return_until_ = 0.0;
+        eye_side_ = -1;
+        swing_.Reset();
+        pocket_pull_ = false;
         held_slot_ = slot;
         held_goods_ = s.goods;
         held_last_ = s.qty <= 1;
@@ -4239,6 +5538,7 @@ private:
         crank_item_ = CrankItem(c, s.goods);
         crank_serial_ = 0;
         crank_played_ = false;
+        optic_item_ = c.optic && s.goods == Monocular;
         hold_item_ = !mouth_item_ && !crank_item_ && HoldItem(c, s.goods);
         hold_use_ = hold_spent_ = false;
         hold_from_ = hold_from_base_ = in.t;
@@ -4256,6 +5556,21 @@ private:
         stab_item_ = !mouth_item_ && StabItem(c, s.goods);
         stab_use_ = false;
         stab_pending_t_ = -1.0;
+        // quick_tap_pick: what is used by the trigger alone (a hunter tool, the Monocular, ...),
+        // and the act a tool waits for (quick_tool_gestures).
+        // (Config::optic: the Monocular looked through is never used by the trigger, its zoom;
+        // nor the Hand Lantern, switched where it is and kept in the hand.)
+        pull_item_ = !(held_class_.use == UseKind::Throw && c.throws) && !mouth_item_ &&
+                     !wipe_item_ && !hold_item_ && !stab_item_ && !crank_item_ && !optic_item_ &&
+                     s.goods != HandLantern::Goods;
+        tool_gesture_ = pull_item_ && c.tool_gestures ? ToolGestureOf(s.goods) : ToolGesture::None;
+        resting_ = false;
+        repressed_ = false;
+        pull_denied_ = false;
+        tool_busy_ = false;
+        tool_direct_use_ = false;
+        pick_wait_ = c.tap_pick && c.left_scheme == 2 && HunterToolOf(s.goods);
+        press_t_ = in.t;
         windup_.Clear(); // the throw's wind-up starts in the hand
         parry_t_ = -1.0; // the squeeze's own trigger is the fist
         Enter(Phase::Holding);
@@ -4263,10 +5578,12 @@ private:
         if (feel) {
             out.Haptics(Haptic::Grab);
         }
-        if (s.qty == 1) {
+        if (s.goods == ShamanBlade::Goods)
+            out.Log("SHAMAN: stab or slash into a target; no trigger, no canned animation");
+        if (s.qty == 1 && s.goods != Cigarette::Goods) {
             out.Haptics(Haptic::LastOne);
         }
-        if (c.select && in.snapshot.selected != slot) {
+        if (c.select && s.goods != Cigarette::Goods && in.snapshot.selected != slot) {
             Send(out, slot, Action::None, in);
         }
         out.Log("GRAB k=" + std::to_string(slot) + " goods=" + std::to_string(s.goods) +
@@ -4286,17 +5603,18 @@ private:
         if (wipe_item_) {
             out.Log("WIPE it along the blade to apply it (let go away from the blade: back)");
         }
+        const bool grip_crushes = c.left_scheme == 2 && !grip_held_;
         if (hold_item_ && s.goods == QueenlyBlood) {
-            out.Log(c.left_scheme == 2 ? "SQUEEZE the grip to use Queenly Blood; holding alone never uses it"
-                                       : "SQUEEZE the trigger to use Queenly Blood; holding alone never uses it");
+            out.Log(grip_crushes ? "SQUEEZE the grip to use Queenly Blood; holding alone never uses it"
+                                 : "SQUEEZE the trigger to use Queenly Blood; holding alone never uses it");
         } else if (hold_item_) {
             char text[200];
             std::snprintf(text, sizeof(text),
                           "HOLD to use (%s): the ring fills over %.2f s, let go to put it back%s",
                           HoldName(HoldKindFor(c, s.goods)), hold_len_,
                           gesture_ == GestureKind::Crush
-                              ? (c.left_scheme == 2 ? "; or CRUSH it: squeeze the grip hard"
-                                                    : "; or CRUSH it: squeeze the trigger hard")
+                              ? (grip_crushes ? "; or CRUSH it: squeeze the grip hard"
+                                              : "; or CRUSH it: squeeze the trigger hard")
                           : gesture_ == GestureKind::Shake ? "; or SHAKE it: three strokes"
                                                            : "");
             out.Log(text);
@@ -4307,6 +5625,16 @@ private:
         if (crank_item_) {
             out.Log("MUSIC BOX in the left hand: the right hand is free; take the crank with the "
                     "right grip and turn it to play (let go to put it back)");
+        }
+        if (pull_item_ && (tool_gesture_ != ToolGesture::None || ToolKeepOf(s.goods))) {
+            out.Log(
+                std::string{"TOOL ("} + ToolGestureName(tool_gesture_) +
+                "): " + (DirectTool(c) && s.goods==HunterRelics::Tonitrus ?
+                    "hold trigger to charge, then swing to steer the ground lightning" :
+                    DirectTool(c) && s.goods==HunterRelics::Gloves ?
+                    "hold trigger to gather spirits, then release to toss or gently drop and summon" :
+                    ToolGestureHint(tool_gesture_, !grip_crushes)) +
+                (c.tool_keep && ToolKeepOf(s.goods) ? "; it stays in the hand after its use" : ""));
         }
     }
 
@@ -4341,9 +5669,50 @@ private:
         // The game owns the arm (a dodge, a hit, a guard): the item stays in his animated hand;
         // uses and throws wait; too long and it goes back.
         const bool arm = in.arm_weight >= 0.9f;
-        suspended_ = arm ? 0.0f : suspended_ + in.dt;
+        // (quick_tool_keep: a tool's own use animation has the arm: ToolBusyTick's own limit.)
+        suspended_ = arm || tool_busy_ ? 0.0f : suspended_ + in.dt;
         if (suspended_ >= c.suspend_s) {
             PutAway(out, "the game kept the arm", true);
+            return;
+        }
+        if (held_goods_ == ShamanBlade::Goods) {
+            // Put-back still works; the trigger never uses this consumable.
+            if (grip_release && c.left_scheme != 2 && !grip_held_) {
+                PutAway(out, "grip released", true);
+                return;
+            }
+            if (blade_space_ != in.holster_space) {
+                blade_stroke_ = {};
+                blade_space_ = in.holster_space;
+                blade_used_stroke_ = 0; // the stroke serials start again
+            }
+            const bool valid = arm && in.body && in.items_ok && !in.dodge &&
+                in.blade_motion_valid && in.hand_valid && in.head_valid && in.snapshot_fresh &&
+                in.snapshot.slot[static_cast<std::size_t>(held_slot_)].usable;
+            const float hand_speed = Length(in.hand_v);
+            // A genuine stop must reach the gate so a refused stroke can rearm.
+            // Head-only motion also reads as stopped, not as relative hand motion.
+            const V3 v = hand_speed >= .7f && hand_speed <= 12.0f
+                             ? in.hand_v - in.head_v : V3{};
+            const bool moving = blade_stroke_.Step(hold_from_base_ns_, in.t, {v.x,v.y,v.z}, valid);
+            blade_active_ns_ = moving ? steady_ns_ : 0;
+            // A stab stops the hand where the blade meets the enemy: the stroke's contact still
+            // counts once the hand has slowed (it was dropped, the user's headset run 2026-11-04:
+            // the Bone Blade never fired), once per stroke.
+            const bool stroke_unused = !(blade_used_session_ == hold_from_base_ns_ &&
+                                         blade_used_stroke_ == blade_stroke_.Serial());
+            if (valid && stroke_unused &&
+                ShamanBlade::Fresh(in.blade_contact, steady_ns_, hold_from_base_ns_,
+                                   blade_stroke_.Serial(), in.holster_space)) {
+                Request& r = Send(out, c.select ? held_slot_ : -1, Action::Use, in);
+                r.blade_contact = in.blade_contact;
+                blade_used_session_ = hold_from_base_ns_;
+                blade_used_stroke_ = blade_stroke_.Serial();
+                blade_stroke_.Consume();
+                blade_active_ns_ = 0;
+                Enter(Phase::Waiting);
+                wait_t_ = in.t;
+            }
             return;
         }
         const bool throwable = held_class_.use == UseKind::Throw && c.throws;
@@ -4375,6 +5744,47 @@ private:
         // A usable: the grip holds it, the trigger uses it (quick_use_mouth: an item to eat or
         // drink also at the mouth; left_scheme=2: only there, the trigger holds it).
         if (phase_ == Phase::Holding) {
+            // A charged glove leaves the hand on trigger release, before scheme 2's Rest
+            // path can cancel it. Physical grip release still puts it away in scheme 1, unless
+            // gathered to the full (then it throws them, as the trigger's release; the user,
+            // 2026-11-06: "once it's fully charged - I want to be able to throw it even with
+            // releasing the grip button (like a regular item ...)") or already flying.
+            if(held_goods_==HunterRelics::Gloves && DirectTool(c) && c.tool_gestures &&
+               !(grip_release && c.left_scheme!=2 && !grip_held_ && !GloveFlung(grip_release)) &&
+               (glove_drop_.ns>0 || (charge_t_>=0.0 &&
+                                     (c.left_scheme==2 || grip_held_ || GloveFlung(grip_release)) &&
+                                     grip_release))) {
+                if(glove_drop_.ns>0)GloveDropTick(c,in,out,arm);
+                else ChargeTick(c,in,out,arm,false);
+                return;
+            }
+            // The hand opened (the grip that holds it let go: quick_grip_hold, left_scheme=1 or a
+            // body pocket): any flick throws it, smoked or not (2026-11-06: "I can't
+            // throw cigarette on the floor unless I take a puff first"). The trigger let go keeps
+            // Drag::Spent (the headset run 14: let go while bringing it up, it flew).
+            const bool opened = !grip_on_ && (grip_held_ || c.left_scheme != 2);
+            if (grip_release && held_goods_ == Cigarette::Goods && arm && in.hand_valid &&
+                (opened || cigarette_drag_.Spent(steady_ns_))) {
+                // Kos Lights: a flick as it leaves the hand throws the cigarette away (only drawn:
+                // Cigarette::Toss); the packet goes back to its slot for another.
+                const V3 v_display = history_.Release(in.t);
+                const V3 v_fresh = UseFresh(c, in.t) ? fresh_.Release(in.t) : V3{};
+                const V3 v = Length(v_fresh) >= Length(v_display) ? v_fresh : v_display;
+                if (Length(v) >= c.throw_min_speed && std::isfinite(v.x) &&
+                    std::isfinite(v.y) && std::isfinite(v.z)) {
+                    cigarette_toss_ = {steady_ns_, {in.hand_p.x, in.hand_p.y, in.hand_p.z},
+                                       {v.x, v.y, v.z}, in.holster_space};
+                    PutAway(out, "the cigarette thrown away (" +
+                                     std::to_string(Length(v)).substr(0, 4) + " m/s)",
+                            true);
+                    return;
+                }
+            }
+            if (grip_release && held_goods_ == Cigarette::Goods && grip_held_ && !grip_on_) {
+                // quick_grip_hold: let go slowly (or the game has the arm), it goes back.
+                FanBack(c, in, out, "the grip let go: put back", true);
+                return;
+            }
             if (grip_release) {
                 // quick_hold_use: let go of before the ring filled, nothing used.
                 // (quick_use_wipe: let go of on the blade or away from it, nothing used.)
@@ -4385,7 +5795,11 @@ private:
                     : stab_item_  ? " without a stab"
                     : crank_item_ ? " (the music box)"
                                   : std::string{};
-                if (c.left_scheme == 2 && CrankPlayed()) {
+                if (c.left_scheme == 2 && c.tap_pick) {
+                    // quick_tap_pick: it rests in the hand (the grip puts it back).
+                    Rest(out, mouth_item_ ? "trigger let go away from the mouth"
+                                          : "trigger let go" + early);
+                } else if (c.left_scheme == 2 && CrankPlayed()) {
                     // The music box let go after it played: used, so put away with the arc
                     // closed, as after any use (2026-10-15: the arc coming back after
                     // the music box felt weird; let go unplayed, it is a cancel: back below).
@@ -4402,6 +5816,36 @@ private:
                                         : "grip released" + early,
                             true);
                 }
+                return;
+            }
+            // quick_tool_keep: the tool's own use is playing; nothing else until it is over.
+            if (held_goods_ == Cigarette::Goods) {
+                const bool ready = arm && in.hand_valid && in.mouth_valid && in.head_valid &&
+                                   in.snapshot_fresh && std::isfinite(in.head_forward.x) &&
+                                   std::isfinite(in.head_forward.y) &&
+                                   std::isfinite(in.head_forward.z);
+                const float mouth_gap = Length(in.hand_p - in.mouth);
+                ++cigarette_frames_;
+                if (ready) {
+                    ++cigarette_ready_;
+                    if (std::isfinite(mouth_gap) &&
+                        (cigarette_near_ < 0.0f || mouth_gap < cigarette_near_))
+                        cigarette_near_ = mouth_gap;
+                }
+                if (cigarette_drag_.Update(steady_ns_, ready, mouth_gap)) {
+                    ++cigarette_puffs_;
+                    const V3 forward = Normalize(in.head_forward, {0, 0, -1});
+                    cigarette_puff_ = {steady_ns_, {in.mouth.x, in.mouth.y, in.mouth.z},
+                                      {forward.x, forward.y, forward.z}, in.holster_space};
+                    out.Haptics(Haptic::Use);
+                }
+                return; // cosmetic only: never Send, consume, select or fire a gun
+            }
+            if (tool_busy_) {
+                ToolBusyTick(c, in, out);
+                return;
+            }
+            if (AtAugurMouth(c, in, out, arm)) {
                 return;
             }
             if (mouth_item_ && AtMouth(c, in, out, arm)) {
@@ -4425,9 +5869,80 @@ private:
                 return;
             }
             if (hold_item_) {
+                // A body pocket's item is carried in the squeezed grip (holster_held_): its ring
+                // fills while the trigger is held, from the pull, as quick_grip_hold's from the
+                // fan, never by the grip that carries it (the tester's 2026-11-01: a Choir Bell
+                // drawn from a pocket was rung 1.5 s later by being held); a bell rings by its
+                // shake meanwhile. Let go of the trigger before it is full: back to empty.
+                if (holster_held_) {
+                    const bool pull = trigger_on_ && !trigger_fist_; // (never the clench's)
+                    if (pull && !pocket_pull_) {
+                        hold_from_ = hold_from_base_ = in.t;
+                        hold_from_ns_ = hold_from_base_ns_ = steady_ns_;
+                        hold_lost_ = 0.0;
+                        hold_lost_frames_ = 0;
+                        out.Log("PULL on the pocket's " + std::to_string(held_goods_) +
+                                ": the ring fills");
+                    } else if (!pull && pocket_pull_ && !hold_spent_) {
+                        out.Log("trigger let go before the ring filled (" + HoldText(in) +
+                                "): nothing used");
+                    }
+                    pocket_pull_ = pull;
+                    if (pocket_pull_) {
+                        HoldTick(c, in, out, arm);
+                    } else if (gesture_ == GestureKind::Shake) {
+                        HoldTick(c, in, out, arm, true);
+                    }
+                    return;
+                }
                 // quick_hold_use: the ring fills while the button stays held; the trigger
-                // (left_scheme=1) does nothing meanwhile (no use, no gun).
-                HoldTick(c, in, out, arm);
+                // (left_scheme=1) does nothing meanwhile (no use, no gun). quick_tap_pick:
+                // resting in the hand, the ring waits for the trigger again (empty).
+                // quick_grip_hold: a bell in the grip rings by its shake alone (its ring by
+                // time still wants the trigger: holding it never rings it).
+                if (!resting_ && !pick_wait_) {
+                    HoldTick(c, in, out, arm);
+                } else if (grip_held_ && gesture_ == GestureKind::Shake) {
+                    HoldTick(c, in, out, arm, true);
+                }
+                return;
+            }
+            // quick_tap_pick: used by the trigger held on from the pick or pressed again;
+            // quick_tool_gestures: a tool with its act (left_scheme=1 too: the grip holds it,
+            // the trigger with the act uses it), or charged by the trigger held (the Augur's
+            // squeeze, Beast Roar's clench: Charges).
+            if (pull_item_ &&
+                ((c.left_scheme == 2 && c.tap_pick) || tool_gesture_ != ToolGesture::None ||
+                 Charges(c))) {
+                const bool scheme2 = c.left_scheme == 2;
+                PullTick(c, in, out, arm, scheme2 ? trigger_hold_ : trigger_on_ && !trigger_fist_,
+                         scheme2 ? repressed_ : true);
+                return;
+            }
+            if (optic_item_) {
+                // Config::optic: the Monocular is looked through at the eye; the trigger does
+                // nothing meanwhile (no use, no gun).
+                return;
+            }
+            if (held_goods_ == HandLantern::Goods) {
+                // The Hand Lantern (core/vr/hand_lantern.h): the trigger or a shake lights it or
+                // puts it out where it is, in the hand; it stays there until the grip lets go
+                // (back to the hip). The use goes out without waiting for its answer: the game
+                // side only flips the light carried.
+                const bool shaken =
+                    c.shake && shake_.Update(c.shake_cfg, in.t, in.hand_valid, in.hand_wv,
+                                             in.hand_v - in.head_v, arm) == ShakeGate::Event::Rung;
+                if (trigger_edge || shaken) {
+                    if (!arm) {
+                        Deny(out, "the game has the arm");
+                    } else if (in.t - last_use_ >= c.use_cooldown_s) {
+                        last_use_ = in.t;
+                        Send(out, -1, Action::Use, in);
+                        out.Haptics(Haptic::Use);
+                        out.Log("LANTERN goods=" + std::to_string(held_goods_) + " switched (" +
+                                (shaken ? "shaken" : "trigger") + "), still in the hand");
+                    }
+                }
                 return;
             }
             if (trigger_edge) {
@@ -4467,10 +5982,16 @@ private:
         if (in.t - commit_t_ < c.use_commit_s) {
             return;
         }
+        if (DirectTool(c) && (in.t < tool_ready_t_ || !in.items_ok)) {
+            return; // quick_tool_direct: the trigger held waits for the tool's pace (and the
+                    // game's item window: not mid-attack, mid-roll or in a stagger)
+        }
         last_use_ = in.t;
         const bool instant = c.instant && (held_class_.use == UseKind::Instant ||
                                            held_class_.use == UseKind::Bullet);
-        if (instant && !latched(held_goods_)) {
+        if (DirectTool(c)) {
+            UseTool(c, in, out); // quick_tool_direct: no animation
+        } else if (instant && !latched(held_goods_)) {
             Send(out, c.select && in.snapshot.selected != held_slot_ ? held_slot_ : -1,
                  Action::Use, in);
             Enter(Phase::Waiting);
@@ -4493,6 +6014,29 @@ private:
     // own use, no animation). A use within the cooldown waits at the mouth for it; one the game
     // says cannot be used now is refused (the deny tick; it stays in the hand, and the hand has
     // to leave the mouth and come back). True: handled this frame.
+    bool AtAugurMouth(const Config& c, const Input& in, Output& out, bool arm) {
+        if (held_goods_ != 2000 || charge_t_ >= 0.0 || !c.mouth || !c.tool_gestures || !DirectTool(c))
+            return false;
+        // A deliberate approach, never a tracking jump or a stale inventory guess. Reset
+        // the dwell on tracking loss so reacquisition at the face cannot finish a bite.
+        if (!in.mouth_valid || !in.head_valid || !in.hand_valid ||
+            !std::isfinite(Length(in.hand_p - in.mouth)) ||
+            !std::isfinite(Length(in.hand_v - in.head_v))) {
+            mouth_gate_.Reset(in.t);
+            return false;
+        }
+        if (!mouth_gate_.Update(c.mouth_cfg, in.t, true, in.hand_p,
+                                in.hand_v - in.head_v, in.mouth, arm))
+            return false;
+        mouth_gate_.Consume(); // success AND refusal need a fresh approach
+        if (!in.snapshot_fresh || held_slot_ < 0 || held_slot_ >= SlotCount)
+            return true;
+        // Share payment, item-window, ownership and native pace checks with squeezing.
+        // The mouth is a separate physical act: it needs no trigger press.
+        PullTick(c, in, out, arm, true, true, true);
+        return true;
+    }
+
     bool AtMouth(const Config& c, const Input& in, Output& out, bool arm) {
         if (!in.mouth_valid) {
             return false;
@@ -4807,7 +6351,7 @@ private:
     // wipe takes (with quick_use_wipe off the papers and the shell are held instead), nor a
     // throwable.
     [[nodiscard]] bool HoldItem(const Config& c, std::int32_t goods) const {
-        return (c.hold_use || goods == QueenlyBlood) && HoldKindFor(c, goods) != HoldKind::None && !MouthItem(c, goods) &&
+        return goods != ShamanBlade::Goods && (c.hold_use || goods == QueenlyBlood) && HoldKindFor(c, goods) != HoldKind::None && !MouthItem(c, goods) &&
                !WipeItem(c, goods) && !StabItem(c, goods) &&
                !(c.throws && Classify(goods).use == UseKind::Throw);
     }
@@ -4849,7 +6393,10 @@ private:
     // nothing used. A use the cooldown or the game's hold on the arm holds up waits at full; one
     // the game refuses there is a deny (scheme 2: back on the arc; scheme 1: it stays in the hand,
     // spent, until let go).
-    void HoldTick(const Config& c, const Input& in, Output& out, bool arm) {
+    // `gesture_only`: only the gesture counts (a bell resting in the grip): no ring by time, no
+    // hum, no build-up; the game's arm or a dodge only hold the strokes back (ShakeGate).
+    void HoldTick(const Config& c, const Input& in, Output& out, bool arm,
+                  bool gesture_only = false) {
         if (hold_spent_) {
             return;
         }
@@ -4864,13 +6411,15 @@ private:
             ++hold_lost_frames_;
         }
         const bool hit = hold_lost_ >= c.hold_arm_grace_s - 1e-6 && hold_lost_frames_ >= 3;
-        if (hit || in.dodge) {
+        if ((hit || in.dodge) && !gesture_only) {
             out.Haptics(Haptic::PutBack);
             out.Log("HOLD cancelled (" +
                     std::string{in.dodge ? "a dodge or leap" : "the game took the arm: a hit, a "
                                                                "dodge or a guard"} +
                     ", " + HoldText(in) + "): back, nothing used");
-            if (c.left_scheme == 2 && trigger_hold_) {
+            if (c.left_scheme == 2 && c.tap_pick) {
+                Rest(out, "the hold cancelled"); // quick_tap_pick: it stays in the hand
+            } else if (c.left_scheme == 2 && trigger_hold_) {
                 Idle(out, true); // the arc stays closed: a fight
             } else {
                 PutAway(out, "hold cancelled", false);
@@ -4878,9 +6427,9 @@ private:
             return;
         }
         // The time held (the fallback; the shake's steps of the ring never shorten it).
-        const float progress = held_goods_ == QueenlyBlood ? 0.0f :
+        const float progress = held_goods_ == QueenlyBlood || gesture_only ? 0.0f :
             static_cast<float>((in.t - hold_from_base_) / hold_len_);
-        out.hold_hum = held_goods_ == QueenlyBlood ? 0.0f : HoldHum(progress);
+        out.hold_hum = held_goods_ == QueenlyBlood || gesture_only ? 0.0f : HoldHum(progress);
         // quick_use_crush / quick_use_shake: the faster way, through the same completion.
         Haptic feel = Haptic::None;
         std::string how;
@@ -4892,7 +6441,8 @@ private:
         } else if (gesture_ == GestureKind::Shake) {
             ShakeTick(c, in, out, arm, feel, how);
         }
-        out.hold_progress = held_goods_ == QueenlyBlood ? std::max(0.0f, crush_.Strain(c.crush_cfg, in.t)) :
+        out.hold_progress = gesture_only ? -1.0f
+            : held_goods_ == QueenlyBlood ? std::max(0.0f, crush_.Strain(c.crush_cfg, in.t)) :
             std::min(static_cast<float>((in.t - hold_from_) / hold_len_), 1.0f);
         if (held_goods_ == QueenlyBlood) ShowRing(in.t - out.hold_progress*hold_len_);
         // Match the hold and the crush's extra strain. Bell strokes keep their own sound.
@@ -4920,7 +6470,7 @@ private:
                      gesture_ == GestureKind::Crush ? "crushed" : "rung");
             return;
         }
-        if (held_goods_ == QueenlyBlood) return; // No timed auto-use: deliberately squeeze.
+        if (held_goods_ == QueenlyBlood || gesture_only) return; // No timed auto-use: deliberately squeeze.
         if (progress < 1.0f || !arm || in.t - last_use_ < c.use_cooldown_s) {
             // Filling; or full, waiting out the cooldown, or for the arm: the game holding it as
             // the ring fills is never used through (a hit's first frames; within
@@ -4946,7 +6496,12 @@ private:
             // (a gesture's own line with it: how it was crushed or rung, for tuning)
             const std::string why =
                 std::string{what} + (feel == Haptic::HoldDone ? "" : " (" + how + ")");
-            if (c.left_scheme == 2) {
+            if (c.left_scheme == 2 && c.tap_pick) {
+                // quick_tap_pick: it stays in the hand, the ring empty (the trigger again).
+                out.Haptics(Haptic::Deny);
+                pulse(held_slot_, true);
+                Rest(out, why + ", the game says it cannot be used now");
+            } else if (c.left_scheme == 2) {
                 out.Haptics(Haptic::Deny);
                 pulse(held_slot_, true);
                 ToArc(in, out, why + ", the game says it cannot be used now: back", 0.0, false);
@@ -4957,13 +6512,44 @@ private:
         }
         out.hold_hum = 0.0f;
         out.hold_progress = 1.0f;
-        out.Haptics(feel);
-        if (in.gameplay && in.body && IsBellItem(held_goods_) && feel == Haptic::BellToll)
-            out.BellSound(feel);
+        // quick_tool_direct: the Choir Bell rung is its use, no animation (its pace first, and
+        // the game's item window: rung mid-attack, mid-roll or in a stagger it is nothing, its
+        // toll too: only the deny is felt).
+        const bool refused = DirectTool(c) && (in.t < tool_ready_t_ || !in.items_ok);
+        if (!refused) {
+            out.Haptics(feel);
+            if (in.gameplay && in.body && IsBellItem(held_goods_) && feel == Haptic::BellToll)
+                out.BellSound(feel);
+        }
         hold_use_ = true;
         hold_done_ns_ = steady_ns_;
         last_use_ = in.t;
-        out.Log(how + ": used");
+        if (!refused)
+            out.Log(how + ": used");
+        if (DirectTool(c)) {
+            if (refused) {
+                out.Haptics(Haptic::Deny);
+                pulse(held_slot_, true);
+                char text[96];
+                if (!in.items_ok) {
+                    std::snprintf(text, sizeof(text), "%s", NotNow);
+                } else {
+                    std::snprintf(text, sizeof(text), "not ready (the tool's pace: %.2f s more)",
+                                  tool_ready_t_ - in.t);
+                }
+                if (c.left_scheme == 2 && c.tap_pick) {
+                    Rest(out, text);
+                } else if (c.left_scheme == 2) {
+                    ToArc(in, out, std::string{text} + ": back", 0.0, false);
+                } else {
+                    hold_spent_ = true;
+                    out.Log(std::string{"deny: "} + text + " (let go)");
+                }
+                return;
+            }
+            UseTool(c, in, out);
+            return;
+        }
         const bool instant =
             c.instant && (held_class_.use == UseKind::Instant || held_class_.use == UseKind::Bullet);
         if (instant && !latched(held_goods_)) {
@@ -4990,13 +6576,12 @@ private:
     // the strain through the confirm (up from 0.35 to 0.70), then crushed (`feel`: Crunch).
     void CrushTick(const Config& c, const Input& in, Output& out, bool arm, float progress,
                    Haptic& feel, std::string& how) {
-        const float squeeze = c.left_scheme == 2 ? in.grip : in.trigger;
-        if (crush_.Update(c.crush_cfg, in.t, squeeze, arm)) {
+        if (crush_.Update(c.crush_cfg, in.t, CrushSqueeze(c, in), arm)) {
             char text[200];
             std::snprintf(text, sizeof(text),
                           "CRUSH (the %s squeezed to %.2f, held %.0f ms; armed %.2f s after the "
                           "take, the item held %.2f s)",
-                          c.left_scheme == 2 ? "grip" : "trigger", crush_.Peak(),
+                          CrushButton(c), crush_.Peak(),
                           (in.t - crush_.Since()) * 1000.0, crush_.ArmedAt() - crush_.HeldSince(),
                           in.t - crush_.HeldSince());
             how = text;
@@ -5150,6 +6735,17 @@ private:
             StartSquare(c, in, out);
         } else if (speed >= c.throw_min_speed && arm) {
             Throw(c, in, out, v, fresh, Length(v_fresh), Length(v_display));
+        } else if (grip_held_) {
+            // quick_grip_hold: no throw, the grip let go of it: back.
+            FanBack(c, in, out,
+                    !arm ? "let go while the game had the arm"
+                         : "let go slowly (" + std::to_string(speed).substr(0, 4) + " m/s)",
+                    true);
+        } else if (c.left_scheme == 2 && c.tap_pick) {
+            // quick_tap_pick: no throw, it rests in the hand (the grip puts it back).
+            Rest(out,
+                 !arm ? "trigger let go while the game had the arm"
+                      : "trigger let go slowly (" + std::to_string(speed).substr(0, 4) + " m/s)");
         } else if (c.left_scheme == 2) {
             // left_scheme=2: back on the arc, which stays open for the next pick.
             ToArc(in, out,
@@ -5275,14 +6871,23 @@ private:
             l2_fresh_needed_ = in.trigger_latch;
             out.Log("Square for goods " + std::to_string(held_goods_) +
                     (CannedOf(held_goods_) ? " (a canned use: its animation shown flat)" : ""));
-            Idle(out, false);
+            if (KeepsTool(c)) {
+                KeepTool(c, in, out,
+                         true); // quick_tool_keep: back in the hand once its use is over
+            } else {
+                Idle(out, false);
+            }
             return;
         }
         if (in.t - wait_t_ >= c.square_wait_s) {
             out.Haptics(Haptic::Deny);
             out.Log("Square path: the game did not select slot " + std::to_string(held_slot_));
             l2_fresh_needed_ = in.trigger_latch;
-            Idle(out, false);
+            if (c.left_scheme == 2 && c.tap_pick) {
+                Rest(out, "the game did not select it"); // still in the hand
+            } else {
+                Idle(out, false);
+            }
         }
     }
 
@@ -5290,13 +6895,38 @@ private:
         if (in.have_result && in.result.serial == serial_ && in.result.outcome != Outcome::None &&
             in.result.outcome != Outcome::Selected) {
             const Result& r = in.result;
+            // A shot may spend bullets between the input snapshot and the game's use.
+            // Only a denied tool with a fresh shortfall gets magic-empty feedback.
+            if (r.outcome == Outcome::Denied && tool_direct_use_ && HeldShortOfBullets(in))
+                out.no_bullets = true;
             out.Log(std::string{"result "} + OutcomeName(r.outcome) + " goods=" +
                     std::to_string(r.goods) + " qty " + std::to_string(r.qty_before) + "->" +
                     std::to_string(r.qty_after) + (r.reason[0] != 0 ? " (" : "") + r.reason +
                     (r.reason[0] != 0 ? ")" : ""));
             l2_fresh_needed_ = in.trigger_latch;
+            // A Call Beyond called with no animation of the game's (quick_tool_direct): the game's
+            // own call (quick_use_audio.h CallSample, on the use audio's mixer).
+            if (r.outcome == Outcome::Used && r.goods == CallBeyond::Goods && tool_direct_use_) {
+                beyond_raises.fetch_add(1, std::memory_order_release);
+            }
+            if (held_goods_ == ShamanBlade::Goods && r.outcome == Outcome::Used) {
+                out.Haptics(Haptic::Use);
+                Idle(out, true); // a combat hit never reopens the fan in the enemy's face
+                return;
+            }
             if (c.left_scheme == 2) {
                 Settle2(c, in, out, r.outcome);
+                return;
+            }
+            if (tool_direct_use_ && r.outcome != Outcome::Used) {
+                tool_ready_t_ = -100.0; // quick_tool_direct: refused, no pace to wait for
+                ready_glow_ = false;
+            }
+            tool_direct_use_ = false;
+            // quick_tool_keep: a pocket's tool used stays while the grip holds it.
+            if (r.outcome == Outcome::Used && KeepsTool(c) && grip_on_) {
+                out.Haptics(ToolUseHaptic(held_goods_));
+                KeepTool(c, in, out, false);
                 return;
             }
             if (r.outcome == Outcome::Used || r.outcome == Outcome::Thrown) {
@@ -5312,7 +6942,7 @@ private:
                 }
                 Idle(out, true);
             } else {
-                if (r.outcome == Outcome::Latched) {
+                if (r.outcome == Outcome::Latched && held_goods_ != ShamanBlade::Goods) {
                     latch(held_goods_);
                 }
                 out.Haptics(Haptic::Deny);
@@ -5361,6 +6991,10 @@ private:
             out.Log("stack: none left in slot " + std::to_string(slot));
             return;
         }
+        if (ShortOfBullets(in.snapshot, s)) {
+            RefuseShort(in, out, slot, "stack"); // (the Accursed Brew thrown with the last bullets)
+            return;
+        }
         Grab(c, in, out, slot, "stack");
     }
 
@@ -5370,26 +7004,47 @@ private:
     // Y's open would (the hunter's hand, the slots); not with the trigger held (a clench round
     // the gun) nor with a vial in the hand (the needle's fist).
     void UpdateIdle2(const Config& c, const Input& in, Output& out, bool grip_edge) {
+        if (FanReturnTick(c, in, out, grip_edge)) {
+            return;
+        }
+        // quick_grip_open_ms: the squeeze still on that long opens it (let go before, nothing:
+        // Update); checked again then, as at the squeeze.
+        if (grip_open_t_ >= 0.0) {
+            if (in.t - grip_open_t_ >= c.grip_open_s - 1e-4) {
+                grip_open_t_ = -1.0;
+                GripOpen(c, in, out);
+            }
+            return;
+        }
         if (!grip_edge) {
             return;
         }
-        // Refused: a soft buzz (Empty), so a squeeze that opens nothing is felt.
-        if (in.trigger_latch || in.trigger_raw >= 0.45f) {
-            out.Haptics(Haptic::Empty);
-            out.Log("grip with the trigger held (a clench): no arc");
-        } else if (in.vial_busy) {
-            out.Haptics(Haptic::Empty);
-            out.Log("grip with the vial in the hand (the needle's fist): no arc; X or a Y tap puts "
-                    "the vial back");
-        } else if (!in.body || !in.snapshot_fresh) {
-            out.Haptics(Haptic::Empty);
-            out.Log(!in.body ? "grip: no arc (the body is not driven)"
-                             : "grip: no arc (no quick-item state)");
-        } else {
-            toggle_by_ = "grip";
-            regrab_slot_ = -1;
-            Open(c, in, out);
+        if (c.grip_open_s > 0.0f && GripOpenRefusal(in) == nullptr) {
+            grip_open_t_ = in.t;
+            return;
         }
+        GripOpen(c, in, out);
+    }
+    // Why the grip opens no arc now (nullptr: it may).
+    [[nodiscard]] static const char* GripOpenRefusal(const Input& in) {
+        return in.trigger_latch || in.trigger_raw >= 0.45f
+                   ? "grip with the trigger held (a clench): no arc"
+               : in.vial_busy ? "grip with the vial in the hand (the needle's fist): no arc; X or "
+                                "a Y tap puts the vial back"
+               : !in.body           ? "grip: no arc (the body is not driven)"
+               : !in.snapshot_fresh ? "grip: no arc (no quick-item state)"
+                                    : nullptr;
+    }
+    void GripOpen(const Config& c, const Input& in, Output& out) {
+        // Refused: a soft buzz (Empty), so a squeeze that opens nothing is felt.
+        if (const char* why = GripOpenRefusal(in)) {
+            out.Haptics(Haptic::Empty);
+            out.Log(why);
+            return;
+        }
+        toggle_by_ = "grip";
+        regrab_slot_ = -1;
+        Open(c, in, out);
     }
 
     // Open: the trigger on a card lit dwell_s takes it (TakeByTrigger); a pull on a card lit for
@@ -5414,7 +7069,15 @@ private:
                 ? std::max(open_t_, static_cast<double>(in.hover.placed_ns) * 1e-9)
                 : open_t_;
         const bool settled = in.t - placed_t >= c.hover_delay_s;
-        const std::int32_t hovered = live && arm && settled ? in.hover.slot : -1;
+        // The fan (D1 of the plan): its lit slot is the hover; the centre and out of the fan are
+        // "off the cards" (the gun's). Its take waits for the arm (below).
+        int fan_hover = -1;
+        if (fan_ && (fan_hover = FanHover(c, in, out)) == -2) {
+            return;
+        }
+        const std::int32_t hovered = fan_                   ? fan_hover
+                                     : live && arm && settled ? in.hover.slot
+                                                              : -1;
         // The arc back after a throw wants a longer look at a card (the hand coming back to rest
         // after the follow-through lands on one).
         const double dwell = reopen_until_ > 0.0
@@ -5446,7 +7109,7 @@ private:
             Close(out, "X (the vial)");
             return;
         }
-        if (grip_edge && grip_armed_) {
+        if (grip_edge && grip_armed_ && !c.grip_hold) {
             Close(out, "grip");
             return;
         }
@@ -5463,19 +7126,65 @@ private:
         const bool still_since_left =
             in.hand_valid && hand_track_.TravelSince(hover_lost_t_ - c.hover_lag_s, in.hand_p) <=
                                  c.late_move_m;
+        // quick_grip_hold: the grip (once the one that opened it was let go) on a card takes it,
+        // as the trigger's pull below (waits for its dwell while the grip stays squeezed on it, or
+        // a card just left); off the cards it closes the arc. The trigger is the gun's.
+        if (c.grip_hold && grip_edge && grip_armed_) {
+            if (hovered >= 0) {
+                pull_slot_ = hovered;
+                pull_t_ = in.t;
+                pull_lit_from_ = hover_since_;
+                pull_by_grip_ = true;
+            } else if (!fan_ && arm && last_hover_ >= 0 && last_dwelled_ &&
+                       in.t - hover_lost_t_ <= c.late_hover_s && still_since_left) {
+                TakeByTrigger(c, in, out, last_hover_, "late hover", true);
+                return;
+            } else {
+                if (fan_) {
+                    out.Log("grip " +
+                            std::string{fan_pick_.out ? "out of the fan"
+                                        : std::hypot(fan_pick_.at.x, fan_pick_.at.y) < FanEnterM
+                                            ? "in the fan's centre"
+                                            : "off the fan's cards"} +
+                            " " + FanDetail(in));
+                }
+                Close(out, "grip");
+                return;
+            }
+        }
+        // ... a fresh pull alone is the gun in the empty hand (the arc closes); one with the grip,
+        // or within fist_s of its squeeze, is a whole-hand grab, never the gun (GunPull).
+        if (c.grip_hold) {
+            if (GunPull(c, in, l2_edge, out)) {
+                panic_l2_ = true;
+                Close(out, "trigger (gun)");
+                return;
+            }
+            l2_edge = false;
+        }
         if (l2_edge) {
             if (hovered >= 0) {
                 pull_slot_ = hovered; // taken once it has been lit `dwell` (below)
                 pull_t_ = in.t;
                 pull_lit_from_ = hover_since_;
-            } else if (arm && last_hover_ >= 0 && last_dwelled_ &&
+                pull_by_grip_ = false;
+            } else if (!fan_ && arm && last_hover_ >= 0 && last_dwelled_ &&
                        in.t - hover_lost_t_ <= c.late_hover_s && still_since_left) {
                 TakeByTrigger(c, in, out, last_hover_, "late hover");
                 return;
             } else {
-                // Combat first: off the cards the gun in the empty hand fires at the pull and the
-                // arc closes in the same frame.
+                // Combat first: off the cards (the fan: in its centre, below the hand, or pulled
+                // out of it) the gun in the empty hand fires at the pull and the arc closes in the
+                // same frame.
                 panic_l2_ = true;
+                if (fan_) {
+                    const float r = std::hypot(fan_pick_.at.x, fan_pick_.at.y);
+                    out.Log("trigger " +
+                            std::string{fan_pick_.out    ? "out of the fan"
+                                        : r < FanEnterM ? "in the fan's centre"
+                                                        : "off the fan's cards"} +
+                            ": the gun " + FanDetail(in));
+                }
                 Close(out, "trigger (gun)");
                 return;
             }
@@ -5487,9 +7196,15 @@ private:
                               hand_track_.TravelSince(pull_t_, in.hand_p) <= c.late_move_m &&
                               in.t - pull_t_ <= c.late_hover_s + c.dwell_s;
             const int lit_ms = static_cast<int>(std::lround((in.t - pull_lit_from_) * 1000.0));
-            if (!in.trigger_latch) {
-                out.Log("trigger let go on slot " + std::to_string(pull_slot_) + " lit " +
-                        std::to_string(lit_ms) + " ms: nothing taken");
+            const char* button = pull_by_grip_ ? "grip" : "trigger";
+            if (!(pull_by_grip_ ? grip_on_ : in.trigger_latch)) {
+                out.Log(std::string{button} + " let go on slot " + std::to_string(pull_slot_) +
+                        " lit " + std::to_string(lit_ms) + " ms: nothing taken");
+                pull_slot_ = -1;
+            } else if (!on_it && !jerk && pull_by_grip_) {
+                // (The grip's: nothing taken, the arc stays; no gun in a squeeze.)
+                out.Log("the hand left slot " + std::to_string(pull_slot_) + " after " +
+                        std::to_string(lit_ms) + " ms (under the dwell): nothing taken");
                 pull_slot_ = -1;
             } else if (!on_it && !jerk) {
                 // The hand slipped off before the card was lit long enough: the pull is the gun's
@@ -5499,13 +7214,19 @@ private:
                 panic_l2_ = true;
                 Close(out, "trigger (gun)");
                 return;
-            } else if (in.t - pull_lit_from_ >= dwell - 1e-6) {
+            } else if (in.t - pull_lit_from_ >= dwell - 1e-6 && (arm || !fan_)) {
+                // (The fan picks without the arm, but the item goes into the hunter's hand only
+                // once the arm is yours again: the pull waits for it while held on the slot.)
                 const std::int32_t slot = pull_slot_;
                 pull_slot_ = -1;
+                if (fan_) {
+                    out.Log("fan take " + FanDetail(in));
+                }
                 TakeByTrigger(c, in, out, slot,
                               !on_it                   ? "hover (just off it: the pull's jerk)"
                               : in.t - pull_t_ > 1e-6 ? "hover (waited for the dwell)"
-                                                       : "hover");
+                                                       : "hover",
+                              pull_by_grip_);
                 return;
             }
         }
@@ -5561,17 +7282,54 @@ private:
     // The trigger took slot `slot`: a throwable is held while the trigger stays down (its
     // release throws, UpdateHolding); a usable is used at once (the game's UseGoods, or its own
     // animation), the arc closing once the game answers. Refused (the game has the arm, the
-    // cooldown, the game says no): a deny, the arc stays open.
+    // cooldown, the game says no): a deny, the arc stays open. quick_tap_pick: every item is
+    // picked up into the hand (only the game having the arm refuses it). `by_grip`
+    // (quick_grip_hold): the grip took it and holds it, the trigger free (it rests in the hand
+    // for the trigger's use; a throwable waits for the grip's release).
     void TakeByTrigger(const Config& c, const Input& in, Output& out, std::int32_t slot,
-                       const char* via) {
+                       const char* via, bool by_grip = false) {
         const int lit_ms = static_cast<int>(std::lround((in.t - hover_since_) * 1000.0));
         const std::string detail = "by the trigger, lit " + std::to_string(lit_ms) + " ms";
         if (slot < 0 || slot >= SlotCount || in.snapshot.slot[static_cast<std::size_t>(slot)].Empty()) {
             out.Haptics(Haptic::Empty);
+            if (fan_ && slot >= 0 && slot < SlotCount) {
+                pulse(slot, true); // an empty slot of the fan: its card flashes
+            }
             out.Log("trigger on an empty card (slot " + std::to_string(slot) + ")");
             return;
         }
         const Slot& s = in.snapshot.slot[static_cast<std::size_t>(slot)];
+        if (ShortOfBullets(in.snapshot, s)) {
+            RefuseShort(in, out, slot, via);
+            return;
+        }
+        if (by_grip) {
+            if (in.arm_weight < c.arm_min) {
+                out.Haptics(Haptic::Deny);
+                pulse(slot, true);
+                out.Log("deny slot " + std::to_string(slot) + ": the game has the arm");
+                return;
+            }
+            Grab(c, in, out, slot, via, "by the grip, lit " + std::to_string(lit_ms) + " ms",
+                 true, true);
+            trigger_hold_ = false;
+            pick_wait_ = false;
+            resting_ = !Throwable(c);
+            out.Log(resting_ ? "HELD by the grip: the trigger uses it, letting go of the grip "
+                               "puts it back"
+                             : "HELD by the grip: swing and let go of the grip to throw it "
+                               "(let go slowly: back)");
+            return;
+        }
+        // quick_tap_pick: taken with the grip still held (the squeeze that opened the fan, kept),
+        // letting go of the grip puts it back; taken without, a new squeeze does.
+        grip_take_held_ = c.tap_pick && grip_on_;
+        if (s.goods == Cigarette::Goods) {
+            if (in.arm_weight < c.arm_min) { out.Haptics(Haptic::Deny); return; }
+            Grab(c, in, out, slot, via, detail);
+            trigger_hold_ = true;
+            return;
+        }
         if (Classify(s.goods).use == UseKind::Throw && c.throws) {
             Grab(c, in, out, slot, via, detail);
             trigger_hold_ = true;
@@ -5604,6 +7362,13 @@ private:
             trigger_hold_ = true;
             return;
         }
+        // quick_tap_pick: whatever it is, picked up and never used at the pull (PullTick: kept
+        // down tap_use_s, or pressed again; the game's refusal is the use's, not the pick's).
+        if (c.tap_pick && c.left_scheme == 2 && arm) {
+            Grab(c, in, out, slot, via, detail);
+            trigger_hold_ = true;
+            return;
+        }
         if (why != nullptr) {
             out.Haptics(Haptic::Deny);
             pulse(slot, true);
@@ -5616,7 +7381,12 @@ private:
         last_use_ = in.t;
         const bool instant =
             c.instant && (held_class_.use == UseKind::Instant || held_class_.use == UseKind::Bullet);
-        if (instant && !latched(held_goods_)) {
+        if (DirectTool(c) && in.t >= tool_ready_t_ && in.items_ok) {
+            UseTool(c, in, out); // quick_tool_direct: no animation
+        } else if (DirectTool(c)) {
+            Deny(out, in.items_ok ? "not ready (the tool's pace)" : NotNow);
+            Idle(out, false);
+        } else if (instant && !latched(held_goods_)) {
             Send(out, c.select && in.snapshot.selected != held_slot_ ? held_slot_ : -1,
                  Action::Use, in);
             Enter(Phase::Waiting);
@@ -5637,6 +7407,7 @@ private:
         }
         out.Haptics(Haptic::GunBack);
         out.Log("ARC (" + why + ")");
+        StopActs(out);
         held_slot_ = -1;
         held_goods_ = -1;
         held_ffx_ = -1;
@@ -5650,6 +7421,13 @@ private:
         hold_item_ = hold_use_ = hold_spent_ = false;
         ClearGestures();
         Enter(Phase::Open);
+        if (fan_) {
+            // The fan back round the hand where it is now (a new placement: the render hook
+            // places it again), never round where it was: after a throw or a put-back the hand can
+            // be anywhere, and the old centre would light a slot, or dismiss it, at once.
+            ++open_serial_;
+            FanBegin(in);
+        }
         open_t_ = in.t; // the hover waits hover_delay_s again (no take as it fades in)
         last_activity_ = in.t;
         open_hand_ = activity_hand_ = in.hand_p;
@@ -5667,6 +7445,11 @@ private:
     // item back on it. Never with a vial in the hand.
     void Settle2(const Config& c, const Input& in, Output& out, Outcome o) {
         const bool done = o == Outcome::Used || o == Outcome::Thrown;
+        if (tool_direct_use_ && o != Outcome::Used) {
+            tool_ready_t_ = -100.0; // quick_tool_direct: refused, no pace to wait for
+            ready_glow_ = false;
+        }
+        tool_direct_use_ = false;
         if (o == Outcome::Latched) {
             latch(held_goods_);
         }
@@ -5680,6 +7463,26 @@ private:
             mouth_use_ = wipe_use_ = stab_use_ = false;
             Enter(Phase::Holding);
             pulse(held_slot_, true);
+            return;
+        }
+        // quick_tap_pick: refused, it stays in the hand (a refused throw too: never thrown).
+        if (!done && c.tap_pick && o != Outcome::Latched && !in.vial_busy) {
+            pulse(held_slot_, true);
+            mouth_use_ = wipe_use_ = stab_use_ = false;
+            thrown_ = false;
+            Rest(out, "refused");
+            return;
+        }
+        // quick_tool_keep: a used tool (the game's UseGoods at once) stays in the hand.
+        if (o == Outcome::Used && KeepsTool(c) && !in.vial_busy) {
+            KeepTool(c, in, out, false); // (UseGoods at once: no animation)
+            return;
+        }
+        // quick_grip_hold: used up or thrown, the arc stays closed (FanBack); otherwise (nothing
+        // spent) it is a put-back.
+        if (grip_held_) {
+            used_since_take_ = used_since_take_ || done;
+            FanBack(c, in, out, thrown_ ? "thrown" : done ? "used" : OutcomeName(o), false);
             return;
         }
         const bool again = !done || (thrown_ && c.stack && c.reopen_s > 0.0f);
@@ -5727,7 +7530,7 @@ private:
             return Haptic::Inject; // quick_use_stab: injected (the presenter's THUMP, both hands)
         }
         if (!mouth_use_) {
-            return h;
+            return h == Haptic::Use ? ToolUseHaptic(held_goods_) : h;
         }
         return MouthOf(held_goods_) == MouthKind::Drink ? Haptic::Gulp : Haptic::Bite;
     }
@@ -5739,6 +7542,8 @@ private:
         hover_slot_ = last_hover_ = -1;
         pull_slot_ = -1;
         reopen_until_ = 0.0;
+        fan_sel_.Reset();
+        fan_pick_ = {};
         HoldTriggerBack();
     }
 
@@ -5749,6 +7554,15 @@ private:
             l2_fresh_needed_ = true;
         }
         parry_t_ = -1.0;
+    }
+
+    void ClaimVialGrip() {
+        vial_trigger_pending_ = false;
+        if (!vial_grip_claimed_) {
+            vial_grip_claimed_ = true;
+            vial_fist_wait_ = !latch_now_;
+        }
+        HoldTriggerBack();
     }
 
     void PutAway(Output& out, const std::string& why, bool haptic) {
@@ -5763,7 +7577,9 @@ private:
         if (gun_back) {
             out.Haptics(Haptic::GunBack);
         }
+        StopActs(out);
         Enter(Phase::Idle);
+        fan_return_until_ = 0.0;
         held_slot_ = -1;
         held_goods_ = -1;
         held_ffx_ = -1;
@@ -5779,7 +7595,17 @@ private:
         pull_slot_ = -1;
         reopen_until_ = 0.0;
         hover_slot_ = last_hover_ = -1;
+        fan_sel_.Reset();
+        fan_pick_ = {};
         HoldTriggerBack();
+    }
+
+    // A body pocket's grab can't be taken now: a vial's pocket (assignment 1) only while a vial is
+    // armed or its injection pending (Input::vial_held, X's own rule: never the game's item-use
+    // state, which the stab checks, nor the drained vial still shown after a heal); a quick item's
+    // pocket while any vial is busy or the game is using an item.
+    [[nodiscard]] static bool PocketBusy(const Input& in, int assignment) {
+        return assignment == 1 ? in.vial_held : in.snapshot.busy || in.vial_busy;
     }
 
     // quick_music_box_crank: the Tiny Music Box played by its crank (core/vr/music_box.h), through
@@ -5832,7 +7658,10 @@ private:
     }
 
     void ClearGestures() {
+        blade_stroke_ = {};
+        blade_active_ns_ = 0;
         crank_item_ = false;
+        optic_item_ = false;
         crank_serial_ = 0;
         crank_played_ = false;
         gesture_ = GestureKind::None;
@@ -5840,12 +7669,902 @@ private:
         shake_shown_ = 0;
         stab_item_ = stab_use_ = false;
         stab_pending_t_ = -1.0;
+        pull_item_ = false;
+        tool_gesture_ = ToolGesture::None;
+        resting_ = repressed_ = pull_denied_ = tool_busy_ = false;
+        grip_take_held_ = false;
+        pick_wait_ = false;
+        grip_held_ = false;
+        eye_side_ = -1;
+        swing_.Reset();
+        items_waited_ = false;
     }
 
+    // ---- quick_tap_pick / quick_tool_keep / quick_tool_gestures
+    // ----------------------------------
+
+    // The trigger let go of the item (or its hold cancelled, or refused): it rests in the hand,
+    // the ring empty; the trigger pressed again holds it (Press), the grip puts it back.
+    void Rest(Output& out, const std::string& why) {
+        if (blow_t_ >= 0.0) {
+            StopBlow(out, why); // the whistle's call stops with the trigger
+        }
+        if (charge_t_ >= 0.0) {
+            StopCharge(out, why); // so does a gathering
+        }
+        resting_ = true;
+        pick_wait_ = false;
+        trigger_hold_ = false;
+        repressed_ = false;
+        release_pending_ = false;
+        hold_use_ = hold_spent_ = false;
+        gesture_pending_ = false;
+        out.hold_hum = 0.0f;
+        out.hold_progress = -1.0f;
+        out.use_whoosh = -1.0f;
+        Enter(Phase::Holding);
+        out.Log("REST (" + why +
+                (grip_held_ ? "): in the hand; the trigger uses it, letting go of the grip puts it "
+                              "back"
+                            : "): in the hand; the trigger again uses it, the grip puts it back"));
+    }
+
+    // The trigger pressed again on the item resting in the hand: held by it, as at the pick (a
+    // ring starts again from empty; a usable is used at once, PullTick).
+    void Press(const Input& in, Output& out) {
+        if (tool_busy_) {
+            out.Log("trigger while the tool's use plays: nothing");
+            return;
+        }
+        resting_ = false;
+        pick_wait_ = false;
+        trigger_hold_ = true;
+        repressed_ = true;
+        pull_denied_ = false;
+        items_waited_ = false;
+        press_t_ = in.t;
+        windup_.Clear();
+        if (hold_item_) {
+            hold_from_ = hold_from_base_ = in.t;
+            hold_from_ns_ = hold_from_base_ns_ = steady_ns_;
+            hold_lost_ = 0.0;
+            hold_lost_frames_ = 0;
+            gesture_pending_ = false;
+            crush_.Reset(in.t);
+            shake_.Reset(in.t);
+            shake_shown_ = 0;
+        }
+        out.Log("PRESS: the trigger again on goods " + std::to_string(held_goods_) +
+                (hold_item_ ? " (the ring starts again)" : ""));
+    }
+
+    // Whether the held tool's act is done this frame (`how` says how). Its gates follow the hand
+    // every frame, held or not (a dwell at the mouth, a fresh squeeze for the crush).
+    bool ToolReady(const Config& c, const Input& in, bool arm, bool held, std::string& how) {
+        const ToolConfig& k = c.tool_cfg;
+        char text[160];
+        switch (tool_gesture_) {
+        case ToolGesture::Mouth: {
+            if (!in.mouth_valid) {
+                return false;
+            }
+            const bool at = mouth_gate_.Update(c.mouth_cfg, in.t, in.hand_valid, in.hand_p,
+                                               in.hand_v - in.head_v, in.mouth, arm);
+            if (at) {
+                std::snprintf(text, sizeof(text), "blown at the mouth (%.1f cm from it)",
+                              100.0f * mouth_gate_.Distance());
+                how = text;
+            }
+            return at;
+        }
+        case ToolGesture::Crush: {
+            if (!crush_.Update(c.crush_cfg, in.t, CrushSqueeze(c, in), arm)) {
+                return false;
+            }
+            std::snprintf(text, sizeof(text), "crushed (the %s at %.2f)", CrushButton(c),
+                          crush_.Peak());
+            how = text;
+            crush_.Consume();
+            return held;
+        }
+        case ToolGesture::Eye: {
+            // As the Monocular's optic (Monocular::SelectEye on Input::eye_d: the drawn item to
+            // each of your eyes, in under 12 cm, out past 17 cm, over to the other eye when it
+            // is clearly closer). Held against the headset the controller often loses its
+            // tracking: untracked, the gate keeps what it was (at the eye it stays; the drawn
+            // hand drifts back to the animation meanwhile, so its distances do not count).
+            if (in.eye_valid && in.eye_tracked) {
+                eye_side_ = Monocular::SelectEye(in.eye_d, eye_side_);
+            }
+            if (eye_side_ >= 0) {
+                std::snprintf(text, sizeof(text), "held to the %s eye (%.1f cm from it)",
+                              eye_side_ == 0 ? "left" : "right",
+                              100.0f * in.eye_d[static_cast<std::size_t>(eye_side_)]);
+                how = text;
+            } else {
+                how = "pointed, as a gun"; // (the tester's 2026-11-01: easy, like a gun)
+            }
+            return true;
+        }
+        case ToolGesture::Raise: {
+            const bool up =
+                in.head_valid && in.hand_valid && in.hand_p.y >= in.head_p.y + k.raise_m;
+            if (up) {
+                std::snprintf(text, sizeof(text), "raised (%.0f cm above the eyes)",
+                              100.0f * (in.hand_p.y - in.head_p.y));
+                how = text;
+            }
+            // Gathered (quick_tool_direct): the trigger starts it wherever the hand is; raised it
+            // calls (ChargeTick).
+            if (Charges(c) && !up) {
+                how = "the trigger held";
+                return true;
+            }
+            return up;
+        }
+        case ToolGesture::Swing: {
+            if (DirectTool(c) && (held_goods_ == HunterRelics::Tonitrus || held_goods_==HunterRelics::Gloves)) {
+                how = held_goods_==HunterRelics::Tonitrus ? "hold the trigger to charge, then swing" :
+                      "hold the trigger to gather spirits, then release to drop";
+                return true;
+            }
+            swing_.Update(k, in.t, in.hand_v - in.head_v, in.hand_valid && in.head_valid);
+            const bool swung = swing_.Ready(k, in.t);
+            if (swung) {
+                std::snprintf(text, sizeof(text), "swung down (%.2f m/s, a %.0f cm stroke)",
+                              swing_.Peak(), 100.0f * swing_.Drop());
+                how = text;
+            }
+            return swung;
+        }
+        default:
+            how = repressed_ ? "the trigger again" : "the trigger held";
+            return true;
+        }
+    }
+
+    // A usable used by the trigger (quick_tap_pick; quick_tool_gestures: with its act): `held`
+    // the trigger holding it, `pressed` pressed again (no wait). Kept down from the pick, it is
+    // used once held tap_use_s. One use per press: refused, the trigger is let go and pressed
+    // again; within the cooldown it waits.
+    void PullTick(const Config& c, const Input& in, Output& out, bool arm, bool held,
+                  bool pressed, bool eating = false) {
+        std::string how;
+        const bool ready = ToolReady(c, in, arm, held, how);
+        if (blow_t_ >= 0.0) {
+            BlowTick(c, in, out, arm, held);
+            return;
+        }
+        if (charge_t_ >= 0.0) {
+            ChargeTick(c, in, out, arm, held);
+            return;
+        }
+        if (!held) {
+            pull_denied_ = false;
+            items_waited_ = false;
+            return;
+        }
+        if ((!eating && (pick_wait_ || pull_denied_)) || (!pressed && in.t - press_t_ < c.tap_use_s - 1e-6) ||
+            !ready) {
+            return; // (a hunter tool: never by the pull that picked it)
+        }
+        // A swing or a crush is over in a moment: refused now, not kept for later. A refused swing
+        // is spent, not the press: the next swing tries again with the trigger still held (the
+        // user's 2026-11-01 leeway).
+        if (eating) how = "bitten at the mouth";
+        const bool momentary = eating || (!Charges(c) && (tool_gesture_ == ToolGesture::Swing ||
+                               tool_gesture_ == ToolGesture::Crush));
+        const auto refuse = [&] {
+            if (tool_gesture_ == ToolGesture::Swing && !Charges(c)) {
+                swing_.Consume();
+            } else {
+                pull_denied_ = true;
+            }
+        };
+        if (!arm) {
+            Deny(out, "the game has the arm");
+            refuse();
+            return;
+        }
+        // quick_tool_direct: the game's item window (Input::items_ok). Mid-attack, mid-roll or in
+        // a stagger a momentary act is a deny; a held one (the trigger held, the whistle at the
+        // mouth, the stone raised, the eye at the eye) waits and goes once the game would take
+        // an item, as its own use would.
+        if (DirectTool(c) && !in.items_ok) {
+            if (momentary) {
+                Deny(out, std::string{NotNow} + " (" + how + ")");
+                refuse();
+            } else if (!items_waited_) {
+                items_waited_ = true;
+                out.Log(std::string{"TOOL waits: "} + NotNow + " (" + how + ")");
+            }
+            return;
+        }
+        if (in.t - last_use_ < c.use_cooldown_s) {
+            return;
+        }
+        if (in.snapshot_fresh &&
+            ShortOfBullets(in.snapshot, in.snapshot.slot[static_cast<std::size_t>(held_slot_)])) {
+            char text[96];
+            std::snprintf(text, sizeof(text), "no bullets: it costs %d, %d carried (",
+                          in.snapshot.slot[static_cast<std::size_t>(held_slot_)].cost,
+                          in.snapshot.bullets);
+            Deny(out, text + how + ")");
+            out.no_bullets = true;
+            refuse();
+            return;
+        }
+        if (in.snapshot_fresh && !in.snapshot.slot[static_cast<std::size_t>(held_slot_)].usable) {
+            Deny(out, "the game says it cannot be used now (" + how + ")");
+            refuse();
+            return;
+        }
+        // quick_tool_direct: the tool's own pace. A held trigger (or a whistle kept at the mouth,
+        // a stone kept raised) waits for it; a swing or a crush before it is a deny.
+        if (DirectTool(c) && in.t < tool_ready_t_) {
+            if (momentary) {
+                char text[96];
+                std::snprintf(text, sizeof(text), "not ready (the tool's pace: %.2f s more)",
+                              tool_ready_t_ - in.t);
+                Deny(out, text);
+                refuse();
+            }
+            return;
+        }
+        if (Blows(c)) {
+            StartBlow(c, in, out, how); // the call first; the use at its end (BlowTick)
+            return;
+        }
+        if (Charges(c) && !eating) {
+            StartCharge(in, out, how); // it gathers first; the use at its end (ChargeTick)
+            return;
+        }
+        pull_denied_ = true;
+        swing_.Consume();
+        out.Haptics(Haptic::Pick);
+        last_use_ = in.t;
+        out.Log("USE goods=" + std::to_string(held_goods_) + " by " + how + " (" +
+                ToolGestureName(tool_gesture_) + ")");
+        if (DirectTool(c)) {
+            // The Blacksky Eye held to your eye: its meteor where you look, from the eye (its
+            // clip's dummy 59); pointed, from the hand (17) where the hand aims, as a gun.
+            const bool at_eye = tool_gesture_ == ToolGesture::Eye && eye_side_ >= 0;
+            const bool pointed_eye = tool_gesture_ == ToolGesture::Eye && !at_eye;
+            UseTool(c, in, out, false, (at_eye || eating) ? ToolAimBy::Gaze : ToolAimBy::Default,
+                    pointed_eye ? ToolHandDummy : -1);
+            if (pointed_eye) {
+                const V3 ray = Rotate(in.aim_valid ? in.aim_q : in.hand_q, {0, 0, -1});
+                out.request.aim = static_cast<std::uint8_t>(ToolAimBy::Hand);
+                out.request.tool_direction = {ray.x, ray.y, ray.z};
+            }
+            if (eating) out.request.mouth = static_cast<std::uint8_t>(MouthKind::Eat);
+            else if (held_goods_ == 2000) mouth_gate_.Consume(); // no squeeze-then-bite double cast
+            return;
+        }
+        const bool instant = c.instant && (held_class_.use == UseKind::Instant ||
+                                           held_class_.use == UseKind::Bullet);
+        if (instant && !latched(held_goods_)) {
+            Send(out, c.select && in.snapshot.selected != held_slot_ ? held_slot_ : -1, Action::Use,
+                 in);
+            Enter(Phase::Waiting);
+            wait_t_ = in.t;
+        } else {
+            StartSquare(c, in, out);
+        }
+    }
+
+    // quick_tool_keep: the item used (the game's own use going out) stays in the hand. A rung
+    // Choir Bell only in left_scheme=2 (in 1 the grip held would fill its ring again at once);
+    // left_scheme=2 only with quick_tap_pick (without it nothing would use it again).
+    [[nodiscard]] bool KeepsTool(const Config& c) const {
+        return c.tool_keep && ToolKeepOf(held_goods_) && !CannedOf(held_goods_) &&
+               (c.left_scheme != 2 || c.tap_pick) &&
+               (pull_item_ || (c.left_scheme == 2 && hold_item_));
+    }
+    // `busy`: the game's own use animation plays (out of sight until it is over); a direct use
+    // (quick_tool_direct) has none: it stays in sight.
+    void KeepTool(const Config& c, const Input& in, Output& out, bool busy) {
+        Enter(Phase::Holding);
+        used_since_take_ = true; // kept after its use: putting it back later never brings the arc
+        tool_busy_ = busy;
+        busy_t_ = in.t;
+        resting_ = c.left_scheme == 2;
+        trigger_hold_ = false;
+        repressed_ = false;
+        // One use per press: a pocket's tool (left_scheme=1) kept with the trigger still held is
+        // not used again until it is let go (PullTick clears this then; left_scheme=2 rests the
+        // tool instead). Held on, the eye, the whistle or the stone used it again at every pace.
+        pull_denied_ = !resting_ && trigger_on_;
+        items_waited_ = false;
+        hold_use_ = hold_spent_ = false;
+        gesture_pending_ = false;
+        out.Log(busy ? "TOOL kept: out of sight while the game's use plays, then back in the hand"
+                     : "TOOL kept: used without an animation, still in the hand");
+    }
+
+    // quick_tool_direct: the tool ready again (its pace over) while it is in the hand: the grab's
+    // soft warm glow on it once (Scene::pulse_*, the renderer's GrabGlow; no vibration, the user's
+    // 2026-10-30 "we have too many haptics already"). Its pace over with it put away: none.
+    void ReadyGlow(const Config& c, const Input& in, Output& out) {
+        if (!ready_glow_ || in.t < tool_ready_t_) {
+            return;
+        }
+        ready_glow_ = false;
+        if (phase_ == Phase::Holding && DirectTool(c) && !tool_busy_) {
+            pulse(held_slot_, false);
+            out.Log("TOOL ready again (its glow)");
+        }
+    }
+    // A charged tool gathered where the player acts next (A Call Beyond to be raised, the Gloves
+    // to be let go): no ring shows it (Scene::hold_ring), so a solid thump (the ring-full one)
+    // and the grab's glow on it once.
+    void ReadyCue(Output& out) {
+        out.Haptics(Haptic::HoldDone);
+        if (held_slot_ >= 0) {
+            pulse(held_slot_, false);
+        }
+    }
+
+    // quick_tool_direct: this tool is used with no animation (ToolUseOf).
+    [[nodiscard]] bool DirectTool(const Config& c) const {
+        return c.tool_direct && ToolUseOf(held_goods_).clip >= 0;
+    }
+    // The game's UseGoods at once with the tool's clip's dummy (Request::tool); the answer comes
+    // back in Waiting (Settle2: it stays in the hand). The next use waits for its pace. `voiced`:
+    // its sound already played (the whistle's call); `aim`: where its launch goes (Request::aim).
+    // `dmy` >= 0: launched from that dummy instead of the clip's (the Blacksky Eye pointed: the
+    // hand's).
+    void UseTool(const Config& c, const Input& in, Output& out, bool voiced = false,
+                 ToolAimBy aim = ToolAimBy::Default, std::int8_t dmy = -1) {
+        if (held_goods_ == Augur::Goods && aim == ToolAimBy::Gaze) augur_charge_ns_ = 0;
+        const ToolUse u = ToolUseOf(held_goods_);
+        Request& r = Send(out, c.select && in.snapshot.selected != held_slot_ ? held_slot_ : -1,
+                          Action::Use, in);
+        r.tool = 1;
+        r.dmy = dmy >= 0 ? dmy : u.dmy;
+        r.voiced = voiced ? 1 : 0;
+        r.aim = static_cast<std::uint8_t>(aim);
+        tool_direct_use_ = true;
+        tool_ready_t_ = in.t + u.rate_ms * 0.001;
+        ready_glow_ = true;
+        Enter(Phase::Waiting);
+        wait_t_ = in.t;
+        char text[160];
+        std::snprintf(text, sizeof(text),
+                      "USE goods=%d directly (no animation; clip %d's UseGoods dummy %d, the next "
+                      "in %.2f s)",
+                      held_goods_, u.clip, static_cast<int>(r.dmy), u.rate_ms * 0.001);
+        out.Log(text);
+    }
+    // Config::whistle_s: the required mouth hold; the remaining call plays out after use.
+    [[nodiscard]] bool Blows(const Config& c) const {
+        return DirectTool(c) && held_goods_ == WhistleGoods && c.whistle_s > 0.0f;
+    }
+    // Every gate of a use passed (at the mouth, the trigger, its pace, the game's yes): the call
+    // starts; nothing is used yet, nothing vibrates (the call is what you hear and feel).
+    void StartBlow(const Config& c, const Input& in, Output& out, const std::string& how) {
+        blow_t_ = in.t;
+        blow_len_ = c.whistle_s;
+        ++blow_id_;
+        blow_state_ = WhistleState::Blowing;
+        // Timed over the call as every long hold, its ring not drawn (the call is the feedback;
+        // the tester's 2026-11-03); no vibration.
+        hold_len_ = std::max(blow_len_, 0.1f);
+        hold_from_ = hold_from_base_ = in.t;
+        hold_from_ns_ = hold_from_base_ns_ = steady_ns_;
+        ringless_from_ns_ = hold_from_ns_;
+        char text[192];
+        std::snprintf(text, sizeof(text),
+                      "WHISTLE blown (%s): its call plays; held through it (%.2f s) the snake "
+                      "comes",
+                      how.c_str(), c.whistle_s);
+        out.Log(text);
+    }
+    // The call playing: the trigger let go, the whistle away from the mouth (past the mouth's
+    // exit distance; a lost frame keeps the last), the arm the game's (a hit) or its item window
+    // closed (a swing of the weapon, a roll) stop it, nothing used, nothing spent (pressed again
+    // at the mouth, it starts again); held through the required duration, the use.
+    void BlowTick(const Config& c, const Input& in, Output& out, bool arm, bool held) {
+        const double blown = in.t - blow_t_;
+        const bool at_mouth = tool_gesture_ != ToolGesture::Mouth ||
+                              mouth_gate_.Distance() <= c.mouth_cfg.exit_m;
+        const char* stop = !held          ? "the trigger let go"
+                           : !at_mouth    ? "away from the mouth"
+                           : !arm         ? "the game has the arm"
+                           : !in.items_ok ? NotNow
+                                          : nullptr;
+        if (stop != nullptr) {
+            StopBlow(out, stop);
+            return;
+        }
+        if (blown < c.whistle_s - 1e-6) {
+            return;
+        }
+        blow_t_ = -1.0;
+        blow_state_ = WhistleState::Done; // the call plays out
+        hold_done_ns_ = steady_ns_;       // the ring's flash
+        pull_denied_ = true;
+        last_use_ = in.t;
+        out.Log("USE goods=" + std::to_string(held_goods_) + " by its call blown to the end (" +
+                ToolGestureName(tool_gesture_) + ")");
+        UseTool(c, in, out, true);
+    }
+    // The call stopped before its end (BlowTick; Rest; put away: Update).
+    void StopBlow(Output& out, const std::string& why) {
+        const double blown = static_cast<double>(steady_ns_) * 1e-9 - blow_t_;
+        blow_t_ = -1.0;
+        blow_state_ = WhistleState::Off;
+        char text[192];
+        std::snprintf(text, sizeof(text),
+                      "WHISTLE stopped after %.2f of %.2f s (%s): nothing used, nothing spent",
+                      blown, blow_len_, why.c_str());
+        out.Log(text);
+    }
+
+    // A Call Beyond (Raise, quick_tool_direct): the trigger held, it gathers first, wherever the
+    // hand is, its clip's own wind-up (ToolUse::windup_ms: the game's 1.17 s before the stars),
+    // the ring filling and the rising air (Output::use_whoosh) as it does; gathered and raised
+    // above your head, the stars: raised from the start they come at its end, gathered low they
+    // wait, the ring full, until you raise it (the tester's 2026-11-01 "hold trigger until circle
+    // is charged and then lift your hand up OR just hold your hand up and hold trigger"). The
+    // game's lock after the use is gone, so the gathering is its cost (the tester's 2026-10-30 "I
+    // do not want to make the game easy").
+    [[nodiscard]] bool Charges(const Config& c) const {
+        return DirectTool(c) && (held_goods_ == Augur::Goods || held_goods_ == BeastRoar::Goods ||
+                                 tool_gesture_ == ToolGesture::Raise ||
+               (tool_gesture_ == ToolGesture::Swing && (held_goods_ == HunterRelics::Tonitrus ||
+                                                       held_goods_ == HunterRelics::Gloves))) &&
+               ToolUseOf(held_goods_).windup_ms > 0;
+    }
+    void StartCharge(const Input& in, Output& out, const std::string& how) {
+        charged_swing_.Reset();
+        charged_heading_={};
+        charge_t_ = in.t;
+        augur_charge_ns_ = held_goods_ == Augur::Goods ? steady_ns_ : 0;
+        roar_charge_ns_ = held_goods_ == BeastRoar::Goods ? steady_ns_ : 0;
+        charge_len_ = held_goods_ == Augur::Goods       ? AugurCreature::WindupSeconds
+                      : held_goods_ == BeastRoar::Goods ? BeastRoar::WindupSeconds
+            : static_cast<float>(ToolUseOf(held_goods_).windup_ms) * 0.001f;
+        charge_full_ = false;
+        hold_len_ = charge_len_;
+        hold_from_ = hold_from_base_ = in.t;
+        hold_from_ns_ = hold_from_base_ns_ = steady_ns_;
+        ringless_from_ns_ = hold_from_ns_; // the tool shows its charge; no ring (Scene::hold_ring)
+        char text[192];
+        std::snprintf(text, sizeof(text),"GATHERING (%s): hold trigger for %.2f s, then %s",
+                      how.c_str(),charge_len_,held_goods_==HunterRelics::Tonitrus ? "swing" :
+                      held_goods_==HunterRelics::Gloves ? "release trigger to toss or drop" :
+                      held_goods_==Augur::Goods ? "crush and invoke" :
+                      held_goods_==BeastRoar::Goods ? "the claw bursts open and roars" :
+                      "raise above your head");
+        out.Log(text);
+    }
+    // Gathering: the trigger let go, the arm the game's (a hit) or its item window closed (a
+    // swing, a roll) lose it, nothing used, nothing spent, gathered or not; gathered (the ring
+    // full, the rising air at its top), the use once the hand is raised above the eyes (raise_m;
+    // a lost frame waits), the ring's flash.
+    void ChargeTick(const Config& c, const Input& in, Output& out, bool arm, bool held) {
+        const ToolConfig& k = c.tool_cfg;
+        const bool tonitrus = held_goods_ == HunterRelics::Tonitrus;
+        const bool gloves = held_goods_ == HunterRelics::Gloves;
+        const bool augur = held_goods_ == Augur::Goods;
+        const bool drop = gloves && !held && in.t-charge_t_>=charge_len_-1e-6;
+        const char* stop = !held && !drop ? "the trigger let go"
+                           : !arm         ? "the game has the arm"
+                           : !in.items_ok ? NotNow
+                           : (tonitrus || gloves || augur) && (!in.hand_valid || !in.head_valid) ? "tracking lost"
+                                          : nullptr;
+        if (stop != nullptr) {
+            StopCharge(out, stop);
+            if(tonitrus || gloves || augur)pull_denied_=true; // a fresh press after interrupted charging
+            return;
+        }
+        const double gathered = in.t - charge_t_;
+        if(tonitrus && (gathered<charge_len_ || Length(in.hand_v-in.head_v)<1.0f)) {
+            const auto point=Rotate(in.hand_q,{0,0,-1});
+            const auto heading=HunterRelics::GroundHeading({},{point.x,point.y,point.z});
+            if(HunterRelics::Length2(heading)>.5f)charged_heading_=heading;
+        }
+        const float progress = std::clamp(static_cast<float>(gathered / charge_len_), 0.0f, 1.0f);
+        out.hold_progress = progress;
+        out.use_whoosh = progress;
+        out.tool_charge = {static_cast<std::uint8_t>(ToolFeelOf(held_goods_)), progress,
+                           gathered >= charge_len_ - 1e-6};
+        const bool roar = held_goods_ == BeastRoar::Goods;
+        if (roar) {
+            out.hold_hum = HoldHum(progress); // the claw's strain in the hand
+        }
+        if (gathered < charge_len_ - 1e-6) {
+            return;
+        }
+        if(roar) {
+            // Revalidate at the burst, as the Augur's.
+            if(!in.snapshot_fresh || held_slot_<0 || held_slot_>=SlotCount ||
+               !in.snapshot.slot[static_cast<size_t>(held_slot_)].usable || HeldShortOfBullets(in)) {
+                out.no_bullets=HeldShortOfBullets(in);
+                StopCharge(out,"Beast Roar no longer usable");pull_denied_=true;return;
+            }
+            charge_t_=-1;pull_denied_=true;last_use_=in.t;
+            out.use_whoosh=-1;out.hold_progress=1;out.hold_hum=0;
+            out.Haptics(Haptic::Roar);
+            UseTool(c,in,out);
+            out.Log("BEAST ROAR: clenched to the full, the claw bursts open and roars");
+            return;
+        }
+        if(augur) {
+            // Revalidate at the burst, not only when the squeeze began.
+            if(!in.snapshot_fresh || held_slot_<0 || held_slot_>=SlotCount ||
+               !in.snapshot.slot[static_cast<size_t>(held_slot_)].usable || HeldShortOfBullets(in)) {
+                out.no_bullets=HeldShortOfBullets(in);
+                StopCharge(out,"Augur no longer usable");pull_denied_=true;return;
+            }
+            charge_t_=-1;pull_denied_=true;last_use_=in.t;
+            out.use_whoosh=-1;out.hold_progress=1;
+            mouth_gate_.Consume(); // squeezing cannot also bite during the same approach
+            out.Haptics(Haptic::Crunch); // the squish: a crack, crackle, crumble in the fist
+            // Crushed in the fist: the tentacles burst from the palm along where the controller
+            // points (its aim ray; the grip's forward without one), as a gun's shot would.
+            const V3 ray=Rotate(in.aim_valid ? in.aim_q : in.hand_q,{0,0,-1});
+            UseTool(c,in,out,false,ToolAimBy::Hand,ToolPalmDummy);
+            out.request.tool_direction={ray.x,ray.y,ray.z};
+            out.Log(in.aim_valid ? "AUGUR: squeeze complete, invoke at the burst from the palm "
+                                   "along the controller's aim"
+                                 : "AUGUR: squeeze complete, invoke at the burst from the palm "
+                                   "along the grip (no aim pose)");
+            return;
+        }
+        if(gloves) {
+            if(!drop) {
+                if(!charge_full_) {
+                    // Gathered: let go now. No ring says it: a solid thump and the glow once.
+                    charge_full_=true;
+                    if(++glove_charge_==0)++glove_charge_;
+                    ReadyCue(out);
+                    out.Log("GLOVES: gathered: let go of the trigger to toss or drop them");
+                }
+                // Gathered and still held, they meet an enemy (the tester's 2026-11-04 "if it hits an
+                // enemy when it is charged (even if we didn't release trigger) it still activates"):
+                // the spirits burst at it from the glove, at once.
+                if(ShamanBlade::Fresh(in.glove_contact,steady_ns_,hold_from_base_ns_,glove_charge_,
+                                      in.holster_space)) {
+                    // Still usable (as a throw's landing and a strike are): never the haptic and
+                    // the charge spent for a use the game would refuse.
+                    if(in.snapshot_fresh && (held_slot_<0 || held_slot_>=SlotCount ||
+                       ShortOfBullets(in.snapshot,in.snapshot.slot[static_cast<size_t>(held_slot_)]) ||
+                       !in.snapshot.slot[static_cast<size_t>(held_slot_)].usable)) {
+                        out.no_bullets=HeldShortOfBullets(in);
+                        StopCharge(out,"the gloves are no longer usable");pull_denied_=true;return;
+                    }
+                    const auto& hit=in.glove_contact;
+                    charge_t_=-1;pull_denied_=true;last_use_=in.t;
+                    out.use_whoosh=-1;out.hold_progress=1;
+                    out.Haptics(Haptic::Spirits);
+                    UseTool(c,in,out,false,ToolAimBy::GloveContact);
+                    out.request.tool_origin={hit.point.x,hit.point.y,hit.point.z};
+                    out.request.tool_direction={hit.blade_base.x-hit.point.x,0.0f,
+                                                hit.blade_base.z-hit.point.z};
+                    out.Log("GLOVES: gathered, they met an enemy: the spirits burst at it");
+                }
+                return;
+            }
+            glove_drop_={steady_ns_,hold_from_base_ns_,in.holster_space,glove_release_.Velocity()};
+            glove_plan_={};charge_t_=-1;pull_denied_=true;
+            out.use_whoosh=-1;out.hold_progress=-1;
+            out.Log("GLOVES: released; check the weighted flight before summoning");
+            return;
+        }
+        if(tonitrus) {
+            if(!charge_full_) {
+                // Charged: a crackle in the hand (and the arcs on its tip, BuildHeld): strike now.
+                charge_full_=true;
+                out.Haptics(Haptic::Charged);
+                out.Log("TONITRUS: charged: strike down, or slash where it should go");
+            }
+            const V3 p=in.hand_p-in.head_p,v=in.hand_v-in.head_v;
+            const auto stroke=charged_swing_.Update(in.t,true,{p.x,p.y,p.z},{v.x,v.y,v.z});
+            if(HunterRelics::Length2(stroke)<.5f) return;
+            const HunterRelics::Vector look=in.head_valid
+                ? HunterRelics::Vector{in.head_forward.x,in.head_forward.y,in.head_forward.z}
+                : HunterRelics::Vector{};
+            if(!HunterRelics::StrikeStroke(stroke,look)) {
+                char text[128];
+                std::snprintf(text,sizeof(text),"TONITRUS: wind-up (%.2f %.2f %.2f): not a strike",
+                              stroke[0],stroke[1],stroke[2]);
+                out.Log(text);
+                return;
+            }
+            const auto direction=HunterRelics::StrikeHeading(stroke,look,charged_heading_);
+            if(HunterRelics::Length2(direction)<.5f)return;
+            // Snapshot gates may have changed while the trigger stayed held.
+            if(in.snapshot_fresh && (held_slot_<0 || held_slot_>=SlotCount ||
+               ShortOfBullets(in.snapshot,in.snapshot.slot[static_cast<size_t>(held_slot_)]) ||
+               !in.snapshot.slot[static_cast<size_t>(held_slot_)].usable)) {
+                out.no_bullets = HeldShortOfBullets(in);
+                StopCharge(out,"the tool is no longer usable");pull_denied_=true;return;
+            }
+            charge_t_=-1;pull_denied_=true;last_use_=in.t;
+            out.hold_progress=1;out.use_whoosh=-1;
+            out.Haptics(Haptic::Thunder);
+            UseTool(c,in,out,false,ToolAimBy::Swing);
+            out.request.tool_direction=direction;
+            const auto gaze=HunterRelics::GroundHeading({},look);
+            const bool looked=HunterRelics::Length2(gaze)>.5f &&
+                              gaze[0]*direction[0]+gaze[2]*direction[2]>.9999f;
+            char text[160];
+            std::snprintf(text,sizeof(text),
+                          "TONITRUS: charged strike (stroke %.2f %.2f %.2f): the lightning goes %s",
+                          stroke[0],stroke[1],stroke[2],
+                          looked ? "where you look" : "the slash's way");
+            out.Log(text);
+            return;
+        }
+        const bool up = in.head_valid && in.hand_valid && in.hand_p.y >= in.head_p.y + k.raise_m;
+        if (!up) {
+            if (!charge_full_) {
+                // No ring says it now: a solid thump and the item's glow once (ReadyCue).
+                charge_full_ = true;
+                ReadyCue(out);
+                out.Log("GATHERED: raise it above your head to call (let go of the trigger: "
+                        "nothing used)");
+            }
+            return;
+        }
+        charge_t_ = -1.0;
+        hold_done_ns_ = steady_ns_;
+        out.hold_progress = 1.0f;
+        out.use_whoosh = -1.0f;
+        pull_denied_ = true;
+        last_use_ = in.t;
+        out.Haptics(Haptic::Pick);
+        char text[96];
+        std::snprintf(text, sizeof(text), "USE goods=%d gathered to the end and raised (%.2f s)",
+                      held_goods_, gathered);
+        out.Log(text);
+        UseTool(c, in, out);
+    }
+    // The item leaves the hand (Idle, ToArc: also a reset by a context switch, which returns
+    // before Update's own check): a call or a gathering under way stops with it, never left to
+    // finish on the next take.
+    void StopActs(Output& out) {
+        glove_drop_={};glove_plan_={};glove_release_.Reset();
+        if (blow_t_ >= 0.0) {
+            StopBlow(out, "put away");
+        }
+        if (charge_t_ >= 0.0) {
+            StopCharge(out, "put away");
+        }
+    }
+    // The gathering lost before its end (ChargeTick; Rest; put away: Update).
+    void StopCharge(Output& out, const std::string& why) {
+        augur_charge_ns_ = 0;
+        roar_charge_ns_ = 0;
+        charged_swing_.Reset();
+        const double gathered = static_cast<double>(steady_ns_) * 1e-9 - charge_t_;
+        charge_t_ = -1.0;
+        out.hold_progress = -1.0f;
+        out.use_whoosh = -1.0f;
+        char text[192];
+        std::snprintf(text, sizeof(text),
+                      "GATHERING lost after %.2f of %.2f s (%s): nothing used, nothing spent",
+                      gathered, charge_len_, why.c_str());
+        out.Log(text);
+    }
+    void GloveDropTick(const Config& c,const Input& in,Output& out,bool arm) {
+        const auto cancel=[&](const char* why) {
+            glove_drop_={};glove_plan_={};pull_denied_=true;Deny(out,why);
+            if(c.left_scheme==2)Rest(out,why);
+        };
+        if(!arm || !in.items_ok || glove_drop_.space!=in.holster_space ||
+           !in.snapshot_fresh || held_slot_<0 || held_slot_>=SlotCount ||
+           in.snapshot.slot[static_cast<size_t>(held_slot_)].goods!=held_goods_ ||
+           ShortOfBullets(in.snapshot,in.snapshot.slot[static_cast<size_t>(held_slot_)]) ||
+           !in.snapshot.slot[static_cast<size_t>(held_slot_)].usable) {
+            out.no_bullets = HeldShortOfBullets(in);
+            cancel("glove drop cancelled: use/context unavailable");return;
+        }
+        if(!glove_plan_.valid) {
+            if(HunterRelics::Matches(glove_drop_,in.relic_drop.request)) {
+                if(!HunterRelics::ValidDrop(in.relic_drop)){cancel("no safe floor for the glove");return;}
+                glove_plan_=in.relic_drop;
+            } else if(steady_ns_-glove_drop_.ns>250'000'000) {
+                cancel("glove floor query expired");return;
+            } else return;
+        }
+        if(steady_ns_<glove_plan_.land_ns)return;
+        if(steady_ns_-glove_plan_.land_ns>250'000'000) {
+            cancel("glove landing expired");return;
+        }
+        last_use_=in.t;out.Haptics(Haptic::Pick);
+        UseTool(c,in,out,false,ToolAimBy::Landing);
+        out.request.tool_origin=glove_plan_.land;
+        out.request.tool_origin[1]+=.06f*glove_plan_.scale;
+        // The throw's way (world); dropped by an enemy it met, toward where it struck that enemy.
+        out.request.tool_direction=glove_plan_.velocity;
+        if(glove_plan_.enemy)
+            for(int a=0;a<3;++a)out.request.tool_direction[a]=glove_plan_.impact[a]-glove_plan_.land[a];
+        out.Log("GLOVES: landed; the spirits rise from the glove at the nearest enemy");
+        glove_drop_={};glove_plan_={};
+    }
+
+    // The hand's velocity for a release now, as a throw reads it (Release): the stronger of the
+    // freshest poses and the display-time ones, or the peak of the last throw_peak_window_s when
+    // the hand was already slowing.
+    [[nodiscard]] V3 ReleaseVelocityNow(const Config& c, const Input& in) const {
+        const V3 v_display = history_.Release(in.t);
+        const V3 v_fresh = UseFresh(c, in.t) ? fresh_.Release(in.t) : V3{};
+        const bool fresh = Length(v_fresh) > 0.0f && Length(v_fresh) >= Length(v_display);
+        const VelocityHistory& h = fresh ? fresh_ : history_;
+        const V3 v = fresh ? v_fresh : v_display;
+        const V3 peak = c.throw_peak_window_s > 0.0f
+                            ? h.PeakBefore(in.t, c.throw_peak_window_s, v, 75.0f, c.throw_min_speed)
+                            : V3{};
+        return Length(peak) > Length(v) ? TurnToward(v, peak, c.throw_peak_turn_deg) * Length(peak)
+                                        : v;
+    }
+
+    // quick_grip_hold: the item the grip took left the hand (`why`; `put_back`: the put-back's
+    // tick): the arc is back for the next one only when it was put back unused within
+    // fan_return_s of its take (a wrong pick let go). Used (a throw, a drink, a kept tool used)
+    // or held longer (a tool through a fight, a long look), it stays closed (the user,
+    // 2026-11-06: a use is the end of it). Never with a vial in the hand.
+    void FanBack(const Config& c, const Input& in, Output& out, const std::string& why,
+                 bool put_back) {
+        const double held = in.t - take_t_;
+        char text[64];
+        std::snprintf(text, sizeof(text), "%.1f s after its take", held);
+        const bool back = !used_since_take_ && c.fan_return_s > 0.0f &&
+                          held <= c.fan_return_s + 1e-6 && !in.vial_busy && !out.draw_vial;
+        if (put_back) {
+            out.Haptics(Haptic::PutBack);
+        }
+        out.Log("PUT (" + why + ", " + text +
+                (back               ? ": the arc comes back once the hand settles)"
+                 : used_since_take_ ? ": used, the arc stays closed)"
+                                    : ": the arc stays closed)"));
+        Idle(out, true);
+        // (Never round the hand where it is now: at the mouth after a drink, the face would be
+        // in the fan; out in front after a throw, the arm in its follow-through.)
+        fan_return_until_ = back ? in.t + FanReturnWaitS : 0.0;
+    }
+    // FanBack's arc opens, silently, once the hand has settled (slower than FanSettleMps against
+    // the head, at least FanSettleM from the eyes) within FanReturnWaitS; a squeeze, X, a pull of
+    // the gun (not the trigger still held from the item's use) or a fight meanwhile and it does not
+    // (the grip's squeeze opens it as ever).
+    static constexpr double FanReturnWaitS = 2.0;
+    static constexpr float FanSettleMps = 0.5f;
+    static constexpr float FanSettleM = 0.30f;
+    // True: the arc opened (or the return was dropped and nothing else is to be done this frame).
+    bool FanReturnTick(const Config& c, const Input& in, Output& out, bool grip_edge) {
+        if (fan_return_until_ <= 0.0) {
+            return false;
+        }
+        const char* drop = grip_edge                   ? "a squeeze"
+                           : in.t > fan_return_until_  ? "the hand never settled"
+                           : in.x_edge || in.vial_busy ? "the vial"
+                           : in.trigger_latch && !l2_fresh_needed_ ? "the trigger (the gun)"
+                           : in.combat                 ? "a fight"
+                           : !in.body || !in.snapshot_fresh || in.snapshot.Count() == 0
+                               ? "no quick items"
+                               : nullptr;
+        if (drop != nullptr) {
+            fan_return_until_ = 0.0;
+            out.Log(std::string{"the arc's return dropped ("} + drop + ")");
+            return false;
+        }
+        const bool settled = in.hand_valid && in.head_valid &&
+                             Length(in.hand_v - in.head_v) < FanSettleMps &&
+                             Length(in.hand_p - in.head_p) >= FanSettleM &&
+                             in.arm_weight >= c.arm_min;
+        if (!settled) {
+            return true;
+        }
+        fan_return_until_ = 0.0;
+        toggle_by_ = "the next one";
+        regrab_slot_ = -1;
+        Open(c, in, out, false); // silent: you did not open it (the tester's 2026-10-30 call)
+        return true;
+    }
+
+    [[nodiscard]] bool Throwable(const Config& c) const {
+        return held_class_.use == UseKind::Throw && c.throws;
+    }
+    // The Executioner's Gloves leave the hand as it opens (`opened`: the grip let go): flying
+    // already (GloveDropTick), or gathered to the full (ChargeTick's drop).
+    [[nodiscard]] bool GloveFlung(bool opened) const {
+        return held_goods_ == HunterRelics::Gloves &&
+               (glove_drop_.ns > 0 || (opened && charge_t_ >= 0.0 && charge_full_));
+    }
+    // A crush's squeeze: the button that does not hold the item (left_scheme=2: the trigger holds
+    // it, so the grip; quick_grip_hold and left_scheme=1: the grip holds it, so the trigger).
+    [[nodiscard]] float CrushSqueeze(const Config& c, const Input& in) const {
+        return c.left_scheme == 2 && !grip_held_ ? in.grip : in.trigger;
+    }
+    [[nodiscard]] const char* CrushButton(const Config& c) const {
+        return c.left_scheme == 2 && !grip_held_ ? "grip" : "trigger";
+    }
+    // The game takes no item use now (Input::items_ok): the denies' and waits' line.
+    static constexpr const char* NotNow =
+        "not now: the game takes no item (mid-attack, mid-roll or in a stagger)";
+
+    // The game's use of the kept tool playing (its own model in his hand): over once the game's
+    // item use ended and the arm is yours again (at least busy_min_s after it went out); never
+    // over in busy_max_s: put away.
+    void ToolBusyTick(const Config& c, const Input& in, Output& out) {
+        const double since = in.t - busy_t_;
+        const bool game_busy = !in.snapshot_fresh || in.snapshot.busy;
+        if (since >= c.tool_cfg.busy_min_s - 1e-6 && !game_busy && in.arm_weight >= 0.9f) {
+            tool_busy_ = false;
+            hold_use_ = hold_spent_ = false;
+            gesture_pending_ = false;
+            crush_.Reset(in.t);
+            shake_.Reset(in.t);
+            shake_shown_ = 0;
+            press_t_ = in.t;
+            char text[96];
+            std::snprintf(text, sizeof(text), "TOOL back in the hand (its use over after %.2f s)",
+                          since);
+            out.Log(text);
+            return;
+        }
+        if (since >= c.tool_cfg.busy_max_s) {
+            PutAway(out, "the tool's use never ended", false);
+        }
+    }
+
+    bool pull_item_{false};
+    ToolGesture tool_gesture_{ToolGesture::None};
+    ShamanBlade::Stroke blade_stroke_{};
+    std::int64_t blade_used_session_{0}; // the take and stroke whose contact was sent
+    std::uint32_t blade_used_stroke_{0};
+    std::uint32_t glove_charge_{}; // the Gloves' gatherings, one more each (Scene::glove_charge)
+    std::uint32_t blade_space_{};
+    std::int64_t blade_active_ns_{};
+    bool resting_{false};
+    bool grip_take_held_{false}; // quick_tap_pick: taken with the grip held (its release puts back)
+    bool pick_wait_{false};      // ... a hunter tool held by the pull that picked it: not used by it
+    bool repressed_{false};
+    bool pull_denied_{false};
+    bool tool_busy_{false};
+    bool tool_direct_use_{false}; // the use waiting for its answer went out directly
+    double press_t_{0.0};
+    double busy_t_{0.0};
+    double tool_ready_t_{-100.0}; // quick_tool_direct: the tools' next use from (their pace)
+    bool ready_glow_{false};      // ... its glow once that comes with the tool in the hand
+    double blow_t_{-1.0};         // Config::whistle_s: the call playing since (< 0: none) ...
+    float blow_len_{0.0f};        // ... and its length
+    std::uint64_t blow_id_{0};
+    WhistleState blow_state_{WhistleState::Off};
+    double charge_t_{-1.0};       // Charges: A Call Beyond gathering since (< 0: none) ...
+    float charge_len_{0.0f};      // ... for this long
+    std::int64_t augur_charge_ns_{};
+    std::int64_t roar_charge_ns_{};
+    bool charge_full_{false};     // ... gathered, waiting to be raised (logged once)
+    int eye_side_{-1};            // Eye: at that eye (0 left, 1 right; -1 none: SelectEye)
+    SwingGate swing_{};           // Swing: the stroke down (Tiny Tonitrus, the Gloves)
+    bool items_waited_{false};    // a held act waiting for the game's item window (logged)
+    // quick_grip_hold: the item in the hand was taken by the grip, which holds it (take_t_: when
+    // it was taken, FanBack's fan_return_s); an open arc's pull_slot_ was the grip's.
+    bool grip_held_{false};
+    double take_t_{0.0};
+    bool used_since_take_{false}; // used since its take (FanBack: the arc stays closed)
+    bool pull_by_grip_{false};
+    double fan_return_until_{0.0}; // FanBack: the arc opens once the hand settles, until then
+    double grip_open_t_{-1.0};     // quick_grip_open_ms: the grip in the air squeezed then (-1: none)
+
     bool holster_held_{false};
+    bool pocket_pull_{false}; // a pocket's ring item: the trigger pulled on it (its ring filling)
     bool holster_grip_ready_{false};
+    bool corpse_grip_claimed_{false}; // owns this squeeze until release, even after contact is lost
+    bool vial_grip_claimed_{false}; // this squeeze belongs to the vial, even after a refused draw
+    bool vial_fist_wait_{false};    // only its first, slightly later trigger can be the same clench
+    bool vial_trigger_pending_{false}; // a trigger before the full squeeze: bounded GunPull window
+    Holsters::GrabTiming holster_timing_{};
+    std::array<std::int32_t, SlotCount * 2> holster_identity_{};
+    std::uint32_t holster_space_{0};
+    int holster_mode_{0};
 
     void Reset(Output& out, const std::string& why) {
+        holster_timing_.Reset();
         out.Log("RESET (" + why + ") in " + PhaseName(phase_));
         Idle(out, false);
         regrab_slot_ = -1;
@@ -5879,6 +8598,11 @@ private:
     }
 
     void Publish(Output& out) {
+        // The vial's first clench owns even the sub-latch analog pull; presentation starts
+        // hiding it for the gun before the pad fires. Every early return uses this handoff.
+        out.block_l2 = out.block_l2 || vial_fist_wait_;
+        out.whistle_id = blow_id_;
+        out.whistle = blow_state_;
         Scene& s = out.scene;
         s.open_serial = open_serial_;
         s.state = phase_ == Phase::Open ? SceneState::Open
@@ -5896,16 +8620,70 @@ private:
         s.reserved_last_goods = reserved ? held_goods_ : -1;
         s.held_slot = static_cast<std::int8_t>(in_hand ? held_slot_ : -1);
         s.held_goods = in_hand ? held_goods_ : -1;
+        s.cigarette_toss = cigarette_toss_;
+        s.cigarette_puff = in_hand && held_goods_ == Cigarette::Goods
+                              ? cigarette_puff_ : Cigarette::Puff{};
+        const bool cigarette = in_hand && held_goods_ == Cigarette::Goods;
+        s.cigarette_near = cigarette ? cigarette_near_ : -1.0f;
+        s.cigarette_frames = cigarette ? cigarette_frames_ : 0;
+        s.cigarette_ready = cigarette ? cigarette_ready_ : 0;
+        s.cigarette_puffs = cigarette ? cigarette_puffs_ : 0;
+        s.cigarette_notice = cigarette_notice_;
+        s.held_session_ns = in_hand ? hold_from_base_ns_ : 0;
+        s.blade_active_ns = phase_ == Phase::Holding && held_goods_ == ShamanBlade::Goods
+                                ? blade_active_ns_ : 0;
+        s.blade_stroke = s.blade_active_ns ? blade_stroke_.Serial() : 0;
+        s.glove_armed_ns = phase_ == Phase::Holding && held_goods_ == HunterRelics::Gloves &&
+                                   charge_t_ >= 0.0 && charge_full_
+                               ? steady_ns_ : 0;
+        s.glove_charge = s.glove_armed_ns ? glove_charge_ : 0;
+        s.relic_drop = in_hand ? glove_drop_ : HunterRelics::DropRequest{};
+        s.call_beyond = {steady_ns_, hold_from_base_ns_,
+                         phase_ == Phase::Holding && charge_t_ >= 0.0 ? hold_from_ns_ : 0,
+                         serial_, in_hand && !tool_busy_ && held_goods_ == CallBeyond::Goods,
+                         phase_ == Phase::Waiting && tool_direct_use_};
         s.pulse_slot = pulse_slot_;
         s.pulse_deny = pulse_deny_;
         s.pulse_ns = pulse_ns_;
         // quick_hold_use: the ring while the held item's button fills it; the flash once full.
-        s.hold_from_ns = phase_ == Phase::Holding && hold_item_ && !hold_spent_ ? hold_from_ns_ : 0;
+        // (A Call Beyond's gathering and the Madaras Whistle's call fill it too: every long hold
+        // shows it, the tester's 2026-11-01.)
+        s.hold_from_ns =
+            (phase_ == Phase::Holding && hold_item_ && !hold_spent_ && !resting_ && !tool_busy_ &&
+             !pick_wait_ && (!holster_held_ || pocket_pull_)) ||
+                    (phase_ == Phase::Holding && (charge_t_ >= 0.0 || blow_t_ >= 0.0))
+                ? hold_from_ns_
+                : 0;
         s.hold_s = hold_len_;
+        s.augur_charge_ns = held_goods_ == Augur::Goods &&
+            (charge_t_ >= 0.0 || (phase_ == Phase::Waiting && tool_direct_use_)) &&
+            augur_charge_ns_ >= s.held_session_ns ? augur_charge_ns_ : 0;
+        s.roar_charge_ns = held_goods_ == BeastRoar::Goods &&
+            (charge_t_ >= 0.0 || (phase_ == Phase::Waiting && tool_direct_use_)) &&
+            roar_charge_ns_ >= s.held_session_ns ? roar_charge_ns_ : 0;
         // (The flash is the last hold's: never on an item taken since, which would show it full.)
         s.hold_done_ns = hold_done_ns_ >= hold_from_ns_ ? hold_done_ns_ : 0;
-        out.held_goods = in_hand ? held_goods_ : -1;
-        out.held_ffx = in_hand ? held_ffx_ : -1;
+        // A tool's charge or call (StartCharge, StartBlow): timed the same, its ring and flash
+        // not drawn; any later hold starts a ring of its own (a new hold_from_ns_).
+        s.hold_ring = !(ringless_from_ns_ != 0 && ringless_from_ns_ == hold_from_ns_);
+        if (!s.hold_ring)
+            s.hold_done_ns = 0;
+        // Its cosmetic invocation flash is driven by Site A's successful-use reply, not
+        // by raising a charged tool whose use may still be refused by the game.
+        if (held_goods_ == CallBeyond::Goods || held_goods_ == OldHunterBone::Goods)
+            s.hold_done_ns = 0;
+        // The last open's fan (kept while it folds away), its pick only while open.
+        s.fan = fan_;
+        s.fan_origin = {fan_frame_.origin.x, fan_frame_.origin.y, fan_frame_.origin.z};
+        s.fan_right = {fan_frame_.right.x, fan_frame_.right.y, fan_frame_.right.z};
+        s.fan_forward = {fan_frame_.forward.x, fan_frame_.forward.y, fan_frame_.forward.z};
+        const bool fan_open = fan_ && phase_ == Phase::Open;
+        s.fan_slot = static_cast<std::int8_t>(fan_open ? FanSlot(fan_pick_.card) : -1);
+        s.fan_out = fan_open && fan_pick_.out;
+        // quick_tool_keep: a kept tool is out of sight while the game's use of it plays (the
+        // game's own model is in his hand then).
+        out.held_goods = in_hand && !tool_busy_ ? held_goods_ : -1;
+        out.held_ffx = in_hand && !tool_busy_ ? held_ffx_ : -1;
         out.stab_item = phase_ == Phase::Holding && stab_item_;
         out.crank_box = phase_ == Phase::Holding && crank_item_;
         out.grabs = grabs_;
@@ -5917,6 +8695,20 @@ private:
     std::uint32_t open_serial_{0};
     std::uint32_t serial_{0};
     std::uint8_t cards_{0};
+    // quick_arc_pick=fan: the last open was a fan (Config::fan at the open), its frame, pick
+    // and selector, the play space it opened in (Input::holster_space: the recenter serial) and
+    // when the controller was last seen.
+    bool fan_{false};
+    FanFrame fan_frame_{};
+    FanSelector fan_sel_{};
+    FanPick fan_pick_{};
+    std::array<std::int8_t, SlotCount> fan_card_slot_{}; // card -> slot (FanBegin)
+    FanDirections fan_dirs_{};       // where the hand reads the cards (FanReadDirections)
+    FanDirections fan_drawn_dirs_{}; // where they are drawn round the pivot (FanDirectionsOf)
+    float fan_span_deg_{150.0f}; // Config::fan_span_deg at the open
+    float fan_radius_m_{0.18f};  // Config::fan_radius_m at the open
+    std::uint32_t fan_space_{0};
+    double fan_seen_t_{0.0};
     bool y_down_{false};
     // What toggled the arc this frame, for the log: "Y" or "L3" (the left stick click's tap).
     const char* toggle_by_{"Y"};
@@ -5925,6 +8717,11 @@ private:
     bool grip_was_{false};
     bool grip_armed_{false};
     bool trigger_on_{false};
+    HunterRelics::ChargedSwing charged_swing_{};
+    HunterRelics::Vector charged_heading_{};
+    HunterRelics::GloveRelease glove_release_{};
+    HunterRelics::DropRequest glove_drop_{};
+    HunterRelics::DropPlan glove_plan_{};
     bool trigger_was_{false};
     bool l2_was_{false};
     bool l2_fresh_needed_{false};
@@ -5942,12 +8739,22 @@ private:
     double wait_t_{0.0};
     double last_use_{-100.0};
     double grip_edge_t_{-100.0}; // the grip's last squeeze
+    double trigger_held_t_{-1.0}; // when the trigger went past 45% (or latched); -1: it is not
+    // A trigger down this long before a pocket's squeeze is still the clench's (trigger_aims).
+    static constexpr double PocketClenchS = 0.2;
     V3 open_hand_{};
     V3 activity_hand_{};
     // The stack (UpdateRegrab): that slot's next one for a squeeze after regrab_from_ until
     // regrab_until_.
     std::int32_t regrab_slot_{-1};
     std::int32_t regrab_goods_{-1};
+    Cigarette::Drag cigarette_drag_{};
+    float cigarette_near_{-1.0f}; // this hold: Scene::cigarette_near and its counts
+    std::uint32_t cigarette_frames_{}, cigarette_ready_{}, cigarette_puffs_{};
+    Cigarette::Puff cigarette_puff_{};
+    Cigarette::Toss cigarette_toss_{};
+    Cigarette::Puff cigarette_notice_{};
+    std::uint32_t cigarette_gift_seen_{0};
     double regrab_from_{0.0};
     double regrab_until_{0.0};
     std::int32_t hover_slot_{-1};
@@ -6062,6 +8869,8 @@ private:
     bool hold_spent_{false};
     // quick_music_box_crank: the music box in the hand (crank_item_) and its play's request.
     bool crank_item_{false};
+    // Config::optic: the Monocular in the hand, looked through (its trigger does nothing).
+    bool optic_item_{false};
     std::uint32_t crank_serial_{0};
     bool crank_played_{false}; // it played (the game's answer Used) since it was taken
     double hold_from_{0.0};
@@ -6070,6 +8879,7 @@ private:
     double hold_lost_{0.0};
     int hold_lost_frames_{0};
     std::int64_t hold_done_ns_{0};
+    std::int64_t ringless_from_ns_{0}; // the hold_from_ns_ of the last charge or call: no ring
     // quick_use_crush / quick_use_shake: the held item's gesture (None: the hold only), its
     // detectors, the ring's unstepped start (hold_from_base_: the time held counts from it, the
     // shake's steps move hold_from_ only), the strokes the ring shows, and a gesture done within

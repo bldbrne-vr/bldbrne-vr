@@ -2,10 +2,14 @@
 // SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdlib>
 #include <optional>
 #include <span>
 #include <tuple>
+#include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <magic_enum/magic_enum.hpp>
@@ -17,6 +21,7 @@
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/translate/translate.h"
 #include "shader_recompiler/ir/basic_block.h"
+#include "shader_recompiler/eye_spec.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/runtime_info.h"
 
@@ -333,7 +338,7 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     }
     if (stage == LogicalStage::Vertex || stage == LogicalStage::TessellationControl ||
         stage == LogicalStage::TessellationEval) {
-        if (info.stores.GetAny(IR::Attribute::RenderTargetIndex)) {
+        if (info.stores.GetAny(IR::Attribute::RenderTargetIndex) || ctx.NativeLayerOutput()) {
             ctx.AddCapability(spv::Capability::ShaderLayer);
         }
         if (info.stores.GetAny(IR::Attribute::ViewportIndex)) {
@@ -636,11 +641,239 @@ void PatchPhiNodes(const IR::Program& program, EmitContext& ctx) {
 }
 #include "native_screen_exports.inc"
 
+// VR_EYE_SPEC (shader_recompiler/eye_spec.h): each buffer binding's marker, an OpConstant of
+// EyeSpec::Magic + binding read only by its own OpIEqual compares, becomes an OpSpecConstant of
+// the same type and default value with SpecId EyeSpec::SpecBase + binding (decorated before the
+// first type declaration, after every other annotation). A marker whose id appears anywhere else
+// in the module (a guest constant of the same value shares it, or a literal word happens to equal
+// the id) stays a plain constant: its default is not 1, so that binding keeps its dynamic eye
+// index. Returns how many markers were made specialization constants.
+// The words of an instruction (after its first) that may hold an id: every one, except literal
+// operands of the instructions the emitter writes most (decorations, names, constants, scalar and
+// vector types, composite extracts and inserts, shuffles, extended instructions). A literal that
+// happens to equal a marker's id, counted, only keeps that marker plain.
+bool MayHoldId(u32 opcode, u32 word) {
+    switch (opcode) {
+    case 3:  // OpSource: literals and a string
+    case 7:  // OpString
+    case 10: // OpExtension
+    case 14: // OpMemoryModel
+    case 15: // OpEntryPoint: a constant is never an interface
+    case 17: // OpCapability
+        return false;
+    case 5:  // OpName: target, string
+    case 6:  // OpMemberName: type, member, string
+    case 11: // OpExtInstImport: result, string
+    case 16: // OpExecutionMode: entry point, literals
+    case 21: // OpTypeInt: result, width, signedness
+    case 22: // OpTypeFloat: result, width
+    case 71: // OpDecorate: target, decoration, literals
+    case 72: // OpMemberDecorate: type, member, decoration, literals
+        return word == 1;
+    case 23: // OpTypeVector: result, component type, count
+    case 24: // OpTypeMatrix: result, column type, count
+    case 43: // OpConstant: type, result, literal value
+    case 50: // OpSpecConstant
+        return word <= 2;
+    case 81: // OpCompositeExtract: type, result, composite, literal indexes
+        return word <= 3;
+    case 79: // OpVectorShuffle: type, result, vector 1, vector 2, literal components
+    case 82: // OpCompositeInsert: type, result, object, composite, literal indexes
+        return word <= 4;
+    case 12: // OpExtInst: type, result, set, literal instruction, operands
+        return word != 4;
+    default:
+        return true;
+    }
+}
+
+u32 PatchEyeSpec(std::vector<u32>& words, std::span<const EmitContext::EyeSpecMarker> markers) {
+    if (markers.empty() || words.size() < 5) {
+        return 0;
+    }
+    constexpr u32 OpConstant = 43, OpSpecConstant = 50, OpDecorate = 71, OpTypeVoid = 19,
+                  OpTypeForwardPointer = 39, DecorationSpecId = 1;
+    // A binding's markers (its flag, and a read-only binding's stride and size): all made
+    // specialization constants, or none.
+    struct Item {
+        u32 marker;   // index in `markers`
+        u32 id;       // the constant's id
+        u32 value;    // its literal
+        u32 uses;     // the references the emitter made
+        u32 spec_id;
+        size_t definition = 0;
+        u32 references = 0;
+    };
+    std::vector<Item> items;
+    for (u32 m = 0; m < markers.size(); ++m) {
+        const auto& k = markers[m];
+        items.push_back({m, k.marker.value, Shader::EyeSpec::Magic + k.binding, k.uses,
+                         Shader::EyeSpec::SpecBase + k.binding});
+        if (Sirit::ValidId(k.delta)) {
+            items.push_back({m, k.delta.value, Shader::EyeSpec::MagicDelta + k.binding,
+                             k.delta_uses, Shader::EyeSpec::SpecBaseDelta + k.binding});
+            items.push_back({m, k.size.value, Shader::EyeSpec::MagicSize + k.binding,
+                             k.size_uses, Shader::EyeSpec::SpecBaseSize + k.binding});
+        }
+    }
+    size_t first_type = 0;
+    for (size_t i = 5; i < words.size();) {
+        const u32 count = words[i] >> 16;
+        const u32 opcode = words[i] & 0xFFFF;
+        if (count == 0 || i + count > words.size()) {
+            return 0; // malformed: leave the module as it is
+        }
+        if (first_type == 0 && opcode >= OpTypeVoid && opcode <= OpTypeForwardPointer) {
+            first_type = i;
+        }
+        for (auto& item : items) {
+            if (opcode == OpConstant && count == 4 && words[i + 2] == item.id &&
+                words[i + 3] == item.value) {
+                item.definition = i;
+                continue;
+            }
+            for (u32 w = 1; w < count; ++w) {
+                item.references += words[i + w] == item.id && MayHoldId(opcode, w) ? 1 : 0;
+            }
+        }
+        i += count;
+    }
+    if (first_type == 0) {
+        return 0;
+    }
+    std::vector<u8> proven(markers.size(), 1);
+    for (const auto& item : items) {
+        if (item.definition == 0 || item.references != item.uses) {
+            proven[item.marker] = 0;
+        }
+    }
+    std::vector<u32> decorations;
+    u32 patched = 0;
+    for (const auto& item : items) {
+        if (!proven[item.marker]) {
+            continue;
+        }
+        words[item.definition] = (4u << 16) | OpSpecConstant;
+        decorations.insert(decorations.end(),
+                           {(4u << 16) | OpDecorate, item.id, DecorationSpecId, item.spec_id});
+    }
+    for (const u8 p : proven) {
+        patched += p;
+    }
+    words.insert(words.begin() + static_cast<std::ptrdiff_t>(first_type), decorations.begin(),
+                 decorations.end());
+    return patched;
+}
+
+// VR_EYE_DEP_AUDIT=1 (diagnostic, off by default): which outputs of a native stereo vertex shader
+// depend on an eye's own data. In a vertex stage only the game's 864-byte camera buffers are paired
+// per eye (Rasterizer::BindBuffers), so an output whose value never reads one (directly or through
+// anything it is computed from) is the same for both eyes. A shader whose only eye-dependent output
+// is the position could run once for both views (VK_NVX_multiview_per_view_attributes). One line a
+// shader, and every 64 shaders the totals.
+void AuditEyeDependence(const IR::Program& program) {
+    static const bool on = [] {
+        const char* v = std::getenv("VR_EYE_DEP_AUDIT");
+        return v && v[0] == '1';
+    }();
+    if (!on || program.info.stage != Stage::Vertex) {
+        return;
+    }
+    const auto camera_handle = [&](const IR::Inst* inst) {
+        const auto op = inst->GetOpcode();
+        const bool load = op == IR::Opcode::ReadConstBuffer ||
+                          (op >= IR::Opcode::LoadBufferU8 && op <= IR::Opcode::LoadBufferFormatF32);
+        if (!load || !inst->Arg(0).IsImmediate()) {
+            return false;
+        }
+        const u32 handle = inst->Arg(0).U32();
+        return handle < program.info.buffers.size() &&
+               !program.info.buffers[handle].IsSpecial() &&
+               program.info.buffers[handle].GetSharp(program.info).GetSize() == 864;
+    };
+    // Memo: an instruction's eye dependence (0 unknown, 1 eye-free, 2 eye-dependent).
+    std::unordered_map<const IR::Inst*, u8> memo;
+    const auto depends = [&](IR::Value root) {
+        if (root.IsEmpty() || root.IsImmediate()) {
+            return false;
+        }
+        std::vector<const IR::Inst*> todo{root.InstRecursive()}, order;
+        std::unordered_map<const IR::Inst*, u8> local;
+        bool found = false;
+        while (!todo.empty() && !found) {
+            const IR::Inst* inst = todo.back();
+            todo.pop_back();
+            if (const auto it = memo.find(inst); it != memo.end()) {
+                found = it->second == 2;
+                continue;
+            }
+            if (!local.emplace(inst, 1).second) {
+                continue;
+            }
+            order.push_back(inst);
+            if (camera_handle(inst)) {
+                found = true;
+                break;
+            }
+            for (size_t i = 0; i < inst->NumArgs(); ++i) {
+                const auto arg = inst->Arg(i);
+                if (!arg.IsEmpty() && !arg.IsImmediate()) {
+                    todo.push_back(arg.InstRecursive());
+                }
+            }
+        }
+        if (!found) {
+            for (const auto* inst : order) {
+                memo[inst] = 1; // its whole slice was walked without a camera read
+            }
+        }
+        return found;
+    };
+    u32 outputs = 0, eye_outputs = 0;
+    bool position_eye = false;
+    std::string eye_list;
+    for (const auto* block : program.blocks) {
+        for (const auto& inst : *block) {
+            if (inst.GetOpcode() != IR::Opcode::SetAttribute) {
+                continue;
+            }
+            const auto attr = inst.Arg(0).Attribute();
+            ++outputs;
+            if (!depends(inst.Arg(1))) {
+                continue;
+            }
+            if (attr == IR::Attribute::Position0) {
+                position_eye = true;
+                continue;
+            }
+            ++eye_outputs;
+            if (eye_list.size() < 200) {
+                eye_list += fmt::format(" {}.{}", IR::NameOf(attr), inst.Arg(2).U32());
+            }
+        }
+    }
+    static std::atomic<u32> shaders{}, camera_position{}, position_only{}, other_eye{};
+    const u32 n = shaders.fetch_add(1) + 1;
+    camera_position += position_eye ? 1 : 0;
+    position_only += position_eye && eye_outputs == 0 ? 1 : 0;
+    other_eye += eye_outputs != 0 ? 1 : 0;
+    LOG_INFO(Render_Recompiler,
+             "VR eye-dep audit: vs {:#x}: {} output writes, position {}, {} other writes eye-dependent:{}",
+             program.info.pgm_hash, outputs, position_eye ? "eye-dependent" : "eye-free",
+             eye_outputs, eye_list);
+    if (n % 64 == 0) {
+        LOG_INFO(Render_Recompiler,
+                 "VR eye-dep audit: {} vertex shaders, {} with an eye-dependent position, {} of them "
+                 "with no other eye-dependent output, {} with other eye-dependent outputs",
+                 n, camera_position.load(), position_only.load(), other_eye.load());
+    }
+}
+
 } // Anonymous namespace
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
-                           const IR::Program& program, Bindings& binding) {
-    EmitContext ctx{profile, runtime_info, program.info, binding};
+                           const IR::Program& program, Bindings& binding, bool merged_eyes) {
+    EmitContext ctx{profile, runtime_info, program.info, binding, merged_eyes};
     if (runtime_info.native_stereo) {
         ctx.info.native_camera_buffers = 0;
         ctx.info.native_projection_buffers = 0;
@@ -669,6 +902,7 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
                 if (!arg.IsEmpty() && !arg.IsImmediate()) todo.push_back(arg.InstRecursive());
             }
         }
+        AuditEyeDependence(program);
     }
     FindNativeScreenExports(ctx, program);
     const Id main{DefineMain(ctx, program)};
@@ -677,7 +911,28 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     SetupFloatMode(ctx, profile, runtime_info, main);
     PatchPhiNodes(program, ctx);
     binding.user_data += program.info.ud_mask.NumRegs();
-    return ctx.Assemble();
+    auto words = ctx.Assemble();
+    if (!ctx.eye_spec_markers.empty()) {
+        // VR_EYE_SPEC: the markers made specialization constants; every 256 stages the totals.
+        const u32 patched = PatchEyeSpec(
+            words, {ctx.eye_spec_markers.data(), ctx.eye_spec_markers.size()});
+        static std::atomic<u32> stages{}, markers{}, made{};
+        const u32 n = stages.fetch_add(1, std::memory_order_relaxed) + 1;
+        markers.fetch_add(static_cast<u32>(ctx.eye_spec_markers.size()), std::memory_order_relaxed);
+        made.fetch_add(patched, std::memory_order_relaxed);
+        if (n % 256 == 0 || patched != ctx.eye_spec_markers.size()) {
+            LOG_INFO(Render_Recompiler,
+                     "VR eye spec: {} stages, {} buffer markers, {} made specialization constants{}",
+                     n, markers.load(std::memory_order_relaxed),
+                     made.load(std::memory_order_relaxed),
+                     patched != ctx.eye_spec_markers.size()
+                         ? fmt::format(" ({:#x}: {} of {} kept plain)", program.info.pgm_hash,
+                                       ctx.eye_spec_markers.size() - patched,
+                                       ctx.eye_spec_markers.size())
+                         : std::string{});
+        }
+    }
+    return words;
 }
 
 Id EmitPhi(EmitContext& ctx, IR::Inst* inst) {

@@ -19,11 +19,16 @@ inline constexpr float DibrDefault = 0.25f;
 inline float Override(float value) {
     return !std::isfinite(value) || value < 0.0f ? -1.0f : std::clamp(value, 0.0f, 0.9f);
 }
+// `upscaled`: DLSS / FSR reconstructed the DIBR centre (renderer_vulkan/vr_dibr_upscale.h). It
+// is already anti-aliased over time, so unset dibr_eye_taa gives no eye history: a second history
+// only softens the reconstruction and costs a pass per refresh (~0.1 ms on an RTX 5080).
 inline float Weight(bool native_stereo, bool render_taa, float eye_taa,
-                    float taa_eye_taa, float dibr_eye_taa) {
+                    float taa_eye_taa, float dibr_eye_taa, bool upscaled = false) {
     const float inherited = render_taa && taa_eye_taa >= 0.0f ? taa_eye_taa : eye_taa;
     if (native_stereo)
         return inherited;
-    return dibr_eye_taa >= 0.0f ? dibr_eye_taa : std::min(DibrDefault, inherited);
+    if (dibr_eye_taa >= 0.0f)
+        return dibr_eye_taa;
+    return upscaled ? 0.0f : std::min(DibrDefault, inherited);
 }
 } // namespace VR::EyeHistory

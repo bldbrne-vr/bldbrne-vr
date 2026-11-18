@@ -7,21 +7,30 @@
 #include "video_core/native_stereo/asymmetric_projection.h"
 #include "video_core/native_stereo/native_stereo.h"
 #include "video_core/fast/constant_write_guard.h"
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <mutex>
 #include <array>
 #include <optional>
 #include <span>
 #include <unordered_map>
 #include <vector>
 
+#include "common/logging/log.h"
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "core/vr/render_taa.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_dispatch_eye_overlap.h"
+#include "video_core/renderer_vulkan/vk_layer_draws.h"
 #include "video_core/renderer_vulkan/vk_pass_merge.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_recorder.h"
+#include "video_core/renderer_vulkan/vr_body_maps.h"
+#include "video_core/renderer_vulkan/vr_depth_pyramid.h"
+#include "video_core/renderer_vulkan/vr_fog_grid.h"
 #include "video_core/texture_cache/download_log.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -31,6 +40,10 @@ struct Liverpool;
 
 namespace Core {
 class MemoryManager;
+}
+
+namespace Shader::Optimization::FogLight {
+class ListView;
 }
 
 namespace Vulkan {
@@ -47,6 +60,7 @@ struct Range;
 }
 
 class Scheduler;
+struct DynamicState;
 class DrawPipe;
 class RenderState;
 class GraphicsPipeline;
@@ -55,7 +69,7 @@ class VrInFrame;
 class VrUiLayer;
 class VrSmaa;
 class VrRenderTaa;
-class VrDibrDlss;
+class VrDibrUpscale;
 struct ForegroundProbe;
 struct NativeAudit;
 struct VrTemporalCapture;
@@ -110,6 +124,11 @@ public:
         u32 dst_offset;
     };
     CopyBuffers ObtainCopyBuffers(VAddr src_addr, u32 src_size, VAddr dst_addr, u32 dst_size);
+    /// FAST_CPU_REPEAT_DRAW: the next draw resolves its bindings again (the copy sink kept copies
+    /// while recording nothing, which the repeat test would take for no change).
+    void ForgetRepeatDraw() noexcept {
+        repeat.valid = false;
+    }
 
     [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
         return texture_cache;
@@ -120,8 +139,11 @@ public:
     bool DrawWorkerActive() const {
         return worker_active;
     }
+    // `reads_guest` false: the task reads no guest memory at B (its writes are guarded on their
+    // own), so a CE dump need not wait for it (bbport 0.7 RunInOrder; FAST_CE_TASK_READS=0: all).
     u64 QueueOrderedTask(void (*handler)(void*, std::span<const std::byte>), void* context,
-                         std::span<const std::byte> packet, bool writes_known = false);
+                         std::span<const std::byte> packet, bool writes_known = false,
+                         bool reads_guest = true);
     void GuardDeferredConstantWrite(VAddr address, u64 bytes);
     void GuardConstantWrite(VAddr address, u64 bytes, u64 ticket);
     /// FAST bit 16 (bbport WaitForPendingReads): before a CE DumpConstRam, wait only for
@@ -153,6 +175,8 @@ public:
     /// `emulator_write`: the emulator's own write of exactly these bytes (MemoryManager::
     /// InvalidateMemory: a file read, a video frame, a protection change), not a guest fault.
     /// `protection_only`: a protection change (sceKernelMprotect), which writes no byte.
+    /// The game handed [addr, addr + size) of GPU memory out again (any thread).
+    void NoteFreshRange(VAddr addr, u64 size);
     bool InvalidateMemory(VAddr addr, u64 size, bool emulator_write = false,
                           bool protection_only = false);
     /// Fast renderer (FastRender::FaultWindow): after a guest write fault at `addr`.
@@ -174,6 +198,9 @@ public:
     /// The guest's SubmitDone flush: Flush(), except that FAST bit 56 skips a submission with
     /// nothing in it (Scheduler::FlushFrameEnd).
     void FlushFrameEnd();
+    /// Liverpool's flush at the end of a guest submission (the GPU-idle task, the last
+    /// retirement): true when B may keep it until the next cut or the pipe runs empty (A/B 3).
+    bool DeferGuestFlush();
     void Finish();
     void OnSubmit();
 
@@ -198,7 +225,8 @@ public:
     }
     // PrepareFrame / PrepareBlankFrame: the frame is over, nothing of it is captured any more.
     void VrEndFrame();
-    bool VrDibrDlssFrame() const { return vr_dibr.dlss; }
+    // The DIBR centre was reconstructed by the upscaler (vr_dibr_upscale.h) at its output size.
+    bool VrDibrUpscaledFrame() const { return vr_dibr.upscaled; }
 
     // VR UI layer (vk_rasterizer_vr.cpp, renderer_vulkan/vr_ui_layer.h): in a UI-layer frame every
     // UI colour draw into the composite target X is also drawn into the presenter's K and W.
@@ -280,6 +308,9 @@ private:
     std::unique_ptr<DrawPacket> draw_packet;
     std::unique_ptr<DrawPacket> recording_packet;
     std::unique_ptr<DrawPipe> draw_pipe;
+    // Eye adaptation's state (shader_recompiler/ir/passes/cinematic_look.h): a small buffer the
+    // tone map reads and writes every frame, made at its first bind, zeroed (not yet valid).
+    std::unique_ptr<VideoCore::Buffer> vr_adapt_buffer;
     std::atomic<DrawPipe*> published_pipe{nullptr};
     VrStereoWarp* vr_warp{}; // SetVrStereoWarp; PrepareVrDraw (A) and DrawRecord (B) read it
     bool worker_active{};
@@ -315,6 +346,9 @@ private:
         bool mode{}, overflow{};
         u64 dumps{}, skipped{}, waited{}, wait_ns{}, untracked_waits{};
         u64 full_off{}, full_mode{}, full_box{}, full_guard{}, notes{}, untracked_packets{};
+        std::array<u64, 9> guard_hits{}; // FAST_CPU_CE_TICKET statistics: by PendingWriteGuard::Hit
+        u64 ticket_waits{};
+        u64 write_only_tasks{}; // ordered tasks queued with reads_guest false (not untracked)
         std::array<u64, 6> untracked_by{};
         // FAST_CPU_GUARD_CE_VERIFY (CeVerifyTargeted): dumps checked; what their full drain
         // changed after the targeted wait's point: the dumped guest bytes, the GPU-modified state
@@ -351,7 +385,20 @@ private:
         bool body_cape_hidden{}, body_head_hidden{}, body_shoulder_cut{};
         const VrHandsTable::Range* hands_split{};
         u32 hands_split_count{}, cut_code{};
+        // cut_code a Monocular code (native stereo): the body cut the free eye keeps (0: none).
+        u32 free_eye_cut{};
         bool probe_selected{};
+        // A draw of the hunter's in the moon's nearest cascade (vr_body_maps.h): captured (its
+        // pipeline the capture variant), or missed (the variant still compiling).
+        bool capture{}, capture_missed{};
+        VrBodyMaps::Draw capture_draw{};
+        // A draw into a shadow atlas tile, steadied (vr_shadow_hold.h Snap): its viewport moved
+        // (x, y; texels) and scaled about its centre (x, y).
+        bool shadow_snapped{};
+        // A held shadow frame's draw into the nearest cascade: that frame's number (0: not one).
+        // Here because this struct travels in both packet forms (EncodeSlim's header, Encode).
+        u32 shadow_near{};
+        std::array<float, 4> shadow_snap{};
     };
     alignas(64) PreparedVrDraw producer_vr{};  // Stage A (PrepareVrDraw), a line of its own
     alignas(64) PreparedVrDraw recording_vr{}; // Stage B (ConsumePacket), like what follows
@@ -375,6 +422,531 @@ private:
     bool vr_mirror_logged{}, vr_mirror_noted{}, vr_mirror_looked{};
     bool VrMirrorFlip() const;
     bool VrInMirrorPass() const;
+    // Light in the air (shader_recompiler/ir/passes/fog_light.h): the frame's point lights from
+    // the light pass's lists (a list of `size` bytes at `source`, guest memory when `guest`), and
+    // the light composite's buffer of them (`out`: FogLight::BufferDwords; its bytes returned).
+    void VrFogCapture(u64 pgm_hash, const float* source, u32 size, bool guest,
+                      const Shader::Optimization::FogLight::ListView& draw_view);
+    // Over the dim line (fog_light.h FillLuminance), or a spawned light bright lately
+    // (BrightHoldFrames); `view`: the list's view to world. Under vr_fog.mutex.
+    bool VrBrightLately(const float* l, const std::array<float, 12>& view, float lum);
+    // The light pass's flat camera, view to world (its light208 buffer's dwords 32..43, `source`
+    // as VrFogCapture's): where its lights are in the world (FogLight's lamp memory).
+    void VrFogCaptureView(const float* source, u32 size, bool guest, bool frame_candidate,
+                          Shader::Optimization::FogLight::ListView& draw_view);
+    void VrFogCaptureSceneView(const float* camera);
+    u32 VrFogUpload(std::span<u32> out);
+    // Lit smoke (shader_recompiler/ir/passes/particle_air.h): the soft particles' lights, the
+    // strongest of this frame's last VrFogUpload (cached there, so a particle draw only copies).
+    u32 VrParticleUpload(std::span<u32> out);
+    struct VrFogLight {
+        std::array<float, 3> position{};
+        float reach{};
+        std::array<float, 3> colour{};
+        std::array<float, 3> world{}; // with the frame's view (VrFogState::view)
+        bool map{};                   // the map's own light (FogLight::IsMapLight)
+        bool on_lantern{};            // verified flame in the merged list
+    };
+    struct VrFogCluster {
+        VrFogLight light; // combined colour and reach at the weighted centre
+        float weight;
+        u8 last_member;
+    };
+    // A light the lamp memory keeps (FogLight's Remember rules): in the world, faded in and out.
+    struct VrFogRemembered {
+        std::array<float, 3> world{};
+        std::array<float, 3> halo_world{}; // one of the listed emitters
+        float reach{};
+        float radius{}; // 1 / sqrt(reach)
+        std::array<float, 3> colour{};
+        std::array<float, 3> steady{}; // its colour's running mean (FogLight::SteadyS)
+        float weight{}; // 0..1: its share of the glow (fading in or out)
+        float unseen{}; // seconds since the game last listed it
+        float age{};    // seconds listed (a spawned light's short life: a flash, FogLight::FlashLifeS)
+        // Its flicker (FogLight::FlameFlicker): the brightness's running mean and mean change,
+        // and 0..1 how much it counts as a flame (a map light that never flickers lights no air).
+        float lum_mean{};
+        float lum_dev{};
+        float flame{};
+        float shadow{}; // 0..1: its share of shadowed air (FogLight::AirLamps)
+        // A flame seen at its place (AirLight::Sources): the votes' confidence, and confirmed
+        // (kept while the light is remembered).
+        float source{};
+        bool sourced{};
+        bool clustered{};
+        bool map{};
+        // A light the game spawned on an object the map places (FogLight::FixtureNext): the map's
+        // own lantern, kept like its lamps; or one seen off every object (a carried light).
+        bool fixture{};
+        bool strayed{};
+        bool seen{};   // listed this frame
+        bool chosen{}; // drawn last frame (FogLight::KeepChosen)
+    };
+    // A lamp memory light where this frame's camera sees it, as VrFogUpload ranks them.
+    struct VrFogCandidate {
+        std::array<float, 3> position;
+        float reach;
+        std::array<float, 3> colour;
+        float weight;
+        float score;
+        VrFogRemembered* remembered;
+        float smoke{}; // its weight for the smoke (the glow's is times its flame)
+        std::array<float, 3> halo_position{};
+    };
+    struct VrFogState {
+        std::atomic<bool> on{}; // this session takes them (FogLight::Enabled, asked at every flip)
+        float density{};    // VR_FOG_DENSITY, else FogLight::Density
+        std::mutex mutex;
+        std::vector<VrFogLight> building; // the light draws' since the last composite
+        std::vector<VrFogLight> ready;    // the composite's (both eyes', a second composite's)
+        std::vector<VrFogCluster> merged; // VrFogUpload's (MergeM), kept for its capacity
+        // The lights `building` holds, as a hash set of their bits (VrFogCapture: a light lights
+        // several tiles, one list per tile; one lookup, not a scan of every light so far).
+        std::array<u64, 256> building_keys{};
+        // VrFogUpload's working lists, kept for their capacity (no allocation per frame).
+        std::vector<VrFogCandidate> candidates;
+        std::vector<const VrFogCandidate*> order;
+        // The lamp memory: the frame's view to world (light208 dwords 32..43, row-major 3x4)
+        // when its light pass gave one, the remembered lights, the frame they were last updated
+        // in, when, and where the camera was then.
+        std::array<float, 12> view{};
+        u64 frame{1};     // counted at every flip
+        u64 view_frame{}; // the frame `view` is from (0: none yet)
+        std::array<float, 12> last_list_view{}; // diagnostics only
+        u64 views_apart{}; // (tests: frames whose lists' camera was not `view`'s)
+        u64 views_apart_frame{};
+        u64 memory_frame{};
+        std::chrono::steady_clock::time_point memory_time{};
+        std::array<float, 3> memory_camera{};
+        std::vector<VrFogRemembered> memory;
+        // Lit smoke's buffer (ParticleAir: the world-to-view rows, then the strongest lights),
+        // made by VrFogUpload, and the frame it is from (0: none).
+        std::array<u32, 80> particle{};
+        u32 particle_dwords{};
+        u64 particle_frame{};
+        // The muzzle flash (FogLight's Muzzle*): where and when the last shot was.
+        std::array<float, 3> muzzle_world{};
+        std::chrono::steady_clock::time_point muzzle_t0{};
+        bool muzzle_on{};
+        u64 muzzle_seen{}; // the gun's shots taken (muzzle_flash.h)
+        // The memory's last step (seconds) and the frame the shadowed air's shares last moved.
+        float memory_dt{};
+        u64 shadow_frame{};
+        // The fog grid's lights (fog_grid.h Lamps): the lights with a glow of their own as
+        // VrFogUpload last listed them (the head's view, the air's colour times the weight), the
+        // muzzle flash after them while it shines, and the frame they are from.
+        struct GridLight {
+            std::array<float, 3> position;
+            float reach;
+            std::array<float, 3> colour;
+            float core2;
+        };
+        std::array<GridLight, 25> grid_lights{};
+        u32 grid_light_count{};
+        // The light in his hand (fog_grid.h Lamps::Held*): the torch's, which the air's list
+        // leaves out as a fill (it reaches 8.5 m); where it is in the world, its reach and colour,
+        // the frame it was last listed in.
+        std::array<float, 3> held_world{};
+        float held_reach{};
+        std::array<float, 3> held_colour{};
+        u64 held_frame{};
+        bool grid_flash{}; // the last of them is the muzzle flash
+        u64 grid_lights_frame{};
+        // The spawned lights seen bright lately (fog_light.h BrightHoldFrames): where, their
+        // reach, the frame they last were (0: a free entry). VrBrightLately, under the mutex.
+        struct BrightLight {
+            std::array<float, 3> world;
+            float reach_k;
+            u64 frame;
+        };
+        std::array<BrightLight, 32> bright{}; // FogLight::BrightLights
+    } vr_fog;
+    // Raised brickwork (shader_recompiler/ir/passes/parallax.h BumpGaps; vr_bump_class.h;
+    // VrPushData::bump_depth). `draw_need`: what the draw needs of the pushed depth, set by
+    // BindTextures from its bump map's class; VrNativeDrawValues pushes `depth_m` (the frame's
+    // depth, VrBumpEndFrame: the setting's, 0 when off) or 0 by it.
+    // The pushed depth is part of the block the recorder leaves out while it does not change
+    // (FAST_CPU_PUSH_SPLIT):
+    //  - NeedKeep: the program reads none (no bump map): what the last draw pushed;
+    //  - NeedDepth: a height map (the game's, or one made: bump_height.h);
+    //  - NeedNone: any other blue: 0, the game's own reads.
+    // (2026-11-12, tried and dropped: a flat blue keeping the last draw's depth for a few draws,
+    // since the moving path draws the game's picture for it too. The Central Yharnam street,
+    // G-buffer ms a frame: strict 1.689, 8 draws 1.717, 64 draws 1.728, for 26% and 29% fewer
+    // whole pushes and no change of the recorder's time per draw.)
+    // `classes`: the textures seen, by address, size and format (at most
+    // BumpClassesMax, then cleared); each is read again BumpFirstRecheckFrames after its first
+    // sight (a texture bound before its bytes arrived), then every BumpRecheckFrames (an address
+    // reused by another texture of the same size), one re-read a frame at most.
+    // A bump map whose blue is flat may get a height made from its normals
+    // (texture_cache/bump_height.h: the cobbled streets): `slot` is its place there, its scale 0
+    // until the image holds that height. `poll_frame`: the frame the finished heights were last
+    // collected (their images are then uploaded again).
+    struct VrBumpState {
+        struct Entry {
+            u8 need;  // without a slot: NeedDepth (the game's height map) or NeedNone
+            u64 next; // the frame to read its bytes again
+            s32 slot; // the height made for it (bump_height.h), -1: none
+        };
+        u8 draw_need{NeedKeep};
+        float pushed_depth{0.0f}; // what the last draw pushed
+        float depth_m{0.0f};
+        u64 frame{1};
+        u64 recheck_frame{0};
+        u64 poll_frame{0};
+        std::vector<std::pair<VAddr, u32>> ready;
+        std::unordered_map<u64, Entry> classes;
+    } vr_bump;
+    static constexpr u64 BumpRetryFrames = 8; // a height's request that found no room this frame
+    static constexpr u8 NeedNone = 0, NeedDepth = 1, NeedKeep = 2;
+    static constexpr size_t BumpClassesMax = 8192;
+    static constexpr u64 BumpFirstRecheckFrames = 60;
+    static constexpr u64 BumpRecheckFrames = 900;
+    void VrBumpClassify(const Shader::Info& stage, const Shader::ImageResource& desc,
+                        const AmdGpu::Image& tsharp);
+    void VrBumpEndFrame();
+    // The hunter's capsules (shader_recompiler/ir/passes/body_shadow.h), built once a frame.
+    struct VrBody {
+        u64 frame{~0ull};
+        std::array<u32, 416> data{}; // BodyShadow::BufferDwords
+        u64 maps_frame{~0ull};       // the frame whose body maps were recorded (or tried)
+        // The lights bright enough to shadow (light_shadow.h's rule, not the fog's: the torch in
+        // his hand reaches 8.4 m, a fill to the fog), as the light pass lists them (VrFogCapture,
+        // under vr_fog.mutex); VrEndFrame hands a frame's to the next frame's maps.
+        struct Light {
+            std::array<float, 3> world{};
+            float reach{};
+            std::array<float, 3> colour{};
+            float camera2{}; // its squared distance from the camera (the nearest are kept)
+            bool bright{};   // over the dim line, or a spawned light bright lately (VrBrightLately)
+        };
+        static constexpr size_t MaxLights = 64;
+        std::vector<Light> building, lights;
+        // The lamps his shadow comes from (body_shadow.h BodyLampsAt): in the world, this frame's.
+        std::array<std::array<double, 3>, 3> top{};
+        u32 top_count{};
+        u64 top_frame{~0ull};
+    } vr_body;
+    // His real silhouette for the lamp shadows (vr_body_maps.h): made with the rasterizer (its
+    // buffers at the first use), the producer pools his meshes' indices, the recording thread
+    // captures and draws the maps.
+    std::unique_ptr<VrBodyMaps> vr_body_maps;
+    void VrBodyMapsBeforeDraw(const GraphicsPipeline* pipeline);
+    // The depth pyramid (vr_depth_pyramid.h): before the frame's first AO pass that reads it.
+    void VrPyramidBeforeDraw(const GraphicsPipeline* pipeline);
+    std::unique_ptr<VrDepthPyramid> vr_pyramid;
+    u64 vr_pyramid_frame{~0ull}; // the frame whose pyramid was recorded (or tried)
+    bool vr_pyramid_ready{};     // ... and was
+    // The fog grid (vr_fog_grid.h, shader_recompiler/ir/passes/fog_grid.h; VR_FOG_GRID=1): built
+    // before the frame's scene copy from the mist's numbers of that frame's air pass
+    // (vk_rasterizer_fog_grid.cpp).
+    std::unique_ptr<VrFogGrid> vr_fog_grid;
+    struct VrFogGridState {
+        u64 frame{~0ull};          // the camera record the grid was last built with
+        u32 counter{};             // builds so far (the buffer's tag, the jitter's frame)
+        std::unique_ptr<VideoCore::Buffer> none; // the stand-in until the first build (its own buffer)
+        // The last build's camera, for the history (fog_grid.h): the moon's light space axes in
+        // its view and its view-to-world rotation (rows), the camera's place in the world and
+        // where that came from, its frustum and size, when it was, and the cascades it had.
+        bool last_valid{};
+        std::array<double, 9> last_axes{}, last_view{};
+        std::array<double, 3> last_place{};
+        u32 last_place_kind{};
+        std::array<float, 4> last_frustum{};
+        std::array<u32, 3> last_size{};
+        std::chrono::steady_clock::time_point last_time{};
+        u32 last_cascades{};
+        // Fog patches (fog_patches.h): the hunter's map they were last picked for, their share
+        // since (eased in after a change of map), when that was.
+        u32 patch_map{~0u};
+        float patch_share{};
+        std::chrono::steady_clock::time_point patch_time{};
+        // The moonlit thin air's share while the game's own moon rays draw (fog_grid.h
+        // GameRaysShare), eased; when it was last stepped.
+        // The world-fixed volume is built this frame (fog_grid.h World).
+        bool volume{};
+        // The stir field (fog_grid.h Stir): built this frame; the last frame's (its volume's
+        // corner, when); the movers' last places, for their speeds.
+        bool stir{};
+        bool stir_built{};
+        std::array<float, 2> stir_corner{};
+        std::chrono::steady_clock::time_point stir_time{};
+        std::array<float, 3> stir_hunter{};
+        bool stir_hunter_known{};
+        std::array<std::array<float, 3>, 2> stir_hand{};
+        std::array<bool, 2> stir_hand_known{};
+        std::array<std::array<float, 2>, 8> stir_others{};
+        u32 stir_other_count{};
+        float game_rays{1.0f};
+        std::chrono::steady_clock::time_point game_rays_time{};
+    } vr_fog_grid_state;
+    void VrFogGridBeforeDraw(const GraphicsPipeline* pipeline);
+    bool VrFogGridParams(std::span<u32> out, bool past, bool atlas, bool& shadows);
+    vk::DescriptorBufferInfo VrFogGridBuffer();
+    // The lamp shadows' blocker grid (light_shadow.h Grid): its buffer, made and cleared before
+    // the first lamp draw that declares it (VrShadowGridBeforeDraw); the frames' stamp counter.
+    std::unique_ptr<VideoCore::Buffer> vr_grid_buffer;
+    // The stand-ins of the lamp shadows' written buffers (the shadow mask, the scene maps, the
+    // blocker grid) until those are made: each its own small buffer of zeros, never a range of the
+    // shared stream buffer (VrWrittenStandIn).
+    std::array<std::unique_ptr<VideoCore::Buffer>, 3> vr_written_none;
+    vk::DescriptorBufferInfo VrWrittenStandIn(u32 which, u64 bytes);
+    // The lights the game keeps on the camera (light_shadow.h AttachedFromM), found in
+    // VrFogCapture (under vr_fog.mutex): the reference frame's view and lights (more than
+    // AttachedFromM from the eye), the frame being listed, and the last decision's.
+    struct VrAttached {
+        struct Candidate {
+            std::array<float, 3> pos{};      // its place in the camera's view
+            float reach{};                   // its reach dword (1 / r^2)
+            std::array<float, 3> colour{};
+            std::array<float, 12> first_view{}; // the camera when first seen there
+            u64 last_frame{};
+            u32 sightings{};
+            bool attached{};
+        };
+        std::unordered_map<u64, Candidate> candidates; // by place (light_shadow.h AttachedSameM)
+        // The confirmed ones (attached) and their cells: what the shadow slots' pick tests a light
+        // against and his body buffer lists. Gathered again only when they change (a light
+        // confirmed, an attached cell taken by another light, the prune): the map grows with every
+        // place a lamp passed while the camera moved, too big to walk every frame.
+        std::vector<Candidate> confirmed;
+        std::vector<u64> confirmed_keys;
+        bool confirmed_dirty{true};
+        void RefreshConfirmed() {
+            if (!confirmed_dirty) {
+                return;
+            }
+            confirmed_dirty = false;
+            confirmed.clear();
+            confirmed_keys.clear();
+            for (const auto& [key, c] : candidates) {
+                if (c.attached) {
+                    confirmed.push_back(c);
+                    confirmed_keys.push_back(key);
+                }
+            }
+        }
+        // This frame's light_shadow.h NoCastLights in the lists: place (flat view) and reach.
+        std::array<std::array<float, 4>, 2> no_cast{};
+        u32 no_cast_count{};
+        u64 pruned{};
+        u64 frame{~0ull};
+        std::array<float, 12> view{};
+    } vr_attached;
+    bool vr_grid_ready{};
+    u32 vr_grid_counter{};
+    u64 vr_grid_header{~0ull}; // the frame whose header was written
+    void VrShadowGridBeforeDraw(const GraphicsPipeline* pipeline);
+    // The scene shadow maps (light_shadow.h SceneMaps): made once; cleared at the frame's first
+    // draw that writes them (the AO pass), a barrier before the frame's first that reads them.
+    void VrSceneMapsBeforeDraw(const GraphicsPipeline* pipeline);
+    // The other casters (enemies and NPCs out of view) for the AO pass: this frame's, once.
+    const std::array<u32, 452>& VrShadowCastersUpload();
+    // (Tests, log builds only: the CPU time the lamp shadows' upkeep takes on this thread, logged
+    // every 900 frames with the slot pick.)
+    // Parts: 0 the draws' slot bytes, 1 the light lists' candidates, 2 the frame's slot pick, 3 the
+    // casters' upload.
+    struct VrShadowCpuScope {
+        explicit VrShadowCpuScope(u32 part_) : part{part_} {
+            if constexpr (Common::Log::Enabled) {
+                scopes.fetch_add(1, std::memory_order_relaxed);
+                t0 = std::chrono::steady_clock::now();
+            }
+        }
+        ~VrShadowCpuScope() {
+            if constexpr (Common::Log::Enabled) {
+                const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - t0).count());
+                total.fetch_add(ns, std::memory_order_relaxed);
+                parts[part].fetch_add(ns, std::memory_order_relaxed);
+            }
+        }
+        u32 part;
+        std::chrono::steady_clock::time_point t0{};
+        inline static std::atomic<u64> total{0};
+        inline static std::atomic<u64> scopes{0};
+        inline static std::array<std::atomic<u64>, 5> parts{};
+    };
+    struct VrScene {
+        struct Lamp {
+            std::array<float, 3> world{}; // game units
+            float k{};                    // reach dword (1 / r^2)
+            float score{};                // the share of the view it lights, roughly
+            float strength{};             // its shadow's strength (the lamp shaders' rule)
+            float clear{};                // its fixture's clearance (the march's rule), game units
+            bool held{};                  // in a hand (it moves: kept within SlotKeepM, not KeepFixedM)
+        };
+        std::vector<Lamp> building;       // this frame's lamps (VrFogCapture)
+        static constexpr size_t SlotCount = 16; // light_shadow.h SceneMaps::Slots
+        std::array<Lamp, SlotCount> chosen{};    // the slots, from the last frame's
+        std::array<u32, SlotCount> flags{};      // light_shadow.h SlotUsed, SlotFresh
+        std::array<std::array<float, 3>, SlotCount> prev{}; // where each slot's lamp was last frame
+        std::array<u32, SlotCount> unseen{};     // frames since each slot's lamp was last listed
+        std::array<u32, SlotCount> age{};        // frames since each slot's lamp took it
+        // The trace's reach from the eye by the GPU's time (light_shadow.h TraceFarLevels).
+        struct TraceDial {
+            float reach_m{12.0f}; // this frame's reach (view metres)
+            u32 level{};         // into TraceFarLevels
+            float ms{-1.0f};     // the game's GPU time a frame, smoothed
+            unsigned frames{};   // the timer's frames read so far
+            u32 over{}, under{}; // frames running over DialDownShare / under DialUpShare
+        } dial;
+        // The mask march's step dial (light_shadow.h StepDial): its level, the frames over or
+        // under, the GPU frames read, the smoothed GPU time.
+        struct {
+            u32 level{};
+            u32 over{};
+            u32 under{};
+            unsigned frames{};
+            float ms{-1.0f};
+        } step_dial;
+        s64 picked_ns{};                         // the last slot pick (the resting spots' time step)
+        std::unique_ptr<VideoCore::Buffer> mask; // the shadow mask (SceneMaps::Mask)
+        std::array<u32, 3> draw_slots{};  // this draw's lights' slots (SceneMaps::DrawSlotsAt)
+        std::array<u32, 452> casters{};   // the other casters (SceneMaps::CasterDwords), this frame's
+        u64 casters_frame{~0ull};
+        bool draw_slots_valid{};
+        u64 draw_slots_pgm{};
+        u32 mask_pixels{};                // its capacity
+        u32 count{};
+        std::unique_ptr<VideoCore::Buffer> buffer;
+        u64 cleared_frame{~0ull};         // the camera record of the last clear
+        u64 barrier_frame{~0ull};
+        // SlotHis a slot (VR_MARCH_OPT 16), made once a frame (its key: the frame, his lamps', the
+        // slots', the view's).
+        u32 his_mask{};
+        std::array<u64, 5> his_key{};
+        // SlotHero a slot (High lamp shadows, light_shadow.h High): the frame's hero lamps, picked
+        // with the slots (the last pick's, kept for its hysteresis).
+        u32 hero_mask{};
+    } vr_scene;
+    bool VrCameraFillKept() const;
+    u32 VrBodyUpload(std::span<u32> out, u64 pgm_hash = 0);
+    // Moonlight in the air (shader_recompiler/ir/passes/moon_shafts.h; vk_rasterizer_moon.cpp):
+    // the shadow pass's cascades (its buffer 0) and atlas (its depth-compared image, then the
+    // light composite's host image), the directional light's light sets (its buffer 0), and the
+    // composite's buffer of them (`out`: MoonShafts::BufferDwords; its bytes returned).
+    void VrMoonCaptureCascades(const float* source, u32 size, bool guest);
+    void VrMoonCaptureAtlas(const Shader::Info& stage);
+    void VrMoonCaptureSets(const AmdGpu::Buffer& sharp, u32 size);
+    // (`for_grid`: the fog grid's own call: the cascades also while the glow's strength is 0.)
+    u32 VrMoonUpload(std::span<u32> out, bool for_grid = false);
+    void VrMoonEndFrame();
+    struct VrMoonState {
+        std::atomic<bool> on{}; // this session takes them (MoonShafts::Enabled, asked every flip)
+        u32 steps{};          // points per ray (the quality)
+        float density{};      // VR_MOON_SHAFTS_DENSITY, else MoonShafts::Density
+        u32 frame{};          // flips counted (the noise's frame, the captures' age)
+        std::mutex mutex;
+        std::array<float, 84> cascades{}; // the flat camera's cascades336
+        u32 cascades_frame{~0u};
+        u32 cascades_serial{}; // captures so far (the fog grid: a frame with cascades of its own)
+        u32 atlas_frame{~0u};
+        u32 atlas_width{}, atlas_height{};
+        float compare_sign{1.0f}; // +1: lit while the depth <= the atlas' (its sampler's compare)
+        u32 sets{};               // the light-set table's sets (a host buffer of the composite)
+        u32 sets_frame{~0u};
+        // The visible moon in the moon's light space (VR::MoonScreen; VrMoonUpload): the glow's
+        // direction, held MoonShafts::GlowHoldMs after the game's light shafts last showed it.
+        std::array<double, 3> glow_light{};
+        s64 glow_seen_ms{-1};
+    } vr_moon;
+    // The air pass (vk_rasterizer_air.cpp, shader_recompiler/ir/passes/air_light.h): the pictures
+    // its two hosts read (the moon's shadow pass's, the light composite's; this frame's), the
+    // half-size cells of the moonlight in the air, and the moon's colour from the probe.
+    struct VrAirState {
+        u64 shadow_target{}, scene_target{};
+        u64 shadow_frame{~0ull}, scene_frame{~0ull};
+        std::unique_ptr<VideoCore::Buffer> cells;
+        std::unique_ptr<VideoCore::Buffer> cells_none; // the stand-in until they are made (its own buffer)
+        std::array<float, 24> widen{}; // each listed light's reach in the air's share (Mist::LampWide)
+        u32 widen_count{};
+        u64 cells_words{};
+        u32 cells_w{}, cells_h{};
+        u64 cells_frame{~0ull};   // the frame whose blur wrote them
+        u64 barrier_frame{~0ull}; // ... whose copy waited for them
+        u64 half_frame{~0ull};    // the last frame the half-size host (AirLight::IsHalfProgram) computed in
+        // The mist: this frame's view to world (the reflections pass's own rows: VrAirCaptureView),
+        // the ground's height (the hunter's feet, eased) and when it was last moved.
+        std::array<float, 12> view{};
+        u64 view_frame{~0ull};
+        float ground{};
+        bool ground_valid{};
+        float area_share{};  // the mist's share here (air_light.h Mist::AreaShare, eased)
+        // The mist's numbers of the frame's compute host, for the scene copy's buffer (the camera's
+        // 12, the mist's 16, the high haze's 1, the distance haze's 3).
+        std::array<u32, 32> mist_carry{};
+        u64 mist_carry_frame{~0ull};
+        // The hunter's place of that frame (his feet, 1.6 m up): what the fog's own things are
+        // centred on. mist_carry's view is the frame's camera, where the fog is seen from.
+        std::array<float, 3> mist_place{};
+        u64 mist_place_frame{~0ull};
+        float moon_full{};   // the moon glow's full share here (moon_shafts.h AreaFull, eased)
+        bool moon_full_valid{};
+        std::chrono::steady_clock::time_point moon_full_time{};
+        bool area_valid{};
+        std::chrono::steady_clock::time_point ground_time{};
+        std::chrono::steady_clock::time_point start_time{std::chrono::steady_clock::now()};
+        std::unique_ptr<VideoCore::Buffer> probe; // host-visible
+        u64 probe_frame{~0ull};
+        u32 probe_counter{};
+        std::chrono::steady_clock::time_point probe_time{};
+        std::array<float, 3> colour{};
+        bool colour_valid{};
+        float blood_moon{}; // the blood moon's share of the air's colour (air_light.h BloodMoon), eased
+        // The source votes (AirLight::Sources): the lights each probe slot's frame gave the
+        // scene's copy (where they are in the world), and the votes read back but not yet
+        // counted (VrFogUpload counts them, under the lamp memory's lock).
+        struct SourceList {
+            u32 count{};
+            std::array<std::array<float, 3>, 24> world{};
+        };
+        std::array<SourceList, 4> source_lists{};
+        SourceList votes_list{};
+        std::array<u32, 24 * 4> votes{};
+        bool votes_pending{};
+    } vr_air;
+    // The moon's place (AirLight::MoonAim): the camera each probe slot's frame gave the scene's
+    // copy (the flat camera's cascades, the first eye's inverse projection, its ndc line), the
+    // word read back with its camera, and the direction being confirmed (the moon's light space).
+    struct VrAirAim {
+        struct Camera {
+            bool valid{};
+            std::array<float, 12> view{}; // view to world (the lamp memory's rows)
+            std::array<float, 16> inverse{};
+            std::array<float, 4> ndc{};
+        };
+        std::array<Camera, 4> cameras{};
+        Camera read_camera{};
+        u32 read_word{};
+        bool pending{};
+        std::array<double, 3> candidate{}; // in the world
+        u32 agree{};
+        float held_brightness{};
+        std::array<double, 3> moon_world{}; // the moon's direction taken
+        s64 moon_seen_ms{-1};
+        std::array<double, 3> shadow_world{}; // the shadow light's direction when the moon was taken
+        std::array<double, 3> glow_world{};   // where the glow points (it glides)
+        bool glow_valid{};
+        s64 glow_ms{-1};
+        u32 area_miss{};   // frames in a row the shadow light pointed elsewhere (another area)
+        u64 area_frame{};
+        s64 sky_seen_ms{-1}; // a sky fragment reported (the mist's open-sky rule)
+        float open_sky{1.0f}; // the mist's share by it, eased
+    } vr_air_aim;
+    void VrAirMoonAim(const std::array<double, 3>* shadow_world); // (vk_rasterizer_moon.cpp, under vr_moon.mutex)
+    void VrAirSourceVotes();                     // (under vr_fog.mutex)
+    void VrAirSourceList(u32 count, const VrFogCandidate* const* order); // (the same)
+    void VrAirCapture(const Shader::Info& stage);
+    void VrAirCaptureView(const float* source, u32 size, bool guest);
+    void VrAirFrame(u64 frame);
+    void VrAirMoon(std::span<u32> moon, u64 pgm_hash);
+    void VrAirWiden(std::span<u32> fog, u64 pgm_hash);
+    void VrAirProbeBuffer();
+    u32 VrAirUpload(std::span<u32> out, const Shader::Info& stage);
+    void VrAirBeforeDraw(const GraphicsPipeline* pipeline);
+    bool VrAirSceneCopy(const Shader::Info& stage, u64 frame) const; // this draw is the frame's scene copy
+    std::array<float, 3> VrAirColour() const;                        // the air's colour as the scene copy gets it
     void VrMirrorCamera(bool mirrored, VAddr camera);
     void VrMirrorAhead();
     // Native stereo, recording thread, the draw being recorded (VrNativeDrawValues, from the
@@ -404,6 +976,44 @@ private:
                       VAddr address = 0, u32 offset = 0, u32 size = 0, u32 count = 0,
                       VAddr count_address = 0);
     void DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
+    /// Far shadows (vr.ini shadows_far, VR_SHADOW_SKIP_CELLS for tests; Stage A, registers only):
+    /// this draw goes into a skipped cell
+    /// of a shadow atlas.
+    bool ShadowCellSkipped(bool can_confine = false);
+    /// The game's lamp shadow maps (Stage A, registers only): this draw's colour target is one a
+    /// game-shadowed lamp shader of ours reads as lit (Info::VrLightShadow::game_shadowed).
+    bool GameLampMapSkipped();
+    void NoteGameLampMap(VAddr address);
+    std::mutex vr_lamp_maps_mutex;
+    std::vector<VAddr> vr_lamp_maps;        // (a handful: the game's pool of cube maps)
+    std::atomic<u32> vr_lamp_map_count{};
+    // FAST_GPU_PASS_PROFILE_DRAWS: this frame's lamp draws so far, by shader.
+    u64 lamp_draw_frame{~0ull};
+    std::unordered_map<u64, u32> lamp_draw_seen;
+    u64 vr_lamp_maps_skipped{};
+    /// Water reflections off (vr.ini water_reflections=0; Stage A, registers only): this draw is
+    /// one of the water reflection's (a clipping draw into a target that mostly takes those).
+    bool WaterReflectionSkipped();
+    // Water reflections on, capped (WaterBudget): this reflection draw is over the frame's
+    // budget (Stage A, once its pipeline is chosen; `indices` its index count, ~0u when unknown:
+    // an indirect draw). A character's draw is never.
+    bool WaterReflectionCapped(u32 indices, const GraphicsPipeline* pipeline);
+    /// Stage B, for a draw WaterReflectionSkipped left out: its target cleared, once a frame.
+    void WaterReflectionClear();
+    /// A FilteredDraw packet's offset for a left-out water reflection draw.
+    static constexpr u32 WaterReflectionMark = 1;
+    /// The shadow atlas held over frames (vr_shadow_hold.h): a held frame's clear, confined to the
+    /// nearest cascade's quarter. Stage A's verdict for the draw at hand, the packet's mark (its
+    /// size field), and Stage B's flag while that draw is recorded.
+    // The shadow atlas held over frames (vr_shadow_hold.h): a held frame's draws into the nearest
+    // cascade. Stage A gives each of them the held frame's number (shadow_near_a, in its packet);
+    // the recording side clears that cascade's quarter at the first of them it records
+    // (vr_shadow_near_done: the frame whose quarter is cleared), and none of them lets the game's
+    // pending clear of the whole atlas through.
+    u32 shadow_near_a{};
+    bool vr_shadow_near_clear{};
+    u32 vr_shadow_near_serial{}, vr_shadow_near_done{};
+    void VrShadowNearClear(const RenderState& state, float depth);
     void DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed, VAddr arg_address,
                             u32 offset, u32 stride, u32 max_count, VAddr count_address);
     void DispatchDirectRecord(const ComputePipeline* pipeline);
@@ -416,9 +1026,11 @@ private:
     bool EyeOverlapTake(EyeOverlap::Check* check, vk::Buffer left_args = {},
                         vk::Buffer right_args = {});
     /// FAST_DISPATCH_EYE_OVERLAP_VERIFY: records both eyes twice (see the header); false when
-    /// this dispatch is not sampled (nothing recorded).
+    /// this dispatch is not sampled (nothing recorded). With `merged` (VR_MERGED_EYES=v,
+    /// vr_merged_eyes.h) the second run is that one launch instead of the swapped order.
     template <typename RecordEye>
-    bool EyeOverlapVerify(const Shader::Info& cs, const RecordEye& record_eye);
+    bool EyeOverlapVerify(const Shader::Info& cs, const RecordEye& record_eye,
+                          const std::function<void()>* merged = nullptr);
     /// FAST_GPU_PASS_PROFILE (bit 38): labels the game render pass `state` begins.
     void LabelGpuPass(GpuPassProfiler& profiler, const GraphicsPipeline* pipeline,
                       const RenderState& state);
@@ -429,6 +1041,8 @@ private:
     /// FAST_SKIP_NOOP_DRAWS_VERIFY: the independent re-derivation; null when it agrees.
     const char* NoopDrawRecheck(const GraphicsPipeline* pipeline, const RenderState& state) const;
     void ReportNoopDraws();
+    void NoteBatchCensus(const GraphicsPipeline* pipeline, const RenderState& state,
+                         bool is_indexed, u32 index_offset);
     // Recording thread only (like target_memo_stats).
     struct NoopDrawStats {
         u64 eligible{}, skipped{}, verify_tick{}, verified{}, mismatches{};
@@ -441,6 +1055,14 @@ private:
     std::unique_ptr<NativeAudit> native_audit;
     void VrNativeAudit(const Pipeline* pipeline, const RenderState* state);
     void VrNativeAuditEnd();
+    // Native stereo: a light glow's god rays blended over the eye pair's scene (the strange moon's
+    // aurora; NativeProjection::GlowRaysComposite) draw with no depth, so in the eyes the glow at
+    // infinity is painted over the hands and people close by and reads as a haze at your face.
+    // PrepareRenderState attaches the scene's depth (read only) to that draw and sets this to the
+    // stored depth vr.ini glow_near_m away; UpdateDynamicState then keeps the glow where the scene
+    // is at least that far (a depth bounds test up to the sky's 1). Negative: not such a draw.
+    float vr_glow_depth_min{-1.0f};
+    std::optional<float> VrGlowDepthCut(const GraphicsPipeline* pipeline) const;
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
@@ -458,16 +1080,21 @@ private:
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
 
-    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
+    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed, bool indirect,
+                            DynamicState* deferred = nullptr) const;
     struct DynSkip; // Recording-owner only: memo of the Update*State results (bit 29).
     std::unique_ptr<DynSkip> dyn_skip;
-    void UpdateViewportScissorState(const GraphicsPipeline* pipeline) const;
+    void UpdateViewportScissorState(const GraphicsPipeline* pipeline,
+                                    std::array<float, 2> jitter) const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;
     void UpdateRasterizationState() const;
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
 
     u32 recording_view_mask{}; // B-owned; never participates in A pipeline selection.
+    // Layer draws: the draw being recorded, for its right eye's copy (vk_layer_draws.h). B-owned.
+    EyeDraws eye_draws{};
+    void NoteEyeDraws(const GraphicsPipeline* pipeline, float hud);
     bool IsRegularDraw() const;
     void AssertRecordingOwner() const;
     bool FilterDraw();
@@ -487,6 +1114,7 @@ private:
     const VideoCore::TextureCache::ImageDesc& TextureDescFor(const AmdGpu::Image& tsharp,
         const Shader::ImageResource& res, const u64* prepared_hash = nullptr);
     bool BindResources(const Pipeline* pipeline);
+    bool BindResourcesFull(const Pipeline* pipeline); // BindResources without FAST_CPU_REPEAT_DRAW
 
     void ResetBindings() {
         for (auto& image_id : bound_images) {
@@ -517,11 +1145,25 @@ private:
     // In-frame items (renderer_vulkan/vr_inframe.h, core/vr/inframe.h): drawn into the scene
     // colour with a private depth copy right after the composite, before the DIBR capture (which
     // then reads that copy). True: drawn this frame.
-    bool VrInjectInFrame();
+    // `upscaled`: into the DIBR upscaler's reconstruction (VrDibrUpscale::ItemsTarget) instead
+    // of X, after it (VrDibrCaptureAtMarker).
+    bool VrInjectInFrame(bool upscaled = false);
     void VrDibrCaptureAtMarker();
     // UI layer: arming at the composite, the per-draw decision and the K/W passes.
     void VrUiArm(s32 mode);
     bool VrUiPrepare(const GraphicsPipeline* pipeline, const RenderState& state);
+    // FAST bit 59: this shadowed draw's use of the HUD's output-size depth/stencil twin (the
+    // game's image, the aspects its tests read, whether only view zero counts); none without a
+    // scaled HUD or a depth/stencil target. VrUiDepthBefore prepares the twin before the draw's
+    // binds; VrUiShadowDraw then only takes it.
+    struct VrUiDepthUse {
+        VideoCore::Image* ds{};
+        vk::ImageAspectFlags tested{};
+        bool shared{};
+    };
+    std::optional<VrUiDepthUse> VrUiDepthUseOf(const GraphicsPipeline* pipeline,
+                                               const RenderState& state);
+    void VrUiDepthBefore(const GraphicsPipeline* pipeline, const RenderState& state);
     // One recorded draw call of the current draw (replayed into K and W).
     struct VrDrawCall {
         const void* context;
@@ -537,9 +1179,24 @@ private:
         }
     };
     // `after_draw` (FAST_GPU_PASS_MERGE, vk_pass_merge.h): the game's own draw into X is already
-    // recorded (VrUiShadowAfter said so); the pair then goes K, W.
+    // recorded (VrUiShadowAfter said so); the pair then goes K, W. `mask_replay`
+    // (VrUiMaskPrepare): after the pair, the draw again in the last pass with the game's own
+    // depth/stencil writes, into the twin (it writes no colour).
     void VrUiShadowDraw(const GraphicsPipeline* pipeline, const RenderState& state,
-                        VrDrawCall issue, bool after_draw);
+                        VrDrawCall issue, bool after_draw, bool mask_replay = false);
+    // VR_UI_MASK_REPLAY (on by default, =0 off; FAST bit 59): a Scaleform mask (a UI draw that
+    // writes the game's depth/stencil and no colour) drawn into the HUD's output-size twin as
+    // well, at its size, so
+    // the twin goes on being the game's without a copy before the next draw that tests it (9
+    // copies a gameplay frame become 1). VrUiMaskPrepare, before the draw's binds: whether to
+    // replay it (`shadowed`: VrUiPrepare took it for K and W), the twin made ready for what the
+    // mask tests and writes. A shadowed mask is replayed by VrUiShadowDraw (`mask_replay`), one
+    // with no colour target by VrUiMaskReplay, where the shadows go.
+    bool VrUiMaskPrepare(const GraphicsPipeline* pipeline, const RenderState& state,
+                         bool shadowed);
+    void VrUiMaskReplay(const GraphicsPipeline* pipeline, const RenderState& state,
+                        VrDrawCall issue);
+    VrUiDepthUse vr_ui_mask{}; ///< the replayed mask's use of the twin (VrUiMaskPrepare)
     // FAST_GPU_PASS_MERGE: whether this UI draw goes into X first, its shadows after (its X pass
     // open, nothing of the shadows reads what the draw writes); counts and verifies the decision.
     bool VrUiShadowAfter(const GraphicsPipeline* pipeline, const RenderState& state);
@@ -699,6 +1356,15 @@ private:
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
+    // FAST_CPU_STAGEB_SPLIT stage 2: a draw's paired resources, owned (capacity kept per draw).
+    Pipeline::Prepared split_resources;
+    Vulkan::VertexBinds split_binds; // and its vertex input, vertex and index binds
+    mutable std::unique_ptr<DynamicState> split_dynamic; // and its dynamic state (made at first use)
+    // FAST_CPU_STAGEB_SPLIT=2 (stage 3): the jobs of Scheduler::SplitSlots, filled on stage B and
+    // encoded on fast:StageB2 (SplitEncode).
+    struct SplitDrawJob;
+    std::unique_ptr<SplitDrawJob[]> split_jobs;
+    static void SplitEncode(void* context, u32 slot);
     Pipeline::BufferBarriers buffer_barriers;
     Shader::PushData push_data;
 
@@ -788,6 +1454,45 @@ private:
     void VerifyWriteFault(VAddr addr, VAddr start, u64 window, bool window_mapped, bool first);
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
+
+    // FAST_CPU_REPEAT_DRAW ('1' on, 'v' verify, off by default; read once): a DrawRecord draw
+    // with the same pipeline, every stage's flattened user data (its user data and every sharp
+    // it points at), render targets and user-data push values as the draw just before, with
+    // nothing recorded, no CPU write fault, no texture/buffer registry change and no native
+    // stereo registry change since that draw, takes that draw's BindResources outputs (writes,
+    // infos, hints, push data, bound images) instead of resolving them again. The draw before
+    // must write no memory itself (no storage buffer, image or raw writes). Verify: the full
+    // path runs and is compared, and must record nothing.
+    struct RepeatDraw {
+        bool valid{};
+        bool allowed{}; // this BindResources call is DrawRecord's
+        const Pipeline* pipeline{};
+        std::vector<u32> flat;
+        u64 texture_epoch{}, buffer_epoch{}, faults{}, uses_end{}, buffer_gen{}, view_gen{};
+        u32 perf_epoch{};
+        std::array<u32, 9> targets{};
+        Shader::PushData base{}, push{};
+        Pipeline::DescriptorWrites writes;
+        u32 set_write_index{};
+        boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
+        boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
+        boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
+        boost::container::static_vector<NativeStereo::BufferHint, Shader::NUM_BUFFERS> buffer_hints;
+        boost::container::static_vector<NativeStereo::ViewHint, Shader::NUM_IMAGES> view_hints;
+        NativeStereo::Handles native_handles{};
+        bool stereo_handles{};
+        u64 hits{}, misses{}, stored{}, verified{}, mismatches{}, recorded{};
+        u64 keys{};
+        std::array<u64, 12> why{}; // RepeatKey's first failing condition (11: a hit)
+    };
+    RepeatDraw repeat;
+    std::vector<u32> repeat_flat; // scratch: this draw's flattened user data
+    // The key of this draw (repeat_flat, targets, base push): true when it is the remembered one.
+    bool RepeatKey(const Pipeline* pipeline, std::array<u32, 9>& targets, Shader::PushData& base);
+    void RepeatRestore();
+    void RepeatStore(const Pipeline* pipeline, const std::array<u32, 9>& targets,
+                    const Shader::PushData& base);
+    const char* RepeatCompare() const;
     u32 midframe_submits{}; // since the last flip (VR_STREAM_STATS / the gpu frame log)
     // FAST bit 62 (MaybeSubmitMidFrame): the 'FAST submit_cadence' line, recording thread only.
     struct SubmitCadenceStats {
@@ -797,8 +1502,12 @@ private:
         u64 deferred{}, polls{};          // bit on: cuts left for later; semaphore queries
         u64 verified{}, verify_idle{};    // FAST_SUBMIT_CADENCE_VERIFY samples; ... GPU idle
         u64 verify_sequence{};
+        u64 guest_deferred{}, guest_idle{}, guest_cap{}; // DeferGuestFlush: held; taken: the GPU
+                                                         // past the previous frame, the cap
     } submit_cadence{};
     u64 submit_count_mark{};
+    u64 frame_end_tick{}; // DeferGuestFlush: the last tick submitted by the previous frame's end
+    u64 guest_deferred_tick{}; // recording owner only; idle flush ignores an already submitted tick
     std::chrono::steady_clock::time_point cadence_poll{};
     void ReportSubmitCadence();
 
@@ -870,7 +1579,8 @@ private:
         bool zero_to_w{true}; // clip space z 0..W (the DIBR math assumes it)
     };
     // The last colour target of each size: the composite's own target, or (Bloodborne: the
-    // composite is a stencil pass) the last scene-sized target before it, is the scene colour X.
+    // composite is a stencil pass) the last scene-sized target before it, is the scene colour X
+    // (VrSceneColor: the image the game's UI is drawn into comes first).
     struct VrColorTarget {
         VideoCore::ImageId id{};
         u64 uid{};
@@ -878,14 +1588,29 @@ private:
         vk::ComponentMapping components{}; // undoes the colour buffer's component swap
         u32 last_draw{};
     };
+    // The image the game's UI was drawn into: the first UI draw's colour target of the
+    // composite's size (VrAfterDraw), taken every frame and kept across frames. Where it was drawn
+    // before the composite it is the scene colour X; the last image of that size need not be. A
+    // pass after the scene's own may copy the scene into another image of that size: Central
+    // Yharnam once the story moves on draws a full-size history copy for the next frame's effect
+    // as the last draw before the composite (a half-size one before). X picked by recency was
+    // that copy: the UI layer caught no UI (no prompts, HUD or menu), and S1 and our in-frame
+    // items took the copy (2026-10-27).
+    struct VrSceneHome {
+        VideoCore::ImageId id{};
+        u64 uid{};
+    } vr_scene_home;
     struct VrDibrFrame {
-        bool dlss{};
+        bool upscaled{};
         vk::Extent2D depth_output_extent{};
         bool captured{};   // the composite was seen (captured or refused)
         bool depth_done{}; // depth captured before a composite that writes depth
         u32 draws{};
         std::array<VrDepthCandidate, 4> depth{};
         std::array<VrColorTarget, 4> color{};
+        VrColorTarget home{};         // vr_scene_home as drawn this frame (id 0: not drawn)
+        vk::Extent2D marker_extent{}; // the composite's pass
+        bool home_learned{};          // vr_scene_home taken from this frame's UI
         vk::Extent2D depth_extent{}; // of the captured depth
         VideoCore::ImageId color_id{};
         u64 color_uid{};
@@ -893,6 +1618,9 @@ private:
         u64 first_draw_record{}; // VR::DrawFrameRecord at the frame's first draw (its update)
         u64 composite_record{};  // ... at the composite (often the next frame's; test stamps)
         bool inframe{};          // VrInjectInFrame drew: the scene depth is its private copy
+        // DIBR upscaler ready: our items wait for its reconstruction (VrDibrCaptureAtMarker).
+        bool items_after{};
+        bool items_unsupported{}; // its depth cannot be blitted: items into X (for the session)
         bool inframe_checked{};  // AER / mono: whether this frame has in-frame items, decided
         bool inframe_wanted{};   // ... (at its first draw)
         // VrMatchCamera: the camera update found in the main view's constants (0 = not yet), and
@@ -901,6 +1629,22 @@ private:
         u32 match_tries{};
         bool taa_resolved{}; // aa_mode=taa resolved this frame: its stable depth is the DIBR's
     } vr_dibr;
+    // The scene colour X among this frame's targets whose extent `match` accepts: the image the
+    // game's UI was drawn into (vr_scene_home) if it was drawn this frame, else the last one drawn.
+    template <typename Match>
+    [[nodiscard]] const VrColorTarget* VrSceneColor(Match&& match) const {
+        if (vr_dibr.home.id && match(vr_dibr.home.extent)) {
+            return &vr_dibr.home;
+        }
+        const VrColorTarget* color = nullptr;
+        for (const auto& target : vr_dibr.color) {
+            if (target.id && match(target.extent) &&
+                (color == nullptr || target.last_draw > color->last_draw)) {
+                color = &target;
+            }
+        }
+        return color;
+    }
     // VrMatchCamera's statistics, logged every 600 frames.
     struct VrCameraMatchStats {
         u32 matched{};
@@ -930,6 +1674,13 @@ private:
     void VrTemporalDispatch(u64 shader);
     void VrS1Reconstruct(); // S1 (FAST bit 51): the provider after the composite
     void VrTemporalEndFrame();
+    // DIBR upscaler object motion (vr_dibr_upscale.h): the native hooks' single-view twins,
+    // called by them outside native stereo.
+    void VrDibrMotionBeforeDraw(const GraphicsPipeline* pipeline, bool indirect, bool indexed,
+                                u32 index_offset);
+    const GraphicsPipeline* VrDibrMotionSelect(const GraphicsPipeline* pipeline, RenderState& state);
+    u32 VrDibrMotionPrepareDraw(const GraphicsPipeline* pipeline, u64 geometry, bool indexed,
+                                u32 index_offset, u32 vertex_offset, u32 first_instance);
 
     struct VrAaLog {
         u8 last{0xFF};     // the last outcome logged (VrAaOutcome)
@@ -939,7 +1690,7 @@ private:
     // aa_mode=taa (vk_rasterizer_vr_aa.cpp): the resolve, the last resolved frame (its camera,
     // depth map and reset facts), the viewport scale of the jittered draws (its signs turn the
     // NDC jitter into window pixels) and the `VR taa:` line's counts.
-    std::unique_ptr<VrDibrDlss> vr_dibr_dlss;
+    std::unique_ptr<VrDibrUpscale> vr_dibr_upscale;
     std::unique_ptr<VrRenderTaa> vr_render_taa;
     struct VrTaaState {
         VR::RenderTaa::FrameFacts facts{};

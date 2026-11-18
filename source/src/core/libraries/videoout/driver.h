@@ -113,7 +113,7 @@ private:
     void DrawBlankFrame(); // Video port out not open
     void DrawLastFrame();  // Used when there is no flip request
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false,
-                            u64 vr_flip = 0);
+                            u64 vr_flip = 0, s64 submitted_ns = 0);
     void PresentThread(std::stop_token token);
 
     std::mutex mutex;

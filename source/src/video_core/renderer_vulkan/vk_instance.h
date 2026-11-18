@@ -4,11 +4,14 @@
 
 #pragma once
 
+#include <memory>
 #include <mutex>
 #include <span>
 #include <unordered_map>
 
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_residency.h"
+#include "video_core/renderer_vulkan/vr_foveation.h"
 
 #define TRACY_VK_USE_SYMBOL_TABLE
 #include <tracy/TracyVulkan.hpp>
@@ -351,6 +354,17 @@ public:
         return properties.deviceName;
     }
 
+    /// Sparse buffers the buffer arenas can use (FAST_BUFFER_ARENA=1 and the device can).
+    bool SupportsSparseBuffers() const {
+        return sparse_buffers;
+    }
+
+    /// The queue for sparse binds: one of their own when the family had one more, else the
+    /// graphics queue (then only under the graphics queue's lock, as in Scheduler::SubmitLocked).
+    vk::Queue GetSparseQueue() const {
+        return sparse_queue;
+    }
+
     /// Returns if the device is an integrated GPU.
     bool IsIntegrated() const {
         return properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
@@ -483,6 +497,39 @@ public:
     /// Returns whether dynamicRenderingUnusedAttachments (VK_EXT_dynamic_rendering_unused_
     /// attachments) is enabled: a pipeline may declare fewer colour attachments than the render
     /// pass instance it draws in (FAST bit 43, vk_pass_breaks.h).
+    /// Fixed foveated rendering (vr_foveation.h): the card has attachment rates (and VR_FOVEATED
+    /// is not 0). The level of each pass is the live vr.ini foveation unless IsFoveationFixed.
+    bool IsFoveationEnabled() const {
+        return foveation;
+    }
+    /// The zones at the device's creation (vr.ini foveation or VR_FOVEATED).
+    const Foveation::Settings& GetFoveationSettings() const {
+        return foveation_settings;
+    }
+    /// VR_FOVEATED (tests) sets the zones for the run: GetFoveationSettings, never vr.ini's.
+    bool IsFoveationFixed() const {
+        return foveation_fixed;
+    }
+    vk::Extent2D GetFoveationTexel() const {
+        return foveation_texel;
+    }
+    /// One attachment layer per view of a multiview pass (else one map for both eyes).
+    bool IsFoveationLayered() const {
+        return foveation_layered;
+    }
+    bool HasFoveation4x4() const {
+        return foveation_4x4;
+    }
+    /// Coarse shading is allowed for fragment shaders that write depth/stencil (else such
+    /// pipelines ignore the rate map).
+    bool FoveationWithShaderDepth() const {
+        return foveation_shader_depth;
+    }
+    /// Coarse shading is allowed for fragment shaders that write the sample mask.
+    bool FoveationWithShaderSampleMask() const {
+        return foveation_shader_mask;
+    }
+
     bool IsDynamicRenderingUnusedAttachmentsSupported() const {
         return dynamic_rendering_unused_attachments;
     }
@@ -498,6 +545,28 @@ public:
     /// Returns the total memory budget available to the device.
     [[nodiscard]] u64 GetTotalMemoryBudget() const {
         return total_memory_budget;
+    }
+
+    /// Windows' budget for this process now (VK_EXT_memory_budget: what it may use in all, its
+    /// own use included) less the system's share as at the start, and apart from it the
+    /// process's own use (`usage`, for the log: never taken off the budget). For the caches'
+    /// eviction marks at a load (TextureMemory::RevisedBudget). A query only, nothing changes
+    /// here. budget 0: not known (no VK_EXT_memory_budget, or an integrated GPU, whose start
+    /// estimate stays).
+    struct MemoryBudgetNow {
+        u64 budget{};
+        u64 usage{};
+        u64 resident{}; ///< of `usage`, what Windows keeps in VRAM (= usage where not known)
+        u64 spilled{};  ///< of `usage`, what Windows moved to system memory (0 where not known)
+        u64 host{};     ///< the game's own system-memory allocations (VK_EXT_memory_budget)
+        u64 non_local{}; ///< the game's system-memory use as Windows counts it (0: not known)
+        u64 residency_sample{}; ///< Windows' reading these came from (0: none, `spilled` unknown)
+    };
+    [[nodiscard]] MemoryBudgetNow QueryMemoryBudget() const;
+
+    /// The device-local heaps' size less the system's share: the most a budget can be.
+    [[nodiscard]] u64 GetDeviceLocalCap() const {
+        return device_local_cap;
     }
 
     /// Determines if a format is supported for a set of feature flags.
@@ -541,6 +610,7 @@ private:
     vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT list_restart_features;
     vk::DriverIdKHR driver_id;
     vk::UniqueDebugUtilsMessengerEXT debug_callback{};
+    vk::UniqueDebugUtilsMessengerEXT address_callback{}; // GpuCrash::AddressMessenger
     std::string vendor_name;
     VmaAllocator allocator{};
     vk::Queue present_queue;
@@ -556,6 +626,9 @@ private:
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
     TracyVkCtx profiler_context{};
     u32 queue_family_index{0};
+    bool sparse_buffers{};
+    bool own_sparse_queue{};
+    vk::Queue sparse_queue;
     bool custom_border_color{};
     bool fragment_shader_barycentric{};
     bool amd_shader_explicit_vertex_parameter{};
@@ -580,9 +653,20 @@ private:
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool dynamic_rendering_unused_attachments{};
+    bool foveation{};
+    Foveation::Settings foveation_settings{};
+    bool foveation_fixed{};
+    vk::Extent2D foveation_texel{};
+    bool foveation_layered{};
+    bool foveation_4x4{};
+    bool foveation_shader_depth{};
+    bool foveation_shader_mask{};
     bool supports_memory_budget{};
+    bool gpu_checkpoints{}; // VK_NV_device_diagnostic_checkpoints (vk_gpu_crash.h)
+    std::unique_ptr<Residency::Reader> residency;
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
+    u64 device_local_cap{};
     std::vector<size_t> valid_heaps;
 };
 

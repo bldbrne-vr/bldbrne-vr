@@ -266,6 +266,45 @@ inline bool WriteLookRows(float* rows12, Vec3 dir, Vec3 fallback_up) {
     return true;
 }
 
+// Moonlight's local X spans the wave: align it with the slash projected across the flight.
+// A thrust (under 20% transverse motion) has no reliable slash plane: retain world-up.
+// Translation and flight are unchanged. No writes on failure.
+inline bool WriteSlashRows(float* rows12, Vec3 dir, Vec3 slash) {
+    if (!Body::IsFinite(dir) || !Body::IsFinite(slash)) return false;
+    const Vec3 z = -Body::Normalize(dir);
+    const Vec3 travel = Body::Normalize(slash);
+    const Vec3 across = Body::Perp(travel, z);
+    if (Body::LengthSq(z) < 0.5f || Body::LengthSq(across) < 0.04f) return false;
+    Vec3 x = Body::Normalize(across);
+    // A slash and its reverse have the same plane. Keep the wave's top upright.
+    const Vec3 reference = Body::Cross(Vec3{0, 1, 0}, z);
+    if (Body::Dot(x, reference) < -1e-4f ||
+        (std::abs(Body::Dot(x, reference)) <= 1e-4f && x.y < 0)) x = -x;
+    const Vec3 y = Body::Cross(z, x);
+    const std::array<Vec3, 3> cols{x, y, z};
+    for (int c = 0; c < 3; ++c) {
+        rows12[c] = cols[c].x;
+        rows12[4 + c] = cols[c].y;
+        rows12[8 + c] = cols[c].z;
+    }
+    return true;
+}
+
+// Move a segmented wave's emitter offsets with its rotation, not just its visual axes.
+// Source is the first native emitter; target is the first oriented emitter.
+inline Vec3 WaveEmitterOffset(Vec3 offset, const float* source, const float* target) {
+    Vec3 out{};
+    for (int c = 0; c < 3; ++c) {
+        const Vec3 from{source[c], source[4 + c], source[8 + c]};
+        const Vec3 to{target[c], target[4 + c], target[8 + c]};
+        const float n = Body::LengthSq(from);
+        if (!Body::IsFinite(from) || !Body::IsFinite(to) || !(n > 1e-6f)) return offset;
+        // Emitter scale must not shrink the spacing of a wave's segments.
+        out = out + Body::Normalize(to) * (Body::Dot(offset, from) / std::sqrt(n));
+    }
+    return Body::IsFinite(out) ? out : offset;
+}
+
 // The flight direction the game takes from an emitter (no spread): -column 2.
 inline Vec3 FlightOfRows(const float* rows12) {
     return Body::Normalize(Vec3{-rows12[2], -rows12[6], -rows12[10]});
@@ -377,10 +416,10 @@ inline Kick KickOf(Family f) {
     case Family::Rifle:
     case Family::Piercing:
         return {14.0f, 0.04f, 25.0f, 60.0f};
-    case Family::Cannon: // (2026-10-13: shoved back as far as the Rifle Spear's blast, and more)
-        return {22.0f, 0.10f, 30.0f, 90.0f};
-    case Family::ChurchCannon: // (2026-10-13: a mortar, well above the blunderbuss)
-        return {20.0f, 0.07f, 30.0f, 80.0f};
+    case Family::Cannon: // a sharp backward shove, less muzzle flip, a heavier recovery
+        return {18.0f, 0.10f, 25.0f, 110.0f};
+    case Family::ChurchCannon: // slightly softer than the Cannon, still above the long guns
+        return {16.0f, 0.07f, 25.0f, 100.0f};
     case Family::Gatling:
         return {2.5f, 0.006f, 10.0f, 30.0f};
     case Family::Sprayer:
@@ -400,6 +439,17 @@ inline float KickEnvelope(const Kick& k, float t_ms) {
     }
     const float s = (t_ms - k.attack_ms) / std::max(k.tau_ms, 1e-3f);
     return (1.0f + s) * std::exp(-s);
+}
+
+// The stake slamming shut as the blast kicks it back to form A (stake_driver.h StakeKickOut): a
+// second, shorter jolt on the blast's kick as the form locks (KickDelayNs + the kick clock's
+// 0.125 s to the switch), StakeSlamGain of the blast's.
+inline constexpr float StakeSlamMs = 135.0f;
+inline constexpr float StakeSlamGain = 0.45f;
+inline constexpr Kick StakeSlam{0.0f, 0.0f, 15.0f, 45.0f};
+inline float BladeKickEnvelope(const Kick& k, float t_ms, bool slam) {
+    return KickEnvelope(k, t_ms) + (slam ? StakeSlamGain * KickEnvelope(StakeSlam, t_ms - StakeSlamMs)
+                                         : 0.0f);
 }
 
 // The kick applied to an L_Weapon target (model space): rotated about the bone's Barrel x Up by
@@ -428,8 +478,9 @@ inline Kick BladeKickOf(std::int32_t variation) {
         return {9.0f, 0.03f, 25.0f, 50.0f};
     case 1000:
         return {22.0f, 0.08f, 30.0f, 90.0f};
-    case 1100: // a big jolt straight back up the arm, its tip thrown up (2026-10-13)
-        return {14.0f, 0.20f, 30.0f, 130.0f};
+    case 1100: // a big jolt straight back up the arm, its tip thrown up (2026-10-13;
+               // the tip 14 -> 18 degrees with the kick-out, 2026-11-07)
+        return {18.0f, 0.20f, 30.0f, 130.0f};
     default:
         return {0.0f, 0.0f, 25.0f, 45.0f};
     }

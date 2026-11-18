@@ -12,6 +12,7 @@
 #include <set>
 #include <sstream>
 #include <SDL3/SDL.h>
+#include <xbyak/xbyak_util.h>
 #include <fmt/core.h>
 #include <fmt/xchar.h>
 #include <hwinfo/hwinfo.h>
@@ -29,6 +30,8 @@
 #include "common/memory_patcher.h"
 #include "common/ntapi.h"
 #include "common/path_util.h"
+#include "common/addon_content.h"
+#include "common/render_diagnostic.h"
 #include "common/polyfill_thread.h"
 #include "common/scm_rev.h"
 #include "common/singleton.h"
@@ -56,6 +59,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/openxr_presenter.h"
 #include "video_core/renderer_vulkan/vr_dlss_runtime.h"
+#include "video_core/renderer_vulkan/vr_overlay_guard.h"
 
 #ifdef _WIN32
 #include <WinSock2.h>
@@ -114,18 +118,52 @@ void ArmExitWatchdog(std::chrono::milliseconds budget) {
 // game would run flat at the preset's size for the whole session. Until then a window of its own
 // shows the message (the game window is Vulkan's) and a thread looks for a headset every second.
 // Closing the window quits.
+// A headset that has just appeared is a runtime still starting: the game waits HeadsetSettleS more
+// without probing, looks once again on the same OpenXR instance, and boots
+// only then. Booting at the first sight of it raced Meta Link's own start: the session was made a
+// second before Link's home (Dash) was ready, the game's request for the display came first, Dash
+// took the display when it came up and never gave it over; the session ran SYNCHRONIZED (never
+// VISIBLE) with the game playing on the desktop and the headset black (2026-11-17: "if I
+// start the game and the headset is not running and get the 'please enter vr' then the game is all
+// black, I hear sound but don't see anything"; Meta's service log of that run: Link's session
+// started 11:10:25.8, ours connected 11:10:28.7, Dash ready 11:10:29.1 and unblocked 11:10:30.4;
+// in another run 7.9 s lay between Link's session and Dash's first frame).
+// Meta's runtime only (vr_xr_queue_policy.h Classify, by the runtime's own name): the evidence is
+// Meta Link's, and a SteamVR or Virtual Desktop headset that connects after the window appeared
+// would wait for nothing; any other runtime boots at the first sight of its headset, as before
+// (a review's point, 2026-11-17). Not covered: a Link that is only just up when the game's FIRST
+// look already finds the headset (no wait window at all), and a session already stuck is not
+// recovered.
+constexpr int HeadsetSettleS = 3;
 void WaitForHeadset(const std::string& title, int width, int height) {
-    if (Vulkan::OpenXRPresenter::IsHeadsetConnected()) {
+    using Presenter = Vulkan::OpenXRPresenter;
+    using Status = Presenter::BootHeadset;
+    const Status initial = Presenter::PollBootHeadset();
+    if (initial == Status::Ready) {
         return;
     }
-    LOG_INFO(Loader, "VR: no headset found; the game boots once one is connected");
-    std::atomic_bool found{false};
-    std::jthread probe([&found](std::stop_token stop) {
-        while (!found && Common::StoppableTimedWait(stop, std::chrono::seconds(1))) {
-            found = Vulkan::OpenXRPresenter::IsHeadsetConnected();
+    if (initial == Status::Waiting) {
+        LOG_INFO(Loader, "VR: no headset found; the game boots once one is connected");
+    }
+    std::atomic status{initial};
+    std::jthread probe([&status, initial](std::stop_token stop) {
+        auto next = initial;
+        while (next == Status::Waiting || next == Status::SettleMeta) {
+            const bool settling = next == Status::SettleMeta;
+            if (!Common::StoppableTimedWait(stop, std::chrono::seconds(settling ? HeadsetSettleS : 1))) {
+                return;
+            }
+            next = Presenter::PollBootHeadset(!settling);
+            if (next == Status::SettleMeta) {
+                LOG_INFO(Loader, "VR: headset found; giving Meta's runtime {} s to finish starting",
+                         HeadsetSettleS);
+            } else if (settling && next == Status::Waiting) {
+                LOG_INFO(Loader, "VR: Meta Link became unavailable during startup; still waiting");
+            }
+            status.store(next);
         }
     });
-    SDL_SetHint(SDL_HINT_APP_NAME, "shadPS4");
+    SDL_SetHint(SDL_HINT_APP_NAME, Common::g_application_name);
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         LOG_ERROR(Loader, "VR: video initialization failed ({})", SDL_GetError());
         std::quick_exit(1);
@@ -147,7 +185,7 @@ void WaitForHeadset(const std::string& title, int width, int height) {
         SDL_RenderDebugText(renderer, (w / scale - SDL_strlen(text) * glyph) * 0.5f,
                             (h * 0.5f + dy) / scale - glyph * 0.5f, text);
     };
-    while (!found) {
+    while (status.load() != Status::Ready) {
         SDL_Event event;
         if (SDL_WaitEventTimeout(&event, 100) &&
             (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED)) {
@@ -161,7 +199,11 @@ void WaitForHeadset(const std::string& title, int width, int height) {
             SDL_SetRenderDrawColor(renderer, 230, 220, 200, 255);
             line("Please continue in VR", 4.0f, -32.0f);
             SDL_SetRenderDrawColor(renderer, 140, 135, 125, 255);
-            line("Waiting for a headset...", 2.0f, 36.0f);
+            const auto state = status.load();
+            const char* message = state == Status::Failed ? "OpenXR startup failed. See the game log."
+                : state == Status::SettleMeta ? "Headset found. Starting in a moment..."
+                                              : "Waiting for a headset...";
+            line(message, 2.0f, 36.0f);
             SDL_RenderPresent(renderer);
         }
     }
@@ -551,6 +593,12 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     Common::Log::Switch((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
                                                                           : "shad_log.txt");
 #ifdef _WIN32
+    // Hybrid Intel CPUs: never on the efficiency cores because the window is in the background.
+    const int unthrottled = Common::DisableProcessPowerThrottling();
+    LOG_BENCHMARK_INFO(Core, "Power throttling (EcoQoS) opt-out: {}",
+                       unthrottled == 2   ? "execution speed and timer resolution"
+                       : unthrottled == 1 ? "execution speed (no timer control on this Windows)"
+                                          : "not accepted by this Windows");
     // The runtime enforces this even when an existing profile contains Disabled.
     LOG_INFO(Core, "Windows guest red-zone protection: always enabled in this Bloodborne build "
                    "(existing Disabled settings are ignored)");
@@ -626,6 +674,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     hwinfo::Memory ram;
     hwinfo::OS os;
     const auto cpus = hwinfo::getAllCPUs();
+    std::string cpu_model = cpus.empty() ? std::string{"unknown"} : cpus.front().modelName();
     for (const auto& cpu : cpus) {
         LOG_INFO(Config, "CPU Model: {}", cpu.modelName());
         LOG_INFO(Config, "CPU Physical Cores: {}, Logical Cores: {}", cpu.numPhysicalCores(),
@@ -641,6 +690,33 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         LOG_INFO(Loader, "eboot SDK version: {:#x}", game_info.sdk_ver);
         LOG_INFO(Loader, "PSVR Supported: {}", (bool)psf_attributes.support_ps_vr.Value());
         LOG_INFO(Loader, "PSVR Required: {}", (bool)psf_attributes.require_ps_vr.Value());
+        // The game, kept in every build (render-diagnostics.txt and the crash reports): its id,
+        // version (an update's when one is mounted over it), The Old Hunters, the folders beside.
+        try {
+            const auto sfo_title = Common::Singleton<PSF>::Instance()->GetString("TITLE_ID");
+            const std::string title_id = sfo_title ? std::string(*sfo_title) : id;
+            const auto beside = [&](std::string_view suffix) {
+                std::error_code ec;
+                auto path = game_folder;
+                path += std::string(suffix);
+                return std::filesystem::exists(path, ec);
+            };
+            const char* update = beside("-UPDATE") ? "-UPDATE" : beside("-patch") ? "-patch" : "none";
+            const bool old_hunters = Common::Addons::HasOldHunters(
+                title_id, Common::Addons::Scan(EmulatorSettings.GetAddonInstallDir(), title_id));
+            // The game's SSE4a instructions run as substitutes on a CPU without it (every Intel
+            // one; core/cpu_patches.cpp), patched in memory as its code loads.
+            const bool sse4a = Xbyak::util::Cpu{}.has(Xbyak::util::Cpu::tSSE4a);
+            Common::RenderDiagnostic::SetGame(fmt::format(
+                "Game: {} (TITLE_ID {}) version {} \"{}\", fw {:#x}, sdk {:#x} (eboot {:#x}), The "
+                "Old Hunters {}, update folder {}, mods folder {}, from {}; CPU {} (SSE4a {})",
+                id, title_id, app_version, title, fw_version, sdk_version, game_info.sdk_ver,
+                old_hunters ? "yes" : "no", update, beside("-mods") ? "yes" : "no",
+                from_archive ? "an archive" : "a folder", cpu_model,
+                sse4a ? "native" : "substituted"));
+        } catch (...) {
+            Common::RenderDiagnostic::SetGame(fmt::format("Game: {} version {}", id, app_version));
+        }
     }
     if (!args.empty()) {
         const auto argc = std::min<size_t>(args.size(), 32);
@@ -663,6 +739,9 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     // Create stdin/stdout/stderr
     Common::Singleton<FileSys::HandleTable>::Instance()->CreateStdHandles();
 
+    // GPU Tweak III's OSD layer stays out of every Vulkan instance, DLSS's early one below too
+    // (it loaded the layer before CreateInstance's guard ran, 2026-11-11).
+    Vulkan::KeepOverlayLayersOut();
     // NVIDIA binary import needs host VA before the guest claims its address ranges.
     if (VR::IsEnabled()) Vulkan::VrDlssRuntime::Get().PrepareDriverAddressSpace();
 
@@ -683,26 +762,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     game_info.trophy_index_map =
         ExtractTrophies("/app0/sce_sys/npbind.dat", "/app0/sce_sys/trophy");
 
-    std::string game_title = fmt::format("{} - {} <{}>", id, title, app_version);
-    std::string window_title = "";
-    std::string remote_url(Common::g_scm_remote_url);
-    std::string remote_host = Common::GetRemoteNameFromLink();
-    if (Common::g_is_release) {
-        if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("shadPS4 v{} | {}", Common::g_version, game_title);
-        } else {
-            window_title =
-                fmt::format("shadPS4 {}/v{} | {}", remote_host, Common::g_version, game_title);
-        }
-    } else {
-        if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("shadPS4 v{} {} {} | {}", Common::g_version,
-                                       Common::g_scm_branch, Common::g_scm_desc, game_title);
-        } else {
-            window_title = fmt::format("shadPS4 v{} {}/{} {} | {}", Common::g_version, remote_host,
-                                       Common::g_scm_branch, Common::g_scm_desc, game_title);
-        }
-    }
+    const std::string window_title = Common::g_application_title;
     if (Vulkan::OpenXRPresenter::IsRequested()) {
         WaitForHeadset(window_title, EmulatorSettings.GetWindowWidth(),
                        EmulatorSettings.GetWindowHeight());

@@ -39,6 +39,9 @@ constexpr std::uint8_t FlagGun = 0x01; // the left trigger is pulled (or was jus
 // (the in-frame renderer's model s10002 with its level): the game's effect is not refreshed, the
 // left weapon stays hidden and the vial grip closed.
 constexpr std::uint8_t FlagDrain = 0x02;
+// Armed now, rather than the spent vial held after an injection. This travels in the same
+// atomic word as the request so a new vial cannot inherit a separately published old drain.
+constexpr std::uint8_t FlagArmed = 0x04;
 
 enum class State : std::uint8_t {
     Off,         // no vial requested
@@ -109,6 +112,7 @@ struct Inputs {
     Body::GateReason reason{Body::GateReason::None};
     Body::AnimClass owner{Body::AnimClass::Unknown};
     bool held{false}; // `owner` is playing now
+    bool blood_bullet_vial{false}; // body verified 100141's native item cancel window
     std::int32_t hp{1};
     std::int32_t item_use_state{0}; // PlayerIns +0x490: a quick item is being used
 };
@@ -183,7 +187,10 @@ constexpr Decision Decide(const Inputs& in, const Policy& p) {
     if ((in.request.flags & FlagGun) != 0) {
         return suppress("gun");
     }
-    if (in.item_use_state != 0) {
+    const bool blood_vial = in.gate_valid && in.blood_bullet_vial && in.held &&
+                           in.owner == Body::AnimClass::ItemUse &&
+                           in.reason == Body::GateReason::Anim && in.request.kind == Kind::Vial;
+    if (in.item_use_state != 0 && !blood_vial) {
         return suppress("item use");
     }
     if (in.gate_valid) {
@@ -199,7 +206,7 @@ constexpr Decision Decide(const Inputs& in, const Policy& p) {
         default:
             break;
         }
-        if (in.held) {
+        if (in.held && !blood_vial) {
             if (const char* clash = ClashOf(in.owner, p.hide_two_handed); clash != nullptr) {
                 return suppress(clash);
             }

@@ -8,6 +8,7 @@
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include "video_core/renderer_vulkan/vr_late_warp.h"
+#include "common/render_diagnostic.h"
 
 #ifdef ENABLE_OPENXR
 
@@ -24,6 +25,7 @@
 #include <openxr/openxr_platform.h>
 
 #include "common/logging/log.h"
+#include "common/assert.h"
 #include "video_core/host_shaders/vr_dibr_warp_comp.h"
 #include "video_core/host_shaders/vr_eye_taa_comp.h"
 #include "video_core/host_shaders/vr_late_classify_comp.h"
@@ -159,7 +161,8 @@ bool VrLateWarp::Init(const DeviceContext& device, XrSession xr_session, s64 for
         return false;
     }
     // vr.ini eye_upscale / eye_sharpen: without it the eyes go at the render's pixels (logged).
-    upscale.Init(dev.device, dev.allocator);
+    // With the vignettes' and the riposte burst's variants (vignette_in_warp, riposte_style).
+    upscale.Init(dev.device, dev.allocator, true);
     initialized = true;
     return true;
 }
@@ -370,7 +373,7 @@ bool VrLateWarp::EnsureImage(Image& image, vk::Extent2D extent, vk::Format forma
     if (image.image && image.extent == extent && image.format == format) {
         return true;
     }
-    WaitIdle(); // our last frames may still use it
+    if (!WaitIdle()) return false; // do not recreate resources on a lost device
     DestroyImage(image);
     const VkImageCreateInfo info{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -433,6 +436,7 @@ bool VrLateWarp::EnsureSwapchain(vk::Extent2D extent) {
         return true;
     }
     DestroySwapchain();
+    if (failed) return false;
     const vk::Extent2D alloc{(extent.width + 63) & ~63u, (extent.height + 63) & ~63u};
     XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
@@ -477,7 +481,7 @@ void VrLateWarp::DestroySwapchain() {
     swapchain_images.clear();
     swapchain_extent = {};
     acquired = waited = false;
-    has_image = false;
+    shown = {};
 }
 
 // Queue lock held.
@@ -501,25 +505,50 @@ bool VrLateWarp::AcquireImage() {
     return true;
 }
 
-void VrLateWarp::WaitIdle() {
+bool VrLateWarp::WaitIdle() {
     std::vector<vk::Fence> busy;
-    for (Slot& s : slots) {
-        if (s.fence && s.pending) {
-            busy.push_back(s.fence);
+    for (const Slot& s : slots) {
+        if (s.fence && s.pending) busy.push_back(s.fence);
+    }
+    if (busy.empty()) return !failed;
+
+    // A timeout is not completion. Keep every resource and fence intact until the GPU
+    // finishes, or the driver confirms device loss. This runs only for resize/teardown;
+    // the normal frame loop polls fences and reuses the previous frame without waiting.
+    bool warned = false;
+    vk::Result result;
+    do {
+        result = dev.device.waitForFences(busy, VK_TRUE, ShutdownTimeoutNs);
+        if (result == vk::Result::eTimeout && !warned) {
+            LOG_WARNING(Render_Vulkan, "VR late warp: still waiting for GPU work; retaining resources");
+            warned = true;
+        }
+    } while (result == vk::Result::eTimeout);
+    if (VrDeviceLost::Note(result, "late warp resource retirement")) {
+        failed = true;
+        for (Slot& s : slots) s.pending = false;
+        return false; // teardown is allowed; no timestamps, fence resets or new rendering
+    }
+    if (result != vk::Result::eSuccess) {
+        // An unexpected wait error proves neither completion nor device loss. Do not
+        // continue into resource destruction (including member destructors).
+        UNREACHABLE_MSG("VR late warp fence wait failed: {}", vk::to_string(result));
+    }
+    for (u32 i = 0; i < slots.size(); ++i) {
+        if (!slots[i].pending) continue;
+        ReadTimestamps(i);
+        slots[i].pending = false;
+        result = dev.device.resetFences(slots[i].fence);
+        if (VrDeviceLost::Note(result, "late warp fence reset")) {
+            failed = true;
+            for (Slot& s : slots) s.pending = false;
+            return false;
+        }
+        if (result != vk::Result::eSuccess) {
+            UNREACHABLE_MSG("VR late warp fence reset failed: {}", vk::to_string(result));
         }
     }
-    if (!busy.empty()) {
-        if (dev.device.waitForFences(busy, VK_TRUE, ShutdownTimeoutNs) != vk::Result::eSuccess) {
-            LOG_WARNING(Render_Vulkan, "VR late warp: GPU work did not finish");
-        }
-        for (u32 i = 0; i < slots.size(); ++i) {
-            if (slots[i].pending) {
-                ReadTimestamps(i);
-                slots[i].pending = false;
-                (void)dev.device.resetFences(slots[i].fence);
-            }
-        }
-    }
+    return !failed;
 }
 
 void VrLateWarp::Shutdown() {
@@ -529,6 +558,7 @@ void VrLateWarp::Shutdown() {
         DestroyImage(v_disp);
         DestroyImage(v_tiles);
         DestroyImage(eyes);
+        DestroyImage(eyes_cant);
         DestroyImage(eye_src[0]);
         DestroyImage(eye_src[1]);
         for (auto& pair : taa_hist) {
@@ -546,6 +576,7 @@ void VrLateWarp::Shutdown() {
             }
             *b = {};
         }
+        cant.Shutdown();
         for (vk::Pipeline p : {reproject_pipeline, warp_pipeline, warp_pipeline_once,
                                classify_pipeline, taa_pipeline}) {
             if (p) {
@@ -594,7 +625,8 @@ void VrLateWarp::Shutdown() {
     command_pool = vk::CommandPool{};
     slots = {};
     slot_index = 0;
-    acquired = waited = has_image = false;
+    acquired = waited = false;
+    shown = {};
     initialized = false;
     memory_bytes = 0;
 }
@@ -673,9 +705,9 @@ void VrLateWarp::FillViews(std::array<XrCompositionLayerProjectionView, 2>& view
     }
 }
 
-bool VrLateWarp::Reuse(std::array<XrCompositionLayerProjectionView, 2>& views) {
-    if (!IsActive() || !has_image || swapchain == XR_NULL_HANDLE ||
-        frame - shown_frame > ReuseFrames) {
+bool VrLateWarp::Reuse(std::array<XrCompositionLayerProjectionView, 2>& views, u32 current_space) {
+    if (!IsActive() || swapchain == XR_NULL_HANDLE ||
+        !shown.CanReuse(frame, current_space, ReuseFrames)) {
         return false;
     }
     ++stats.reused;
@@ -691,13 +723,13 @@ bool VrLateWarp::Render(const Source& source,
     }
     const auto& cap = source.capture;
     if (!cap.valid || cap.size.width == 0 || cap.size.height == 0) {
-        return Reuse(views);
+        return Reuse(views, source.taa_frame.space);
     }
     for (const vk::Rect2D& r : source.crops) {
         if (r.extent.width == 0 || r.extent.height == 0 || r.offset.x < 0 || r.offset.y < 0 ||
             r.offset.x + r.extent.width > cap.size.width ||
             r.offset.y + r.extent.height > cap.size.height) {
-            return Reuse(views);
+            return Reuse(views, source.taa_frame.space);
         }
     }
     // eye_upscale / eye_sharpen: each eye at its output size, enlarged and sharpened from the
@@ -713,8 +745,9 @@ bool VrLateWarp::Render(const Source& source,
                     source.out[e].height >= in[e].height;
         }
         if (sized && (source.out != in || source.sharpen > 0.0f || source.color.Active() ||
-                      output_gamma != 1.0f ||
-                      source.vignettes.health > .0001f || source.vignettes.desaturation > .0001f)) {
+                      output_gamma != 1.0f || source.vignettes.health > .0001f ||
+                      source.vignettes.desaturation > .0001f || source.vignettes.riposte > .0001f ||
+                      source.vignettes.ritual[0] > .0001f || source.vignettes.ritual[1] > .0001f)) {
             scaling = upscale.Prepare(in, source.out, source.sharpen);
             if (scaling) {
                 out = source.out;
@@ -725,7 +758,26 @@ bool VrLateWarp::Render(const Source& source,
         return false;
     }
     const vk::Extent2D both{out[0].width + out[1].width, std::max(out[0].height, out[1].height)};
-    if (!EnsureSwapchain(both) ||
+    // Canted displays (core/vr/eye_cant.h): each eye turned into its own view, at the density of
+    // its parallel image; the swapchain holds the turned eyes.
+    if (source.canted && !cant.Ready() && !cant_tried) {
+        cant_tried = true; // once: a failure leaves the parallel eyes (logged)
+        cant.Init(dev.device, dev.allocator);
+    }
+    const bool turn = source.canted && cant.Ready();
+    std::array<vk::Extent2D, 2> shown_out = out;
+    if (turn) {
+        for (u32 e = 0; e < 2; ++e) {
+            shown_out[e] = VrEyeCant::Extent(source.cant_fovs[e], source.fovs[e], out[e]);
+        }
+    }
+    const vk::Extent2D shown_both{shown_out[0].width + shown_out[1].width,
+                                  std::max(shown_out[0].height, shown_out[1].height)};
+    if (!EnsureSwapchain(shown_both) ||
+        (turn && !EnsureImage(eyes_cant, shown_both, vk::Format::eR8G8B8A8Unorm,
+                              vk::ImageUsageFlagBits::eStorage |
+                                  vk::ImageUsageFlagBits::eTransferSrc,
+                              "turned eyes")) ||
         !EnsureImage(eyes, both, vk::Format::eR8G8B8A8Unorm,
                      vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc,
                      "eyes") ||
@@ -812,7 +864,7 @@ bool VrLateWarp::Render(const Source& source,
         const vk::Result status = dev.device.getFenceStatus(slot.fence);
         if (status == vk::Result::eNotReady) {
             ++stats.gpu_late; // the warp of two XR frames ago is still running
-            return Reuse(views);
+            return Reuse(views, source.taa_frame.space);
         }
         if (status != vk::Result::eSuccess) {
             VrDeviceLost::Note(status, "the late warp's fence");
@@ -839,7 +891,7 @@ bool VrLateWarp::Render(const Source& source,
         }
         if (r == XR_TIMEOUT_EXPIRED) {
             ++stats.wait_timeouts;
-            return Reuse(views);
+            return Reuse(views, source.taa_frame.space);
         }
         if (XR_FAILED(r)) {
             Disable(fmt::format("xrWaitSwapchainImage failed ({})", static_cast<s32>(r)));
@@ -850,7 +902,7 @@ bool VrLateWarp::Render(const Source& source,
     bool recorded = false;
     {
         LockTrace::Phase phase{"late warp: record"}; // VR_LOCK_TRACE only
-        recorded = Record(slot, slot_index, source, scaling, out);
+        recorded = Record(slot, slot_index, source, scaling, out, shown_out);
     }
     if (!recorded) {
         return false;
@@ -937,14 +989,38 @@ bool VrLateWarp::Render(const Source& source,
         return false;
     }
     acquired = waited = false;
-    has_image = true;
-    shown_frame = frame;
+    // Only after a successful GPU submission and swapchain release. At most three
+    // outcome records per process; no timing queries, waits or per-frame formatting.
+    if (turn) {
+        RENDER_DIAGNOSTIC_ONCE("angled-screen correction: path=late-warp submitted_L=true submitted_R=true");
+    } else if (source.canted) {
+        RENDER_DIAGNOSTIC_ONCE("angled-screen correction: path=late-warp requested=true "
+                               "submitted_L=false submitted_R=false ready={}", cant.Ready());
+    } else {
+        RENDER_DIAGNOSTIC_ONCE("angled-screen correction: path=late-warp requested=false "
+                               "submitted_L=false submitted_R=false");
+    }
+    shown = {frame, source.taa_frame.space, true};
     shown_poses = source.eye_poses;
     shown_fovs = source.fovs;
+    if (turn) {
+        // Each eye as it was turned: its own orientation (the parallel eye's turned by the cant)
+        // and its located FOV.
+        for (u32 e = 0; e < 2; ++e) {
+            const XrQuaternionf& a = source.eye_poses[e].orientation;
+            const XrQuaternionf& b = source.cant[e];
+            shown_poses[e].orientation = {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+                                          a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                                          a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+                                          a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+        }
+        shown_fovs = source.cant_fovs;
+        ++stats.canted;
+    }
     shown_rects[0] = {{0, 0},
-                      {static_cast<s32>(out[0].width), static_cast<s32>(out[0].height)}};
-    shown_rects[1] = {{static_cast<s32>(out[0].width), 0},
-                      {static_cast<s32>(out[1].width), static_cast<s32>(out[1].height)}};
+                      {static_cast<s32>(shown_out[0].width), static_cast<s32>(shown_out[0].height)}};
+    shown_rects[1] = {{static_cast<s32>(shown_out[0].width), 0},
+                      {static_cast<s32>(shown_out[1].width), static_cast<s32>(shown_out[1].height)}};
     slot_upscaled[slot_index] = scaling;
     slot_taa[slot_index] = taa_on;
     if (taa_on) {
@@ -972,7 +1048,8 @@ bool VrLateWarp::Render(const Source& source,
 }
 
 bool VrLateWarp::Record(Slot& slot, u32 index, const Source& source, bool scaling,
-                        const std::array<vk::Extent2D, 2>& out) {
+                        const std::array<vk::Extent2D, 2>& out,
+                        const std::array<vk::Extent2D, 2>& shown) {
     const bool taa_on = source.taa > 0.0f && static_cast<bool>(taa_pipeline);
     const bool per_eye = scaling || taa_on;
     const auto& cap = source.capture;
@@ -1079,15 +1156,38 @@ bool VrLateWarp::Record(Slot& slot, u32 index, const Source& source, bool scalin
     }
     // vignette_in_warp (VrVignetteWarp): the frame's vignettes, blended into each eye by the
     // upscale's last pass, for exactly the eye poses and FOVs this pair is submitted with.
-    const bool vignettes = scaling && upscale.VignettesReady() &&
-                           (source.vignettes.count > 0 || source.vignettes.health > .0001f ||
-                            source.vignettes.desaturation > .0001f);
+    static bool riposte_shown = false;
+    if ((source.vignettes.riposte > .0001f) != riposte_shown) {
+        riposte_shown = !riposte_shown;
+        LOG_INFO(Render_Vulkan, "VR riposte: the look {} (late warp{})",
+                 riposte_shown ? "shows" : "is gone",
+                 !scaling                  ? "; NOT drawn: no upscale pass"
+                 : !upscale.RiposteReady() ? "; NOT drawn: no riposte variants"
+                                           : "");
+    }
+    // The Kos ritual's vision (kos_visions): drawn by the vignette variants, over the vignettes.
+    const bool ritual = source.vignettes.ritual[0] > .0001f || source.vignettes.ritual[1] > .0001f;
+    static bool ritual_shown = false;
+    if (ritual != ritual_shown) {
+        ritual_shown = ritual;
+        LOG_INFO(Render_Vulkan, "VR Kos: the ritual's vision {} (late warp{})",
+                 ritual ? "shows" : "is gone",
+                 !scaling                    ? "; NOT drawn: no upscale pass"
+                 : !upscale.VignettesReady() ? "; NOT drawn: no vignette variants"
+                                             : "");
+    }
+    const bool vignettes =
+        scaling && upscale.VignettesReady() &&
+        (source.vignettes.count > 0 || source.vignettes.health > .0001f ||
+         source.vignettes.desaturation > .0001f || source.vignettes.riposte > .0001f || ritual);
     if (vignettes) {
         VrVignetteWarp::Block vb{};
         vb.head = {std::min(source.vignettes.count, VrVignetteWarp::MaxItems), bgra ? 1u : 0u,
                    std::bit_cast<u32>(source.vignettes.health),
                    std::bit_cast<u32>(source.vignettes.desaturation)};
         vb.field = source.vignettes.field;
+        vb.riposte = {source.vignettes.riposte, source.vignettes.roar_palette ? 1.0f : 0.0f, 0.0f, 0.0f};
+        vb.ritual = source.vignettes.ritual;
         for (u32 e = 0; e < 2; ++e) {
             const XrPosef& pose = source.eye_poses[e];
             const VrLate::Mat3 r = VrLate::FromQuat(
@@ -1568,6 +1668,7 @@ bool VrLateWarp::Record(Slot& slot, u32 index, const Source& source, bool scalin
             .buffer = uniforms.buffer,
             .offset = index * uniform_stride + vignette_offset,
             .range = sizeof(VrVignetteWarp::Block),
+            .riposte = source.vignettes.riposte,
         };
         const bool recorded =
             upscale.Record(cmd, sources, L::eGeneral, targets, source.sharpen,
@@ -1580,10 +1681,34 @@ bool VrLateWarp::Record(Slot& slot, u32 index, const Source& source, bool scalin
         cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eComputeShader, query_pool, q0 + 5);
     }
 
+    // Canted displays: each parallel eye turned into its own view (VrEyeCant), into eyes_cant,
+    // which then goes to the swapchain in its place.
+    const bool turn = source.canted && cant.Ready() && eyes_cant.image;
+    const Image& final_eyes = turn ? eyes_cant : eyes;
+    if (turn) {
+        const std::array<vk::ImageMemoryBarrier2, 2> to_turn{
+            Barrier(eyes.image, L::eGeneral, L::eGeneral, S::eComputeShader,
+                    A::eShaderStorageWrite, S::eComputeShader, A::eShaderStorageRead),
+            Barrier(eyes_cant.image, L::eUndefined, L::eGeneral, S::eCopy, A::eNone,
+                    S::eComputeShader, A::eShaderStorageWrite),
+        };
+        cmd.pipelineBarrier2(
+            {.imageMemoryBarrierCount = 2, .pImageMemoryBarriers = to_turn.data()});
+        for (u32 e = 0; e < 2; ++e) {
+            cant.Record(cmd, {eyes.view,
+                              {{e == 0 ? 0 : static_cast<s32>(out[0].width), 0}, out[e]},
+                              source.fovs[e],
+                              eyes_cant.view,
+                              {{e == 0 ? 0 : static_cast<s32>(shown[0].width), 0}, shown[e]},
+                              source.cant_fovs[e],
+                              source.cant[e]});
+        }
+    }
+
     // Into the swapchain image (the compositor is done with it: xrWaitSwapchainImage).
     const vk::Image target = swapchain_images[image_index];
     const std::array<vk::ImageMemoryBarrier2, 2> to_copy{
-        Barrier(eyes.image, L::eGeneral, L::eTransferSrcOptimal, S::eComputeShader,
+        Barrier(final_eyes.image, L::eGeneral, L::eTransferSrcOptimal, S::eComputeShader,
                 A::eShaderStorageWrite, S::eCopy, A::eTransferRead),
         Barrier(target, L::eUndefined, L::eTransferDstOptimal, S::eNone, A::eNone, S::eCopy,
                 A::eTransferWrite),
@@ -1594,13 +1719,15 @@ bool VrLateWarp::Record(Slot& slot, u32 index, const Source& source, bool scalin
         .srcOffset = {0, 0, 0},
         .dstSubresource = ColorLayers,
         .dstOffset = {0, 0, 0},
-        .extent = {eyes.extent.width, eyes.extent.height, 1},
+        .extent = {final_eyes.extent.width, final_eyes.extent.height, 1},
     };
-    cmd.copyImage(eyes.image, L::eTransferSrcOptimal, target, L::eTransferDstOptimal, region);
+    cmd.copyImage(final_eyes.image, L::eTransferSrcOptimal, target, L::eTransferDstOptimal,
+                  region);
     if (stamp_writer) {
         for (u32 e = 0; e < 2; ++e) {
-            const XrRect2Di rect{{e == 0 ? 0 : static_cast<s32>(out[0].width), 0},
-                                 {static_cast<s32>(out[e].width), static_cast<s32>(out[e].height)}};
+            const XrRect2Di rect{
+                {e == 0 ? 0 : static_cast<s32>(shown[0].width), 0},
+                {static_cast<s32>(shown[e].width), static_cast<s32>(shown[e].height)}};
             stamp_writer(cmd, target, rect, source.stamp);
         }
     }

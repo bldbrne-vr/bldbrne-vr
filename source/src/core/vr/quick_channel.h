@@ -43,8 +43,16 @@ bool LatestRequest(Request& out);
 void PublishResult(const Result& result);
 bool LatestResult(Result& out);
 
+void PublishBladeContact(const ShamanBlade::Contact& contact);
+bool LatestBladeContact(ShamanBlade::Contact& contact);
+// The gathered Executioner's Gloves against an enemy (the render tick -> the presenter).
+void PublishGloveContact(const ShamanBlade::Contact& contact);
+bool LatestGloveContact(ShamanBlade::Contact& contact);
+
 void PublishScene(const Scene& scene);
 bool LatestScene(Scene& out);
+void PublishRelicDrop(const HunterRelics::DropPlan& plan);
+bool LatestRelicDrop(HunterRelics::DropPlan& out);
 // Exact rendered body attachments -> left-hand pickup test.
 void PublishHolsterTargets(const Holsters::Targets& targets);
 bool LatestHolsterTargets(Holsters::Targets& out);

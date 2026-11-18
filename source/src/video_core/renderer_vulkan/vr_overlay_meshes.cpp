@@ -767,7 +767,7 @@ const char* MeshName(MeshId id) {
         "HandMiddle2",      "HandRing0",         "HandRing1",
         "HandRing2",        "HandPinky0",        "HandPinky1",
         "HandPinky2",       "LaserBeam",         "LaserDot",
-        "AxisArrow",        "Arrow",             "Vignette",
+        "AxisArrow",        "Arrow",             "Vignette", "MonocularIris",
     };
     const u32 i = static_cast<u32>(id);
     return i < MeshCount ? names[i] : "?";
@@ -808,11 +808,13 @@ MeshData BuildMesh(MeshId id) {
         TransformMesh(mesh, Mat4::RotationX(-90.0f * DegToRad)); // +Y -> -Z
         return mesh;
     }
-    case MeshId::Vignette: {
+    case MeshId::Vignette:
+    case MeshId::MonocularIris: {
         // Rings every 3 degrees through the ramp, wider beyond it; the profile is a squared
         // smoothstep, so the glow stays at the edges.
+        const float inner = id == MeshId::MonocularIris ? 8.0f : VignetteInnerDeg;
         std::vector<float> angles;
-        for (float a = VignetteInnerDeg; a < VignetteFullDeg + 4.0f; a += 3.0f) {
+        for (float a = inner; a < VignetteFullDeg + 4.0f; a += 3.0f) {
             angles.push_back(a);
         }
         for (const float a : {66.0f, 75.0f, VignetteOuterDeg}) {
@@ -823,7 +825,7 @@ MeshData BuildMesh(MeshId id) {
         mesh.closed = false;
         for (const float a : angles) {
             const float t = std::clamp(
-                (a - VignetteInnerDeg) / (VignetteFullDeg - VignetteInnerDeg), 0.0f, 1.0f);
+                (a - inner) / (VignetteFullDeg - inner), 0.0f, 1.0f);
             const float smooth = t * t * (3.0f - 2.0f * t);
             const float r = std::tan(a * DegToRad);
             for (u32 j = 0; j <= Segments; ++j) {
@@ -1272,11 +1274,22 @@ void AppendVignette(std::vector<DrawItem>& out, const Pose& head, const Vignette
         // x, y: the fitted profile's fractions of the displayed field; w: 3 (FrameData field).
         m.params = {v.fit_inner, std::max(v.fit_full, v.fit_inner + 0.01f), m.params.z, 3.0f};
     }
+    if (v.corners && v.wedge_focus > 0.0f) {
+        // x: the zoom into what the lenses show (the corners' looks replace the profile, so x is
+        // theirs).
+        m.params.x = std::clamp(v.corner_zoom, 1.0f, 2.2f);
+    }
     if (v.wedge_focus > 0.0f) {
         // The directional hit flash: the shader weights the ring toward (x, y) (emissive is
         // otherwise unused by the vignette).
-        m.emissive = {v.wedge_x, v.wedge_y, std::clamp(v.wedge_power, 0.25f, 16.0f),
-                      std::min(v.wedge_focus, 1.0f)};
+        // A negative z: the corners' veins (vr_overlay.frag, vr_eye_upscale.comp): x their reach,
+        // y the beat clock, -z the status (its whole part) and a trunk's width (the fraction).
+        m.emissive = v.corners ? Vec4{std::clamp(v.corner_reach, 0.05f, 1.41f), v.vein_beats,
+                                      -(static_cast<float>(std::clamp(v.vein_type, 0, 4)) +
+                                        std::clamp(v.vein_width, 0.002f, 0.099f)),
+                                      std::min(v.wedge_focus, 1.0f)}
+                               : Vec4{v.wedge_x, v.wedge_y, std::clamp(v.wedge_power, 0.25f, 16.0f),
+                                      std::min(v.wedge_focus, 1.0f)};
     }
     const float d = std::max(v.distance_m, 0.1f);
     out.push_back({MeshId::Vignette, Pass::Screen, Shade::Vignette,

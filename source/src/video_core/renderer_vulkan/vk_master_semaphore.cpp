@@ -4,6 +4,7 @@
 #include <limits>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/renderer_vulkan/vk_gpu_crash.h"
 
 #include "common/assert.h"
 #include "common/crash_record.h"
@@ -37,6 +38,11 @@ void MasterSemaphore::Refresh() {
     do {
         this_tick = gpu_tick.load(std::memory_order_acquire);
         auto [counter_result, cntr] = instance.GetDevice().getSemaphoreCounterValue(*semaphore);
+        if (counter_result != vk::Result::eSuccess) {
+            // The GPU report first (2026-11-13: lost devices reached this check before any
+            // reporting path, so gpu-crash.txt never got the driver's fault or the markers).
+            GpuCrash::Report(counter_result, "the master semaphore's value read");
+        }
         ASSERT_MSG(counter_result == vk::Result::eSuccess,
                    "Failed to get master semaphore value: {}", vk::to_string(counter_result));
         counter = cntr;
@@ -69,6 +75,7 @@ void MasterSemaphore::Wait(u64 tick) {
         return static_cast<VkResult>(instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT));
     });
     if (result != VK_SUCCESS) {
+        GpuCrash::Report(result, fmt::format("the game's timeline wait for tick {}", tick));
         // Preserve the reason in logs-off builds too. Never return as if the GPU
         // completed: callers may immediately recycle resources after this wait.
         char message[128];

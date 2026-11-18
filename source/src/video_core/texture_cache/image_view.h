@@ -44,6 +44,9 @@ struct Image;
 
 struct ImageView {
     ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info, const Image& image);
+    // A view made elsewhere, for the game's view `info` (sky detail's copies: no native stereo).
+    ImageView(const ImageViewInfo& info_, vk::UniqueImageView view)
+        : info{info_}, image_view{std::move(view)} {}
     ~ImageView();
 
     ImageView(const ImageView&) = delete;

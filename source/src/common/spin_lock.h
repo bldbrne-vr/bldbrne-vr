@@ -4,13 +4,15 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 
 namespace Common {
 
 /**
  * SpinLock class
- * a lock similar to mutex that forces a thread to spin wait instead calling the
- * supervisor. Should be used on short sequences of code.
+ * a lock similar to mutex that spins briefly instead of calling the supervisor, then parks the
+ * waiter (WaitOnAddress / futex) so a descheduled holder does not leave every waiter spinning
+ * through its time slice. Should be used on short sequences of code.
  */
 class SpinLock {
 public:
@@ -27,7 +29,10 @@ public:
     [[nodiscard]] bool try_lock();
 
 private:
-    std::atomic_flag lck = ATOMIC_FLAG_INIT;
+    void LockSlow();
+
+    // 0 free, 1 held, 2 held with a parked waiter (unlock wakes one)
+    std::atomic<std::uint32_t> state{0};
 };
 
 } // namespace Common

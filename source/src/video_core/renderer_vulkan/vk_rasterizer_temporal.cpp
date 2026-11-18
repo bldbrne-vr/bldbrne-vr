@@ -31,6 +31,7 @@
 #include "common/memory_write_trace.h"
 #include "common/logging/log.h"
 #include "core/memory.h"
+#include "core/vr/inframe.h"
 #include "core/vr/vr_session.h"
 #include "video_core/renderer_vulkan/vr_body_split.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -42,8 +43,23 @@
 #include "video_core/renderer_vulkan/vr_fsr4_interleave.h"
 #include "video_core/renderer_vulkan/vr_dlss_direct.h"
 #include "video_core/renderer_vulkan/vr_upscaler_fast.h"
+#include "video_core/renderer_vulkan/vr_dibr_upscale.h"
+#include "video_core/renderer_vulkan/vr_eye_axes.h"
 namespace Vulkan {
 namespace {
+// Tonitrus' world flash in this frame's own item list, for the upscaler's history restart on
+// its jumps (VrTemporalScene::SetFlashLevel): the record VrInjectInFrame takes the frame's items
+// with (the first draw's, when it has a projection, else the frame's camera record).
+float FrameFlashLevel(u64 first_draw_record) {
+    VR::CameraRecord rec = VR::DrawFrameRecord();
+    if (first_draw_record != 0 && first_draw_record != rec.id) {
+        VR::CameraRecord first{};
+        if (VR::GetRecord(first_draw_record, first) && first.has_projection) {
+            rec = first;
+        }
+    }
+    return VR::InFrame::StormFor(rec.id);
+}
 // Bit 37 provider options for this frame's plan. Only FSR has any, so DLSS and OFF never
 // reconfigure when the bit flips; FSR recreates both eyes (and restarts history) on a change.
 // Bit off = no flags = FSR 4's original passes, exactly as before the bit existed, except bit
@@ -447,7 +463,7 @@ void ReportWholeFrame(uint64_t frame, const VrTemporalCapture& t, uint32_t resol
                       uint32_t uploads) {
     static uint64_t last_frame{};
     static uint64_t seen_frames{}, seen_reconstructed{}, seen_inframe{}, seen_ui_scene{};
-    static uint64_t seen_hud_frames{}, seen_hud_syncs{}, seen_hud_draws{};
+    static uint64_t seen_hud_frames{}, seen_hud_syncs{}, seen_hud_draws{}, seen_hud_masks{};
     if (frame - last_frame < 300)
         return;
     const auto& s = t.s1;
@@ -462,6 +478,7 @@ void ReportWholeFrame(uint64_t frame, const VrTemporalCapture& t, uint32_t resol
              : accepted.upscaler == VR::Graphics::Upscaler::Dlss ? "dlss"
              : accepted.upscaler == VR::Graphics::Upscaler::Fsr31 ? "fsr31"
              : accepted.upscaler == VR::Graphics::Upscaler::Fsr4 ? "fsr4"
+             : accepted.upscaler == VR::Graphics::Upscaler::Fsr41 ? "fsr41"
                                                                  : "off",
              int(VR::Graphics::EffectiveProfile(accepted)), t.active,
              double(s.reconstructed - seen_reconstructed) / frames, s.failed, s.missed,
@@ -470,10 +487,13 @@ void ReportWholeFrame(uint64_t frame, const VrTemporalCapture& t, uint32_t resol
     if constexpr (Common::Log::Enabled) {
         const double hud_frames = double(std::max<uint64_t>(s.hud_frames - seen_hud_frames, 1));
         LOG_INFO(Render_Vulkan,
-                 "VR UI depth: {:.2f} copies/frame, {:.2f} shadow draws/frame ({} HUD frames)",
+                 "VR UI depth: {:.2f} copies/frame, {:.2f} shadow draws/frame, {:.2f} masks "
+                 "replayed/frame ({} HUD frames)",
                  double(s.hud_syncs - seen_hud_syncs) / hud_frames,
                  double(s.hud_draws - seen_hud_draws) / hud_frames,
+                 double(s.hud_masks - seen_hud_masks) / hud_frames,
                  s.hud_frames - seen_hud_frames);
+        seen_hud_masks = s.hud_masks;
         seen_hud_frames = s.hud_frames;
         seen_hud_syncs = s.hud_syncs;
         seen_hud_draws = s.hud_draws;
@@ -539,6 +559,62 @@ void S1RetryIdle(VrTemporalCapture& t, const VR::Graphics::Config& off,
     }
     t.active = ready;
 }
+// Foveated upscaling's rectangles for these sizes (vr.ini upscale_focus, read at start;
+// VR_DLSS_FOCUS=<fraction> for tests; vr_dlss_focus.h): around each lens
+// centre once the headset's angles are known (the image centres until then), then kept while
+// the sizes stay, so the Plan (the pair's key) does not change from frame to frame. Both eyes'
+// or none; none after a failure turned focus off (DlssFocus::Off). Each change and the turning
+// off go to the render diagnostics too (play builds and headset trials keep them). Recording
+// thread only (the frame's first scene draw).
+std::array<DlssFocus::Rect,2> DlssFocusRects(u32 in_w, u32 in_h, u32 out_w, u32 out_h) {
+    static const float fraction = [] {
+        const float tested = DlssFocus::Fraction(std::getenv("VR_DLSS_FOCUS"));
+        return tested != 0.0f ? tested : DlssFocus::LevelFraction(VR::GetSettings().upscale_focus);
+    }();
+    if (fraction == 0.0f) return {};
+    if (DlssFocus::IsOff()) {
+        static bool told = false;
+        if (!told) {
+            told = true;
+            const std::string line = fmt::format("VR DLSS focus: off for this session ({}); "
+                "using whole-eye upscaling", DlssFocus::OffReason().load());
+            LOG_WARNING(Render_Vulkan, "{}", line);
+            Common::RenderDiagnostic::Write(line);
+        }
+        return {};
+    }
+    static std::array<u32,4> sizes{};
+    static std::array<DlssFocus::Rect,2> rects{};
+    static bool from_fov{}, planned{};
+    const std::array<u32,4> now{in_w,in_h,out_w,out_h};
+    if (planned && now == sizes && from_fov) return rects;
+    // The head state's lock only until the headset's angles are known (or the sizes change).
+    std::array<float,2> cx{}, cy{};
+    const bool fov = EyeAxes(VR::GetHead(), cx, cy);
+    if (planned && now == sizes && fov == from_fov) return rects;
+    std::array<DlssFocus::Rect,2> next{};
+    for (unsigned eye = 0; eye < 2; ++eye)
+        next[eye] = DlssFocus::Plan(in_w, in_h, out_w, out_h, cx[eye], cy[eye], fraction);
+    if (!next[0].On() || !next[1].On()) next = {};
+    const bool changed = !planned || next != rects;
+    rects = next;
+    sizes = now;
+    from_fov = fov;
+    planned = true;
+    if (!changed) return rects;
+    const std::string line = fmt::format(
+        "VR DLSS focus: {:.2f} of each side, {}x{} -> {}x{}: L {}x{} at ({}, {}) -> {}x{} at ({}, {}), "
+        "R {}x{} at ({}, {}) -> {}x{} at ({}, {}){}", fraction, in_w, in_h, out_w, out_h,
+        rects[0].in_w, rects[0].in_h, rects[0].in_x, rects[0].in_y, rects[0].out_w, rects[0].out_h,
+        rects[0].out_x, rects[0].out_y, rects[1].in_w, rects[1].in_h, rects[1].in_x, rects[1].in_y,
+        rects[1].out_w, rects[1].out_h, rects[1].out_x, rects[1].out_y,
+        !rects[0].On() ? " (none fit)"
+        : fov          ? ""
+                       : " (image centres until the headset's angles are known)");
+    LOG_INFO(Render_Vulkan, "{}", line);
+    Common::RenderDiagnostic::Write(line);
+    return rects;
+}
 } // namespace
 
 VrTemporalCapture::~VrTemporalCapture() { RetireViews(0); RetireViews(1); RetireS1(); }
@@ -549,8 +625,12 @@ void VrTemporalCapture::RetireS1() {
     scheduler.DeferOperation([color = std::move(s.color), depth = std::move(s.depth),
                               encode = std::move(s.encode), views = std::move(s.srgb),
                               download = s.verify_download, ui_ds = std::move(s.ui_ds),
-                              ui_ds_view = std::move(s.ui_ds_view)]() mutable {
+                              ui_ds_view = std::move(s.ui_ds_view),
+                              depth_targets = std::move(s.depth_targets),
+                              ui_ds_targets = std::move(s.ui_ds_targets)]() mutable {
         for (auto& view : views) view.reset();
+        for (auto& view : depth_targets) view.reset();
+        ui_ds_targets.clear();
         ui_ds_view.reset();
         ui_ds.Destroy();
         color.Destroy();
@@ -563,6 +643,7 @@ void VrTemporalCapture::RetireS1() {
     s.ui_ds_layers = 0;
     s.ui_ds_dirty = true;
     s.ui_ds_failed = false;
+    s.ui_ds_prepared = false;
     s.srgb = {};
     s.color_format = s.depth_format = s.srgb_format = s.encode_format = vk::Format::eUndefined;
     s.color_layout = vk::ImageLayout::eUndefined;
@@ -601,24 +682,36 @@ bool VrTemporalCapture::S1Color(const VideoCore::Image& x) {
              vk::to_string(format));
     return true;
 }
-// The scene depth at the output size (nearest blits, depth aspect): the in-frame items' depth.
+// The scene depth at the output size (nearest scaling, depth aspect: S1ScaleDepth): the in-frame
+// items' depth.
 bool VrTemporalCapture::S1Depth(const VideoCore::Image& depth) {
     auto& s = s1;
     const vk::Format format = depth.backing->image.image_ci.format;
     if (s.depth && s.depth_format == format) return true;
     if (!s.depth_blit) return false;
-    const auto features =
-        instance.GetPhysicalDevice().getFormatProperties(format).optimalTilingFeatures;
-    if (!(features & vk::FormatFeatureFlagBits::eBlitSrc) ||
-        !(features & vk::FormatFeatureFlagBits::eBlitDst)) {
-        s.depth_blit = false;
-        LOG_WARNING(Render_Vulkan, "VR temporal S1: the scene depth's format {} cannot be "
-                    "blitted; in-frame items stay in the input-size target", vk::to_string(format));
-        return false;
+    if (!VrDepthRescale::Blits(instance, format)) {
+        if (!VrDepthRescale::Scales(format)) {
+            s.depth_blit = false;
+            LOG_WARNING(Render_Vulkan, "VR temporal S1: the scene depth's format {} cannot be "
+                        "scaled; in-frame items stay in the input-size target",
+                        vk::to_string(format));
+            return false;
+        }
+        LOG_INFO(Render_Vulkan, "VR temporal S1: the scene depth's format {} cannot be blitted; "
+                 "VrDepthRescale scales it ({})", vk::to_string(format),
+                 VrDepthRescale::Choose(instance, depth, vk::ImageAspectFlagBits::eDepth) ==
+                         VrDepthRescale::Mode::Draw
+                     ? "a draw"
+                     : "a compute copy");
     }
     if (s.depth) {
-        scheduler.DeferOperation([old = std::move(s.depth)]() mutable { old.Destroy(); });
+        scheduler.DeferOperation([old = std::move(s.depth),
+                                  targets = std::move(s.depth_targets)]() mutable {
+            for (auto& view : targets) view.reset();
+            old.Destroy();
+        });
     }
+    s.depth_targets = {};
     s.depth = VideoCore::UniqueImage(instance.GetDevice(), instance.GetAllocator());
     s.depth.Create(vk::ImageCreateInfo{
         .imageType = vk::ImageType::e2D,
@@ -628,18 +721,49 @@ bool VrTemporalCapture::S1Depth(const VideoCore::Image& depth) {
         .arrayLayers = 2,
         .samples = vk::SampleCountFlagBits::e1,
         .tiling = vk::ImageTiling::eOptimal,
-        .usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
+        // An attachment for VrDepthRescale's draw and for the in-frame items (S1DepthTarget).
+        .usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
+                 vk::ImageUsageFlagBits::eDepthStencilAttachment,
         .initialLayout = vk::ImageLayout::eUndefined});
     s.depth_format = format;
     return true;
 }
+vk::ImageView VrTemporalCapture::S1DepthTarget(uint32_t layer) {
+    auto& s = s1;
+    if (!s.depth || layer >= s.depth_targets.size() || s.depth_format == vk::Format::eS8Uint)
+        return {};
+    if (s.depth_targets[layer]) return *s.depth_targets[layer];
+    // As VrDepthRescale::Draw makes them: either can make the view first.
+    const bool stencil = s.depth_format == vk::Format::eD32SfloatS8Uint ||
+                         s.depth_format == vk::Format::eD24UnormS8Uint ||
+                         s.depth_format == vk::Format::eD16UnormS8Uint;
+    auto view = instance.GetDevice().createImageViewUnique(
+        {.image = s.depth.image,
+         .viewType = vk::ImageViewType::e2D,
+         .format = s.depth_format,
+         .subresourceRange = {stencil ? vk::ImageAspectFlagBits::eDepth |
+                                            vk::ImageAspectFlagBits::eStencil
+                                      : vk::ImageAspectFlags{vk::ImageAspectFlagBits::eDepth},
+                              0, 1, layer, 1}});
+    if (view.result != vk::Result::eSuccess) return {};
+    s.depth_targets[layer] = std::move(view.value);
+    return *s.depth_targets[layer];
+}
 // FAST bit 59: the HUD passes' depth/stencil at the output size (Scaleform's stencil masks).
 // The game keeps drawing its masks into its own input-size image; before a shadowed HUD draw that
-// tests depth or stencil, a dirty twin takes its contents again (nearest blit, every aspect).
-// Outside a render pass. Null: the format cannot be blitted or attached (the caller falls back).
+// tests depth or stencil, a dirty twin takes its contents again (nearest scaling, every aspect
+// tested: S1ScaleDepth). With `copy`, before the draw's binds: a draw copy binds a pipeline,
+// descriptors, push constants and a viewport of its own. Null: the format cannot be scaled or
+// attached, or (without `copy`) the twin was not made ready for this draw (the caller falls back).
 vk::ImageView VrTemporalCapture::S1UiDepth(VideoCore::Image& ds, vk::ImageAspectFlags tested_aspects,
-                                            bool shared_view_only) {
+                                            bool shared_view_only, bool copy) {
     auto& s = s1;
+    if (!copy) {
+        const bool ready = s.ui_ds_prepared && s.ui_ds &&
+                           s.ui_ds_layout == vk::ImageLayout::eDepthStencilAttachmentOptimal;
+        return ready ? *s.ui_ds_view : vk::ImageView{};
+    }
+    s.ui_ds_prepared = false;
     const vk::Format format = ds.backing->image.image_ci.format;
     const uint32_t layers = std::max(1u, ds.backing->image.image_ci.arrayLayers);
     vk::ImageAspectFlags aspect{};
@@ -670,22 +794,33 @@ vk::ImageView VrTemporalCapture::S1UiDepth(VideoCore::Image& ds, vk::ImageAspect
         if (s.ui_ds_failed && s.ui_ds_format == format) return {};
         const auto features =
             instance.GetPhysicalDevice().getFormatProperties(format).optimalTilingFeatures;
-        if (!(features & vk::FormatFeatureFlagBits::eBlitSrc) ||
-            !(features & vk::FormatFeatureFlagBits::eBlitDst) ||
+        const bool blits = VrDepthRescale::Blits(instance, format);
+        if (!(blits || VrDepthRescale::Scales(format)) ||
             !(features & vk::FormatFeatureFlagBits::eDepthStencilAttachment)) {
             s.ui_ds_failed = true;
             s.ui_ds_format = format;
             LOG_WARNING(Render_Vulkan, "VR temporal S1: the HUD's depth/stencil format {} cannot "
-                        "be blitted; such HUD frames stay at the input size", vk::to_string(format));
+                        "be scaled; such HUD frames stay at the input size", vk::to_string(format));
             return {};
         }
+        if (!blits) {
+            LOG_INFO(Render_Vulkan, "VR temporal S1: the HUD's depth/stencil format {} cannot be "
+                     "blitted; VrDepthRescale scales its masks ({})", vk::to_string(format),
+                     VrDepthRescale::Choose(instance, ds, vk::ImageAspectFlagBits::eStencil) ==
+                             VrDepthRescale::Mode::Draw
+                         ? "a draw"
+                         : "a compute copy");
+        }
         if (s.ui_ds) {
-            scheduler.DeferOperation([old = std::move(s.ui_ds),
-                                      view = std::move(s.ui_ds_view)]() mutable {
+            scheduler.DeferOperation([old = std::move(s.ui_ds), view = std::move(s.ui_ds_view),
+                                      targets = std::move(s.ui_ds_targets)]() mutable {
+                targets.clear();
                 view.reset();
                 old.Destroy();
             });
         }
+        s.ui_ds_targets.clear();
+        s.ui_ds_targets.resize(layers);
         s.ui_ds = VideoCore::UniqueImage(instance.GetDevice(), instance.GetAllocator());
         s.ui_ds.Create(vk::ImageCreateInfo{
             .imageType = vk::ImageType::e2D,
@@ -722,6 +857,9 @@ vk::ImageView VrTemporalCapture::S1UiDepth(VideoCore::Image& ds, vk::ImageAspect
     const auto cmd = scheduler.Commands();
     const auto twin_to = [&](vk::ImageLayout layout, vk::PipelineStageFlags2 stage,
                              vk::AccessFlags2 access) {
+        // A UI shadow pass may still be open (FAST bit 42): every command here goes outside it
+        // (the clear and the blit below follow a twin_to).
+        scheduler.EndRendering();
         const vk::ImageMemoryBarrier2 barrier{
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
@@ -762,23 +900,31 @@ vk::ImageView VrTemporalCapture::S1UiDepth(VideoCore::Image& ds, vk::ImageAspect
     const auto copy_aspects = tested_aspects & aspect & ~s.ui_ds_valid_aspects;
     if (copy_aspects) {
         const vk::ImageLayout game_layout = ds.backing->state.layout;
-        ds.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
-        twin_to(vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eTransfer,
-                vk::AccessFlagBits2::eTransferWrite);
-        const vk::ImageBlit region{
-            .srcSubresource = {copy_aspects, 0, 0, shared_view_only ? 1u : layers},
-            .srcOffsets = std::array<vk::Offset3D, 2>{vk::Offset3D{0, 0, 0},
-                vk::Offset3D{static_cast<int32_t>(ds.info.size.width),
-                             static_cast<int32_t>(ds.info.size.height), 1}},
-            .dstSubresource = {copy_aspects, 0, 0, shared_view_only ? 1u : layers},
-            .dstOffsets = std::array<vk::Offset3D, 2>{vk::Offset3D{0, 0, 0},
-                vk::Offset3D{static_cast<int32_t>(s.width), static_cast<int32_t>(s.height), 1}}};
-        cmd.blitImage(ds.GetImage(), vk::ImageLayout::eTransferSrcOptimal, s.ui_ds.image,
-                      vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eNearest);
+        // A draw reads the game's masks sampled and writes the twin as its attachment; a blit or
+        // the buffer copy go by transfer.
+        const auto mode = VrDepthRescale::Choose(instance, ds, copy_aspects);
+        const bool draw = mode == VrDepthRescale::Mode::Draw;
+        if (draw) {
+            ds.Transit(vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+                       vk::AccessFlagBits2::eShaderRead, {});
+            twin_to(vk::ImageLayout::eDepthStencilAttachmentOptimal, ds_stages, ds_access);
+        } else {
+            ds.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+                       {});
+            twin_to(vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eTransfer,
+                    vk::AccessFlagBits2::eTransferWrite);
+        }
+        const bool scaled = S1ScaleDepth(cmd, mode, ds, {ds.info.size.width, ds.info.size.height},
+                                         s.ui_ds.image, {s.width, s.height},
+                                         shared_view_only ? 1u : layers, format, copy_aspects,
+                                         s.ui_ds_targets, s.ui_ds_valid_aspects & ~copy_aspects);
         twin_to(vk::ImageLayout::eDepthStencilAttachmentOptimal, ds_stages, ds_access);
         if (game_layout != vk::ImageLayout::eUndefined &&
-            game_layout != vk::ImageLayout::eTransferSrcOptimal) {
+            game_layout != ds.backing->state.layout) {
             ds.Transit(game_layout, ds_access, {}); // the game's own pass expects it back
+        }
+        if (!scaled) {
+            return {};
         }
         s.ui_ds_valid_aspects |= copy_aspects;
         s.ui_ds_source = ds.GetImage();
@@ -786,7 +932,41 @@ vk::ImageView VrTemporalCapture::S1UiDepth(VideoCore::Image& ds, vk::ImageAspect
     } else if (s.ui_ds_layout != vk::ImageLayout::eDepthStencilAttachmentOptimal) {
         twin_to(vk::ImageLayout::eDepthStencilAttachmentOptimal, ds_stages, ds_access);
     }
+    s.ui_ds_prepared = true;
     return *s.ui_ds_view;
+}
+bool VrTemporalCapture::S1ScaleDepth(const RecorderProxy& cmd, VrDepthRescale::Mode mode,
+                                     VideoCore::Image& src_image, vk::Extent2D src_size,
+                                     vk::Image dst, vk::Extent2D dst_size, uint32_t layers,
+                                     vk::Format format, vk::ImageAspectFlags aspects,
+                                     std::span<vk::UniqueImageView> targets,
+                                     vk::ImageAspectFlags keep) {
+    const vk::Image src = src_image.GetImage();
+    if (mode == VrDepthRescale::Mode::None) {
+        return false;
+    }
+    if (mode == VrDepthRescale::Mode::Blit) {
+        const vk::ImageBlit region{
+            .srcSubresource = {aspects, 0, 0, layers},
+            .srcOffsets = std::array<vk::Offset3D, 2>{vk::Offset3D{0, 0, 0},
+                vk::Offset3D{static_cast<int32_t>(src_size.width),
+                             static_cast<int32_t>(src_size.height), 1}},
+            .dstSubresource = {aspects, 0, 0, layers},
+            .dstOffsets = std::array<vk::Offset3D, 2>{vk::Offset3D{0, 0, 0},
+                vk::Offset3D{static_cast<int32_t>(dst_size.width),
+                             static_cast<int32_t>(dst_size.height), 1}}};
+        cmd.blitImage(src, vk::ImageLayout::eTransferSrcOptimal, dst,
+                      vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eNearest);
+        return true;
+    }
+    if (!depth_rescale) {
+        depth_rescale = std::make_unique<VrDepthRescale>(instance, scheduler);
+    }
+    if (mode == VrDepthRescale::Mode::Draw) {
+        return depth_rescale->Draw(cmd, src_image, src_size, dst, dst_size, layers, format,
+                                   aspects, targets, keep);
+    }
+    return depth_rescale->Record(cmd, src, src_size, dst, dst_size, layers, format, aspects);
 }
 bool VrTemporalCapture::S1SrgbViews(vk::Format srgb) {
     auto& s = s1;
@@ -1042,7 +1222,10 @@ bool VrTemporalCapture::Views(VideoCore::Image& image, bool depth, vk::Format fo
 void Rasterizer::VrTemporalBeforeDraw(const GraphicsPipeline* pipeline, bool indirect,
                                       bool indexed, u32 index_offset) {
     ScratchProfile::Cpu scratch_temporal(39, "Rasterizer::VrTemporalBeforeDraw");
-    if (!NativeStereo::Enabled()) return;
+    if (!NativeStereo::Enabled()) {
+        VrDibrMotionBeforeDraw(pipeline, indirect, indexed, index_offset);
+        return;
+    }
     // S1 (bit 51): the guest itself renders at the input size, so no reduced-raster proxies.
     // Same recording thread as every reader of vr_temporal_scaled (draws, dispatches, VrEndFrame).
     const auto whole_frame = WholeFrameOutput();
@@ -1114,6 +1297,11 @@ void Rasterizer::VrTemporalBeforeDraw(const GraphicsPipeline* pipeline, bool ind
         t.depth_id={}; t.color_id={};
         t.motion_characters=t.motion_player=t.motion_camera_only=0;
         t.depth_uid=t.color_uid=0; t.draws=t.motion_draws=t.refused=0; t.index_syncs=t.index_writes=0; t.resolved=false; t.reconstructed=false;
+        { // the last frame's ReadForMotion answers (the frame log)
+            const auto reads = buffer_cache.TakeMotionReadCounts();
+            t.last_reads = {reads.snapshots, reads.waiting, reads.copies, reads.replaced,
+                            reads.no_room, reads.full};
+        }
         const auto profile = VR::Graphics::EffectiveProfile(accepted);
         const auto input = VR::Graphics::InputResolution({t.width,t.height},
             vr_temporal_scaled ? accepted.upscaler : VR::Graphics::Upscaler::Off, profile);
@@ -1126,6 +1314,17 @@ void Rasterizer::VrTemporalBeforeDraw(const GraphicsPipeline* pipeline, bool ind
                                     {t.input_width,t.input_height,output_width,output_height}}},false};
         plan.provider_flags=UpscalerProviderFlags(accepted);
         plan.dlss_preset=dlss_preset; // a change recreates both DLSS eyes
+        // Foveated upscaling (vr.ini upscale_focus, vr_dlss_focus.h): S1's DLSS (not DLSS 5) or
+        // FSR on a rectangle around each lens centre (VrTemporalScene cuts it out and composes
+        // the eyes, the render around it from X, which must be the input itself). Not with the
+        // diagnostic twins (they compare whole eyes).
+        if (t.s1.on &&
+            ((accepted.upscaler == VR::Graphics::Upscaler::Dlss && !accepted.dlss5) ||
+             VR::Graphics::IsFsr(accepted.upscaler)) &&
+            t.input_width == t.width && t.input_height == t.height &&
+            !(plan.provider_flags & (VrTemporalPair::DlssVerifyTwin | VrTemporalPair::Fsr4VerifyTwin |
+                                     VrTemporalPair::Fsr4VerifyInterleave)))
+            plan.focus = DlssFocusRects(t.input_width,t.input_height,output_width,output_height);
         // FAST_GPU_S1_ASYM: S1's provider latched by incomplete frames waits, configured and
         // idle, until its retry frame; then it runs again and ProbeFailures more incomplete
         // frames in a row latch it again (vr_temporal_failure.h).
@@ -1140,9 +1339,12 @@ void Rasterizer::VrTemporalBeforeDraw(const GraphicsPipeline* pipeline, bool ind
                          t.frame,t.s1.retries);
             }
         }
-        if (accepted.upscaler == VR::Graphics::Upscaler::Fsr31 && !t.s1.on) {
+        // FSR 4.1 too: its bridge runs FSR 3.1.5 where AMD offers no 4.1.
+        if ((accepted.upscaler == VR::Graphics::Upscaler::Fsr31 ||
+             accepted.upscaler == VR::Graphics::Upscaler::Fsr41) && !t.s1.on) {
             t.faulted = true;
-            t.failure = "FSR 3.1.5 requires whole-frame reconstruction; enable it and restart";
+            t.failure = std::string(VR::Graphics::UpscalerName(accepted.upscaler)) +
+                        " requires whole-frame reconstruction; enable it and restart";
             VR::Graphics::PublishStatus(accepted, VR::Graphics::RunState::Unavailable);
             RENDER_DIAGNOSTIC_ONCE("{}", t.failure);
         }
@@ -1174,7 +1376,8 @@ void Rasterizer::VrTemporalBeforeDraw(const GraphicsPipeline* pipeline, bool ind
     if (t.gbuffer) {
         const bool character = HasCharacterSkeleton(pipeline);
         const bool player = !character && IsPlayerMotion(pipeline->GetStage(Shader::LogicalStage::Vertex));
-        t.object_candidate = FullObjectMotion() || character || player;
+        t.object_candidate = !indirect && t.scene.Objects() &&
+                             (FullObjectMotion() || character || player);
         t.motion_characters += character;
         t.motion_player += player;
         t.motion_camera_only += !t.object_candidate;
@@ -1183,7 +1386,8 @@ void Rasterizer::VrTemporalBeforeDraw(const GraphicsPipeline* pipeline, bool ind
     if(gbuffer) {
         // Motion history observes indices; it must never make guest memory coherent by
         // writing a widened GPU readback over neighboring allocations after a load.
-        // Prepare before draw binding because genuinely GPU-produced indices may wait.
+        // Prepare before draw binding: genuinely GPU-produced indices need a GPU copy (camera
+        // motion until it lands, a frame or two later).
         if (indexed && t.object_candidate) {
             const auto& regs = ScratchDraw::Registers(liverpool);
             const u32 stride = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2 : 4;
@@ -1191,7 +1395,8 @@ void Rasterizer::VrTemporalBeforeDraw(const GraphicsPipeline* pipeline, bool ind
             const u64 bytes = u64(regs.num_indices) * stride;
             if (address && bytes && bytes <= UINT32_MAX && IsMapped(address, bytes)) {
                 t.motion_index_address = address;
-                t.motion_index_data = buffer_cache.ReadForMotion(address, static_cast<u32>(bytes));
+                t.motion_index_data =
+                    buffer_cache.ReadForMotion(address, static_cast<u32>(bytes), vr_temporal_frame);
                 if (!t.motion_index_data.empty() &&
                     t.motion_index_data.data() != reinterpret_cast<const u8*>(address)) {
                     ++t.index_syncs;
@@ -1203,10 +1408,10 @@ void Rasterizer::VrTemporalBeforeDraw(const GraphicsPipeline* pipeline, bool ind
         if (depth.info.size.width!=t.width || depth.info.size.height!=t.height ||
             !depth.native_stereo || depth.backing->num_samples!=1 ||
             (t.depth_id && (t.depth_id!=db_desc.first || t.depth_uid!=depth.image_uid))) {
-            t.scene.IncompleteMotion(); ++t.refused;
+            t.scene.InvalidateScene(); ++t.refused;
         } else { t.depth_id=db_desc.first; t.depth_uid=depth.image_uid; }
         ++t.draws;
-        if(indirect) { t.scene.IncompleteMotion(); ++t.refused; }
+        // Indirect draws have no CPU vertex range; keep camera motion for them.
     }
     if(t.depth_id && db_desc.first==t.depth_id && cb_descs[0].first && std::popcount(key.mrt_mask)<=2) {
         const auto& color=texture_cache.GetImage(cb_descs[0].first);
@@ -1219,9 +1424,21 @@ void Rasterizer::VrTemporalBeforeDraw(const GraphicsPipeline* pipeline, bool ind
 }
 const GraphicsPipeline* Rasterizer::VrTemporalSelect(const GraphicsPipeline* pipeline, RenderState& state) {
     ScratchProfile::Cpu scratch_temporal(40, "Rasterizer::VrTemporalSelect");
-    if(!vr_temporal || !vr_temporal->gbuffer || !vr_temporal->object_candidate) return pipeline;
+    if(!vr_temporal) return VrDibrMotionSelect(pipeline, state);
+    if(!vr_temporal->gbuffer || !vr_temporal->object_candidate) return pipeline;
+    // VR_EXP_NO_OBJECT_MOTION=1 (GPU timing experiment only, never a default): no object-motion
+    // variant; every draw keeps camera-only motion (characters ghost under the upscaler).
+    static const bool exp_no_object_motion = [] {
+        const char* value = std::getenv("VR_EXP_NO_OBJECT_MOTION");
+        return value && value[0] == '1';
+    }();
+    if(exp_no_object_motion) return pipeline;
     auto& t=*vr_temporal;
     auto* objects=t.scene.Objects();
+    if (!objects) {
+        ++t.motion_camera_only;
+        return pipeline; // Object history became unavailable after candidate selection.
+    }
     const GraphicsPipeline* variant=nullptr;
     bool deferred=false; // the variant still compiles (bit 40: never waited for here)
     // The live motion buffers. With VrPushData the variant is the same for every allocation (the
@@ -1263,13 +1480,13 @@ const GraphicsPipeline* Rasterizer::VrTemporalSelect(const GraphicsPipeline* pip
     if(deferred) {
         // Fast bit 40: its motion variant still compiles in the background. Meanwhile the draw
         // goes as static scenery does (camera motion only): marking the frame's motion
-        // incomplete would drop every frame's reconstruction until it is ready, and 8 such
-        // frames in a row turn the provider off (TemporalFailure).
+        // incomplete would unnecessarily drop reconstruction until it is ready.
+        ++t.motion_camera_only;
         return pipeline;
     }
     const bool attached=variant && objects->Attach(state);
     if(!attached) {
-        if(t.refused<3) {
+        if(t.refused<3 && (t.frame<10 || t.frame%300==0)) {
             const auto& key=pipeline->GetGraphicsKey();
             LOG_WARNING(Render_Vulkan,
                         "VR temporal motion: {} (views={}, samples={}, MRTs={}, mask={:#x}, "
@@ -1286,7 +1503,10 @@ const GraphicsPipeline* Rasterizer::VrTemporalSelect(const GraphicsPipeline* pip
                 LOG_WARNING(Render_Vulkan,"VR temporal motion stage: hardware={} logical={} hash={:#x} reserved={}",
                     uint32_t(stage->stage),uint32_t(stage->l_stage),stage->pgm_hash,stage->uses_reserved_motion_varyings);
         }
-        t.scene.IncompleteMotion(); ++t.refused; return pipeline;
+        // The ordinary draw still writes scene depth. The composer keeps camera motion
+        // where no valid object vector matches that depth.
+        ++t.motion_camera_only;
+        ++t.refused; return pipeline;
     }
     vr_motion_buffers=motion;
     return variant;
@@ -1294,7 +1514,10 @@ const GraphicsPipeline* Rasterizer::VrTemporalSelect(const GraphicsPipeline* pip
 uint32_t Rasterizer::VrTemporalPrepareDraw(const GraphicsPipeline* pipeline, uint64_t geometry,
         bool indexed, uint32_t index_offset, uint32_t vertex_offset, uint32_t first_instance) {
     ScratchProfile::Cpu scratch_temporal(41, "Rasterizer::VrTemporalPrepareDraw");
-    if(!vr_temporal || !pipeline->HasVrMotion()) return 0;
+    if(!pipeline->HasVrMotion()) return 0;
+    if(!vr_temporal)
+        return VrDibrMotionPrepareDraw(pipeline, geometry, indexed, index_offset, vertex_offset,
+                                       first_instance);
     const auto& regs = ScratchDraw::Registers(liverpool);
     // No vertex invocation means no missing motion, even if a motion pipeline was selected.
     if (regs.num_indices == 0) return 0;
@@ -1302,8 +1525,11 @@ uint32_t Rasterizer::VrTemporalPrepareDraw(const GraphicsPipeline* pipeline, uin
     auto* objects=t.scene.Objects();
     if(!objects) return 0;
     const auto refuse=[&](const char* why) {
-        if(t.refused<3) LOG_WARNING(Render_Vulkan,"VR temporal motion draw refused: {}",why);
-        t.scene.IncompleteMotion(); ++t.refused; return 0u;
+        if(t.refused<3 && (t.frame<10 || t.frame%300==0)) LOG_WARNING(Render_Vulkan,"VR temporal motion draw uses camera fallback: {}",why);
+        // Parameter zero is the inactive pair: no history access and invalid object
+        // vectors, so these pixels use camera motion without rejecting the frame.
+        ++t.motion_camera_only;
+        ++t.refused; return 0u;
     };
     if(!geometry) return refuse("vertex identity unavailable");
     Motion::VertexRange range{vertex_offset,regs.num_indices};
@@ -1343,6 +1569,140 @@ uint32_t Rasterizer::VrTemporalPrepareDraw(const GraphicsPipeline* pipeline, uin
     ++t.motion_draws;
     return index;
 }
+// DIBR upscaler object motion: the scene draws of the centre (non-multiview, at the provider's
+// input size) that draw characters or the player's body and held items get native stereo's motion
+// variant with one view. Unlike native stereo, a refused draw only falls back to camera motion
+// for its pixels: the frame is still reconstructed.
+void Rasterizer::VrDibrMotionBeforeDraw(const GraphicsPipeline* pipeline, bool indirect,
+                                        bool indexed, u32 index_offset) {
+    // VR_DIBR_OBJECT_MOTION=0 (A/B, fallback): camera motion only.
+    static const bool object_motion = [] {
+        const char* value = std::getenv("VR_DIBR_OBJECT_MOTION");
+        return !(value && value[0] == '0');
+    }();
+    if (!object_motion || !vr_dibr_upscale || !VR::DibrFrameActive()) return;
+    auto& d = vr_dibr_upscale->draws;
+    d.gbuffer = d.object_candidate = false;
+    d.index_data = {};
+    d.index_address = 0;
+    const auto input = vr_dibr_upscale->InputSize();
+    const auto& key = pipeline->GetGraphicsKey();
+    const auto& regs = ScratchDraw::Registers(liverpool);
+    if (!input.width || !db_desc.first || key.probe_view_mask != 0 ||
+        std::popcount(key.mrt_mask) < 5 || (!indirect && regs.num_indices == 0))
+        return;
+    const auto& depth = texture_cache.GetImage(db_desc.first);
+    if (depth.info.size.width != input.width || depth.info.size.height != input.height ||
+        depth.backing->num_samples != 1)
+        return;
+    if (d.frame != vr_temporal_frame) {
+        d.frame = vr_temporal_frame;
+        d.draws = d.motion_draws = d.refused = d.characters = d.player = 0;
+        if (d.frame % 600 == 0) d.index_ranges.Trim(d.frame);
+        vr_dibr_upscale->BeginMotion(d.frame);
+    }
+    if (!vr_dibr_upscale->Objects()) return;
+    d.gbuffer = true;
+    ++d.draws;
+    const bool character = HasCharacterSkeleton(pipeline);
+    const bool player = !character && IsPlayerMotion(pipeline->GetStage(Shader::LogicalStage::Vertex));
+    d.characters += character;
+    d.player += player;
+    // Indirect draws have no CPU vertex range: camera motion for them.
+    d.object_candidate = !indirect && (FullObjectMotion() || character || player);
+    if (!d.object_candidate || !indexed) return;
+    // As native stereo: read the indices before binding; never write a widened readback back.
+    const u32 stride = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2 : 4;
+    const VAddr address = regs.index_base_address.Address<VAddr>() + u64(index_offset) * stride;
+    const u64 bytes = u64(regs.num_indices) * stride;
+    if (address && bytes && bytes <= UINT32_MAX && IsMapped(address, bytes)) {
+        d.index_address = address;
+        d.index_data =
+            buffer_cache.ReadForMotion(address, static_cast<u32>(bytes), vr_temporal_frame);
+    }
+}
+const GraphicsPipeline* Rasterizer::VrDibrMotionSelect(const GraphicsPipeline* pipeline,
+                                                       RenderState& state) {
+    if (!vr_dibr_upscale) return pipeline;
+    auto& d = vr_dibr_upscale->draws;
+    auto* objects = d.gbuffer && d.object_candidate ? vr_dibr_upscale->Objects() : nullptr;
+    if (!objects) return pipeline;
+    const auto motion = objects->Specialization();
+    bool deferred = false; // still compiling (bit 40): camera motion meanwhile
+    const GraphicsPipeline* variant = nullptr;
+    if (FastRender::On(MotionFast)) {
+        // Bit 36: the cache's answer for this base without its selection lock (native stereo's
+        // memo; the cache changes an entry only inside GetVrMotionPipeline).
+        const auto it = d.variants.find(pipeline);
+        if (it != d.variants.end() && it->second.motion == motion &&
+            !ScratchDraw::Registers(liverpool).clipper_control.clip_disable) {
+            variant = it->second.variant;
+        } else {
+            variant = pipeline_cache.GetVrMotionPipeline(pipeline, motion, false, &deferred);
+            if (variant) d.variants.insert_or_assign(pipeline, VrDibrUpscale::DrawState::Variant{motion, variant});
+            else d.variants.erase(pipeline);
+        }
+    } else {
+        if (!d.variants.empty()) d.variants.clear();
+        variant = pipeline_cache.GetVrMotionPipeline(pipeline, motion, false, &deferred);
+    }
+    if (deferred) return pipeline;
+    if (!variant || !objects->Attach(state)) {
+        if (++d.refused <= 3)
+            LOG_INFO(Render_Vulkan, "VR DIBR motion: {} (views={}, MRTs={}, mask={:#x}); camera "
+                     "motion for this draw", variant ? "target attachment refused"
+                                                     : "pipeline variant refused",
+                     pipeline->GetGraphicsKey().probe_view_mask, state.num_color_attachments,
+                     pipeline->GetGraphicsKey().mrt_mask);
+        return pipeline;
+    }
+    vr_motion_buffers = motion;
+    return variant;
+}
+u32 Rasterizer::VrDibrMotionPrepareDraw(const GraphicsPipeline* pipeline, u64 geometry,
+                                        bool indexed, u32 index_offset, u32 vertex_offset,
+                                        u32 first_instance) {
+    if (!vr_dibr_upscale) return 0;
+    auto& d = vr_dibr_upscale->draws;
+    auto* objects = vr_dibr_upscale->Objects();
+    const auto& regs = ScratchDraw::Registers(liverpool);
+    if (!objects || regs.num_indices == 0 || !geometry) return 0;
+    Motion::VertexRange range{vertex_offset, regs.num_indices};
+    uint64_t index_address = 0, topology = 0;
+    if (indexed) {
+        const u32 stride = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2 : 4;
+        index_address = regs.index_base_address.Address<VAddr>() + u64(index_offset) * stride;
+        const u64 bytes = u64(regs.num_indices) * stride;
+        if (d.index_address != index_address || d.index_data.size() != bytes) return 0;
+        const auto* data = static_cast<const void*>(d.index_data.data());
+        const auto scan = [&] {
+            return stride == 2
+                ? Motion::IndexedRange(std::span(static_cast<const uint16_t*>(data), regs.num_indices),
+                                       int32_t(vertex_offset), regs.enable_primitive_restart != 0)
+                : Motion::IndexedRange(std::span(static_cast<const uint32_t*>(data), regs.num_indices),
+                                       int32_t(vertex_offset), regs.enable_primitive_restart != 0);
+        };
+        const Motion::IndexRangeCache::Key key{index_address, regs.num_indices, stride,
+                                               int32_t(vertex_offset),
+                                               regs.enable_primitive_restart != 0};
+        if (data == reinterpret_cast<const void*>(index_address) && FastRender::On(MotionFast) &&
+            TemporalOptimizations()) {
+            const auto proven = ProvenIndexRange(buffer_cache, d.index_ranges, key, bytes, d.frame, scan);
+            range = proven.range;
+            topology = proven.topology;
+        } else {
+            topology = XXH3_64bits(data, bytes);
+            range = d.index_ranges.GetVerified(key, topology, d.frame, scan).range;
+        }
+    }
+    if (!range.count) return 0;
+    const auto index = objects->Prepare({.shader = pipeline->GetStage(Shader::LogicalStage::Vertex).pgm_hash,
+        .geometry = geometry, .indices = index_address, .topology = topology,
+        .index_count = regs.num_indices, .instances = regs.num_instances.NumInstances(),
+        .first_instance = first_instance, .vertices = range});
+    d.motion_draws += index != 0;
+    return index;
+}
 void Rasterizer::VrTemporalDispatch(uint64_t shader) {
     ScratchProfile::Cpu scratch_temporal(42, "Rasterizer::VrTemporalDispatch");
     if(!vr_temporal || shader!=0x9a9cf8a9 || !vr_temporal->active || vr_temporal->resolved) return;
@@ -1359,10 +1719,10 @@ void Rasterizer::VrTemporalDispatch(uint64_t shader) {
     const auto fail=[&](const char* why, bool persistent = false) {
         // Loading/camera cuts can invalidate one frame's motion. Resolve resets history;
         // retry the next complete scene rather than disabling the provider until a menu edit.
-        // Repeated missing object coverage must not leave a permanently reduced, spatially
+        // Repeated invalid scene inputs must not leave a permanently reduced, spatially
         // enlarged image while the menu says the temporal provider is enabled.
         persistent = TemporalFailure(t.incomplete_frames, persistent);
-        t.faulted=persistent; t.failure=why; t.scene.IncompleteMotion();
+        t.faulted=persistent; t.failure=why; t.scene.InvalidateScene();
         VR::Graphics::PublishStatus(VR::Graphics::Unpack(t.accepted_key), persistent ?
             VR::Graphics::RunState::Unavailable : VR::Graphics::RunState::Retrying);
         LOG_BENCHMARK_WARNING(Render_Vulkan,"VR temporal native: frame {} {}: {} (draws={} motion={} refused={})",
@@ -1379,6 +1739,7 @@ void Rasterizer::VrTemporalDispatch(uint64_t shader) {
         const char* const label =
             upscaler == VR::Graphics::Upscaler::Dlss   ? "VR temporal resolve (DLSS, both eyes)"
             : upscaler == VR::Graphics::Upscaler::Fsr31 ? "VR temporal resolve (FSR 3.1.5, both eyes)"
+            : upscaler == VR::Graphics::Upscaler::Fsr41 ? "VR temporal resolve (FSR 4.1, both eyes)"
             : upscaler == VR::Graphics::Upscaler::Fsr4 ? "VR temporal resolve (FSR 4, both eyes)"
                                                        : "VR temporal resolve (both eyes)";
         GpuPassProfiler::MarkAt(scheduler, 0x7E3B'0000'0000ull | static_cast<u64>(upscaler),
@@ -1407,6 +1768,7 @@ void Rasterizer::VrTemporalDispatch(uint64_t shader) {
     const float frame_ms=t.last_resolve.time_since_epoch().count() ?
         std::clamp(std::chrono::duration<float,std::milli>(now-t.last_resolve).count(),1.f,1000.f):11.111f;
     t.last_resolve=now;
+    t.scene.SetFlashLevel(FrameFlashLevel(vr_dibr.first_draw_record));
     const auto result=t.scene.Resolve(sources,frame_ms);
     const auto output=t.scene.Output();
     if(result!=VrTemporalPair::Result::Ready || !output) {
@@ -1437,8 +1799,9 @@ void Rasterizer::VrTemporalDispatch(uint64_t shader) {
     color->flags|=VideoCore::ImageFlagBits::GpuModified;
     color->flags&=~VideoCore::ImageFlagBits::Dirty;
     if(t.frame<10 || t.frame%60==0)
-        LOG_BENCHMARK_INFO(Render_Vulkan,"VR temporal native: frame {} both eyes recorded {}x{}, motion draws={}/{}, raster {}x{} -> {}x{}, reduced_draws={}, index_syncs={} index_writes={} characters={} player={} camera_only={}",
-            t.frame,t.width,t.height,t.motion_draws,t.draws,t.input_width,t.input_height,t.width,t.height,t.reduced_draws,t.index_syncs,t.index_writes,t.motion_characters,t.motion_player,t.motion_camera_only);
+        LOG_BENCHMARK_INFO(Render_Vulkan,"VR temporal native: frame {} both eyes recorded {}x{}, motion draws={}/{}, raster {}x{} -> {}x{}, reduced_draws={}, index_syncs={} index_writes={} characters={} player={} camera_only={}, last frame's index snapshots={} waiting={} copies={} replaced={} no_room={} full={}",
+            t.frame,t.width,t.height,t.motion_draws,t.draws,t.input_width,t.input_height,t.width,t.height,t.reduced_draws,t.index_syncs,t.index_writes,t.motion_characters,t.motion_player,t.motion_camera_only,
+            t.last_reads[0],t.last_reads[1],t.last_reads[2],t.last_reads[3],t.last_reads[4],t.last_reads[5]);
 }
 // S1 (bit 51): right after the composite draw (its target X: the tonemapped frame at the input
 // size, scene jittered) and before our in-frame items and the UI layer's scene copy. The provider
@@ -1460,7 +1823,7 @@ void Rasterizer::VrS1Reconstruct() {
             if(retry) S1RetryLatch(t,why);
             else s.retry.Reset();
         }
-        t.faulted=persistent; t.failure=why; t.scene.IncompleteMotion(); ++s.failed;
+        t.faulted=persistent; t.failure=why; t.scene.InvalidateScene(); ++s.failed;
         VR::Graphics::PublishStatus(VR::Graphics::Unpack(t.accepted_key), persistent && !retry ?
             VR::Graphics::RunState::Unavailable : VR::Graphics::RunState::Retrying);
         LOG_BENCHMARK_WARNING(Render_Vulkan,"VR temporal native: frame {} {}: {} (S1; draws={} motion={} refused={})",
@@ -1469,7 +1832,8 @@ void Rasterizer::VrS1Reconstruct() {
         scheduler.GetDynamicState().Invalidate(); // a refused provider may have recorded passes
     };
     // X: the first HUD draw's own target when it is the scene's size, else the last colour target
-    // of the scene's size drawn before it (VrTrackTargets, as for the DIBR/UI capture).
+    // of the scene's size drawn before it that the UI is drawn into (VrSceneColor, as for the
+    // DIBR/UI capture).
     VideoCore::Image* x=nullptr;
     VideoCore::ImageId x_id{};
     if(const auto own_id=cb_descs[0].first; own_id && cb_descs[0].second.view_info.range.base.layer==0) {
@@ -1477,10 +1841,8 @@ void Rasterizer::VrS1Reconstruct() {
         if(own.info.size.width==t.width && own.info.size.height==t.height) { x=&own; x_id=own_id; }
     }
     if(!x) {
-        const VrColorTarget* best=nullptr;
-        for(const auto& target : vr_dibr.color)
-            if(target.id && target.extent==vk::Extent2D{t.width,t.height} &&
-               (!best || target.last_draw>best->last_draw)) best=&target;
+        const vk::Extent2D size{t.width,t.height};
+        const VrColorTarget* best=VrSceneColor([size](vk::Extent2D e) { return e==size; });
         x=best ? texture_cache.TryGetImage(best->id,best->uid) : nullptr;
         if(x) x_id=best->id;
     }
@@ -1527,11 +1889,16 @@ void Rasterizer::VrS1Reconstruct() {
     depth->Transit(vk::ImageLayout::eGeneral,vk::AccessFlagBits2::eShaderRead,{});
     std::array<VrTemporalImages::Source,2> sources;
     for(uint32_t eye=0;eye<2;++eye)
-        sources[eye]={*t.views[0].eyes[eye],*t.views[1].eyes[eye],t.width,t.height};
+        // Bit 46: the images behind the views too, so DLSS may read X's and the depth's layers in
+        // place (as in the scene path above).
+        sources[eye]={*t.views[0].eyes[eye],*t.views[1].eyes[eye],t.width,t.height,
+            x->GetImage(),depth->GetImage(),x->backing->image.image_ci.format,
+            depth->backing->image.image_ci.format,eye};
     const auto now=std::chrono::steady_clock::now();
     const float frame_ms=t.last_resolve.time_since_epoch().count() ?
         std::clamp(std::chrono::duration<float,std::milli>(now-t.last_resolve).count(),1.f,1000.f):11.111f;
     t.last_resolve=now;
+    t.scene.SetFlashLevel(FrameFlashLevel(vr_dibr.first_draw_record));
     const auto result=t.scene.Resolve(sources,frame_ms);
     const auto output=t.scene.Output();
     if(result!=VrTemporalPair::Result::Ready || !output) {
@@ -1545,8 +1912,9 @@ void Rasterizer::VrS1Reconstruct() {
         LOG_INFO(Render_Vulkan,"VR temporal S1: frame {} reconstructed again (FAST_GPU_S1_ASYM, retry {})",
                  t.frame,s.retries);
     }
-    // The provider's eyes (RGBA16F, GENERAL) into the twin's layers: same size, a format
-    // conversion only. Alpha is the provider's; the eyes' projection layers ignore it.
+    // The provider's eyes (RGBA8 by default in S1, else RGBA16F; GENERAL) into the twin's
+    // layers: same size, a format conversion at most. Alpha is the provider's; the eyes'
+    // projection layers ignore it.
     GpuPassProfiler::MarkAt(scheduler, 0x7E3B'0000'0310ull, GpuPassProfiler::Group::Temporal,
                             "VR S1 output copy (provider eyes into the output-size scene)");
     const auto cmd=scheduler.Commands();
@@ -1608,8 +1976,9 @@ void Rasterizer::VrS1Reconstruct() {
     VR::Graphics::PublishStatus(VR::Graphics::Unpack(t.accepted_key), VR::Graphics::RunState::Active,
         {t.width,t.height},{s.width,s.height});
     if(t.frame<10 || t.frame%60==0)
-        LOG_BENCHMARK_INFO(Render_Vulkan,"VR temporal native: frame {} both eyes recorded {}x{}, motion draws={}/{}, raster {}x{} -> {}x{}, reduced_draws={}, index_syncs={} index_writes={} characters={} player={} camera_only={} (S1 whole frame, {} after the composite)",
+        LOG_BENCHMARK_INFO(Render_Vulkan,"VR temporal native: frame {} both eyes recorded {}x{}, motion draws={}/{}, raster {}x{} -> {}x{}, reduced_draws={}, index_syncs={} index_writes={} characters={} player={} camera_only={}, last frame's index snapshots={} waiting={} copies={} replaced={} no_room={} full={} (S1 whole frame, {} after the composite)",
             t.frame,s.width,s.height,t.motion_draws,t.draws,t.width,t.height,s.width,s.height,t.draws,t.index_syncs,t.index_writes,t.motion_characters,t.motion_player,t.motion_camera_only,
+            t.last_reads[0],t.last_reads[1],t.last_reads[2],t.last_reads[3],t.last_reads[4],t.last_reads[5],
             neural ? "DLSS 5, linear in, sRGB-encoded out" : "LDR");
 }
 void Rasterizer::VrTemporalEndFrame() {
@@ -1626,8 +1995,12 @@ void Rasterizer::VrTemporalEndFrame() {
             }
         ReportWholeFrame(vr_temporal_frame,*vr_temporal,resolves,uploads);
     }
-    if (!NativeStereo::Enabled() ||
-        (vr_temporal_scaled && pipeline_cache.GetProfile().max_push_constant_size < 136)) {
+    if (!NativeStereo::Enabled()) {
+        // DIBR: its upscaler publishes its own state (vr_dibr_upscale.cpp).
+        if (!DibrUpscale::Requested())
+            VR::Graphics::PublishStatus(VR::Graphics::Accepted(),
+                                        VR::Graphics::RunState::Unsupported);
+    } else if (vr_temporal_scaled && pipeline_cache.GetProfile().max_push_constant_size < 136) {
         VR::Graphics::PublishStatus(VR::Graphics::Accepted(), VR::Graphics::RunState::Unsupported);
     } else if (!vr_temporal || (!vr_temporal->faulted &&
                (!vr_temporal->active || !vr_temporal->draws))) {
@@ -1674,9 +2047,11 @@ bool VrSceneProxy::Eligible(const VideoCore::Image& source) {
         source.info.resources.levels != 1 || source.backing->image.image_ci.arrayLayers != 2 ||
         source.info.props.is_block)
         return false;
-    const auto features = source.instance->GetPhysicalDevice()
-                              .getFormatProperties(source.backing->image.image_ci.format)
-                              .optimalTilingFeatures;
+    const vk::Format format = source.backing->image.image_ci.format;
+    if (source.info.props.is_depth)
+        return VrDepthRescale::Blits(*source.instance, format); // AMD: no depth blits
+    const auto features =
+        source.instance->GetPhysicalDevice().getFormatProperties(format).optimalTilingFeatures;
     const auto need = vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eBlitDst;
     return (features & need) == need;
 }

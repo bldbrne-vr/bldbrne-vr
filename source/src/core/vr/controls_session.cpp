@@ -8,11 +8,14 @@
 
 #include <fmt/format.h>
 
+#include "common/singleton.h"
 #include "core/vr/body_settings.h"
 #include "core/vr/controls_session.h"
 #include "core/vr/melee_settings.h"
 #include "core/vr/quick_settings.h"
+#include "core/vr/two_hand_settings.h"
 #include "core/vr/vr_session.h"
+#include "input/controller.h"
 
 namespace VR::ControlsView {
 
@@ -32,7 +35,11 @@ Config CurrentConfig() {
     c.quick_arc = q.quick_items && q.quick_arc;
     c.arc_l3 = q.arc_l3;
     c.belt_vial = q.belt_vial;
+    c.grip_hold = q.grip_hold;
+    c.x_fan = s.x_fan;
     c.right_grip_draw = s.right_grip_draw;
+    c.optimized_two_hand = VR::TwoHand::GetTwoHandSettings().optimized_controls;
+    c.trigger_hold = VR::TwoHand::GetTwoHandSettings().trigger_hold;
     c.swings = s.gestures;
     c.melee_physical = m.physical;
     c.menu_hold_screen = s.menu_hold_screen;
@@ -41,12 +48,23 @@ Config CurrentConfig() {
     c.grip_adjust = b.body && b.grip_adjust;
     c.snap_turn_deg = s.snap_turn_deg;
     c.seated = s.seated;
+    // A gamepad play style with a gamepad connected (its type known at connect: UNKNOWN = none):
+    // the gamepad's page, and the VR controllers' as that style plays them (no grip adjust: the
+    // arms are the game's there).
+    if (VR::CurrentPlayStyle() != VR::PlayStyle::Style::Motion) {
+        c.grip_adjust = false;
+        const SDL_GamepadType type =
+            (*Common::Singleton<Input::GameControllers>::Instance())[0]->GamepadType();
+        c.gamepad = type != SDL_GAMEPAD_TYPE_UNKNOWN;
+        c.gamepad_xbox = Input::UsesXboxNames(type);
+        c.third_person = !VR::IsFirstPerson();
+    }
     return c;
 }
 
 std::string Describe(const Config& c, Family family, std::string_view profile, bool dpad) {
     return fmt::format("{} layout{}{}, inject={}, quick_arc={}, quick_arc_l3={}, belt_vial={}, "
-                       "melee={}{}{}; {} controllers ({}{})",
+                       "melee={}{}{}; {} controllers ({}{}){}",
                        c.layout.classic ? "classic" : "motion",
                        c.layout.classic ? "" : fmt::format(", left_scheme={}", c.layout.left_scheme),
                        c.layout.swap ? ", move with the right stick" : "", c.layout.inject ? 1 : 0,
@@ -55,7 +73,11 @@ std::string Describe(const Config& c, Family family, std::string_view profile, b
                        c.right_grip_draw ? ", right_grip=draw" : "",
                        c.layout.y_menu ? ", Y = the menu (y_menu)" : "", FamilyName(family),
                        profile.empty() ? std::string_view{"no profile bound yet"} : profile,
-                       dpad ? ", trackpad d-pad" : "");
+                       dpad ? ", trackpad d-pad" : "",
+                       c.gamepad ? fmt::format("; a gamepad ({} names, {} person)",
+                                               c.gamepad_xbox ? "Xbox" : "PlayStation",
+                                               c.third_person ? "third" : "first")
+                                 : std::string{});
 }
 
 } // namespace VR::ControlsView

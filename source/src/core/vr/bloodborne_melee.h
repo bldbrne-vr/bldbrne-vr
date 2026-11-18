@@ -8,11 +8,16 @@
 
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include "common/types.h"
 #include "core/vr/anim_classes.h"
 #include "core/vr/body_frame.h"
+#include "core/vr/visceral_clearance.h"
+#include "core/vr/weapon_fit.h"
 
 namespace VR::Bow { struct NativeGeometry; }
+namespace VR::Solid { struct Shape; }
 
 // Bloodborne (v1.09 eboot): physical melee, the swing IS the attack (vr.ini melee=physical;
 // core/vr/melee_window.h has the pure logic).
@@ -55,6 +60,33 @@ void InstallMelee(VAddr base, u64 size);
 
 // True when physical melee is installed and on (the final-damage detour must be in for it).
 [[nodiscard]] bool MeleePhysicalWanted();
+
+// Game loop only: a small physical item against live enemy hurtboxes. No pointer escapes.
+// Called only during a deliberate Shaman Bone Blade stroke, never at idle.
+bool ItemBladeContact(Body::Vec3 a0, Body::Vec3 b0, Body::Vec3 a1, Body::Vec3 b1,
+                      float scale, Body::Vec3& contact, u32& target);
+// Recheck only the original native handle; reused/deleted actors and unavailable map casts deny.
+bool ItemBladeContactStillValid(u32 target, Body::Vec3 base, Body::Vec3 point, float scale);
+// Game loop only: a thrown item (a sphere of `radius`, world units, from `from` to `to`: one step
+// of its flight; `from` == `to`: held still, a touch) against live enemy hurtboxes, the hunter
+// never. True: the first it touches, `fraction` of the way, `away` from that enemy toward the item
+// (flat, not normalized) and its handle in `target`.
+bool ItemSphereEnemyHit(Body::Vec3 from, Body::Vec3 to, float radius, float scale, float& fraction,
+                        Body::Vec3& away, u32* target = nullptr);
+// The same, for many tests against one place (a thrown item's whole flight): live enemies'
+// hurtbox capsules read once (Game loop only), their roots within `reach` (+6 m for a tall one's
+// upper body) of `centre`, nearest first, at most Max; then pure tests against that store. Fixed
+// storage (keep it static: 16 KB), no pointer escapes.
+struct EnemyCapsules {
+    static constexpr size_t Max = 512;
+    std::array<GrabCamera::CollisionCapsule, Max> capsules{};
+    std::array<u32, Max> handle{};
+    size_t count{0};
+};
+size_t GatherEnemyCapsules(Body::Vec3 centre, float reach, float scale, EnemyCapsules& out);
+bool SphereHitsCapsules(Body::Vec3 from, Body::Vec3 to, float radius, float scale,
+                        const EnemyCapsules& caps, float& fraction, Body::Vec3& away,
+                        u32* target = nullptr);
 
 // What the body knows about the right arm this update (core/vr/bloodborne_body.cpp).
 struct MeleeBody {
@@ -112,16 +144,34 @@ struct MeleeHitInfo {
     u32 serial{0};          // its window
     const char* kind{""};   // "light", "heavy", "charged" ...
     bool transform{false};  // a flick's transform attack
+    bool charged{false};    // a charged attack (the trigger held to full; not a transform's, nor
+                            // one the classifier judged light)
+    bool heavy{false};        // its row a heavy or a charged one (whatever the verdict) ...
+    bool judged_light{false}; // ... a wind-up the classifier judged light: the light's damage
     float tip_speed{0.0f};  // the presenter's tip speed for that window (m/s; 0 unknown)
+    float tip_peak{0.0f};   // ... its peak while the window was open (m/s; 0 unknown)
+    float arc_deg{0.0f};    // how far its stroke swept the blade (the swing classifier's; 0 unknown)
     bool blade{false};      // the blade below is known (two pose ticks within 0.1 s)
     VR::Body::Vec3 base{}, tip{};
     VR::Body::Vec3 base_vel{}, tip_vel{};
     s64 blade_ns{0}; // steady clock of the pose tick
+    // The left hand's (MeleeLeftHitInfoOf): the right weapon's left part (the transformed Beast
+    // Claw's left claw), a light swing with no blade above.
+    bool left{false};
 };
 
 // The final-damage detour (DamageStep): what MeleeDamage matched for this hit; false when the hit
 // is not a physical swing's (the blade may still be filled in for any right-hand hit).
 bool MeleeHitInfoOf(u8* res, MeleeHitInfo& out);
+
+// The final-damage detour: a hit by the right weapon's own left part (melee_left: the transformed
+// Beast Claw's left claw, a split blade's second blade), its swing's tip speeds and sweep from the
+// left hand's window; false for any other hit (a left-hand weapon's, a gun punch's).
+bool MeleeLeftHitInfoOf(u8* res, MeleeHitInfo& out);
+
+// The final-damage detour, after the hit: the drawn blade stays in the flesh at least this long
+// (its bite hold; a Beast Claw's cut holds a beat longer than a hit: core/vr/sever_feel.h Hitstop).
+void MeleeBiteAtLeast(float seconds);
 
 // SolveBody (loop thread): the blade's bite on the right arm's target, model space (melee_bite;
 // none without a recent hit).
@@ -139,7 +189,18 @@ bool MeleeBladeSegment(u8* chr, VR::Body::Vec3& base, VR::Body::Vec3& tip, const
 // bow). Game:Main (the body's pose copy, the same thread).
 bool MeleeBladeReach(float& base, float& tip);
 
+// weapon_wall_shape (bloodborne_weapon_shape.h): fitted capsules in the requested hand's grip
+// frame (dummy 300 or 340, game units) for the weapon, form and parts held now, what the other
+// weapon meets (bloodborne_body.cpp SolidWeapons); false while
+// none is fitted (the line above then: the whips, the first seconds of a new weapon or form, the
+// setting off). Any thread.
+bool MeleeFittedShape(VR::WeaponFit::Fit& out, bool left = false);
+
 s32 MeleePartLine(int hand, VR::Body::Vec3& base, VR::Body::Vec3& tip, bool& seen);
+
+// Game:Main, owned left hand only: current transformed Beast Claw finger pose,
+// in dummy 340's frame. Fixed storage; false keeps the existing single line.
+bool MeleeLeftClawShape(u8* chr, float scale, VR::Solid::Shape& out);
 
 // Current native bow/arrow animation roots, for weapon-only nock placement.
 // Requires the bow skeleton; the arrow skeleton only while an arrow is present.
@@ -154,5 +215,9 @@ void MeleeBowPartPose(u8* node);
 // quick_use_wipe's measurement: the light move's blade trail dummies (`id_a`, `id_b`: the game's
 // swing trail is drawn between them, along the blade you see), world; false when not known.
 bool MeleeBladeTrail(u8* chr, VR::Body::Vec3& a, VR::Body::Vec3& b, s32& id_a, s32& id_b);
+
+// VR_VISCERAL_TEST (tests): the enemy it put in front of the hunter, or nullptr. The gun's parry
+// probe (VR_GUN_PARRY_PROBE) follows it, so a real stagger opens the visceral.
+u8* VisceralTestTarget();
 
 } // namespace VR::Bloodborne

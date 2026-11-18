@@ -67,6 +67,16 @@ inline bool IsTracked(const TrackedHand& h) {
            IsFinite(h.q) && Dot(h.q, h.q) > 0.5f;
 }
 
+// The bare hands' fingers (core/vr/hand_rig.h; the presenter's ApplyFingerRig): in unarmed mode
+// a hand's thumb, index finger and other three follow its controller (0 open .. 1 closed), blended
+// over the game's own fingers by `weight` (0: the game's own).
+struct FingerCurl {
+    float weight{0.0f};
+    float thumb{0.0f};
+    float index{0.0f};
+    float grip{0.0f};
+};
+
 // Published once per XR frame (seqlock, core/vr/body_channel.h).
 struct HandsSample {
     std::uint64_t seq{0};      // publications so far (1 = the first)
@@ -82,10 +92,17 @@ struct HandsSample {
     // The two-handed grip's weight (the presenter's ApplyTwoHand): the left hand on the right
     // weapon's handle (0: on its controller).
     float two_hand{0.0f};
+    bool suppress_self_clash{false}; // attached optimized support, even before visual blend begins
     // ... and the weapon's offset in the hunter's right fist (the right hand slid along it while
     // two-handed, core/vr/two_hand_grip.h SupportGrip::WeaponShift): in the right weapon bone's
     // own frame, game units; zero: the game's own grip point.
     Vec3 two_hand_weapon_shift{};
+    // Slide mode (B) on a seated two-handed grip: the weapon's weight mostly steps aside while
+    // the hands are adjusted (core/vr/weapon_weight.h Input::sliding).
+    bool two_hand_slide{false};
+    // The left hand's lead on a seated two-handed grip (SupportGrip::LeftLeadWeight, 0..1): the
+    // weapon's weight turns it about the leading fist (core/vr/weapon_weight.h CarrySupport).
+    float two_hand_left_lead{0.0f};
     std::int8_t bow_hand{-1}; // native Bowblade, -1 when gameplay does not own it
     bool bow_arrow{false};
     bool bow_nocked{false};
@@ -94,6 +111,7 @@ struct HandsSample {
     float music_box_weight{0.0f};
     Vec3 music_box_contact{};
     Quat music_box_frame{};
+    std::array<FingerCurl, 2> fingers{}; // C0000::Left = 0, C0000::Right = 1
 };
 
 // ---- Anchor (render-camera hook -> next frame's pose hook) --------------------------------------

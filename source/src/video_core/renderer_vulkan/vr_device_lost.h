@@ -21,6 +21,7 @@
 
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vk_gpu_crash.h"
 
 namespace Vulkan::VrDeviceLost {
 
@@ -36,6 +37,7 @@ inline bool Note(vk::Result result, std::string_view where) {
     if (result != vk::Result::eErrorDeviceLost) {
         return false;
     }
+    GpuCrash::Report(result, where); // gpu-crash.txt (once per process)
     if (!lost.exchange(true, std::memory_order_relaxed)) {
         LOG_CRITICAL(Render_Vulkan,
                      "VR: the GPU device was lost ({}: VK_ERROR_DEVICE_LOST, a driver reset or "

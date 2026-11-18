@@ -71,6 +71,24 @@ inline Jitter Halton(std::uint32_t index, std::uint32_t phases = 8) {
     return {RadicalInverse(i, 2) - 0.5f, RadicalInverse(i, 3) - 0.5f};
 }
 
+// An upscaler's jitter cycle (DLSS and FSR guides: 8 x (output / input)^2 phases, so every output
+// pixel is covered by input samples within one cycle): 8 at native size, 18 at Quality (2/3), 32
+// at Performance (1/2), 50 at Ultra Performance (0.4); 8..64.
+inline std::uint32_t UpscalerPhases(float ratio) {
+    if (!(ratio > 0.0f) || ratio >= 1.0f) {
+        return 8u;
+    }
+    const float phases = std::ceil(8.0f / (ratio * ratio) - 1e-3f);
+    return static_cast<std::uint32_t>(std::clamp(phases, 8.0f, 64.0f));
+}
+
+// Phase `index` of an UpscalerPhases cycle, centred: -0.5 .. 0.5 px (Halton 2, 3, 1-based).
+inline Jitter UpscalerHalton(std::uint32_t index, std::uint32_t phases) {
+    phases = std::clamp<std::uint32_t>(phases, 8u, 64u);
+    const std::uint32_t i = (index % phases) + 1;
+    return {RadicalInverse(i, 2) - 0.5f, RadicalInverse(i, 3) - 0.5f};
+}
+
 // The NDC offset of a pixel jitter on a W x H render (NDC spans 2 over the render).
 inline Jitter JitterNdc(Jitter px, float width, float height) {
     if (!(width > 0.0f) || !(height > 0.0f)) {

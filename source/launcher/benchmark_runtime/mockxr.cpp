@@ -14,6 +14,9 @@
 // MOCKXR_QUEST_FOV=1: report Quest 3's per-eye FOV (left eye L-54/R+40/U+44/D-55 degrees,
 // right eye mirrored) with fovMutable = false, like Meta Link. Every projection layer is then
 // checked against it: a submitted FOV that differs from the located one is logged as an error.
+// MOCKXR_CANT_DEG=<deg>: a canted display (Pimax): each eye's view turned <deg> outward about the
+// head's up axis (left eye to the left), its FOV located around that turned axis; the dumps'
+// `disp q` is then each eye's own display orientation (the compositor simulation's).
 // Eye dumps contain only the submitted imageRect of each view.
 //
 // VR body test tooling (src/core/vr/body_presets.h, shared with the emulator's --vr-sim hands):
@@ -117,7 +120,7 @@
 // every event is logged (`MOCKXR input ...`). Hand tests: `lhand <seconds> dx dy dz` moves the left
 // grip (minimum jerk over <seconds>) to that offset (metres, LOCAL) from its scripted pose and keeps
 // it there until the next lhand (`lhand 0.3 0 0 0`: back), e.g. the palm onto a quick-item card,
-// then `grip_left`. A line `@<offset> <action> ...` starts that event <offset> s after the previous
+// then `grip_left`; `rhand` the same for the right grip. A line `@<offset> <action> ...` starts that event <offset> s after the previous
 // event's start, alongside it (e.g. `grip_left 1.0` then `@0.7 lhand 0.4 0.05 0.3 -0.45`: a swing
 // let go of mid-way, a throw). Throw tests: `lthrow_over <seconds> <speed> <yaw> <pitch>` and
 // `lthrow_push ...` script a whole left-hand throw on their own (the grip squeezed from the start,
@@ -221,6 +224,8 @@
 // later than due (the application missed a refresh: its predictedDisplayTime is two periods after
 // the last). MOCKXR_THROTTLE=<k>: every xrWaitFrame waits k periods (a runtime running the
 // application at refresh / k, like ASW) while still reporting the display's period. Logged once.
+// MOCKXR_REPORT_THROTTLE=<n>: every n-th xrWaitFrame reports twice the display's period (a
+// runtime that reports its throttling there, as the real ones do), the display's otherwise.
 // MOCKXR_UNFOCUS=<t>+<dur>[,...]: on the script clock (MOCKXR_BUTTONS'), the session goes to
 // VISIBLE at <t> s (input focus lost: the Quest dashboard, the headset taken off) and back to
 // FOCUSED <dur> s later; logged (`MOCKXR focus ...`). Held MOCKXR_BUTTONS stay held through it.
@@ -692,6 +697,17 @@ bool QuestFov() {
     return quest;
 }
 
+// MOCKXR_CANT_DEG: each eye's turn from the head (identity without it).
+XrQuaternionf EyeCant(uint32_t eye) {
+    static const float half = [] {
+        const char* v = std::getenv("MOCKXR_CANT_DEG");
+        const float deg = v != nullptr ? static_cast<float>(std::atof(v)) : 0.0f;
+        return 0.5f * std::clamp(deg, -30.0f, 30.0f) * 3.14159265f / 180.0f;
+    }();
+    const float a = eye == 0 ? half : -half; // outward: the left eye turns left (+ about up)
+    return {0.0f, std::sin(a), 0.0f, std::cos(a)};
+}
+
 // The FOV xrLocateViews reports for `eye` (0 = left).
 XrFovf LocatedFov(uint32_t eye) {
     constexpr float D = 3.14159265f / 180.0f;
@@ -775,6 +791,7 @@ const std::array<float, 3>& HandShift() {
 
 bool ScriptedHandUnshifted(int side, int64_t time, BP::HandPose& out);
 void LiveLeftOffset(int64_t time, float out[3]); // input.txt `lhand` (below)
+void LiveRightOffset(int64_t time, float out[3]); // input.txt `rhand` (below)
 void LiveThrowPose(int64_t time, BP::HandPose& pose); // input.txt `lthrow_*` (below)
 void LiveAimPose(int64_t time, BP::HandPose& pose);   // input.txt `laim` (below)
 void LiveRightPose(int64_t time, BP::HandPose& pose); // input.txt `rswing_*` (below)
@@ -901,9 +918,10 @@ bool ScriptedHandUnshifted(int side, int64_t time, BP::HandPose& out) {
         return true;
     }
     out = BP::Evaluate(*point.preset, side, point.t);
-    if (side == 0) {
+    {
         float live[3];
-        LiveLeftOffset(time, live); // at the pose's own time: the velocities see the move
+        // at the pose's own time: the velocities see the move
+        (side == 0 ? LiveLeftOffset : LiveRightOffset)(time, live);
         for (int i = 0; i < 3; ++i) {
             out.p[i] += live[i];
         }
@@ -1372,7 +1390,8 @@ void CheckProjectionView(uint32_t v, const XrCompositionLayerProjectionView& vie
 
 // ---- API implementation ------------------------------------------------------------
 // The extensions offered: the base list (MOCKXR_NO_LAYER_EXT / MOCKXR_NO_DEPTH shorten it), then
-// MOCKXR_EXTS's (other runtimes' controller extensions).
+// MOCKXR_EXTS's (other runtimes' controller extensions). MOCKXR_NO_REFRESH_EXT=1: without
+// XR_FB_display_refresh_rate (a runtime that never says its refresh rate, as SteamVR).
 const std::vector<std::string>& OfferedExtensions() {
     static const std::vector<std::string> offered = [] {
         static const char* exts[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
@@ -1384,6 +1403,10 @@ const std::vector<std::string>& OfferedExtensions() {
                               : std::getenv("MOCKXR_NO_DEPTH")   ? 4u
                                                                  : 5u;
         std::vector<std::string> list(exts, exts + base);
+        if (std::getenv("MOCKXR_NO_REFRESH_EXT") != nullptr) {
+            std::erase(list, std::string{XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME});
+            Log("MOCKXR_NO_REFRESH_EXT: XR_FB_display_refresh_rate not offered");
+        }
         if (const char* extra = std::getenv("MOCKXR_EXTS"); extra != nullptr && *extra != '\0') {
             std::string all = extra;
             size_t at = 0;
@@ -2175,7 +2198,17 @@ XrResult XRAPI_CALL WaitFrame(XrSession, const XrFrameWaitInfo*, XrFrameState* s
         g_session->next_frame = now;
     }
     state->predictedDisplayTime = g_session->next_frame + 2 * period;
-    state->predictedDisplayPeriod = period;
+    static const int report_throttle = [] {
+        const char* v = std::getenv("MOCKXR_REPORT_THROTTLE");
+        const int n = v != nullptr ? std::max(std::atoi(v), 0) : 0;
+        if (n > 0) {
+            Log("MOCKXR wait: every %d-th frame reports twice the display period", n);
+        }
+        return n;
+    }();
+    state->predictedDisplayPeriod =
+        report_throttle > 0 && waits % static_cast<uint64_t>(report_throttle) == 0 ? 2 * period
+                                                                                   : period;
     g_display_time.store(state->predictedDisplayTime);
     state->shouldRender = XR_TRUE;
     return XR_SUCCESS;
@@ -2917,17 +2950,17 @@ struct InputEvent {
 };
 std::mutex g_input_mutex;
 std::vector<InputEvent> g_input;
-// input.txt `lhand`: the left grip's live offset, eased from `from` to `to` over [t0, t1].
+// input.txt `lhand` / `rhand`: a grip's live offset, eased from `from` to `to` over [t0, t1].
 struct LiveLeft {
     double t0{0.0};
     double t1{0.0};
     float from[3]{};
     float to[3]{};
 };
-LiveLeft g_live_left; // under g_input_mutex
+LiveLeft g_live_left;  // under g_input_mutex
+LiveLeft g_live_right; // under g_input_mutex
 
-void LiveLeftAt(double t, float out[3]) {
-    const LiveLeft& l = g_live_left;
+void LiveHandAt(const LiveLeft& l, double t, float out[3]) {
     const float k = t >= l.t1 ? 1.0f
                     : t <= l.t0
                         ? 0.0f
@@ -2937,9 +2970,18 @@ void LiveLeftAt(double t, float out[3]) {
     }
 }
 
+void LiveLeftAt(double t, float out[3]) {
+    LiveHandAt(g_live_left, t, out);
+}
+
 void LiveLeftOffset(int64_t time, float out[3]) {
     std::lock_guard lk{g_input_mutex};
     LiveLeftAt(static_cast<double>(time) * 1e-9, out);
+}
+
+void LiveRightOffset(int64_t time, float out[3]) {
+    std::lock_guard lk{g_input_mutex};
+    LiveHandAt(g_live_right, static_cast<double>(time) * 1e-9, out);
 }
 
 // input.txt `lthrow_over` / `lthrow_push` (see the top): the plan of one scripted throw.
@@ -3602,6 +3644,7 @@ void ApplyHeadEvents() {
     for (auto& e : g_input) {
         if (e.applied || t < e.start ||
             (e.action != "drift" && e.action != "recenter" && e.action != "lhand" &&
+             e.action != "rhand" &&
              e.action != "recenter_pose" && e.action != "laim" && e.action != "lean" &&
              e.action != "look" && e.action != "head_y")) {
             continue;
@@ -3666,19 +3709,21 @@ void ApplyHeadEvents() {
                 a.to_p[1], a.to_p[2], a.to_q[0], a.to_q[1], a.to_q[2], a.to_q[3], e.end - e.start);
             continue;
         }
-        if (e.action == "lhand") {
+        if (e.action == "lhand" || e.action == "rhand") {
+            const bool left = e.action == "lhand";
+            LiveLeft& live = left ? g_live_left : g_live_right;
             float now[3];
-            LiveLeftAt(t, now);
+            LiveHandAt(live, t, now);
             for (int i = 0; i < 3; ++i) {
-                g_live_left.from[i] = now[i];
+                live.from[i] = now[i];
             }
-            g_live_left.to[0] = e.x;
-            g_live_left.to[1] = e.y;
-            g_live_left.to[2] = e.z;
-            g_live_left.t0 = e.start;
-            g_live_left.t1 = e.end;
-            Log("MOCKXR input lhand: left grip to (%.3f, %.3f, %.3f) over %.2f s", e.x, e.y, e.z,
-                e.end - e.start);
+            live.to[0] = e.x;
+            live.to[1] = e.y;
+            live.to[2] = e.z;
+            live.t0 = e.start;
+            live.t1 = e.end;
+            Log("MOCKXR input %s: %s grip to (%.3f, %.3f, %.3f) over %.2f s", e.action.c_str(),
+                left ? "left" : "right", e.x, e.y, e.z, e.end - e.start);
             continue;
         }
         if (e.action == "recenter_pose") {
@@ -3995,6 +4040,7 @@ void DumpOverlay(const XrCompositionLayerProjection& p, int64_t display_time,
         const auto& rect = p.views[v].subImage.imageRect;
         XrPosef display{};
         HeadPose(display_time, display);
+        display.orientation = Multiply(display.orientation, EyeCant(v)); // the eye's display
         const XrFovf located = LocatedFov(v);
         Log("%s eye %u pose q(%.5f %.5f %.5f %.5f) p(%.4f %.4f %.4f) fov l%.3f r%.3f u%.3f d%.3f "
             "rect %d,%d %dx%d disp q(%.5f %.5f %.5f %.5f) located l%.3f r%.3f u%.3f d%.3f",
@@ -4611,6 +4657,7 @@ XrResult EndFrameInWorld(const XrFrameEndInfo* info) {
                     // time and the eye's located FOV (for the stereo/compositor simulation).
                     XrPosef display{};
                     HeadPose(info->displayTime, display);
+                    display.orientation = Multiply(display.orientation, EyeCant(v));
                     const XrFovf located = LocatedFov(v);
                     Log("dump %d eye %u pose q(%.5f %.5f %.5f %.5f) p(%.4f %.4f %.4f) fov l%.3f "
                         "r%.3f u%.3f d%.3f rect %d,%d %dx%d disp q(%.5f %.5f %.5f %.5f) "
@@ -4708,7 +4755,7 @@ XrResult XRAPI_CALL LocateViews(XrSession, const XrViewLocateInfo* info, XrViewS
     for (uint32_t i = 0; i < cap && i < 2; ++i) {
         const float offset = i == 0 ? -0.032f : 0.032f;
         const XrVector3f d = Rotate(head.orientation, {offset, 0, 0});
-        views[i].pose = {head.orientation,
+        views[i].pose = {Multiply(head.orientation, EyeCant(i)),
                          {head.position.x + d.x, head.position.y + d.y, head.position.z + d.z}};
         views[i].fov = LocatedFov(i);
     }

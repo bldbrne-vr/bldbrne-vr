@@ -11,6 +11,20 @@
 
 #include <xxhash.h>
 #include "shader_recompiler/ir/passes/billboard_face_eye.h"
+#include "shader_recompiler/ir/passes/light_shadow.h"
+#include "shader_recompiler/ir/passes/ambient_occlusion.h"
+#include "shader_recompiler/ir/passes/moon_shadow.h"
+#include "shader_recompiler/ir/passes/reflections.h"
+#include "shader_recompiler/ir/passes/bounce_light.h"
+#include "shader_recompiler/ir/passes/fog_light.h"
+#include "shader_recompiler/ir/passes/cinematic_look.h"
+#include "shader_recompiler/ir/passes/parallax.h"
+#include "shader_recompiler/ir/passes/particle_air.h"
+#include "shader_recompiler/ir/passes/moon_shafts.h"
+#include "shader_recompiler/ir/passes/air_light.h"
+#include "shader_recompiler/ir/passes/fog_grid.h"
+#include "shader_recompiler/ir/passes/specular_aa.h"
+#include "shader_recompiler/ir/passes/wet_blood.h"
 
 #include "video_core/native_stereo/native_stereo.h"
 #include "common/hash.h"
@@ -21,9 +35,12 @@
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "video_core/cache_storage.h"
+#include "video_core/startup_compile.h"
 #include "video_core/pipeline_cache_policy.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_shader_record.h"
+#include "shader_recompiler/eye_spec.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Serialization {
@@ -58,8 +75,15 @@ static u32 ShaderBinaryVersionOf(const Shader::RuntimeInfo& runtime_info) {
     // The geometry stage runs the vertex epilogue before every EmitVertex.
     const bool epilogue = runtime_info.stage == Shader::Stage::Vertex ||
                           runtime_info.stage == Shader::Stage::Geometry;
+    // VR_EYE_SPEC (shader_recompiler/eye_spec.h): a native stereo graphics module made with the
+    // eye-spec markers is another binary; a session with the switch neither loads one made
+    // without them (correct, but no variant could share anything) nor the other way round.
+    const bool eye_spec = Shader::EyeSpec::Enabled() && runtime_info.native_stereo &&
+                          runtime_info.stage != Shader::Stage::Compute;
+    // VR_EXP_EYE_INDEX / VR_EXP_CULL: every module of such a session is kept apart.
     return ShaderBinaryVersion(
-        ScopeOf(epilogue, fragment, fragment ? runtime_info.fs_info.vr_cut : 0u));
+               ScopeOf(epilogue, fragment, fragment ? runtime_info.fs_info.vr_cut : 0u)) ^
+           (eye_spec ? 0x8000'0000u : 0u) ^ Shader::EyeSpec::ExperimentWord();
 }
 
 // A permutation index past this is a corrupted meta (a program has a handful of permutations).
@@ -146,8 +170,14 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
     key.Serialize(ar);
     sdata.Serialize(ar);
 
-    Storage::DataBase::Instance().Save(Storage::BlobType::PipelineKey,
-                                       fmt::format("g_{:#018x}", hash), ar.TakeOff());
+    const auto name = fmt::format("g_{:#018x}", hash);
+    const u8* end = ar.CurrPtr();
+    auto blob = ar.TakeOff(); // moved: the same storage
+    if (ShaderRecord::RecordOn()) [[unlikely]] {
+        // VR_SHADER_RECORD: the key's bytes (not the archive's spare capacity past them).
+        ShaderRecord::RecordKey(name, {blob.data(), static_cast<size_t>(end - blob.data())});
+    }
+    Storage::DataBase::Instance().Save(Storage::BlobType::PipelineKey, name, std::move(blob));
 }
 
 void RegisterShaderMeta(const Shader::Info& info,
@@ -382,6 +412,47 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
     return true;
 }
 
+bool PipelineCache::ReadGraphicsKeyBlob(std::vector<u8>&& blob, GraphicsPipelineKey& key,
+                                        GraphicsPipeline::SerializationSupport& sdata) {
+    Serialization::Archive ar{std::move(blob)};
+    Serialization::Reader pldata{ar};
+    u32 version{};
+    u32 is_compute{};
+    pldata.Read(version);
+    pldata.Read(is_compute);
+    // Either naming's key: their layouts are the same, and a list's stage hashes are only names
+    // the startup build maps to the player's permutations (a list is recorded with the ids).
+    if (ar.Failed() || is_compute != 0 ||
+        (version != Serialization::PipelineKeyVersion &&
+         version != Serialization::OtherNamingKeyVersion)) {
+        return false;
+    }
+    key.Deserialize(ar);
+    sdata.Deserialize(ar);
+    return !ar.Failed();
+}
+
+bool PipelineCache::LoadCachedPermutation(u64 perm_id, u32 stage) {
+    std::vector<u8> meta;
+    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
+                                       Serialization::BlobName(perm_id), meta);
+    if (meta.empty() || stage >= MaxShaderStages) {
+        return false;
+    }
+    Serialization::Archive ar{std::move(meta)};
+    load_other_mode = false;
+    load_motion_idle = false;
+    const bool loaded = LoadPipelineStage(ar, stage, perm_id);
+    // Nothing of a pipeline load stays behind.
+    selection.infos.fill(nullptr);
+    selection.modules.fill(nullptr);
+    selection.fetch_shader.reset();
+    load_reject = PipelineCachePolicy::Reject::None;
+    load_other_mode = false;
+    load_motion_idle = false;
+    return loaded;
+}
+
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     // The stages of a pipeline that did not load must never reach the next one (a pipeline
     // without a fragment program would get the previous one's).
@@ -389,6 +460,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
         selection.infos.fill(nullptr);
         selection.modules.fill(nullptr);
         load_runtime_infos = {};
+        load_starts = {};
         selection.fetch_shader.reset();
     };
     reset();
@@ -454,6 +526,36 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
         reset();
         return false;
     }
+    if (!BindingsLineUp(selection.infos, load_starts)) {
+        load_reject = Reject::Misaligned;
+        // Which one, a few a session: each stage's program, where its bindings start in the cache
+        // and where the stages before it end now (unified/buffer/user data), and its resources.
+        static u32 told = 0;
+        if (told < 8) {
+            ++told;
+            std::string stages;
+            Shader::Backend::Bindings at{};
+            for (size_t i = 0; i < selection.infos.size(); ++i) {
+                const Shader::Info* const info = selection.infos[i];
+                if (info == nullptr) {
+                    continue;
+                }
+                stages += fmt::format(
+                    "; stage {} {:#x} (cached {:#018x}): starts {}/{}/{}, the stages before end "
+                    "{}/{}/{}; {} buffers, {} images, {} samplers, {} user data",
+                    i, info->pgm_hash, selection.graphics_key.stage_hashes[i],
+                    load_starts[i].unified, load_starts[i].buffer, load_starts[i].user_data,
+                    at.unified, at.buffer, at.user_data, info->buffers.size(),
+                    info->images.size(), info->samplers.size(), info->ud_mask.NumRegs());
+                info->AddBindings(at);
+            }
+            LOG_WARNING(Render_Vulkan, "Cached pipeline not preloaded, its stages' bindings not "
+                                       "lined up{}",
+                        stages);
+        }
+        reset();
+        return false;
+    }
 
     const auto [it, is_new] = graphics_pipelines.try_emplace(selection.graphics_key);
 
@@ -502,6 +604,40 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
         }
         return false;
     }
+    // The light composite declares the lights in the air's buffer in every permutation since
+    // 2026-11-09 (BouncePass): one written before numbers its resources without it, and once this
+    // session compiles a permutation of the program (adding it to the program's one Info), such a
+    // module's descriptors would be bound one off. Stale, compiled again.
+    // The same since the moonlight in the air (moon_shafts.h): its buffer, the moon's shadow atlas
+    // (a host image) and the light-set table (a host buffer).
+    if (program->info.stage == Shader::Stage::Fragment &&
+        Shader::Optimization::BounceLight::IsCompositeProgram(program->info.pgm_hash) &&
+        (std::ranges::none_of(program->info.buffers, [](const Shader::BufferResource& buffer) {
+             return buffer.buffer_type == Shader::BufferType::VrFogLights;
+         }) ||
+         std::ranges::none_of(program->info.buffers, [](const Shader::BufferResource& buffer) {
+             return buffer.buffer_type == Shader::BufferType::VrMoonShafts;
+         }) ||
+         std::ranges::none_of(program->info.images, [](const Shader::ImageResource& image) {
+             return image.sharp_idx ==
+                    Shader::VrHostImageBase + static_cast<u32>(Shader::VrHostImage::MoonAtlas);
+         }) ||
+         std::ranges::none_of(program->info.buffers, [](const Shader::BufferResource& buffer) {
+             return buffer.IsVrHost();
+         }))) {
+        load_reject = Reject::StageStale;
+        return false;
+    }
+    // The soft particle programs declare lit smoke's buffer in every permutation since
+    // 2026-11-11 (ParticleAirPass): one written before numbers its resources without it.
+    if (program->info.stage == Shader::Stage::Fragment &&
+        Shader::Optimization::ParticleAir::IsParticleProgram(program->info.pgm_hash) &&
+        std::ranges::none_of(program->info.buffers, [](const Shader::BufferResource& buffer) {
+            return buffer.buffer_type == Shader::BufferType::VrParticleLights;
+        })) {
+        load_reject = Reject::StageStale;
+        return false;
+    }
 
     // Device addresses are never valid across executions: a motion permutation is cached only
     // with VrPushData, as its flag alone (the draw pushes the addresses).
@@ -517,6 +653,153 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
     if (spec.runtime_info.native_stereo != NativeStereo::Enabled() ||
         spec.runtime_info.billboard_face_eye != Shader::Optimization::BillboardFaceEye::Enabled(
             NativeStereo::Enabled(), VR::IsEnabled(), std::getenv("VR_BILLBOARD_FACE_EYE"))) {
+        load_other_mode = true;
+    }
+    // A light rectangle made with the other light-shadow rule (vr.ini light_shadows, and
+    // light_shadow_detail: Low or High).
+    if (spec.runtime_info.native_light_scissor &&
+        spec.runtime_info.vr_light_shadows != VrLightShadowLevel()) {
+        load_other_mode = true;
+    }
+    // A permutation of the game's AO pass made with ours, in a session without it; a mask-only one
+    // (ambient_occlusion.h MaskOnly) in a session that is not.
+    if (const u8 ao = spec.runtime_info.vr_ambient_occlusion; ao & Shader::RuntimeInfo::VrAmbientOcclusionBit) {
+        const bool upscaler = VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off;
+        const bool ours = Shader::Optimization::AmbientOcclusion::Enabled(
+            VR::IsEnabled(), VR::GetSettings().ambient_occlusion, upscaler,
+            std::getenv("VR_AMBIENT_OCCLUSION"));
+        const bool mask_only = Shader::Optimization::AmbientOcclusion::MaskOnly(
+            ours, VrLampShadowsOn(), Shader::Optimization::LightShadow::SceneMaps::Mask());
+        // ... and made with the lamp shadows' work or without it (RuntimeInfo::VrAoLampShadows),
+        // in a session that is the other way.
+        const bool lamps = Shader::Optimization::LightShadow::SceneMaps::Enabled() && VrLampShadowsOn();
+        if (((ao & Shader::RuntimeInfo::VrAoMaskOnly) ? !mask_only : !ours) ||
+            ((ao & Shader::RuntimeInfo::VrAoLampShadows) != 0) != lamps) {
+            load_other_mode = true;
+        }
+    }
+    // A permutation of the game's moon-shadow mask made with ours, in a session without it.
+    if ((spec.runtime_info.vr_ambient_occlusion & Shader::RuntimeInfo::VrMoonShadows) &&
+        !Shader::Optimization::MoonShadow::Enabled(
+            VR::IsEnabled(), VR::GetSettings().moon_shadows,
+            VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
+            std::getenv("VR_MOON_SHADOWS"))) {
+        load_other_mode = true;
+    }
+    // A permutation of the ambient composite with our specular occlusion, in a session without it.
+    if ((spec.runtime_info.vr_ambient_occlusion & Shader::RuntimeInfo::VrSpecularOcclusion) &&
+        !Shader::Optimization::AmbientOcclusion::SpecEnabled(
+            Shader::Optimization::AmbientOcclusion::Enabled(
+                VR::IsEnabled(), VR::GetSettings().ambient_occlusion,
+                VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
+                std::getenv("VR_AMBIENT_OCCLUSION")),
+            std::getenv("VR_SPEC_OCCLUSION"))) {
+        load_other_mode = true;
+    }
+    // (The two reflection checks below are for the reflection programs only. The game's AO
+    // programs carry VrAmbientOcclusionBit, which no reflection program has, and on them bit 16 is
+    // VrAoLampShadows and bit 8 VrAoMaskOnly. Until 2026-11-17 these checks read an AO permutation
+    // with the lamp shadows as a reflection one, so it was skipped here with wet streets off or
+    // with our AO off, and then built during play.)
+    const bool ao_program =
+        (spec.runtime_info.vr_ambient_occlusion & Shader::RuntimeInfo::VrAmbientOcclusionBit) != 0;
+    // A permutation of the game's reflections (trace or composite) made with ours, in a
+    // session without wet streets.
+    if (!ao_program &&
+        (spec.runtime_info.vr_ambient_occlusion &
+         (Shader::RuntimeInfo::VrReflections | Shader::RuntimeInfo::VrReflectionComposite)) &&
+        !Shader::Optimization::Reflections::Enabled(VR::IsEnabled(),
+                                                    VR::GetSettings().wet_streets,
+                                                    std::getenv("VR_REFLECTIONS_TRACE"))) {
+        load_other_mode = true;
+    }
+    // The composite made with or without blood on glossy floors (RuntimeInfo::VrBloodFloors), in
+    // a session that chose the other.
+    if (const u8 ao = spec.runtime_info.vr_ambient_occlusion;
+        !ao_program && (ao & Shader::RuntimeInfo::VrReflectionComposite) &&
+        ((ao & Shader::RuntimeInfo::VrBloodFloors) != 0) !=
+            Shader::Optimization::Reflections::BloodEnabled(VR::IsEnabled(),
+                                                            VR::GetSettings().wet_streets,
+                                                            std::getenv("VR_BLOOD_REFLECTION"))) {
+        load_other_mode = true;
+    }
+    // A permutation of the light composite made with our bounce or our lights in the air, in a
+    // session without it. (The composite's only: bit 1 is VrAirPass on the air pass's programs.
+    // Until 2026-11-17 this check took them for the composite, so with the bounce off they were
+    // skipped here and built during play.)
+    if (const u8 composite = spec.runtime_info.vr_composite_light;
+        Shader::Optimization::BounceLight::IsCompositeProgram(program->info.pgm_hash) &&
+        ((composite & Shader::RuntimeInfo::VrCompositeBounce) &&
+         !Shader::Optimization::BounceLight::Enabled(
+             VR::IsEnabled(), VR::GetSettings().bounce_light,
+             VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
+             std::getenv("VR_BOUNCE_LIGHT"))) ||
+        ((composite & Shader::RuntimeInfo::VrCompositeFog) &&
+         !Shader::Optimization::FogLight::Enabled(
+             VR::IsEnabled(), VR::GetSettings().fog_light,
+             VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
+             std::getenv("VR_FOG_LIGHT"))) ||
+        ((composite & Shader::RuntimeInfo::VrCompositeShafts) &&
+         !Shader::Optimization::MoonShafts::Enabled(
+             VR::IsEnabled(), VR::MoonGlowOn(VR::GetSettings()),
+             VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
+             std::getenv("VR_MOON_SHAFTS")))) {
+        load_other_mode = true;
+    }
+    // A light program or the ambient composite with our widened gloss, in a session without it.
+    if ((spec.runtime_info.vr_ambient_occlusion & Shader::RuntimeInfo::VrSpecularAa) &&
+        !Shader::Optimization::SpecularAa::Enabled(VR::IsEnabled(),
+                                                  VR::GetSettings().ambient_occlusion,
+                                                  std::getenv("VR_SPEC_AA"))) {
+        load_other_mode = true;
+    }
+    // A G-buffer program with our raised brickwork, in a session without it (or not the map's:
+    // parallax.h BumpGaps::MapPrograms).
+    if ((spec.runtime_info.vr_composite_light & Shader::RuntimeInfo::VrBumpGaps) &&
+        (!Shader::Optimization::BumpGaps::IsMapProgram(program->info.pgm_hash) ||
+         !Shader::Optimization::BumpGaps::Enabled(VR::IsEnabled(),
+                                                  VR::GetSettings().raised_bricks,
+                                                  std::getenv("VR_BUMP_GAPS")))) {
+        load_other_mode = true;
+    }
+    // A parallax program with our deeper stones, in a session without them. (A parallax
+    // program's only: bit 64 is VrFogGrid on the air pass's programs, which were skipped here
+    // until 2026-11-17 with the deeper stones off.)
+    if (Shader::Optimization::Parallax::IsParallaxProgram(program->info.pgm_hash) &&
+        (spec.runtime_info.vr_composite_light & Shader::RuntimeInfo::VrParallax) &&
+        !Shader::Optimization::Parallax::Enabled(VR::IsEnabled(),
+                                                 VR::GetSettings().ambient_occlusion,
+                                                 std::getenv("VR_PARALLAX"))) {
+        load_other_mode = true;
+    }
+    // The tone map with our eye adaptation, in a session without it.
+    if ((spec.runtime_info.vr_ambient_occlusion & Shader::RuntimeInfo::VrEyeAdaptation) &&
+        !Shader::Optimization::CinematicLook::AdaptEnabled(VR::IsEnabled(),
+                                                           VR::GetSettings().eye_adaptation,
+                                                           std::getenv("VR_EYE_ADAPT"))) {
+        load_other_mode = true;
+    }
+    // An air pass program made for the fog grid (fog_grid.h), in a session without it.
+    if ((spec.runtime_info.vr_composite_light & Shader::RuntimeInfo::VrFogGrid) &&
+        (Shader::Optimization::AirLight::IsComputeProgram(program->info.pgm_hash) ||
+         Shader::Optimization::AirLight::IsHalfProgram(program->info.pgm_hash) ||
+         Shader::Optimization::AirLight::IsApplyProgram(program->info.pgm_hash)) &&
+        !Shader::Optimization::FogGrid::Enabled()) {
+        load_other_mode = true;
+    }
+    // A soft particle program with our lit smoke, in a session without it.
+    if ((spec.runtime_info.vr_composite_light & Shader::RuntimeInfo::VrParticleAir) &&
+        !Shader::Optimization::ParticleAir::Enabled(
+            VR::IsEnabled(), VR::GetSettings().fog_light,
+            VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
+            std::getenv("VR_PARTICLE_AIR"))) {
+        load_other_mode = true;
+    }
+    // A _Bloody_ G-buffer program with our wet blood, in a session without it.
+    if ((spec.runtime_info.vr_composite_light & Shader::RuntimeInfo::VrWetBlood) &&
+        !Shader::Optimization::WetBlood::Enabled(VR::IsEnabled(),
+                                                VR::GetSettings().ambient_occlusion,
+                                                std::getenv("VR_WET_BLOOD"))) {
         load_other_mode = true;
     }
     // Object motion runs only with an upscaler (VrObjectMotion::Begin). A session started without
@@ -547,6 +830,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
     vk::ShaderModule module{};
 
     const u64 vertex_output_locations = program->info.vertex_output_locations;
+    std::shared_ptr<Shader::Info> own;
     std::unique_lock program_lock(programs_mutex);
     auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
     if (new_program) {
@@ -579,14 +863,22 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
         } else {
             module = CompileSPV(spv, instance.GetDevice());
         }
+        // Its meta's resources (since meta 22 / 21 its own translation's): its own Info when they
+        // are not the program's (Program::Module::info).
+        if (module && !(perm_idx < modules.size() && modules[perm_idx].module == module)) {
+            own = OwnResources(std::move(program->info), it_pgm.value()->info, perm_idx);
+        } else if (perm_idx < modules.size()) {
+            own = modules[perm_idx].info;
+        }
     }
     ++programs_generation;
     // Like a compile's selection: the pipeline is created with its stages' own runtime infos.
     load_runtime_infos[stage] = spec.runtime_info;
+    load_starts[stage] = spec.start;
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx, expected_id,
-                                vertex_output_locations);
+                                vertex_output_locations, own);
 
-    selection.infos[stage] = &it_pgm.value()->info;
+    selection.infos[stage] = own ? own.get() : &it_pgm.value()->info;
     selection.modules[stage] = module;
     // Like the draw path: only a stage that has a fetch shader sets it (a geometry stage after
     // the export stage must not clear the vertex fetch).
@@ -681,6 +973,8 @@ void PipelineCache::WarmUp() {
     }
 
     using namespace PipelineCachePolicy;
+    namespace Startup = VideoCore::StartupCompile;
+    Startup::Begin("Reading existing shader cache", 0);
     u32 num_pipelines{};
     u32 num_total_pipelines{};
     std::array<u32, static_cast<size_t>(Reject::Count)> rejects{};
@@ -692,6 +986,7 @@ void PipelineCache::WarmUp() {
     db.ForEachBlob(Storage::BlobType::PipelineKey,
                    [&](const std::string& name, std::vector<u8>&& data) {
                        ++num_total_pipelines;
+                       Startup::Update(num_total_pipelines);
 
                        Serialization::Archive ar{std::move(data)};
                        Serialization::Reader pldata{ar};
@@ -756,44 +1051,49 @@ void PipelineCache::WarmUp() {
     // worker threads. The pipelines only read their programs (loaded above, not changed again
     // here) and create Vulkan objects; the warm-up waits for all of them before it returns, so
     // nothing else runs meanwhile.
-    const u32 hw = std::max(1u, std::thread::hardware_concurrency());
-    const u32 num_workers = std::clamp<u32>(hw > 2 ? hw - 2 : 1, 1u, 8u);
-    {
-        std::atomic<size_t> next{0};
-        const auto work = [&] {
-            // Bit 40: a pipeline the driver rejects is left without a handle, pruned below.
-            g_tolerate_pipeline_rejection = async_bit;
-            for (size_t i = next++; i < jobs.size(); i = next++) {
-                auto& job = jobs[i];
-                if (job.is_compute) {
-                    job.compute = std::make_unique<ComputePipeline>(
-                        instance, scheduler, desc_heap, profile, *pipeline_cache, job.compute_key,
-                        *job.infos[0], job.modules[0], job.compute_sdata, true);
-                } else {
-                    job.graphics = std::make_unique<GraphicsPipeline>(
-                        instance, scheduler, desc_heap, profile, job.graphics_key, *pipeline_cache,
-                        job.infos, job.runtime_infos, job.fetch_shader, job.modules,
-                        job.graphics_sdata, true);
+    const u32 num_workers = Startup::Workers();
+    Startup::Begin("Preparing cached pipelines", jobs.size());
+    Startup::RunBatches(jobs.size(), [&](size_t i) {
+        // Bit 40: a pipeline the driver rejects is left without a handle, pruned below.
+        g_tolerate_pipeline_rejection = async_bit;
+        auto& job = jobs[i];
+        if (job.is_compute) {
+            job.compute = std::make_unique<ComputePipeline>(
+                instance, scheduler, desc_heap, profile, *pipeline_cache, job.compute_key,
+                *job.infos[0], job.modules[0], job.compute_sdata, true);
+        } else {
+            job.graphics = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, profile, job.graphics_key, *pipeline_cache,
+                job.infos, job.runtime_infos, job.fetch_shader, job.modules, job.graphics_sdata,
+                true);
+        }
+        g_tolerate_pipeline_rejection = false;
+    }); // joined between batches, with a short rest
+    // A rejected key can be rebuilt. A surviving pipeline still borrows its stages' metadata
+    // and may use their modules again for eye variants. Protect those stages before deleting
+    // either their files or their in-memory handles, independent of job order.
+    const auto driver_rejected = [](const PreloadJob& job) {
+        return job.is_compute ? !job.compute->Handle() : !job.graphics->Handle();
+    };
+    std::vector<VkShaderModule> kept_modules;
+    if (async_bit && std::ranges::any_of(jobs, driver_rejected)) {
+        for (const auto& job : jobs) {
+            if (!driver_rejected(job)) {
+                for (const auto module : job.modules) {
+                    if (module) {
+                        kept_modules.push_back(static_cast<VkShaderModule>(module));
+                    }
                 }
             }
-            g_tolerate_pipeline_rejection = false;
-        };
-        std::vector<std::jthread> workers{};
-        for (u32 w = 1; w < num_workers && w < jobs.size(); ++w) {
-            workers.emplace_back(work);
         }
-        work(); // this thread too
-    } // joined
-    // Bit 40: a pipeline the driver rejected (bbport throws CorruptData and rebuilds its whole
-    // cache, BBV vk_graphics_pipeline.cpp:424-431, vk_pipeline_serialization.cpp:382-446) is
-    // pruned instead: its key and its stages' meta and SPIR-V are deleted, its placeholder is
-    // removed, and the cached modules it was built from are dropped for this session (GetProgram
-    // compiles such a permutation again at its own index), so no draw can reach them.
+        std::ranges::sort(kept_modules);
+    }
     std::vector<std::pair<Storage::BlobType, std::string>> pruned{};
     std::vector<vk::ShaderModule> rejected_modules{};
     u32 rejected_graphics{}, rejected_compute{};
     const auto prune_stage = [&](const Shader::Info* info, vk::ShaderModule module, u64 perm_id) {
-        if (!info || !module) {
+        if (!info || !module ||
+            std::ranges::binary_search(kept_modules, static_cast<VkShaderModule>(module))) {
             return;
         }
         // The meta is named by the key's stage hash; with FAST_CPU_PERM_IDS so is the binary,
@@ -816,8 +1116,9 @@ void PipelineCache::WarmUp() {
         }
     };
     for (auto& job : jobs) {
+        const bool rejected = async_bit && driver_rejected(job);
         if (job.is_compute) {
-            if (async_bit && job.compute && !job.compute->Handle()) {
+            if (rejected) {
                 ++rejected_compute;
                 compute_pipelines.erase(job.compute_key);
                 pruned.emplace_back(Storage::BlobType::PipelineKey,
@@ -827,7 +1128,7 @@ void PipelineCache::WarmUp() {
             }
             compute_pipelines.find(job.compute_key).value() = std::move(job.compute);
         } else {
-            if (async_bit && job.graphics && !job.graphics->Handle()) {
+            if (rejected) {
                 ++rejected_graphics;
                 graphics_pipelines.erase(job.graphics_key);
                 const u64 hash = std::hash<GraphicsPipelineKey>{}(job.graphics_key);
@@ -846,8 +1147,9 @@ void PipelineCache::WarmUp() {
         }
     }
     if (rejected_graphics + rejected_compute != 0) {
-        // Nothing has selected a program yet: no draw, memo or worker holds these modules.
+        // Only stages exclusive to rejected jobs remain.
         u32 dropped{};
+        u32 recipes_dropped{};
         if (!rejected_modules.empty()) {
             std::unique_lock program_lock(programs_mutex);
             const auto device = instance.GetDevice();
@@ -862,6 +1164,12 @@ void PipelineCache::WarmUp() {
                     }
                 }
             }
+            // Also invalidate any recipe referring to a dropped handle outside its job stages.
+            for (auto it = graphics_pipelines.begin(); it != graphics_pipelines.end(); ++it) {
+                if (it->second && it->second->DropEyeSpecRecipe(rejected_modules)) {
+                    ++recipes_dropped;
+                }
+            }
             ++programs_generation;
             PerfMemo::BumpEpoch();
         }
@@ -872,8 +1180,9 @@ void PipelineCache::WarmUp() {
         LOG_WARNING(Render,
                     "FAST async_pipelines: the driver rejected {} cached graphics and {} compute "
                     "pipelines: pruned ({} of {} entries deleted), {} cached modules dropped "
-                    "(compiled again on first use)",
-                    rejected_graphics, rejected_compute, removed_blobs, pruned.size(), dropped);
+                    "(compiled again on first use), {} eye-shared variant recipes with them",
+                    rejected_graphics, rejected_compute, removed_blobs, pruned.size(), dropped,
+                    recipes_dropped);
     }
 
     // A rejected key can never load: deleted, so later sessions neither read nor report it (its

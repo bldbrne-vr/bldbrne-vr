@@ -51,6 +51,8 @@ bool ParseQuickSetting(const std::string& key, const std::string& value) {
         return true;
     } else if (key == "holster_haptics") {
         s.holster_haptics = Flag(value);
+    } else if (key == "shoulder_vial") {
+        s.shoulder_vial = Flag(value);
     } else if (key == "holster_height_cm") {
         s.holster_height_cm = std::clamp(f(), -20.0f, 20.0f);
     } else if (key == "holster_width_cm") {
@@ -73,6 +75,13 @@ bool ParseQuickSetting(const std::string& key, const std::string& value) {
         s.hover_scale = std::clamp(f(), 0.5f, 2.0f);
     } else if (key == "quick_arc_pick") {
         s.pick_sector = value == "sector" || value == "1";
+        s.pick_fan = value == "fan" || value == "2";
+    } else if (key == "quick_fan_style") {
+        s.fan_style = value == "brass" || value == "1" ? 1 : 0;
+    } else if (key == "quick_fan_seen") {
+        s.fan_seen = Flag(value);
+    } else if (key == "quick_fan_return_seen") {
+        s.fan_return_seen = Flag(value);
     } else if (key == "quick_arc_grace_ms") {
         s.grace_ms = std::clamp(f(), 0.0f, 500.0f);
     } else if (key == "quick_arc_nearest") {
@@ -189,6 +198,22 @@ bool ParseQuickSetting(const std::string& key, const std::string& value) {
         s.shake_arm = std::clamp(f(), 0.4f, 3.0f);
     } else if (key == "quick_use_stab") {
         s.use_stab = Flag(value);
+    } else if (key == "quick_tap_pick") {
+        s.tap_pick = Flag(value);
+    } else if (key == "quick_tap_use_ms") {
+        s.tap_use_ms = std::clamp(f(), 0.0f, 2000.0f);
+    } else if (key == "quick_grip_hold") {
+        s.grip_hold = Flag(value);
+    } else if (key == "quick_fan_return_ms") {
+        s.fan_return_ms = std::clamp(f(), 0.0f, 30000.0f);
+    } else if (key == "quick_grip_open_ms") {
+        s.grip_open_ms = std::clamp(f(), 0.0f, 1000.0f);
+    } else if (key == "quick_tool_keep") {
+        s.tool_keep = Flag(value);
+    } else if (key == "quick_tool_gestures") {
+        s.tool_gestures = Flag(value);
+    } else if (key == "quick_tool_direct") {
+        s.tool_direct = Flag(value);
     } else if (key == "quick_music_box_crank") {
         s.music_box_crank = Flag(value);
     } else if (key == "music_box_grab_cm") {
@@ -225,6 +250,8 @@ bool ParseQuickSetting(const std::string& key, const std::string& value) {
         s.molotov_burst_bullet = static_cast<int>(std::lround(f()));
     } else if (key == "molotov_burst_radius_m") {
         s.molotov_burst_radius_m = std::clamp(f(), 0.0f, 6.0f);
+    } else if (key == "molotov_fire_scale") {
+        s.molotov_fire_scale = std::clamp(f(), 1.0f, 3.0f);
     } else if (key == "molotov_burst_ground") {
         s.molotov_burst_ground = Flag(value);
     } else if (key == "throw_haptic_scale") {
@@ -295,6 +322,9 @@ void WriteQuickDefaults(std::ostream& out) {
            "Vial, as X;\n# belt_vial_zone scales the hip's box\n"
         << "holster_mode=" << d.holster_mode << "\n"
         << "holster_haptics=" << d.holster_haptics << "\n"
+        << "# the left hand over the right shoulder with the grip draws a Blood Vial (body "
+           "slots on)\n"
+        << "shoulder_vial=" << d.shoulder_vial << "\n"
         << "holster_height_cm=" << d.holster_height_cm << "\n"
         << "holster_width_cm=" << d.holster_width_cm << "\n"
         << "holster_forward_cm=" << d.holster_forward_cm << "\n"
@@ -308,8 +338,13 @@ void WriteQuickDefaults(std::ostream& out) {
         << "# hover volume around each card (x)\n"
         << "quick_arc_hover_scale=" << d.hover_scale << "\n"
         << "# hover = the hunter's fist on a card picks it; sector = point the hand at it from "
-           "where the arc opened\n"
-        << "quick_arc_pick=" << (d.pick_sector ? "sector" : "hover") << "\n"
+           "where the arc opened; fan = the direction the hand moves from where it opened picks, "
+           "no reach (pull it away to close)\n"
+        << "quick_arc_pick=" << (d.pick_fan ? "fan" : d.pick_sector ? "sector" : "hover")
+        << "\n"
+        << "# the fan's look: lancet = gothic panes, brass = an engraved brass rim\n"
+        << "quick_fan_style=" << (d.fan_style == 1 ? "brass" : "lancet") << "\n"
+        << "quick_fan_seen=1\n"
         << "# a squeeze just after the hand left a card still takes it (ms) / one with no card lit "
            "takes the clearly nearest card up to this x the hover volume (0 = off)\n"
         << "quick_arc_grace_ms=" << d.grace_ms << "\n"
@@ -433,6 +468,35 @@ void WriteQuickDefaults(std::ostream& out) {
         << "music_box_grab_cm=" << d.music_box_grab_cm << "\n"
         << "music_box_turns=" << d.music_box_turns << "\n"
         << "music_box_replay_s=" << d.music_box_replay_s << "\n"
+        << "# the trigger on a card picks the item up, never uses it: kept down it goes on (a "
+           "ring fills,\n# a throw flies when let go, a tool is used after this long, ms); let go "
+           "it stays in the hand and\n# the trigger again uses it; only the grip puts it back. "
+           "0 = let go puts it back, tools at the pull\n"
+        << "quick_tap_pick=" << (d.tap_pick ? 1 : 0) << "\n"
+        << "quick_tap_use_ms=" << d.tap_use_ms << "\n"
+        << "# the grip holds: the grip on a card takes the item and holds it while squeezed (as a "
+           "pocket's), the\n# trigger uses it, let go of the grip it is thrown or put back; "
+           "the trigger with the fan open is the\n# gun; 0 = the trigger takes (quick_tap_pick). "
+           "An item put back unused within this long of its take\n# brings the fan back; "
+           "one used or thrown never does (ms; 0 = never)\n"
+        << "quick_grip_hold=" << (d.grip_hold ? 1 : 0) << "\n"
+        << "quick_fan_return_ms=" << d.fan_return_ms << "\n"
+        << "quick_fan_return_seen=1\n"
+        << "# the grip in the air opens the fan once squeezed this long (ms; 0 = at the squeeze; "
+           "Y and X at once)\n"
+        << "quick_grip_open_ms=" << d.grip_open_ms << "\n"
+        << "# the hunter tools stay in the hand after their use; 0 = they go away\n"
+        << "quick_tool_keep=" << (d.tool_keep ? 1 : 0) << "\n"
+        << "# the hunter tools' acts with the trigger: the Madaras Whistle at your mouth, the Old "
+           "Hunter Bone crushed\n# (the grip hard; with the grip holding, the trigger hard), A "
+           "Call Beyond gathered with the trigger,\n# then raised above your head, Tiny Tonitrus "
+           "and the Executioner's Gloves swung down (or slashed\n# forward and down), the "
+           "Blacksky Eye pointed as a gun (held to your eye: where you look); 0 = the trigger "
+           "alone\n"
+        << "quick_tool_gestures=" << (d.tool_gestures ? 1 : 0) << "\n"
+        << "# no use animations for the hunter tools: your act is the use, the game's effect at "
+           "once (at the tool's own\n# pace); 0 = the game's own use animation\n"
+        << "quick_tool_direct=" << (d.tool_direct ? 1 : 0) << "\n"
         << "# throwables fly with your hand's release velocity; 0 = the game's own throw\n"
         << "quick_throw=" << (d.throws ? 1 : 0) << "\n"
         << "# hand speed at release to throw (m/s; slower puts it back) and launch speed per hand "
@@ -507,6 +571,9 @@ void WriteQuickDefaults(std::ostream& out) {
         << "molotov_burst_deg=" << d.molotov_burst_deg << "\n"
         << "molotov_burst_bullet=" << d.molotov_burst_bullet << "\n"
         << "molotov_burst_radius_m=" << d.molotov_burst_radius_m << "\n"
+        << "# a Molotov's own burst and fire where it lands or hits: this many times its radius "
+           "(1 = the game's own; the flames keep their size)\n"
+        << "molotov_fire_scale=" << d.molotov_fire_scale << "\n"
         << "molotov_burst_ground=" << (d.molotov_burst_ground ? 1 : 0) << "\n"
         << "# quick-item visuals drawn into the game's own frame (0 = none) and their brightness\n"
         << "inframe=" << (d.inframe ? 1 : 0) << "\n"

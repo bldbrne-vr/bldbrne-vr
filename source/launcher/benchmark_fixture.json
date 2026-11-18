@@ -2,7 +2,8 @@
   "schema": 1,
   "scene": "Central Yharnam fixed-view fixture",
   "game_versions": [
-    "01.00"
+    "01.00",
+    "01.09"
   ],
   "files": [
     {
@@ -10,7 +11,7 @@
       "path": "1000/savedata/CUSA00207/SPRJ0005/backup0000"
     },
     {
-      "sha256": "653ac2c4686d29c800d27e80b1f84406614cb464be71c8943cddc45bfefd0bb9",
+      "sha256": "7286064f21308f922809028e7643985401d8d753a18437fcacf07733076adec8",
       "path": "1000/savedata/CUSA00207/SPRJ0005/backup0010"
     },
     {
@@ -54,7 +55,7 @@
       "path": "1000/savedata/CUSA00207/SPRJ0005/userdata0009"
     },
     {
-      "sha256": "884b45b1c6c0fdcc0196f4a5ea383e4447efcd8039394564889dd9db3b29ee14",
+      "sha256": "0083dc9d568f4981344800387cedbe19f7465695e1167879cbe8548c6bd426dd",
       "path": "1000/savedata/CUSA00207/SPRJ0005/userdata0010"
     },
     {

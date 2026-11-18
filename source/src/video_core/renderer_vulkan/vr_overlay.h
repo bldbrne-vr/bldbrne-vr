@@ -36,7 +36,7 @@ namespace Vulkan {
 // of the game layer.
 //
 // One double-wide swapchain (left eye | right eye) is rendered in a single dynamic-rendering
-// pass with 4x MSAA (resolved into the swapchain image) and reversed-Z depth; the draw list is
+// pass with MSAA (vr.ini overlay_msaa, default 2x; resolved into the swapchain image) and reversed-Z depth; the draw list is
 // recorded once per eye with that eye's viewport. No device features beyond Vulkan 1.3 core
 // (dynamic rendering, synchronization2) are needed.
 //
@@ -159,6 +159,7 @@ public:
     // After BeginFrame: the head of this frame's eyes (their midpoint, their mean orientation),
     // for head-locked items such as the heal vignette. False without valid views.
     bool HeadPose(VrOverlay::Pose& head) const;
+    bool EyePose(u32 eye, VrOverlay::Pose& pose) const;
     // Before BeginFrame: the game layer's stereo the next frames match (see StereoMatch).
     void SetStereoMatch(const StereoMatch& match) {
         stereo_match = match;
@@ -197,7 +198,7 @@ public:
 
     // Stats since the last call.
     Stats TakeStats();
-    // e.g. "1440x1536 x2, B8G8R8A8_SRGB, 4x MSAA, 196 MB".
+    // e.g. "1440x1536 x2, B8G8R8A8_SRGB, 2x MSAA, 130 MB".
     [[nodiscard]] std::string Describe() const;
 
 private:

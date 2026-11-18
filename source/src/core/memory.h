@@ -264,6 +264,21 @@ public:
     void SetPrtArea(u32 id, VAddr address, u64 size);
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
+    /// A/B switch 1 (FAST_CPU_SPARSE_HOLD, on unless '0'): the mapping lock held shared for a run
+    /// of this thread's CopySparseMemory calls (Rasterizer::PrepareConstants: one draw's
+    /// constants), which then skip their own lock and release, each an atomic on a line every
+    /// reader thread shares. Nothing that waits for another thread or takes the lock exclusively
+    /// may run inside one.
+    class SparseReadHold {
+    public:
+        explicit SparseReadHold(MemoryManager& memory);
+        ~SparseReadHold();
+        SparseReadHold(const SparseReadHold&) = delete;
+        SparseReadHold& operator=(const SparseReadHold&) = delete;
+
+    private:
+        MemoryManager* held{};
+    };
     void QueueSparseMemory(VAddr source, u8* dest, u64 size);
     void CopySparseMemoryBatch(std::span<const ScratchBatch::Range> ranges, u8* dest,
                                std::span<const u32> offsets);
@@ -318,6 +333,9 @@ public:
     s32 GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPoolBlockStats* stats);
 
     void InvalidateMemory(VAddr addr, u64 size) const;
+    /// The game's GPU memory allocator handed [addr, addr + size) out again: what the GPU wrote
+    /// there is dead (core/vr/bloodborne_gpu_memory.cpp).
+    void NoteFreshGpuRange(VAddr addr, u64 size) const;
     /// InvalidateMemory for a protection change: no byte is written (the GPU's stay kept).
     void InvalidateProtection(VAddr addr, u64 size) const;
 

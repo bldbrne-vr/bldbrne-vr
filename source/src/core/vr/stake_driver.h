@@ -9,10 +9,88 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 
 namespace VR::Tricks {
+// Unknown live rows may mean the parameter table is not ready. Retry at most once
+// per 60 eligible weapon updates; cache only a resolved attack or definitive non-attack.
+class StakeAttackLookup {
+public:
+    template <class Lookup>
+    std::int32_t Resolve(Lookup&& lookup) {
+        if (judge != 0) {
+            return judge;
+        }
+        if (wait != 0) {
+            --wait;
+            return 0;
+        }
+        const auto first = lookup(570);
+        const auto second = lookup(930);
+        if (first == 0) {
+            judge = 570;
+        } else if (second == 0) {
+            judge = 930;
+        } else if (first >= 0 && second >= 0) {
+            judge = -1;
+        } else {
+            wait = 59;
+        }
+        return judge;
+    }
+private:
+    std::int32_t judge{0};
+    unsigned wait{0};
+};
+
+// The blast kicks the stake out of form B (2026-11-07: "as if the blast itself kicked
+// it out of transformed mode", "a nice kick"): the retract starts KickDelayNs after the discharge,
+// inside its contact window, at the kick clock (transform.h KickClock), and the hand's recoil and
+// buzz slam a second time as it locks (gun_aim.h StakeSlam). VR_STAKE_KICK=0: the earlier calm
+// retract after the window (a test A/B only).
+inline constexpr std::int64_t KickDelayNs = 10'000'000;
+inline bool StakeKickOut() {
+    static const bool on = [] {
+        const char* v = std::getenv("VR_STAKE_KICK");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
+// An accepted powered discharge returns to form A, hit or miss: kicked out at once (`kick`) or
+// after its contact window. Entirely pose-thread owned: recovery follows the firing mechanism,
+// not a damage callback.
+struct StakeReturn {
+    enum class Action { None, Start };
+    std::uintptr_t owner{};
+    std::int32_t weapon{-1}, slot{-1};
+    std::int64_t opened{};
+    bool kick{true};
+    void Arm(std::uintptr_t who, std::int32_t id, std::int32_t where, std::int64_t at,
+             bool kick_out) {
+        owner = who; weapon = id; slot = where; opened = at; kick = kick_out;
+    }
+    Action Update(std::uintptr_t who, std::int32_t id, std::int32_t where, bool form_b,
+                  std::int64_t now, bool blocked, bool window_open) {
+        if (opened == 0) return Action::None;
+        if (who != owner || id != weapon || where != slot || !form_b || now < opened ||
+            now - opened > 2'000'000'000) {
+            opened = 0;
+            return Action::None;
+        }
+        // The kick: within the blast's window (a powered window never becomes a transform
+        // attack). The calm retract preserves OpenPowered's 200 ms impulse, including when its
+        // publication closes early.
+        if (blocked || (kick ? now - opened < KickDelayNs
+                             : window_open || now - opened < 200'000'000))
+            return Action::None;
+        opened = 0; // exactly one recovery per accepted discharge
+        return Action::Start;
+    }
+};
+
 // Retail 1.09: a116_042630 invokes behavior 101100930 / attack 1100930.
 // Its sphere uses body dummy 60. The per-instance attack spec is copied to
 // entry+0x54 by 0x185D988; spec+0x134/+0x138 are its dummy ids (0x1F1439D).

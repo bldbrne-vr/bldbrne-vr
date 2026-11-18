@@ -4,6 +4,7 @@
 #include <boost/container/static_vector.hpp>
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/vr_push_data.h"
 
 namespace Shader::Backend::SPIRV {
 
@@ -233,6 +234,68 @@ Id EmitImageGradient(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id
     const Id sample = ctx.OpImageSampleExplicitLod(result_type, sampled_image, coords,
                                                    operands.mask, operands.operands);
     return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
+}
+
+// VrBumpSample (ir/passes/parallax.h BumpGaps; parallax_pass.cpp MoveReads): a 2D implicit-detail
+// read of a material whose bump map may be a height map. For a draw that moves (its pushed depth
+// above 0, the same for every pixel of the draw) the read is made at `moved` with `coords`' own
+// change across the pixel (times 2^bias) as its gradients: the spot the view ray met, at the
+// detail level of the unmoved surface. For every other draw, and without the push data, it is
+// the game's own read at `coords`, untouched.
+Id EmitVrBumpSample(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id moved, Id bias,
+                    const IR::Value& offset) {
+    const auto& texture = ctx.images[handle & 0xFFFF];
+    const Id image = ctx.NativeNonUniform(
+        ctx.OpLoad(texture.image_type, ctx.NativeImagePointer(texture.image_type, texture.id)));
+    const Id result_type = texture.data_types->Get(4);
+    const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
+    // (Paired where it is read: an OpSampledImage must be in the block that uses it.)
+    const auto sampled_image = [&] {
+        return ctx.NativeNonUniform(ctx.OpSampledImage(texture.sampled_type, image, sampler));
+    };
+    const auto plain = [&] {
+        ImageOperands operands;
+        operands.Add(spv::ImageOperandsMask::Bias, bias);
+        operands.AddOffset(ctx, offset);
+        const Id sample = ctx.OpImageSampleImplicitLod(result_type, sampled_image(), coords,
+                                                       operands.mask, operands.operands);
+        return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
+    };
+    if (!ctx.UsesVrPushData()) {
+        return plain();
+    }
+    const Id result = ctx.AddGlobalVariable(
+        ctx.TypePointer(spv::StorageClass::Private, ctx.F32[4]), spv::StorageClass::Private);
+    ctx.interfaces.push_back(result);
+    const Id moves = ctx.OpFOrdGreaterThan(ctx.U1[1], ctx.PushF32(VrPushData::BumpDepthIndex),
+                                           ctx.ConstF32(0.0f));
+    const Id moved_label = ctx.OpLabel(), plain_label = ctx.OpLabel(), merge = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(moves, moved_label, plain_label);
+    ctx.AddLabel(moved_label);
+    {
+        // (The plain derivatives, as an implicit read takes them: a flat blue drawn on this
+        // path reads the same detail level as on the plain one.)
+        Id dx = ctx.OpDPdx(ctx.F32[2], coords);
+        Id dy = ctx.OpDPdy(ctx.F32[2], coords);
+        if (Sirit::ValidId(bias)) {
+            const Id grow = ctx.OpExp2(ctx.F32[1], bias);
+            dx = ctx.OpVectorTimesScalar(ctx.F32[2], dx, grow);
+            dy = ctx.OpVectorTimesScalar(ctx.F32[2], dy, grow);
+        }
+        ImageOperands operands;
+        operands.AddDerivatives(ctx, dx, dy);
+        operands.AddOffset(ctx, offset);
+        const Id sample = ctx.OpImageSampleExplicitLod(result_type, sampled_image(), moved,
+                                                       operands.mask, operands.operands);
+        ctx.OpStore(result, texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample);
+    }
+    ctx.OpBranch(merge);
+    ctx.AddLabel(plain_label);
+    ctx.OpStore(result, plain());
+    ctx.OpBranch(merge);
+    ctx.AddLabel(merge);
+    return ctx.OpLoad(ctx.F32[4], result);
 }
 
 Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod, Id ms) {

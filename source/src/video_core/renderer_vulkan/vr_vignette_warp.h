@@ -13,6 +13,7 @@
 #include <cmath>
 
 #include "common/types.h"
+#include "core/vr/status_corners.h"
 #include "video_core/renderer_vulkan/vr_overlay_meshes.h"
 
 // The vignettes drawn by the late warp (vr.ini vignette_in_warp): the hit flash and its wedge, the
@@ -113,13 +114,19 @@ struct Block {
     std::array<std::array<float, 4>, 2> eye_pos{}; // in local space
     std::array<std::array<float, 4>, 2> tan{}; // tan of angleLeft, angleRight, angleUp, angleDown
     std::array<Item, MaxItems> items{};
+    std::array<float, 4> riposte{}; // x = a visceral's burst (host_shaders/vr_riposte.glsl), 0 .. 1
+    std::array<float, 4> ritual{};  // the Kos ritual's vision (vr_kos_ritual.glsl): rise, burst,
+                                    // clock (s), seed
 };
-static_assert(sizeof(Block) == 864);
+static_assert(sizeof(Block) == 896);
 
 // The vignettes of one XR frame, as DrawOverlay made them, and the field the overlay would have
 // fitted them to.
 struct Frame {
     float health{}, desaturation{};
+    float riposte{}; // vr.ini riposte_style (core/vr/riposte_style.h)
+    bool roar_palette{};
+    std::array<float, 4> ritual{}; // vr.ini kos_visions (core/vr/trick_weapons.h KosRitualAt)
     u32 count{0};
     std::array<Item, MaxItems> items{};
     std::array<float, 4> field{};
@@ -173,8 +180,13 @@ inline bool PlaneHit(const Item& it, const float p[3], const float d[3], float& 
 }
 
 // The item's opacity at plane coordinates (tx, ty): vr_overlay.frag's ShadeVignette over the
-// rasterised ring mesh (no fragment outside it). `field`: FrameConstants::field.
-inline float Alpha(const Item& it, float tx, float ty, const std::array<float, 4>& field) {
+// rasterised ring mesh (no fragment outside it). `field`: FrameConstants::field. `color`: its
+// colour there (linear, RGB order: the item's, or a status look's own in the corners).
+inline float Alpha(const Item& it, float tx, float ty, const std::array<float, 4>& field,
+                   std::array<float, 3>* color = nullptr) {
+    if (color) {
+        *color = {it.color[0], it.color[1], it.color[2]};
+    }
     const float r = std::sqrt(tx * tx + ty * ty);
     const RingSample ring = SampleRing(r);
     if (!ring.inside) {
@@ -205,9 +217,31 @@ inline float Alpha(const Item& it, float tx, float ty, const std::array<float, 4
         profile = std::pow(profile, std::max(it.params[2], 0.01f));
     }
     if (it.wedge[3] > 0.0f) {
-        const float c = r > 1e-6f ? (tx * it.wedge[0] + ty * it.wedge[1]) / r : 0.0f;
-        const float wedge = std::pow(std::max(0.5f + 0.5f * c, 0.0f), std::max(it.wedge[2], 0.01f));
-        profile *= (1.0f - it.wedge[3]) + it.wedge[3] * wedge;
+        if (it.wedge[2] < 0.0f) {
+            // The four corners: the status's own look (x the reach, y the beat clock, -z the
+            // status and the veins' width), its own colours.
+            const std::array<float, 4> f =
+                field[0] > 1.0f ? field : std::array<float, 4>{54.0f, 54.0f, 44.0f, 55.0f};
+            constexpr float Deg = 57.2957795f;
+            const float ax = std::atan(tx) * Deg;
+            const float ay = std::atan(ty) * Deg;
+            const float qx = ax / std::max(ax < 0.0f ? f[0] : f[1], 1.0f);
+            const float qy = ay / std::max(ay > 0.0f ? f[2] : f[3], 1.0f);
+            const float kind = std::floor(-it.wedge[2]);
+            // params[0]: the zoom into what the lenses show (StatusCornerZoomed).
+            const VR::StatusCorners::Corner look = VR::StatusCorners::StatusCornerZoomed(
+                qx, qy, it.params[0], it.wedge[0], it.wedge[1], -it.wedge[2] - kind,
+                static_cast<int>(kind));
+            profile = look.alpha;
+            if (color) {
+                *color = look.rgb;
+            }
+        } else {
+            const float c = r > 1e-6f ? (tx * it.wedge[0] + ty * it.wedge[1]) / r : 0.0f;
+            const float wedge =
+                std::pow(std::max(0.5f + 0.5f * c, 0.0f), std::max(it.wedge[2], 0.01f));
+            profile *= (1.0f - it.wedge[3]) + it.wedge[3] * wedge;
+        }
     }
     return it.color[3] * profile;
 }
@@ -238,7 +272,8 @@ inline std::array<float, 3> Apply(const Frame& f, bool bgra, std::array<float, 3
         if (!PlaneHit(it, p, d, tx, ty)) {
             continue;
         }
-        const float a = std::clamp(Alpha(it, tx, ty, f.field), 0.0f, 1.0f);
+        std::array<float, 3> look{};
+        const float a = std::clamp(Alpha(it, tx, ty, f.field, &look), 0.0f, 1.0f);
         if (!(a > 0.0f)) {
             continue;
         }
@@ -247,8 +282,7 @@ inline std::array<float, 3> Apply(const Frame& f, bool bgra, std::array<float, 3
             decoded = true;
         }
         const std::array<float, 3> col =
-            bgra ? std::array<float, 3>{it.color[2], it.color[1], it.color[0]}
-                 : std::array<float, 3>{it.color[0], it.color[1], it.color[2]};
+            bgra ? std::array<float, 3>{look[2], look[1], look[0]} : look;
         for (u32 k = 0; k < 3; ++k) {
             c[k] = c[k] + (col[k] - c[k]) * a;
         }

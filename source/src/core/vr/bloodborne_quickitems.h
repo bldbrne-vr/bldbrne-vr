@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <array>
 #include "common/types.h"
 
 // Bloodborne (v1.09 eboot): quick items in VR, the game side (core/vr/quick_items.h has the
@@ -44,6 +45,28 @@ void QuickItemsRenderTick(u64 record_id, const float* rows, const float* positio
 // Installed (the slots can be read).
 [[nodiscard]] bool QuickItemsReady();
 
+// Existing hand-pose loop: bounded cosmetic pressure, zero for stale/put-away scenes.
+[[nodiscard]] float CallBeyondSqueeze(s64 now_ns);
+[[nodiscard]] float AugurSqueeze(s64 now_ns);
+[[nodiscard]] float MessengerSqueeze(s64 now_ns);
+[[nodiscard]] float GloveHandOpen(s64 now_ns);
+[[nodiscard]] float BeastRoarScreenStrength(s64 now_ns);
+
+// The thumb-facing eyepiece of the Monocular, in the current tracking space. Published from
+// the same model transform that draws the held item, including the hand's render carry.
+[[nodiscard]] bool MonocularEyepiece(u32 space_serial, s64 now_ns,
+                                     std::array<float, 3>& position);
+// The held item `goods`'s drawn centre (its model's bounds), the same way: the Blacksky Eye held
+// to your eye is measured from it (core/vr/quick_items.h ToolGesture::Eye).
+[[nodiscard]] bool HeldItemPoint(u32 space_serial, s64 now_ns, s32 goods,
+                                 std::array<float, 3>& position);
+// Raw protector ID in the player's arm slot, or -1 when unavailable.
+[[nodiscard]] s32 EquippedArmArmor(const u8* player);
+
+// The held Blacksky Eye as last drawn: its centre (game world) and radius (world units), its
+// pupil turned onto the shot's line (core/vr/blacksky_eye.h): where its meteor leaves.
+[[nodiscard]] bool BlackskyPupil(s64 now_ns, std::array<float, 3>& centre, float& radius);
+
 // quick_use_sounds: the game's sound of the item `goods` used at once with goodsUseAnim
 // `use_anim` (core/vr/quick_items.h UseSoundsOf; the Blood Vial's injection: 26), played by the
 // render ticks that follow. Site A (the player's update).
@@ -53,5 +76,18 @@ void QueueQuickUseSound(s32 goods, s32 use_anim);
 // core/vr/bloodborne_gun.cpp, the first bullet of a shot). The next render tick bursts a Molotov
 // of his in flight within molotov_burst_deg of that ray.
 void QuickItemsGunShot(const float* start, const float* ray);
+
+// The Hand Lantern in the hunter's hand carries a light (core/vr/hand_lantern.h Carry; the hip's
+// lantern is out meanwhile): core/vr/bloodborne_held.cpp lights the palm. Site A's view.
+[[nodiscard]] bool LanternLightInHand();
+
+// ... or was, less than a second ago: the game's lantern model on the palm stays undrawn while
+// its effect fades out (core/vr/hand_lantern.h; the renderer's skip).
+[[nodiscard]] bool LanternModelHidden();
+
+// ... and the light in the hand went out within the last HandLantern::GlowAloneNs: its effect's
+// last frame may still draw the glow card without the model (the renderer's skip). Reads the
+// clock: asked only for such a card.
+[[nodiscard]] bool LanternJustPutOut();
 
 } // namespace VR::Bloodborne

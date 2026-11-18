@@ -143,6 +143,20 @@ bool ParseMeleeSetting(const std::string& key, const std::string& value) {
         s.budget_quick_charges = std::clamp(std::stoi(value), 1, 8);
     } else if (key == "melee_budget_quick_s") {
         s.budget_quick_s = std::clamp(f(), 0.0f, 2.0f);
+    } else if (key == "melee_budget_miss_refund") {
+        s.budget_miss_refund = Flag(value);
+    } else if (key == "melee_dual_hands") {
+        s.dual_hands = Flag(value);
+    } else if (key == "melee_dual_charges") {
+        s.dual_charges = std::clamp(std::stoi(value), 1, 8);
+    } else if (key == "melee_dual_damage_pct") {
+        s.dual_damage_pct = std::clamp(f(), 25.0f, 150.0f);
+    } else if (key == "melee_dual_sharpen") {
+        s.dual_sharpen = Flag(value);
+    } else if (key == "melee_dual_sharpen_rubs") {
+        s.dual_sharpen_rubs = std::clamp(std::stoi(value), 1, 12);
+    } else if (key == "melee_dual_sharpen_pct") {
+        s.dual_sharpen_pct = std::clamp(f(), 0.0f, 200.0f);
     } else if (key == "melee_plunge") {
         s.plunge = Flag(value);
     } else if (key == "melee_plunge_min_drop_m") {
@@ -151,6 +165,18 @@ bool ParseMeleeSetting(const std::string& key, const std::string& value) {
         s.plunge_damage = std::clamp(f(), 1.0f, 4.0f);
     } else if (key == "melee_plunge_hold_s") {
         s.plunge_hold_s = std::clamp(f(), 0.5f, 6.0f);
+    } else if (key == "melee_deflect") {
+        s.deflect = Flag(value);
+    } else if (key == "melee_deflect_stamina") {
+        s.deflect_stamina = std::clamp(std::stoi(value), 0, 100);
+    } else if (key == "melee_deflect_snap_deg") {
+        s.deflect_snap_deg = std::clamp(f(), 0.0f, 90.0f);
+    } else if (key == "melee_deflect_return_deg") {
+        s.deflect_return_deg = std::clamp(f(), 0.0f, 90.0f);
+    } else if (key == "melee_deflect_margin_cm") {
+        s.deflect_margin_cm = std::clamp(f(), 0.0f, 30.0f);
+    } else if (key == "melee_deflect_max_radius_m") {
+        s.deflect_max_radius_m = std::clamp(f(), 0.0f, 3.0f);
     } else {
         return false;
     }
@@ -214,7 +240,7 @@ void WriteMeleeDefaults(std::ostream& out) {
         << "melee_bite=" << (d.bite ? 1 : 0) << "\n"
         << "melee_whoosh=" << (d.whoosh ? 1 : 0) << "\n"
         << "melee_trail=" << (d.trail ? 1 : 0) << "\n"
-        << "# right trigger held this long: the next swing is charged (0.35 s: heavy)\n"
+        << "# right trigger held this long: the next swing is charged (0.36 s: heavy)\n"
         << "melee_charge_s=" << d.charge_s << "\n"
         << "# a swing begun just before a stagger hands the attack back waits this long (ms) for "
            "it, then\n# its attack opens on the swing under way; later = refused (the deny tick); "
@@ -250,13 +276,43 @@ void WriteMeleeDefaults(std::ostream& out) {
            "melee_budget_charges = off)\n"
         << "melee_budget_quick_charges=" << d.budget_quick_charges << "\n"
         << "melee_budget_quick_s=" << d.budget_quick_s << "\n"
+        << "# 1 = a swing that hits nothing gives its charges back as it ends, so the next swing "
+           "registers\n# (stamina and the trigger's charge stay spent); 0 = a miss uses them like "
+           "a hit\n"
+        << "melee_budget_miss_refund=" << (d.budget_miss_refund ? 1 : 0) << "\n"
+        << "# the Blade of Mercy and Rakuyo split in two: each hand its own charges (this many) at "
+           "the game's own\n# pace, each hit at this % of its damage (0 = both hands share the "
+           "right hand's, full damage)\n"
+        << "melee_dual_hands=" << (d.dual_hands ? 1 : 0) << "\n"
+        << "melee_dual_charges=" << d.dual_charges << "\n"
+        << "melee_dual_damage_pct=" << d.dual_damage_pct << "\n"
+        << "# ... rubbing the blades together this many times sharpens both (a ring): each "
+           "blade's next hit that\n# lands deals this % more\n"
+        << "melee_dual_sharpen=" << (d.dual_sharpen ? 1 : 0) << "\n"
+        << "melee_dual_sharpen_rubs=" << d.dual_sharpen_rubs << "\n"
+        << "melee_dual_sharpen_pct=" << d.dual_sharpen_pct << "\n"
         << "# the plunge: a swing while you fall keeps its attack until you land, so the blade "
            "hits what you\n# land on; after a fall this deep (m) its hits deal x the damage. "
            "No plunge animation\n"
         << "melee_plunge=" << (d.plunge ? 1 : 0) << "\n"
         << "melee_plunge_min_drop_m=" << d.plunge_min_drop_m << "\n"
         << "melee_plunge_damage=" << d.plunge_damage << "\n"
-        << "melee_plunge_hold_s=" << d.plunge_hold_s << "\n";
+        << "melee_plunge_hold_s=" << d.plunge_hold_s << "\n"
+        << "# bullet deflection: an enemy's bullet that meets the right weapon bounces off it "
+           "(your swing\n# turns it) and hurts enemies. A swing's bounce within this many degrees "
+           "of the shooter goes\n# back at him 8 times in 10 (a still blade never; a bullet not "
+           "sent back keeps this far off him).\n# Caught this much short of the blade (cm); never "
+           "projectiles wider than this (m)\n"
+        << "melee_deflect=" << (d.deflect ? 1 : 0) << "\n"
+        << "# stamina per passive bullet block (0 = free); deliberate swats cost no extra.\n"
+           "# Pellets launched together share a charge; a paid block pauses regeneration 0.35 s.\n"
+        << "melee_deflect_stamina=" << d.deflect_stamina << "\n"
+        << "melee_deflect_snap_deg=" << d.deflect_snap_deg << "\n"
+        << "# past that the chance falls (6 in 10, 1 in 2, 1 in 3, very rarely) to none at this "
+           "many degrees\n# (0 = never sent back)\n"
+        << "melee_deflect_return_deg=" << d.deflect_return_deg << "\n"
+        << "melee_deflect_margin_cm=" << d.deflect_margin_cm << "\n"
+        << "melee_deflect_max_radius_m=" << d.deflect_max_radius_m << "\n";
 }
 
 std::string MeleeSettingsText() {
@@ -273,7 +329,9 @@ std::string MeleeSettingsText() {
                        "visceral_thrust_speed={:.2f} visceral_thrust_cm={:.0f} "
                        "visceral_thrust_align_deg={:.0f} swing_buffer_ms={:.0f} "
                        "melee_plunge={} melee_plunge_min_drop_m={:.2f} melee_plunge_damage={:.2f} "
-                       "melee_plunge_hold_s={:.2f}",
+                       "melee_plunge_hold_s={:.2f} melee_deflect={} melee_deflect_stamina={} "
+                       "melee_deflect_snap_deg={:.0f} melee_deflect_return_deg={:.0f} "
+                       "melee_deflect_margin_cm={:.0f} melee_deflect_max_radius_m={:.2f}",
                        s.physical ? "physical" : "vanilla", s.open_onset ? "onset" : "commit",
                        s.visceral ? 1 : 0, s.speed_damage ? 1 : 0, s.radius_scale,
                        s.radius_fit ? 1 : 0, s.radius_margin_cm,
@@ -285,7 +343,10 @@ std::string MeleeSettingsText() {
                        s.visceral_thrust ? 1 : 0, s.visceral_swing ? 1 : 0, s.visceral_cue,
                        s.visceral_thrust_speed, s.visceral_thrust_cm,
                        s.visceral_thrust_align_deg, s.swing_buffer_ms, s.plunge ? 1 : 0,
-                       s.plunge_min_drop_m, s.plunge_damage, s.plunge_hold_s);
+                       s.plunge_min_drop_m, s.plunge_damage, s.plunge_hold_s, s.deflect ? 1 : 0,
+                       s.deflect_stamina,
+                       s.deflect_snap_deg, s.deflect_return_deg, s.deflect_margin_cm,
+                       s.deflect_max_radius_m);
 }
 
 } // namespace VR::Melee

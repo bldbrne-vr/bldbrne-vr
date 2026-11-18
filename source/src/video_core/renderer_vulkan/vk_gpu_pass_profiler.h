@@ -45,12 +45,15 @@
 // producer state.
 //
 // FAST_GPU_PASS_PROFILE=2: coarse, without the transfer/native-copy scopes (fewer timestamps).
+// FAST_GPU_PASS_PROFILE_GAPS=1: the gaps split by the label open before each submission
+// ("(gap after: ...)"), to find which submissions leave the GPU idle.
 // FAST_GPU_PASS_PROFILE_VERIFY=1: a `FAST gpu passes verify:` line with the self-checks
 // (timestamp order, slices whose results were missing, marks skipped inside passes, frame span
 // percentiles to compare with VR_GPU_TIMING's `VR gpu frame:` span).
 
 #pragma once
 
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -167,6 +170,28 @@ public:
     /// labelled by LabelNextPass or by its shape.
     void BeginPass(const RenderState& state);
 
+    /// FAST_GPU_PASS_PROFILE_DRAWS=1 (read once): single draws are timed inside their pass too
+    /// (StampDraw), the GPU then running each before the next starts (a timestamp waits for all
+    /// the work before it): their times add up to more than the pass alone takes.
+    [[nodiscard]] static bool DrawsOn() noexcept {
+        static const bool on = [] {
+            const char* const env = std::getenv("FAST_GPU_PASS_PROFILE_DRAWS");
+            return env != nullptr && env[0] == '1';
+        }();
+        return on;
+    }
+    /// Inside a pass: a timestamp before a draw (`views`: the pass's view count, one query each;
+    /// the first holds the time, the rest are skipped when read), its time to the next charged
+    /// to `key`.
+    template <typename Describe>
+    void StampDraw(u64 key, u32 views, Group group, Describe&& describe) {
+        Name(key, group, describe);
+        StampInPass(key, views);
+    }
+    [[nodiscard]] u64 FrameNo() const noexcept {
+        return frame_no;
+    }
+
     /// Scheduler::SubmitExecution, before the submission: the gap label; returns the label to
     /// resume in the next command buffer.
     [[nodiscard]] u64 SubmitBegin();
@@ -234,6 +259,8 @@ private:
     void LabelPassIfNew(const RenderState& state, u64 key, Group group, const char* name);
     /// Writes a timestamp for `key` (or continues its open segment); false when it could not.
     bool Stamp(u64 key, bool call);
+    void StampInPass(u64 key, u32 views);
+    static constexpr u64 PadKey = 1; // a multiview timestamp's extra queries (read as zero)
     void EndFrame();
     void Collect();
     void Accumulate(GpuPassDetail::Slice& slice);
@@ -250,6 +277,7 @@ private:
     u64 tick_mask = ~u64{0};
     bool coarse = false;
     bool verify = false;
+    bool gap_detail = false; // FAST_GPU_PASS_PROFILE_GAPS=1: each gap named by the label before it
     u64 max_ticks = 0; // longer segments: out of order
 
     // The recording thread of `scheduler`.

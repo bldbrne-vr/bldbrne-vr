@@ -4,10 +4,12 @@
 
 #include "video_core/native_stereo/native_stereo.h"
 #include <algorithm>
+#include <bit>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
+#include "video_core/fast_render.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -43,7 +45,11 @@ GraphicsPipeline::GraphicsPipeline(
     // passes the loaded permutations' own runtime infos). Without a fragment program that slot
     // may hold another selection's: no motion then.
     vr_motion = infos[u32(Shader::LogicalStage::Fragment)] != nullptr &&
-                runtime_infos[u32(Shader::LogicalStage::Fragment)].vr_motion.enabled;
+                runtime_infos[u32(Shader::LogicalStage::Fragment)].vr_motion.enabled &&
+                !runtime_infos[u32(Shader::LogicalStage::Fragment)].vr_motion.Capture();
+    // A body-map capture (vr_body_maps.h): its vertex stage stores, nothing else changes.
+    vr_capture = infos[u32(Shader::LogicalStage::Vertex)] != nullptr &&
+                 runtime_infos[u32(Shader::LogicalStage::Vertex)].vr_motion.Capture();
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
     BuildDescSetLayout(preloading);
@@ -226,7 +232,8 @@ GraphicsPipeline::GraphicsPipeline(
     } else if (is_rect_list || is_quad_list) {
         if (!preloading) {
             sdata.tes = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
-                AuxShaderType::PassthroughTES, vertex_output_locations);
+                AuxShaderType::PassthroughTES, vertex_output_locations,
+                NativeStereo::LayerDraws() && key.probe_view_mask == 3);
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationEvaluation,
@@ -297,7 +304,9 @@ GraphicsPipeline::GraphicsPipeline(
 
     const vk::PipelineRenderingCreateInfo pipeline_rendering_ci = {
         .pNext = instance.IsMixedDepthSamplesSupported() ? &mixed_samples : nullptr,
-        .viewMask = key.probe_view_mask,
+        // Layer draws: a both-eye pipeline renders without multiview (NativeStereo::LayerDraws).
+        .viewMask = NativeStereo::LayerDraws() && key.probe_view_mask == 3 ? 0u
+                                                                           : key.probe_view_mask,
         .colorAttachmentCount = key.num_color_attachments,
         .pColorAttachmentFormats = color_formats.data(),
         .depthAttachmentFormat = key.z_format != AmdGpu::DepthBuffer::ZFormat::Invalid
@@ -389,8 +398,45 @@ GraphicsPipeline::GraphicsPipeline(
     // In practice, we use dynamic state for all of it.
     constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
 
-    const vk::GraphicsPipelineCreateInfo pipeline_info = {
+    // Fixed foveated rendering (vr_foveation.h): every pipeline may run in a pass with a shading
+    // rate attachment; the pipeline's own rate stays 1x1 and the attachment's replaces it (a pass
+    // without one shades at full rate, as before). A fragment shader writing depth/stencil or the
+    // sample mask on a card that restricts coarse shading with it keeps the attachment out
+    // (always 1x1), as the extension requires.
+    const bool foveated = instance.IsFoveationEnabled();
+    bool full_rate_only = false;
+    if (foveated) {
+        if (const auto* fs = infos[u32(Shader::LogicalStage::Fragment)]) {
+            const bool depth = fs->stores.Get(Shader::IR::Attribute::Depth) ||
+                               fs->stores.Get(Shader::IR::Attribute::StencilRef);
+            const bool mask = fs->stores.Get(Shader::IR::Attribute::SampleMask) ||
+                              runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info.vr_cut != 0;
+            // A shader writing the lamp shadows' cubes or mask (light_shadow.h SceneMaps: the AO
+            // pass) writes for its own pixel only: at a coarse rate the pixels it skips keep no
+            // shadow, so it runs at full rate.
+            const bool writes_shadows = std::ranges::any_of(fs->buffers, [](const auto& buffer) {
+                return buffer.is_written && (buffer.buffer_type == Shader::BufferType::VrShadowMask ||
+                                             buffer.buffer_type == Shader::BufferType::VrSceneMaps);
+            });
+            // (No longer: the shadow work covers a coarse fragment's block itself, and the AO the
+            // pass makes stays at the eye's rate, as the game had it.)
+            (void)writes_shadows;
+            full_rate_only = (depth && !instance.FoveationWithShaderDepth()) ||
+                             (mask && !instance.FoveationWithShaderSampleMask());
+        }
+    }
+    const vk::PipelineFragmentShadingRateStateCreateInfoKHR foveation_rate = {
         .pNext = &pipeline_rendering_ci,
+        .fragmentSize = vk::Extent2D{1, 1},
+        .combinerOps = std::array{vk::FragmentShadingRateCombinerOpKHR::eKeep,
+                                  full_rate_only ? vk::FragmentShadingRateCombinerOpKHR::eKeep
+                                                 : vk::FragmentShadingRateCombinerOpKHR::eReplace},
+    };
+    const vk::GraphicsPipelineCreateInfo pipeline_info = {
+        .pNext = foveated ? static_cast<const void*>(&foveation_rate)
+                          : static_cast<const void*>(&pipeline_rendering_ci),
+        .flags = foveated ? vk::PipelineCreateFlagBits::eRenderingFragmentShadingRateAttachmentKHR
+                          : vk::PipelineCreateFlags{},
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
         .pVertexInputState = !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,
@@ -406,6 +452,13 @@ GraphicsPipeline::GraphicsPipeline(
         .layout = *pipeline_layout,
     };
 
+    // VR_EYE_SPEC: what a variant is built from, the create info as it stands (copied).
+    if (Shader::EyeSpec::Enabled() && NativeStereo::Enabled() && eye_spec_buffers != 0) {
+        eye_spec_recipe = EyeSpecVariants::CopyRecipe(pipeline_info, device, pipeline_cache);
+        if (!eye_spec_recipe) {
+            EyeSpecVariants::g_stats.no_recipe.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
     if (pipeline_result != vk::Result::eSuccess && g_tolerate_pipeline_rejection) {
@@ -421,6 +474,119 @@ GraphicsPipeline::GraphicsPipeline(
 }
 
 GraphicsPipeline::~GraphicsPipeline() = default;
+
+bool GraphicsPipeline::DropEyeSpecRecipe(std::span<const vk::ShaderModule> gone) {
+    if (!eye_spec_recipe) {
+        return false;
+    }
+    for (const auto& stage : eye_spec_recipe->stages) {
+        if (std::ranges::find(gone, stage.module) != gone.end()) {
+            eye_spec_recipe.reset();
+            return true;
+        }
+    }
+    return false;
+}
+
+void GraphicsPipeline::EyeSelect(EyeSpecVariants::DrawMask& drawn) const {
+    drawn.handle = vk::Pipeline{};
+    if (!eye_spec_recipe) {
+        return;
+    }
+    using namespace EyeSpecVariants;
+    auto& s = g_stats;
+    constexpr auto relaxed = std::memory_order_relaxed;
+    static thread_local u32 log_tick = 0;
+    if ((++log_tick & 1023) == 0) {
+        MaybeLog();
+    }
+    const u64 shared = drawn.shared & eye_spec_buffers;
+    // VR_EYE_SPEC=2 only: strided pairs (=1 leaves them on their dynamic index).
+    const u64 strided = Shader::EyeSpec::Strides() ? drawn.strided & eye_spec_strides : 0;
+    if (eye_spec_slot) {
+        const Slot& slot = *eye_spec_slot;
+        switch (slot.state.load(std::memory_order_acquire)) {
+        case State::Ready: {
+            if (!FastRender::AbOn(UseBit)) {
+                s.none.fetch_add(1, relaxed); // in-run A/B: the base pipeline this phase
+                return;
+            }
+            bool fits = (shared & (slot.mask & ~slot.strided)) == (slot.mask & ~slot.strided) &&
+                        (strided & slot.strided) == slot.strided;
+            for (u32 i = 0; fits && i < slot.strides.size(); ++i) {
+                const Stride* const mine = drawn.StrideOf(slot.strides[i].binding);
+                fits = mine && mine->delta == slot.strides[i].delta &&
+                       mine->size == slot.strides[i].size;
+            }
+            if (!fits) {
+                s.mismatch.fetch_add(1, relaxed);
+                return;
+            }
+            // Descriptor 0 of each strided binding covers both eyes' copies.
+            for (const auto& want : slot.strides) {
+                Stride* const mine = const_cast<Stride*>(drawn.StrideOf(want.binding));
+                mine->left->range = u64{want.delta} + want.size;
+            }
+            drawn.handle = *slot.pipeline;
+            s.variant.fetch_add(1, relaxed);
+            if (!slot.strides.empty()) {
+                s.variant_strided.fetch_add(1, relaxed);
+            }
+            return;
+        }
+        case State::Compiling:
+            s.compiling.fetch_add(1, relaxed);
+            return;
+        case State::Failed:
+            s.none.fetch_add(1, relaxed);
+            return;
+        }
+        return;
+    }
+    // The bindings every one of the first draws shared, with the same stride and size if strided.
+    if (!eye_spec_learn) {
+        eye_spec_learn = std::make_unique<Learn>();
+    }
+    Learn& learn = *eye_spec_learn;
+    learn.shared &= shared;
+    if (learn.first) {
+        learn.first = false;
+        learn.strided = strided;
+        for (u32 i = 0; i < drawn.stride_count; ++i) {
+            learn.strides[drawn.strides[i].binding] = drawn.strides[i];
+        }
+    } else {
+        learn.strided &= strided;
+        for (u64 bits = learn.strided; bits != 0; bits &= bits - 1) {
+            const u32 b = static_cast<u32>(std::countr_zero(bits));
+            const Stride* const mine = drawn.StrideOf(b);
+            if (!mine || mine->delta != learn.strides[b].delta ||
+                mine->size != learn.strides[b].size) {
+                learn.strided &= ~(u64{1} << b);
+            }
+        }
+    }
+    s.learning.fetch_add(1, relaxed);
+    if (++eye_spec_draws < LearnDraws) {
+        return;
+    }
+    auto slot = std::make_shared<Slot>();
+    slot->strided = learn.strided & ~learn.shared;
+    slot->mask = learn.shared | slot->strided;
+    for (u64 bits = slot->strided; bits != 0; bits &= bits - 1) {
+        const u32 b = static_cast<u32>(std::countr_zero(bits));
+        slot->strides.push_back({b, learn.strides[b].delta, learn.strides[b].size, nullptr});
+    }
+    eye_spec_learn.reset();
+    Compiler* const compiler = g_compiler.load(std::memory_order_acquire);
+    if (slot->mask == 0 || !compiler) {
+        slot->state.store(State::Failed, relaxed);
+    } else {
+        s.requested.fetch_add(1, relaxed);
+        compiler->Submit(slot, eye_spec_recipe);
+    }
+    eye_spec_slot = std::move(slot);
+}
 
 template <typename Attribute, typename Binding>
 void GraphicsPipeline::GetVertexInputs(
@@ -487,6 +653,12 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             const auto sharp =
                 preloading ? AmdGpu::Buffer{}
                            : buffer.GetSharp(*stage); // See for the comment in compute PL creation
+            if (binding < Shader::EyeSpec::MaxBindings) {
+                eye_spec_buffers |= u64{1} << binding;
+                if (buffer.buffer_type == Shader::BufferType::Guest && !buffer.is_written) {
+                    eye_spec_strides |= u64{1} << binding;
+                }
+            }
             bindings.push_back({
                 .binding = binding++,
                 .descriptorType = vk::DescriptorType::eStorageBuffer,

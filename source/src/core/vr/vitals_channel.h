@@ -25,6 +25,11 @@ void PublishStatus(const Status& status);
 // Any thread. False before the first status.
 bool LatestStatus(Status& out);
 
+// A hunter tool refused for want of bullets (the presenter, VR::Quick::Output::no_bullets) at
+// `steady_ns`: the wrist's counter flashes red (VitalsRenderTick). Any thread; 0: never.
+void NoteBulletsShort(std::int64_t steady_ns);
+std::int64_t BulletsShortNs();
+
 struct GaugeState {
     std::int64_t tick_ns{0};   // the render tick's last run for a driven first-person frame
     std::int64_t anchor_ns{0}; // ... and the last one that found the forearm's dummies

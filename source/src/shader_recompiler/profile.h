@@ -44,6 +44,9 @@ struct Profile {
     bool supports_workgroup_explicit_memory_layout{};
     bool supports_amd_shader_explicit_vertex_parameter{};
     bool supports_fragment_shader_barycentric{};
+    // Attachment shading rates on (fixed foveated rendering): a fragment shader may read its
+    // fragment's size (ShadingRateKHR; the lamp shadows' AO pass, light_shadow.h SceneMaps).
+    bool supports_fragment_shading_rate{};
     bool has_broken_spirv_clamp{};
     bool lower_left_origin_mode{};
     bool needs_manual_interpolation{};
@@ -52,6 +55,9 @@ struct Profile {
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};
+    // Native stereo both-eye stages take the eye from vr_hud's sign bit and the last vertex stage
+    // writes gl_Layer (NativeStereo::LayerDraws), instead of multiview's ViewIndex.
+    bool native_layer_draws{};
 
     // Native stereo graphics: the per-draw VR values follow PushData in the push constants
     // (VrPushData) instead of being baked into each shader permutation. Derived from the limit

@@ -22,6 +22,19 @@ void SetCurrentThreadRealtime(std::chrono::nanoseconds period_ns);
 
 void SetCurrentThreadPriority(ThreadPriority new_priority);
 
+/// Windows: asks that this process never be power-throttled (EcoQoS). Windows 11 throttles a
+/// process whose window is not in the foreground, which in VR is always the case, and on hybrid
+/// Intel CPUs (12th generation and later) that moves its threads to the efficiency cores. Also
+/// keeps its timer resolution requests. Elsewhere, and on Windows versions without it, nothing.
+/// Returns what Windows accepted: 2 speed and timers, 1 speed only, 0 nothing.
+int DisableProcessPowerThrottling();
+
+/// Windows: on CPUs with cores of different speed (Intel 12th generation and later), asks that the
+/// calling thread run on the fastest cores. A preference, not a pin: Windows still uses the other
+/// cores when the fast ones are busy. Where every core is the same (AMD, older Intel) nothing
+/// changes. Returns how many cores the thread now prefers, 0 when nothing changed.
+int PreferPerformanceCores();
+
 void SetCurrentThreadName(const char* name);
 
 void SetThreadName(void* thread, const char* name);

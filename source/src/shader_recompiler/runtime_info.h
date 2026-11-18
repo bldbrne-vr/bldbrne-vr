@@ -284,6 +284,73 @@ struct RuntimeInfo {
     // A light rectangle's fragment stage with a tile of its own: the per-eye tile test, its
     // bounds baked in native_light_bounds (zero with VrPushData: the draw pushes them).
     bool native_light_scissor{};
+    // VR light shadows (ir/passes/light_shadow.h): such a light rectangle's fragment stage
+    // marches its near lights through the depth (the byte after native_light_scissor: the
+    // struct's layout is unchanged, older cache entries read it as off). LightShadow::Level: 0
+    // none, 1 the shadows, 2 High (the hero lamps' own march; a byte since 2026-11-17, a bool
+    // before, so older entries hold 0 or 1).
+    u8 vr_light_shadows{};
+    // The game's screen-space shading passes computed by ours (the next padding byte: the layout
+    // is unchanged; older cache entries hold 0 or 1, the AO bit): VrAmbientOcclusionBit, its AO
+    // pass (ir/passes/ambient_occlusion.h); VrMoonShadows, its moon-shadow mask
+    // (ir/passes/moon_shadow.h).
+    static constexpr u8 VrAmbientOcclusionBit = 1;
+    static constexpr u8 VrMoonShadows = 2;
+    // Wet streets (ir/passes/reflections.h): VrReflections, the game's trace computed by ours
+    // (VrReflectionsJitter: its jitter moves every frame, with an upscaler); VrReflectionComposite,
+    // its composite counting the reflection once.
+    static constexpr u8 VrReflections = 4;
+    static constexpr u8 VrReflectionsJitter = 8;
+    // The same bit on the game's AO programs (never a trace program): VrAoMaskOnly, ours writes the
+    // lamp shadows' mask and leaves the game's AO (ambient_occlusion.h MaskOnly).
+    static constexpr u8 VrAoMaskOnly = 8;
+    static constexpr u8 VrReflectionComposite = 16;
+    // The same bit on the game's AO programs (never the composite): VrAoLampShadows, ours does the
+    // lamp shadows' work in that pass too (light_shadow.h SceneMaps: the cubes, the mask), only
+    // with the lamp shadows on (2026-11-17: the mask is the default since, a session without lamp
+    // shadows must not pay for it).
+    static constexpr u8 VrAoLampShadows = 16;
+    // The same bit again on the composite (never a trace or AO program): VrBloodFloors, the
+    // reflection seen through blood on glossy floors (reflections.h Blood*). Its own key bit, so
+    // turning it on retranslates this one program and no other.
+    static constexpr u8 VrBloodFloors = 8;
+    // With our AO: the same composite darkens its shine by the specular occlusion
+    // (ir/passes/ambient_occlusion.h SpecOcclusion).
+    static constexpr u8 VrSpecularOcclusion = 32;
+    // The game's light programs and its ambient composite read a gloss widened by the normal's
+    // variance (ir/passes/specular_aa.h: less shimmer on shiny details).
+    static constexpr u8 VrSpecularAa = 64;
+    // The tone map's exposure follows the eye's adaptation (ir/passes/cinematic_look.h).
+    static constexpr u8 VrEyeAdaptation = 128;
+    u8 vr_ambient_occlusion{};
+    // The light composite's VR lighting (the last padding byte before native_light_bounds: the
+    // layout is unchanged; older cache entries hold 0 or 1): VrCompositeBounce, one bounce
+    // (ir/passes/bounce_light.h); VrCompositeFog, the lights in the air (ir/passes/fog_light.h).
+    static constexpr u8 VrCompositeBounce = 1;
+    static constexpr u8 VrCompositeFog = 2;
+    // VrCompositeShafts, the moonlight in the air (ir/passes/moon_shafts.h).
+    static constexpr u8 VrCompositeShafts = 4;
+    // Not the light composite's: the game's _Bloody_ G-buffer programs make their blood wet
+    // (ir/passes/wet_blood.h; this byte had bits to spare).
+    static constexpr u8 VrWetBlood = 8;
+    // Not the light composite's either: the game's soft particle programs take the frame's
+    // lights (ir/passes/particle_air.h); VrParticleAirPremul, their blend is premultiplied.
+    static constexpr u8 VrParticleAir = 16;
+    static constexpr u8 VrParticleAirPremul = 32;
+    // The game's three parallax programs walk their height maps in finer layers
+    // (ir/passes/parallax.h: deeper stones).
+    static constexpr u8 VrParallax = 64;
+    // A G-buffer program (five or more colour targets) whose bump map's height darkens its gaps
+    // (ir/passes/parallax.h BumpGaps).
+    static constexpr u8 VrBumpGaps = 128;
+    // Not the light composite's either: the shadow mask's blur and the scene's copy are the air
+    // pass's two hosts (ir/passes/air_light.h); on those two programs only.
+    static constexpr u8 VrAirPass = 1;
+    // On the air pass's three programs only (never a parallax program, whose bit this is): the
+    // mist comes from the fog grid (ir/passes/fog_grid.h). Its own key bit: a permutation made
+    // with the grid is never taken for one made without.
+    static constexpr u8 VrFogGrid = 64;
+    u8 vr_composite_light{};
     std::array<std::array<float,4>,2> native_light_bounds{};
     Stage stage;
     u32 num_user_data;
@@ -319,6 +386,9 @@ struct RuntimeInfo {
         }
         if (native_stereo != other.native_stereo || native_multiview != other.native_multiview || native_asymmetric != other.native_asymmetric || native_projection != other.native_projection) return false;
         if (native_light_scissor != other.native_light_scissor || native_light_bounds != other.native_light_bounds) return false;
+        if (vr_light_shadows != other.vr_light_shadows) return false;
+        if (vr_ambient_occlusion != other.vr_ambient_occlusion) return false;
+        if (vr_composite_light != other.vr_composite_light) return false;
         switch (stage) {
         case Stage::Fragment:
             return fs_info == other.fs_info;

@@ -37,8 +37,9 @@ inline std::atomic<std::uint64_t> generation{1};
 inline void Invalidate() { if (Enabled()) generation.fetch_add(1, std::memory_order_relaxed); }
 struct Memo {
     using Key = std::array<std::uint64_t, 5>;
-    // The largest upload: native stereo graphics with Shader::VrPushData (bytes 0..223).
-    static constexpr std::size_t Capacity = 224;
+    // The largest upload: native stereo graphics with Shader::VrPushData (bytes 0..231: the bump
+    // map's class at 224, 2026-11-12).
+    static constexpr std::size_t Capacity = 232;
     Key key{};
     std::array<unsigned char, Capacity> bytes{};
     std::uint64_t epoch{};

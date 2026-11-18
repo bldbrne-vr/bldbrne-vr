@@ -232,7 +232,26 @@ Headset ScanHeadset(const fs::path &runtime, const std::atomic_bool* cancel) {
     h.refresh_hz = j.value("refresh_hz", 0.0f);
     return h;
 }
-void CopyFixture(const fs::path &package, const fs::path &destination) {
+void CopyFixture(const fs::path &package, const fs::path &destination,
+                 const std::string &save_folder) {
+    if (save_folder.size() != 9 ||
+        !std::all_of(save_folder.begin(), save_folder.end(),
+                     [](char c) { return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); }))
+        throw std::runtime_error("Invalid game save folder for the benchmark save.");
+    // 1000/savedata/<the fixture's title>/SPRJ0005/... -> 1000/savedata/<save_folder>/...
+    const auto in_game_folder = [&](const fs::path &rel) {
+        // Only a file under 1000/savedata/<title>/: a shorter path would run past its end.
+        if (std::distance(rel.begin(), rel.end()) < 4 || *std::next(rel.begin()) != "savedata")
+            throw std::runtime_error("Benchmark save path is not under savedata.");
+        auto it = rel.begin();
+        fs::path out = *it++;
+        out /= *it++;
+        ++it;
+        out /= save_folder;
+        for (; it != rel.end(); ++it)
+            out /= *it;
+        return out;
+    };
     const auto manifest = Json::parse(Read(package / "manifest.json"));
     if (manifest.at("schema") != 1 || !manifest.at("files").is_array() ||
         manifest.at("files").empty())
@@ -252,9 +271,10 @@ void CopyFixture(const fs::path &package, const fs::path &destination) {
     fs::create_directories(destination);
     for (auto &f : manifest.at("files")) {
         const auto rel = SafeRelative(f.at("path").get<std::string>());
-        NoLinks(destination, rel);
-        fs::create_directories((destination / rel).parent_path());
-        fs::copy_file(package / "home" / rel, destination / rel);
+        const auto target = in_game_folder(rel);
+        NoLinks(destination, target);
+        fs::create_directories((destination / target).parent_path());
+        fs::copy_file(package / "home" / rel, destination / target);
     }
 }
 // Remove only owned paths beneath the scan root, never junction targets or player data.
@@ -319,7 +339,7 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
         if (!ValidGameRefreshHz(q.target_hz) || q.seconds < (adaptive ? 30u : 90u) || q.seconds > 300 ||
             q.display_hz < 30 || q.display_hz > 360)
             throw std::runtime_error("Invalid benchmark duration or target refresh rate.");
-        progress("Target: " + std::to_string(q.target_hz) + " FPS (8% tolerance). Checking benchmark save and runtime.");
+        progress("Target: " + std::to_string(q.target_hz) + " FPS with at least 13.8% reserve. Checking benchmark save and runtime.");
         const auto manifest = Json::parse(Read(q.package / "manifest.json"));
         const auto runtime_json = q.package / "runtime.json";
         const auto mock = q.package / "benchmark_xr.dll";
@@ -333,6 +353,7 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
         const auto game = GameExecutable(Path(q.profile.game));
         const auto support = GameSupportInfo(game);
         const auto version = CheckGameBuild(game);
+        const auto save_folder = SaveDataFolder(game.parent_path() / "sce_sys" / "param.sfo");
         if (std::find(manifest.at("game_versions").begin(), manifest.at("game_versions").end(),
                       Json(version)) == manifest.at("game_versions").end())
             throw std::runtime_error("Benchmark save is not validated for this game version.");
@@ -354,6 +375,9 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
         if (adaptive)
             candidates.clear();
         Json metadata{{"schema", 1},
+                      {"scan_policy", 2},
+                      {"required_reserve_percent", RequiredReservePercent},
+                      {"workload", "repeated-movement-melee-head-turns-v1"},
                       {"gpu", q.system.gpu},
                       {"driver", q.system.driver},
                       {"dedicated_vram_bytes", q.system.vram},
@@ -373,10 +397,11 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
                       {"search", quick ? "quick-temporal-first" : adaptive ? "temporal-first-adaptive" : "fixed-matrix"},
                       {"scan_budget_seconds", quick ? QuickScanBudgetSeconds : LongScanBudgetSeconds},
                       {"runtime_sha256", FileHash(Path(q.profile.runtime))},
+                      {"intel_sfx_workaround", q.profile.intel_sfx_workaround},
                       {"fixture_manifest", manifest},
                       {"startup_navigation",startup},
                       {"game", support},
-                      {"scope", "Controlled static-scene rendering estimate; fixed test FOV, "
+                      {"scope", "Controlled movement/attack rendering estimate; fixed test FOV, "
                                 "not headset/compositor or motion-quality certification"}};
         metadata["upscaler_files"] = Json::object();
         for (const auto *file : {"dlss/nvngx_dlss.dll", "dlss/vr_dlss_stereo.dll",
@@ -403,6 +428,10 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
         bool shared_cache = cache_module && GetProcAddress(cache_module, "BbvrSharedShaderCacheV1");
         if (cache_module) FreeLibrary(cache_module);
         const auto normal_text = Read(q.paths.Config());
+        // The player's frame timing (vr.ini frame_hooks: the hooks by default, 0 = 60 FPS++) is
+        // measured as played: its runs use the same game timing.
+        const auto player_hooks = VR::Ini::ValueOf(Read(q.paths.Ini()), "frame_hooks");
+        const std::string frame_hooks = player_hooks == "0" || player_hooks == "false" ? "0" : "1";
         const auto normal_config = normal_text.empty() ? Json::object() : Json::parse(normal_text);
         if (normal_config.contains("Vulkan") &&
             normal_config["Vulkan"].value("pipeline_cache_archived", false)) shared_cache = false;
@@ -415,14 +444,24 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
         progress("Verified bundled save. GPU: " + q.system.gpu + ".");
         std::vector<std::vector<Sample>> all(candidates.size());
         fs::path cache;
-        // The limit the current run is measured against: the budget, or for a quick scan's
-        // confirmation of a passing screen, QuickScanHardSeconds.
+        // The limit the current run is measured against: the budget, or for subsequent
+        // quick-scan adaptive steps and confirmation, QuickScanHardSeconds.
         double run_limit = work_limit;
+        // The quick scan's next step (benchmark.cpp NextQuickCandidate), from the results so far.
+        const auto next_quick = [&](bool screen = false) {
+            return NextQuickCandidate(q.system, DlssIncluded(Path(q.profile.runtime)),
+                                      Fsr4Included(Path(q.profile.runtime)), report.results,
+                                      q.target_hz, screen, Fsr31Included(Path(q.profile.runtime)),
+                                      &q.headset);
+        };
         while (!cancel) {
-            // A confirmed quick recommendation completes the search normally.
-            // Do not relabel it as budget-limited merely because another run
-            // would not fit in the remaining time.
-            if (quick && Recommend(report.results)) break;
+            // A confirmed quick recommendation completes the search normally (only the final
+            // choice is confirmed). Do not relabel it as budget-limited merely because another
+            // run would not fit in the remaining time.
+            if (quick) {
+                const auto chosen=Recommend(report.results);
+                if(chosen && report.results[*chosen].meets_target) break;
+            }
             if (elapsed() >= (quick ? QuickScanHardSeconds : work_limit)) {
                 report.time_limited = true;
                 break;
@@ -441,24 +480,28 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
                 }
                 const bool screen = completed_runs == 0 ||
                                     elapsed() + 2 * estimated_run * 1.1 < QuickScanWorkSeconds;
-                auto next = quick ? NextQuickCandidate(q.system, DlssIncluded(Path(q.profile.runtime)),
-                                    Fsr4Included(Path(q.profile.runtime)), report.results, q.target_hz, screen, Fsr31Included(Path(q.profile.runtime)), &q.headset)
+                auto next = quick ? next_quick(screen)
                                   : NextCandidate(q.system, DlssIncluded(Path(q.profile.runtime)),
                                     Fsr4Included(Path(q.profile.runtime)), report.results, q.target_hz, Fsr31Included(Path(q.profile.runtime)), &q.headset);
                 if (!next)
                     break;
                 if (quick && completed_runs) {
-                    // A new screen must start inside the budget (and `screen` already left room
-                    // for its confirmation). Confirming a passing screen may run on to the hard
-                    // limit: a slow PC's runs are long, and it should still get a confirmed answer.
-                    const bool confirmation = std::any_of(report.results.begin(), report.results.end(),
+                    // Runs may use the time up to the hard limit (NextQuickCandidate keeps them
+                    // few: one per adaptive step, a second only for the final choice). A new step
+                    // that would leave no room for that confirmation gives way to confirming the
+                    // best choice so far, so the scan still ends with a confirmed answer.
+                    bool confirmation = std::any_of(report.results.begin(), report.results.end(),
                         [&](const auto &r) { return r.candidate.id == next->id && r.provisional; });
-                    if (confirmation ? elapsed() + estimated_run * 1.1 > QuickScanHardSeconds
-                                     : QuickScanWorkSeconds - elapsed() < estimated_run * .9) {
+                    if (!confirmation && elapsed() + 2 * estimated_run * 1.1 > QuickScanHardSeconds)
+                        if (const auto best = Recommend(report.results, true)) {
+                            next = report.results[*best].candidate;
+                            confirmation = true;
+                        }
+                    if (elapsed() + estimated_run * 1.1 > QuickScanHardSeconds) {
                         report.time_limited = true;
                         break;
                     }
-                    run_limit = confirmation ? QuickScanHardSeconds : work_limit;
+                    run_limit = QuickScanHardSeconds;
                 }
                 if (!report.results.empty() && next->id != report.results.back().candidate.id) {
                     const auto& previous = report.results.back().candidate;
@@ -491,7 +534,9 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
                 // Reverse the second pass to reduce systematic ordering bias.
                 for (size_t index = begin; index < (quick ? begin + 1 : candidates.size()) && !cancel; ++index) {
                     const size_t i = repeat ? candidates.size() - 1 - (index - begin) : index;
-                    const auto &c = candidates[i];
+                    auto &c = candidates[i];
+                    c.upscale_focus = FoveatedUpscaleAvailable(c.graphics, c.stereo)
+                        ? ScanFoveatedUpscale : 0;
                     const unsigned run_number = quick ? unsigned(all[i].size()) + 1 : repeat + 1;
                     progress(quick ? (run_number == 1 ? "Screening: " : "Confirming: ") + c.label : repeat < 2 ? "Pass " + std::to_string(repeat + 1) + " of 2: " + c.label
                                         : "Retry after an invalid sample: " + c.label);
@@ -507,6 +552,8 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
                     fs::create_directory(dir);
                     Paths isolated{dir};
                     Profile p = q.profile;
+                    p.non_aggro = false;
+        p.free_camera = false; // benchmarks always use the normal camera
                     p.refresh_hz = 90; // Start from the audited template before private uncapping.
                     p.follow_headset = false; // The scan owns its controlled display cadence.
                     p.saves = PathText(isolated.User() / "home");
@@ -514,9 +561,11 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
                     fs::create_directories(Path(p.saves));
                     Write(isolated.Ini(),
                           VR::Ini::ApplyEdits("", {{"graphics_config", GraphicsText(c.graphics)},
-                                                   {"dlss_model", c.model},
+                                                   {"upscale_focus", std::to_string(c.upscale_focus)},
+                                                   {"dlss_model", "builtin"}, // the preset's model
                                                    {"aa_mode", "smaa"},
-                                                   {"dibr_eye_taa", "0.25"}}));
+                                                   {"dibr_eye_taa", "0.25"},
+                                                   {"frame_hooks", frame_hooks}}));
                     // A fresh portable user profile must never invoke migration of the
                     // player's saves.
                     Json users = Json::array();
@@ -535,7 +584,7 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
                     if (!fs::remove(Path(p.saves)))
                         throw std::runtime_error(
                             "Benchmark home was unexpectedly populated before fixture copy.");
-                    CopyFixture(q.package, Path(p.saves));
+                    CopyFixture(q.package, Path(p.saves), save_folder);
                     auto config = Json::parse(Read(isolated.Config()));
                     config["GPU"]["vblank_frequency"] = 360;
                     config["Log"] = {
@@ -566,7 +615,10 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
                     Write(isolated.Ini(),
                           VR::Ini::ApplyEdits(Read(isolated.Ini()),
                                               {{"frame_cap", "off"},
-                                               {"refresh_hz", std::to_string(q.display_hz)}}));
+                                               {"refresh_hz", std::to_string(q.display_hz)},
+                                               // The frame-rate hooks (frame_hooks): uncapped
+                                               // as the patch's deadline below.
+                                               {"game_fps", "360"}}));
                     const auto patch = isolated.User() / "patches/bbvr_patch.xml";
                     Write(patch, UncapPatch(Read(patch)));
                     if (!shared_cache && !cache.empty())
@@ -595,6 +647,9 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
                          {L"VR_GPU_TIMING", L"1"},
                          {L"VR_GPU_TIMING_WINDOW_S", std::to_wstring(ScanSweepSeconds)},
                          {L"VR_FRAME_TIMES", L"1"},
+                         {L"VR_MELEE_LOG", L"1"},
+                         {L"VR_ANIM_LOG", L"1"},
+                         {L"MOCKXR_HANDS", L"rest"},
                          {L"VR_LATENCY_GPU", L"1"}});
                     if (shared_cache)
                         Environment(plan, {{L"BBVR_SHADER_CACHE_ROOT", shared_cache_root.wstring()}});
@@ -620,15 +675,23 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
                     // When gameplay began (the first projection): a slow PC loads later, and its
                     // run is extended so it still gets ScanGameplaySeconds of play to measure.
                     std::optional<std::chrono::steady_clock::time_point> gameplay;
+                    bool activity_started=false;
                     while (!cancel && !child.Finished()) {
                         if (elapsed() >= run_limit) {
                             report.time_limited = true;
                             break;
                         }
                         const auto now = std::chrono::steady_clock::now();
-                        if (adaptive && !gameplay &&
+                        if (!gameplay &&
                             Read(LogFile(isolated)).find("VR projection: ") != std::string::npos)
                             gameplay = now;
+                        if(gameplay && !activity_started && !fs::exists(dir/"input.txt")) {
+                            // Publish atomically so MockXR cannot consume a partial script.
+                            Write(dir/"input.pending",ScanInput());
+                            fs::rename(dir/"input.pending",dir/"input.txt");
+                            activity_started=true;
+                            progress("Measuring repeated movement, physical attacks and head turns.");
+                        }
                         if (now - begin >= std::chrono::seconds(deadline_seconds)) {
                             const unsigned wanted = gameplay
                                 ? unsigned(std::ceil(std::chrono::duration<double>(*gameplay - begin).count())) +
@@ -647,7 +710,7 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
                             const auto partial = Read(LogFile(isolated));
                             // Keep all warmup, sample-count, pacing and provider checks.
                             // Background CPU telemetry is evaluated on the completed range below.
-                            if (Analyze(partial, q.headset, c, 0).valid) {
+                            if (Analyze(partial, q.headset, c, 0).valid && ScanActivityObserved(partial)) {
                                 progress("Enough warmed-up data collected; evaluating " + c.label);
                                 break;
                             }
@@ -690,6 +753,10 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
                         }
                     }
                     auto sample = Analyze(text, q.headset, c, other);
+                    if(sample.valid && (!activity_started || !ScanActivityObserved(text))) {
+                        sample.valid=false;
+                        sample.reason="Movement and at least three physical attacks were not confirmed during measurement.";
+                    }
                     if (text.find("GPU_Model: " + q.system.gpu) == std::string::npos) {
                         sample.valid = false;
                         sample.reason = "Measured Vulkan GPU differs from the scanned adapter.";

@@ -1,4 +1,4 @@
-"""Fetch pinned DLSS SDK/runtime and FSR 4 assets into ignored local storage.
+"""Fetch pinned DLSS SDK/runtime, FSR 4 assets and AMD's FSR 4.1 SDK into ignored local storage.
 Does not load DLLs, change the emulator build, or deploy beside a running executable.
 """
 from pathlib import Path, PurePosixPath
@@ -11,6 +11,9 @@ import urllib.request
 ROOT = Path(__file__).resolve().parent / "local" / "dependencies"
 DLSS = ("NVIDIA/DLSS", "374959484e79a640feaba44c93ac8cfb0a03f5b5")
 FSR = ("FireBurn/Q2RTX", "ae8d628fae208813172446d1e49ed94150b04658")
+# AMD FSR SDK v2.4.0 (2026-10-28): FSR Upscaling 4.1.2, the first with Vulkan. Its signed loader
+# and upscaler DLLs are under the SDK's MIT-style section of docs/license.md.
+FSR41 = ("GPUOpen-LibrariesAndSDKs/FidelityFX-SDK", "7539ae8b6568ad29ed78a753404351daf3b5cca7")
 
 
 def read(url):
@@ -87,14 +90,26 @@ def fsr_files(entries):
     return [("baseq2/fsr4_shaders/" + name, name) for name in names]
 
 
+def fsr41_files(entries):
+    # The Vulkan loader and upscaler, the API headers the bridge builds against, the license.
+    required = ["docs/license.md", "Kits/FidelityFX/signedbin/amd_fidelityfx_loader_vk.dll",
+                "Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_vk.dll"]
+    required += sorted(p for p in entries if p.startswith("Kits/FidelityFX/api/include/")
+                       and "/dx12/" not in p)
+    required += sorted(p for p in entries if p.startswith("Kits/FidelityFX/upscalers/include/"))
+    return [(p, p) for p in required]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--provider", choices=("all", "dlss", "fsr4"), default="all")
+    parser.add_argument("--provider", choices=("all", "dlss", "fsr4", "fsr41"), default="all")
     args = parser.parse_args()
     if args.provider in ("all", "dlss"):
         fetch_set("dlss-sdk", DLSS, dlss_files)
     if args.provider in ("all", "fsr4"):
         fetch_set("fsr4_shaders", FSR, fsr_files)
+    if args.provider in ("all", "fsr41"):
+        fetch_set("fsr-sdk-2.4.0", FSR41, fsr41_files)
     print("Dependencies staged only; no DLL loaded or emulator changed.")
 
 

@@ -98,15 +98,37 @@ int GameController::ReadStates(State* states, int states_num) {
 
 void GameController::Button(OrbisPadButtonDataOffset button, bool is_pressed) {
     std::lock_guard lock{m_state_mutex};
-    m_state.OnButton(button, is_pressed);
+    m_state.OnButton(button, m_layers.PhysicalButton(static_cast<u32>(button), is_pressed));
     PushStateLocked();
 }
 
 void GameController::Axis(Input::Axis axis, int value, bool smooth) {
     std::lock_guard lock{m_state_mutex};
+    const auto shown = m_layers.PhysicalAxis(std::to_underlying(axis), value);
+    if (!shown) {
+        return; // the presenter drives it: the gamepad's shows when it lets go
+    }
     const u64 timestamp = Libraries::Kernel::sceKernelGetProcessTime();
-    m_state.OnAxis(axis, value, timestamp, smooth);
+    m_state.OnAxis(axis, *shown, timestamp, smooth);
     PushStateLocked(timestamp);
+}
+
+void GameController::InjectButton(OrbisPadButtonDataOffset button, bool is_pressed) {
+    std::lock_guard lock{m_state_mutex};
+    m_state.OnButton(button, m_layers.InjectButton(static_cast<u32>(button), is_pressed));
+    PushStateLocked();
+}
+
+void GameController::InjectAxis(Input::Axis axis, int value) {
+    std::lock_guard lock{m_state_mutex};
+    const u64 timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+    m_state.OnAxis(axis, m_layers.InjectAxis(std::to_underlying(axis), value), timestamp, false);
+    PushStateLocked(timestamp);
+}
+
+PadLayers::Physical GameController::Physical() {
+    std::lock_guard lock{m_state_mutex};
+    return m_layers.PhysicalNow();
 }
 
 void GameController::UpdateGyro(const float gyro[3]) {
@@ -157,6 +179,8 @@ void GameController::SetTouchpadState(int touch_index, bool touch_down, float x,
 void GameController::ConnectController(SDL_Gamepad* pad) {
     std::lock_guard lock{m_state_mutex};
     m_sdl_gamepad = pad;
+    m_gamepad_type.store(pad ? SDL_GetGamepadType(pad) : SDL_GAMEPAD_TYPE_UNKNOWN,
+                         std::memory_order_relaxed);
     m_states_queue.Clear();
     if (!m_state.connected) {
         ++m_state.connected_count;
@@ -173,10 +197,13 @@ void GameController::DisconnectController() {
     std::lock_guard lock{m_state_mutex};
     m_states_queue.Clear();
     m_sdl_gamepad = nullptr;
+    m_gamepad_type.store(SDL_GAMEPAD_TYPE_UNKNOWN, std::memory_order_relaxed);
 
     const u8 connected_count = m_state.connected_count;
     m_state = {};
     m_state.connected_count = connected_count;
+    // Both layers with it (the presenter's PadMapper resends what it holds on the reconnect).
+    m_layers = {};
     std::fill(gyro_buf, gyro_buf + 3, 0.0f);
     std::fill(accel_buf, accel_buf + 3, 0.0f);
     accel_buf[1] = 9.81f;
@@ -263,6 +290,15 @@ bool GameController::SetVibration(u8 smallMotor, u8 largeMotor) {
 }
 
 static bool is_first_check = true;
+
+SDL_GamepadType FirstGamepadType() {
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    const SDL_GamepadType type = ids != nullptr && count > 0 ? SDL_GetGamepadTypeForID(ids[0])
+                                                             : SDL_GAMEPAD_TYPE_UNKNOWN;
+    SDL_free(ids);
+    return type;
+}
 
 void GameControllers::TryOpenSDLControllers() {
     using namespace Libraries::UserService;

@@ -18,7 +18,7 @@ static void EmitVertexMotion(EmitContext& ctx) {
         ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant, ctx.F32[1]),
                           ctx.push_data_block, ctx.ConstU32(PushData::VrHudIndex));
     const Id pair_index = ctx.OpShiftRightLogical(
-        u32_type, ctx.OpConvertFToU(u32_type, ctx.OpLoad(ctx.F32[1], param_ptr)),
+        u32_type, ctx.OpConvertFToU(u32_type, ctx.NativeHud(ctx.OpLoad(ctx.F32[1], param_ptr))),
         ctx.ConstU32(VrMotion::ParameterShift));
     const Id param_index = ctx.OpIAdd(u32_type, pair_index, ctx.NativeEyeIndex());
     // VrPushData: each address is a uvec2 {low, high} of the push block, bitcast to a u64.
@@ -76,7 +76,9 @@ static void EmitVertexMotion(EmitContext& ctx) {
                             ctx.u32_zero_value));
     };
     const Id do_store = flag(VrMotion::FlagStore);
-    const Id do_load = flag(VrMotion::FlagLoad);
+    // A body-map capture (VrMotion::Capture) only stores, w the frame's tag.
+    const bool capture = motion.Capture();
+    const Id do_load = capture ? ctx.false_value : flag(VrMotion::FlagLoad);
     const Id store_label = ctx.OpLabel();
     const Id store_merge = ctx.OpLabel();
     ctx.OpSelectionMerge(store_merge, spv::SelectionControlMask::MaskNone);
@@ -84,16 +86,16 @@ static void EmitVertexMotion(EmitContext& ctx) {
     ctx.AddLabel(store_label);
     const Id store_address = address(positions_buffer, motion.positions_address, 0,
                                      ctx.OpIAdd(u32_type, store_base, slot), 16);
-    // Indexed draws may invoke the same vertex more than once. Atomic component stores
-    // avoid write/write races; all these invocations produce the same clip position.
-    const Id scalar_ptr = ctx.TypePointer(spv::StorageClass::PhysicalStorageBuffer, u32_type);
-    const Id scope = ctx.ConstU32(static_cast<u32>(spv::Scope::Device));
-    for (u32 i = 0; i < 4; ++i) {
-        const Id ptr = ctx.OpConvertUToPtr(
-            scalar_ptr, ctx.OpIAdd(ctx.U64, store_address, ctx.Constant(ctx.U64, u64(i * 4))));
-        const Id bits = ctx.OpBitcast(u32_type, ctx.OpCompositeExtract(ctx.F32[1], position, i));
-        ctx.OpAtomicExchange(u32_type, ptr, scope, ctx.u32_zero_value, bits);
-    }
+    // Indexed draws may invoke the same vertex more than once. They all write the same clip
+    // position, so one aligned 16-byte store leaves the same bytes in any interleaving (four
+    // atomic component exchanges cost ~0.05 ms of the scene's 3.2 at the user's settings on an
+    // RTX 5080, 2026-11-08, for the same result).
+    const Id stored =
+        capture ? ctx.OpCompositeInsert(ctx.F32[4], ctx.OpBitcast(ctx.F32[1], load_base),
+                                        position, 3u)
+                : position;
+    ctx.OpStore(ctx.OpConvertUToPtr(f32x4_ptr, store_address), stored,
+                spv::MemoryAccessMask::Aligned, 16u);
     ctx.OpBranch(store_merge);
     ctx.AddLabel(store_merge);
 

@@ -75,6 +75,10 @@ struct FetchShaderSnapshot {
     std::vector<u32> words;
     FetchShaderData data;
 };
+// The startup shader build's recording: while set on this thread, ParseFetchShader keeps its
+// result here (translation_capture.h).
+inline thread_local std::optional<FetchShaderData>* g_fetch_capture = nullptr;
+
 std::shared_ptr<const FetchShaderSnapshot> FindFetchShaderSnapshot(
     const Info& info, const FetchShaderData& expected);
 

@@ -36,15 +36,40 @@ void GuardExit(const std::array<bool, N>& raw, std::array<bool, N>& input,
 class ExitGuard {
 public:
     static constexpr float SettleSeconds = 0.15f;
+    // The grips (the menu's Square / Triangle: an item, a blood vial once gameplay resumes) stay
+    // held back after Back while the menu is still up, at most this long: a quick Back's settle
+    // can end before the game's closing fade does (2026-11-06: "sometimes when I close
+    // the menu by pressing B quickly, it still uses an item (blood vial)").
+    static constexpr float GripHoldSeconds = 0.6f;
 
-    void Reset() { settle_left = 0.0f; }
+    void Reset() { settle_left = 0.0f; blocked_hold_was = false; grip_hold_left = 0.0f; }
+    // A custom VR page closes without sending the game's Back button. Give that
+    // hand-over the same protection as backing out of a game menu.
+    void BeginClose() { settle_left = SettleSeconds; blocked_hold_was = false; }
+    [[nodiscard]] bool Settling() const { return settle_left > 0.0f; }
+    // A grip squeezed in GripHoldSeconds was held back since the last call (logs).
+    bool TakeGripCaught() { const bool c = grip_caught; grip_caught = false; return c; }
 
     template <std::size_t N>
     void Update(const std::array<bool, N>& raw, std::array<bool, N>& input,
                 std::array<bool, N>& blocked, bool menu_live,
-                std::size_t back_right, std::size_t back_left, float dt) {
+                std::size_t back_right, std::size_t back_left, float dt,
+                std::size_t grip_r = N, std::size_t grip_l = N) {
         const bool back = raw[back_right] || raw[back_left];
-        settle_left = back ? SettleSeconds : std::max(0.0f, settle_left - dt);
+        // A blocked squeeze can outlast Back. Do not let another squeeze become
+        // a fresh menu action while the hands are still finishing that hand-over.
+        bool blocked_hold = false;
+        if (Settling()) {
+            for (std::size_t i = 0; i < N; ++i) {
+                if (i != back_right && i != back_left) blocked_hold |= raw[i] && blocked[i];
+            }
+        }
+        // Once every blocked control is released, a fresh deliberate press can work
+        // immediately; there is no extra dead time after finishing the hand-over.
+        const bool released = blocked_hold_was && !blocked_hold && !back;
+        settle_left = released ? 0.0f : back || blocked_hold ? SettleSeconds
+                                                           : std::max(0.0f, settle_left - dt);
+        blocked_hold_was = blocked_hold;
         if (!menu_live || back) {
             GuardExit(raw, input, blocked, menu_live, back_right, back_left);
         } else if (settle_left > 0.0f) {
@@ -54,10 +79,27 @@ public:
                 input[i] = false;
             }
         }
+        // GripHoldSeconds: from Back, in a live menu; gone the moment the menu is (a squeeze it
+        // held stays blocked until let go, as any other).
+        grip_hold_left = !menu_live ? 0.0f
+                         : back     ? GripHoldSeconds
+                                    : std::max(0.0f, grip_hold_left - dt);
+        if (grip_hold_left > 0.0f) {
+            for (const std::size_t g : {grip_r, grip_l}) {
+                if (g < N && raw[g]) {
+                    grip_caught = grip_caught || !blocked[g];
+                    blocked[g] = true;
+                    input[g] = false;
+                }
+            }
+        }
     }
 
 private:
     float settle_left{};
+    bool blocked_hold_was{};
+    float grip_hold_left{};
+    bool grip_caught{};
 };
 
 } // namespace VR::MenuInput

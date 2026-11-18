@@ -95,13 +95,10 @@ private:
 };
 
 // Chamber and gesture state. Only confirmed shots empty the chamber.
-// A flick reloads (2026-10-16, the tester: no "still first", any strong flick once PostShotNs has
-// passed): over the last FlickNs of samples since the shot's PostShotNs, the wrist's fastest
-// sample reached FlickSpeed and its net turn from any of those samples to now reached
-// MinExcursion. Motion before PostShotNs (the recoil, the wrist settling) never counts, and a
-// moving hand needs no pause first. Near the body (Step's `near`: the hand close to the torso, or
-// its position only inferred) the peak must be NearFlickSpeed, so a slow turn there (the wrist
-// gauge, the hip, a pouch) never reloads while a quick ordinary flick does.
+// A vertical snap arms the reload. A downward snap needs more speed than an upward one. Once armed,
+// lowering it back by ReturnAngle at any speed within ReturnNs loads it (2026-11-06, the user: "a lot
+// lot more forgiving, but still there", then 500 ms; was 5 degrees within 300 ms); going over the top
+// counts.
 class WristReload {
 public:
     void Reset() {
@@ -146,16 +143,20 @@ public:
         if (serial == pending_)
             pending_ = 0;
     }
-    void Shot(std::int64_t now) {
+    void Shot(std::int64_t now, Body::Vec3 barrel = {0, 0, -1}, Family family = Family::Pistol) {
         if (!enabled_) {
             return;
         }
         pending_ = 0;
         empty_ = true;
         shot_ns_ = now;
+        post_shot_ns_ = family == Family::Cannon || family == Family::ChurchCannon
+                            ? 300'000'000 : PostShotNs;
+        barrel_ = Body::LengthSq(barrel) > 0.5f ? barrel : Body::Vec3{0, 0, -1};
         InvalidateMotion();
     }
     void InvalidateMotion() {
+        return_until_ = 0;
         previous_ns_ = 0;
         count_ = 0;
         burst_ = false;
@@ -200,6 +201,7 @@ public:
         const auto delta = now - previous_ns_;
         if (!previous_ns_ || delta <= 0 || delta > 100'000'000) {
             End(now, ReloadEnd::Blocked); // no samples for a while (a menu, the screen)
+            InvalidateMotion();
             previous_ = q;
             previous_ns_ = now;
             count_ = 0;
@@ -210,17 +212,18 @@ public:
         const std::int64_t before_ns = previous_ns_;
         previous_ = q;
         previous_ns_ = now;
-        if (!empty_ || now - shot_ns_ < PostShotNs) {
+        if (!empty_ || now - shot_ns_ < post_shot_ns_) {
             count_ = 0;
             return false;
         }
         // A tracking jump empties the window: nothing before it is part of a flick.
         if (speed > MaxSpeed) {
+            return_until_ = 0;
             End(now, ReloadEnd::TrackingJump);
             count_ = 0;
             return false;
         }
-        // The window: the samples of the last FlickNs since PostShotNs (the first one is where
+        // The window: the samples of the last FlickNs since the shot's delay (the first one is where
         // the wrist was when the window opened, its speed not counted).
         // A burst (one movement) runs from its first sample over QuietSpeed until it slows again.
         if (speed >= QuietSpeed && !burst_) {
@@ -235,43 +238,94 @@ public:
         const std::uint8_t id = burst_ ? burst_id_ : 0;
         if (burst_) {
             Note(near_sample);
-            peak_all_ = std::max(peak_all_, speed);
             burst_near_[id] = burst_near_[id] || near_sample.near;
         }
-        // The window's first sample: the previous one when it is past PostShotNs too; otherwise
+        const auto muzzle = Body::Rotate(q, barrel_);
+        const float pitch = std::asin(std::clamp(muzzle.y, -1.0f, 1.0f));
+        if (return_until_) {
+            // Swinging over the top (past straight up or down) reads as the way back, and counts.
+            if (now > return_until_) {
+                End(now, ReloadEnd::Expired);
+                InvalidateMotion();
+                return false;
+            }
+            const float directed_pitch = stroke_sign_ * pitch;
+            apex_ = std::max(apex_, directed_pitch);
+            if (apex_ - directed_pitch >= ReturnAngle) {
+                End(now, ReloadEnd::Reloaded);
+                empty_ = false;
+                InvalidateMotion();
+                return true;
+            }
+            return false;
+        }
+        // The window's first sample: the previous one when it is past the shot's delay too; otherwise
         // this one, its speed not counted (its step began before the cutoff: the recoil would
         // leak in).
-        const bool straddles = count_ == 0 && before_ns - shot_ns_ < PostShotNs;
+        const bool straddles = count_ == 0 && before_ns - shot_ns_ < post_shot_ns_;
+        const float last_pitch = count_ ? samples_[(first_ + count_ - 1) % samples_.size()].pitch
+            : std::asin(std::clamp(Body::Rotate(before, barrel_).y, -1.0f, 1.0f));
+        const float rise_speed = (pitch - last_pitch) / (static_cast<float>(delta) * 1e-9f);
         if (count_ == 0 && !straddles)
-            Push({before_ns, before, 0.0f, near_sample.near, id});
-        Push({now, q, straddles ? 0.0f : speed, near_sample.near, id});
+            Push({before_ns, last_pitch, 0.0f, near_sample.near, id});
+        Push({now, pitch, straddles ? 0.0f : rise_speed, near_sample.near, id});
         while (count_ > 1 && now - samples_[first_].ns > FlickNs)
             Drop();
         // Near: a sample near the body in the window, or one of a movement that was near at any
         // moment (a slow turn at the hip that leaves the body before it ends never reloads).
-        float peak = 0.0f, turn = 0.0f;
+        float peak = 0.0f, turn = 0.0f, down_peak = 0.0f, down_turn = 0.0f;
         bool near = false;
-        for (std::size_t i = 0; i < count_; ++i) {
-            const Sample& s = samples_[(first_ + i) % samples_.size()];
-            peak = std::max(peak, s.speed);
-            turn = std::max(turn, Turn(q, s.q));
+        // Walk backward along the current stroke. Once it has reversed by the return angle,
+        // older motion cannot supply either speed or distance to that direction.
+        bool seeking_up = true, seeking_down = true;
+        float newer_speed = 0.0f; // speed of the interval from this sample to the newer one
+        for (std::size_t i = count_; i > 0; --i) {
+            const Sample& s = samples_[(first_ + i - 1) % samples_.size()];
+            const float rise = pitch - s.pitch;
+            seeking_up = seeking_up && turn - rise < StrokeReversal;
+            seeking_down = seeking_down && down_turn + rise < StrokeReversal;
+            if (seeking_up) {
+                peak = std::max(peak, newer_speed);
+                turn = std::max(turn, rise);
+            }
+            if (seeking_down) {
+                down_peak = std::max(down_peak, -newer_speed);
+                down_turn = std::max(down_turn, -rise);
+            }
+            newer_speed = s.speed;
             near = near || s.near || (s.burst != 0 && burst_near_[s.burst]);
         }
-        if (burst_)
-            turn_max_ = std::max(turn_max_, turn);
-        if (peak >= Need(near) && turn >= MinExcursion) {
-            End(now, ReloadEnd::Reloaded);
-            empty_ = false;
-            // The trigger is already released: accept its next press, even next frame.
-            InvalidateMotion();
-            return true;
+        if (burst_) {
+            const bool descending = down_turn > turn;
+            const float excursion = descending ? down_turn : turn;
+            if (excursion >= turn_max_) {
+                stroke_sign_ = descending ? -1.0f : 1.0f;
+                turn_max_ = excursion;
+                peak_all_ = descending ? down_peak : peak;
+            }
+        }
+        const bool up = peak >= Need(near) && turn >= MinExcursion;
+        const bool down = down_peak >= Need(near) + DownSpeedExtra && down_turn >= MinExcursion;
+        if (up || down) {
+            // The stroke can finish gently after the fast part of the burst has ended.
+            if (!burst_) {
+                burst_ = true;
+                attempt_ns_ = samples_[first_].ns;
+            }
+            stroke_sign_ = up ? 1.0f : -1.0f;
+            peak_all_ = up ? peak : down_peak;
+            turn_max_ = up ? turn : down_turn;
+            near_ = near;
+            apex_ = stroke_sign_ * pitch;
+            return_until_ = now + ReturnNs;
+            return false;
         }
         if (burst_ && speed < QuietSpeed)
             End(now, Verdict()); // the burst slowed down without a reload
         return false;
     }
     // A flick counts from PostShotNs after the shot (120 ms with a still wrist first until
-    // 2026-10-16, then 200; now 100 ms, no pause needed), 5.5 rad/s and 26 degrees within
+    // 2026-10-16, then 200; now 100 ms, cannons 300 ms, no pause needed), 5.5 rad/s and 26 degrees within
     // FlickNs; near the body 6.5 rad/s, the same turn.
     static constexpr std::int64_t PostShotNs = 100'000'000;
     static constexpr std::int64_t FlickNs = 180'000'000;
@@ -282,9 +336,18 @@ public:
     static constexpr float MinExcursion = 26.0f * Body::Deg; // net wrist turn, near or far
 
 private:
+    static constexpr float DownSpeedExtra = 2.5f; // rad/s above the upward threshold
+    // A stroke ends where it reversed this much (the walk back over the window).
+    static constexpr float StrokeReversal = 5.0f * Body::Deg;
+    // Once armed: the lowering that loads it, within ReturnNs.
+    static constexpr float ReturnAngle = 3.0f * Body::Deg;
+    static constexpr std::int64_t ReturnNs = 500'000'000;
+    Body::Vec3 barrel_{0, 0, -1};
+    float apex_{}, stroke_sign_{1.0f};
+    std::int64_t return_until_{};
     struct Sample {
         std::int64_t ns{};
-        Body::Quat q{};
+        float pitch{};
         float speed{};
         bool near{};
         std::uint8_t burst{}; // the movement it is part of (0: none)
@@ -303,8 +366,11 @@ private:
         --count_;
     }
     // Why a burst that did not reload ended: by its peak and turn.
+    float AttemptSpeed() const {
+        return Need(near_) + (stroke_sign_ < 0 ? DownSpeedExtra : 0.0f);
+    }
     ReloadEnd Verdict() const {
-        return peak_all_ < Need(near_)       ? ReloadEnd::TooSlow
+        return peak_all_ < AttemptSpeed()       ? ReloadEnd::TooSlow
                : turn_max_ < MinExcursion ? ReloadEnd::TooSmall
                                           : ReloadEnd::Expired;
     }
@@ -315,7 +381,7 @@ private:
         burst_ = false;
         attempt_ = {why,         near_, peak_all_, turn_max_,
                     static_cast<float>(static_cast<double>(now - attempt_ns_) * 1e-6),
-                    Need(near_), near_inferred_, near_close_, closest_};
+                    AttemptSpeed(), near_inferred_, near_close_, closest_};
         has_attempt_ = true;
     }
     // A frame of the burst: near once is near for the whole burst; why, and the closest tracked
@@ -336,6 +402,7 @@ private:
     float closest_{-1.0f};
     float peak_all_{}, turn_max_{};
     std::int64_t previous_ns_{}, shot_ns_{}, request_ns_{}, attempt_ns_{};
+    std::int64_t post_shot_ns_{PostShotNs}; // captured at the shot; cannon recoil needs 300 ms
     std::uint32_t pending_{};
     bool enabled_{true};
     bool empty_{}, rejected_hold_{};

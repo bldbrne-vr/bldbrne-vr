@@ -26,11 +26,20 @@
 #include "core/file_sys/file_override.h"
 #include "core/vr/bloodborne_body.h"
 #include "core/vr/bloodborne_camera.h"
+#include "core/vr/bloodborne_deflect.h"
 #include "core/vr/body_channel.h"
+#include "core/vr/free_camera.h"
+#include "core/vr/glow_push.h"
 #include "core/vr/grab_camera.h"
+#include "core/vr/riposte_style.h"
 #include "core/vr/root_height_hold.h"
 #include "core/vr/bloodborne_enemy_bars.h"
+#include "core/vr/bloodborne_kos_lights.h"
+#include "core/vr/bloodborne_ebrietas.h"
+#include "core/vr/bloodborne_lamp_light.h"
+#include "core/vr/bloodborne_woods_shadows.h"
 #include "core/vr/bloodborne_lights.h"
+#include "core/vr/bloodborne_shadow_cascades.h"
 #include "core/vr/bloodborne_evasion.h"
 #include "core/vr/bloodborne_facing.h"
 #include "core/vr/bloodborne_gun.h"
@@ -43,10 +52,17 @@
 #include "core/vr/bloodborne_stagger.h"
 #include "core/vr/bloodborne_status.h"
 #include "core/vr/bloodborne_menu.h"
+#include "core/vr/bloodborne_frame_rate.h"
+#include "core/vr/bloodborne_gpu_memory.h"
 #include "core/vr/bloodborne_lamps.h"
+#include "core/vr/game_reflections.h"
+#include "core/vr/bloodborne_respec.h"
+#include "core/vr/soft_save.h"
 #include "core/vr/bloodborne_motion.h"
 #include "core/vr/bloodborne_levers.h"
 #include "core/vr/bloodborne_pickup.h"
+#include "core/vr/bloodborne_corpse.h"
+#include "core/vr/bloodborne_sever.h"
 #include "core/vr/bloodborne_ragdoll.h"
 #include "core/vr/bloodborne_pose.h"
 #include "core/vr/bloodborne_transform.h"
@@ -56,16 +72,53 @@
 #include "core/vr/bloodborne_whip.h"
 #include "core/vr/camera_shake.h"
 #include "core/vr/hook_util.h"
+#include "core/vr/bloodborne_render_jobs.h"
 #include "core/vr/bloodborne_visceral_stage.h"
 #include "core/vr/visceral_stage.h"
 #include "core/vr/inframe.h"
 #include "core/vr/live_tune.h"
 #include "core/vr/quick_settings.h"
+#include "core/vr/ui_slots.h"
 #include "core/vr/vr_session.h"
 
 namespace VR::Bloodborne {
 
 namespace {
+// Non-aggro with the free camera: Kyo's Player Stealth flag, the launcher's "Non-aggro mode" byte
+// (bbvr_patch.xml 0x0593E88E: RVA 0x553E88E, beside WorldChrMan; zero in the game file), switched
+// by FreeCamera::StealthSwitch. 1.09 only: it is written from the render camera hook, which only
+// installs on the verified 1.09 code, and only while it holds 0 or 1. The game thread only.
+constexpr u64 StealthFlagRva = 0x553E88E;
+u8* g_stealth_flag{};
+void FreeCameraStealth(bool free_camera) {
+    static VR::FreeCamera::StealthSwitch stealth;
+    static bool missing_logged{false};
+    if (g_stealth_flag == nullptr) {
+        if (free_camera && !missing_logged) {
+            missing_logged = true;
+            LOG_WARNING(Core, "VR free camera: no non-aggro flag (module too small); enemies still "
+                              "see the hunter");
+        }
+        return;
+    }
+    u8 write = 0;
+    const u8 current = *g_stealth_flag;
+    switch (stealth.Update(free_camera, current, write)) {
+    case VR::FreeCamera::StealthSwitch::Step::None:
+        return;
+    case VR::FreeCamera::StealthSwitch::Step::Refused:
+        LOG_WARNING(Core, "VR free camera: the non-aggro byte holds {} (not 0 or 1): left alone; "
+                          "enemies still see the hunter",
+                    current);
+        return;
+    case VR::FreeCamera::StealthSwitch::Step::On:
+    case VR::FreeCamera::StealthSwitch::Step::Back:
+        *g_stealth_flag = write;
+        LOG_INFO(Core, "VR free camera: non-aggro {} (it was {})", free_camera ? "on" : "back",
+                 stealth.Before() ? "on" : "off");
+        return;
+    }
+}
 
 using Hook::EmitHostCallStub;
 using Hook::MakeWritable;
@@ -173,6 +226,13 @@ bool g_nops_active = false; // only touched on the camera thread
 bool g_installed = false;
 bool g_post_hooks = false;
 std::atomic<float> g_fov_override{0.0f};
+// The VR FOV last written into the render camera (camera thread; BandFov: a frame still carrying
+// it is no shot of the game's).
+float g_vr_fov_written = 0.0f;
+// The game's own target field of view (FovHook, before the override) and the render camera's
+// aspect (RenderCameraHook): the views VR::GlowPush compares.
+std::atomic<float> g_game_fov{0.0f};
+std::atomic<float> g_render_aspect{0.0f};
 // Render orientation for the post hook (camera thread only).
 bool g_view_active = false;
 float g_view_yaw = 0.0f;
@@ -415,6 +475,15 @@ void PS4_SYSV_ABI CameraHook(u8* camera, u8* /*saved_ymm*/) {
             *pitch = result.pitch;
             *pitch_copy = result.pitch;
             *yaw = result.yaw;
+        }
+        // Third person, locked on: the game steers the orbit toward the target; cap how far
+        // above the hunter it may lift the camera (lockon_pitch_max_deg, 90 = no cap).
+        if (!result.orbit && g_follow_lock && !VR::IsFirstPerson()) {
+            const float cap = VR::GetSettings().lockon_pitch_max_deg * 0.0174532925f;
+            if (cap < 1.5f && *pitch > cap) {
+                *pitch = cap;
+                *pitch_copy = cap;
+            }
         }
         g_fov_override.store(result.vfov, std::memory_order_relaxed);
         g_view_active = result.decoupled;
@@ -674,6 +743,104 @@ bool RemoCutscene() {
     return playing;
 }
 
+// The game takes the camera (a remo cutscene, a scripted camera, the aim camera gone): it is
+// handed back once, on the first such frame, and nothing of the last driven frame is left in the
+// game's hands or the renderer's:
+//  - g_last: the follow camera's next update writes no VR pitch, yaw or view (CameraHook,
+//    CameraPostHook; it used to keep them for up to 5 more updates);
+//  - g_fov_override: the FOV hook and the god rays' push stop at once, and the game's own FOV
+//    comes back in one step (g_fov_snap) instead of easing out of the VR FOV;
+//  - a camera record the headset did not place (VR::OnGameCamera): until now these frames kept
+//    the last gameplay record, so native stereo re-projected the game's camera into the headset's
+//    lens frustum (wider than the shot, while the game culls for the shot) and the first frames
+//    still went to the eyes as gameplay.
+// Its position, orientation, FOV and projection stay the game's. A scripted camera is handed
+// back only once it has lasted HandBackFrames rendered frames (as the renderer's own switch to the
+// virtual screen, vr_session.cpp boundaries_without_tick): a single frame without a follow update
+// stays gameplay, as before. No per-frame cost beyond a counter; the record's lock and the log
+// line come once per hand-back.
+constexpr u32 HandBackFrames = 4;
+u32 g_game_frames = 0;     // rendered frames in a row with the game's camera
+bool g_handed_back = false; // handed back, not driven or flat-ticked since
+
+void HandBack(const u8* render, const char* why) {
+    g_comfort_reset = true;
+    if (g_handed_back) {
+        return;
+    }
+    g_handed_back = true;
+    g_last = {};
+    g_view_active = false;
+    const float vr_fov = g_fov_override.exchange(0.0f, std::memory_order_relaxed);
+    if (vr_fov > 0.0f) {
+        g_fov_snap = true;
+    }
+    float fov = 0.0f;
+    float aspect = 0.0f;
+    if (render != nullptr) {
+        std::memcpy(&fov, render + OffsetFov, sizeof(fov));
+        std::memcpy(&aspect, render + OffsetAspect, sizeof(aspect));
+    }
+    VR::OnGameCamera(fov, aspect);
+    LOG_INFO(Core,
+             "VR camera: handed back to the game ({}): no VR orientation, FOV or eye frustum from "
+             "here; render camera fov={:.1f} deg aspect={:.3f}{}",
+             why, fov * 57.29578f, aspect,
+             vr_fov > 0.0f ? fmt::format(" (the VR FOV {:.1f} deg dropped, the game's snaps back)",
+                                         vr_fov * 57.29578f)
+                           : std::string{});
+}
+
+// The virtual screen shows a frame of the game's camera as the centred 16:9 band of the taller VR
+// render (openxr_presenter.cpp, the screen quad), while the game spreads its vertical FOV over the
+// whole height: the band was a centre crop of the shot, (16/9) / aspect closer than the flat game
+// frames it. On such a frame the render camera gets the vertical FOV whose 16:9 band is exactly
+// the shot: the game frames and culls the picture it was made for (more rows above and below,
+// which the band leaves out). Never on a driven frame, never without the headset's screen (the
+// simulated head shows the whole image). The VR FOV still in the camera on a hand-back's first
+// frames (the one we wrote, exactly; or any of 100 degrees or more) is not a shot's: left alone.
+// Per game-camera frame: two reads, a tan, an atan and a write; no allocation, no lock.
+constexpr float ShotFovMax = 100.0f * 0.0174532925f;
+void BandFov(u8* render) {
+    if (render == nullptr || VR::IsSimulatedHead()) {
+        return;
+    }
+    float fov{};
+    float aspect{};
+    std::memcpy(&fov, render + OffsetFov, sizeof(fov));
+    std::memcpy(&aspect, render + OffsetAspect, sizeof(aspect));
+    if (!(aspect > 0.25f && fov > 0.05f && fov < ShotFovMax) ||
+        !Ui::Slots::CropScreenToBand(aspect, VR::GetDisplayMode() == VR::DisplayMode::Screen)) {
+        return;
+    }
+    if (g_vr_fov_written > 0.0f && std::abs(fov - g_vr_fov_written) < 1e-4f) {
+        return; // the VR FOV itself, not yet snapped back
+    }
+    const float band_fov =
+        2.0f * std::atan(std::tan(0.5f * fov) * Ui::Slots::ScreenBandAspect / aspect);
+    std::memcpy(render + OffsetFov, &band_fov, sizeof(band_fov));
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        LOG_INFO(Core,
+                 "VR camera: the game's shot on the virtual screen: fov {:.1f} deg on 16:9 -> "
+                 "{:.1f} deg over the {:.3f} render (its 16:9 band is the shot)",
+                 fov * 57.29578f, band_fov * 57.29578f, aspect);
+    }
+}
+
+// A frame the game owns that may be a one-frame gap (no follow update this frame).
+void GameFrame(u8* render, const char* why) {
+    g_comfort_reset = true;
+    if (g_game_frames < HandBackFrames) {
+        ++g_game_frames;
+    }
+    if (g_game_frames >= HandBackFrames) {
+        HandBack(render, why);
+        BandFov(render);
+    }
+}
+
 // The render camera (a per-frame copy of the camera manager) is the last write before
 // rendering; the one VR tick per rendered frame happens here.
 struct FinalVisceralView {
@@ -684,9 +851,33 @@ struct FinalVisceralView {
 };
 thread_local FinalVisceralView final_visceral_view;
 
+// vr.ini riposte_style: the visceral camera's effect time drives the lunge's burst
+// (core/vr/riposte_style.h); its start and its longest end (no pull cut it) are logged. The game's
+// camera thread only: plain values and two atomics, nothing of the game's is written.
+void NoteRiposteCamera(float elapsed, s64 now) {
+    static float last_elapsed = -1.0f;
+    const VR::Riposte::CameraNote note = VR::Riposte::NoteCamera(elapsed, now);
+    if (note == VR::Riposte::CameraNote::Ignored) {
+        return; // an older visceral's effect still running: the newest one is followed
+    }
+    if (note == VR::Riposte::CameraNote::New) {
+        LOG_INFO(Core, "VR riposte: the visceral camera's clock at {:.2f} s: the lunge's burst",
+                 elapsed);
+        last_elapsed = -1.0f;
+    }
+    if (last_elapsed < VR::Riposte::CamEndS && elapsed >= VR::Riposte::CamEndS) {
+        LOG_INFO(Core,
+                 "VR riposte: the visceral camera's clock at {:.2f} s: the lunge's burst's latest "
+                 "end, just before the second kick (unless a pull cut it sooner)",
+                 elapsed);
+    }
+    last_elapsed = elapsed;
+}
+
 void PS4_SYSV_ABI VisceralCameraEffectSourceHook(const u8* instance, float* transform) {
     VR::GrabCamera::ThrowPlacement held{};
-    if (!VisceralStagePlacement(VR::Body::SteadyNowNs(), VR::GetSettings().world_scale, held)) return;
+    const s64 now = VR::Body::SteadyNowNs();
+    if (!VisceralStagePlacement(now, VR::GetSettings().world_scale, held)) return;
     // Native code has already read resource+4/+8 and instance+0x38 here.
     // Keep the raw resource identity: its first word is not yet a verified ID.
     const u8* resource{};
@@ -694,6 +885,10 @@ void PS4_SYSV_ABI VisceralCameraEffectSourceHook(const u8* instance, float* tran
     std::memcpy(&resource, instance+0x30, sizeof(resource));
     std::memcpy(&elapsed, instance+0x38, sizeof(elapsed));
     std::memcpy(&duration, resource+4, sizeof(duration));
+    // The lunge's burst: only on the visceral curve whose kicks are known (as the kicks below).
+    if (duration == 27.0f && std::isfinite(elapsed) && VR::GetSettings().riposte_style) {
+        NoteRiposteCamera(elapsed, now);
+    }
     const float before[3]{transform[12],transform[13],transform[14]};
     const bool middle_reduced = VR::VisceralStage::AttenuateMiddleKick(transform, elapsed, duration);
     if (middle_reduced) TraceVisceralView("middle_kick_reduced",
@@ -701,10 +896,12 @@ void PS4_SYSV_ABI VisceralCameraEffectSourceHook(const u8* instance, float* tran
     const bool reduced = VR::VisceralStage::AttenuateLateKick(transform, elapsed, duration);
     if (reduced) TraceVisceralView("late_kick_reduced",
         visceral_effect_record.load(std::memory_order_relaxed), before, transform+12);
-    const auto kind = fmt::format("effect_source_{:x}", reinterpret_cast<uintptr_t>(resource));
-    const float metadata[3]{elapsed,duration,0};
-    TraceVisceralView(kind.c_str(), visceral_effect_record.load(std::memory_order_relaxed),
-                      metadata, transform+12);
+    if (VisceralTraceOn()) { // the name is built only for the trace
+        const auto kind = fmt::format("effect_source_{:x}", reinterpret_cast<uintptr_t>(resource));
+        const float metadata[3]{elapsed,duration,0};
+        TraceVisceralView(kind.c_str(), visceral_effect_record.load(std::memory_order_relaxed),
+                          metadata, transform+12);
+    }
 }
 
 void PS4_SYSV_ABI VisceralCameraEffectHook(u8* controller, float* effect) {
@@ -738,6 +935,7 @@ void PS4_SYSV_ABI RenderFinalHook(u8* render, u8*) {
 }
 
 void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* render) {
+    FreeCameraStealth(VR::IsFreeCamera()); // every rendered frame, before any early return
     final_visceral_view = {};
     static VR::GrabCamera::PairPosition grab_position;
     static VR::GrabCamera::ThrowCamera throw_camera;
@@ -750,14 +948,17 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
         throw_camera.Reset();
         BodyRenderTick(nullptr, nullptr, false);
         EvasionRenderTick(nullptr, false);
+        if (VR::IsFreeCamera()) VR::ResetFreeCamera();
         return;
     }
     if (RemoCutscene()) {
-        g_comfort_reset = true;
+        HandBack(render, "a remo cutscene"); // RemoStillNs already ruled out a hitch
+        BandFov(render);
         grab_position.Reset();
         throw_camera.Reset();
         BodyRenderTick(nullptr, nullptr, false);
         EvasionRenderTick(nullptr, false);
+        if (VR::IsFreeCamera()) VR::ResetFreeCamera();
         return; // the cutscene's camera: left to the game (virtual screen)
     }
     u32 mode{};
@@ -765,6 +966,7 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
     // Never written by us: the presenter crops each eye out of the image with it.
     float aspect{};
     std::memcpy(&aspect, render + OffsetAspect, sizeof(aspect));
+    g_render_aspect.store(aspect, std::memory_order_relaxed);
     if (g_shake.on) {
         ShakeFlush();
         u8* follow_cam = nullptr;
@@ -807,11 +1009,12 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
         u8* aim = nullptr;
         std::memcpy(&aim, manager + OffsetManagerAimCam, sizeof(aim));
         if (aim == nullptr) {
-            g_comfort_reset = true;
+            GameFrame(render, "no aim camera");
             grab_position.Reset();
             throw_camera.Reset();
             BodyRenderTick(nullptr, nullptr, false);
             EvasionRenderTick(nullptr, false);
+            if (VR::IsFreeCamera()) VR::ResetFreeCamera();
             return;
         }
         float f[3];
@@ -825,21 +1028,30 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
         result = VR::OnCameraTick(g_follow_pitch, g_follow_yaw, g_follow_fov, g_follow_lock, false,
                                   aspect, true, anchor_ptr);
     } else {
-        g_comfort_reset = true;
+        GameFrame(render, "a scripted camera");
         grab_position.Reset();
         throw_camera.Reset();
         BodyRenderTick(nullptr, nullptr, false);
         EvasionRenderTick(nullptr, false);
+        if (VR::IsFreeCamera()) VR::ResetFreeCamera();
         return; // cutscene or scripted camera: left to the game (virtual screen)
     }
     g_last = result;
     ++g_render_ticks;
+    g_game_frames = 0;
+    if (g_handed_back) {
+        g_handed_back = false;
+        LOG_INFO(Core, "VR camera: the game's camera ended: {}",
+                 result.active ? "driven by the headset again" : "a flat frame (not driven)");
+    }
     if (!result.active) {
         g_comfort_reset = true; // cinematic flat mode, virtual screen, VR off
+        BandFov(render);        // the game's camera on the virtual screen
         grab_position.Reset();
         throw_camera.Reset();
         BodyRenderTick(nullptr, nullptr, false);
         EvasionRenderTick(nullptr, false);
+        if (VR::IsFreeCamera()) VR::ResetFreeCamera();
         return;
     }
 
@@ -848,10 +1060,27 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
     // render camera looks lower than your head (result.render_pitch; the camera record says so).
     WriteOrientation(render, result.view_yaw, result.render_pitch, result.view_roll);
     std::memcpy(render + OffsetFov, &result.vfov, sizeof(result.vfov));
+    g_vr_fov_written = result.vfov;
 
     float p[3];
     std::memcpy(p, render + OffsetPosition, sizeof(p));
     const auto& settings = VR::GetSettings();
+    if (VR::IsFreeCamera() && VR::ApplyFreeCamera(result, p, anchor_ptr)) {
+        std::memcpy(render + OffsetPosition, p, sizeof(p));
+        VR::SetRecordRenderPosition(result.record_id, {p[0],p[1],p[2]});
+        VR::SetRecordEyeForward(result.record_id, 0.0f, false);
+        float proj[4];
+        std::memcpy(&proj[0], render + OffsetFov, sizeof(float));
+        std::memcpy(&proj[1], render + OffsetAspect, sizeof(float));
+        std::memcpy(&proj[2], render + OffsetNear, sizeof(float));
+        std::memcpy(&proj[3], render + OffsetFar, sizeof(float));
+        VR::SetRecordProjection(result.record_id, proj[0], proj[1], proj[2], proj[3]);
+        // The hunter stays at his actual location, never at the sightseeing camera.
+        BodyRenderTick(nullptr, nullptr, false);
+        EvasionRenderTick(nullptr, false);
+        g_comfort_reset = true;
+        return;
+    }
     u8* follow_cam = nullptr;
     std::memcpy(&follow_cam, manager + OffsetManagerFollowCam, sizeof(follow_cam));
     const auto now = std::chrono::steady_clock::now();
@@ -1017,8 +1246,10 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
             result.throw_weight = shared.weight;
             result.throw_holding = shared.holding;
             throw_camera.Reset();
-        } else if (stage_enabled) {
+        } else if (stage_enabled && !own_throw) {
             // Native placement owns separation. No camera retreat, fallback re-anchor or glide.
+            // A throw of yours without a staged anchor (rejected or expired) falls through to the
+            // camera hold and keep-out below, as without the stage.
             throw_camera.Reset();
         } else {
             const auto hold = throw_camera.Step(own_throw, base_b, grab_sample.facing, scale,
@@ -1087,6 +1318,22 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
         // so the pair has no vertical offset.
         g_comfort_path = false;
         throw_camera.Reset();
+        // Third person (the follow camera): pulled toward the hunter by tp_distance_scale (0.5 ..
+        // 1). The game's collision has already placed it; along the line to his pivot it never
+        // goes through a wall it was not through. Both eyes: the same pivot and camera.
+        if (!VR::IsFirstPerson() && mode == 0 && follow_cam != nullptr &&
+            settings.tp_distance_scale < 1.0f) {
+            float pivot[3];
+            std::memcpy(pivot, follow_cam + OffsetFollowPivot, sizeof(pivot));
+            const float k = std::clamp(settings.tp_distance_scale, 0.5f, 1.0f);
+            const float dx = p[0] - pivot[0], dy = p[1] - pivot[1], dz = p[2] - pivot[2];
+            if (std::isfinite(pivot[0]) && std::isfinite(pivot[1]) && std::isfinite(pivot[2]) &&
+                dx * dx + dy * dy + dz * dz < 400.0f * scale * scale) {
+                p[0] = pivot[0] + dx * k;
+                p[1] = pivot[1] + dy * k;
+                p[2] = pivot[2] + dz * k;
+            }
+        }
         const bool restart = g_legacy_reset; // the comfort camera drove the last frame
         static bool have_height = false;
         static float height = 0.0f;
@@ -1175,12 +1422,22 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
     std::memcpy(&proj[2], render + OffsetNear, sizeof(float));
     std::memcpy(&proj[3], render + OffsetFar, sizeof(float));
     VR::SetRecordProjection(result.record_id, proj[0], proj[1], proj[2], proj[3]);
+    // VR body: the root's move after the pose copy that the arms did not predict (stairs), taken
+    // out of his render before the producers below read his hands.
+    if (fp_follow) {
+        BodyLateRootFix(result, p);
+    }
     // inframe_hand_sync: this update's carry, for the producers below (HandSyncBegin).
     HandSyncBegin(result.record_id, reinterpret_cast<const float*>(render + OffsetMatrix), p);
     // The game's vial in the hunter's hand: its depth proxy in this frame's view (DIBR).
     HeldRenderTick(result.record_id, reinterpret_cast<const float*>(render + OffsetMatrix), p);
     // The Blood Gauge on the hunter's left wrist (hud_vitals=wrist): its own in-frame list.
     VitalsRenderTick(result.record_id, reinterpret_cast<const float*>(render + OffsetMatrix), p);
+    // A Beast Claw's severed pieces: their own in-frame list (asleep, without the claw and with
+    // nothing cut around: not called).
+    if (SeverAwake() != 0) {
+        SeverRenderTick(result.record_id, reinterpret_cast<const float*>(render + OffsetMatrix), p);
+    }
     // Quick items: the arc's placement and hover, and its in-frame draw list for this camera.
     QuickItemsRenderTick(result.record_id, reinterpret_cast<const float*>(render + OffsetMatrix),
                          p);
@@ -1190,6 +1447,8 @@ void PS4_SYSV_ABI RenderCameraHook(u8* field_camera, u8* /*saved_ymm*/, u8* rend
     // VR body: the anchor of this frame's view (the final position, after comfort smoothing) for
     // the next frame's pose copy.
     BodyRenderTick(&result, p, fp_follow);
+    // melee_deflect: the enemies' bullets against the weapon the body just placed.
+    DeflectTick(VR::Body::SteadyNowNs());
     EvasionRenderTick(&result, fp_follow);
     if (fp_follow) {
         SpectatorView(render, result, p, scale);
@@ -1278,6 +1537,11 @@ void PS4_SYSV_ABI FovHook(u8* camera, u8* saved_ymm) {
         LOG_INFO(Core, "VR: first FOV hook call, camera={} thread '{}'", fmt::ptr(camera),
                  Common::GetCurrentThreadName());
     }
+    float game_fov{};
+    std::memcpy(&game_fov, saved_ymm + 32 * 1, sizeof(game_fov));
+    if (game_fov > 0.05f && game_fov < 3.1f) {
+        g_game_fov.store(game_fov, std::memory_order_relaxed);
+    }
     const float fov = g_fov_override.load(std::memory_order_relaxed);
     if (fov > 0.0f) {
         // Target FOV lives in xmm1 (saved at ymm slot 1); snapping the current value too
@@ -1285,10 +1549,81 @@ void PS4_SYSV_ABI FovHook(u8* camera, u8* saved_ymm) {
         std::memcpy(saved_ymm + 32 * 1, &fov, sizeof(fov));
         std::memcpy(camera + OffsetFov, &fov, sizeof(fov));
     } else if (g_fov_snap) {
-        // Cinematic flat mode: the game's FOV at once instead of a slow zoom out of the VR FOV.
+        // Cinematic flat mode or a hand-back (HandBack): the game's FOV at once instead of a slow
+        // zoom out of the VR FOV.
         g_fov_snap = false;
+        float was{};
+        std::memcpy(&was, camera + OffsetFov, sizeof(was));
         std::memcpy(camera + OffsetFov, saved_ymm + 32 * 1, sizeof(float));
+        LOG_INFO(Core, "VR camera: the game's FOV back at once: {:.1f} deg (was {:.1f})",
+                 game_fov * 57.29578f, was * 57.29578f);
     }
+}
+
+// The light glow's god rays (FFX light-shaft renderer): the fan point is the projected light plus
+// a normalized direction (xmm1) times its length / 100 (xmm2, broadcast), here, right before
+// `vmulps xmm1, xmm1, xmm2; vaddps xmm0, xmm8, xmm1; vmovaps [r12+0x570], xmm0` (the shader's
+// dwords 68..71). 18 bytes: WriteJump's absolute jump needs 14, these three are whole, use no
+// rip-relative operand, and nothing in the eboot branches into them.
+// vr.ini glow_push: the length scaled to the angle the flat game gives the push (VR::GlowPush)
+// in the frames our field of view drives; flat frames (cinematics, the virtual screen) keep it.
+constexpr u64 GlowPushRva = 0xEEA645;
+constexpr std::array<u8, 18> GlowPushSig = {0xC5, 0xF0, 0x59, 0xCA, 0xC5, 0xB8, 0x58, 0xC1, 0xC4,
+                                             0xC1, 0x78, 0x29, 0x84, 0x24, 0x70, 0x05, 0x00, 0x00};
+// The two instructions before it: `vdivss xmm2, xmm0, [rip+...]` (the length / 100) and
+// `vpshufd xmm2, xmm2, 0`.
+constexpr std::array<u8, 13> GlowPushLeadSig = {0xC5, 0xFA, 0x5E, 0x15, 0xA8, 0x33, 0x9C,
+                                                0x03, 0xC5, 0xF9, 0x70, 0xD2, 0x00};
+// The flat game's screen.
+constexpr float GlowGameAspect = 16.0f / 9.0f;
+
+void PS4_SYSV_ABI GlowPushHook(u8* /*effect*/, u8* saved_ymm) {
+    const float render_fov = g_fov_override.load(std::memory_order_relaxed);
+    if (render_fov <= 0.0f || !VR::GetSettings().glow_push) {
+        return;
+    }
+    const float game_fov = g_game_fov.load(std::memory_order_relaxed);
+    const float aspect = g_render_aspect.load(std::memory_order_relaxed);
+    float dir[3];
+    std::memcpy(dir, saved_ymm + 32 * 1, sizeof(dir));
+    const float scale =
+        VR::GlowPush::Scale(dir, {std::tan(0.5f * render_fov), aspect},
+                            {std::tan(0.5f * game_fov), GlowGameAspect});
+    // Lane 0 is the push's sideways part (clip x): glow_push_side of it.
+    const float side = std::clamp(VR::GetSettings().glow_push_side, 0.0f, 1.0f);
+    float length[4];
+    std::memcpy(length, saved_ymm + 32 * 2, sizeof(length));
+    for (float& l : length) {
+        l *= scale;
+    }
+    length[0] *= side;
+    std::memcpy(saved_ymm + 32 * 2, length, sizeof(length));
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 3) {
+        LOG_INFO(Core,
+                 "VR glow push: game {:.1f} deg on 16:9, render {:.1f} deg at {:.4f}; direction "
+                 "({:.3f}, {:.3f}, {:.3f}): the push x{:.3f}, its sideways part x{:.2f} more",
+                 game_fov * 57.29578f, render_fov * 57.29578f, aspect, dir[0], dir[1], dir[2],
+                 scale, side);
+    }
+}
+
+void InstallGlowPush(u8* module, u64 size) {
+    u8* const site = module + GlowPushRva;
+    if (size < GlowPushRva + GlowPushSig.size() ||
+        std::memcmp(site - GlowPushLeadSig.size(), GlowPushLeadSig.data(),
+                    GlowPushLeadSig.size()) != 0 ||
+        std::memcmp(site, GlowPushSig.data(), GlowPushSig.size()) != 0 ||
+        !MakeWritable(site, GlowPushSig.size())) {
+        LOG_ERROR(Core, "VR glow push: light-shaft signature not found; the game's push is kept");
+        return;
+    }
+    using Xbyak::util::r12;
+    void* stub = EmitHostCallStub(*g_code, reinterpret_cast<void*>(&GlowPushHook),
+                                  GlowPushSig.data(), GlowPushSig.size(),
+                                  reinterpret_cast<u64>(site + GlowPushSig.size()), r12);
+    WriteJump(site, GlowPushSig.size(), stub);
+    LOG_INFO(Core, "VR glow push: installed (vr.ini glow_push)");
 }
 
 std::vector<StoreSite> FindStoreSites(u8* start, u8* end, u8* skip_begin, u8* skip_end) {
@@ -1332,14 +1667,31 @@ std::vector<StoreSite> FindStoreSites(u8* start, u8* end, u8* skip_begin, u8* sk
 } // Anonymous namespace
 
 void OnEbootLoaded(VAddr base, u64 size) {
+    g_stealth_flag = size > StealthFlagRva ? reinterpret_cast<u8*>(base + StealthFlagRva) : nullptr;
+    // The GPU memory hooks fix the renderer, VR or not (bloodborne_gpu_memory.cpp).
+    static bool gpu_memory_installed = false;
+    if (!gpu_memory_installed) {
+        gpu_memory_installed = true;
+        GpuMemoryEbootLoaded(base, size);
+        RenderJobsEbootLoaded(base, size); // failed/cancelled render jobs must not exhaust the pool
+        FrameRateEbootLoaded(base, size); // frame_hooks: the frame rate by hooks, VR or not
+        PrepareHeldEffects(base, size); // VR: the effect sites, before the params (the Tonitrus)
+        KosLightsEbootLoaded(); // the Kos Lights item in the game's data, VR or not (saves own it)
+        EbrietasEffectEbootLoaded(); // data-only trail fix; never changes the effects/VR clocks
+    }
     if (!VR::IsEnabled() || g_installed) {
         return;
     }
+    LampLightEbootLoaded(); // vr_interactions: the lamp scripts, before the game opens them
+    WoodsShadowsEbootLoaded(); // the Forbidden Woods' moon shadows (a test switch for now)
+    ReflectionsEbootLoaded(base, size); // reflections: before the render settings are made
     // Instant Blood Vial injection and the cinematic detection share their own hook and do not
     // depend on the camera. The body's pose hook is installed after relocation (its vtable slots
     // are filled then); only its VR_BODY_HOOK=code variant patches code here.
     InstallPlayerHook(base, size);
     InstallHeld(base, size); // the armed vial in the hunter's own hand (checks only, no patch)
+    InstallDeflect(base, size); // melee_deflect (its bullets from the launch hook, installed by
+                                // InstallQuickItems with quick items on or off)
     InstallQuickItems(base, size); // quick items in VR (the arc, uses, throws)
     InstallMelee(base, size); // physical melee: the swing is the attack (before the damage hook)
     InstallTransform(base, size); // the weapon-only transform (after the player hook: site A)
@@ -1347,19 +1699,25 @@ void OnEbootLoaded(VAddr base, u64 size) {
     InstallWhip(base, size);      // the physical whip (whip=physical: a whip form's chain)
     InstallTuning(base, size);
     InstallRagdoll(base, size); // the kill ragdoll (after the damage detour it rides on)
+    InstallCorpseHands(base, size); // bare hands on corpses (rides on the kill ragdoll's stub)
+    InstallSever(base, size); // Beast Claw dismemberment (on; VR_SEVER=0 turns it off)
     InstallGun(base, size); // the gun: shots along the barrel, the bang at the pull
     InstallIframes(base, size);
     InstallShoulderEquipment(base, size);
     InitVisceralPull(base, size); // the interactive visceral (rides on the stagger detour)
     InstallStaggerSpeed(base, size); // shorter hit staggers (stagger_shorten_ms)
+    ArmHookHooksReady(); // reserve the Arm's trigger only after both native hooks are ready
     ConfirmVisceralPull(IsStaggerSpeedInstalled(), IsOffhandDamageInstalled());
     InstallFacing(base, size); // the hunter strafes: only turns and your heading turn him
     InstallLeverProbe(base, size); // physical levers; live setting controls hand interaction
     InstallPickup(base, size); // item pickups: the pop-up without the pickup animation
     MenuEbootLoaded(base, size);
     LampsEbootLoaded(base, size);
+    RespecEbootLoaded(base, size); // the Doll's respec (doll_respec)
+    SoftSave::EbootLoaded(base, size);
     InstallEnemyBars(base, size); // ui_enemy_hp_bars: the enemies' HP bars on / off, live
     InstallLights(base, size); // body_fill_lights: camera-attached fill lights follow the hunter
+    InstallShadowCascadeOverlap(base, size); // the moon cascades overlap (moon_shadows)
     InstallStatus(base, size); // status build-ups: the faster drain and the meter's rows
     EvasionEbootLoaded(base, size);
     BodyEbootLoaded(base, size);
@@ -1402,6 +1760,7 @@ void OnEbootLoaded(VAddr base, u64 size) {
         g_store_sites = std::move(sites);
         WriteJump(camera_site, CameraHookSig.size(), camera_stub);
         WriteJump(fov_site, FovHookLen, fov_stub);
+        InstallGlowPush(module, size);
 
         // Decoupled view: replace the render orientation after the update returns.
         u8* const post1 = module + PostHookRva1;

@@ -32,16 +32,21 @@ namespace VR::Page {
 inline constexpr float PageX0 = 370.0f;
 inline constexpr float PageY0 = 140.0f;
 inline constexpr float PageX1 = 1610.0f;
-inline constexpr float PageY1 = 930.0f;
+// One band under the title's rule for a tab's sub-tab strip (2026-10-30, the user: "make the VR
+// settings a little taller so it fits one more row"): everything below it sits that much lower
+// than the movie's places (vr_page_art.h, generated, keeps them).
+inline constexpr float StripBandPx = 60.0f;
+inline constexpr float StripRuleY = 254.7f; // the title's rule (Frame[13..19]), above the band
+inline constexpr float PageY1 = 930.0f + StripBandPx;
 // Image px per stage px: the menu canvas's 2560 x 1440 UI image (24-px body text = 32 px).
 inline constexpr float PageScale = 4.0f / 3.0f;
 inline constexpr int PageWidth = 1654;  // ceil((PageX1 - PageX0) * PageScale)
-inline constexpr int PageHeight = 1054; // ceil((PageY1 - PageY0) * PageScale)
+inline constexpr int PageHeight = 1134; // ceil((PageY1 - PageY0) * PageScale)
 // The panel's visible centre (stage px): its ornament rules (#33 / #32: x 501.6..1418.1, y
 // 151.7..891.7), the title's and the key guide's centre line. The left button mirrors the right
 // one about it; the presenter puts it where the menu canvas's centre is.
 inline constexpr float PanelCentreX = 959.7f;
-inline constexpr float PanelCentreY = 521.7f;
+inline constexpr float PanelCentreY = 521.7f + 0.5f * StripBandPx;
 
 // RGBA8, premultiplied alpha, sRGB-encoded values (the game blends its UI in that domain).
 struct Image {
@@ -126,6 +131,10 @@ struct View {
     Glyphs glyphs{};
     Hover hover{};   // the pointer's halo
     bool confirm{false};
+    int page{0}, pages{1}; // the tab's page shown, of how many
+    std::vector<std::string> subtabs; // its pages' names (their first header) when pages > 1
+    bool strip_selected{false};       // the sub-tab strip has the selection
+    bool graphics{false};  // the tab has ACCEPT / SAVE AND RESTART (its button row sits lower)
     // A page of centred rows (the lantern's): the frame without the settings page's column
     // divider and the panel texture's dark gutter beside it (they cut through centred labels).
     bool single_column{false};
@@ -154,6 +163,11 @@ float LabelBaseline(int slot);
 
 // Draws the page and its glow layer (both PageWidth x PageHeight). False without assets.
 bool Render(const Assets& assets, const View& view, Image& page, Image& glow);
+
+// A test aid (VR_PAGE_TEST_DUMP): the view's texts wider than their room at full size, one line
+// each ("<what> '<text>' <width> of <room> px: drawn smaller" when the page shrinks it to fit,
+// "... OVER" when even that is past its room). Empty when everything fits.
+std::vector<std::string> TextFitReport(const View& view, const GameText::GameFont* font);
 
 // An image as the compositor blends it. The game blends its UI in its encoded (sRGB) domain; an
 // OpenXR compositor blends an sRGB swapchain in linear light, where the page's 88% black panel

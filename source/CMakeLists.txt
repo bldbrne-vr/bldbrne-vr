@@ -242,7 +242,9 @@ set(APP_IS_RELEASE false)
 # A public release (launcher/make_release.ps1): the public repository and a neutral branch in the
 # window title and the log, instead of the remote and branch the build came from.
 set(BBVR_RELEASE_VERSION "" CACHE STRING "Public release version (empty: a development build)")
+set(BBVR_DISPLAY_VERSION "0.9.61") # Current mod version for development builds.
 if (NOT "${BBVR_RELEASE_VERSION}" STREQUAL "")
+  set(BBVR_DISPLAY_VERSION "${BBVR_RELEASE_VERSION}")
   set(GIT_BRANCH "release")
   set(GIT_DESC "v${BBVR_RELEASE_VERSION}")
   set(GIT_REMOTE_NAME "origin")
@@ -992,6 +994,25 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/bloodborne_gun.h
          src/core/vr/bloodborne_givekit.cpp
          src/core/vr/bloodborne_givekit.h
+         src/core/vr/bloodborne_kos_lights.cpp
+         src/core/vr/bloodborne_kos_lights.h
+         src/core/vr/bloodborne_ebrietas.cpp
+         src/core/vr/bloodborne_ebrietas.h
+         src/core/vr/ebrietas_effect.h
+         src/core/vr/ebrietas_effect_codec.h
+         src/core/vr/bloodborne_lamp_light.cpp
+         src/core/vr/bloodborne_lamp_light.h
+         src/core/vr/bloodborne_woods_shadows.cpp
+         src/core/vr/bloodborne_woods_shadows.h
+         src/core/vr/fog_emitters.h
+         src/core/vr/map_lights.h
+         src/core/vr/map_objects.h
+         src/core/vr/woods_shadows.h
+         src/core/vr/door_knock.h
+         src/core/vr/dual_blades.h
+         src/core/vr/lamp_light.h
+         src/core/vr/kos_lights_data.h
+         src/core/vr/kos_lights_icon.h
          src/core/vr/bloodborne_heal.cpp
          src/core/vr/bloodborne_heal.h
          src/core/vr/bloodborne_held.cpp
@@ -1002,11 +1023,32 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/bloodborne_iframes.h
          src/core/vr/bloodborne_ragdoll.cpp
          src/core/vr/bloodborne_ragdoll.h
+         src/core/vr/bloodborne_sever.cpp
+         src/core/vr/bloodborne_sever.h
+         src/core/vr/sever_cache.h
+         src/core/vr/sever_enemy.h
+         src/core/vr/sever_feel.h
+         src/core/vr/sever_jobs.h
+         src/core/vr/sever_mesh.cpp
+         src/core/vr/sever_mesh.h
+         src/core/vr/sever_model.cpp
+         src/core/vr/sever_model.h
+         src/core/vr/sever_policy.h
+         src/core/vr/sever_pose.h
+         src/core/vr/sever_rig.h
+         src/core/vr/bloodborne_corpse.cpp
+         src/core/vr/bloodborne_wheelchair.cpp
+         src/core/vr/bloodborne_wheelchair.h
+         src/core/vr/wheelchair.h
+         src/core/vr/bloodborne_corpse.h
+         src/core/vr/corpse_hands.h
          src/core/vr/ragdoll_deaths.h
          src/core/vr/ragdoll_kill.h
          src/core/vr/bloodborne_stagger.cpp
          src/core/vr/bloodborne_stagger.h
          src/core/vr/bloodborne_visceral_stage.cpp
+         src/core/vr/write_watch.cpp
+         src/core/vr/write_watch.h
          src/core/vr/bloodborne_visceral_stage.h
          src/core/vr/visceral_stage.h
          src/core/vr/bloodborne_visceral_pull.cpp
@@ -1017,10 +1059,18 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/torch_lift.h
          src/core/vr/trick_weapons.h
          src/core/vr/solid_weapon.h
+         src/core/vr/weapon_fit.h
+         src/core/vr/weapon_simple.h
+         src/core/vr/weapon_authored.h
+         src/core/vr/weapon_authored_data.h
+         src/core/vr/weapon_mesh.h
+         src/core/vr/bloodborne_weapon_shape.cpp
+         src/core/vr/bloodborne_weapon_shape.h
          src/core/vr/sparks.h
          src/core/vr/weapon_wall.h
          src/core/vr/blade_sounds.h
          src/core/vr/visceral_pull.h
+         src/core/vr/riposte_style.h
          src/core/vr/stagger_speed.h
          src/core/vr/bloodborne_layout.h
          src/core/vr/bloodborne_melee.cpp
@@ -1030,6 +1080,10 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/bloodborne_enemy_bars.cpp
          src/core/vr/bloodborne_enemy_bars.h
          src/core/vr/bloodborne_lights.cpp
+         src/core/vr/bloodborne_shadow_cascades.cpp
+         src/core/vr/bloodborne_shadow_cascades.h
+         src/core/vr/muzzle_flash.h
+         src/core/vr/moon_screen.h
          src/core/vr/bloodborne_lights.h
          src/core/vr/bloodborne_status.cpp
          src/core/vr/bloodborne_status.h
@@ -1038,9 +1092,29 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/bloodborne_levers.h
          src/core/vr/bloodborne_pickup.cpp
          src/core/vr/bloodborne_pickup.h
+         src/core/vr/bloodborne_gpu_memory.cpp
+         src/core/vr/bloodborne_gpu_memory.h
+         src/core/vr/bloodborne_render_jobs.cpp
+         src/core/vr/bloodborne_render_jobs.h
+         src/core/vr/bloodborne_frame_rate.cpp
+         src/core/vr/bloodborne_frame_rate.h
+         src/core/vr/cutscene_frame_limit.h
          src/core/vr/bloodborne_lamps.cpp
+         src/core/vr/game_reflections.cpp
+         src/core/vr/game_reflections.h
+         src/core/vr/bloodborne_respec.cpp
+         src/core/vr/bloodborne_respec.h
+         src/core/vr/doll_respec.h
+         src/core/vr/respec_feel.h
          src/core/vr/bloodborne_lamps.h
          src/core/vr/vial_refill.h
+         src/core/vr/soft_save.cpp
+         src/core/vr/soft_save.h
+         src/core/vr/soft_save_channel.h
+         src/core/vr/soft_save_page.h
+         src/core/vr/soft_save_policy.h
+         src/core/vr/soft_save_read_lease.h
+         src/core/vr/soft_save_storage.h
          src/core/vr/lamp_channel.h
          src/core/vr/lamp_sequence.h
          src/core/vr/lamp_presentation.h
@@ -1052,6 +1126,9 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/pickup_gate.h
          src/core/vr/bloodborne_motion.cpp
          src/core/vr/bloodborne_motion.h
+         src/core/vr/bloodborne_deflect.cpp
+         src/core/vr/bloodborne_deflect.h
+         src/core/vr/bullet_deflect.h
          src/core/vr/bloodborne_quickitems.cpp
          src/core/vr/bloodborne_quickitems.h
          src/core/vr/bloodborne_transform.cpp
@@ -1076,6 +1153,22 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/grind_audio.cpp
          src/core/vr/grind_audio.h
          src/core/vr/quick_use_audio.h
+         src/core/vr/blood_draw.h
+         src/core/vr/blood_draw_channel.h
+         src/core/vr/status_corners.h
+         src/core/vr/blacksky_eye.h
+         src/core/vr/tool_empty_audio.h
+         src/core/vr/tool_empty_audio.cpp
+         src/core/vr/item_audio.h
+         src/core/vr/item_audio.cpp
+         src/core/vr/charge_audio.h
+         src/core/vr/charge_audio.cpp
+         src/core/vr/thunder_audio.h
+         src/core/vr/thunder_audio.cpp
+         src/core/vr/tonitrus_charge.h
+         src/core/vr/tonitrus_charge.cpp
+         src/core/vr/furnace_audio.h
+         src/core/vr/furnace_audio.cpp
          src/core/vr/whip_damage.h
          src/core/vr/body_channel.cpp
          src/core/vr/body_channel.h
@@ -1090,6 +1183,7 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/c0000_rig.h
          src/core/vr/c0000_skeleton.h
          src/core/vr/c0000_transform_lengths.h
+         src/core/vr/camera_frame.h
          src/core/vr/camera_gap.h
          src/core/vr/cinematic_state.h
          src/core/vr/combat_channel.cpp
@@ -1104,12 +1198,19 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/gun_reload.h
          src/core/vr/gun_reload_audio.h
          src/core/vr/gun_reload_audio.cpp
+         src/core/vr/monocular_audio.h
+         src/core/vr/monocular_audio.cpp
          src/core/vr/lever_audio.cpp
          src/core/vr/lever_audio.h
+         src/core/vr/clip_audio.h
+         src/core/vr/whistle_audio.cpp
+         src/core/vr/whistle_audio.h
          src/core/vr/hand_grip.h
          src/core/vr/held_item.h
          src/core/vr/hook_util.cpp
          src/core/vr/hook_util.h
+         src/core/vr/readable_memory.cpp
+         src/core/vr/readable_memory.h
          src/core/vr/hook_wrap.cpp
          src/core/vr/hook_wrap.h
          src/core/vr/iframe_extend.h
@@ -1149,8 +1250,13 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/vitals_channel.cpp
          src/core/vr/vitals_channel.h
          src/core/vr/vr_session.cpp
+         src/core/vr/card_memory.cpp
+         src/core/vr/card_memory.h
+         src/core/vr/card_tier.h
          src/core/vr/vr_session.h
          src/core/vr/bc7_decode.h
+         src/core/vr/sky_textures.cpp
+         src/core/vr/sky_textures.h
          src/core/vr/game_font.h
          src/core/vr/vr_ini.h
          src/core/vr/vr_page.h
@@ -1165,6 +1271,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/controls_session.cpp
          src/core/vr/controls_session.h
          src/core/vr/controls_view.h
+         src/core/vr/dlss5_file.cpp
+         src/core/vr/dlss5_file.h
          src/core/vr/vr_page_runtime.cpp
          src/core/vr/vr_page_runtime.h
          src/core/vr/tpf_patch.h
@@ -1172,6 +1280,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/vr_tile_goggles_layer.h
          src/core/vr/vr_tile_patch.h
          src/core/vr/whip_chain.h
+         src/core/vr/cutter_path.h
+         src/core/vr/kos_lash.h
          src/core/vr/whip_lash.h
          src/core/vr/whip_flick.h
          src/core/vr/whip_idle.h
@@ -1207,6 +1317,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/recompiler.cpp
                       src/shader_recompiler/recompiler.h
                       src/shader_recompiler/resource.h
+                      src/shader_recompiler/vr_host_image.cpp
                       src/shader_recompiler/info.h
                       src/shader_recompiler/params.h
                       src/shader_recompiler/vr_motion.h
@@ -1233,6 +1344,15 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/backend/spirv/emit_spirv_select.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_shared_memory.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_vr_motion.inc
+    src/shader_recompiler/backend/spirv/emit_spirv_moon_shadow.cpp
+    src/shader_recompiler/backend/spirv/emit_spirv_reflections.cpp
+    src/shader_recompiler/backend/spirv/emit_spirv_light_shadow.cpp
+    src/shader_recompiler/backend/spirv/emit_spirv_specular_aa.cpp
+    src/shader_recompiler/backend/spirv/emit_spirv_bump_shift.cpp
+                      src/shader_recompiler/backend/spirv/emit_spirv_light_common.h
+                      src/shader_recompiler/backend/spirv/emit_spirv_moon_shafts.cpp
+                      src/shader_recompiler/backend/spirv/emit_spirv_air_light.cpp
+                      src/shader_recompiler/backend/spirv/emit_spirv_particle_air.cpp
     src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_undefined.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
@@ -1264,6 +1384,28 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/frontend/structured_control_flow.h
                       src/shader_recompiler/ir/passes/billboard_face_eye.h
                       src/shader_recompiler/ir/passes/billboard_face_eye_pass.cpp
+                      src/shader_recompiler/ir/passes/moon_shadow.h
+                      src/shader_recompiler/ir/passes/moon_shadow_pass.cpp
+                      src/shader_recompiler/ir/passes/reflections.h
+                      src/shader_recompiler/ir/passes/reflections_pass.cpp
+                      src/shader_recompiler/ir/passes/ambient_occlusion.h
+                      src/shader_recompiler/ir/passes/bounce_light.h
+                      src/shader_recompiler/ir/passes/fog_light.h
+                      src/shader_recompiler/ir/passes/moon_shafts.h
+                      src/shader_recompiler/ir/passes/air_light.h
+                      src/shader_recompiler/ir/passes/fog_grid.h
+                      src/shader_recompiler/ir/passes/fog_patches.h
+                      src/shader_recompiler/ir/passes/air_light_pass.cpp
+                      src/shader_recompiler/ir/passes/light_shadow.h
+                      src/shader_recompiler/ir/passes/light_shadow_pass.cpp
+                      src/shader_recompiler/ir/passes/specular_aa.h
+                      src/shader_recompiler/ir/passes/specular_aa_pass.cpp
+                      src/shader_recompiler/ir/passes/parallax.h
+                      src/shader_recompiler/ir/passes/parallax_pass.cpp
+                      src/shader_recompiler/ir/passes/particle_air.h
+                      src/shader_recompiler/ir/passes/particle_air_pass.cpp
+                      src/shader_recompiler/ir/passes/wet_blood.h
+                      src/shader_recompiler/ir/passes/wet_blood_pass.cpp
                       src/shader_recompiler/ir/passes/screen_rect_pass.cpp
                       src/shader_recompiler/ir/passes/constant_propagation_pass.cpp
                       src/shader_recompiler/ir/passes/dead_code_elimination_pass.cpp
@@ -1335,11 +1477,18 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/buffer_cache/buffer.h
                src/video_core/buffer_cache/buffer_cache.cpp
                src/video_core/buffer_cache/buffer_cache.h
+               src/video_core/buffer_cache/upload_staging.cpp
+               src/video_core/buffer_cache/upload_staging.h
+               src/video_core/buffer_cache/upload_staging_state.h
                src/video_core/buffer_cache/fault_manager.cpp
                src/video_core/buffer_cache/fault_manager.h
                src/video_core/buffer_cache/read_barrier_logic.h
                src/video_core/buffer_cache/memory_tracker.h
                src/video_core/buffer_cache/range_set.h
+               src/video_core/buffer_cache/sparse_bind_batch.h
+               src/video_core/buffer_cache/sparse_pool.cpp
+               src/video_core/buffer_cache/sparse_pool.h
+               src/video_core/buffer_cache/sparse_pool_logic.h
                src/video_core/buffer_cache/region_definitions.h
                src/video_core/buffer_cache/region_manager.h
                src/video_core/renderer_vulkan/liverpool_to_vk.cpp
@@ -1359,17 +1508,26 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_common.h
                src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
                src/video_core/renderer_vulkan/vk_compute_pipeline.h
+               src/video_core/renderer_vulkan/vk_gpu_crash.cpp
+               src/video_core/renderer_vulkan/vk_gpu_crash.h
                src/video_core/renderer_vulkan/vk_gpu_pass_profiler.cpp
                src/video_core/renderer_vulkan/vk_gpu_pass_profiler.h
                src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
                src/video_core/renderer_vulkan/vk_graphics_pipeline.h
                src/video_core/renderer_vulkan/vk_instance.cpp
                src/video_core/renderer_vulkan/vk_instance.h
+               src/video_core/renderer_vulkan/vk_residency.cpp
+               src/video_core/renderer_vulkan/vk_residency.h
                src/video_core/renderer_vulkan/vk_master_semaphore.cpp
                src/video_core/renderer_vulkan/vk_master_semaphore.h
                src/video_core/renderer_vulkan/vk_pipeline_prepare.cpp
                src/video_core/renderer_vulkan/vk_pipeline_async.cpp
                src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+               src/video_core/renderer_vulkan/vk_shader_record.cpp
+               src/video_core/renderer_vulkan/vk_shader_prebuild.cpp
+               src/video_core/startup_compile.cpp
+               src/video_core/startup_compile.h
+               src/video_core/renderer_vulkan/vk_shader_record.h
                src/video_core/renderer_vulkan/vk_pipeline_cache.h
                src/video_core/renderer_vulkan/vk_pipeline_common.cpp
                src/video_core/renderer_vulkan/vk_pipeline_common.h
@@ -1388,6 +1546,7 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_scheduler.cpp
                src/video_core/renderer_vulkan/vk_scheduler.h
                src/video_core/renderer_vulkan/vk_pass_breaks.h
+               src/video_core/renderer_vulkan/vk_layer_draws.h
                src/video_core/renderer_vulkan/vk_pass_merge.h
                src/video_core/renderer_vulkan/vk_dispatch_eye_overlap.h
                src/video_core/renderer_vulkan/vr_perf.cpp
@@ -1405,8 +1564,15 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vr_inframe.cpp
                src/video_core/renderer_vulkan/vr_inframe.h
                src/video_core/renderer_vulkan/vr_eye_scale.h
+               src/video_core/renderer_vulkan/vr_eye_cant.cpp
+               src/video_core/renderer_vulkan/vr_eye_cant.h
+               src/video_core/renderer_vulkan/vr_kos_iris.cpp
+               src/video_core/renderer_vulkan/vr_kos_iris.h
+               src/video_core/renderer_vulkan/vr_kos_iris_data.h
                src/video_core/renderer_vulkan/vr_eye_upscale.cpp
                src/video_core/renderer_vulkan/vr_eye_upscale.h
+               src/video_core/renderer_vulkan/vr_riposte_meter.cpp
+               src/video_core/renderer_vulkan/vr_riposte_meter.h
                src/video_core/renderer_vulkan/vr_smaa.cpp
                src/video_core/renderer_vulkan/vr_smaa.h
                src/video_core/renderer_vulkan/vr_smaa_trim.h
@@ -1418,8 +1584,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vr_temporal_runtime.h
                src/video_core/renderer_vulkan/vr_temporal_runtime.cpp
                src/video_core/renderer_vulkan/vr_temporal_images.h
-               src/video_core/renderer_vulkan/vr_dibr_dlss.cpp
-               src/video_core/renderer_vulkan/vr_dibr_dlss.h
+               src/video_core/renderer_vulkan/vr_dibr_upscale.cpp
+               src/video_core/renderer_vulkan/vr_dibr_upscale.h
                src/video_core/renderer_vulkan/vr_temporal_images.cpp
                src/video_core/renderer_vulkan/vr_temporal_scene.h
                src/video_core/renderer_vulkan/vr_temporal_scene.cpp
@@ -1430,6 +1596,17 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_rasterizer_temporal.cpp
                src/video_core/renderer_vulkan/vr_camera_motion.h
     src/video_core/renderer_vulkan/vr_camera_motion.cpp
+    src/video_core/renderer_vulkan/vr_depth_rescale.h
+    src/video_core/renderer_vulkan/vr_depth_rescale.cpp
+    src/video_core/renderer_vulkan/vr_body_maps.h
+    src/core/vr/lamp_glow.h
+    src/video_core/renderer_vulkan/vr_body_maps.cpp
+    src/video_core/renderer_vulkan/vr_depth_pyramid.h
+    src/video_core/renderer_vulkan/vr_depth_pyramid.cpp
+    src/video_core/renderer_vulkan/vr_fog_grid.h
+    src/video_core/renderer_vulkan/vr_fog_grid.cpp
+    src/video_core/renderer_vulkan/vr_shadow_hold.h
+    src/video_core/renderer_vulkan/vr_shadow_hold.cpp
     src/video_core/renderer_vulkan/vr_motion_camera.h
     src/video_core/renderer_vulkan/vr_object_motion.h
     src/video_core/renderer_vulkan/vr_object_motion.cpp
@@ -1437,9 +1614,17 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
     src/video_core/renderer_vulkan/vr_motion_history.h
     src/video_core/renderer_vulkan/vr_dlss_runtime.cpp
                src/video_core/renderer_vulkan/vr_dlss_runtime.h
+               src/video_core/renderer_vulkan/vr_nvidia_profile.cpp
+               src/video_core/renderer_vulkan/vr_nvidia_profile.h
+               src/video_core/renderer_vulkan/vr_overlay_guard.cpp
+               src/video_core/renderer_vulkan/vr_overlay_guard.h
                src/video_core/renderer_vulkan/vr_dlss_session.h
                src/video_core/renderer_vulkan/vr_dlss_bridge.h
                src/video_core/renderer_vulkan/vr_dlss_preset.h
+               src/video_core/renderer_vulkan/vr_dlss_focus.h
+               src/video_core/renderer_vulkan/vr_dlss_focus_pass.cpp
+               src/video_core/renderer_vulkan/vr_dlss_focus_pass.h
+               src/video_core/renderer_vulkan/vr_eye_axes.h
                src/video_core/renderer_vulkan/vr_render_taa.cpp
                src/video_core/renderer_vulkan/vr_render_taa.h
                src/video_core/renderer_vulkan/smaa/AreaTex.h
@@ -1459,6 +1644,9 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vr_ui_layer.cpp
                src/video_core/renderer_vulkan/vr_ui_layer.h
                src/video_core/renderer_vulkan/vk_rasterizer_vr.cpp
+               src/video_core/renderer_vulkan/vk_rasterizer_moon.cpp
+               src/video_core/renderer_vulkan/vk_rasterizer_air.cpp
+               src/video_core/renderer_vulkan/vk_rasterizer_fog_grid.cpp
                src/video_core/renderer_vulkan/vk_rasterizer_vr_draws.cpp
                src/video_core/renderer_vulkan/vk_rasterizer_vr_aa.cpp
                src/video_core/renderer_vulkan/vk_presenter_vr.cpp
@@ -1478,6 +1666,12 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/texture_cache/image_view.h
                src/video_core/texture_cache/sampler.cpp
                src/video_core/texture_cache/sampler.h
+               src/video_core/texture_cache/bump_height.cpp
+               src/video_core/texture_cache/bump_height.h
+               src/video_core/texture_cache/bump_height_derive.cpp
+               src/video_core/texture_cache/bump_height_derive.h
+               src/video_core/texture_cache/sky_detail.cpp
+               src/video_core/texture_cache/sky_detail.h
                src/video_core/texture_cache/texture_cache.cpp
                src/video_core/texture_cache/texture_cache.h
                src/video_core/texture_cache/tile_manager.cpp
@@ -1485,8 +1679,12 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/texture_cache/types.h
                src/video_core/cache_storage.cpp
                src/video_core/cache_storage.h
+               src/video_core/cache_pack.cpp
+               src/video_core/cache_pack.h
                src/video_core/pipeline_cache_policy.h
                src/video_core/page_manager.cpp
+               src/video_core/shader_archive.cpp
+               src/video_core/shader_archive.h
                src/video_core/fast_render.cpp
                src/video_core/fast_render.h
                src/video_core/page_manager.h
@@ -1535,6 +1733,7 @@ set(IMGUI src/imgui/imgui_config.h
 
 set(INPUT src/input/controller.cpp
           src/input/controller.h
+          src/input/pad_layers.h
           src/input/controller_state.cpp
           src/input/input_handler.cpp
           src/input/input_handler.h
@@ -1590,6 +1789,40 @@ string(SHA256 red_zone_cache_fingerprint "${red_zone_cache_fingerprint}")
 set_property(SOURCE src/core/cpu_patches.cpp APPEND PROPERTY COMPILE_DEFINITIONS
     "RED_ZONE_CACHE_BUILD_ID=\"${red_zone_cache_fingerprint}\"")
 
+# Resources are shared by the emulator and asset regression tests.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/CMakeRC.cmake")
+cmrc_add_resource_library(embedded-resources
+        ALIAS res::embedded
+        NAMESPACE res
+        src/resources/big_picture/controller.png
+        src/resources/big_picture/experimental.png
+        src/resources/big_picture/folder.png
+        src/resources/big_picture/graphics.png
+        src/resources/big_picture/log.png
+        src/resources/big_picture/profiles.png
+        src/resources/big_picture/settings.png
+        src/resources/big_picture/trophy.png
+        src/resources/bronze.png
+        src/resources/gold.png
+        src/resources/platinum.png
+        src/resources/shadps4.png
+        src/resources/silver.png
+        src/resources/trophy.wav
+        src/resources/vr/beast_chain_clink.pcm
+        src/resources/vr/gun_reload.pcm
+        src/resources/vr/gun_empty.pcm
+        src/resources/vr/tool_empty.pcm
+        src/resources/vr/beast_roar.brb
+        src/resources/vr/call_beyond.brb
+        src/resources/vr/executioner_glove.brb
+        src/resources/vr/augur_creature.brb
+        src/resources/vr/music_box_regal.dds
+        src/resources/vr/poison_knife.dds
+        src/resources/vr/shaman_blade.dds
+        src/resources/vr/sangiran17.bin
+        src/resources/vr/messenger_skull.bin
+        src/resources/vr/messenger_chunks.bin)
+
 if(NOT ENABLE_TESTS)
 
 add_executable(shadps4
@@ -1621,9 +1854,11 @@ if(BBVR_THINLTO)
 endif()
 
 # PGO applies only to the emulator target; dependency libraries stay unchanged.
-set(BBVR_PGO "OFF" CACHE STRING "Profile-guided optimisation: OFF, GENERATE, USE")
+set(BBVR_PGO "OFF" CACHE STRING "PGO: OFF, GENERATE, USE")
 set_property(CACHE BBVR_PGO PROPERTY STRINGS OFF GENERATE USE)
 set(BBVR_PGO_PROFILE "" CACHE FILEPATH "Indexed LLVM profile for PGO")
+set(BBVR_PGO_SCOPE "VIDEO" CACHE STRING "PGO USE: VIDEO (renderer only, the default since 2026-11-05) or ALL sources")
+set_property(CACHE BBVR_PGO_SCOPE PROPERTY STRINGS ALL VIDEO)
 if(NOT BBVR_PGO STREQUAL "OFF")
     if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR NOT MSVC)
         message(FATAL_ERROR "PGO requires the tested clang-cl toolchain")
@@ -1645,7 +1880,35 @@ if(NOT BBVR_PGO STREQUAL "OFF")
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${BBVR_PGO_PROFILE}")
         file(SHA256 "${BBVR_PGO_PROFILE}" BBVR_PGO_SHA256)
         target_compile_definitions(shadps4 PRIVATE "BBVR_PGO_SHA256=\"${BBVR_PGO_SHA256}\"")
-        target_compile_options(shadps4 PRIVATE "-fprofile-use=${BBVR_PGO_PROFILE}")
+        # Code the training never ran is built as without PGO (only placed apart from the hot
+        # code): no size optimization of it (pgso), no cold function attribute, and its calls
+        # inlined at the normal /O2 threshold, not the cold one (45). The same options again at
+        # link time, where ThinLTO's backend optimizes and generates the code.
+        set(scratch_pgo_neutral -pgso=false -pgo-cold-func-opt=default
+            -inline-cold-callsite-threshold=225 -inlinecold-threshold=225)
+        # A target's options are de-duplicated (SHELL: keeps each -mllvm pair); a source file's
+        # are not, and take no SHELL: (it reached clang-cl as a file name): plain pairs there.
+        set(scratch_pgo_options "-fprofile-use=${BBVR_PGO_PROFILE}")
+        set(scratch_pgo_source_options "-fprofile-use=${BBVR_PGO_PROFILE}")
+        foreach(option ${scratch_pgo_neutral})
+            list(APPEND scratch_pgo_options "SHELL:-mllvm ${option}")
+            list(APPEND scratch_pgo_source_options -mllvm ${option})
+            if(NOT option MATCHES "^-pgo-cold-func-opt") # a compile-time option only
+                target_link_options(shadps4 PRIVATE "/mllvm:${option}")
+            endif()
+        endforeach()
+        if(BBVR_PGO_SCOPE STREQUAL "VIDEO")
+            # The renderer's threads alone (stage B, the recorder, the presenter): the video core
+            # and the guest-memory copies they call. Everything else builds as without PGO.
+            set(scratch_pgo_sources ${VIDEO_CORE} src/core/memory.cpp src/core/address_space.cpp)
+            list(FILTER scratch_pgo_sources INCLUDE REGEX "\\.cpp$")
+            # AMD's FSR 4 bridge (not runnable on the training machine): built as without PGO.
+            list(FILTER scratch_pgo_sources EXCLUDE REGEX "vr_fsr4")
+            set_property(SOURCE ${scratch_pgo_sources} APPEND PROPERTY COMPILE_OPTIONS
+                         ${scratch_pgo_source_options})
+        else()
+            target_compile_options(shadps4 PRIVATE ${scratch_pgo_options})
+        endif()
     else()
         message(FATAL_ERROR "Unknown PGO mode")
     endif()
@@ -1812,31 +2075,6 @@ add_subdirectory(${HOST_SHADERS_INCLUDE})
 add_dependencies(shadps4 host_shaders)
 target_include_directories(shadps4 PRIVATE ${HOST_SHADERS_INCLUDE})
 
-# embed resources
-
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/CMakeRC.cmake")
-cmrc_add_resource_library(embedded-resources
-        ALIAS res::embedded
-        NAMESPACE res
-        src/resources/big_picture/controller.png
-        src/resources/big_picture/experimental.png
-        src/resources/big_picture/folder.png
-        src/resources/big_picture/graphics.png
-        src/resources/big_picture/log.png
-        src/resources/big_picture/profiles.png
-        src/resources/big_picture/settings.png
-        src/resources/big_picture/trophy.png
-        src/resources/bronze.png
-        src/resources/gold.png
-        src/resources/platinum.png
-        src/resources/shadps4.png
-        src/resources/silver.png
-        src/resources/trophy.wav
-        src/resources/vr/beast_chain_clink.pcm
-        src/resources/vr/gun_reload.pcm
-        src/resources/vr/gun_empty.pcm
-        src/resources/vr/music_box_regal.dds
-        src/resources/vr/sangiran17.bin)
 target_link_libraries(shadps4 PRIVATE res::embedded)
 
 # ImGui resources

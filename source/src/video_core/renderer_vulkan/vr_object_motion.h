@@ -32,6 +32,9 @@ public:
     bool Active() const {
         return active;
     }
+    // 1: the DIBR centre (single-layer target, a non-multiview pass); 2: native stereo (default).
+    // A change releases the resources; call before Begin.
+    void SetViews(uint32_t count);
 
 private:
     // Start selective tracking at 4M positions/eye; grow after exhaustion, up to
@@ -52,6 +55,9 @@ private:
     void Release();
     Target* GetTarget(uint32_t width, uint32_t height);
     void Retire(Target& target);
+    vk::ImageSubresourceRange Range() const {
+        return {vk::ImageAspectFlagBits::eColor, 0, 1, 0, views};
+    }
     const Instance& instance;
     Scheduler& scheduler;
     std::unique_ptr<VrObjectMotionState> history;
@@ -61,6 +67,7 @@ private:
     Shader::VrMotion specialization{};
     std::array<Target, MaxTargets> targets;
     uint64_t frame{};
+    uint32_t views{2};
     bool active{}, failed{};
 };
 } // namespace Vulkan

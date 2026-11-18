@@ -8,6 +8,7 @@
 namespace Common {
 
 constexpr char g_version[]  = "@APP_VERSION@";
+constexpr char g_application_title[] = "BLDBRNE-VR v@BBVR_DISPLAY_VERSION@";
 constexpr bool g_is_release = @APP_IS_RELEASE@;
 
 constexpr char g_scm_rev[]         = "@GIT_REV@";

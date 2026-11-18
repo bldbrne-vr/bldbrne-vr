@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -81,6 +82,60 @@ constexpr std::array<u8, 32> FindSig = {
     0x8B, 0x06, 0x83, 0xF8, 0xFF, 0x0F, 0x84, 0xA6, 0x00, 0x00, 0x00, 0x89, 0xC1, 0x48, 0x69, 0xC9,
     0x15, 0x3F, 0xEF, 0x03, 0x48, 0xC1, 0xE9, 0x20, 0x89, 0xC2, 0x29, 0xCA, 0xD1, 0xEA, 0x01, 0xCA,
 };
+
+// pickup_reach: how far an item on the ground offers its prompt. The checker asks for the nearest
+// item whose ActionButtonParam region holds the hunter (0x17D9FB0 for enemy drops and world
+// items, 0x17DA500 for treasure), through ActionButtonMan's region test (0x1CDE850): the row's
+// regionType (+0x00) picks the test, 0 a cylinder (0x1CDBB40): the level distance under radius
+// (+0x0C, metres) plus the item's own +0x44, height +0x1C above +0x20, angle +0x10 / +0x28. The
+// rows: 4000 for world items (0x12FDADE), 4100 or 4110 for enemy drops (0x12FD8D1, 0x12FD915) and
+// each treasure's own (its entry's +0x4C, read at 0x17DA5E1); a treasure without one (-1, most of
+// them) takes 4300 with its flag 0x100, else 4200 (0x17DA5F5, 0x17DA60F). A row comes from 0x1F128A0
+// (Out{const void* 0x531CBF0; s32 -1; u8* row}*, s32 id), as the region test asks for it. The
+// rows are the game's, read on this same thread: their radius is scaled in place, once.
+constexpr u64 AbRowRva = 0x1F128A0;
+constexpr std::array<u8, 28> AbRowSig = {
+    0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x41, 0x89, 0xF4,
+    0x49, 0x89, 0xFE, 0x31, 0xC9, 0x45, 0x85, 0xE4, 0x0F, 0x88, 0xF2, 0x00, 0x00, 0x00,
+};
+constexpr u64 AbRowOutRva = 0x531CBF0;
+// The region test's lookup (lea of the Out's first word ... call 0x1F128A0) and its dispatch on
+// the row's first byte; the cylinder test's reads of radius, angle, height, base, angle check.
+constexpr u64 AbLookupRva = 0x1CDE889;
+constexpr std::array<u8, 37> AbLookupSig = {
+    0x48, 0x8D, 0x05, 0x60, 0xE3, 0x63, 0x03, 0x48, 0x89, 0x45, 0xB8, 0xC7, 0x45,
+    0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0x48, 0xC7, 0x45, 0xC8, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0x8D, 0x7D, 0xB8, 0x89, 0xCE, 0xE8, 0xF2, 0x3F, 0x23, 0x00,
+};
+constexpr u64 AbDispatchRva = 0x1CDE8B7;
+constexpr std::array<u8, 11> AbDispatchSig = {0x0F, 0xB6, 0x00, 0x83, 0xF8, 0x02,
+                                              0x74, 0x30, 0x83, 0xF8, 0x01};
+constexpr u64 AbCylinderRva = 0x1CDBC16;
+constexpr std::array<u8, 23> AbCylinderSig = {
+    0xC5, 0x7A, 0x10, 0x79, 0x0C, 0x44, 0x8B, 0x71, 0x10, 0xC5, 0x7A, 0x10,
+    0x69, 0x1C, 0xC5, 0xFA, 0x10, 0x71, 0x20, 0x0F, 0xB6, 0x41, 0x24,
+};
+constexpr u64 DropRowRva = 0x12FD8D1; // mov r12d, 4100; mov edx, 2; mov ecx, 4100
+constexpr std::array<u8, 16> DropRowSig = {0x41, 0xBC, 0x04, 0x10, 0x00, 0x00, 0xBA, 0x02,
+                                           0x00, 0x00, 0x00, 0xB9, 0x04, 0x10, 0x00, 0x00};
+constexpr u64 DropRowFlaggedRva = 0x12FD915; // mov eax, 4110
+constexpr std::array<u8, 5> DropRowFlaggedSig = {0xB8, 0x0E, 0x10, 0x00, 0x00};
+constexpr u64 WorldRowRva = 0x12FDADE; // mov ecx, 4000
+constexpr std::array<u8, 5> WorldRowSig = {0xB9, 0xA0, 0x0F, 0x00, 0x00};
+// mov r12d, [r14+0x4C]; cmp r12d, -1; jnz; mov eax, [r14+0x48]; bt eax, 8; jnb; mov r12d, 4300;
+// jmp; mov ecx, 0x108; bextr eax, eax, ecx; mov r12d, -1; jnz; mov r12d, 4200
+constexpr u64 TreasureRowRva = 0x17DA5E1;
+constexpr std::array<u8, 52> TreasureRowSig = {
+    0x45, 0x8B, 0x66, 0x4C, 0x41, 0x83, 0xFC, 0xFF, 0x75, 0x35, 0x41, 0x8B, 0x46,
+    0x48, 0x0F, 0xBA, 0xE0, 0x08, 0x73, 0x08, 0x41, 0xBC, 0xCC, 0x10, 0x00, 0x00,
+    0xEB, 0x23, 0xB9, 0x08, 0x01, 0x00, 0x00, 0xC4, 0xE2, 0x70, 0xF7, 0xC0, 0x41,
+    0xBC, 0xFF, 0xFF, 0xFF, 0xFF, 0x75, 0x11, 0x41, 0xBC, 0x68, 0x10, 0x00, 0x00,
+};
+constexpr std::array<s32, 5> FixedItemRows = {4000, 4100, 4110, 4200, 4300};
+constexpr u32 OffsetAbRadius = 0x0C;
+constexpr u32 OffsetAbHeight = 0x1C;
+constexpr u32 OffsetAbBase = 0x20;
+constexpr u32 OffsetAbText = 0x30;
 
 // The three pickups: `call PickUp` (its arguments rdi = ItemDropMan, rsi = &handle and the handle
 // at [rbp-0x38] are set just before), the event's argument setup (only callee-saved registers and
@@ -413,7 +468,110 @@ s64 SteadyNs() {
         .count();
 }
 
+// ---- pickup_reach: the items' rows, scaled at the checker's entry ------------------------------
+
+struct AbRowOut {
+    const void* first; // the region test's own first word (AbRowOutRva)
+    s32 id;
+    u32 pad;
+    u8* row;
+};
+static_assert(sizeof(AbRowOut) == 0x18 && offsetof(AbRowOut, row) == 0x10);
+using AbRowFn = void(PS4_SYSV_ABI*)(AbRowOut*, s32 id);
+
+bool g_reach = false; // the rows can be found and scaled (every signature matched)
+bool g_scan = false;  // VR_PICKUP_SCAN
+s64 g_reach_ns = 0;
+// The rows scaled (the checker's thread only): the radius written, so a row is scaled once, and
+// again from its new value if the game ever loads its params anew. `skip`: left as it is (not a
+// cylinder, or an implausible radius; logged once).
+struct Reached {
+    s32 id;
+    const u8* row;
+    float written;
+    bool skip;
+};
+std::vector<Reached> g_reached;
+
+void Reach(s32 id, float scale) {
+    AbRowOut out{g_base + AbRowOutRva, -1, 0, nullptr};
+    reinterpret_cast<AbRowFn>(g_base + AbRowRva)(&out, id);
+    u8* const row = out.row;
+    if (!Plausible(row, 4)) {
+        return;
+    }
+    auto it = std::find_if(g_reached.begin(), g_reached.end(),
+                           [&](const Reached& r) { return r.id == id && r.row == row; });
+    const float radius = Read<float>(row + OffsetAbRadius);
+    if (it != g_reached.end() && (it->skip || radius == it->written)) {
+        return;
+    }
+    const u8 region = Read<u8>(row);
+    if (region != 0 || !(radius > 0.05f && radius < 20.0f)) {
+        LOG_INFO(Core, "VR pickup: reach row {}: region type {}, radius {:.2f}: left as it is", id,
+                 region, radius);
+        if (it == g_reached.end()) {
+            g_reached.push_back({id, row, radius, true});
+        } else {
+            it->skip = true;
+        }
+        return;
+    }
+    const float scaled = radius * scale;
+    std::memcpy(row + OffsetAbRadius, &scaled, sizeof(scaled));
+    LOG_INFO(Core,
+             "VR pickup: reach row {} radius {:.2f} -> {:.2f} m (x{:.2f}; height {:.2f} from "
+             "{:+.2f}, text {}){}",
+             id, radius, scaled, scale, Read<float>(row + OffsetAbHeight),
+             Read<float>(row + OffsetAbBase), Read<s32>(row + OffsetAbText),
+             it != g_reached.end() ? " again (the row was loaded anew)" : "");
+    if (it == g_reached.end()) {
+        g_reached.push_back({id, row, scaled, false});
+    } else {
+        it->written = scaled;
+    }
+}
+
+// Twice a second: the fixed rows, and every treasure's own row (a new map's treasure is scaled
+// within half a second of its list filling, before the hunter can walk to it).
+void ReachTick() {
+    const float scale = VR::GetSettings().pickup_reach;
+    if (!g_reach || std::abs(scale - 1.0f) < 1e-3f) {
+        return;
+    }
+    const s64 now = SteadyNs();
+    if (now - g_reach_ns < 500'000'000) {
+        return;
+    }
+    g_reach_ns = now;
+    for (const s32 id : FixedItemRows) {
+        Reach(id, scale);
+    }
+    u8* const idm = Read<u8*>(g_base + ItemDropManRva);
+    if (!Plausible(idm)) {
+        return;
+    }
+    std::array<s32, 16> seen{};
+    size_t seen_count = 0;
+    u8* e = Read<u8*>(idm + 0x28); // the treasure list
+    for (int i = 0; i < MaxWalk && Plausible(e); ++i, e = Read<u8*>(e + OffsetNext)) {
+        const s32 id = Read<s32>(e + OffsetParam);
+        if (id <= 0 || std::find(seen.begin(), seen.begin() + seen_count, id) !=
+                           seen.begin() + seen_count) {
+            continue;
+        }
+        if (seen_count < seen.size()) {
+            seen[seen_count++] = id;
+        }
+        Reach(id, scale);
+    }
+}
+
 void PS4_SYSV_ABI ScanHook(u8* /*checker*/, u8* /*saved_ymm*/) {
+    ReachTick();
+    if (!g_scan) {
+        return;
+    }
     ++g_scan_calls;
     const s64 now = SteadyNs();
     if (now - g_scan_ns < 1'000'000'000) {
@@ -570,6 +728,31 @@ void InstallPickup(VAddr base, u64 size) {
     }
     g_find = reinterpret_cast<FindFn>(module + FindRva);
     const bool scan = std::getenv("VR_PICKUP_SCAN") != nullptr;
+    g_scan = scan;
+    // pickup_reach: the row lookup, the region test and the rows the checker passes, all as read
+    // above; otherwise the game's own radius.
+    std::string reach_bad;
+    const auto need = [&](u64 rva, const auto& sig, const char* what) {
+        if (!matches(rva, sig, sig.size())) {
+            reach_bad += fmt::format(" {} {:#x} ({})", what, rva,
+                                     Hook::HexBytes(module + rva, sig.size()));
+        }
+    };
+    need(AbRowRva, AbRowSig, "row lookup");
+    need(AbLookupRva, AbLookupSig, "region test");
+    need(AbDispatchRva, AbDispatchSig, "region type");
+    need(AbCylinderRva, AbCylinderSig, "cylinder");
+    need(DropRowRva, DropRowSig, "drop row");
+    need(DropRowFlaggedRva, DropRowFlaggedSig, "drop row 4110");
+    need(WorldRowRva, WorldRowSig, "world row");
+    need(TreasureRowRva, TreasureRowSig, "treasure row");
+    const float reach = VR::GetSettings().pickup_reach;
+    if (!reach_bad.empty()) {
+        LOG_WARNING(Core, "VR pickup: reach signature MISMATCH ({}); the game's pickup radius",
+                    reach_bad.substr(1));
+    }
+    g_reach = reach_bad.empty() && std::abs(reach - 1.0f) >= 1e-3f;
+    const bool entry = scan || g_reach; // the checker's entry hook (ScanHook: ReachTick, the scan)
     for (const Site& site : Sites) {
         if (!Hook::MakeWritable(module + site.rva, SiteLen(site))) {
             LOG_ERROR(Core, "VR pickup: could not make {:#x} writable; the game's own pickups",
@@ -577,8 +760,10 @@ void InstallPickup(VAddr base, u64 size) {
             return;
         }
     }
-    if (scan && !Hook::MakeWritable(module + CheckerRva, CheckerPrologueLen)) {
-        LOG_ERROR(Core, "VR pickup: could not make the checker writable; no scan");
+    if (entry && !Hook::MakeWritable(module + CheckerRva, CheckerPrologueLen)) {
+        LOG_ERROR(Core, "VR pickup: could not make the checker writable; no scan, the game's "
+                        "pickup radius");
+        g_reach = false;
     }
     try {
         g_code = std::make_unique<Xbyak::CodeGenerator>(1024);
@@ -587,7 +772,7 @@ void InstallPickup(VAddr base, u64 size) {
             stubs[i] = EmitSite(*g_code, Sites[i], module);
         }
         void* scan_stub = nullptr;
-        if (scan) {
+        if (scan || g_reach) {
             using Xbyak::util::rdi;
             scan_stub = Hook::EmitHostCallStub(
                 *g_code, reinterpret_cast<void*>(&ScanHook), CheckerSig.data(), CheckerPrologueLen,
@@ -608,9 +793,12 @@ void InstallPickup(VAddr base, u64 size) {
     LOG_INFO(Core,
              "VR pickup: installed at {:#x} / {:#x} / {:#x} (enemy drops, world items, treasure): "
              "pickup_instant {}{} - in first-person VR an item is granted with the game's pop-up "
-             "and no pickup animation{}",
+             "and no pickup animation; pickup_reach x{:.2f}{}{}",
              Sites[0].rva, Sites[1].rva, Sites[2].rva, SettingOn() ? 1 : 0,
-             g_env_setting >= 0 ? " (VR_PICKUP_INSTANT)" : "",
+             g_env_setting >= 0 ? " (VR_PICKUP_INSTANT)" : "", reach,
+             g_reach ? " (the radius of item rows 4000 / 4100 / 4110 / 4200 / 4300 and each "
+                       "treasure's own)"
+                     : " (the game's radius)",
              scan ? "; VR_PICKUP_SCAN: the item glows near the hunter are logged" : "");
 }
 

@@ -18,10 +18,13 @@
 #include <xbyak/xbyak.h>
 
 #include "common/logging/log.h"
+#include "core/vr/amygdalan_hook.h"
 #include "core/vr/bloodborne_layout.h"
+#include "core/vr/bloodborne_ragdoll.h"
 #include "core/vr/bloodborne_stagger.h"
 #include "core/vr/bloodborne_visceral_pull.h"
 #include "core/vr/hook_util.h"
+#include "core/vr/ladder_steps.h"
 #include "core/vr/stagger_speed.h"
 #include "core/vr/vr_session.h"
 
@@ -138,6 +141,123 @@ bool ReadState(const u8* chr, S::In& in) {
     return true;
 }
 
+// cinematic_ladder_skip: the hunter's climbing sounds keep his rhythm behind the black
+// (core/vr/ladder_steps.h). PlaySound (`void(u64* handle, const float* pos, s32 type, s32 id)`):
+// a detour over its 16-byte prologue asks LadderSoundAt for every sound; one it thins plays at
+// FarAway instead of at his feet, out of earshot (the call and its handle stay the game's own).
+// Installed from the first main-player update (the game's update thread, where the TAE sounds
+// play), after every module checked PlaySound's signature at load (VR_SOUND_TRACE's way).
+constexpr u64 PlaySoundRva = 0x13E0290;
+constexpr std::array<u8, 16> PlaySoundPrologue = {
+    0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, // push rbp; mov rbp, rsp; push r15; push r14
+    0x53, 0x48, 0x81, 0xEC, 0x28, 0x01, 0x00, 0x00, // push rbx; sub rsp, 0x128
+};
+constexpr u32 OffsetPhysicsModule = 0x68;
+constexpr u32 OffsetPhysicsPosition = 0x1E0;
+constexpr std::array<float, 3> FarAway = {0.0f, -100000.0f, 0.0f};
+std::unique_ptr<Xbyak::CodeGenerator> g_sound_code;
+bool g_sound_tried = false;
+std::atomic<u32> g_climb_sounds{0}; // his sounds since the climb went fast
+std::atomic<u32> g_thinned{0};
+
+// His feet (the physics module's position, game metres).
+bool HunterFeet(float (&out)[3]) {
+    const u8* const world = Read<const u8*>(g_base + WorldChrManRva);
+    const u8* const player = Plausible(world) ? Read<const u8*>(world + OffsetMainPlayer) : nullptr;
+    const u8* const bag = Plausible(player) ? Read<const u8*>(player + OffsetChrModules) : nullptr;
+    const u8* const physics = Plausible(bag) ? Read<const u8*>(bag + OffsetPhysicsModule) : nullptr;
+    if (!Plausible(physics) || Read<const u8*>(physics + OffsetOwner) != player) {
+        return false;
+    }
+    std::memcpy(out, physics + OffsetPhysicsPosition, sizeof(out));
+    return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+}
+
+// The position a sound plays at: null for its own, FarAway for a step the fast climb thins.
+const float* PS4_SYSV_ABI LadderSoundAt(const float* pos) {
+    namespace L = VR::LadderSteps;
+    const VR::Cinematic::LadderSkip skip = VR::LadderSkipNow();
+    if (!L::Fast(skip.black, skip.climb, skip.rate)) {
+        if (g_climb_sounds.load(std::memory_order_relaxed) == 0) {
+            return nullptr; // (every sound of the game passes here: no write)
+        }
+        if (const u32 heard = g_climb_sounds.exchange(0, std::memory_order_relaxed); heard > 0) {
+            LOG_INFO(Core, "VR cine: ladder skip: {} of his {} climbing sounds thinned (his rhythm)",
+                     g_thinned.exchange(0, std::memory_order_relaxed), heard);
+        }
+        return nullptr;
+    }
+    float feet[3]{};
+    if (!Plausible(reinterpret_cast<const u8*>(pos), 4) || !HunterFeet(feet) ||
+        !L::Near(pos, feet)) {
+        return nullptr; // the world's
+    }
+    if (L::Keep(g_climb_sounds.fetch_add(1, std::memory_order_relaxed), skip.rate)) {
+        return nullptr;
+    }
+    g_thinned.fetch_add(1, std::memory_order_relaxed);
+    return FarAway.data();
+}
+
+void InstallLadderSounds() {
+    g_sound_tried = true;
+    u8* const site = g_base + PlaySoundRva;
+    if (std::memcmp(site, PlaySoundPrologue.data(), PlaySoundPrologue.size()) != 0 ||
+        !Hook::MakeWritable(site, PlaySoundPrologue.size())) {
+        LOG_WARNING(Core, "VR cine: ladder skip's sounds not thinned (PlaySound's prologue: {})",
+                    Hook::HexBytes(site, PlaySoundPrologue.size()));
+        return;
+    }
+    try {
+        g_sound_code = std::make_unique<Xbyak::CodeGenerator>(1024);
+        using namespace Xbyak::util;
+        auto& c = *g_sound_code;
+        c.align(16);
+        auto* const entry = const_cast<u8*>(c.getCurr());
+        // Hook::EmitHostCallStubWith's frame, and a non-null answer replaces the saved rsi (the
+        // position argument) before the guest registers come back.
+        c.lea(rsp, ptr[rsp - 128]); // keep the guest red zone intact
+        c.pushf();
+        for (const auto& reg : {rax, rcx, rdx, rbx, rsi, rdi, r8, r9, r10, r11, rbp}) {
+            c.push(reg);
+        }
+        c.mov(rdi, rsi); // the position
+        c.mov(rbp, rsp);
+        c.and_(rsp, -32);
+        c.sub(rsp, 32 * 16);
+        for (int i = 0; i < 16; ++i) {
+            c.vmovdqu(ptr[rsp + 32 * i], Xbyak::Ymm(i));
+        }
+        c.mov(rax, reinterpret_cast<u64>(&LadderSoundAt));
+        c.call(rax);
+        for (int i = 0; i < 16; ++i) {
+            c.vmovdqu(Xbyak::Ymm(i), ptr[rsp + 32 * i]);
+        }
+        c.mov(rsp, rbp);
+        Xbyak::Label own;
+        c.test(rax, rax);
+        c.jz(own);
+        c.mov(ptr[rsp + 6 * 8], rax); // the saved rsi (pushed fifth of eleven)
+        c.L(own);
+        for (const auto& reg : {rbp, r11, r10, r9, r8, rdi, rsi, rbx, rdx, rcx, rax}) {
+            c.pop(reg);
+        }
+        c.popf();
+        c.lea(rsp, ptr[rsp + 128]);
+        for (const u8 b : PlaySoundPrologue) {
+            c.db(b);
+        }
+        EmitAbsoluteJump(c, reinterpret_cast<u64>(site + PlaySoundPrologue.size()));
+        c.ready();
+        Hook::WriteJump(site, PlaySoundPrologue.size(), entry);
+    } catch (const Xbyak::Error& error) {
+        LOG_ERROR(Core, "VR cine: ladder skip's sound detour failed ({})", error.what());
+        return;
+    }
+    LOG_INFO(Core, "VR cine: ladder skip: his climbing sounds keep his rhythm (PlaySound {:#x})",
+             PlaySoundRva);
+}
+
 const char* EndName(S::Shortener::End e) {
     switch (e) {
     case S::Shortener::End::Gained:
@@ -160,7 +280,7 @@ void PS4_SYSV_ABI StaggerHook(u8* chr, u8* saved_ymm) {
         // Not the main player: the interactive visceral's held target (the entry lets only it
         // through besides him) runs at the hold's speed with him; while freehand's catch holds
         // the world still (the entry lets every character through) everyone else at its rate.
-        const float partner = VisceralPullPartnerRate(chr);
+        const float partner = VisceralPullPartnerRate(chr) * ArmHookAnimationRate(chr);
         if (partner != 1.0f && std::isfinite(dt)) {
             const float scaled = dt * partner;
             std::memcpy(saved_ymm, &scaled, sizeof(scaled));
@@ -168,6 +288,9 @@ void PS4_SYSV_ABI StaggerHook(u8* chr, u8* saved_ymm) {
         return;
     }
     ++g_updates;
+    if (!g_sound_tried && VR::GetSettings().cinematic_ladder_skip) {
+        InstallLadderSounds(); // the game's update thread, after the load's signature checks
+    }
     const float shorten_s = std::max(VR::GetSettings().stagger_shorten_ms, 0.0f) * 0.001f;
     S::In in{};
     in.dt = dt;
@@ -181,7 +304,14 @@ void PS4_SYSV_ABI StaggerHook(u8* chr, u8* saved_ymm) {
     }
     const s32 clip = g_shortener.Id();
     const float gained = g_shortener.Gained();
-    const float rate = g_shortener.Step(in) * hold;
+    // cinematic_ladder_skip: his climbing clips at the skip's pace behind the black.
+    namespace C = VR::Cinematic;
+    const C::LadderSkip ladder = VR::LadderSkipNow();
+    const float climb =
+        ladder.rate != 1.0f && in.anim_id >= 0 && C::IsLadderClimb(C::ClassifyLadderClip(in.anim_id))
+            ? ladder.rate
+            : 1.0f;
+    const float rate = g_shortener.Step(in) * hold * climb;
     const s64 now = NowNs();
     if (const auto end = g_shortener.TakeEnded(); end != S::Shortener::End::None) {
         (end == S::Shortener::End::Gained   ? g_ended_gained
@@ -224,7 +354,10 @@ void InstallStaggerSpeed(VAddr base, u64 size) {
     g_log = std::getenv("VR_STAGGER_LOG") != nullptr;
     const float shorten = VR::GetSettings().stagger_shorten_ms;
     const bool pull = VisceralPullWanted(); // the interactive visceral rides on the same detour
-    if (!(shorten > 0.0f) && !pull) {
+    // The ladder skip's pace rides on it too (cinematic_ladder_skip_speed).
+    const bool ladder = VR::GetSettings().cinematic_ladder_skip &&
+                        VR::GetSettings().cinematic_ladder_skip_speed > 1.0f;
+    if (!(shorten > 0.0f) && !pull && !ladder && !AmygdalanHook::Enabled()) {
         LOG_INFO(Core, "VR stagger: stagger_shorten_ms=0, the game's staggers (not installed)");
         return;
     }
@@ -267,6 +400,11 @@ void InstallStaggerSpeed(VAddr base, u64 size) {
         c.mov(rax, reinterpret_cast<u64>(VisceralPullWorldSlot()));
         c.cmp(qword[rax], 0);
         c.jne(to_host, Xbyak::CodeGenerator::T_NEAR);
+        if (AmygdalanHook::Enabled()) {
+            c.mov(rax, reinterpret_cast<u64>(ArmHookTargetSlot()));
+            c.cmp(r13, qword[rax]);
+            c.je(to_host, Xbyak::CodeGenerator::T_NEAR);
+        }
         c.mov(rax, reinterpret_cast<u64>(VisceralPullPartnerSlot()));
         c.mov(rax, ptr[rax]);
         c.test(rax, rax);

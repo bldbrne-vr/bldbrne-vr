@@ -16,6 +16,7 @@
 #include "core/libraries/videoout/video_out.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "core/platform.h"
+#include "core/vr/bloodborne_frame_rate.h"
 #include "core/vr/vr_session.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
@@ -146,6 +147,12 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
 
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
     LOG_TRACE(Lib_VideoOut, "called");
+    // frame_hooks: the game's own pacer sets the frame rate (bloodborne_frame_rate.h); its flip
+    // rate (every second vblank, its 30 FPS) would halve it.
+    if (VR::Bloodborne::FrameHooksActive() && rate != 0) {
+        LOG_INFO(Lib_VideoOut, "Frame rate hooks: flip rate {} ignored (a flip every vblank)", rate);
+        rate = 0;
+    }
     driver->GetPort(handle)->flip_rate = rate;
     if (ScratchPacing::Enabled())
         LOG_INFO(Lib_VideoOut, "VR pacing flip rate: requested={} effective vblanks per flip={}",

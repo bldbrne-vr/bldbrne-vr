@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
 #include <xbyak/xbyak.h>
@@ -199,15 +200,21 @@ static void VisitPointer(u32 off_dw, IR::Inst* subtree, PassInfo& pass_info,
     PopPtr(c);
 }
 
-static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
-    Xbyak::CodeGenerator& c = g_srt_codegen;
+// An SrtSnapshot's walker: emitted to be compared, never run, so in plain memory.
+struct PlainAllocator : Xbyak::Allocator {
+    bool useProtect() const override {
+        return false;
+    }
+};
+PlainAllocator g_plain_allocator;
 
+static void GenerateSrtProgram(Info& info, PassInfo& pass_info, Xbyak::CodeGenerator& c) {
     if (pass_info.srt_roots.empty()) {
         return;
     }
 
     // Register the signal handler for SRT walker, if not already registered
-    if (g_srt_codegen_start == nullptr) {
+    if (&c == &g_srt_codegen && g_srt_codegen_start == nullptr) {
         g_srt_codegen_start = c.getCurr();
         auto* signals = Core::Signals::Instance();
         // Call after the memory invalidation handler
@@ -215,7 +222,8 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
         signals->RegisterAccessViolationHandler(SrtWalkerSignalHandler, priority);
     }
 
-    info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
+    // An offset: an SrtSnapshot's own buffer moves as it grows.
+    const size_t start = c.getSize();
     pass_info.dst_off_dw = NUM_USER_DATA_REGS;
     ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
 
@@ -226,12 +234,12 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     c.ret();
     c.ready();
 
-    info.srt_info.walker_func_size =
-        c.getCurr() - reinterpret_cast<const u8*>(info.srt_info.walker_func);
+    u8* const walker = c.getCode<u8*>() + start;
+    info.srt_info.walker_func = reinterpret_cast<PFN_SrtWalker>(walker);
+    info.srt_info.walker_func_size = c.getSize() - start;
 
     if (EmulatorSettings.IsDumpShaders()) {
-        DumpSrtProgram(info, reinterpret_cast<const u8*>(info.srt_info.walker_func),
-                       info.srt_info.walker_func_size);
+        DumpSrtProgram(info, walker, info.srt_info.walker_func_size);
     }
 
     info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
@@ -239,7 +247,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
 
 }; // namespace
 
-void FlattenExtendedUserdataPass(IR::Program& program) {
+void FlattenExtendedUserdataPass(IR::Program& program, SrtSnapshot* snapshot) {
     Shader::Info& info = program.info;
     PassInfo pass_info;
 
@@ -293,7 +301,19 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
         }
     }
 
-    GenerateSrtProgram(info, pass_info);
+    if (!snapshot) {
+        GenerateSrtProgram(info, pass_info, g_srt_codegen);
+    } else {
+        Xbyak::CodeGenerator codegen(4096, Xbyak::AutoGrow, &g_plain_allocator);
+        GenerateSrtProgram(info, pass_info, codegen);
+        const std::span walker{reinterpret_cast<const u8*>(info.srt_info.walker_func),
+                               info.srt_info.walker_func_size};
+        snapshot->differs = info.srt_info.flattened_bufsize_dw != snapshot->flat.size() ||
+                            !std::ranges::equal(walker, snapshot->walker);
+        // Its memory goes with `codegen`.
+        info.srt_info.walker_func = nullptr;
+        info.srt_info.walker_func_size = 0;
+    }
 
     // Assign offsets to duplicate readconsts
     for (IR::Inst* readconst : all_readconsts) {
@@ -302,7 +322,11 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
         readconst->SetFlags<u32>(original->Flags<u32>());
     }
 
-    info.RefreshFlatBuf();
+    if (!snapshot) {
+        info.RefreshFlatBuf();
+    } else if (!snapshot->differs) {
+        info.flattened_ud_buf.assign(snapshot->flat.begin(), snapshot->flat.end());
+    }
 }
 
 } // namespace Shader::Optimization
@@ -317,7 +341,7 @@ PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
 
 namespace Optimization {
 
-void FlattenExtendedUserdataPass(IR::Program& program) {
+void FlattenExtendedUserdataPass(IR::Program& program, SrtSnapshot* snapshot) {
     UNREACHABLE_MSG("FlattenExtendedUserdataPass unimplemented for target architecture.");
 }
 

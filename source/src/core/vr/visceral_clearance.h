@@ -81,6 +81,27 @@ inline std::optional<float> RayCapsule(Body::Vec3 eye, Body::Vec3 dir,
     return entry;
 }
 
+// The gap from a point to a capsule's surface (negative inside it).
+inline float PointGap(Body::Vec3 p, const CollisionCapsule& c) {
+    const Body::Vec3 ab = c.b - c.a;
+    const float len_sq = Body::LengthSq(ab);
+    const float t = len_sq > 1e-12f ? std::clamp(Body::Dot(p - c.a, ab) / len_sq, 0.0f, 1.0f) : 0.0f;
+    return Body::Length(p - (c.a + ab * t)) - c.radius;
+}
+
+// The nearest gap from the eye to any of the bodies, each moved by `shift` (infinity: none).
+inline float NearestGap(Body::Vec3 eye, std::span<const CollisionCapsule> capsules,
+                        Body::Vec3 shift = {}) {
+    float nearest = std::numeric_limits<float>::infinity();
+    for (auto c : capsules) {
+        if (!Body::IsFinite(c.a) || !Body::IsFinite(c.b) || !std::isfinite(c.radius)) continue;
+        c.a = c.a + shift;
+        c.b = c.b + shift;
+        nearest = std::min(nearest, PointGap(eye, c));
+    }
+    return nearest;
+}
+
 inline SurfaceRay CastVictimSurface(Body::Vec3 eye, Body::Vec3 victim,
                                     Body::Vec3 facing, float scale,
                                     std::span<const CollisionCapsule> capsules) {

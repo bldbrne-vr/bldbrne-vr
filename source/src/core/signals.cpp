@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/decoder.h"
 #include "common/signal_context.h"
+#include "common/slow_scope.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/threads/exception.h"
@@ -31,6 +32,8 @@ namespace Core {
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     if (ScratchDraw::IsSpeculativeReadFault(pExp)) return EXCEPTION_CONTINUE_SEARCH;
+    // The stall sampler's stack reads fault into its own __except (slow_scope.h OnSamplerThread).
+    if (Common::Slow::OnSamplerThread()) return EXCEPTION_CONTINUE_SEARCH;
     using namespace Libraries::Kernel;
     const auto* signals = Signals::Instance();
     // Windows static guest red-zone protection

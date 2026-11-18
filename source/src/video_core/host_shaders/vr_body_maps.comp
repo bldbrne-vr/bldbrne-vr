@@ -1,0 +1,150 @@
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// The hunter's body maps (renderer_vulkan/vr_body_maps.h): his triangles, as the moon's shadow
+// pass drew them this frame (each vertex's clip position stored by its capture variant, w the
+// frame's tag), drawn from up to two lamps near him into small depth maps: each texel the
+// nearest of him along its direction from the lamp (the lamp's own z). One thread a triangle
+// and a map. The lamp shadows (emit_spirv_light_shadow.cpp) then test a pixel against the map
+// of its lamp: his real silhouette, not capsules.
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Positions {
+    vec4 positions[];
+};
+layout(std430, binding = 1) readonly buffer Indices {
+    uint index_words[];
+};
+layout(std430, binding = 2) readonly buffer Table {
+    uint table[];
+};
+layout(std430, binding = 3) buffer Maps {
+    uint maps[];
+};
+
+layout(push_constant) uniform Push {
+    uint triangles; // all the draws' triangles
+    uint draws;
+    uint map_size;
+    uint tag;      // this frame's (the positions' w bits)
+    uint table_at; // the frame's table, in dwords
+} pc;
+
+// The table: per map (TableMapDwords) its clip-to-lamp rows (12), f, near, base, 0; then per
+// draw (TableDrawDwords) its first triangle, triangles, first index in the pool, 16-bit indices,
+// first position, lowest index, positions, 0.
+const uint MaxMaps = 2u;
+const uint TableMapDwords = 16u;
+const uint TableDrawDwords = 8u;
+// Triangles wider than this many texels a side are left out (none of his are, near a lamp).
+const int MaxSpan = 48;
+
+uint Index(uint at, bool short_indices) {
+    if (short_indices) {
+        return (index_words[at >> 1] >> ((at & 1u) * 16u)) & 0xFFFFu;
+    }
+    return index_words[at];
+}
+
+float F(uint at) {
+    return uintBitsToFloat(table[at]);
+}
+
+void Splat(uint base, ivec2 texel, float z) {
+    const int size = int(pc.map_size);
+    if (texel.x < 0 || texel.y < 0 || texel.x >= size || texel.y >= size) {
+        return;
+    }
+    atomicMin(maps[base + uint(texel.y * size + texel.x)], floatBitsToUint(z));
+}
+
+void main() {
+    const uint triangle = gl_GlobalInvocationID.x;
+    const uint map = gl_GlobalInvocationID.y;
+    if (triangle >= pc.triangles || map >= MaxMaps) {
+        return;
+    }
+    const uint maps_at = pc.table_at;
+    const uint m = maps_at + map * TableMapDwords;
+    const uint base = table[m + 14u];
+    if (base == 0xFFFFFFFFu) {
+        return; // no lamp for this map this frame
+    }
+    // Its draw: the last whose first triangle is at or before it.
+    const uint draws_at = maps_at + MaxMaps * TableMapDwords;
+    uint d = draws_at;
+    for (uint i = 0u; i < pc.draws; ++i) {
+        const uint at = draws_at + i * TableDrawDwords;
+        if (table[at] <= triangle) {
+            d = at;
+        }
+    }
+    const uint local = triangle - table[d];
+    if (local >= table[d + 1u]) {
+        return;
+    }
+    const bool short_indices = table[d + 3u] != 0u;
+    const uint first = table[d + 2u] + local * 3u;
+    const uint store = table[d + 4u];
+    const uint lowest = table[d + 5u];
+    const uint count = table[d + 6u];
+    const float f = F(m + 12u);
+    const float near_z = F(m + 13u);
+    const float size = float(pc.map_size);
+    vec3 q[3];
+    for (uint k = 0u; k < 3u; ++k) {
+        const uint index = Index(first + k, short_indices);
+        if (index < lowest || index - lowest >= count) {
+            return;
+        }
+        const vec4 c = positions[store + index - lowest];
+        if (floatBitsToUint(c.w) != pc.tag) {
+            return; // not drawn this frame (a hidden cape's, say)
+        }
+        const vec4 p = vec4(c.xyz, 1.0);
+        q[k] = vec3(dot(p, vec4(F(m + 0u), F(m + 1u), F(m + 2u), F(m + 3u))),
+                    dot(p, vec4(F(m + 4u), F(m + 5u), F(m + 6u), F(m + 7u))),
+                    dot(p, vec4(F(m + 8u), F(m + 9u), F(m + 10u), F(m + 11u))));
+        if (!(q[k].z > near_z)) {
+            return; // behind the lamp or at its holder's hand
+        }
+    }
+    // On to the map: texel coordinates.
+    vec2 s[3];
+    for (uint k = 0u; k < 3u; ++k) {
+        s[k] = (q[k].xy / q[k].z * f * 0.5 + 0.5) * size;
+    }
+    // The corners always (thin parts at least as dots), then the triangle's texel centres.
+    for (uint k = 0u; k < 3u; ++k) {
+        Splat(base, ivec2(floor(s[k])), q[k].z);
+    }
+    const float area = (s[1].x - s[0].x) * (s[2].y - s[0].y) - (s[2].x - s[0].x) * (s[1].y - s[0].y);
+    if (abs(area) < 1e-6) {
+        return;
+    }
+    const ivec2 lo = ivec2(floor(min(s[0], min(s[1], s[2]))));
+    const ivec2 hi = ivec2(ceil(max(s[0], max(s[1], s[2]))));
+    const ivec2 a = max(lo, ivec2(0));
+    const ivec2 b = min(hi, ivec2(int(pc.map_size) - 1));
+    if (b.x - a.x > MaxSpan || b.y - a.y > MaxSpan) {
+        return;
+    }
+    const float inv_area = 1.0 / area;
+    const vec3 inv_z = vec3(1.0 / q[0].z, 1.0 / q[1].z, 1.0 / q[2].z);
+    for (int y = a.y; y <= b.y; ++y) {
+        for (int x = a.x; x <= b.x; ++x) {
+            const vec2 c = vec2(x, y) + 0.5;
+            const float w0 = ((s[1].x - c.x) * (s[2].y - c.y) - (s[2].x - c.x) * (s[1].y - c.y)) * inv_area;
+            const float w1 = ((s[2].x - c.x) * (s[0].y - c.y) - (s[0].x - c.x) * (s[2].y - c.y)) * inv_area;
+            const float w2 = 1.0 - w0 - w1;
+            if (w0 < 0.0 || w1 < 0.0 || w2 < 0.0) {
+                continue;
+            }
+            const float z = 1.0 / dot(vec3(w0, w1, w2), inv_z);
+            atomicMin(maps[base + uint(y * int(pc.map_size) + x)], floatBitsToUint(z));
+        }
+    }
+}

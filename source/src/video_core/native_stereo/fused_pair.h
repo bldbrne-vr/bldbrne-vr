@@ -57,6 +57,47 @@ bool Pair(std::span<Write> writes, const Bound<BufferInfo, ImageInfo, BufferHint
           std::span<const std::uint8_t> writable, std::span<BufferInfo> out_buffers,
           std::span<ImageInfo> out_images, std::size_t& buffers_used, std::size_t& images_used,
           bool fold, Ops& ops) {
+    // This descriptor's carried hint, or null.
+    const auto hint_of = [&](const BufferInfo* info) -> const BufferHint* {
+        const std::size_t index = IndexIn(info, bound.buffers, bound.buffer_count);
+        return index < bound.buffer_hints.size() && bound.buffer_hints[index].left == info->buffer
+                   ? &bound.buffer_hints[index]
+                   : nullptr;
+    };
+    // Sparse twins first (2026-11-06, a review): a write that needs new private blocks gives its
+    // entry a new right handle (native_stereo.cpp SparseWriteLocked), so a read of the same buffer
+    // paired before it in this draw would keep the old twin, whose blocks there still show the left
+    // eye. Every written range is made private (`ops.PrivatizeWrite`: sparse entries only) before
+    // anything is paired; the pass below then finds it private, and every read and write of it
+    // takes the same right. The sizes are checked first, so an overflow still records nothing.
+    {
+        std::size_t need_buffers = 0, need_images = 0;
+        for (const auto& w : writes) {
+            const Kind kind = ops.KindOf(w);
+            if (kind == Kind::Buffer) {
+                need_buffers += 2 * std::size_t{w.descriptorCount};
+            } else if (kind == Kind::Image) {
+                need_images += 2 * std::size_t{w.descriptorCount};
+            } else if (fold && kind == Kind::Sampler) {
+                need_images += w.descriptorCount;
+            }
+        }
+        if (need_buffers > out_buffers.size() || need_images > out_images.size()) {
+            return ops.Overflow();
+        }
+        for (const auto& w : writes) {
+            if (ops.KindOf(w) != Kind::Buffer ||
+                !(w.dstBinding < writable.size() && writable[w.dstBinding])) {
+                continue;
+            }
+            for (std::size_t i = 0; i < w.descriptorCount; ++i) {
+                if (w.pBufferInfo[i].buffer) {
+                    const BufferHint* const hint = hint_of(w.pBufferInfo + i);
+                    ops.PrivatizeWrite(w.pBufferInfo[i], hint ? hint->entry : nullptr);
+                }
+            }
+        }
+    }
     std::size_t ob = 0, oi = 0;
     for (auto& w : writes) {
         const Kind kind = ops.KindOf(w);
@@ -71,16 +112,13 @@ bool Pair(std::span<Write> writes, const Bound<BufferInfo, ImageInfo, BufferHint
                 const BufferInfo left = w.pBufferInfo[i];
                 BufferInfo right = left;
                 if (left.buffer) {
-                    const std::size_t index =
-                        IndexIn(w.pBufferInfo + i, bound.buffers, bound.buffer_count);
-                    const BufferHint* const hint = index < bound.buffer_hints.size() &&
-                                                           bound.buffer_hints[index].left ==
-                                                               left.buffer
-                                                       ? &bound.buffer_hints[index]
-                                                       : nullptr;
+                    const BufferHint* const hint = hint_of(w.pBufferInfo + i);
                     bool stream = false;
                     if (hint && hint->entry) {
-                        auto have = ops.RightOf(*hint->entry);
+                        // A sparse view's twin shares memory: a write makes its range its own.
+                        auto have = written && ops.Sparse(*hint->entry)
+                                        ? ops.Write(left, *hint->entry)
+                                        : ops.RightOf(*hint->entry);
                         if (!have && written) {
                             have = ops.Create(left.buffer, *hint->entry);
                         }
@@ -89,7 +127,7 @@ bool Pair(std::span<Write> writes, const Bound<BufferInfo, ImageInfo, BufferHint
                         }
                         stream = ops.Stream(*hint->entry);
                     } else {
-                        right.buffer = ops.Lookup(left.buffer, written, stream);
+                        right.buffer = ops.Lookup(left, written, stream);
                     }
                     // Stream buffers receive CPU writes directly; mirror only the read range.
                     if (right.buffer != left.buffer && !written && stream) {

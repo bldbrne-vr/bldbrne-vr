@@ -25,6 +25,12 @@ public:
     bool Submit(vk::Queue queue, vk::Semaphore signal = {}, u64 value = 0);
     double LastGpuMs() const { return last_gpu_ms; }
     u32 SlotIndex() const { return current; }
+    // The slot's last submission finished (or none is pending): the images it sampled may be
+    // written again. Never waits.
+    bool SlotDone(u32 slot) const {
+        const auto& s = slots[slot & 1];
+        return !s.pending || device.getFenceStatus(s.fence) == vk::Result::eSuccess;
+    }
     void Draw(vk::CommandBuffer cmd, vk::ImageView target, vk::Extent2D extent,
               vk::ImageView atlas, vk::Extent2D atlas_extent,
               std::span<const VrUiGeometry::Piece> pieces, const XrPosef& eye,

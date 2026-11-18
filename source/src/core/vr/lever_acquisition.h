@@ -62,6 +62,55 @@ inline float ScanReach(const Rig &rig, Vec3 head, const std::array<Vec3, 2> &han
     return d <= ArmRadius(rig) ? d : std::numeric_limits<float>::infinity();
 }
 
+// Out of reach. A lever no hand can take by its stem and pull to its stop from where the hunter
+// stands keeps the game's own prompt and button, and is never armed (2026-11-10: some
+// Chalice levers are "very high up and the hand cannot reach them"; a prompt only where a hand
+// cannot pull). The XR side publishes how high a hand reaches in the game's frame (ReachTracker):
+// the hunter's feet, his eyes' standing height over them, a raised arm's grip over the eyes and
+// the grab radius. The game side compares it with the highest the stem's lowest grip goes over
+// the pull (LowestGripTop): the hand slides down the stem as it pulls (physical_lever.h Slides).
+inline constexpr float OverheadReach = 0.50f; // metres: a raised arm's grip over the eyes
+// The eyes' standing height is the highest of the last few seconds: it falls this many metres a
+// second, so a duck does not flip a lever's prompt and a seated player reaches lower.
+inline constexpr float ReachDecay = 0.05f;
+// A gap in the XR side's updates longer than this starts the standing height afresh.
+inline constexpr std::int64_t ReachGapNs = 5'000'000'000;
+
+// The highest the stem's lowest grip (the shaft's start; the handle without a shaft) goes from
+// rest to the stop: world Y, in the rig's own units. Sampled every 1/32 of the sweep (under 1 cm
+// short of the true top for a 2 m stem).
+inline float LowestGripTop(const Rig &rig) {
+    const Vec3 low = rig.shaft ? rig.shaft_start : rig.rest;
+    float top = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i <= 32; ++i)
+        top = std::max(top, rig.pivot.y + Rotate(low, rig.axis, rig.sweep * i / 32.0f).y);
+    return top;
+}
+
+// The XR side's reach, one update per frame a hand can pull: world Y in game units.
+class ReachTracker {
+public:
+    // `feet_y`: the hunter's root; `eyes`: his eyes over it now (game units); `scale`: game units
+    // per metre.
+    float Update(float feet_y, float eyes, float scale, std::int64_t now) {
+        const bool fresh = last_ns_ > 0 && now >= last_ns_ && now - last_ns_ <= ReachGapNs &&
+                           std::isfinite(standing_);
+        const float dt = fresh ? static_cast<float>(now - last_ns_) * 1e-9f : 0.0f;
+        last_ns_ = now;
+        standing_ = fresh ? std::max(eyes, standing_ - ReachDecay * scale * dt) : eyes;
+        return feet_y + standing_ + (OverheadReach + GrabRadius) * scale;
+    }
+
+private:
+    float standing_{std::numeric_limits<float>::quiet_NaN()};
+    std::int64_t last_ns_{};
+};
+
+// `reach_top`: the XR side's (infinite: unknown, never out of reach). Both in the rig's units.
+inline bool OutOfReach(const Rig &rig, float reach_top) {
+    return std::isfinite(reach_top) && LowestGripTop(rig) > reach_top;
+}
+
 // The XR side's view of the armed lever each frame (pure; the presenter maps the game's word,
 // lever_channel.h Nearby, into metres): the decision behind arming, the game's re-check and the
 // reach tick, kept out of the presenter so it can be tested.
@@ -138,6 +187,41 @@ inline ArmOutput Arm(ArmState &state, const ArmInput &in) {
     }
     return out;
 }
+
+// Two input-thread timers; no clock reads, allocation, game queries or extra scanning.
+// Observe before Tracker::Step consumes this frame's edge. Never buffer startup-held grips.
+class ApproachGrip {
+public:
+    static constexpr float Window = 0.080f;
+    void Clear() { remaining = {}; }
+    void Step(const std::array<bool, 2>& edges, const std::array<Hand, 2>& hands,
+              const std::array<bool, 2>& allowed, float dt) {
+        for (int h = 0; h < 2; ++h) {
+            const auto& hand = hands[h];
+            if (!allowed[h] || !hand.tracked || !hand.grip_valid ||
+                !std::isfinite(hand.grip) || hand.grip < Press ||
+                !std::isfinite(dt) || dt <= 0 || dt > MaxFrame) {
+                remaining[h] = 0;
+            } else if (edges[h]) {
+                remaining[h] = Window;
+            } else {
+                remaining[h] = std::max(0.0f, remaining[h] - dt);
+            }
+        }
+    }
+    bool WaitingForReach(int hand, float distance) const {
+        return remaining[hand] > 0 && distance > GrabRadius;
+    }
+    bool Retry(Tracker& tracker, int hand, float distance) {
+        if (remaining[hand] <= 0 || !std::isfinite(distance) || distance > GrabRadius)
+            return false;
+        // Consume once, including if ownership prevents replay.
+        remaining[hand] = 0;
+        return tracker.RetryApproachSqueeze(hand);
+    }
+private:
+    std::array<float, 2> remaining{};
+};
 
 class Acquisition {
 public:

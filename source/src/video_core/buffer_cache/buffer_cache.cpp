@@ -1,3 +1,4 @@
+#include <limits>
 #include <chrono>
 #include <cstdio>
 #include "video_core/host_copies.h"
@@ -20,6 +21,7 @@
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/buffer_eviction.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -36,14 +38,25 @@
 #include <vector>
 #include <vk_mem_alloc.h>
 #include <xxhash.h>
+#include "video_core/buffer_cache/dma_table.h"
+#include "video_core/vram_report.h"
+#include <array>
+#include <chrono>
 
 namespace VideoCore {
 
 static constexpr size_t DataShareBufferSize = 64_KB;
-static constexpr size_t StagingBufferSize = 512_MB;
 static constexpr size_t DownloadBufferSize = 32_MB;
+static constexpr size_t MotionStagingSize = 8_MB; // ReadForMotion's copies in flight
 static constexpr size_t UboStreamBufferSize = 64_MB;
 static constexpr size_t DeviceBufferSize = 128_MB;
+
+// dma_table.h: the page table in full only with direct memory access on (decided once, here).
+static u64 BdaPageTableSize() {
+    const bool full = EmulatorSettings.IsDirectMemoryAccessEnabled();
+    DmaTable::allocated.store(full, std::memory_order_release);
+    return full ? BufferCache::BDA_PAGETABLE_SIZE : 64_KB;
+}
 
 /// FAST bit 34: index buffer binds without the per-draw copy (BindIndexBuffer, ObtainIndexBuffer).
 /// An index range of 16 KB or less is copied into the stream buffer on every bind (ObtainBuffer's
@@ -102,6 +115,17 @@ const u32 g_index_verify_period = [] {
 const bool g_geometry_verify = std::getenv("FAST_GEOMETRY_VERIFY") != nullptr;
 const bool g_tracked_small_buffers = std::getenv("VR_TRACKED_SMALL_BUFFERS") != nullptr;
 const bool g_exact_upload_memo = std::getenv("VR_EXACT_UPLOAD_MEMO") != nullptr;
+// VR_MOTION_READBACK_WAIT=1: ReadForMotion waits for its GPU copy, as before 2026-11-07.
+const bool g_motion_readback_wait = [] {
+    const char* value = std::getenv("VR_MOTION_READBACK_WAIT");
+    return value && value[0] == '1';
+}();
+// FAST_UPLOAD_RETIRE (on unless '0', 2026-11-07): every upload hands the bytes it copied back to
+// the CPU (SynchronizeBuffer), not ReadForMotion's alone.
+const bool g_upload_retire = [] {
+    const char* value = std::getenv("FAST_UPLOAD_RETIRE");
+    return !value || value[0] != '0';
+}();
 const u32 g_small_read_direct_verify_period = [] {
     const char* v = std::getenv("FAST_SMALL_READ_DIRECT_VERIFY");
     const int n = v ? std::atoi(v) : 0;
@@ -124,9 +148,62 @@ const bool g_vertex_memo_verify = [] {
 // FAST_CPU_VERTEX_MEMO's line (recording owner only, like BindVertexBuffers): merged ranges,
 // ranges bound by the test, ranges left to ObtainBuffer's small-read path, misses.
 struct VertexMemoStats {
-    u64 ranges, hits, small, misses, verified, races, mismatches;
+    u64 ranges, hits, small, misses, verified, races, mismatches, streamed;
 };
 VertexMemoStats g_vertex_memo_stats{};
+
+// FAST_CPU_VERTEX_STREAM (on unless '0', 2026-11-16): a direct non-indexed draw's merged vertex
+// range larger than a caching page (one ObtainBuffer would synchronize into the cache) is copied
+// into the stream buffer from its start to the end of the bytes the draw fetches, and bound there
+// (as ObtainBuffer's small reads are), when those end within VertexStreamMaxBytes of its start and
+// no page of them is GPU-modified. Central Yharnam's particles (the game's lingering fog among
+// them) bind 4 MiB vertex buffers and fetch a few hundred bytes at their start while the CPU
+// writes the next frame's on: each range ended on a freshly written page, whose upload ended the
+// render pass (~19 times a frame, the particle pass drawn in ~20 pieces). Streamed: the same
+// bytes, no upload, no pass break (GPU 6.72 -> 6.46 ms a frame there).
+const bool g_vertex_stream = [] {
+    const char* value = std::getenv("FAST_CPU_VERTEX_STREAM");
+    return !value || value[0] != '0';
+}();
+constexpr u64 VertexStreamMaxBytes = 64_KB;
+// The copy starts at the range's start aligned down to this, and lands at an offset so aligned:
+// every element keeps its address's alignment modulo it, as in a cache buffer (page-aligned).
+constexpr u64 VertexStreamAlign = 256;
+
+// The end of the bytes a draw fetches from the vertex buffers starting in [base, base + size):
+// each per-vertex buffer's elements [first_vertex, + vertex_count), each per-instance one's
+// [first_instance, + instance_count) (a divisor fetches fewer of them), element e at the buffer's
+// base + e * stride (stride 0: its base), at most 16 bytes (one attribute a buffer, at offset 0:
+// GraphicsPipeline::GetVertexInputs). 0 when the stream must leave the range to the cache: a
+// fetched element past its buffer's records (the binding's size bounds it there), a swizzled
+// buffer, no fetched byte, or bytes past the range.
+u64 VertexFetchEnd(const Vulkan::VertexView& inputs, const VertexFetch& fetch, VAddr base,
+                   u64 size) {
+    u64 end = 0;
+    for (size_t k = 0; k < inputs.guest_buffers.size(); ++k) {
+        const AmdGpu::Buffer& buffer = inputs.guest_buffers[k];
+        const VAddr address = buffer.base_address;
+        if (address == 0 || buffer.GetSize() == 0 || address < base || address - base >= size) {
+            continue; // unbound, or in another merged range
+        }
+        if (k >= inputs.bindings.size() || buffer.swizzle_enable || buffer.add_tid_enable) {
+            return 0;
+        }
+        const bool per_instance = inputs.bindings[k].inputRate == vk::VertexInputRate::eInstance;
+        const u64 first = per_instance ? fetch.first_instance : fetch.first_vertex;
+        const u64 count = per_instance ? fetch.instance_count : fetch.vertex_count;
+        if (count == 0) {
+            continue;
+        }
+        const u64 stride = buffer.GetStride();
+        if (stride != 0 && first + count > buffer.num_records) {
+            return 0;
+        }
+        const u64 last = stride == 0 ? 0 : (first + count - 1) * stride;
+        end = std::max(end, address + last + 16);
+    }
+    return end > base && end - base <= size ? end : 0;
+}
 
 u32 IndexPromotionBudget() {
     return g_index_promotion_budget;
@@ -143,13 +220,15 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
       fault_manager{instance, scheduler, *this, CACHING_PAGEBITS, CACHING_NUMPAGES},
-      staging_buffer{instance, scheduler, MemoryUsage::Upload, StagingBufferSize},
+      staging_pool{instance, scheduler},
       stream_buffer{instance, scheduler, MemoryUsage::Stream, UboStreamBufferSize},
       download_buffer{instance, scheduler, MemoryUsage::Download, DownloadBufferSize},
+      motion_staging{instance, scheduler, MemoryUsage::Download, MotionStagingSize},
       device_buffer{instance, scheduler, MemoryUsage::DeviceLocal, DeviceBufferSize},
       gds_buffer{instance, scheduler, MemoryUsage::Stream, 0, AllFlags, DataShareBufferSize},
       bda_pagetable_buffer{instance, scheduler, MemoryUsage::DeviceLocal,
-                           0,        AllFlags,  BDA_PAGETABLE_SIZE} {
+                           0,        AllFlags,  BdaPageTableSize()},
+      sparse_pool{instance} {
     Vulkan::SetObjectName(instance.GetDevice(), gds_buffer.Handle(), "GDS Buffer");
     Vulkan::SetObjectName(instance.GetDevice(), bda_pagetable_buffer.Handle(),
                           "BDA Page Table Buffer");
@@ -164,10 +243,22 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         LOG_INFO(Render_Vulkan, "FAST small_read_direct: unavailable with readback_linear_images");
     }
 
-    // The stream buffer's shadow (VR_STREAM_MEM, buffer.cpp) goes into the GPU's memory before
-    // every submit of this scheduler.
-    if (stream_buffer.HasShadow()) {
-        scheduler.SetPreSubmitHook([this] { stream_buffer.FlushShadow(); });
+    // Before every submit of this scheduler: the motion snapshot copies asked for since the last
+    // one (ReadForMotion), then the stream buffer's shadow (VR_STREAM_MEM, buffer.cpp) into the
+    // GPU's memory.
+    scheduler.SetPreSubmitHook([this, shadow = stream_buffer.HasShadow()] {
+        FlushMotionCopies();
+        if (shadow) {
+            stream_buffer.FlushShadow();
+        }
+    });
+    // Sparse views (FAST_BUFFER_ARENA=1): their binds go out right before each submit.
+    if (sparse_pool.Enabled()) {
+        // On their own queue when the device had one (GetSparseQueue), else the graphics one
+        // the scheduler passes (under its lock).
+        scheduler.SetSparseBinds(
+            [this](vk::Queue) { return sparse_pool.SubmitBinds(instance.GetSparseQueue()); },
+            sparse_pool.Timeline());
     }
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
@@ -179,24 +270,26 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         return;
     }
 
-    const s64 device_local_memory = static_cast<s64>(instance.GetTotalMemoryBudget());
-    const s64 min_spacing_expected = device_local_memory - 1_GB;
-    const s64 min_spacing_critical = device_local_memory - 512_MB;
-    const s64 mem_threshold = std::min<s64>(device_local_memory, TARGET_GC_THRESHOLD);
-    const s64 min_vacancy_expected = (6 * mem_threshold) / 10;
-    const s64 min_vacancy_critical = (2 * mem_threshold) / 10;
-    trigger_gc_memory = static_cast<u64>(
-        std::max<u64>(std::min(device_local_memory - min_vacancy_expected, min_spacing_expected),
-                      DEFAULT_TRIGGER_GC_MEMORY));
-    critical_gc_memory = static_cast<u64>(
-        std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
-                      DEFAULT_CRITICAL_GC_MEMORY));
+    // FAST_BUFFER_EVICT_CARD_MB=N (a test): the marks as on a card with a budget of N MiB.
+    const char* card_mb = std::getenv("FAST_BUFFER_EVICT_CARD_MB");
+    const s64 device_local_memory =
+        card_mb ? static_cast<s64>(std::strtoull(card_mb, nullptr, 10)) << 20
+                : static_cast<s64>(instance.GetTotalMemoryBudget());
+    SetMemoryMarks(device_local_memory);
+    start_budget = card_mb ? 0 : device_local_memory; // a test's card is not revised
+    LOG_INFO(Render_Vulkan, "Buffer cache: VRAM budget {} MiB{}, eviction under pressure from {} "
+             "MiB, critical from {} MiB",
+             device_local_memory >> 20, card_mb ? " (FAST_BUFFER_EVICT_CARD_MB)" : "",
+             trigger_gc_memory >> 20, critical_gc_memory >> 20);
 }
 
 BufferCache::~BufferCache() {
     FastRender::WaitHostCopies();
-    if (stream_buffer.HasShadow()) {
-        scheduler.SetPreSubmitHook(Common::UniqueFunction<void>{});
+    scheduler.SetPreSubmitHook(Common::UniqueFunction<void>{});
+    if (sparse_pool.Enabled()) {
+        // Every deferred release into the pool has run by now (~Rasterizer drains both queues
+        // before any cache goes).
+        scheduler.SetSparseBinds({}, {});
     }
 }
 
@@ -230,6 +323,33 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool emulator_wr
         device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); });
 }
 
+void BufferCache::NoteFreshRange(VAddr addr, u64 size) {
+    // Pages wholly inside: no GPU byte of theirs survives a CPU write from now on (a fault keeps
+    // nothing aside). Pages shared with older data keep their GPU state; their dead byte ranges go
+    // in ProcessFresh.
+    memory_tracker->ForgetKept(addr, size);
+    const VAddr pages_start = Common::AlignUp(addr, TRACKER_BYTES_PER_PAGE);
+    const VAddr pages_end = Common::AlignDown(addr + size, TRACKER_BYTES_PER_PAGE);
+    if (pages_start < pages_end) {
+        memory_tracker->UnmarkRegionAsGpuModified(pages_start, pages_end - pages_start);
+    }
+    std::scoped_lock lk{fresh_mutex};
+    fresh_ranges.emplace_back(addr, size);
+    fresh_pending.store(true, std::memory_order_release);
+}
+
+void BufferCache::ProcessFresh() {
+    std::vector<std::pair<VAddr, u64>> ranges;
+    {
+        std::scoped_lock lk{fresh_mutex};
+        ranges.swap(fresh_ranges);
+        fresh_pending.store(false, std::memory_order_release);
+    }
+    for (const auto& [addr, size] : ranges) {
+        gpu_modified_ranges.Subtract(addr, size);
+    }
+}
+
 void BufferCache::InvalidateWriteFault(VAddr device_addr, u64 size) {
     if (!IsRegionRegistered(device_addr, size)) {
         return;
@@ -250,6 +370,7 @@ void BufferCache::MarkFaultWindow(VAddr device_addr, u64 size, FaultWindowCounts
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     Common::MemoryWriteTrace::Event("buffer.read.request", device_addr, size, is_write);
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
+        MaterializeRetiles(device_addr, size, RetileDownload);
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         // GPU-modified ranges come as many small scattered islands, so the download
         // is widened to a window around the request
@@ -267,13 +388,15 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     });
 }
 
-std::span<const u8> BufferCache::ReadForMotion(VAddr address, u32 size) {
+std::span<const u8> BufferCache::ReadForMotion(VAddr address, u32 size, u64 frame) {
     FastRender::AssertRecordingAccess();
     if (!size || size > 16_MB) return {};
+    MaterializeRetiles(address, size, RetileMotion);
     if (!HasGpuWrites(address, size)) {
         return {reinterpret_cast<const u8*>(address), size};
     }
-    Buffer& buffer = slot_buffers[FindBuffer(address, size)];
+    const BufferId buffer_id = FindBuffer(address, size);
+    Buffer& buffer = slot_buffers[buffer_id];
     // This is the same upload the upcoming indexed draw needs. It retires only
     // CPU-owned bytes; it never downloads old GPU contents into guest memory.
     SynchronizeBuffer(buffer, address, size, false, false, true);
@@ -281,72 +404,243 @@ std::span<const u8> BufferCache::ReadForMotion(VAddr address, u32 size) {
         Common::MemoryWriteTrace::Event("motion.index.cpu_reclaimed", address, size);
         return {reinterpret_cast<const u8*>(address), size};
     }
+    const u64 serial = buffer.perf_serial;
     const u64 use = ++motion_snapshot_use;
-    for (auto& entry : motion_snapshots) {
-        if (entry.address == address && entry.bytes.size() == size &&
-            entry.serial == buffer.perf_serial && entry.write_seq == buffer.perf_write_seq) {
-            entry.last_use = use;
-            return entry.bytes;
+    // A snapshot stays this request's until a write into its own bytes (NoteMotionWrite) or a
+    // new buffer under them: writes elsewhere in a large buffer leave it alone (2026-11-08; the
+    // buffer's write counter, as before, refreshed every character of a merged buffer each frame).
+    if (auto found = MotionSnapshotBound(address, size);
+        found != motion_snapshots.end() && found->address == address && found->size == size) {
+        if (found->serial == serial && found->state != MotionState::Stale) {
+            found->last_use = use;
+            found->last_frame = frame;
+            if (found->state == MotionState::Pending ||
+                !found->data->ready.load(std::memory_order_acquire)) {
+                ++motion_reads.waiting;
+                return {};
+            }
+            ++motion_reads.snapshots;
+            return found->data->bytes;
         }
-    }
-    // A stale version of this exact request cannot be reused. Remove it before
-    // allocating its replacement so repeated writes cannot consume all cache slots.
-    std::erase_if(motion_snapshots, [&](const MotionSnapshot& entry) {
-        if (entry.address != address || entry.bytes.size() != size) return false;
-        motion_snapshot_bytes -= entry.bytes.size();
-        return true;
-    });
-    // Bound both allocations and entry count. A snapshot is valid only until the next
-    // ReadForMotion call; the temporal caller consumes it during this same draw.
-    while (!motion_snapshots.empty() &&
-           (motion_snapshots.size() >= 16 || motion_snapshot_bytes + size > 16_MB)) {
-        const auto oldest = std::min_element(motion_snapshots.begin(), motion_snapshots.end(),
-            [](const auto& a, const auto& b) { return a.last_use < b.last_use; });
-        motion_snapshot_bytes -= oldest->bytes.size();
-        motion_snapshots.erase(oldest);
+        // A stale version of this exact request cannot be reused. Remove it before
+        // allocating its replacement so repeated writes cannot consume all cache slots.
+        motion_snapshot_bytes -= size;
+        motion_snapshots.erase(found);
+        ++motion_reads.replaced;
     }
     // Vulkan buffer copies are dword-aligned, including 16-bit indices starting at +2.
     const u64 begin = Common::AlignDown(static_cast<u64>(buffer.Offset(address)), u64{4});
     const u64 prefix = buffer.Offset(address) - begin;
     const u64 transfer_size = Common::AlignUp(prefix + size, u64{4});
     ASSERT(begin + transfer_size <= buffer.SizeBytes());
-    const auto [download, staging_offset] = download_buffer.Map(transfer_size);
-    download_buffer.Commit();
-    scheduler.EndRendering();
-    const auto commands = scheduler.Commands();
-    const vk::BufferMemoryBarrier2 barrier{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
-        .buffer = buffer.Handle(), .offset = begin, .size = transfer_size,
+    // Where the copy goes, decided before the cache makes room for it. The old wait takes the
+    // shared download ring; otherwise motion copies have a ring of their own whose bytes come back
+    // only once a copy has landed (the GPU finishing is not enough: its deferred operation may run
+    // later) or was dropped unrecorded, and nothing waits for room. No room, or a request larger
+    // than the ring (none seen so far): camera motion for this draw, asked again next time.
+    StreamBuffer& staging = g_motion_readback_wait ? download_buffer : motion_staging;
+    u8* download{};
+    u64 staging_offset{}, staging_bytes{};
+    if (g_motion_readback_wait) {
+        std::tie(download, staging_offset) = download_buffer.Map(transfer_size);
+        download_buffer.Commit();
+    } else {
+        // The oldest copies that have landed (or were dropped) give their bytes back, in ring
+        // order.
+        while (!motion_staging_uses.empty() &&
+               (motion_staging_uses.front().data->ready.load(std::memory_order_acquire) ||
+                motion_staging_uses.front().data->dropped)) {
+            motion_staging_used -= motion_staging_uses.front().bytes;
+            motion_staging_uses.pop_front();
+        }
+        // An empty ring starts over: a copy that would not fit before its end must not wait
+        // for another copy to move the position (reviewed 2026-11-07).
+        if (motion_staging_uses.empty()) {
+            motion_staging_head = 0;
+        }
+        const u64 at = motion_staging_head % MotionStagingSize;
+        // A copy never wraps: the ring's tail is skipped and held with it.
+        const u64 skip = at + transfer_size > MotionStagingSize ? MotionStagingSize - at : 0;
+        staging_bytes = skip + transfer_size;
+        if (transfer_size > MotionStagingSize ||
+            motion_staging_used + staging_bytes > MotionStagingSize) {
+            ++motion_reads.no_room;
+            return {};
+        }
+        staging_offset = (at + skip) % MotionStagingSize;
+        download = motion_staging.mapped_data.data() + staging_offset;
+    }
+    // Bound both allocations and entry count. Sized for a crowded scene's characters (100-170
+    // motion draws a frame): with 16 entries / 16 MB the same snapshots could be evicted and
+    // copied again every frame. Never one used in this frame: with more requests a frame than
+    // room, evicting the least recently used made every request evict one needed again later in
+    // the frame (nothing ever reused, a copy for each). This request keeps camera motion instead,
+    // and the snapshots held keep their characters' object motion (a code review, 2026-11-08).
+    // The motion ring's bytes are not taken yet (the wait's stream ring retires its own).
+    while (!motion_snapshots.empty() &&
+           (motion_snapshots.size() >= 256 || motion_snapshot_bytes + size > 64_MB)) {
+        const auto oldest = std::min_element(motion_snapshots.begin(), motion_snapshots.end(),
+            [](const auto& a, const auto& b) { return a.last_use < b.last_use; });
+        if (oldest->last_frame == frame) {
+            ++motion_reads.full;
+            return {};
+        }
+        motion_snapshot_bytes -= oldest->size;
+        motion_snapshots.erase(oldest);
+    }
+    if (motion_snapshots.empty()) {
+        motion_snapshot_longest = 0;
+    }
+    auto data = std::make_shared<MotionBytes>();
+    data->bytes.resize(size);
+    if (!g_motion_readback_wait) {
+        motion_staging_head += staging_bytes;
+        motion_staging_used += staging_bytes;
+        motion_staging_uses.push_back({staging_bytes, data});
+    }
+    motion_snapshots.insert(MotionSnapshotBound(address, size),
+                            MotionSnapshot{address, size, MotionState::Pending, serial, use, frame,
+                                           data});
+    motion_snapshot_bytes += size;
+    motion_snapshot_longest = std::max(motion_snapshot_longest, size);
+    // Recorded with every other copy asked for before the next submit (FlushMotionCopies): one
+    // barrier for them all instead of a pass break and a wait for all earlier GPU work per copy.
+    motion_copies.push_back({
+        .address = address,
+        .size = size,
+        .buffer_id = buffer_id,
+        .serial = serial,
+        .staging = staging.Handle(),
+        .region = vk::BufferCopy{begin, staging_offset, transfer_size},
+        .prefix = prefix,
+        .host = download,
+        .coherent = staging.is_coherent,
+        .allocation = staging.buffer.allocation,
+        .data = data,
+    });
+    ++motion_reads.copies;
+    Common::MemoryWriteTrace::Event("motion.index.private_snapshot", address, size, transfer_size);
+    // The copy lands a frame or two later; until then the draw keeps camera motion. Waiting
+    // here stopped the draw recording until the GPU had run everything queued, once per copy:
+    // the frame rate that sank after many areas (2026-11-07).
+    if (!g_motion_readback_wait) {
+        return {};
+    }
+    // VR_MOTION_READBACK_WAIT=1: recorded now and waited for, as before 2026-11-07.
+    const auto land = RecordMotionCopies();
+    scheduler.Finish();
+    if (!land) {
+        return {};
+    }
+    land();
+    ++motion_reads.snapshots;
+    return data->bytes;
+}
+
+std::vector<BufferCache::MotionSnapshot>::iterator BufferCache::MotionSnapshotBound(VAddr address,
+                                                                                    u32 size) {
+    return std::lower_bound(motion_snapshots.begin(), motion_snapshots.end(),
+                            std::pair{address, size}, [](const MotionSnapshot& entry, const auto& key) {
+                                return std::pair{entry.address, entry.size} < key;
+                            });
+}
+
+void BufferCache::MarkMotionWrite(VAddr address, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    // Sorted by address, none longer than the longest held: the first that can hold a byte of the
+    // write starts less than that far before it.
+    const VAddr end = address + size;
+    const VAddr from = address > motion_snapshot_longest ? address - motion_snapshot_longest : 0;
+    for (auto it = MotionSnapshotBound(from, 0); it != motion_snapshots.end() && it->address < end;
+         ++it) {
+        if (it->address + it->size > address) {
+            // Before its copy as well: a write noted ahead of the draw that does it (a written
+            // binding, a submit in between) would land after a copy at this submit.
+            it->state = MotionState::Stale;
+        }
+    }
+}
+
+Common::UniqueFunction<void> BufferCache::RecordMotionCopies() {
+    if (motion_copies.empty()) {
+        return {};
+    }
+    struct Landing {
+        std::shared_ptr<MotionBytes> data;
+        const u8* host;
+        u64 prefix, offset, size;
+        bool coherent;
+        VmaAllocation allocation;
     };
-    commands.pipelineBarrier2(vk::DependencyInfo{
-        .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &barrier});
-    commands.copyBuffer(buffer.Handle(), download_buffer.Handle(),
-                        vk::BufferCopy{begin, staging_offset, transfer_size});
+    std::vector<Landing> lands;
+    lands.reserve(motion_copies.size());
+    std::optional<decltype(scheduler.Commands())> commands;
+    for (const auto& copy : motion_copies) {
+        // Still the request's snapshot, unwritten since it was asked for, and its buffer the one
+        // it was asked from. A buffer deleted this tick (merged, collected) stays allocated until
+        // the GPU is done with the tick, but its snapshots never match again: dropped, as are
+        // replaced, evicted and stale ones (their staging bytes go back to the ring).
+        const auto it = MotionSnapshotBound(copy.address, copy.size);
+        const bool listed = it != motion_snapshots.end() && it->data == copy.data &&
+                            it->state == MotionState::Pending;
+        const bool source = slot_buffers.is_allocated(copy.buffer_id) &&
+                            slot_buffers[copy.buffer_id].perf_serial == copy.serial &&
+                            !slot_buffers[copy.buffer_id].is_deleted;
+        if (!listed || !source) {
+            copy.data->dropped = true;
+            continue;
+        }
+        if (!commands) {
+            scheduler.EndRendering();
+            commands.emplace(scheduler.Commands());
+            // Every write recorded before is done and visible to the copies. The reads before
+            // need no order.
+            const vk::MemoryBarrier2 written{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            };
+            commands->pipelineBarrier2(
+                vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &written});
+        }
+        commands->copyBuffer(slot_buffers[copy.buffer_id].Handle(), copy.staging, copy.region);
+        it->state = MotionState::Copied;
+        lands.push_back({copy.data, copy.host, copy.prefix, copy.region.dstOffset,
+                         copy.region.size, copy.coherent, copy.allocation});
+    }
+    motion_copies.clear();
+    if (lands.empty()) {
+        return {};
+    }
     // Completion alone does not replace the device-to-host visibility dependency.
-    const vk::BufferMemoryBarrier2 host_barrier{
+    const vk::MemoryBarrier2 copied{
         .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
         .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eHost,
         .dstAccessMask = vk::AccessFlagBits2::eHostRead,
-        .buffer = download_buffer.Handle(), .offset = staging_offset, .size = transfer_size,
     };
-    commands.pipelineBarrier2(vk::DependencyInfo{
-        .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &host_barrier});
-    scheduler.Finish();
-    if (!download_buffer.is_coherent) {
-        vmaInvalidateAllocation(instance.GetAllocator(), download_buffer.buffer.allocation,
-                                staging_offset, transfer_size);
+    commands->pipelineBarrier2(
+        vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &copied});
+    // By value: the deferred operation runs after the GPU is done with this tick, on any thread.
+    // Each `ready` also gives that copy's staging bytes back.
+    return [lands = std::move(lands), allocator = instance.GetAllocator()] {
+        for (const auto& land : lands) {
+            if (!land.coherent) {
+                vmaInvalidateAllocation(allocator, land.allocation, land.offset, land.size);
+            }
+            std::memcpy(land.data->bytes.data(), land.host + land.prefix, land.data->bytes.size());
+            land.data->ready.store(true, std::memory_order_release);
+        }
+    };
+}
+
+void BufferCache::FlushMotionCopies() {
+    if (auto land = RecordMotionCopies()) {
+        scheduler.DeferOperation(std::move(land));
     }
-    MotionSnapshot entry{address, buffer.perf_serial, buffer.perf_write_seq, use,
-                         std::vector<u8>(size)};
-    std::memcpy(entry.bytes.data(), download + prefix, size);
-    motion_snapshot_bytes += size;
-    motion_snapshots.push_back(std::move(entry));
-    Common::MemoryWriteTrace::Event("motion.index.private_snapshot", address, size, transfer_size);
-    return motion_snapshots.back().bytes;
 }
 
 template <bool async>
@@ -462,7 +756,8 @@ void BufferCache::PrepareVertexInputs(const Vulkan::GraphicsPipeline& pipeline,
 void BufferCache::BindVertexBuffers(
     const Vulkan::GraphicsPipeline& pipeline,
     boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers,
-    u64* motion_geometry, const Vulkan::VertexView* prepared) {
+    u64* motion_geometry, const Vulkan::VertexView* prepared, Vulkan::VertexBinds* binds,
+    const VertexFetch* fetch) {
     ScratchProfile::Cpu scratch_vertex(30,"BufferCache::BindVertexBuffers");
     FastRender::BProfile::Scope b_profile{FastRender::BProfile::VertexIndex};
     const auto& regs = ScratchDraw::Registers(liverpool);
@@ -495,18 +790,26 @@ void BufferCache::BindVertexBuffers(
     const Vulkan::VertexView inputs = prepared ? *prepared : Vulkan::VertexView{local};
     const auto& guest_buffers = inputs.guest_buffers;
     if (motion_geometry) *motion_geometry = inputs.geometry;
-    if (instance.IsVertexInputDynamicState())
-        scheduler.Commands().setVertexInputEXT(inputs.bindings, inputs.attributes);
+    if (instance.IsVertexInputDynamicState()) {
+        if (binds) {
+            binds->vertex_input = true;
+            binds->bindings.assign(inputs.bindings.begin(), inputs.bindings.end());
+            binds->attributes.assign(inputs.attributes.begin(), inputs.attributes.end());
+        } else {
+            scheduler.Commands().setVertexInputEXT(inputs.bindings, inputs.attributes);
+        }
+    }
     if (inputs.bindings.empty()) return;
     struct BufferRange {
         VAddr base_address, end_address;
         vk::Buffer vk_buffer;
         u64 offset;
+        VAddr stream_end; // FAST_CPU_VERTEX_STREAM: its stream copy ends here (0: not streamed)
         size_t GetSize() const { return end_address - base_address; }
     };
     Vulkan::VertexInputs<BufferRange> ranges_merged;
     for (const auto& range : inputs.ranges)
-        ranges_merged.push_back({range.base_address, range.end_address, {}, 0});
+        ranges_merged.push_back({range.base_address, range.end_address, {}, 0, 0});
 
     // FAST_CPU_VERTEX_MEMO: a range ObtainBuffer synchronizes into the cache (over 16 KB, or any
     // with VR_TRACKED_SMALL_BUFFERS; smaller ones keep its stream copy or bit 33) is bound in the
@@ -533,14 +836,59 @@ void BufferCache::BindVertexBuffers(
                    ? page->buffer_id
                    : BufferId{};
     };
+    // FAST_CPU_VERTEX_STREAM: where the stream copy of a range would end (0: the cache's way).
+    const auto stream_end_of = [&](const BufferRange& range, u64 size) -> VAddr {
+        const VAddr end = VertexFetchEnd(inputs, *fetch, range.base_address, size);
+        if (end == 0) {
+            return 0;
+        }
+        const VAddr copy_start = Common::AlignDown(range.base_address, VertexStreamAlign);
+        const u64 bytes = end - copy_start;
+        if (bytes > VertexStreamMaxBytes) {
+            return 0;
+        }
+        // Every buffer of the range is bound within the copy (pack cuts its size at the end).
+        for (const auto& b : guest_buffers) {
+            if (b.base_address != 0 && b.GetSize() != 0 && b.base_address >= range.base_address &&
+                b.base_address < range.end_address && b.base_address >= end) {
+                return 0;
+            }
+        }
+        // Only a range the cache already holds in one buffer and the CPU has written since (the
+        // particles', rewritten every frame): one the cache has never held goes its way, uploaded
+        // once and then bound from that buffer (the memo), not copied again at every draw (the
+        // 2026-11-16 review). The cache holds only mapped memory, and the bytes before the range's
+        // start lie in its first page. None of it written by the GPU: the guest bytes are the
+        // range's contents, as for a small read.
+        if (range.base_address + size > (u64{1} << MemoryTracker::MAX_CPU_PAGE_BITS)) {
+            return 0;
+        }
+        const PageData* page = page_table.find(range.base_address >> CACHING_PAGEBITS);
+        if (page == nullptr || !page->buffer_id) {
+            return 0;
+        }
+        const Buffer& held = slot_buffers[page->buffer_id];
+        if (held.is_deleted || !held.IsInBounds(range.base_address, size) ||
+            // With the memo off, a miss tells us nothing about CPU writes. Let the usual
+            // synchronized bind handle a clean range instead of streaming it every draw.
+            (!vertex_memo && memory_tracker->IsRegionCpuCleanRelaxed(range.base_address, size)) ||
+            IsRegionGpuModified(copy_start, bytes)) {
+            return 0;
+        }
+        return end;
+    };
 
     // Map buffers for merged ranges
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
+        MaterializeRetiles(range.base_address, size, RetileVertex);
         const bool memo_range =
             vertex_memo && (size > CACHING_PAGESIZE || g_tracked_small_buffers);
         const BufferId clean_id =
             memo_range ? clean_buffer(range.base_address, static_cast<u32>(size)) : BufferId{};
+        if (clean_id) {
+            NoteUsed(clean_id);
+        }
         Buffer* const clean = clean_id ? &slot_buffers[clean_id] : nullptr;
         if constexpr (Common::Log::Enabled) {
             if (vertex_memo) {
@@ -550,21 +898,37 @@ void BufferCache::BindVertexBuffers(
                 if ((memo_stats.ranges & 0xFFFF) == 0) {
                     LOG_INFO(Render_Vulkan,
                              "FAST_CPU_VERTEX_MEMO: ranges={} hits={} small={} misses={} "
-                             "verified={} races={} mismatches={}",
+                             "verified={} races={} mismatches={} streamed={}",
                              memo_stats.ranges, memo_stats.hits, memo_stats.small,
                              memo_stats.misses, memo_stats.verified, memo_stats.races,
-                             memo_stats.mismatches);
+                             memo_stats.mismatches, memo_stats.streamed);
                 }
             }
         }
         Buffer* buffer = clean;
         bool queried = false; // a cache buffer: the GPU-modified query below is the old path's
+        // FAST_CPU_VERTEX_STREAM: a range the cache would synchronize, its fetched bytes copied.
+        const VAddr stream_end = !clean && fetch && g_vertex_stream && size > CACHING_PAGESIZE
+                                     ? stream_end_of(range, size)
+                                     : 0;
         if (clean && !g_vertex_memo_verify) {
             if constexpr (Common::Log::Enabled) {
                 ++memo_stats.hits;
             }
             range.vk_buffer = clean->buffer;
             range.offset = static_cast<u32>(clean->Offset(range.base_address));
+        } else if (stream_end != 0) {
+            const VAddr copy_start = Common::AlignDown(range.base_address, VertexStreamAlign);
+            const u64 at =
+                stream_buffer.Copy(copy_start, stream_end - copy_start, VertexStreamAlign);
+            buffer = &stream_buffer;
+            range.vk_buffer = stream_buffer.buffer;
+            range.offset = at + (range.base_address - copy_start);
+            range.stream_end = stream_end;
+            queried = true; // as for a small read: no page of the copy is GPU-modified
+            if constexpr (Common::Log::Enabled) {
+                ++memo_stats.streamed;
+            }
         } else {
             // FAST_CPU_VERTEX_MEMO_VERIFY: what the test found (read before ObtainBuffer, which
             // could create or join buffers if it disagreed), the range's tracking epoch and the
@@ -604,7 +968,8 @@ void BufferCache::BindVertexBuffers(
                 }
             }
         }
-        if (!(queried && FastRender::On(UploadEarlyExit)) &&
+        // (A streamed range's copy holds no GPU-written byte: no barrier, with bit 24 off too.)
+        if (stream_end == 0 && !(queried && FastRender::On(UploadEarlyExit)) &&
             IsRegionGpuModified(range.base_address, size)) {
             if (auto barrier =
                     buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
@@ -614,30 +979,47 @@ void BufferCache::BindVertexBuffers(
         }
     }
 
-    // Bind vertex buffers
+    const auto pack = [&](auto& host_buffers, auto& host_offsets,
+                          auto& host_sizes, auto& host_strides) {
+        for (const auto& buffer : guest_buffers) {
+            u64 size = buffer.GetSize();
+            if (buffer.base_address != 0 && buffer.GetSize() > 0) {
+                const auto host_buffer_info =
+                    std::ranges::find_if(ranges_merged, [&](const BufferRange& range) {
+                        return buffer.base_address >= range.base_address &&
+                               buffer.base_address < range.end_address;
+                    });
+                ASSERT(host_buffer_info != ranges_merged.cend());
+                host_buffers.emplace_back(host_buffer_info->vk_buffer);
+                host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
+                                       host_buffer_info->base_address);
+                // FAST_CPU_VERTEX_STREAM: a streamed range's buffers end where its copy ends
+                // (every one starts before it: stream_end_of).
+                if (host_buffer_info->stream_end != 0) {
+                    size = std::min<u64>(size, host_buffer_info->stream_end - buffer.base_address);
+                }
+            } else {
+                host_buffers.emplace_back(VK_NULL_HANDLE);
+                host_offsets.push_back(0);
+            }
+            host_sizes.push_back(size);
+            host_strides.push_back(buffer.GetStride());
+        }
+    };
+    if (binds) {
+        binds->buffers.clear();
+        binds->offsets.clear();
+        binds->sizes.clear();
+        binds->strides.clear();
+        pack(binds->buffers, binds->offsets, binds->sizes, binds->strides);
+        binds->two = !instance.IsVertexInputDynamicState();
+        return;
+    }
     Vulkan::VertexInputs<vk::Buffer> host_buffers;
     Vulkan::VertexInputs<vk::DeviceSize> host_offsets;
     Vulkan::VertexInputs<vk::DeviceSize> host_sizes;
     Vulkan::VertexInputs<vk::DeviceSize> host_strides;
-    for (const auto& buffer : guest_buffers) {
-        if (buffer.base_address != 0 && buffer.GetSize() > 0) {
-            const auto host_buffer_info =
-                std::ranges::find_if(ranges_merged, [&](const BufferRange& range) {
-                    return buffer.base_address >= range.base_address &&
-                           buffer.base_address < range.end_address;
-                });
-            ASSERT(host_buffer_info != ranges_merged.cend());
-            host_buffers.emplace_back(host_buffer_info->vk_buffer);
-            host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
-                                   host_buffer_info->base_address);
-        } else {
-            host_buffers.emplace_back(VK_NULL_HANDLE);
-            host_offsets.push_back(0);
-        }
-        host_sizes.push_back(buffer.GetSize());
-        host_strides.push_back(buffer.GetStride());
-    }
-
+    pack(host_buffers, host_offsets, host_sizes, host_strides);
     const auto cmdbuf = scheduler.Commands();
     const auto num_buffers = guest_buffers.size();
     if (instance.IsVertexInputDynamicState()) {
@@ -648,8 +1030,39 @@ void BufferCache::BindVertexBuffers(
     }
 }
 
+void BufferCache::EncodeVertexBinds(const Vulkan::VertexBinds& binds,
+                                    const Vulkan::RecorderProxy& cmdbuf) {
+    if (binds.vertex_input) {
+        cmdbuf.setVertexInputEXT(binds.bindings, binds.attributes);
+    }
+    if (!binds.buffers.empty()) {
+        const u32 count = static_cast<u32>(binds.buffers.size());
+        if (binds.two) {
+            cmdbuf.bindVertexBuffers2(0, count, binds.buffers.data(), binds.offsets.data(),
+                                      binds.sizes.data(), binds.strides.data());
+        } else {
+            cmdbuf.bindVertexBuffers(0, count, binds.buffers.data(), binds.offsets.data());
+        }
+    }
+    if (binds.index) {
+        cmdbuf.bindIndexBuffer(binds.index_buffer, binds.index_offset, binds.index_type);
+    }
+}
+
 void BufferCache::BindIndexBuffer(
-    u32 index_offset, boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
+    u32 index_offset, boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers,
+    Vulkan::VertexBinds* binds) {
+    // FAST_CPU_STAGEB_SPLIT: the bind as values for EncodeVertexBinds, else encoded here.
+    const auto bind = [&](vk::Buffer buffer, vk::DeviceSize offset, vk::IndexType type) {
+        if (binds) {
+            binds->index = true;
+            binds->index_buffer = buffer;
+            binds->index_offset = offset;
+            binds->index_type = type;
+        } else {
+            scheduler.Commands().bindIndexBuffer(buffer, offset, type);
+        }
+    };
     ScratchProfile::Cpu scratch_index(31,"BufferCache::BindIndexBuffer");
     FastRender::BProfile::Scope b_profile{FastRender::BProfile::VertexIndex};
     const auto& regs = ScratchDraw::Registers(liverpool);
@@ -667,8 +1080,7 @@ void BufferCache::BindIndexBuffer(
     // command stream, e.g. VrInFrame::Record); only obtaining the buffer is shortened.
     if (FastRender::On(IndexBind)) {
         if (const auto bound = ObtainIndexBuffer(index_address, index_buffer_size, barriers)) {
-            scheduler.Commands().bindIndexBuffer(bound->first->Handle(), bound->second,
-                                                 index_type);
+            bind(bound->first->Handle(), bound->second, index_type);
             return;
         }
     }
@@ -683,14 +1095,14 @@ void BufferCache::BindIndexBuffer(
             barriers.emplace_back(*barrier);
         }
     }
-    const auto cmdbuf = scheduler.Commands();
-    cmdbuf.bindIndexBuffer(vk_buffer->Handle(), offset, index_type);
+    bind(vk_buffer->Handle(), offset, index_type);
 }
 
 std::optional<std::pair<Buffer*, u32>> BufferCache::ObtainIndexBuffer(
     VAddr address, u32 size,
     boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
     FastRender::AssertRecordingAccess();
+    MaterializeRetiles(address, size, RetileIndex);
     if (!index_bind_memo) {
         index_bind_memo = std::make_unique<IndexBindMemo>(); // value-initialized: all zero
         index_bind_memo->tick = ~u64{0};
@@ -739,6 +1151,7 @@ std::optional<std::pair<Buffer*, u32>> BufferCache::ObtainIndexBuffer(
                 return std::nullopt;
             }
             ++memo.hits;
+            NoteUsed(buffer_id);
             return bind(buffer, gpu_modified);
         }
     }
@@ -844,6 +1257,7 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
     Common::MemoryWriteTrace::Event("dma.fill", address, num_bytes, value, is_gds);
     ASSERT_MSG(address % 4 == 0, "GDS offset must be dword aligned");
     if (!is_gds) {
+        MaterializeRetiles(address, num_bytes, RetileFill);
         texture_cache.ClearMeta(address);
         if (!IsRegionGpuModified(address, num_bytes)) {
             u32* buffer = std::bit_cast<u32*>(address);
@@ -875,6 +1289,12 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         // Fallback to creating dst buffer on GPU to at least have this data there
     }
     texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
+    if (!src_gds) {
+        MaterializeRetiles(src, num_bytes, RetileCopy);
+    }
+    if (!dst_gds) {
+        MaterializeRetiles(dst, num_bytes, RetileCopy);
+    }
     auto& src_buffer = [&] -> const Buffer& {
         if (src_gds) {
             return gds_buffer;
@@ -891,7 +1311,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         const auto buffer_id = FindBuffer(dst, num_bytes);
         auto& buffer = slot_buffers[buffer_id];
         SynchronizeBuffer(buffer, dst, num_bytes, true, true);
-        gpu_modified_ranges.Add(dst, num_bytes);
+        gpu_modified_ranges.AddIfNew(dst, num_bytes);
         NoteGpuWrite(dst, num_bytes);
         return buffer;
     }();
@@ -956,11 +1376,182 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
     });
 }
 
+namespace {
+// VR_RETILE_DEFER (BufferCache::DeferImageRetile), read once: on unless '0'.
+char RetileDeferMode() {
+    static const char mode = [] {
+        const char* value = std::getenv("VR_RETILE_DEFER");
+        return value && (value[0] == '0' || value[0] == 'm') ? value[0] : '1';
+    }();
+    return mode;
+}
+constexpr std::array<const char*, BufferCache::NumRetileTriggers> RetileTriggerNames{
+    "obtain", "copy", "fill", "download", "image upload", "index", "motion", "range sync",
+    "dma", "vertex memo", "hle copy", "source gone", "overlap", "forced"};
+} // namespace
+
+bool BufferCache::DeferImageRetile(VAddr dst, u64 bytes, ImageId source,
+                                   const vk::BufferImageCopy& region) {
+    FastRender::AssertRecordingAccess();
+    const char mode = RetileDeferMode();
+    if (mode == '0' || retile_off || bytes == 0 ||
+        EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled ||
+        texture_cache.ReadsBackLinearImages() || FastRender::On(FastRender::CopyThreads)) {
+        return false;
+    }
+    const VAddr hi = dst + bytes;
+    for (u32 i = 0; i < retile_read_count; ++i) {
+        if (retile_read[i].first < hi && dst < retile_read[i].second) {
+            return false; // read before: recorded now, as always
+        }
+    }
+    // This copy rewrites every byte of [dst, dst + bytes): a pending re-tile of exactly that
+    // range is dropped unread; one overlapping it otherwise is recorded first.
+    for (auto& retile : retiles) {
+        if (!retile.valid || retile.hi <= dst || hi <= retile.lo) {
+            continue;
+        }
+        if (retile.lo == dst && retile.hi == hi) {
+            retile.valid = false;
+            --retile_count;
+            ++retile_superseded;
+        } else {
+            MaterializeRetile(retile, RetileOverlap);
+        }
+    }
+    DeferredRetile* slot = nullptr;
+    for (auto& retile : retiles) {
+        if (!retile.valid) {
+            slot = &retile;
+            break;
+        }
+    }
+    if (!slot) {
+        return false; // all four in use: this one is recorded now
+    }
+    // The buffer state the recorded copy leaves (its CPU-modified pages uploaded first, then the
+    // range GPU-modified), without the re-tile.
+    [[maybe_unused]] const auto obtained = ObtainBuffer(dst, static_cast<u32>(bytes), true, true);
+    const Image& image = texture_cache.GetImage(source);
+    *slot = DeferredRetile{.lo = dst,
+                           .hi = hi,
+                           .image = source,
+                           .image_uid = image.image_uid,
+                           .write_serial = image.write_serial,
+                           .region = region,
+                           .valid = true};
+    ++retile_count;
+    if ((++retile_deferred % 1800) == 0) {
+        ReportRetiles();
+    }
+    return true;
+}
+
+void BufferCache::MaterializeRetilesIn(VAddr addr, u64 size, u32 trigger) {
+    const VAddr end = size > ~u64{0} - addr ? ~u64{0} : addr + size;
+    for (auto& retile : retiles) {
+        if (retile.valid && retile.lo < end && addr < retile.hi) {
+            MaterializeRetile(retile, trigger);
+        }
+    }
+}
+
+void BufferCache::MaterializeRetilesFrom(ImageId image) {
+    if (retile_count == 0) [[likely]] {
+        return;
+    }
+    for (auto& retile : retiles) {
+        if (retile.valid && retile.image == image) {
+            MaterializeRetile(retile, RetileSourceGone);
+        }
+    }
+}
+
+bool BufferCache::IsRetileSource(ImageId image) const noexcept {
+    if (retile_count == 0) [[likely]] {
+        return false;
+    }
+    for (const auto& retile : retiles) {
+        if (retile.valid && retile.image == image) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void BufferCache::RetileFrameEnd() {
+    if (RetileDeferMode() == 'm') {
+        MaterializeAllRetiles(RetileForced);
+    }
+}
+
+void BufferCache::MaterializeRetile(DeferredRetile& retile, u32 trigger) {
+    FastRender::AssertRecordingAccess();
+    // Taken off the list first: the lookup below may come back through a hooked entry point.
+    retile.valid = false;
+    --retile_count;
+    ++retile_materialized;
+    ++retile_triggers[trigger];
+    Image& image = texture_cache.GetImage(retile.image);
+    const u64 bytes = retile.hi - retile.lo;
+    if (image.image_uid != retile.image_uid) {
+        // Not expected: an unregistered source records its re-tiles first.
+        LOG_ERROR(Render_Vulkan,
+                  "VR retile defer: the source of {:#x}+{:#x} changed identity before its re-tile; "
+                  "deferring off",
+                  retile.lo, bytes);
+        retile_off = true;
+        return;
+    }
+    // No ObtainBuffer: the copy's upload and GPU-modified marking were done when it was
+    // deferred, and CPU writes since then must stay pending to land over these bytes, as they
+    // would have over the recorded copy.
+    const bool late = image.write_serial != retile.write_serial;
+    retile_late += late ? 1 : 0;
+    Buffer& buffer = slot_buffers[FindBuffer(retile.lo, static_cast<u32>(bytes))];
+    NativeStereo::Barrier(scheduler);
+    texture_cache.GetTileManager().TileImage(image, std::span{&retile.region, 1}, buffer.Handle(),
+                                             static_cast<u32>(buffer.Offset(retile.lo)),
+                                             static_cast<u32>(bytes));
+    NativeStereo::Barrier(scheduler);
+    if (trigger != RetileForced && trigger != RetileOverlap && trigger != RetileSourceGone) {
+        // A reader: from now on copies into this destination are recorded when made, as before.
+        if (retile_read_count < retile_read.size()) {
+            retile_read[retile_read_count++] = {retile.lo, retile.hi};
+        } else {
+            retile_off = true;
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "VR retile defer: {} read {:#x}+{:#x} (a re-tile of image {:#x}, {}); {}",
+                    RetileTriggerNames[trigger], retile.lo, bytes, image.info.guest_address,
+                    late ? "LATE: the image was written since the copy"
+                         : "exact: the image is unchanged since the copy",
+                    retile_off ? "deferring off for this session"
+                               : "this destination is no longer deferred");
+        ReportRetiles();
+    }
+}
+
+void BufferCache::ReportRetiles() {
+    std::string triggers;
+    for (u32 i = 0; i < NumRetileTriggers; ++i) {
+        if (retile_triggers[i] != 0) {
+            triggers += fmt::format(" {} {}", RetileTriggerNames[i], retile_triggers[i]);
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "VR retile defer: {} deferred, {} dropped unread, {} recorded later{}{} ({} after "
+             "the source changed); pending {}",
+             retile_deferred, retile_superseded, retile_materialized,
+             triggers.empty() ? "" : " by", triggers, retile_late, retile_count);
+}
+
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id,
                                                   SmallRead* small_read) {
     FastRender::AssertRecordingAccess();
     ScratchProfile::Cpu scratch_obtain(17,"BufferCache::ObtainBuffer");
+    MaterializeRetiles(device_addr, size, RetileObtain);
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     const bool tracked_small = g_tracked_small_buffers;
     if (!tracked_small && !is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
@@ -982,10 +1573,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     if (IsBufferInvalid(buffer_id)) {
         buffer_id = FindBuffer(device_addr, size);
     }
-    Buffer& buffer = slot_buffers[buffer_id];
+    Buffer& buffer = slot_buffers[NoteUsed(buffer_id)];
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
-        gpu_modified_ranges.Add(device_addr, size);
+        gpu_modified_ranges.AddIfNew(device_addr, size);
         NoteGpuWrite(device_addr, size);
     }
     return {&buffer, buffer.Offset(device_addr)};
@@ -1196,6 +1787,7 @@ std::optional<std::pair<Buffer*, u32>> BufferCache::ObtainSmallDirect(VAddr devi
         }
     }
     ++stats.hits;
+    std::atomic_ref<u64>(buffer.last_used_tick).store(gc_tick, std::memory_order_relaxed);
     return std::pair<Buffer*, u32>{&buffer, static_cast<u32>(buffer.Offset(device_addr))};
 }
 
@@ -1290,24 +1882,34 @@ void BufferCache::VerifySmallDirect(Buffer& buffer, VAddr device_addr, u32 size,
     });
 }
 
-std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 size) {
+BufferCache::ImageUploadBuffer BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 size) {
+    MaterializeRetiles(gpu_addr, size, RetileImageUpload);
     // Check if any buffer contains the full requested range.
     const BufferId buffer_id = page_table[gpu_addr >> CACHING_PAGEBITS].buffer_id;
     if (buffer_id) {
         if (Buffer& buffer = slot_buffers[buffer_id]; buffer.IsInBounds(gpu_addr, size)) {
+            NoteUsed(buffer_id);
             SynchronizeBuffer(buffer, gpu_addr, size, false, false);
-            return {&buffer, buffer.Offset(gpu_addr)};
+            return {&buffer, static_cast<u32>(buffer.Offset(gpu_addr)), {}};
         }
     }
     // If some buffer within was GPU modified create a full buffer to avoid losing GPU data.
     if (IsRegionGpuModified(gpu_addr, size)) {
-        return ObtainBuffer(gpu_addr, size, false, false);
+        const auto [buffer, offset] = ObtainBuffer(gpu_addr, size, false, false);
+        return {buffer, offset, {}};
     }
     // In all other cases, just do a CPU copy to the staging buffer.
-    const auto [data, offset] = staging_buffer.Map(size, instance.StorageMinAlignment());
-    memory->CopySparseMemory(gpu_addr, data, size);
-    staging_buffer.Commit();
-    return {&staging_buffer, offset};
+    const auto staging = staging_pool.Request(size, instance.StorageMinAlignment());
+    memory->CopySparseMemory(gpu_addr, staging.data, size);
+    staging.Flush();
+    return {staging.buffer, static_cast<u32>(staging.offset), staging};
+}
+
+BufferCache::ImageUploadBuffer BufferCache::ObtainBufferForBytes(const u8* data, u32 size) {
+    const auto staging = staging_pool.Request(size, instance.StorageMinAlignment());
+    std::memcpy(staging.data, data, size);
+    staging.Flush();
+    return {staging.buffer, static_cast<u32>(staging.offset), staging};
 }
 
 bool BufferCache::IsRegionRegistered(VAddr addr, size_t size) {
@@ -1344,13 +1946,21 @@ BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size) {
     const u64 page = device_addr >> CACHING_PAGEBITS;
     const BufferId buffer_id = page_table[page].buffer_id;
     if (!buffer_id) {
-        return CreateBuffer(device_addr, size);
+        return NoteUsed(CreateBuffer(device_addr, size));
     }
     const Buffer& buffer = slot_buffers[buffer_id];
     if (buffer.IsInBounds(device_addr, size)) {
-        return buffer_id;
+        return NoteUsed(buffer_id);
     }
-    return CreateBuffer(device_addr, size);
+    return NoteUsed(CreateBuffer(device_addr, size));
+}
+
+// Every way to a buffer stamps it (EvictIdleBuffers' idle age; VR_VRAM_REPORT's): lookups here,
+// the vertex, index and copy memos' hits and image uploads (MarkUsed).
+BufferId BufferCache::NoteUsed(BufferId buffer_id) {
+    std::atomic_ref<u64>(slot_buffers[buffer_id].last_used_tick)
+        .store(gc_tick, std::memory_order_relaxed);
+    return buffer_id;
 }
 
 namespace {
@@ -1389,11 +1999,23 @@ void BufferCache::PollBufferGrowSwitch() {
     }
 }
 
+// FAST_BUFFER_LEAP_FIX ('0' off, on by default since 0.5.5; read once): the stream leap grows a region in
+// the direction its requests go past the buffers they merge (it grew the side where the old
+// buffer stuck out: a region streamed upward was re-created 16 KB at a time, 3.2 GB allocated
+// in one sewers load, 2026-10-24), by the region's own size, and a leapt buffer keeps its score
+// so the next growth leaps again at once.
+static const bool g_leap_fix = [] {
+    const char* value = std::getenv("FAST_BUFFER_LEAP_FIX");
+    return !(value && value[0] == '0');
+}();
+
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 wanted_size) {
     static constexpr int STREAM_LEAP_THRESHOLD = 16;
     boost::container::small_vector<BufferId, 16> overlap_ids;
     VAddr begin = device_addr;
     VAddr end = device_addr + wanted_size;
+    const VAddr request_begin = begin, request_end = end; // FAST_BUFFER_LEAP_FIX
+    VAddr overlaps_begin = ~VAddr{0}, overlaps_end = 0;
     int stream_score = 0;
     bool has_stream_leap = false;
     const auto expand_begin = [&](VAddr add_value) {
@@ -1435,6 +2057,8 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         overlap_ids.push_back(overlap_id);
         overlap.is_picked = true;
         const VAddr overlap_device_addr = overlap.CpuAddr();
+        overlaps_begin = std::min(overlaps_begin, overlap_device_addr);
+        overlaps_end = std::max(overlaps_end, overlap_device_addr + overlap.SizeBytes());
         const bool expands_left = overlap_device_addr < begin;
         if (expands_left) {
             begin = overlap_device_addr;
@@ -1445,7 +2069,8 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
             end = overlap_end;
         }
         stream_score += overlap.StreamScore();
-        if (stream_score > STREAM_LEAP_THRESHOLD && !has_stream_leap) {
+        // FAST_BUFFER_LEAP_FIX: a region leaps on its third growth, not its seventeenth.
+        if (stream_score > (g_leap_fix ? 2 : STREAM_LEAP_THRESHOLD) && !has_stream_leap) {
             // When this memory region has been joined a bunch of times, we assume it's being used
             // as a stream buffer. Increase the size to skip constantly recreating buffers.
             has_stream_leap = true;
@@ -1455,10 +2080,14 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
             const VAddr leap = BufferGrowGeometric()
                                    ? std::clamp<VAddr>(end - begin, CACHING_PAGESIZE * 128, 128_MB)
                                    : CACHING_PAGESIZE * 128;
-            if (expands_right) {
+            // FAST_BUFFER_LEAP_FIX: the side the request goes past the buffers merged so far
+            // (inside the scan, which then picks up whatever the leap now covers).
+            const bool leap_right = g_leap_fix ? request_end > overlaps_end : expands_right;
+            const bool leap_left = g_leap_fix ? request_begin < overlaps_begin : expands_left;
+            if (leap_right) {
                 expand_end(leap);
             }
-            if (expands_left) {
+            if (leap_left) {
                 expand_begin(leap);
             }
         }
@@ -1471,7 +2100,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
     };
 }
 
-void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
+bool BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
                               bool accumulate_stream_score) {
     Buffer& new_buffer = slot_buffers[new_buffer_id];
     Buffer& overlap = slot_buffers[overlap_id];
@@ -1487,6 +2116,14 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
         .dstOffset = dst_base_offset,
         .size = overlap.SizeBytes(),
     };
+    if (new_buffer.sparse_view && overlap.sparse_view) {
+        // Sparse views (SparsePool): the new buffer is bound to the old one's pieces, so its bytes
+        // are already there. Only a right-eye copy, if the old buffer had one, still moves.
+        NativeStereo::CopyRight(scheduler, overlap.Handle(), new_buffer.Handle(), std::span{&copy, 1});
+        new_buffer.PerfNoteWrite();
+        DeleteBuffer(overlap_id);
+        return true;
+    }
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.Commands();
 
@@ -1530,24 +2167,211 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
         .pBufferMemoryBarriers = post_barriers.data(),
     });
     DeleteBuffer(overlap_id);
+    return false;
 }
+
+// FAST_BUFFER_SPARSE_MIN_KB (read once; default 2048): a merge this large or larger makes a sparse
+// view (SparsePool); a smaller one, and every first creation, stays an ordinary buffer, which is
+// faster to make (a sparse buffer ~0.15 ms on the RTX 5080) and costs 16 KB pages, not 64 KB
+// blocks. The pools that grew by copying are far larger than this.
+// FAST_SPARSE_VERIFY=1 (a test, read once): VerifySparseMerge on every merge of sparse views.
+static const bool g_sparse_verify = [] {
+    const char* value = std::getenv("FAST_SPARSE_VERIFY");
+    return value && value[0] == '1';
+}();
+
+static const u64 g_sparse_min_bytes = [] {
+    const char* value = std::getenv("FAST_BUFFER_SPARSE_MIN_KB");
+    return (value ? u64(std::strtoull(value, nullptr, 10)) : u64{2048}) << 10;
+}();
+
+namespace {
+// Logs-on builds: CreateBuffer's time by step (its "create buffer" total hid which one costs, and
+// logged the size asked for, not the size made); a call over 2 ms is logged with it.
+struct CreateSteps {
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point start = Clock::now(), last = start;
+    std::array<double, 4> ms{}; // overlaps, creation, merge, registration
+    void Mark(size_t step) {
+        if constexpr (Common::Log::Enabled) {
+            const auto now = Clock::now();
+            ms[step] += std::chrono::duration<double, std::milli>(now - last).count();
+            last = now;
+        }
+    }
+};
+} // namespace
 
 BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
     Common::Slow::Scope slow{Common::Slow::CreateBuffer, wanted_size};
+    CreateSteps steps;
+    const u32 asked = wanted_size;
     const VAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
-    const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
-    const u32 size = static_cast<u32>(overlap.end - overlap.begin);
-    const BufferId new_buffer_id =
-        slot_buffers.insert(instance, scheduler, MemoryUsage::DeviceLocal, overlap.begin,
-                            AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
-    auto& new_buffer = slot_buffers[new_buffer_id];
-    for (const BufferId overlap_id : overlap.ids) {
-        JoinOverlap(new_buffer_id, overlap_id, !overlap.has_stream_leap);
+    OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
+    // Sparse views own whole 64 KB blocks (no block is shared with another buffer): a large
+    // enough result, or one that takes in a view, is resolved again over whole blocks.
+    bool view_wanted = false;
+    if (sparse_pool.Enabled()) {
+        bool takes_view = false;
+        for (const BufferId id : overlap.ids) {
+            takes_view |= slot_buffers[id].sparse_view;
+        }
+        // A merge makes a view (a buffer that grows: copy-on-grow is what views remove); a first
+        // creation stays ordinary, as fast as before (a load makes hundreds of MB of them).
+        view_wanted = takes_view ||
+                      (!overlap.ids.empty() && overlap.end - overlap.begin >= g_sparse_min_bytes);
+        const VAddr block_begin = SparseLogic::AlignDown(overlap.begin);
+        const VAddr block_end = SparseLogic::AlignUp(overlap.end);
+        if (view_wanted && (block_begin != overlap.begin || block_end != overlap.end) &&
+            block_begin >= CACHING_PAGESIZE + DEVICE_PAGESIZE &&
+            block_end - block_begin <= std::numeric_limits<u32>::max()) {
+            for (const BufferId id : overlap.ids) {
+                slot_buffers[id].is_picked = false;
+            }
+            overlap = ResolveOverlaps(block_begin, static_cast<u32>(block_end - block_begin));
+        }
     }
+    const u32 size = static_cast<u32>(overlap.end - overlap.begin);
+    steps.Mark(0);
+    // Diagnostic (VR_BUFFER_GROWTH_LOG=1): creations that merge buffers or exceed 8 MB.
+    static const bool growth_log = std::getenv("VR_BUFFER_GROWTH_LOG") != nullptr;
+    if (growth_log && (!overlap.ids.empty() || size > (8u << 20))) {
+        static u32 logged = 0;
+        u64 merged = 0;
+        for (const BufferId id : overlap.ids)
+            merged += slot_buffers[id].SizeBytes();
+        if (logged++ < 400)
+            LOG_INFO(Render_Vulkan,
+                     "VR buffer growth: wanted {:#x}+{:#x} -> {:#x}+{:#x} ({} KB), merging {} "
+                     "buffers ({} KB), stream leap {}",
+                     device_addr, wanted_size, overlap.begin, size, size >> 10,
+                     overlap.ids.size(), merged >> 10, overlap.has_stream_leap);
+    }
+    // A sparse view over whole blocks, when VRAM had the slab for it; an ordinary buffer otherwise.
+    vk::Buffer view{};
+    std::vector<u32> view_pieces;
+    if (view_wanted && overlap.begin % SparseLogic::BlockSize == 0 &&
+        size % SparseLogic::BlockSize == 0) {
+        Common::Slow::Scope slow_view{Common::Slow::SparseView, size};
+        view = sparse_pool.CreateView(overlap.begin, size,
+                                      AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+                                      view_pieces);
+    }
+    const BufferId new_buffer_id =
+        view ? slot_buffers.insert(instance, scheduler, overlap.begin, u64{size}, view, &sparse_pool,
+                                   std::move(view_pieces))
+             : slot_buffers.insert(instance, scheduler, MemoryUsage::DeviceLocal, overlap.begin,
+                                   AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
+    steps.Mark(1);
+    bool shared = false;
+    // FAST_SPARSE_VERIFY: the old views merged without a copy (their handles live until the tick).
+    boost::container::small_vector<std::tuple<vk::Buffer, u64, u64>, 8> verify;
+    for (const BufferId overlap_id : overlap.ids) {
+        const Buffer& old = slot_buffers[overlap_id];
+        const auto old_view = std::make_tuple(old.Handle(), u64{old.SizeBytes()},
+                                              u64{old.CpuAddr() - overlap.begin});
+        // FAST_BUFFER_LEAP_FIX: a leapt region keeps its score (the next growth leaps again).
+        const bool joined =
+            JoinOverlap(new_buffer_id, overlap_id, g_leap_fix || !overlap.has_stream_leap);
+        if (joined && g_sparse_verify) {
+            verify.push_back(old_view);
+        }
+        shared |= joined;
+    }
+    if (shared) {
+        // The old handles' writes reach the pieces the new buffer binds: one barrier orders them
+        // before whatever uses the new handle (the copies a merge made had theirs).
+        scheduler.EndRendering();
+        const vk::MemoryBarrier2 barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        };
+        scheduler.Commands().pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &barrier,
+        });
+        // Bit 44: every write so far is visible to every read now, as after a merge's copy.
+        slot_buffers[new_buffer_id].shader_reads_visible = true;
+        for (const auto& [old_view, bytes, offset] : verify) {
+            VerifySparseMerge(old_view, bytes, slot_buffers[new_buffer_id].Handle(), offset);
+        }
+    }
+    steps.Mark(2);
     Register(new_buffer_id);
+    steps.Mark(3);
+    if constexpr (Common::Log::Enabled) {
+        const double total =
+            std::chrono::duration<double, std::milli>(CreateSteps::Clock::now() - steps.start)
+                .count();
+        static u32 logged = 0;
+        if (total >= 2.0 && logged < 300) {
+            ++logged;
+            LOG_WARNING(Render_Vulkan,
+                        "SLOW create buffer: {:.2f} ms: overlaps {:.2f}, {} {:.2f}, merge {:.2f} "
+                        "({} buffers), register {:.2f}; asked {} KB, made {} KB",
+                        total, steps.ms[0], view ? "sparse view" : "buffer", steps.ms[1],
+                        steps.ms[2], overlap.ids.size(), steps.ms[3], asked >> 10, size >> 10);
+        }
+    }
     return new_buffer_id;
+}
+
+void BufferCache::VerifySparseMerge(vk::Buffer old_view, u64 bytes, vk::Buffer new_view,
+                                    u64 offset) {
+    // The first and the last MiB of the old view (a wrong bind shows at the edges of runs).
+    static constexpr u64 Sample = 1_MB;
+    std::array<std::pair<u64, u64>, 2> parts{{{0, std::min(bytes, Sample)}, {0, 0}}};
+    if (bytes > Sample) {
+        const u64 tail = std::min(Sample, bytes - Sample);
+        parts[1] = {bytes - tail, tail};
+    }
+    u64 total = 0;
+    for (const auto& [at, size] : parts) {
+        total += size;
+    }
+    auto readback = std::make_shared<Buffer>(instance, scheduler, MemoryUsage::Download, 0,
+                                             vk::BufferUsageFlagBits::eTransferDst, 2 * total);
+    boost::container::small_vector<vk::BufferCopy, 2> from_old, from_new;
+    u64 at_out = 0;
+    for (const auto& [at, size] : parts) {
+        if (size == 0) {
+            continue;
+        }
+        from_old.push_back({at, at_out, size});
+        from_new.push_back({offset + at, total + at_out, size});
+        at_out += size;
+    }
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.Commands();
+    cmdbuf.copyBuffer(old_view, readback->Handle(), from_old);
+    cmdbuf.copyBuffer(new_view, readback->Handle(), from_new);
+    const vk::MemoryBarrier2 to_host = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                               .pMemoryBarriers = &to_host});
+    scheduler.DeferOperation([readback, total, bytes, offset] {
+        static std::atomic<u64> checked{0}, bad{0};
+        ++checked;
+        const u8* const data = readback->mapped_data.data();
+        if (std::memcmp(data, data + total, total) != 0) {
+            ++bad;
+            LOG_WARNING(Render_Vulkan,
+                        "Sparse verify: a merged view ({} KB at +{:#x}) differs from the new "
+                        "view's bytes: {} of {} merges bad",
+                        bytes >> 10, offset, bad.load(), checked.load());
+        } else if ((checked & 63) == 0) {
+            LOG_INFO(Render_Vulkan, "Sparse verify: {} merges checked, {} bad", checked.load(),
+                     bad.load());
+        }
+    });
 }
 
 void BufferCache::ProcessFaultBuffer() {
@@ -1582,21 +2406,28 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
     if constexpr (insert) {
         total_used_memory += Common::AlignUp(size, CACHING_PAGESIZE);
         buffer.SetLRUId(lru_cache.Insert(buffer_id, gc_tick));
-        boost::container::small_vector<vk::DeviceAddress, 128> bda_addrs;
-        bda_addrs.reserve(size_pages);
-        for (u64 i = 0; i < size_pages; ++i) {
-            vk::DeviceAddress addr = buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS);
-            bda_addrs.push_back(addr);
+        // The page table's device addresses, only when the DMA table exists (a review: the array
+        // was built for every buffer, a large merge's thousands of pages included).
+        if (DmaTable::allocated.load(std::memory_order_relaxed)) {
+            boost::container::small_vector<vk::DeviceAddress, 128> bda_addrs;
+            bda_addrs.reserve(size_pages);
+            for (u64 i = 0; i < size_pages; ++i) {
+                vk::DeviceAddress addr = buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS);
+                bda_addrs.push_back(addr);
+            }
+            WriteDataBuffer(bda_pagetable_buffer, page_begin * sizeof(vk::DeviceAddress),
+                            bda_addrs.data(), bda_addrs.size() * sizeof(vk::DeviceAddress));
         }
-        WriteDataBuffer(bda_pagetable_buffer, page_begin * sizeof(vk::DeviceAddress),
-                        bda_addrs.data(), bda_addrs.size() * sizeof(vk::DeviceAddress));
         std::unique_lock lk{buffer_ranges_mutex};
         buffer_ranges.Add(buffer.CpuAddr(), buffer.SizeBytes(), buffer_id);
     } else {
         total_used_memory -= Common::AlignUp(size, CACHING_PAGESIZE);
         lru_cache.Free(buffer.LRUId());
-        const u64 offset = bda_pagetable_buffer.Offset(page_begin * sizeof(vk::DeviceAddress));
-        bda_pagetable_buffer.Fill(offset, size_pages * sizeof(vk::DeviceAddress), 0);
+        if (DmaTable::allocated.load(std::memory_order_relaxed)) {
+            const u64 offset =
+                bda_pagetable_buffer.Offset(page_begin * sizeof(vk::DeviceAddress));
+            bda_pagetable_buffer.Fill(offset, size_pages * sizeof(vk::DeviceAddress), 0);
+        }
         std::unique_lock lk{buffer_ranges_mutex};
         buffer_ranges.Subtract(buffer.CpuAddr(), buffer.SizeBytes());
     }
@@ -1686,12 +2517,19 @@ static void VerifyTransferEyeCopies(const Vulkan::Instance& instance, Vulkan::Sc
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                                     bool is_texel_buffer, bool retire_cpu_uploads) {
     ScratchProfile::Cpu scratch_cpu(1,"BufferCache::SynchronizeBuffer");
+    // Every upload and every GPU write it precedes (ObtainBuffer, CopyBuffer) sees the ranges the
+    // game handed out again before it as dead GPU data.
+    TakeFresh();
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
-    vk::Buffer src_buffer = VK_NULL_HANDLE;
-    const bool async_upload = FastRender::On(FastRender::CopyThreads) && !is_written &&
-                              staging_buffer.is_coherent && !staging_buffer.HasShadow();
+    std::optional<UploadStagingPool::Allocation> upload;
+    SCOPE_EXIT {
+        if (upload) {
+            upload->Retire();
+        }
+    };
+    const bool async_upload = FastRender::On(FastRender::CopyThreads) && !is_written;
     memory_tracker->ForEachUploadRange(
         device_addr, size, is_written,
         [&](u64 device_addr_out, u64 range_size) {
@@ -1714,9 +2552,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                     }
                 });
         },
-        [&](bool safe_async) { src_buffer = UploadCopies(buffer, copies, total_size_bytes, safe_async); },
+        [&](bool safe_async) { upload = UploadCopies(buffer, copies, total_size_bytes, safe_async); },
         async_upload);
 
+    const vk::Buffer src_buffer = upload ? upload->buffer->Handle() : vk::Buffer{};
     if (src_buffer) {
         scheduler.EndRendering();
     ScratchProfile::Gpu scratch_gpu(scheduler,11);
@@ -1804,19 +2643,33 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         // Motion snapshots need byte ownership, not the historical GPU-dirty page bit.
         // Only ranges the normal upload path actually emitted become CPU-authoritative;
         // untouched GPU bytes on mixed pages were excluded by ForUpload and stay owned.
-        if (retire_cpu_uploads) {
+        // Every upload does it (FAST_UPLOAD_RETIRE): when another pass uploaded a reloaded
+        // model's indices before the motion read, they stayed marked GPU-written for good, and
+        // after many areas dozens of characters' indices went through GPU snapshots each frame.
+        if (retire_cpu_uploads || g_upload_retire) {
+            bool retired = retire_cpu_uploads;
             for (const auto& copy : copies) {
-                gpu_modified_ranges.Subtract(buffer_start + copy.dstOffset, copy.size);
+                const VAddr at = buffer_start + copy.dstOffset;
+                if (retire_cpu_uploads || gpu_modified_ranges.Intersects(at, copy.size)) {
+                    gpu_modified_ranges.Subtract(at, copy.size);
+                    retired = true;
+                }
             }
-            copy_memo_epoch.fetch_add(1, std::memory_order_acq_rel);
+            if (retired) {
+                copy_memo_epoch.fetch_add(1, std::memory_order_acq_rel);
+            }
         }
         TouchBuffer(buffer);
         buffer.PerfNoteWrite(); // the resync memo: guest data uploaded into it
+        for (const auto& copy : copies) {
+            NoteMotionWrite(buffer_start + copy.dstOffset, copy.size);
+        }
     }
     if (is_written) {
         // Bound for writing (a shader, a copy, a fill): written from here (a shader's writes come
         // with its draw: no memo is kept for this buffer during this draw's bindings).
         buffer.PerfNoteWriteBound();
+        NoteMotionWrite(device_addr, size);
     }
     if (is_texel_buffer && !is_written) {
         return SynchronizeBufferFromImage(buffer, device_addr, size);
@@ -1824,41 +2677,27 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     return false;
 }
 
-vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-                                     size_t total_size_bytes, bool async_upload) {
+std::optional<UploadStagingPool::Allocation> BufferCache::UploadCopies(
+    Buffer& buffer, std::span<vk::BufferCopy> copies, size_t total_size_bytes, bool async_upload) {
     if (copies.empty()) {
-        return VK_NULL_HANDLE;
+        return {};
     }
-    // Never wait on recorder/GPU progress while holding async source-region locks.
-    const auto [staging, offset] = staging_buffer.Map(total_size_bytes, 0, !async_upload);
-    if (staging) {
-        for (auto& copy : copies) {
-            u8* const src_pointer = staging + copy.srcOffset;
-            const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
-            if (async_upload)
-                memory->QueueSparseMemory(device_addr, src_pointer, copy.size);
-            else
-                memory->CopySparseMemory(device_addr, src_pointer, copy.size);
-            // Apply the staging offset
-            copy.srcOffset += offset;
+    const auto staging = staging_pool.Request(total_size_bytes);
+    // Eligibility and source protection still come from MemoryTracker. Select
+    // coherence per allocation, since the pool may span different memory types.
+    async_upload &= staging.buffer->is_coherent;
+    for (auto& copy : copies) {
+        u8* const destination = staging.data + copy.srcOffset;
+        const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
+        if (async_upload) {
+            memory->QueueSparseMemory(device_addr, destination, copy.size);
+        } else {
+            memory->CopySparseMemory(device_addr, destination, copy.size);
         }
-        staging_buffer.Commit();
-        return staging_buffer.Handle();
-    } else {
-        // For large one time transfers use a temporary host buffer.
-        auto temp_buffer =
-            std::make_unique<Buffer>(instance, scheduler, MemoryUsage::Upload, 0,
-                                     vk::BufferUsageFlagBits::eTransferSrc, total_size_bytes);
-        const vk::Buffer src_buffer = temp_buffer->Handle();
-        u8* const staging = temp_buffer->mapped_data.data();
-        for (const auto& copy : copies) {
-            u8* const src_pointer = staging + copy.srcOffset;
-            const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
-            memory->CopySparseMemory(device_addr, src_pointer, copy.size);
-        }
-        scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable { buffer.reset(); });
-        return src_buffer;
+        copy.srcOffset += staging.offset;
     }
+    staging.Flush();
+    return staging;
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size) {
@@ -1868,6 +2707,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
             static constexpr u32 ZmaskUncompressed = 0xf;
             buffer.image_data = true; // bit 33: no longer guest bytes there
             buffer.Fill(buffer.Offset(device_addr), size, ZmaskUncompressed);
+            NoteMotionWrite(device_addr, size);
             return true;
         } else {
             LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}", magic_enum::enum_name(*type));
@@ -1994,6 +2834,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
     }
     tile_manager.TileImage(image, buffer_copies, buffer.Handle(), buf_offset, copy_size);
     buffer.PerfNoteWrite(); // this resync wrote it
+    NoteMotionWrite(buffer.CpuAddr() + buf_offset, copy_size);
     count.resyncs.fetch_add(1, std::memory_order_relaxed);
     count.resync_bytes.fetch_add(copy_size, std::memory_order_relaxed);
     // The memo, unless a shader bound in this draw writes the image or the buffer (or reads raw
@@ -2101,6 +2942,7 @@ void BufferCache::CheckSkippedResync(Image& image, std::span<vk::BufferImageCopy
 }
 
 void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
+    MaterializeRetiles(device_addr, size, RetileRange);
     const VAddr device_addr_end = device_addr + size;
     ForEachBufferInRange(device_addr, size, [&](BufferId buffer_id, Buffer& buffer) {
         RENDERER_TRACE;
@@ -2118,23 +2960,14 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
         .dstOffset = buffer.Offset(address),
         .size = num_bytes,
     };
-    vk::Buffer src_buffer = staging_buffer.Handle();
-    if (num_bytes < StagingBufferSize) {
-        const auto [staging, offset] = staging_buffer.Map(num_bytes);
-        std::memcpy(staging, value, num_bytes);
-        copy.srcOffset = offset;
-        staging_buffer.Commit();
-    } else {
-        // For large one time transfers use a temporary host buffer.
-        // RenderDoc can lag quite a bit if the stream buffer is too large.
-        Buffer temp_buffer{
-            instance, scheduler, MemoryUsage::Upload, 0, vk::BufferUsageFlagBits::eTransferSrc,
-            num_bytes};
-        src_buffer = temp_buffer.Handle();
-        u8* const staging = temp_buffer.mapped_data.data();
-        std::memcpy(staging, value, num_bytes);
-        scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable {});
-    }
+    const auto staging = staging_pool.Request(num_bytes);
+    SCOPE_EXIT {
+        staging.Retire();
+    };
+    std::memcpy(staging.data, value, num_bytes);
+    copy.srcOffset = staging.offset;
+    staging.Flush();
+    const vk::Buffer src_buffer = staging.buffer->Handle();
     scheduler.EndRendering();
     ScratchProfile::Gpu scratch_gpu(scheduler,12);
     const auto cmdbuf = scheduler.Commands();
@@ -2168,6 +3001,7 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
         .pBufferMemoryBarriers = &post_barrier,
     });
     buffer.PerfNoteWrite();
+    NoteMotionWrite(address, num_bytes);
 }
 
 // The catch-all log of GPU-written bytes an upload replaced with the guest's (MemoryTracker::
@@ -2252,6 +3086,7 @@ void BufferCache::SettleGpuWrites() {
             LOG_INFO(Render_Vulkan, "VR draws: gpumem {:#x}+{}: {}", addr, size,
                      gpu ? "GPU-written, copied back" : "not GPU-written (guest memory as is)");
             if (gpu) {
+                MaterializeRetiles(addr, size, RetileDownload);
                 Buffer& buffer = slot_buffers[FindBuffer(addr, static_cast<u32>(size))];
                 DownloadBufferMemory<true>(buffer, addr, size);
             }
@@ -2286,6 +3121,7 @@ void BufferCache::SettleGpuWrites() {
         if (!IsRegionRegistered(addr, size) || !IsRegionGpuModified(addr, size)) {
             continue; // unmapped since, or already back (a readback, the GC)
         }
+        MaterializeRetiles(addr, size, RetileDownload);
         Buffer& buffer = slot_buffers[FindBuffer(addr, static_cast<u32>(size))];
         DownloadBufferMemory<true>(buffer, addr, size);
         copied += size;
@@ -2302,55 +3138,404 @@ void BufferCache::SettleGpuWrites() {
     }
 }
 
-void BufferCache::RunGarbageCollector() {
+// FAST_BUFFER_EVICT=0 turns the buffer cache's eviction off (read once).
+static const bool g_buffer_evict = [] {
+    const char* value = std::getenv("FAST_BUFFER_EVICT");
+    return !(value && value[0] == '0');
+}();
+
+void BufferCache::RunGarbageCollector(u64 transition_request) {
+    staging_pool.TickFrame();
     SCOPE_EXIT {
         ++gc_tick;
     };
     PollBufferGrowSwitch();
     SettleGpuWrites();
+    // VR_VRAM_REPORT: every 10 s, the cache's buffers (and their right-eye twins) by time since
+    // last lookup or bind (last_used_tick). Under pressure EvictIdleBuffers frees idle ones.
+    if (VramReport::Enabled()) {
+        static std::array<u64, 64> tick_at{}; // gc_tick at each second, by second % 64
+        const u64 second = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
+                                                std::chrono::steady_clock::now().time_since_epoch())
+                                                .count());
+        static u64 last_second = 0, reported_second = 0;
+        if (second != last_second) {
+            last_second = second;
+            tick_at[second % tick_at.size()] = gc_tick;
+        }
+        if (second >= reported_second + 10 && gc_tick > 0) {
+            reported_second = second;
+            const u64 t10 = tick_at[(second - 10) % tick_at.size()];
+            const u64 t60 = tick_at[(second - 60) % tick_at.size()];
+            std::array<std::pair<u64, u64>, 3> bytes{}; // age: <10 s, 10-60 s, >60 s (own, twin)
+            for (const auto& buffer : slot_buffers) {
+                if (buffer.is_deleted || !buffer.CpuAddr())
+                    continue;
+                const u64 tick = std::atomic_ref<u64>(const_cast<u64&>(buffer.last_used_tick))
+                                     .load(std::memory_order_relaxed);
+                const u32 age = tick >= t10 ? 0 : (t60 && tick < t60) ? 2 : 1;
+                bytes[age].first += buffer.SizeBytes();
+                if (NativeStereo::ExistingRight(buffer.Handle()))
+                    bytes[age].second += buffer.SizeBytes();
+            }
+            LOG_INFO(Render_Vulkan,
+                     "VR VRAM report: buffer cache by last use: <10 s {} MiB (+{} right-eye), "
+                     "10-60 s {} MiB (+{}), >60 s {} MiB (+{})",
+                     bytes[0].first >> 20, bytes[0].second >> 20, bytes[1].first >> 20,
+                     bytes[1].second >> 20, bytes[2].first >> 20, bytes[2].second >> 20);
+            if (sparse_pool.Enabled()) {
+                // The right-eye column above counts a sparse twin at its view's size; its memory
+                // is only its own blocks (the rest shares the left pieces): those are here.
+                LOG_INFO(Render_Vulkan,
+                         "VR VRAM report: sparse views: {} MiB in pieces ({} MiB of them the right "
+                         "eye's own), {} MiB of slabs",
+                         sparse_pool.ResidentBytes() >> 20, sparse_pool.PrivateBytes() >> 20,
+                         sparse_pool.SlabBytes() >> 20);
+            }
+            // The largest buffers idle over 10 s, with whether the GPU wrote them.
+            std::vector<std::tuple<u64, VAddr, bool, bool>> idle; // size, address, twin, gpu
+            for (const auto& buffer : slot_buffers) {
+                if (buffer.is_deleted || !buffer.CpuAddr() || buffer.SizeBytes() < (4u << 20))
+                    continue;
+                const u64 tick = std::atomic_ref<u64>(const_cast<u64&>(buffer.last_used_tick))
+                                     .load(std::memory_order_relaxed);
+                if (tick < t10)
+                    idle.emplace_back(buffer.SizeBytes(), buffer.CpuAddr(),
+                                      bool(NativeStereo::ExistingRight(buffer.Handle())),
+                                      gpu_modified_ranges.Intersects(buffer.CpuAddr(),
+                                                                     buffer.SizeBytes()));
+            }
+            std::ranges::sort(idle, std::greater{});
+            std::string list;
+            for (size_t i = 0; i < std::min<size_t>(idle.size(), 12); ++i) {
+                const auto& [size, address, twin, gpu] = idle[i];
+                list += fmt::format(" {:#x}+{}MiB{}{}", address, size >> 20, twin ? " twin" : "",
+                                    gpu ? " gpu" : "");
+            }
+            LOG_INFO(Render_Vulkan, "VR VRAM report: buffers idle over 10 s, largest:{}", list);
+        }
+    }
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
+    }
+    const u64 second = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch())
+                                            .count());
+    gc_seconds.Record(second, gc_tick);
+    if (sparse_pool.Enabled()) {
+        // Slabs no view binds any more go back to the driver after a while (SparsePool).
+        sparse_pool.Collect(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 std::chrono::steady_clock::now().time_since_epoch())
+                                                 .count()));
+    }
+    // A load: the marks follow Windows' budget for the game now (ReviseMemoryMarks), once per
+    // request, as the texture cache's.
+    if (const u64 sequence = transition_request >> 1; sequence != revised_sequence) {
+        revised_sequence = sequence;
+        ReviseMemoryMarks();
+    } else if (live_budget.Due(second)) {
+        ReviseMemoryMarks(true); // during play too (TextureMemory::LiveBudget)
+    }
+    // A warp, a death or a new map: the textures' rule (four passes 2 s apart, under pressure or
+    // after a confirmed map change) and their cutoff, the tick of the request: what the area left
+    // behind used and the new one has not touched since.
+    if (g_buffer_evict && !DmaTable::allocated.load(std::memory_order_relaxed)) {
+        if (const auto cutoff = transition_cleanup.Step(second, transition_request, gc_tick, [&] {
+                return total_used_memory >= trigger_gc_memory;
+            })) {
+            evict_second = second; // this second's pass
+            EvictUnusedSince(*cutoff, BufferEviction::MaxPerTransitionPass,
+                             BufferEviction::MaxBytesPerTransitionPass, true);
+        }
     }
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
-    const bool aggressive = total_used_memory >= critical_gc_memory;
-    const u64 ticks_to_destroy = std::min<u64>(aggressive ? 80 : 160, gc_tick);
-    int max_deletions = aggressive ? 64 : 32;
-    const auto clean_up = [&](BufferId buffer_id) {
-        if (max_deletions == 0) {
-            return;
-        }
-        --max_deletions;
-        Buffer& buffer = slot_buffers[buffer_id];
-        // The catch-all log (off for performance):
-        // if (gpu_modified_ranges.Intersects(buffer.CpuAddr(), buffer.SizeBytes())) {
-        //     static std::atomic<u64> logs{0};
-        //     const u64 n = logs.fetch_add(1, std::memory_order_relaxed);
-        //     if (n < 64 || (n & 255) == 0) {
-        //         LOG_INFO(Render_Vulkan,
-        //                  "FAST_GPU_PAGE_KEEP: GC evicts a buffer with GPU-written bytes at "
-        //                  "{:#x}..{:#x} (downloaded, written back later; {} so far)",
-        //                  buffer.CpuAddr(), buffer.CpuAddr() + buffer.SizeBytes(), n + 1);
-        //     }
-        // }
-        // InvalidateMemory(buffer.CpuAddr(), buffer.SizeBytes());
-        DownloadBufferMemory<true>(buffer, buffer.CpuAddr(), buffer.SizeBytes());
-        memory_tracker->MarkRegionAsCpuModified(buffer.CpuAddr(), buffer.SizeBytes());
-        // Its GPU copy goes: a buffer made there later uploads whole (FAST_GPU_PAGE_KEEP).
-        memory_tracker->ForgetKept(buffer.CpuAddr(), buffer.SizeBytes());
-        DeleteBuffer(buffer_id);
+    // Over the critical mark the 5 s rule, never resting: a rest let memory climb over the budget
+    // while travelling (TextureMemory::CriticalBackoff), and a buffer unused 5 s is rarely needed
+    // the next moment, unlike a texture briefly off screen.
+    EvictIdleBuffers(total_used_memory >= critical_gc_memory, second);
+}
+
+
+// FAST_BUFFER_EVICT_VERIFY=1 (a test): each evicted buffer's bytes against the game's, where the
+// tracker calls the game's page unchanged since the upload (a page the CPU wrote since differs
+// rightly). A difference there means the eviction loses bytes only the buffer had.
+static const bool g_buffer_evict_verify = [] {
+    const char* value = std::getenv("FAST_BUFFER_EVICT_VERIFY");
+    return value && value[0] == '1';
+}();
+
+void BufferCache::VerifyEviction(Buffer& buffer) {
+    const VAddr address = buffer.CpuAddr();
+    const u64 bytes = buffer.SizeBytes();
+    if (bytes > 64_MB) {
+        return;
+    }
+    static constexpr u64 Page = 4_KB;
+    std::vector<u8> guest(bytes), cpu_modified(Common::DivCeil(bytes, Page));
+    memory->CopySparseMemory(address, guest.data(), bytes);
+    for (u64 i = 0; i < cpu_modified.size(); ++i) {
+        cpu_modified[i] = memory_tracker->IsRegionCpuModified(address + i * Page,
+                                                              std::min(Page, bytes - i * Page));
+    }
+    auto readback = std::make_shared<Buffer>(instance, scheduler, MemoryUsage::Download, 0,
+                                             vk::BufferUsageFlagBits::eTransferDst, bytes);
+    const vk::MemoryBarrier2 to_transfer{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
     };
+    const vk::MemoryBarrier2 to_host{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    scheduler.EndRendering(); // verification only
+    const auto cmdbuf = scheduler.Commands();
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                               .pMemoryBarriers = &to_transfer});
+    cmdbuf.copyBuffer(buffer.Handle(), readback->Handle(), vk::BufferCopy{0, 0, bytes});
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                               .pMemoryBarriers = &to_host});
+    const u64 serial = buffer.perf_serial;
+    scheduler.DeferOperation([readback, guest = std::move(guest),
+                              cpu_modified = std::move(cpu_modified), address, bytes, serial] {
+        static std::atomic<u64> checked{0}, bad{0};
+        ++checked;
+        u64 clean_bad = 0, dirty_bad = 0, first = ~u64{0};
+        for (u64 i = 0; i < cpu_modified.size(); ++i) {
+            const u64 begin = i * Page, size = std::min(Page, bytes - begin);
+            if (std::memcmp(guest.data() + begin, readback->mapped_data.data() + begin, size) ==
+                0) {
+                continue;
+            }
+            if (cpu_modified[i]) {
+                ++dirty_bad;
+            } else {
+                ++clean_bad;
+                first = std::min(first, begin);
+            }
+        }
+        if (clean_bad) {
+            ++bad;
+            LOG_WARNING(Render_Vulkan,
+                        "Buffer evict verify: {:#x}+{:#x} (serial {}) differs on {} unchanged "
+                        "pages (first +{:#x}), {} CPU-written; {} of {} evictions bad",
+                        address, bytes, serial, clean_bad, first, dirty_bad, bad.load(),
+                        checked.load());
+        } else if ((checked & 63) == 0) {
+            LOG_INFO(Render_Vulkan, "Buffer evict verify: {} evictions checked, {} bad",
+                     checked.load(), bad.load());
+        }
+    });
+}
+
+void BufferCache::SetMemoryMarks(s64 budget) {
+    const s64 min_spacing_expected = budget - 1_GB;
+    const s64 mem_threshold = std::min<s64>(budget, TARGET_GC_THRESHOLD);
+    const s64 min_vacancy_expected = (6 * mem_threshold) / 10;
+    trigger_gc_memory = static_cast<u64>(std::max<u64>(
+        std::min(budget - min_vacancy_expected, min_spacing_expected), DEFAULT_TRIGGER_GC_MEMORY));
+    // Within a small margin of the budget, as the textures' (TextureMemory::CriticalMark).
+    critical_gc_memory = static_cast<u64>(
+        TextureMemory::CriticalMark(budget, static_cast<s64>(trigger_gc_memory)));
+    marks_budget = budget;
+}
+
+void BufferCache::ReviseMemoryMarks(bool live) {
+    if (start_budget <= 0) {
+        return;
+    }
+    const auto now = instance.QueryMemoryBudget();
+    auto revised = TextureMemory::RevisedBudget(marks_budget, start_budget,
+                                                static_cast<s64>(now.budget),
+                                                static_cast<s64>(instance.GetDeviceLocalCap()));
+    if (live) {
+        revised = live_budget.Confirm(revised);
+        // Windows moving the game's memory to system memory counts, whatever its budget reads.
+        // Once per new Windows reading. None (the counters unavailable or stale) or the same one
+        // again: the watch keeps its state, holding the marks while active, counting nothing.
+        auto spill = TextureMemory::SpillWatch::Answer{spill_watch.Active(), std::nullopt};
+        if (now.residency_sample != 0 && now.residency_sample != spill_sample) {
+            spill_sample = now.residency_sample;
+            spill = spill_watch.Step(static_cast<s64>(now.usage), static_cast<s64>(now.spilled),
+                                     marks_budget);
+        }
+        if (Common::Log::Enabled && ++spill_readings % 15 == 0) {
+            LOG_INFO(Render_Vulkan, "{}: residency: Vulkan's VRAM use {} MiB, resident {} MiB, "
+                     "system memory {} MiB (its own {} MiB): spilled {} MiB",
+                     "Buffer cache", now.usage >> 20, now.resident >> 20, now.non_local >> 20,
+                     now.host >> 20, now.spilled >> 20);
+        }
+        if (spill.hold) {
+            revised = spill.budget;
+            if (spill.budget) {
+                LOG_WARNING(Render_Vulkan,
+                            "{}: Windows keeps {} MiB of the game's {} MiB in VRAM (the rest is "
+                            "in system memory) while its budget reads {} MiB: the marks drop to "
+                            "{} MiB",
+                            "Buffer cache", now.resident >> 20, now.usage >> 20, now.budget >> 20,
+                            *spill.budget >> 20);
+            }
+        } else if (spill_was_active) {
+            LOG_INFO(Render_Vulkan, "{}: the game is all in VRAM again: Windows' budget sets "
+                     "the marks again", "Buffer cache");
+        }
+        spill_was_active = spill_watch.Active();
+    }
+    if (!revised) {
+        return;
+    }
+    const s64 before = marks_budget;
+    SetMemoryMarks(*revised);
+    LOG_INFO(Render_Vulkan,
+             "Buffer cache: {} Windows' budget for the game is {} MiB (its use {} MiB): "
+             "the marks follow it, {} -> {} MiB (eviction under pressure from {} MiB, critical "
+             "from {} MiB)",
+             live ? "during play" : "at a load", now.budget >> 20, now.usage >> 20, before >> 20, *revised >> 20,
+             trigger_gc_memory >> 20, critical_gc_memory >> 20);
+}
+
+void BufferCache::EvictIdleBuffers(bool critical, u64 second) {
+    // DMA: shaders reach buffers through the address table, bound or not; no idle age tells.
+    if (!g_buffer_evict || second == evict_second ||
+        DmaTable::allocated.load(std::memory_order_relaxed)) {
+        return;
+    }
+    evict_second = second;
+    // Uses before the start of the second IdleSeconds back (0: not running that long yet).
+    const u64 cutoff = gc_seconds.Before(second, BufferEviction::IdleSeconds(critical));
+    if (cutoff == 0) {
+        return;
+    }
+    EvictUnusedSince(cutoff, critical ? BufferEviction::MaxPerCriticalPass : BufferEviction::MaxPerPass,
+                     critical ? BufferEviction::MaxBytesPerPass * 4 : BufferEviction::MaxBytesPerPass,
+                     false);
+}
+
+void BufferCache::EvictUnusedSince(u64 cutoff, std::size_t max_count, u64 max_bytes,
+                                   bool transition) {
+    const u64 second = evict_second;
+    std::vector<BufferEviction::Candidate> candidates;
+    for (u32 index = 0; index < slot_buffers.capacity(); ++index) {
+        const BufferId id{index};
+        if (!slot_buffers.is_allocated(id)) {
+            continue;
+        }
+        const Buffer* const buffer = &slot_buffers[id];
+        if (buffer->is_deleted || !buffer->CpuAddr()) {
+            continue;
+        }
+        const u64 tick = std::atomic_ref<u64>(const_cast<u64&>(buffer->last_used_tick))
+                             .load(std::memory_order_relaxed);
+        if (tick >= cutoff || buffer->image_data) {
+            continue; // the cheap tests first; the GPU and twin tests for the idle ones only
+        }
+        const VAddr address = buffer->CpuAddr();
+        const u64 bytes = buffer->SizeBytes();
+        candidates.push_back({
+            .id = index,
+            .bytes = bytes,
+            .last_used_tick = tick,
+            .gpu_written = gpu_modified_ranges.Intersects(address, bytes) ||
+                           memory_tracker->IsRegionGpuModified(address, bytes),
+            .twin = bool(NativeStereo::ExistingRight(buffer->Handle())),
+            .image_data = buffer->image_data,
+        });
+    }
+    // Idle buffers that keep a right-eye twin: the twin alone goes, the biggest first within the
+    // same bounds (a twin is half of a per-eye buffer's memory; the 2026-10-26 soak's twins grew
+    // 72 -> 872 MiB). A GPU-written buffer's twin only after a transition (TwinReleasable).
+    std::vector<BufferEviction::Candidate> twins;
+    for (const auto& c : candidates) {
+        if (BufferEviction::TwinReleasable(c, cutoff, transition)) {
+            twins.push_back({.id = c.id, .bytes = c.bytes, .last_used_tick = c.last_used_tick});
+        }
+    }
+    auto twin_victims = BufferEviction::Pick(std::move(twins), cutoff, max_count, max_bytes);
+    // Each release makes the binding memos rebuild once (a new stereo buffer generation): an idle
+    // pass frees twins only in a batch worth it; after a transition the load hides it.
+    u64 twin_bytes = 0;
+    for (const u32 index : twin_victims) {
+        twin_bytes += slot_buffers[BufferId{index}].SizeBytes();
+    }
+    if (!transition && twin_bytes < BufferEviction::MinTwinBytesPerIdlePass) {
+        twin_victims.clear();
+    }
+    for (const u32 index : twin_victims) {
+        const u64 freed = NativeStereo::ReleaseRight(scheduler, slot_buffers[BufferId{index}].Handle());
+        if (freed) {
+            ++released_twins;
+            released_twin_bytes += freed;
+        }
+    }
+    const auto victims =
+        BufferEviction::Pick(std::move(candidates), cutoff, max_count, max_bytes);
+    for (const u32 index : victims) {
+        const BufferId buffer_id{index};
+        Buffer& buffer = slot_buffers[buffer_id];
+        const VAddr address = buffer.CpuAddr();
+        const u64 bytes = buffer.SizeBytes();
+        if (g_buffer_evict_verify) {
+            VerifyEviction(buffer);
+        }
+        // The game's memory holds every byte (no GPU write): a buffer made here later uploads
+        // them (the tracker's pages CPU-modified), as for a page never cached.
+        memory_tracker->MarkRegionAsCpuModified(address, bytes);
+        memory_tracker->ForgetKept(address, bytes);
+        DeleteBuffer(buffer_id);
+        ++evicted_buffers;
+        evicted_bytes += bytes;
+    }
+    if ((!victims.empty() || !twin_victims.empty()) &&
+        (transition || second >= evict_logged_second + 10)) {
+        evict_logged_second = second;
+        LOG_INFO(Render_Vulkan,
+                 "Buffer cache: evicted {} buffers ({} MiB) and {} right-eye twins ({} MiB) so "
+                 "far{}; VRAM {} MiB of {} (pressure {} MiB)",
+                 evicted_buffers, evicted_bytes >> 20, released_twins, released_twin_bytes >> 20,
+                 transition ? ", this pass after a transition" : "", total_used_memory >> 20,
+                 marks_budget >> 20, trigger_gc_memory >> 20);
+    }
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
     lru_cache.Touch(buffer.LRUId(), gc_tick);
 }
 
+// FAST_BACKGROUND_FREE ('1' on, off by default; read once at start-up. 2026-10-24: no hitch
+// it removes measured yet, ~2-3% fps at the sewers spot): a deleted buffer's memory is freed
+// on the scheduler's background thread (every cache buffer has a dedicated allocation: a ~1 ms
+// vkFreeMemory each, which the sewers' streaming did hundreds of times in one frame, 2026-10-24).
+// The slot and the native stereo entry are still released on the recording thread.
+static const bool g_background_free = [] {
+    const char* value = std::getenv("FAST_BACKGROUND_FREE");
+    return value && value[0] == '1';
+}();
+
 void BufferCache::DeleteBuffer(BufferId buffer_id) {
     Buffer& buffer = slot_buffers[buffer_id];
     Unregister(buffer_id);
-    scheduler.DeferOperation([this, buffer_id] { slot_buffers.erase(buffer_id); });
+    // A sparse view's pieces lose its reference once the GPU is done with it (SparsePool).
+    const bool view = buffer.sparse_view;
+    const VAddr view_begin = buffer.CpuAddr();
+    scheduler.DeferOperation([this, buffer_id, view, view_begin,
+                              view_pieces = std::move(buffer.sparse_pieces)] {
+        if (g_background_free || FastRender::On(FastRender::BackgroundFree)) {
+            const auto released = slot_buffers[buffer_id].buffer.Release();
+            if (released.buffer) {
+                scheduler.DeferPriorityOperation(
+                    [released] { UniqueBuffer::DestroyReleased(released); });
+            }
+        }
+        slot_buffers.erase(buffer_id);
+        if (view) {
+            sparse_pool.ReleaseView(view_begin, view_pieces);
+        }
+    });
     buffer.is_deleted = true;
 }
 

@@ -194,7 +194,18 @@ void VrPageLayer::Shutdown() {
         if (staging) {
             vmaDestroyBuffer(dev.allocator, static_cast<VkBuffer>(staging), staging_allocation);
         }
+        for (auto& b : bake) {
+            if (b.view) {
+                dev.device.destroyImageView(b.view);
+            }
+            if (b.image) {
+                vmaDestroyImage(dev.allocator, static_cast<VkImage>(b.image), b.allocation);
+            }
+        }
     }
+    bake = {};
+    bake_made = bake_failed = bake_missed = false;
+    bake_current = bake_written = -1;
     if (swapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(swapchain);
     }
@@ -248,7 +259,7 @@ bool VrPageLayer::Stage(const u8* page_rgba, const u8* glow_rgba) {
     return true;
 }
 
-bool VrPageLayer::Upload() {
+bool VrPageLayer::Upload(u64 revision, const std::function<bool(u32)>& writable) {
     if (!initialized || failed || !staged) {
         return false;
     }
@@ -355,6 +366,9 @@ bool VrPageLayer::Upload() {
     cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                         vk::PipelineStageFlagBits::eColorAttachmentOutput, {}, {}, {},
                         vk::ArrayProxy<const vk::ImageMemoryBarrier>(mips, to_color.data()));
+    if (writable) {
+        PlaceBake(revision, writable); // the same images into a bake image, in this submission
+    }
     if (cmd.end() != vk::Result::eSuccess) {
         return Fail("command buffer end");
     }
@@ -377,6 +391,210 @@ bool VrPageLayer::Upload() {
     has_image = true;
     ++uploads;
     return true;
+}
+
+bool VrPageLayer::MakeBake() {
+    bake_made = true; // one attempt per session
+    constexpr vk::FormatFeatureFlags blit_features =
+        vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eBlitDst |
+        vk::FormatFeatureFlagBits::eSampledImageFilterLinear;
+    const bool blits =
+        dev.physical_device &&
+        (dev.physical_device.getFormatProperties(format).optimalTilingFeatures & blit_features) ==
+            blit_features;
+    // The second level whatever the runtime's swapchain mips: sampled 1.2-2x minified (header).
+    bake_mips = blits && height % 2 == 0 ? 2 : 1;
+    for (auto& b : bake) {
+        const VkImageCreateInfo info{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = static_cast<VkFormat>(format),
+            .extent = {width, 2 * height, 1},
+            .mipLevels = bake_mips,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                     VK_IMAGE_USAGE_SAMPLED_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        VmaAllocationCreateInfo alloc{};
+        alloc.usage = VMA_MEMORY_USAGE_AUTO;
+        VkImage image{};
+        if (const VkResult r =
+                vmaCreateImage(dev.allocator, &info, &alloc, &image, &b.allocation, nullptr);
+            r != VK_SUCCESS) {
+            bake_failed = true;
+            LOG_WARNING(Render_Vulkan, "VR page layer: no bake image ({}); the page stays a layer",
+                        static_cast<s32>(r));
+            return false;
+        }
+        b.image = vk::Image{image};
+        auto [view_result, view] = dev.device.createImageView({
+            .image = b.image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = format,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, bake_mips, 0, 1},
+        });
+        if (view_result != vk::Result::eSuccess) {
+            bake_failed = true;
+            LOG_WARNING(Render_Vulkan, "VR page layer: no bake image view; the page stays a layer");
+            return false;
+        }
+        b.view = view;
+    }
+    LOG_INFO(Render_Vulkan,
+             "VR page layer: {} bake images {}x{} ({} mip level{}): the page drawn into the eyes",
+             BakeImages, width, 2 * height, bake_mips, bake_mips > 1 ? "s" : "");
+    return true;
+}
+
+void VrPageLayer::RecordBake(u32 target) {
+    const vk::Image image = bake[target].image;
+    const auto level = [](u32 mip) {
+        return vk::ImageSubresourceRange{vk::ImageAspectFlagBits::eColor, mip, 1, 0, 1};
+    };
+    // Its last bake read it (writable: that submission finished): fully overwritten.
+    const vk::ImageMemoryBarrier to_dst{
+        .srcAccessMask = {},
+        .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eTransferDstOptimal,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, bake_mips, 0, 1},
+    };
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer,
+                        {}, {}, {}, to_dst);
+    const vk::BufferImageCopy copy{
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {width, 2 * height, 1},
+    };
+    cmd.copyBufferToImage(staging, image, vk::ImageLayout::eTransferDstOptimal, copy);
+    std::array<vk::ImageMemoryBarrier, 2> to_read{};
+    for (u32 mip = 0; mip < 2; ++mip) {
+        to_read[mip] = vk::ImageMemoryBarrier{
+            .srcAccessMask = mip == 0 && bake_mips > 1 ? vk::AccessFlagBits::eTransferRead
+                                                       : vk::AccessFlagBits::eTransferWrite,
+            .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+            .oldLayout = mip == 0 && bake_mips > 1 ? vk::ImageLayout::eTransferSrcOptimal
+                                                   : vk::ImageLayout::eTransferDstOptimal,
+            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image,
+            .subresourceRange = level(mip),
+        };
+    }
+    if (bake_mips > 1) {
+        const vk::ImageMemoryBarrier to_src{
+            .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+            .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+            .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image,
+            .subresourceRange = level(0),
+        };
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                            vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, to_src);
+        const vk::ImageBlit blit{
+            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                     vk::Offset3D{static_cast<s32>(width),
+                                                  static_cast<s32>(2 * height), 1}},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 1, 0, 1},
+            .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                     vk::Offset3D{static_cast<s32>(std::max(width / 2, 1u)),
+                                                  static_cast<s32>(height), 1}},
+        };
+        cmd.blitImage(image, vk::ImageLayout::eTransferSrcOptimal, image,
+                      vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
+    }
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                        vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {},
+                        vk::ArrayProxy<const vk::ImageMemoryBarrier>(bake_mips, to_read.data()));
+}
+
+void VrPageLayer::PlaceBake(u64 revision, const std::function<bool(u32)>& writable) {
+    if (bake_failed || (!bake_made && !MakeBake())) {
+        return;
+    }
+    (void)BakeCurrent(); // the previous copy, if its fence was seen, becomes current first
+    for (u32 i = 0; i < BakeImages; ++i) {
+        if (static_cast<s32>(i) == bake_current || static_cast<s32>(i) == bake_written ||
+            !writable(i)) {
+            continue;
+        }
+        RecordBake(i);
+        bake_written = static_cast<s32>(i);
+        bake_written_revision = revision;
+        bake_missed = false;
+        return;
+    }
+    bake_missed = true; // every other one still sampled by a bake in flight: next frame
+    bake_missed_revision = revision;
+}
+
+bool VrPageLayer::RetryBake(const std::function<bool(u32)>& writable) {
+    if (!initialized || failed || !bake_missed) {
+        return false;
+    }
+    if (staged) {
+        bake_missed = false; // newer images staged: their upload bakes them
+        return false;
+    }
+    if (pending) {
+        const vk::Result status = dev.device.getFenceStatus(fence);
+        if (status == vk::Result::eNotReady) {
+            return false;
+        }
+        if (status != vk::Result::eSuccess) {
+            VrDeviceLost::Note(status, "the VR page's fence");
+            return Fail(fmt::format("fence status {}", vk::to_string(status)));
+        }
+        pending = false;
+    }
+    (void)BakeCurrent();
+    if (cmd.reset() != vk::Result::eSuccess ||
+        cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}) !=
+            vk::Result::eSuccess) {
+        return Fail("command buffer begin");
+    }
+    PlaceBake(bake_missed_revision, writable);
+    if (cmd.end() != vk::Result::eSuccess) {
+        return Fail("command buffer end");
+    }
+    if (bake_written < 0) {
+        return false; // still none free: nothing recorded, nothing submitted
+    }
+    if (dev.device.resetFences(fence) != vk::Result::eSuccess) {
+        return Fail("fence reset");
+    }
+    const vk::SubmitInfo submit{.commandBufferCount = 1, .pCommandBuffers = &cmd};
+    if (const vk::Result r = dev.queue.submit(submit, fence); r != vk::Result::eSuccess) {
+        VrDeviceLost::Note(r, "the VR page's bake copy");
+        return Fail(fmt::format("queue submit: {}", vk::to_string(r)));
+    }
+    pending = true;
+    return true;
+}
+
+s32 VrPageLayer::BakeCurrent() {
+    if (bake_written >= 0 &&
+        (!pending || dev.device.getFenceStatus(fence) == vk::Result::eSuccess)) {
+        bake_current = bake_written;
+        bake_revision = bake_written_revision;
+        bake_written = -1;
+    }
+    return bake_current;
 }
 
 } // namespace Vulkan

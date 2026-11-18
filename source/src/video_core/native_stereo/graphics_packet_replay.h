@@ -5,7 +5,7 @@
 // You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
-// Scratch speculative scanner: register effects only; never execute guest writes or waits.
+// Speculative scanner: register effects only; never execute guest writes or waits.
 #pragma once
 #include "video_core/amdgpu/regs.h"
 #include "video_core/amdgpu/pm4_cmds.h"

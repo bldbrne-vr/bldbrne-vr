@@ -337,6 +337,7 @@ constexpr float PickupCapS = 5.0f;
 // 22 -> L1, 26 -> the dodges, 31 -> items, 32 -> switches and 0x800000).
 constexpr std::uint64_t AllowRightAttack = 0x3; // R1, R2
 constexpr std::uint64_t AllowLeftAttack = 0x8;  // L2
+constexpr std::uint64_t AllowItems = 0x1C0;     // event 31 (0x1A22CE1: |= 0x1C0): an item use
 // A cancel window counts this long after the clip started at the earliest (the first frame of a
 // clip may still carry the last clip's requests); the earliest real ones open at 0.23 s.
 constexpr std::int64_t CancelMinNs = 100 * AnimMillis;
@@ -465,7 +466,19 @@ struct GateOut {
     // attack window (the dodge plays on; the attack ends its i-frames, dodge_attack_iframes=0).
     // attack_ok stays the game's window (items, the crank and the transform still wait for it).
     bool dodge_attack{false};
+    // The game would take an item use now: no held clip (idle, locomotion, a clip handed back) nor
+    // weapon switch, or its item window (AllowItems, TAE JumpTable 31) is open, CancelMinNs after
+    // it started; never through a visceral or grab, an event animation, a ladder or death. A hunter
+    // tool used with no animation (quick_tool_direct) waits for it, as the game's own use would:
+    // not mid-attack, mid-roll or in a stagger. A held clip without the cancel signal: closed.
+    bool items_ok{true};
 };
+
+// The native blood-bullet clip may allow a vial before attacks/movement. This
+// exception is presentation/item access only; the animation still owns combat.
+constexpr bool BloodBulletVialWindow(const GateOut& g) {
+    return g.held && g.owner_id == 100141 && g.reason == GateReason::Anim && g.items_ok;
+}
 
 // A clip of the ring, so its later frames can be told from a new start: the same id that does not
 // start at 0 is the same clip playing on.
@@ -505,6 +518,11 @@ public:
         out.owner_id = owner_id;
         out.owner_age_ns = owner_id >= 0 ? now - clip_start : 0;
         out.hold_ns = hold;
+        // (A weapon switch keeps your arms but is a move of its own: its item window too.)
+        const bool moving = held || switching;
+        const std::int64_t since = held ? now - clip_start : now - switch_start;
+        out.items_ok =
+            !moving || (s.cancel_valid && since >= CancelMinNs && (s.allow & AllowItems) != 0);
 
         if (s.anim_gate && held) {
             const AnimPolicy p = PolicyOf(owner);
@@ -534,6 +552,7 @@ public:
             out.reason = reason;
             out.kept = false;
             out.dodge_attack = false;
+            out.items_ok = false;
         };
         // A pickup sets the event flag too, but your hand is already at the item.
         if (s.event_valid && s.event && now >= pickup_until) {
@@ -565,9 +584,14 @@ public:
             out.kept = false;
             out.dodge_attack = false;
             out.attack_ok = {!switching, !switching};
+            out.items_ok = !s.cancel_valid || (s.allow & AllowItems) != 0;
         }
         if (s.hp_valid && s.hp <= 0) {
             take_both(GateReason::Dead);
+        }
+        if (BloodBulletVialWindow(out)) {
+            out.ik[0] = true; // left hand can reach its vial; right arm/torso keep their policy
+            out.attack_ok[0] = cancelled[0]; // item permission is not L2/punch permission
         }
         out.changed = !have_last || out.ik != last_ik || out.torso != last_torso ||
                       out.reason != last_reason || out.kept != last_kept ||

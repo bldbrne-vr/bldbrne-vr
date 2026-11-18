@@ -1,0 +1,95 @@
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// VR canted eyes (renderer_vulkan/vr_eye_cant.cpp; core/vr/eye_cant.h): a canted display's eye
+// (Pimax) is turned outward from the head, but the game renders parallel eyes, each covering the
+// turned eye's whole view. Each finished parallel eye is turned into its own view (the late
+// warp's last pass, or the game-rate pair's copy into the headset): per pixel of the turned eye
+// (its located FOV) the ray, turned into the parallel eye (pc.m: eye -> head), and the parallel
+// image's colour there. A pure turn about the eye's own
+// centre, so every depth lands exactly (no parallax). Catmull-Rom on the stored bytes (the eyes
+// hold sRGB-encoded values, as the eye upscale filters them) without its four corner taps (their
+// weights are at most 1/256: 12 loads, not 16, renormalized), clamped to the bilinear footprint
+// (no ringing); outside the parallel image: black.
+//   src_img: both parallel eyes side by side (`eyes`), this eye at pc.src (x, y, w, h).
+//   dst_img: both turned eyes side by side, this eye at pc.dst.
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba8) uniform readonly image2D src_img;
+layout(binding = 1, rgba8) uniform writeonly image2D dst_img;
+
+layout(push_constant) uniform CantPush {
+    vec4 m0; // the eye -> head turn, rows (xyz)
+    vec4 m1;
+    vec4 m2;
+    vec4 dst_tan; // the turned eye's FOV tangents: left, right, up, down
+    vec4 src_tan; // the parallel eye's
+    ivec4 dst;    // this eye in dst_img: x, y, w, h
+    ivec4 src;    // this eye in src_img: x, y, w, h
+} pc;
+
+vec4 Texel(ivec2 i) {
+    return imageLoad(src_img, pc.src.xy + clamp(i, ivec2(0), pc.src.zw - 1));
+}
+
+vec4 CatmullRomWeights(float f) {
+    return vec4(((-0.5 * f + 1.0) * f - 0.5) * f, (1.5 * f - 2.5) * f * f + 1.0,
+                ((-1.5 * f + 2.0) * f + 0.5) * f, (0.5 * f - 0.5) * f * f);
+}
+
+// The parallel eye's colour at q (texel coordinates, texel centres at integers).
+vec4 Sample(vec2 q) {
+    const vec2 b = floor(q);
+    const vec2 f = q - b;
+    const ivec2 i = ivec2(b);
+    const vec4 wx = CatmullRomWeights(f.x);
+    const vec4 wy = CatmullRomWeights(f.y);
+    vec4 acc = vec4(0.0);
+    float sum = 0.0;
+    vec4 lo = vec4(1.0);
+    vec4 hi = vec4(0.0);
+    for (int dy = -1; dy <= 2; ++dy) {
+        for (int dx = -1; dx <= 2; ++dx) {
+            const bool corner = (dx == -1 || dx == 2) && (dy == -1 || dy == 2);
+            if (corner) {
+                continue;
+            }
+            const vec4 c = Texel(i + ivec2(dx, dy));
+            const float w = wx[dx + 1] * wy[dy + 1];
+            acc += w * c;
+            sum += w;
+            if (dx >= 0 && dx <= 1 && dy >= 0 && dy <= 1) {
+                lo = min(lo, c);
+                hi = max(hi, c);
+            }
+        }
+    }
+    return clamp(acc / sum, lo, hi);
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.dst.z || p.y >= pc.dst.w) {
+        return;
+    }
+    // The turned eye's ray through this pixel (its own frame: x right, y up, -z forward) ...
+    const vec2 uv = (vec2(p) + 0.5) / vec2(pc.dst.zw);
+    const vec3 ray = vec3(mix(pc.dst_tan.x, pc.dst_tan.y, uv.x), mix(pc.dst_tan.z, pc.dst_tan.w, uv.y),
+                          -1.0);
+    // ... in the parallel eye's (the head's) frame.
+    const vec3 d = vec3(dot(pc.m0.xyz, ray), dot(pc.m1.xyz, ray), dot(pc.m2.xyz, ray));
+    vec4 colour = vec4(0.0, 0.0, 0.0, 1.0);
+    if (d.z < -1e-4) {
+        const vec2 t = d.xy / -d.z;
+        const vec2 s = vec2((t.x - pc.src_tan.x) / (pc.src_tan.y - pc.src_tan.x),
+                            (pc.src_tan.z - t.y) / (pc.src_tan.z - pc.src_tan.w));
+        if (all(greaterThanEqual(s, vec2(0.0))) && all(lessThanEqual(s, vec2(1.0)))) {
+            colour = vec4(Sample(s * vec2(pc.src.zw) - 0.5).rgb, 1.0);
+        }
+    }
+    imageStore(dst_img, pc.dst.xy + p, colour);
+}

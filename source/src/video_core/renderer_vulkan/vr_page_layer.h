@@ -10,6 +10,8 @@
 
 #ifdef ENABLE_OPENXR
 
+#include <array>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -67,7 +69,28 @@ public:
     bool Stage(const u8* page_rgba, const u8* glow_rgba);
     // Queue lock held: the staged images into the next swapchain image, released. False when it
     // could not this frame (nothing staged, the image not ready: try again) or after a failure.
-    bool Upload();
+    // With `writable` (the page baked into the eye images, ui_compose=eyes) the same submission
+    // also copies them into a bake image (below), `revision` being the page image's.
+    bool Upload(u64 revision = 0, const std::function<bool(u32)>& writable = {});
+
+    // The page baked into the eye images (the presenter's VrUiCompose): a plain sampled copy of
+    // each upload, in a ring of BakeImages made at the first such upload, since a released
+    // swapchain image belongs to the runtime. `writable(i)`: no bake in flight still samples
+    // image i. An upload that found none writable is copied later (RetryBake, queue lock held).
+    static constexpr u32 BakeImages = 3;
+    bool RetryBake(const std::function<bool(u32)>& writable);
+    // The newest bake image whose copy the GPU finished (-1: none yet; never waits), and the page
+    // revision it holds.
+    [[nodiscard]] s32 BakeCurrent();
+    [[nodiscard]] u64 BakeRevision() const {
+        return bake_revision;
+    }
+    [[nodiscard]] vk::ImageView BakeView(u32 i) const {
+        return bake[i % BakeImages].view;
+    }
+    [[nodiscard]] vk::Extent2D BakeExtent() const {
+        return {width, 2 * height};
+    }
     [[nodiscard]] bool Staged() const {
         return staged;
     }
@@ -99,6 +122,28 @@ public:
 
 private:
     bool Fail(std::string_view what);
+    bool MakeBake();
+    // Records the staging buffer's images into bake image `target` (its mip level too), left in
+    // shader-read layout for the bake.
+    void RecordBake(u32 target);
+    // Picks a bake image no bake samples and records into it; otherwise remembers the miss.
+    void PlaceBake(u64 revision, const std::function<bool(u32)>& writable);
+
+    struct BakeImage {
+        vk::Image image;
+        VmaAllocation allocation{};
+        vk::ImageView view;
+    };
+    std::array<BakeImage, BakeImages> bake{};
+    bool bake_made{false};
+    bool bake_failed{false};
+    u32 bake_mips{1};
+    s32 bake_current{-1};
+    s32 bake_written{-1}; // recorded with the pending copy: current once its fence is seen
+    u64 bake_written_revision{0};
+    u64 bake_revision{0};
+    bool bake_missed{false}; // the staged images still wait for a bake image
+    u64 bake_missed_revision{0};
 
     DeviceContext dev{};
     XrSession session{XR_NULL_HANDLE};

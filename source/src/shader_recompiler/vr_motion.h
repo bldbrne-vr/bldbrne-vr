@@ -43,6 +43,20 @@ struct VrMotion {
     bool Baked() const {
         return params_address != 0 || positions_address != 0;
     }
+    // The hunter's body maps (renderer_vulkan/vr_body_maps.h): a draw of his in the moon's
+    // shadow pass stores its clip position, w replaced by the frame's tag (the parameters'
+    // load_base), and nothing else: no load, no fragment motion, no extra target. Marked by
+    // params_address (so Baked: never cached on disk; the draw pushes the real addresses).
+    static constexpr uint64_t CaptureMarker = 1;
+    bool Capture() const {
+        return enabled && params_address == CaptureMarker && positions_address == 0;
+    }
+    static VrMotion CaptureVariant() {
+        VrMotion m{};
+        m.enabled = true;
+        m.params_address = CaptureMarker;
+        return m;
+    }
     // What a motion variant is built and kept with (PipelineCache::VrMotionVariant): with the
     // addresses pushed (`pushed`) only the flag, so every allocation finds the same permutation
     // (and the one cached on disk); otherwise the addresses too.

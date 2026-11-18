@@ -182,21 +182,21 @@ constexpr DrainWord UnpackDrain(std::uint64_t word) {
 constexpr std::uint64_t EmptyDrainWord = PackDrain({0, 1});
 
 // The game's update's side (bloodborne_held.cpp, while the vial in the hand is ours): the word it
-// hands the renderer. Whether the vial is an empty one is decided as it is armed (ours from this
-// update, or a new vial armed over a drain: the presenter's word back to 0) from the Blood Vials
-// carried then (-1 unknown: full), and kept until it is put away (Reset), so a refused stab's hold
-// stays empty and a stab's own drain (the last vial's included) plays out from full.
+// hands the renderer. An armed vial uses the current carried count (-1 unknown: full), ignoring
+// any previous injection's drain still in flight. Once stabbed, keep its empty/full decision so
+// a refused stab stays empty and a confirmed drain (the last vial's included) plays from full.
 class ArmedLook {
 public:
     // The word for this update; `fresh` (out) is set when the look was decided again.
-    std::uint64_t Word(std::uint64_t drain_word, std::int32_t carried, bool& fresh) {
-        fresh = !on_ || (last_ != 0 && drain_word == 0);
-        if (fresh) {
+    std::uint64_t Word(std::uint64_t drain_word, std::int32_t carried, bool armed, bool& fresh) {
+        const std::uint64_t word = armed ? 0 : drain_word;
+        fresh = !on_ || (last_ != 0 && word == 0) || (armed && empty_ != (carried == 0));
+        if (fresh || armed) {
             empty_ = carried == 0;
         }
         on_ = true;
-        last_ = drain_word;
-        return drain_word == 0 && empty_ ? EmptyDrainWord : drain_word;
+        last_ = word;
+        return word == 0 && empty_ ? EmptyDrainWord : word;
     }
     void Reset() {
         on_ = empty_ = false;

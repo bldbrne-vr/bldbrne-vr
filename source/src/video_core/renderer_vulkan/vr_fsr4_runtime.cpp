@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vr_dibr_upscale.h"
 #include "video_core/renderer_vulkan/vr_fsr4_runtime.h"
 #ifdef _WIN32
 #include <windows.h>
@@ -21,9 +22,9 @@ VrFsr4Runtime::~VrFsr4Runtime() {
 #endif
 }
 bool VrFsr4Runtime::Load() {
-    // Reconstruction currently consumes paired native images, never the DIBR centre frame.
-    if (!std::getenv("VR_NATIVE_STEREO")) {
-        problem = "Disabled in DIBR mode; native-stereo preference preserved";
+    // Native stereo's pair, or the DIBR centre (vr_dibr_upscale.h; VR_DIBR_UPSCALE=0 never loads).
+    if (!std::getenv("VR_NATIVE_STEREO") && !DibrUpscale::Requested()) {
+        problem = "Disabled in DIBR mode (VR_DIBR_UPSCALE=0)";
         return false;
     }
     if (attempted)
@@ -31,8 +32,15 @@ bool VrFsr4Runtime::Load() {
     attempted = true;
 #ifdef _WIN32
     const bool fsr31_provider = provider == VR::Graphics::Upscaler::Fsr31;
+    // FSR 4.1: its bridge and AMD's DLLs in fsr41 (the bridge runs the fsr31 one beside it where
+    // AMD offers no 4.1, and needs nothing more from here).
+    const bool fsr41_provider = provider == VR::Graphics::Upscaler::Fsr41;
+    const char* const env = fsr41_provider ? "VR_FSR41_DIR"
+                            : fsr31_provider ? "VR_FSR31_DIR"
+                                             : "VR_FSR4_DIR";
+    const char* const folder = fsr41_provider ? "fsr41" : fsr31_provider ? "fsr31" : "fsr4";
     std::filesystem::path directory;
-    if (const char* p = std::getenv(fsr31_provider ? "VR_FSR31_DIR" : "VR_FSR4_DIR"); p && *p)
+    if (const char* p = std::getenv(env); p && *p)
         directory = std::filesystem::absolute(p);
     else {
         std::wstring path(32768, L'\0');
@@ -42,19 +50,23 @@ bool VrFsr4Runtime::Load() {
             return false;
         }
         path.resize(n);
-        directory = std::filesystem::path(path).parent_path() / (fsr31_provider ? "fsr31" : "fsr4");
+        directory = std::filesystem::path(path).parent_path() / folder;
     }
     // Explicit diagnostic override: never packaged or selected by the launcher.
     const char* fsr31 = std::getenv("VR_FSR31_PROBE_DLL");
-    const bool probe31 = !fsr31_provider && fsr31 && *fsr31;
-    const auto library = probe31 ? std::filesystem::absolute(fsr31)
-                                 : directory / (fsr31_provider ? "vr_fsr31_stereo.dll" : "vr_fsr4_stereo.dll");
-    assets = fsr31_provider ? directory : directory / "fsr4_shaders";
+    const bool probe31 = !fsr31_provider && !fsr41_provider && fsr31 && *fsr31;
+    const auto library = probe31          ? std::filesystem::absolute(fsr31)
+                         : fsr41_provider ? directory / "vr_fsr41_stereo.dll"
+                         : fsr31_provider ? directory / "vr_fsr31_stereo.dll"
+                                          : directory / "vr_fsr4_stereo.dll";
+    assets = fsr31_provider || fsr41_provider ? directory : directory / "fsr4_shaders";
     std::error_code error;
     if (!std::filesystem::is_regular_file(library, error) ||
-        (!fsr31_provider && !probe31 && !std::filesystem::is_regular_file(assets / "LICENSE-FSR4-v07.txt", error))) {
-        problem = fsr31_provider ? "FSR 3.1.5 bridge missing (fsr31 folder or VR_FSR31_DIR)"
-                                 : "FSR 4 bridge/assets missing (fsr4 folder or VR_FSR4_DIR)";
+        (!fsr31_provider && !fsr41_provider && !probe31 &&
+         !std::filesystem::is_regular_file(assets / "LICENSE-FSR4-v07.txt", error))) {
+        problem = fsr41_provider   ? "FSR 4.1 bridge missing (fsr41 folder or VR_FSR41_DIR)"
+                  : fsr31_provider ? "FSR 3.1.5 bridge missing (fsr31 folder or VR_FSR31_DIR)"
+                                   : "FSR 4 bridge/assets missing (fsr4 folder or VR_FSR4_DIR)";
         return false;
     }
     module = LoadLibraryExW(library.c_str(), nullptr,
@@ -71,6 +83,18 @@ bool VrFsr4Runtime::Load() {
         return false;
     }
     if (probe31) LOG_INFO(Render_Vulkan, "FSR diagnostic override: FSR 3.1.5 provider (no frame generation); FSR4 settings select its input ratio");
+    VrFsr41PrepareViewsFn prepare_views{};
+    if (fsr41_provider)
+        status = reinterpret_cast<const char* (*)()>(
+            GetProcAddress(static_cast<HMODULE>(module), "VrFsr41GetStatus"));
+    if (fsr41_provider) {
+        prepare_views = reinterpret_cast<VrFsr41PrepareViewsFn>(
+            GetProcAddress(static_cast<HMODULE>(module), VR_FSR41_PREPARE_EXPORT));
+        if (!prepare_views || !status) {
+            problem = "FSR 4.1 bridge needs updating (stereo preparation/status exports missing)";
+            return false;
+        }
+    }
     api = candidate;
     // ABI 2 bridges accept the optimized post; newer ones list further flags in an export.
     uint32_t bridge_flags = api->abi >= 2 ? VR_FSR4_FLAG_OPTIMIZED_POST : 0u;
@@ -85,7 +109,10 @@ bool VrFsr4Runtime::Load() {
     const auto* pair = get_pair ? get_pair() : nullptr;
     session = std::make_unique<VrFsr4Session>(
         api, bridge_flags,
-        pair && pair->abi == VR_FSR4_PAIR_ABI && pair->EvaluatePair ? pair : nullptr);
+        pair && pair->abi == VR_FSR4_PAIR_ABI && pair->EvaluatePair ? pair : nullptr,
+        prepare_views);
+    // The FSR 3.1.5 bridge's Problem reads a context: never asked without one.
+    session->SetContextFreeProblem(!fsr31_provider && !probe31);
     // FAST bit 37 uses bbport's post passes only when their manifest was packaged, and the
     // fenced SPD auto-exposure pass (packaged with that manifest) only when the bridge takes
     // its flag. The bridge loads either only for a context whose flags request it.
@@ -109,8 +136,10 @@ VrFsr4Session* VrFsr4Runtime::Activate(const VR::Graphics::Config& accepted,
             session->Disable();
         return nullptr;
     }
-    if (provider == VR::Graphics::Upscaler::Fsr31 ? !instance.IsVrFsr31Supported()
-                                                : !instance.IsVrFsr4Supported()) {
+    // FSR 4.1 needs what its FSR 3.1.5 fallback needs; AMD's own checks pick 4.1 or not.
+    if (provider == VR::Graphics::Upscaler::Fsr31 || provider == VR::Graphics::Upscaler::Fsr41
+            ? !instance.IsVrFsr31Supported()
+            : !instance.IsVrFsr4Supported()) {
         problem = std::string(VR::Graphics::UpscalerName(provider)) +
                   " required device features are unavailable";
         return nullptr;
@@ -123,6 +152,10 @@ VrFsr4Session* VrFsr4Runtime::Activate(const VR::Graphics::Config& accepted,
     }
     problem.clear();
     return session.get();
+}
+std::string VrFsr4Runtime::BridgeStatus() const {
+    const char* text = status ? status() : nullptr;
+    return text ? std::string(text) : std::string{};
 }
 bool VrFsr4Runtime::Shutdown(uint64_t completed) {
     if (!session)

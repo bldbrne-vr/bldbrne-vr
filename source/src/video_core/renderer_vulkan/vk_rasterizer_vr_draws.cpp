@@ -93,10 +93,14 @@
 #include "core/vr/body_channel.h"
 #include "core/vr/body_cut_boost.h"
 #include "core/vr/body_settings.h"
+#include "core/vr/bloodborne_quickitems.h"
+#include "core/vr/c0000_skeleton.h"
+#include "core/vr/hand_lantern.h"
 #include "core/vr/live_tune.h"
 #include "core/vr/quick_channel.h"
 #include "core/vr/quick_settings.h"
 #include "core/vr/vr_session.h"
+#include "shader_recompiler/ir/passes/body_shadow.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -538,6 +542,11 @@ struct CapeEntry {
     u32 hands{};   // VrHandsTable::Keys index + 1 (0: all hand, or not one of the hunter's parts)
     u64 hash{};    // FNV-1a of the whole index data (logs)
     bool other_logged{}; // arms_only / hands_only: logged as a draw that is not one of his parts
+    // Body maps (vr_body_maps.h): its indices in the pool (~0u: not there), their range, and
+    // whether that was tried with the pool made (then a full pool is not asked again).
+    u32 pool_first{~0u};
+    u32 lowest{}, highest{};
+    bool pool_tried{};
 };
 
 // Frames a piece judged someone else's stays theirs (about a third of a second at 90 Hz).
@@ -557,6 +566,15 @@ struct CapeState {
     // his parts' draws stand exactly there. Without it the camera's column decides.
     bool has_player{};
     VR::Vec3 player{};
+    u64 record_id{}; // this frame's camera record (VR::RecordPlayerBones)
+    // His bones this frame (VR::RecordPlayerBones, fetched by the first tilted piece near him)
+    // and their bind points (C0000::Active()'s reference pose, once): a rigid piece is his only
+    // when it sits on one of them (VrBodySplit::OnPlayersBone).
+    u32 bones_frame{~0u};
+    bool has_bones{};
+    float bones[VR::PlayerBoneCount][3]{};
+    bool has_bind{};
+    float bind[VR::PlayerBoneCount][3]{};
     u32 player_log_budget{3}; // roots at his origin
     u32 piece_log_budget{12}; // rigid pieces on his bones
     // Other characters' roots (upright draws standing elsewhere: their skinned bodies), world
@@ -574,7 +592,12 @@ struct CapeState {
         VR::Vec3 at{};
         u32 until{};
     };
-    std::unordered_map<VAddr, std::array<Theirs, 4>> theirs;
+    // `bone`: the bone of his it sat on last (tried first: his hat costs one compare a frame).
+    struct Piece {
+        std::array<Theirs, 4> places{};
+        s16 bone{-1};
+    };
+    std::unordered_map<VAddr, Piece> theirs;
     u32 frame_no{};
     std::unordered_map<VAddr, CapeEntry> by_index; // keyed by the draw's index data address
     // The draw being recorded: the kept index ranges of a partial cape face set (nullptr: the
@@ -582,6 +605,10 @@ struct CapeState {
     const VrCapeTable::Range* split{};
     u32 split_count{};
     u32 player_draws{}; // this frame: draws of the model under the camera
+    // Body maps (vr_body_maps.h): this draw's capture, for PrepareVrDraw (a draw of his in the
+    // moon's nearest cascade).
+    bool capture{};
+    VrBodyMaps::Draw capture_draw{};
     u32 skipped{};      // this frame: cape draws left out
     u32 split_draws{};  // this frame: draws drawn without their cape triangles
     u32 skipped_total{};
@@ -604,6 +631,9 @@ struct CapeState {
     // every code selects the same cut variant.
     u32 cut_code{};
     u32 cut_request{};
+    s32 monocular_eye{-1};
+    bool monocular_player_draw{};
+    u32 monocular_free_cut{}; // the body cut the Monocular code replaced, for the free eye
     // Fast bit 40 with VrPushData: a body draw the cutaway would cut, in a colour pass while it
     // is configured but not cutting (looking ahead): the cut whose variant VrCutPipeline
     // prebuilds, so the first look down never waits for it (0 = none).
@@ -725,7 +755,8 @@ auto FindKey(const Table& keys, u32 count, u64 hash) {
 // rows are a rotation with a translation (Bloodborne's per-object constants; the same buffer in
 // the G-buffer and the shadow passes). False when the draw has none. `upright`: its up axis is the
 // world's (a character root; a rigid piece on a bone is tilted).
-bool ObjectPosition(const Shader::Info& vs, VR::Vec3& out, bool* upright = nullptr) {
+bool ObjectPosition(const Shader::Info& vs, VR::Vec3& out, bool* upright = nullptr,
+                    float* tilted_rot = nullptr) {
     for (const auto& desc : vs.buffers) {
         if (desc.IsSpecial()) {
             continue;
@@ -747,11 +778,66 @@ bool ObjectPosition(const Shader::Info& vs, VR::Vec3& out, bool* upright = nullp
         }
         if (ok) {
             out = {m[3], m[7], m[11]};
+            // Upright by the up axis's direction, whatever the model's scale (a scaled NPC root
+            // is still a root: taken for a tilted piece it was hidden near him).
+            const float up2 = m[1] * m[1] + m[5] * m[5] + m[9] * m[9];
+            const bool is_upright = m[5] > 0.0f && m[5] * m[5] > 0.999f * up2;
             if (upright != nullptr) {
-                *upright = m[5] > 0.9995f;
+                *upright = is_upright;
+            }
+            // A tilted piece's rotation (row-major 3x3; upright draws skip it).
+            if (tilted_rot != nullptr && !is_upright) {
+                for (int r = 0; r < 3; ++r) {
+                    tilted_rot[r * 3] = m[r * 4];
+                    tilted_rot[r * 3 + 1] = m[r * 4 + 1];
+                    tilted_rot[r * 3 + 2] = m[r * 4 + 2];
+                }
             }
             return true;
         }
+    }
+    return false;
+}
+
+// The centre of a non-indexed draw's `count` vertices by their position (vertex input 0: three or
+// four 32-bit floats), read where the GPU reads them. False when the draw has no such input or
+// its buffer does not hold them all.
+bool VertexCentre(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs, u32 count,
+                  VR::Vec3& out) {
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+    VertexInputs<AmdGpu::Buffer> buffers;
+    pipeline.GetVertexInputs(attributes, bindings, divisors, buffers,
+                             regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
+    for (size_t k = 0; k < attributes.size() && k < buffers.size(); ++k) {
+        if (attributes[k].location != 0) {
+            continue;
+        }
+        const AmdGpu::Buffer& b = buffers[k];
+        const auto format = b.GetDataFmt();
+        const u64 stride = b.GetStride();
+        const u64 first = regs.index_offset;
+        if ((format != AmdGpu::DataFormat::Format32_32_32 &&
+             format != AmdGpu::DataFormat::Format32_32_32_32) ||
+            b.GetNumberFmt() != AmdGpu::NumberFormat::Float || stride < 12 || count == 0 ||
+            b.base_address < 0x10000 || (first + count) * stride > b.GetSize()) {
+            return false;
+        }
+        double sum[3]{};
+        for (u64 i = 0; i < count; ++i) {
+            const auto* at = reinterpret_cast<const void*>(b.base_address + (first + i) * stride);
+            float p[3];
+            std::memcpy(p, ScratchDraw::MemorySource(at, sizeof(p)), sizeof(p));
+            if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) {
+                return false;
+            }
+            sum[0] += p[0];
+            sum[1] += p[1];
+            sum[2] += p[2];
+        }
+        out = {float(sum[0] / count), float(sum[1] / count), float(sum[2] / count)};
+        return true;
     }
     return false;
 }
@@ -794,6 +880,7 @@ bool FirstPersonFrame(CapeState& cs) {
     cs.units_per_m = rec.world_scale > 0.0f ? rec.world_scale : 1.0f;
     cs.has_player = rec.has_player_position;
     cs.player = rec.player_position;
+    cs.record_id = rec.id;
     cs.reason = "";
     return true;
 }
@@ -922,6 +1009,7 @@ bool Rasterizer::VrCapeSkip(const GraphicsPipeline* pipeline, u32 index_offset) 
     if (!cs.frame_checked) {
         cs.frame_checked = true;
         const bool first_person = FirstPersonFrame(cs);
+        cs.monocular_eye = first_person ? VR::DrawFrameRecord().monocular_eye : -1;
         cs.frame_on = first_person && CapeEnabled(cs, Insp());
         VR::Holsters::Targets pouch{};
         cs.pouch_on = first_person && VR::GetSettings().inject &&
@@ -997,14 +1085,21 @@ bool Rasterizer::VrCapeSkip(const GraphicsPipeline* pipeline, u32 index_offset) 
             }
         }
     }
-    if (!cs.frame_on && cs.cut_code == 0 && !cs.head_on && !cs.hands_on && !cs.pouch_on) {
+    // (His body maps need his draws found too: vr_body_maps.h.)
+    const bool body_maps = Shader::Optimization::BodyShadow::Enabled() &&
+                           Shader::Optimization::BodyShadow::MapsEnabled() && vr_body_maps &&
+                           vr_body_maps->Ready();
+    if (!cs.frame_on && cs.cut_code == 0 && !cs.head_on && !cs.hands_on && !cs.pouch_on &&
+        cs.monocular_eye < 0 && !body_maps) {
         return false;
     }
     // The main player: the model standing under the first-person camera (an NPC or another hunter
     // in the same armour would have to stand inside the player).
     VR::Vec3 object{};
     bool upright = false;
-    if (!ObjectPosition(pipeline->GetStage(Shader::LogicalStage::Vertex), object, &upright)) {
+    float tilted_rot[9];
+    if (!ObjectPosition(pipeline->GetStage(Shader::LogicalStage::Vertex), object, &upright,
+                        tilted_rot)) {
         return false;
     }
     const float dx = (object.x - cs.camera.x) / cs.units_per_m;
@@ -1023,15 +1118,17 @@ bool Rasterizer::VrCapeSkip(const GraphicsPipeline* pipeline, u32 index_offset) 
             cs.others_next.push_back(object);
         }
         if (his && !upright) {
-            // A piece within reach of him: someone else's when another root is nearer to it, or
-            // when it was judged theirs a moment ago in the same place.
+            // A piece within reach of him: someone else's when it was judged theirs a moment ago
+            // in the same place, or when it sits on none of his bones (VrBodySplit::OnPlayersBone;
+            // without his bones: when another root is nearer to it).
             const float mine = px * px + py * py + pz * pz;
             const auto& r = std::as_const(ScratchDraw::Registers(liverpool));
             const VAddr key = r.index_base_address.Address<VAddr>() +
                               VAddr(index_offset) *
                                   (r.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2
                                                                                                   : 4);
-            auto& places = cs.theirs[key];
+            auto& piece = cs.theirs[key];
+            auto& places = piece.places;
             const auto near_place = [&](const CapeState::Theirs& t) {
                 const float ux = (object.x - t.at.x) / cs.units_per_m;
                 const float uy = (object.y - t.at.y) / cs.units_per_m;
@@ -1056,7 +1153,69 @@ bool Rasterizer::VrCapeSkip(const GraphicsPipeline* pipeline, u32 index_offset) 
                     break;
                 }
             }
+            if (his && cs.bones_frame != cs.frame_no) {
+                cs.bones_frame = cs.frame_no;
+                cs.has_bones = false;
+                if (!cs.has_bind) {
+                    if (const auto* sk = VR::Body::C0000::Active()) {
+                        for (int b = 0; b < VR::PlayerBoneCount; ++b) {
+                            for (int i = 0; i < 3; ++i) {
+                                cs.bind[b][i] = sk->model[b].t[i];
+                            }
+                        }
+                        cs.has_bind = true;
+                    }
+                }
+                std::array<VR::Vec3, VR::PlayerBoneCount> bones;
+                if (cs.has_bind && VR::RecordPlayerBones(cs.record_id, bones)) {
+                    for (int b = 0; b < VR::PlayerBoneCount; ++b) {
+                        cs.bones[b][0] = bones[b].x;
+                        cs.bones[b][1] = bones[b].y;
+                        cs.bones[b][2] = bones[b].z;
+                    }
+                    cs.has_bones = true;
+                }
+            }
+            if (his && cs.has_bones) {
+                const float rel[3] = {object.x - cs.player.x, object.y - cs.player.y,
+                                      object.z - cs.player.z};
+                const float match = VrBodySplit::BoneMatchM * cs.units_per_m;
+                int bone = -1;
+                if (piece.bone >= 0 &&
+                    VrBodySplit::OnPlayersBone(tilted_rot, rel, cs.bind + piece.bone,
+                                               cs.bones + piece.bone, 1, match) == 0) {
+                    bone = piece.bone;
+                } else {
+                    float nearest = 0.0f;
+                    bone = VrBodySplit::OnPlayersBone(tilted_rot, rel, cs.bind, cs.bones,
+                                                      VR::PlayerBoneCount, match, &nearest);
+                    if (bone < 0) {
+                        his = false;
+                        remember();
+                        if (cs.others_log_budget != 0) {
+                            --cs.others_log_budget;
+                            const float up2 = tilted_rot[1] * tilted_rot[1] +
+                                              tilted_rot[4] * tilted_rot[4] +
+                                              tilted_rot[7] * tilted_rot[7];
+                            LOG_INFO(Render_Vulkan,
+                                     "VR body: a piece {:.2f} m from his origin sits on none of "
+                                     "his bones (nearest {:.2f} m; scale {:.3f}, up y {:.3f}): "
+                                     "someone else's, drawn as it is",
+                                     std::sqrt(mine), std::sqrt(nearest) / cs.units_per_m,
+                                     std::sqrt(up2), tilted_rot[4] / std::sqrt(up2));
+                        }
+                    } else if (cs.piece_log_budget != 0) {
+                        LOG_INFO(Render_Vulkan,
+                                 "VR body: a piece {:.2f} m from his origin sits on his bone {}",
+                                 std::sqrt(mine), bone);
+                    }
+                }
+                piece.bone = static_cast<s16>(bone);
+            }
             for (const auto& root : cs.others) {
+                if (!his || cs.has_bones) {
+                    break;
+                }
                 const float ox = (object.x - root.x) / cs.units_per_m;
                 const float oy = (object.y - root.y) / cs.units_per_m;
                 const float oz = (object.z - root.z) / cs.units_per_m;
@@ -1102,12 +1261,27 @@ bool Rasterizer::VrCapeSkip(const GraphicsPipeline* pipeline, u32 index_offset) 
     // A cape mesh: its index data is a cape face set of a parts file (vr_cape_table.h); a body
     // or leg face set (vr_body_table.h): what of it is cut away near the camera.
     const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
+    if (cs.monocular_eye >= 0) {
+        const float vp_w = regs.viewport_control.xscale_enable
+                               ? 2.0f * std::abs(regs.viewports[0].xscale)
+                               : 0.0f;
+        const float vp_h = regs.viewport_control.yscale_enable
+                               ? 2.0f * std::abs(regs.viewports[0].yscale)
+                               : 0.0f;
+        cs.monocular_player_draw = VrBodySplit::HeadHiddenPass(
+            pipeline->GetGraphicsKey().mrt_mask != 0, vp_w, vp_h, VR::MainAspect());
+    }
     const u32 index_size = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2 : 4;
     const VAddr index_addr =
         regs.index_base_address.Address<VAddr>() + VAddr(index_offset) * index_size;
     const u32 count = regs.num_indices;
     const u64 bytes = u64(count) * index_size;
     if (count == 0 || bytes > (64u << 20) || index_addr < 0x10000) {
+        return false;
+    }
+    // The index data read in place: only while it is mapped (FAST_CPU_SUBMIT_AHEAD lets the game
+    // unmap memory a draw still being decoded referenced; the GPU path reads it safely later).
+    if (memory->ClampRangeSize(index_addr, bytes) < bytes) {
         return false;
     }
     const auto* data = reinterpret_cast<const u8*>(index_addr);
@@ -1201,6 +1375,189 @@ bool Rasterizer::VrCapeSkip(const GraphicsPipeline* pipeline, u32 index_offset) 
                          "VR cape: drawing the player's face set {:#018x} without its cape triangles ({} of {} "
                          "indices in {} ranges, at {:#x})",
                          hash, kept, count, key.range_count, index_addr);
+            }
+        }
+    }
+    // Body maps, step 0 (VR_BODY_MAP_LOG=1, diagnostics): his depth-only draws (the moon's
+    // shadow cascades) on a few frames: the viewport (the atlas tile), the index range, the vertex
+    // shader's buffers, and where a 864-byte camera buffer's matrices put his origin.
+    static const bool body_map_log = [] {
+        const char* const v = std::getenv("VR_BODY_MAP_LOG");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (body_map_log && cs.frame_no % 600 == 300 && cs.frame_no <= 6000 &&
+        !VrBodySplit::HeadHiddenPass(
+            pipeline->GetGraphicsKey().mrt_mask != 0,
+            regs.viewport_control.xscale_enable ? 2.0f * std::abs(regs.viewports[0].xscale) : 0.0f,
+            regs.viewport_control.yscale_enable ? 2.0f * std::abs(regs.viewports[0].yscale) : 0.0f,
+            VR::MainAspect())) {
+        u32 lo = ~0u, hi = 0;
+        for (u32 i = 0; i < count; ++i) {
+            const u32 v = index_size == 2 ? u32(reinterpret_cast<const u16*>(data)[i])
+                                          : reinterpret_cast<const u32*>(data)[i];
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
+        }
+        const auto& vs = pipeline->GetStage(Shader::LogicalStage::Vertex);
+        std::string sizes;
+        std::string cam;
+        for (const auto& desc : vs.buffers) {
+            if (desc.IsSpecial()) {
+                continue;
+            }
+            const auto sharp = desc.GetSharp(vs);
+            sizes += fmt::format(" {}", sharp.GetSize());
+            if (sharp.GetSize() == 864 && sharp.base_address >= 0x10000 && cam.empty()) {
+                float m[216];
+                std::memcpy(m,
+                            ScratchDraw::MemorySource(
+                                reinterpret_cast<const void*>(sharp.base_address), sizeof(m)),
+                            sizeof(m));
+                const float o[4] = {object.x, object.y, object.z, 1.0f};
+                // Rows 8..19: a 3x4 view (row-major), rows 52..67: a 4x4 projection (row-major);
+                // also as column-major, whichever puts him inside the tile.
+                float v3[3];
+                for (int r = 0; r < 3; ++r) {
+                    v3[r] = m[8 + 4 * r] * o[0] + m[9 + 4 * r] * o[1] + m[10 + 4 * r] * o[2] +
+                            m[11 + 4 * r];
+                }
+                float c_row[4], c_col[4];
+                for (int r = 0; r < 4; ++r) {
+                    c_row[r] = m[52 + 4 * r] * v3[0] + m[53 + 4 * r] * v3[1] +
+                               m[54 + 4 * r] * v3[2] + m[55 + 4 * r];
+                    c_col[r] = m[52 + r] * v3[0] + m[56 + r] * v3[1] + m[60 + r] * v3[2] +
+                               m[64 + r];
+                }
+                cam = fmt::format(" view-space ({:.3f} {:.3f} {:.3f}); clip row-major ({:.3f} "
+                                  "{:.3f} {:.3f} {:.3f}), column-major ({:.3f} {:.3f} {:.3f} "
+                                  "{:.3f}); first 24 dwords:",
+                                  v3[0], v3[1], v3[2], c_row[0], c_row[1], c_row[2], c_row[3],
+                                  c_col[0], c_col[1], c_col[2], c_col[3]);
+                for (int i = 0; i < 24; ++i) {
+                    cam += fmt::format(" {:.4g}", m[i]);
+                }
+                cam += "; 48..71:";
+                for (int i = 48; i < 72; ++i) {
+                    cam += fmt::format(" {:.4g}", m[i]);
+                }
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "VR body map (frame {}): a shadow draw of his (colour targets {:#x}): {} indices "
+                 "({}-bit) range {}..{}, {} instances, viewport scale ({:.1f} {:.1f}) offset ({:.1f} {:.1f}) z ({:.4f} "
+                 "{:.4f}), origin ({:.3f} {:.3f} {:.3f}), vs {:#x} buffers:{}{}",
+                 cs.frame_no, pipeline->GetGraphicsKey().mrt_mask, count, index_size * 8, lo, hi,
+                 regs.num_instances.NumInstances(),
+                 regs.viewports[0].xscale, regs.viewports[0].yscale, regs.viewports[0].xoffset,
+                 regs.viewports[0].yoffset, regs.viewports[0].zscale, regs.viewports[0].zoffset,
+                 object.x, object.y, object.z, vs.pgm_hash, sizes, cam);
+    }
+    // Body maps (vr_body_maps.h): a draw of his in the moon's nearest cascade (the atlas's top
+    // left tile) takes the capture variant; its clip positions go back to the world (relative to
+    // his origin) with this pass's own camera (its 864-byte buffer: a 3x4 view at dwords 8..19, an
+    // orthographic projection at 52..67).
+    namespace BodyShadowTune = Shader::Optimization::BodyShadow;
+    if (BodyShadowTune::Enabled() && BodyShadowTune::MapsEnabled() && vr_body_maps &&
+        vr_body_maps->Ready() && cs.has_player &&
+        regs.primitive_type == AmdGpu::PrimitiveType::TriangleList &&
+        regs.num_instances.NumInstances() == 1 && regs.viewport_control.xscale_enable &&
+        regs.viewport_control.yscale_enable) {
+        const auto& vp = regs.viewports[0];
+        const float sx = std::abs(vp.xscale), sy = std::abs(vp.yscale);
+        const bool nearest_tile = sx >= 256.0f && std::abs(vp.xoffset - sx) < 1.0f &&
+                                  std::abs(vp.yoffset - sy) < 1.0f;
+        const bool shadow_pass = !VrBodySplit::HeadHiddenPass(
+            pipeline->GetGraphicsKey().mrt_mask != 0, 2.0f * sx, 2.0f * sy, VR::MainAspect());
+        if (nearest_tile && shadow_pass) {
+            if (entry.pool_first == ~0u && !entry.pool_tried) {
+                u32 lo = ~0u, hi = 0;
+                for (u32 i = 0; i < count; ++i) {
+                    const u32 v = index_size == 2 ? u32(reinterpret_cast<const u16*>(data)[i])
+                                                  : reinterpret_cast<const u32*>(data)[i];
+                    lo = std::min(lo, v);
+                    hi = std::max(hi, v);
+                }
+                entry.lowest = lo;
+                entry.highest = hi;
+                entry.pool_first = vr_body_maps->PoolIndices(data, count, index_size);
+                entry.pool_tried = true;
+                if (entry.pool_first == ~0u) {
+                    LOG_WARNING(Render_Vulkan,
+                                "VR body maps: a mesh of his ({} indices) did not fit the pool",
+                                count);
+                }
+            }
+            const auto& vs = pipeline->GetStage(Shader::LogicalStage::Vertex);
+            const float* cam = nullptr;
+            float m[68];
+            for (const auto& desc : vs.buffers) {
+                if (desc.IsSpecial()) {
+                    continue;
+                }
+                const auto sharp = desc.GetSharp(vs);
+                if (sharp.GetSize() == 864 && sharp.base_address >= 0x10000) {
+                    std::memcpy(m,
+                                ScratchDraw::MemorySource(
+                                    reinterpret_cast<const void*>(sharp.base_address), sizeof(m)),
+                                sizeof(m));
+                    cam = m;
+                    break;
+                }
+            }
+            // An orthographic projection (its last row 0 0 0 1), as the moon's cascades have.
+            const bool ortho = cam != nullptr && cam[64] == 0.0f && cam[65] == 0.0f &&
+                               cam[66] == 0.0f && cam[67] == 1.0f;
+            const u32 vertices =
+                entry.highest >= entry.lowest ? entry.highest - entry.lowest + 1 : 0;
+            if (ortho && entry.pool_first != ~0u && vertices != 0 &&
+                vertices <= VrBodyMaps::MaxVertices) {
+                // clip = P3 (V3 w + Vt) + Pt  ->  w = (P3 V3)^-1 (clip - P3 Vt - Pt).
+                double a[9], t[3];
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        double v = 0.0;
+                        for (int k = 0; k < 3; ++k) {
+                            v += double(cam[52 + 4 * r + k]) * cam[8 + 4 * k + c];
+                        }
+                        a[3 * r + c] = v;
+                    }
+                    double v = cam[52 + 4 * r + 3];
+                    for (int k = 0; k < 3; ++k) {
+                        v += double(cam[52 + 4 * r + k]) * cam[8 + 4 * k + 3];
+                    }
+                    t[r] = v;
+                }
+                const double det = a[0] * (a[4] * a[8] - a[5] * a[7]) -
+                                   a[1] * (a[3] * a[8] - a[5] * a[6]) +
+                                   a[2] * (a[3] * a[7] - a[4] * a[6]);
+                if (std::isfinite(det) && std::abs(det) > 1e-18) {
+                    const double inv[9] = {(a[4] * a[8] - a[5] * a[7]) / det,
+                                           (a[2] * a[7] - a[1] * a[8]) / det,
+                                           (a[1] * a[5] - a[2] * a[4]) / det,
+                                           (a[5] * a[6] - a[3] * a[8]) / det,
+                                           (a[0] * a[8] - a[2] * a[6]) / det,
+                                           (a[2] * a[3] - a[0] * a[5]) / det,
+                                           (a[3] * a[7] - a[4] * a[6]) / det,
+                                           (a[1] * a[6] - a[0] * a[7]) / det,
+                                           (a[0] * a[4] - a[1] * a[3]) / det};
+                    const double origin[3] = {cs.player.x, cs.player.y, cs.player.z};
+                    VrBodyMaps::Draw d{};
+                    d.pool_first = entry.pool_first;
+                    d.count = count - count % 3;
+                    d.short_indices = index_size == 2;
+                    d.lowest = entry.lowest;
+                    d.vertices = vertices;
+                    for (int r = 0; r < 3; ++r) {
+                        double shift = 0.0;
+                        for (int c = 0; c < 3; ++c) {
+                            d.clip_to_world[4 * r + c] = float(inv[3 * r + c]);
+                            shift += inv[3 * r + c] * t[c];
+                        }
+                        d.clip_to_world[4 * r + 3] = float(-shift - origin[r]);
+                    }
+                    cs.capture = true;
+                    cs.capture_draw = d;
+                }
             }
         }
     }
@@ -1368,10 +1725,12 @@ bool Rasterizer::VrDrawCapeSplit(RecorderProxy cmdbuf, u32 instances, s32 vertex
         const u32 n = cs.hands_split_count;
         cs.hands_split = nullptr;
         cs.hands_split_count = 0;
-        for (u32 r = 0; r < n; ++r) {
-            cmdbuf.drawIndexed(hands[r].count, instances, hands[r].first, vertex_offset,
-                               instance_offset);
-        }
+        DrawEyes(cmdbuf, eye_draws, [&] {
+            for (u32 r = 0; r < n; ++r) {
+                cmdbuf.drawIndexed(hands[r].count, instances, hands[r].first, vertex_offset,
+                                   instance_offset);
+            }
+        });
         return true;
     }
     if (const VrBodyTable::Key* key = cs.body_split; key != nullptr) {
@@ -1393,11 +1752,14 @@ bool Rasterizer::VrDrawCapeSplit(RecorderProxy cmdbuf, u32 instances, s32 vertex
             return false; // nothing left out, one pipeline (a shadow pass): the draw as it is
         }
         const VrBodyTable::Range* r = &VrBodyTable::Ranges[key->begin];
+        // Layer draws: each run for both eyes before the next pipeline bind.
         const auto draw = [&](u32 first, u32 n) {
-            for (u32 k = first; k < first + n; ++k) {
-                cmdbuf.drawIndexed(r[k].count, instances, r[k].first, vertex_offset,
-                                   instance_offset);
-            }
+            DrawEyes(cmdbuf, eye_draws, [&] {
+                for (u32 k = first; k < first + n; ++k) {
+                    cmdbuf.drawIndexed(r[k].count, instances, r[k].first, vertex_offset,
+                                       instance_offset);
+                }
+            });
         };
         const u32 kept = u32(key->keep) + (shoulder_cut ? 0u : key->shoulder);
         const u32 cut_at = u32(key->keep) + key->shoulder;
@@ -1421,10 +1783,12 @@ bool Rasterizer::VrDrawCapeSplit(RecorderProxy cmdbuf, u32 instances, s32 vertex
     if (ranges == nullptr) {
         return false;
     }
-    for (u32 r = 0; r < count; ++r) {
-        cmdbuf.drawIndexed(ranges[r].count, instances, ranges[r].first, vertex_offset,
-                           instance_offset);
-    }
+    DrawEyes(cmdbuf, eye_draws, [&] {
+        for (u32 r = 0; r < count; ++r) {
+            cmdbuf.drawIndexed(ranges[r].count, instances, ranges[r].first, vertex_offset,
+                               instance_offset);
+        }
+    });
     return true;
 }
 
@@ -1433,11 +1797,23 @@ bool Rasterizer::PrepareVrDraw(const GraphicsPipeline*& pipeline, bool indexed, 
     producer_vr = {};
     if (!vr_warp)
         return true;
+    Cape().capture = false;
     if (VrFilterDraw(pipeline, indexed, indirect, offset))
         return false;
     const u32 cut = Cape().cut_request;
     pipeline = VrCutPipeline(pipeline);
     const auto& cs = Cape();
+    // Body maps: a draw of his in the moon's nearest cascade stores its positions (its capture
+    // variant; while that compiles the frame's maps are left out, never a body missing a part).
+    if (cs.capture && indexed && !indirect) {
+        if (const auto* variant = pipeline_cache.GetVrCapturePipeline(pipeline)) {
+            pipeline = variant;
+            producer_vr.capture = true;
+            producer_vr.capture_draw = cs.capture_draw;
+        } else {
+            producer_vr.capture_missed = true;
+        }
+    }
     producer_vr.split = cs.split;
     producer_vr.split_count = cs.split_count;
     producer_vr.body_split = cs.body_split;
@@ -1448,6 +1824,7 @@ bool Rasterizer::PrepareVrDraw(const GraphicsPipeline*& pipeline, bool indexed, 
     producer_vr.hands_split = cs.hands_split;
     producer_vr.hands_split_count = cs.hands_split_count;
     producer_vr.cut_code = cut;
+    producer_vr.free_eye_cut = Shader::VrCut::MonocularEye(cut) >= 0 ? cs.monocular_free_cut : 0;
     return true;
 }
 
@@ -1585,14 +1962,73 @@ PipelineSkip::Veto Rasterizer::VrSkipVeto(const Shader::Info* vs) {
 bool Rasterizer::VrFilterDraw(const GraphicsPipeline* pipeline, bool is_indexed, bool indirect,
                               u32 index_offset) {
     producer_vr.probe_selected = false;
+    // The Hand Lantern carried lit (core/vr/hand_lantern.h): the game's lit-lantern effect on
+    // the palm gives its light; its own lantern model is not drawn (ours is, in-frame), nor its
+    // glow card: the draw right after the model, or the card alone just after the light went out
+    // (the effect's last frame draws it without the model). The card's shaders are the effects'
+    // shared glow ones: alone, a card is the lantern's only where the lantern's own card (after
+    // its model) was just drawn, so no other glow in the world is hidden.
+    {
+        static bool lantern_glow_next = false;
+        static VR::Vec3 lantern_card{}; // the lantern's own card: its centre (world, metres)
+        static s64 lantern_card_ns = 0; // ... drawn then
+        const bool glow_next = std::exchange(lantern_glow_next, false);
+        if (VR::Bloodborne::LanternModelHidden() && !indirect) {
+            const auto& hashes = pipeline->GetGraphicsKey().stage_hashes;
+            const u64 vs = hashes[u32(Shader::LogicalStage::Vertex)];
+            if (vs == VR::HandLantern::ModelVsHash || vs == VR::HandLantern::GlowVsHash) {
+                const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
+                const u32 count = regs.num_indices;
+                if (is_indexed) {
+                    if (vs == VR::HandLantern::ModelVsHash &&
+                        count == VR::HandLantern::ModelIndexCount) {
+                        lantern_glow_next = true;
+                        return true;
+                    }
+                } else if (vs == VR::HandLantern::GlowVsHash &&
+                           count == VR::HandLantern::GlowVertexCount &&
+                           hashes[u32(Shader::LogicalStage::Fragment)] ==
+                               VR::HandLantern::GlowFsHash) {
+                    VR::Vec3 at{};
+                    if (glow_next) {
+                        // The lantern's own card: its place kept for a card alone.
+                        if (VertexCentre(*pipeline, regs, count, at)) {
+                            lantern_card = at;
+                            lantern_card_ns = VR::Body::SteadyNowNs();
+                        }
+                        return true;
+                    }
+                    if (lantern_card_ns != 0 && VR::Bloodborne::LanternJustPutOut() &&
+                        VR::Body::SteadyNowNs() - lantern_card_ns < VR::HandLantern::GlowAloneNs &&
+                        VertexCentre(*pipeline, regs, count, at)) {
+                        const float dx = at.x - lantern_card.x;
+                        const float dy = at.y - lantern_card.y;
+                        const float dz = at.z - lantern_card.z;
+                        if (dx * dx + dy * dy + dz * dz <
+                            VR::HandLantern::GlowNearM * VR::HandLantern::GlowNearM) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
     Cape().split = nullptr;       // set again below for a partial cape face set
     Cape().cut_request = 0;       // set again below for the hunter's body
+    Cape().monocular_player_draw = false;
+    Cape().monocular_free_cut = 0;
     Cape().cut_ahead = 0;         // ... or for his body while the cutaway is not cutting
     Cape().body_split = nullptr;  // set again below for a body face set with arms
     Cape().body_head_hidden = false;
     Cape().body_shoulder_cut = false;
     Cape().hands_split = nullptr; // set again below for a hunter face set with hand triangles
     const bool cape = is_indexed && !indirect && VrCapeSkip(pipeline, index_offset);
+    if (!cape && Cape().monocular_player_draw) {
+        // The magnified eye drops the draw; the free eye keeps the body's cutaway near the
+        // camera (pushed per draw; a baked variant cannot carry both and draws it uncut).
+        Cape().monocular_free_cut = Cape().cut_request;
+        Cape().cut_request = Shader::VrCut::MonocularCode(Cape().monocular_eye);
+    }
     // AA image replacement and its outcome counters belong to recording.
     const bool aa_skip = false;
     Inspector& insp = Insp();
@@ -1670,7 +2106,8 @@ bool Rasterizer::VrFilterDraw(const GraphicsPipeline* pipeline, bool is_indexed,
         const auto& blend = key.blend_controls[0];
         LOG_INFO(Render_Vulkan,
                  "VRDRAWX f={} i={} skip={} vs={:#x} fs={:#x} n={} inst={} ind={} ib={:#x}/{} "
-                 "prim={} cb={:#x} db={:#x} dw={} blend={} cull={} vb={} vsb={} fsb={} tex={}{}",
+                 "prim={} cb={:#x} db={:#x} dw={} blend={} cull={} vb={} vsb={} fsb={} tex={} "
+                 "guest_vs={:#x} guest_fs={:#x}{}",
                  insp.frame, d.index, skip ? 1 : 0, d.vs, d.fs, d.n, d.instances,
                  indirect ? 2 : (is_indexed ? 1 : 0), d.ib, d.ib_size,
                  static_cast<u32>(regs.primitive_type), d.cb, d.db,
@@ -1678,6 +2115,8 @@ bool Rasterizer::VrFilterDraw(const GraphicsPipeline* pipeline, bool is_indexed,
                  static_cast<u32>(regs.polygon_control.cull_front) |
                      (static_cast<u32>(regs.polygon_control.cull_back) << 1),
                  BufList(d.vbs, true), BufList(d.vs_bufs, false), BufList(d.fs_bufs, false), tex,
+                 pipeline->GuestShaderKey(Shader::LogicalStage::Vertex),
+                 pipeline->GuestShaderKey(Shader::LogicalStage::Fragment),
                  aa_skip ? " aa=skip"
                  : false ? " aa=taa"
                          : (false ? " aa=smaa" : ""));
@@ -1714,7 +2153,7 @@ void Rasterizer::VrDrawsEndFrame() {
     cs.others_next.clear();
     if (++cs.frame_no % 256 == 0) {
         std::erase_if(cs.theirs, [&](const auto& entry) {
-            return std::ranges::all_of(entry.second,
+            return std::ranges::all_of(entry.second.places,
                                        [&](const auto& t) { return t.until < cs.frame_no; });
         });
     }

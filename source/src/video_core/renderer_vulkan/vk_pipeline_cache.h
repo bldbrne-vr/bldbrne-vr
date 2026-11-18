@@ -5,6 +5,7 @@
 #pragma once
 #include <algorithm>
 #include <atomic>
+#include <filesystem>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -21,6 +22,7 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
+#include "shader_recompiler/vr_push_data.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/fast_render.h"
 #include "video_core/pipeline_cache_policy.h"
@@ -58,6 +60,9 @@ namespace Vulkan {
 class Instance;
 class Scheduler;
 class ShaderCache;
+namespace MergedEyes {
+class Compiler;
+}
 
 struct Program {
     struct Module {
@@ -70,6 +75,12 @@ struct Program {
         u64 vertex_output_locations{};
         std::shared_ptr<const Shader::Gcn::FetchShaderSnapshot> fetch_snapshot;
         u32 fetch_snapshot_tries{}; // failed snapshot lookups: retried every 64th selection
+        // Its own resources, when its translation declared others than the program's `info`
+        // (null: the program's). A VR pass that adds buffers in some permutations only (the AO
+        // pass's shadow buffers in its multiview one) made such a permutation's pipeline take the
+        // first permutation's descriptor layout: a texture's descriptor read as a buffer's, a GPU
+        // fault (2026-11-13, the headset's title-to-world crash). SameResources decides.
+        std::shared_ptr<Shader::Info> info;
     };
     static constexpr size_t MaxPermutations = 8;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
@@ -114,16 +125,27 @@ struct Program {
         : info{stage, l_stage, params} {}
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec, u64 id,
-                   u64 vertex_output_locations) {
+                   u64 vertex_output_locations, std::shared_ptr<Shader::Info> own = {}) {
+        spec.info = own ? own.get() : &info;
         modules.emplace_back(module, std::move(spec), id, vertex_output_locations);
+        modules.back().info = std::move(own);
         PerfMemo::BumpEpoch();
     }
 
     void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
-                      size_t perm_idx, u64 id, u64 vertex_output_locations) {
+                      size_t perm_idx, u64 id, u64 vertex_output_locations,
+                      std::shared_ptr<Shader::Info> own = {}) {
+        // The deserializer's temporary Program may be destroyed as soon as this returns.
+        spec.info = own ? own.get() : &info;
         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
         modules[perm_idx] = {module, std::move(spec), id, vertex_output_locations};
+        modules[perm_idx].info = std::move(own);
         PerfMemo::BumpEpoch();
+    }
+
+    // The resources permutation `index` declares (its own, else the program's).
+    [[nodiscard]] Shader::Info& InfoOf(size_t index) {
+        return index < modules.size() && modules[index].info ? *modules[index].info : info;
     }
 
     // A permutation of this program is named `id` (the warm-up's gaps are none).
@@ -132,6 +154,19 @@ struct Program {
             modules, [id](const Module& m) { return m.spec.Valid() && m.id == id; });
     }
 };
+
+// Whether two translations of a program declare the same resources, in the same order, with
+// what their descriptors and bindings depend on (the descriptor layout, the user data pushed, the
+// flattened user data's size). A permutation that does not gets its own Info (Program::Module).
+[[nodiscard]] bool SameResources(const Shader::Info& a, const Shader::Info& b);
+
+// Whether a pipeline's stages line up: each one's bindings start (its specialization's `start`)
+// where the stages before it end, in the descriptor layout's order (GraphicsPipeline::
+// BuildDescSetLayout; the selection's too). A pipeline put together outside the draw path (the
+// warm-up, the startup shader build) that does not would read one stage's descriptors as
+// another's; it is never built (the draw path selects and compiles its own).
+[[nodiscard]] bool BindingsLineUp(std::span<const Shader::Info* const> infos,
+                                  std::span<const Shader::Backend::Bindings> starts);
 
 // Mutable inputs and outputs of one selection. Render-side calls retain one instance;
 // preparation workers will supply independent instances and copied register inputs.
@@ -321,6 +356,21 @@ const PreparedDraw* NextPreparedDraw(GraphicsSubmission& submission, size_t offs
 class GraphicsPreparation;
 struct PipelinePreparation;
 
+// A light rectangle's light-shadow level this session (RuntimeInfo::vr_light_shadows,
+// light_shadow.h Level: 0, 1, 2 High): the one rule for compiling, loading cached permutations
+// and the start-up build. High is read once, at the first call (a change in the game's menu
+// applies at the next start: no lamp program is compiled again mid-session for it).
+u8 VrLightShadowLevel();
+// High lamp shadows this session (the hero lamps' march: the CPU's pick, SlotHero), read once.
+bool VrLightShadowHigh();
+// The lamp shadows on this session (VrLightShadowLevel above 0): the AO pass's lamp work
+// (RuntimeInfo::VrAoLampShadows) and the CPU's scene maps, mask, grid and body maps only then.
+bool VrLampShadowsOn();
+// The CPU's side of the scene maps and the mask (light_shadow.h SceneMaps Enabled, Mask): their
+// switches and the session's lamp shadows.
+bool VrSceneMapsOn();
+bool VrSceneMaskOn();
+
 class PipelineCache {
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
@@ -328,6 +378,10 @@ public:
     ~PipelineCache();
 
     void WarmUp();
+    // The startup shader build (vk_shader_prebuild.cpp): after the warm-up, the shader list's
+    // permutations and pipelines this cache lacks, from the game's own shader archives; then
+    // The Old Hunters' list, when the add-on is installed.
+    void PrebuildFromList();
     void Sync();
 
     // The warm-up's loaders: false = not preloaded, `load_reject` says why (the pipeline is then
@@ -458,6 +512,7 @@ public:
     // The vr_cut value a cut variant is built and kept with: the cut itself, or with VrPushData
     // only its flag (one variant serves every radius).
     u32 VrCutVariant(u32 cut) const {
+        if (Shader::VrCut::MonocularEye(cut) >= 0) return cut;
         return cut != 0 && UsesVrPushData() ? 1u : cut;
     }
     // The vr_motion a motion variant is built and kept with: the motion buffers' addresses too,
@@ -472,6 +527,9 @@ public:
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
                               std::optional<Shader::Gcn::FetchShaderData>, u64>;
+    // A new permutation's own Info when its resources differ from the program's (Program::Module).
+    std::shared_ptr<Shader::Info> OwnResources(Shader::Info&& translated,
+                                               const Shader::Info& program_info, size_t perm_idx);
     Result GetProgram(PipelineSelection& selection, Shader::Stage stage, Shader::LogicalStage l_stage,
                       const Shader::ShaderParams& params, Shader::Backend::Bindings& binding,
                       std::optional<Shader::Gcn::FetchShaderData>* spare_fetch = nullptr,
@@ -510,6 +568,8 @@ private:
                                    const Shader::StageSpecialization* wanted = nullptr);
     const Shader::RuntimeInfo& BuildRuntimeInfo(PipelineSelection& selection, Shader::Stage stage, Shader::LogicalStage l_stage,
                                                 u32 view_mask);
+    // VR_MERGED_EYES: `pipeline` (just selected for this dispatch) has its variant wanted.
+    void BuildMergedEyes(const ComputePipeline& pipeline);
 
     // perf_spec_memo: the permutation of `program` remembered for these inputs, or -1. `proj`
     // receives the projection of the bound sharps (with the remembered fetch shader's attributes
@@ -534,6 +594,11 @@ public:
     const GraphicsPipeline* GetVrMotionPipeline(const GraphicsPipeline* base,
                                                 const Shader::VrMotion& motion, bool wait = true,
                                                 bool* deferred = nullptr);
+    // Render-owner only. The body-map capture variant of a draw of the hunter's in the moon's
+    // shadow pass (Shader::VrMotion::Capture, vr_body_maps.h): its vertex stage also stores its
+    // clip position. Null when it cannot carry one, and while it compiles in the background
+    // (never waited for; not cached on disk).
+    const GraphicsPipeline* GetVrCapturePipeline(const GraphicsPipeline* base);
 
     // perf_spec_memo statistics and shadow-check results (the CP thread; read and reset by the
     // rasterizer's 5 s 'VR perf check:' line).
@@ -637,6 +702,13 @@ private:
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;
+    // VR_MERGED_EYES (vr_merged_eyes.h): the thread translating merged variants and building their
+    // pipelines (made at the first variant); reset first in the destructor.
+    std::unique_ptr<MergedEyes::Compiler> merged_compiler;
+    // VR_EYE_SPEC (vr_eye_spec_variants.h): the thread building eye-shared variants (made in the
+    // constructor when it is on, published in EyeSpecVariants::g_compiler); reset first in the
+    // destructor, before any pipeline or the device.
+    std::unique_ptr<EyeSpecVariants::Compiler> eye_spec_compiler;
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
@@ -655,12 +727,18 @@ private:
         AsyncInFlight job;
     };
     tsl::robin_map<const GraphicsPipeline*, VrMotionPending> vr_motion_pending;
+    // Body-map capture variants (GetVrCapturePipeline): ready, still compiling, or impossible
+    // (null, remembered so it is not asked again).
+    tsl::robin_map<const GraphicsPipeline*, const GraphicsPipeline*> vr_capture_pipelines;
+    tsl::robin_map<const GraphicsPipeline*, AsyncInFlight> vr_capture_pending;
     PipelineCachePolicy::Reject load_reject{}; // why the last Load*Pipeline returned false
     bool load_other_mode{}; // a stage of the pipeline being loaded is the other mode's
     bool load_motion_idle{}; // ... an object-motion variant's, and the session has no upscaler
     // The loaded stages' own runtime infos (LoadPipelineStage), for the pipeline created from
     // them: the loaders' own, so the render selection starts the session untouched.
     std::array<Shader::RuntimeInfo, MaxShaderStages> load_runtime_infos{};
+    // ... and where each loaded stage's bindings start (BindingsLineUp).
+    std::array<Shader::Backend::Bindings, MaxShaderStages> load_starts{};
     // The warm-up: the loaders queue each pipeline here (its stages loaded, a placeholder in the
     // map) and the pipelines are created on worker threads before the warm-up returns.
     struct PreloadJob {
@@ -678,6 +756,17 @@ private:
         std::unique_ptr<ComputePipeline> compute{};
     };
     std::vector<PreloadJob>* preload_jobs{};
+    // A graphics pipeline key blob of this build's layout (either naming's version, graphics),
+    // for PrebuildFromList; false for anything else.
+    static bool ReadGraphicsKeyBlob(std::vector<u8>&& blob, GraphicsPipelineKey& key,
+                                    GraphicsPipeline::SerializationSupport& sdata);
+    // A cached permutation the warm-up did not load (no cached pipeline uses it), loaded as the
+    // warm-up loads a stage (logical stage `stage`), for PrebuildFromList; false when the cache
+    // does not hold it whole.
+    bool LoadCachedPermutation(u64 perm_id, u32 stage);
+    // One list's startup build (PrebuildFromList): the game's, or The Old Hunters' (`dlc`: its own
+    // marker and log name).
+    void PrebuildList(const std::filesystem::path& dir, bool dlc);
     struct VrCutKey {
         const GraphicsPipeline* base;
         u32 cut;

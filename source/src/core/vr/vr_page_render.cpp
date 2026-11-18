@@ -52,8 +52,41 @@ constexpr float NumberDy = -11.0f + 40.5f - 6.4f + Ascent24 * 23.0f / 24.0f;
 constexpr float ButtonTextDx = -23.0f + 160.0f; // Text_0 #99 centre from the button's origin
 constexpr float ButtonTextDy = -31.6f + Ascent24;
 
+// The rendering state's line (the Upscaling tab) between the last row and the buttons.
+constexpr float GraphicsStatusBaseline = 646.0f + StripBandPx;
+// The rooms (stage px) of the texts drawn smaller when they are wider (Render): a choice's value
+// (to 16 px), an Action row's label (to 17 px), the help line (to 17 px), the rendering state
+// (20 px, to 18 px).
+constexpr float ValueRoom = 290.0f;
+constexpr float ActionRoom = 800.0f;
+constexpr float HelpRoom = 1418.1f - 501.6f - 16.0f; // the ornament rules, 8 px inside
+constexpr float StatusRoom = 880.0f;
+
 float ButtonOriginY(const View& view) {
-    return PageArt::ButtonY + ((view.tab == 6 || view.tab == 7) && !view.confirm ? 12.0f : 0.0f);
+    return PageArt::ButtonY + StripBandPx + (view.graphics && !view.confirm ? 12.0f : 0.0f);
+}
+
+// The sub-tab strip in its band under the title's rule: the pages' names centred on the panel, a
+// gap between them; the shown one in the title's gold with a hairline under it.
+constexpr float StripBaseline = StripRuleY + 6.0f + 0.5f * StripBandPx + 0.5f * Ascent24 - 2.0f;
+constexpr float StripGap = 72.0f;
+struct StripLayout {
+    std::vector<float> x, width;
+};
+StripLayout LayoutStrip(const View& view, const GameText::GameFont* font) {
+    StripLayout l;
+    float total = 0.0f;
+    for (const auto& name : view.subtabs) {
+        l.width.push_back(TextWidth(font, name));
+        total += l.width.back();
+    }
+    total += StripGap * static_cast<float>(std::max<size_t>(view.subtabs.size(), 1) - 1);
+    float x = PanelCentreX - 0.5f * total;
+    for (const float w : l.width) {
+        l.x.push_back(x);
+        x += w + StripGap;
+    }
+    return l;
 }
 
 float ButtonHalfWidth(const ButtonView& button) {
@@ -78,10 +111,22 @@ View MakeView(Model& model, const Glyphs& glyphs) {
     v.glyphs = glyphs;
     v.hover = s.hover;
     v.confirm = s.confirm;
+    v.page = s.page;
+    v.pages = tab.Pages();
+    if (v.pages > 1) {
+        for (int p = 0; p < v.pages; ++p) {
+            v.subtabs.emplace_back(tab.PageName(p));
+        }
+    }
+    v.strip_selected = s.focus == FocusStrip && !s.confirm;
+    v.graphics = tab.left.action == ButtonAction::RestartGraphics ||
+                 tab.left.action == ButtonAction::AcceptGraphics ||
+                 tab.right.action == ButtonAction::RestartGraphics ||
+                 tab.right.action == ButtonAction::AcceptGraphics;
+    const auto& headers = tab.HeadersOf(s.page);
     for (int h = 0; h < 2; ++h) {
-        v.headers[static_cast<size_t>(h)] = tab.headers[static_cast<size_t>(h)] != nullptr
-                                                ? tab.headers[static_cast<size_t>(h)]
-                                                : "";
+        v.headers[static_cast<size_t>(h)] =
+            headers[static_cast<size_t>(h)] != nullptr ? headers[static_cast<size_t>(h)] : "";
     }
     Store& store = model.GetStore();
     for (int slot = 0; slot < Slots; ++slot) {
@@ -107,7 +152,8 @@ View MakeView(Model& model, const Glyphs& glyphs) {
         v.buttons[0] = {true, "YES", s.confirm_yes == 1};
         v.buttons[1] = {true, "NO", s.confirm_yes == 0};
         v.help = s.confirm_restart ? "Save and restart the game? Progress since the last autosave may be lost."
-                                   : "Return this page to its defaults?";
+                                   : v.pages > 1 ? "Return this tab (all its pages) to its defaults?"
+                                                 : "Return this page to its defaults?";
         v.keys = {{KeyGlyph::DpadLR, "Select"}, {KeyGlyph::Confirm, "OK"}, {KeyGlyph::Back, "Return"}};
         return v;
     }
@@ -115,7 +161,11 @@ View MakeView(Model& model, const Glyphs& glyphs) {
                     s.focus == FocusLeftButton};
     v.buttons[1] = {tab.right.label != nullptr, tab.right.label != nullptr ? tab.right.label : "",
                     s.focus == FocusRightButton};
-    if (s.focus >= FocusLeftButton) {
+    if (v.strip_selected) {
+        v.help = "This tab's pages: left or right switches between them.";
+        v.keys = {{KeyGlyph::DpadLRValues, "Page"}, {KeyGlyph::DpadUD, "Select"},
+                  {KeyGlyph::Back, "Return"}};
+    } else if (s.focus == FocusLeftButton || s.focus == FocusRightButton) {
         const Button& b = s.focus == FocusLeftButton ? tab.left : tab.right;
         v.help = b.help != nullptr ? b.help : "";
         v.keys = {{KeyGlyph::DpadUD, "Select"}, {KeyGlyph::Confirm, "OK"}, {KeyGlyph::Back, "Return"}};
@@ -130,7 +180,8 @@ View MakeView(Model& model, const Glyphs& glyphs) {
         v.graphics_status = model.GraphicsPending()
             ? "Unsaved changes | ACCEPT to save. Return discards changes."
             : store.Get("graphics_status");
-        if (s.focus == 1 && s.tab == 6)
+        if (const Row* scale = model.RowAt(s.focus);
+            scale != nullptr && std::string_view(scale->id) == "graphics_scale")
             v.help = "-50% to +50% per dimension. Save and restart to change scene/output resolution.";
     }
     if (!s.notice.empty()) {
@@ -141,7 +192,7 @@ View MakeView(Model& model, const Glyphs& glyphs) {
 
 float RowTop(int slot) {
     const auto s = static_cast<size_t>(std::clamp(slot, 0, Slots - 1));
-    return PageArt::RowY[s] + RowShift[s];
+    return PageArt::RowY[s] + RowShift[s] + StripBandPx;
 }
 
 float HeaderBaseline(int group) {
@@ -171,6 +222,14 @@ std::vector<HitBox> HitBoxes(const View& view, const GameText::GameFont* font) {
                      t.prev_cx + 0.5f * t.prev_w + 4.0f, t.badge_cy + 18.0f});
     boxes.push_back({{Target::TabNext, -1}, t.next_cx - 0.5f * t.next_w - 4.0f, t.badge_cy - 18.0f,
                      t.next_cx + 0.5f * t.next_w + 4.0f, t.badge_cy + 18.0f});
+    if (view.pages > 1 && !view.confirm) {
+        const StripLayout l = LayoutStrip(view, font);
+        for (size_t p = 0; p < l.x.size(); ++p) {
+            boxes.push_back({{Target::PageTab, static_cast<int>(p)}, l.x[p] - 0.5f * StripGap,
+                             StripBaseline - 34.0f, l.x[p] + l.width[p] + 0.5f * StripGap,
+                             StripBaseline + 14.0f});
+        }
+    }
     for (int slot = 0; slot < Slots; ++slot) {
         const RowView& r = view.rows[static_cast<size_t>(slot)];
         if (!r.present || !r.enabled) {
@@ -222,7 +281,7 @@ Hover HitTest(const std::vector<HitBox>& boxes, float x, float y) {
         }
     }
     if (x >= PageArt::FrameX0 && x < PageArt::FrameX1 && y >= PageArt::FrameY0 &&
-        y < PageArt::FrameY1) {
+        y < PageArt::FrameY1 + StripBandPx) {
         return {Target::Page, -1};
     }
     return {};
@@ -280,23 +339,23 @@ bool Render(const Assets& assets, const View& v, Image& page_out, Image& glow_ou
             // in the headset that world, at another depth and redrawn every frame, read as the
             // page flickering and differing per eye: the play test of 2026-10-09); its soft edges
             // keep the game's dim (PanelDim). VR_PAGE_SEE_THROUGH=1: the game's dim everywhere.
+            // The frame with the sub-tab strip's band (TallFrame: Frame's order, then the
+            // strip's lower rule).
+            const auto& frame = TallFrameCached();
             for (int i = 0; i < PageArt::FrameBackdropCount; ++i) {
-                DrawPiece(page, assets, PageArt::Frame[i], 0.0f, 0.0f, false,
+                DrawPiece(page, assets, frame[static_cast<size_t>(i)], 0.0f, 0.0f, false,
                           PageArt::ScreenDimAlpha, 1e9f, true, PanelOpaque());
             }
-            if (!v.single_column) {
-                DrawPieces(page, assets, PageArt::Frame, 0.0f, 0.0f);
-            } else {
-                // Without the column divider and the panel texture's split halves.
-                const int n = static_cast<int>(std::size(PageArt::Frame));
-                for (int i = 0; i < n; ++i) {
-                    const bool texture =
-                        i >= PageArt::FrameTextureFirst && i < PageArt::FrameTextureEnd;
-                    const bool divider =
-                        i >= PageArt::FrameDividerFirst && i < PageArt::FrameDividerEnd;
-                    if (!texture && !divider) {
-                        DrawPiece(page, assets, PageArt::Frame[i], 0.0f, 0.0f, false, 1.0f);
-                    }
+            const int n = static_cast<int>(frame.size());
+            for (int i = 0; i < n; ++i) {
+                // A single-column page without the column divider and the texture's split halves.
+                const bool texture =
+                    i >= PageArt::FrameTextureFirst && i < PageArt::FrameTextureEnd;
+                const bool divider =
+                    i >= PageArt::FrameDividerFirst && i < PageArt::FrameDividerEnd;
+                if (!v.single_column || (!texture && !divider)) {
+                    DrawPiece(page, assets, frame[static_cast<size_t>(i)], 0.0f, 0.0f, false,
+                              1.0f);
                 }
             }
             cache = page.px;
@@ -315,6 +374,31 @@ bool Render(const Assets& assets, const View& v, Image& page_out, Image& glow_ou
         DrawText(page, font, v.headers[static_cast<size_t>(h)], HeaderX, HeaderBaseline(h),
                  Align::Left, HeaderTeal);
     }
+    // 3b. The sub-tab strip (a tab with pages): the shown page in gold with a hairline, the
+    //     others grey; selected, a soft gold band behind it (as the lamp page's rows).
+    if (v.pages > 1) {
+        const StripLayout l = LayoutStrip(v, font);
+        if (v.strip_selected) {
+            const float half = 0.5f * (l.x.back() + l.width.back() - l.x.front()) + 90.0f;
+            SelectionBand(page, PanelCentreX, StripBaseline - 8.0f, half, 1.0f);
+            SelectionBand(glow, PanelCentreX, StripBaseline - 8.0f, half, 0.5f);
+        }
+        for (size_t p = 0; p < l.x.size(); ++p) {
+            const bool shown = static_cast<int>(p) == v.page;
+            const bool hovered = v.hover.target == Target::PageTab && v.hover.index == static_cast<int>(p);
+            DrawText(page, font, v.subtabs[p], l.x[p], StripBaseline, Align::Left,
+                     shown ? TitleGold : hovered ? LabelSelected : TabDim);
+            if (shown) { // the hairline of the tab strip's shown tab (DrawTabStrip)
+                const int y = static_cast<int>(Canvas::ToY(StripBaseline + 8.0f));
+                const int x0 = static_cast<int>(Canvas::ToX(l.x[p] + 4.5f)),
+                          x1 = static_cast<int>(Canvas::ToX(l.x[p] + l.width[p] - 4.5f));
+                for (int x = x0; x < x1; ++x) {
+                    page.Over(x, y, 150 / 255.0f, 122 / 255.0f, 70 / 255.0f, 200 / 255.0f);
+                    page.Over(x, y + 1, 150 / 255.0f, 122 / 255.0f, 70 / 255.0f, 110 / 255.0f);
+                }
+            }
+        }
+    }
 
     // 4. Rows.
     for (int slot = 0; slot < Slots; ++slot) {
@@ -330,7 +414,7 @@ bool Render(const Assets& assets, const View& v, Image& page_out, Image& glow_ou
         }
         const Rgb ink = !r.enabled ? TabDim : r.selected ? LabelSelected : LabelGrey;
         if (r.widget == Widget::Action) {
-            constexpr float room = 800.f;
+            constexpr float room = ActionRoom;
             const float width = TextWidth(font, r.label);
             const float size = width > room ? std::max(17.f, 24.f * room / width) : 24.f;
             if (v.single_column) {
@@ -373,8 +457,9 @@ bool Render(const Assets& assets, const View& v, Image& page_out, Image& glow_ou
         } else {
             DrawPieces(page, assets, PageArt::ComboOrnament, ox, oy);
             const float value_width = TextWidth(font, r.value);
-            const float value_size =
-                value_width > 290 ? std::max(16.0f, 24.0f * 290 / value_width) : 24.0f;
+            const float value_size = value_width > ValueRoom
+                                         ? std::max(16.0f, 24.0f * ValueRoom / value_width)
+                                         : 24.0f;
             DrawText(page, font, r.value, ValueCentreX, oy + ValueDy, Align::Centre, ink, 1.0f,
                      value_size);
             if (r.selected && r.enabled) {
@@ -390,10 +475,10 @@ bool Render(const Assets& assets, const View& v, Image& page_out, Image& glow_ou
 
     // Current rendering state stays separate from the focused setting's help.
     if (!v.graphics_status.empty()) {
-        constexpr float room = 880.0f;
+        constexpr float room = StatusRoom;
         const float width = TextWidth(font, v.graphics_status);
         const float size = width > room ? std::clamp(24.0f * room / width, 18.0f, 20.0f) : 20.0f;
-        DrawText(page, font, v.graphics_status, PanelCentreX, 646.0f, Align::Centre,
+        DrawText(page, font, v.graphics_status, PanelCentreX, GraphicsStatusBaseline, Align::Centre,
                  HelpKhaki, 1.0f, size);
     }
 
@@ -406,7 +491,8 @@ bool Render(const Assets& assets, const View& v, Image& page_out, Image& glow_ou
         const bool mirror = b == 0;
         DrawPieces(page, assets, PageArt::ButtonOrnament, PageArt::ButtonX, ButtonOriginY(v),
                    mirror);
-        const bool framed = bv.label == "ACCEPT" || bv.label == "SAVE AND RESTART";
+        const bool framed = bv.label == "ACCEPT" || bv.label == "SAVE AND RESTART" ||
+                            bv.label == "Soft save" || bv.label == "Clear soft save";
         if (framed) {
             const float x0 = Canvas::ToX(ButtonCentreX(b) - ButtonHalfWidth(bv));
             const float x1 = Canvas::ToX(ButtonCentreX(b) + ButtonHalfWidth(bv));
@@ -431,15 +517,22 @@ bool Render(const Assets& assets, const View& v, Image& page_out, Image& glow_ou
         }
     }
 
-    // 6. The one-line help and the key guide (glyph, "：", text; letter spacing 2). A help line
-    //    wider than the frame's rules (a long notice, a long translation of the font) is drawn
-    //    smaller to fit inside them, never past the frame.
+    // 6. The help and the key guide (glyph, "：", text; letter spacing 2). A help line wider than
+    //    the frame's rules goes on two lines (as Show VR controls'), the same size (2026-10-30: 17
+    //    of the page's helps were drawn smaller, 5 of them past the frame even so); two still too
+    //    wide (a long notice, a long translation of the font) are drawn smaller to fit inside them.
     {
-        constexpr float HelpRoom = 1418.1f - 501.6f - 16.0f; // the ornament rules, 8 px inside
-        const float w = TextWidth(font, v.help);
-        const float size = w > HelpRoom ? std::max(24.0f * HelpRoom / w, 17.0f) : 24.0f;
-        DrawText(page, font, v.help, HelpCentreX, HelpBaseline, Align::Centre, HelpKhaki, 1.0f,
-                 size);
+        const auto lines = WrapHelp(font, v.help, HelpRoom);
+        float widest = 0.0f;
+        for (const auto& l : lines) {
+            widest = std::max(widest, TextWidth(font, l));
+        }
+        const float size = widest > HelpRoom ? std::max(24.0f * HelpRoom / widest, 17.0f) : 24.0f;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            const float up = HelpLinePitch * static_cast<float>(lines.size() - 1 - i);
+            DrawText(page, font, lines[i], HelpCentreX, HelpBaseline - up, Align::Centre,
+                     HelpKhaki, 1.0f, size);
+        }
     }
     DrawKeyGuide(page, assets, v.keys, v.glyphs);
 
@@ -491,6 +584,67 @@ void ToCompositorAlpha(Image& image) {
                                0.0722f * (decode[std::min(p[2] + t, 255)] - decode[p[2]]);
         p[3] = static_cast<u8>(std::clamp(1.0f - transmit, 0.0f, 1.0f) * 255.0f + 0.5f);
     }
+}
+
+std::vector<std::string> TextFitReport(const View& v, const GameText::GameFont* font) {
+    std::vector<std::string> out;
+    if (font == nullptr) {
+        return out;
+    }
+    // `w` drawn at full size up to `room`; smaller (the page's own fit) up to `smaller_room`.
+    const auto check = [&](const char* what, const std::string& text, float w, float room,
+                           float smaller_room) {
+        if (text.empty() || w <= room) {
+            return;
+        }
+        const bool fits = w <= smaller_room;
+        out.push_back(std::string{what} + " '" + text + "' " +
+                      std::to_string(static_cast<int>(std::lround(w))) + " of " +
+                      std::to_string(static_cast<int>(std::lround(room))) + " px: " +
+                      (fits ? "drawn smaller" : "OVER"));
+    };
+    // The headers: left-aligned, before the column divider.
+    for (const auto& h : v.headers) {
+        check("header", h, TextWidth(font, h), PanelCentreX - 12.0f - HeaderX, 0.0f);
+    }
+    for (const RowView& r : v.rows) {
+        if (!r.present) {
+            continue;
+        }
+        if (r.widget == Widget::Action) {
+            check("label", r.label, TextWidth(font, r.label), ActionRoom, ActionRoom * 24.f / 17.f);
+            continue;
+        }
+        // A label: right-aligned on the label column, from the headers' left edge.
+        check("label", r.label, TextWidth(font, r.label), LabelRight - HeaderX, 0.0f);
+        if (r.widget != Widget::Slider) {
+            check("value", r.value, TextWidth(font, r.value), ValueRoom, ValueRoom * 24.f / 16.f);
+        }
+    }
+    // The help: one line or two at full size (Render), else smaller.
+    for (const auto& l : WrapHelp(font, v.help, HelpRoom)) {
+        check("help line", l, TextWidth(font, l), HelpRoom, HelpRoom * 24.f / 17.f);
+    }
+    // The rendering state: 20 px up to its room, then down to 18 px (widths at 24 px).
+    check("status", v.graphics_status, TextWidth(font, v.graphics_status), StatusRoom * 24.f / 20.f,
+          StatusRoom * 24.f / 18.f);
+    for (const ButtonView& b : v.buttons) {
+        if (b.present) {
+            check("button", b.label, TextWidth(font, b.label), 2.0f * ButtonHalfWidth(b) - 24.0f,
+                  0.0f);
+        }
+    }
+    // The sub-tab strip: inside the frame's rules.
+    if (v.pages > 1 && !v.subtabs.empty()) {
+        const StripLayout l = LayoutStrip(v, font);
+        std::string names;
+        for (const auto& n : v.subtabs) {
+            names += (names.empty() ? "" : " | ") + n;
+        }
+        check("strip", names, l.x.back() + l.width.back() - l.x.front(),
+              PageArt::FrameX1 - PageArt::FrameX0 - 160.0f, 0.0f);
+    }
+    return out;
 }
 
 } // namespace VR::Page

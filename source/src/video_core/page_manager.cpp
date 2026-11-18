@@ -3,7 +3,10 @@
 
 #include <cstdlib>
 #include <boost/container/small_vector.hpp>
+#include <atomic>
+#include <chrono>
 #include "common/assert.h"
+#include "video_core/ds_ab.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/range_lock.h"
@@ -206,10 +209,58 @@ struct PageManager::Impl {
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
+        if (ProtectCensus()) [[unlikely]] {
+            NoteProtect(size, True(perms & Core::MemoryPermission::Write));
+        }
         impl.Protect(address, size, perms);
     }
 
+    // VR_PROTECT_CENSUS=1 (diagnostic, off by default): the protection changes a second, write
+    // watches set (protect) and lifted (unprotect), their calls and sizes; every 5 s a line.
+    static bool ProtectCensus() {
+        static const bool on = [] {
+            const char* v = std::getenv("VR_PROTECT_CENSUS");
+            return v && v[0] == '1';
+        }();
+        return on;
+    }
+    static void NoteProtect(size_t size, bool unprotect) {
+        static std::atomic<u64> calls[2]{}, bytes[2]{}, pages_one[2]{};
+        static std::atomic<s64> last_ns{0};
+        const int k = unprotect ? 1 : 0;
+        calls[k].fetch_add(1, std::memory_order_relaxed);
+        bytes[k].fetch_add(size, std::memory_order_relaxed);
+        if (size <= 4096) {
+            pages_one[k].fetch_add(1, std::memory_order_relaxed);
+        }
+        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        s64 last = last_ns.load(std::memory_order_relaxed);
+        if (last == 0) {
+            last_ns.compare_exchange_strong(last, now);
+            return;
+        }
+        if (now - last < 5'000'000'000 || !last_ns.compare_exchange_strong(last, now)) {
+            return;
+        }
+        const double s = double(now - last) / 1e9;
+        u64 c[2], b[2], o[2];
+        for (int i = 0; i < 2; ++i) {
+            c[i] = calls[i].exchange(0);
+            b[i] = bytes[i].exchange(0);
+            o[i] = pages_one[i].exchange(0);
+        }
+        LOG_INFO(Render, "VR protect census: protect {:.0f}/s ({:.0f} KiB avg, {:.0f}% one page), "
+                         "unprotect {:.0f}/s ({:.0f} KiB avg, {:.0f}% one page)",
+                 double(c[0]) / s, c[0] ? double(b[0]) / double(c[0]) / 1024.0 : 0.0,
+                 c[0] ? 100.0 * double(o[0]) / double(c[0]) : 0.0, double(c[1]) / s,
+                 c[1] ? double(b[1]) / double(c[1]) / 1024.0 : 0.0,
+                 c[1] ? 100.0 * double(o[1]) / double(c[1]) : 0.0);
+    }
+
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
+        FastRender::NoteAnyFault();
         if (const auto hook = fault_hook.load(std::memory_order_acquire);
             hook != nullptr && hook(context, fault_address)) [[unlikely]] {
             return true;
@@ -264,10 +315,14 @@ struct PageManager::Impl {
         // Iterate requested pages
         const u64 aligned_addr = page << PM_PAGE_BITS;
         const u64 aligned_end = page_end << PM_PAGE_BITS;
-        if (!rasterizer->IsMapped(aligned_addr, aligned_end - aligned_addr)) {
-            LOG_WARNING(Render,
-                        "Tracking memory region {:#x} - {:#x} which is not fully GPU mapped.",
-                        aligned_addr, aligned_end);
+        // A warning only: logs-off builds skip the check (a recursive shared lock each time);
+        // VR_DS_AB=a's on windows skip it too, to measure that.
+        if (Common::Log::Enabled && !(DsAb::Mode() == 'a' && DsAb::FixesOn())) {
+            if (!rasterizer->IsMapped(aligned_addr, aligned_end - aligned_addr)) {
+                LOG_WARNING(Render,
+                            "Tracking memory region {:#x} - {:#x} which is not fully GPU mapped.",
+                            aligned_addr, aligned_end);
+            }
         }
 
         for (; page != page_end; ++page) {

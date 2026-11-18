@@ -25,6 +25,8 @@
 #include "video_core/renderer_vulkan/openxr_presenter.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vr_dlss_runtime.h"
+#include "video_core/renderer_vulkan/vr_nvidia_profile.h"
+#include "video_core/renderer_vulkan/vr_overlay_guard.h"
 #include "core/vr/vr_session.h"
 
 #ifdef __APPLE__
@@ -279,6 +281,11 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     }();
     setenv("VK_DRIVER_FILES", icd_path.c_str(), true);
 #endif
+
+    // Before the loader looks for layers: GPU Tweak III's OSD layer stays out.
+    KeepOverlayLayersOut();
+    // Before the driver loads: it reads its application profile then.
+    ApplyNvidiaPowerProfile();
 
     static vk::detail::DynamicLoader dl;
     VULKAN_HPP_DEFAULT_DISPATCHER.init(

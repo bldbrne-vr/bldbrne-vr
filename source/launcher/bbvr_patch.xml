@@ -10,6 +10,16 @@
         <ID>CUSA03023</ID>
         <ID>CUSA03173</ID>
     </TitleID>
+    <Metadata Title="Bloodborne" Name="Intel 12th Gen+ SFX workaround" Note="Skip dangerous SFX. Skips part of the effects code; may remove effects. On by default; disable in the launcher at your own risk of attack/effects crashes." Author="emoose" PatchVer="1.0" AppVer="01.09" AppElf="eboot.bin" isEnabled="true">
+        <PatchList>
+            <Line Type="bytes" Address="0x02CF83E0" Value="c3" />
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Bloodborne" Name="Non-aggro mode" Note="Kyo's Player Stealth: enemies do not see or react to you unless attacked. Off by default; the launcher's Non-aggro mode turns it on." Author="Kyo" PatchVer="1.0" AppVer="01.09" AppElf="eboot.bin" isEnabled="false">
+        <PatchList>
+            <Line Type="bytes" Address="0x0593E88E" Value="01" />
+        </PatchList>
+    </Metadata>
     <Metadata Title="Bloodborne" Name="Skip Intro + warning message" Author="illusion, Kyo" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true">
         <PatchList>
             <Line Type="bytes32" Address="0x04d99138" Value="0x00000000" />
@@ -327,10 +337,10 @@
             <Line Type="bytes" Address="0x00B6E67A" Value="BB01000000909090909090" />
         </PatchList>
     </Metadata>
-    <Metadata Title="Bloodborne" Name="Resolution Patch 1456x1576 VR" Note="Generated from Kyo's 4:3 patch: render 1456x1576, UI canvas 1920x2078. Needs extra_dmem_in_mbytes 4000." Author="Kyo (template), bloodborne-vr" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true">
+    <Metadata Title="Bloodborne" Name="Resolution Patch 1456x1576 VR" Note="Generated from Kyo's 4:3 patch: render 1456x1576, UI canvas 1920x2078. Graphics heaps 4080 + 2304 MiB (Kyo's 3952 + 2560: the first raised to near its 32-bit limit, the second trimmed; it only fills when the first is full). Needs extra_dmem_in_mbytes 3500." Author="Kyo (template), bloodborne-vr" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true">
         <PatchList>
-            <Line Type="bytes" Address="0x04b36dda" Value="00f7" />
-            <Line Type="bytes" Address="0x04b36de2" Value="00a0" />
+            <Line Type="bytes" Address="0x04b36dda" Value="00ff" />
+            <Line Type="bytes" Address="0x04b36de2" Value="0090" />
             <Line Type="bytes32" Address="0x055289f8" Value="0x000000a0" />
             <Line Type="bytes32" Address="0x055289fc" Value="0x0000005a" />
             <Line Type="bytes" Address="0x0183A35D" Value="F3816C3F" />
@@ -446,4 +456,4 @@
             <Line Type="bytes" Address="0x026A07D4" Value="488DB560F7FFFFB9090000004C8B8578F1FFFFE86484BBFEC7430C030000004889DF488DB560F7FFFFBA34000000B9090000004C8B8578F1FFFFE83D84BBFE41B7010F1F4000" />
         </PatchList>
     </Metadata>
-<Metadata Title="Bloodborne" Name="VR limiter sleep path" Author="bloodborne-vr" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true"><PatchList><Line Type="bytes" Address="0x02434ADA" Value="E99B00000090" /></PatchList></Metadata><Metadata Title="Bloodborne" Name="VR limiter 1ms tail" Author="bloodborne-vr" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true"><PatchList><Line Type="bytes" Address="0x02434BAC" Value="E0478F02" /><Line Type="bytes" Address="0x02434BB6" Value="9E498F02" /></PatchList></Metadata></Patch>
+<Metadata Title="Bloodborne" Name="Scratch limiter sleep path" Author="scratchpad" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true"><PatchList><Line Type="bytes" Address="0x02434ADA" Value="E99B00000090" /></PatchList></Metadata><Metadata Title="Bloodborne" Name="Scratch limiter 1ms tail" Author="scratchpad" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true"><PatchList><Line Type="bytes" Address="0x02434BAC" Value="E0478F02" /><Line Type="bytes" Address="0x02434BB6" Value="9E498F02" /></PatchList></Metadata></Patch>

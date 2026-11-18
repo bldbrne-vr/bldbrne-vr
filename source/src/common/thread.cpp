@@ -4,9 +4,12 @@
 // SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
 #include <ctime>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "core/libraries/kernel/threads/pthread.h"
 
@@ -108,6 +111,94 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
         break;
     }
     SetThreadPriority(handle, windows_priority);
+    if (new_priority >= ThreadPriority::High) {
+        // These threads pace the frame (renderer stages, recorder): never power-throttled, so a
+        // hybrid CPU keeps them on its performance cores (see DisableProcessPowerThrottling).
+        THREAD_POWER_THROTTLING_STATE state{};
+        state.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+        state.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+        state.StateMask = 0;
+        SetThreadInformation(handle, ThreadPowerThrottling, &state, sizeof(state));
+    }
+}
+
+int DisableProcessPowerThrottling() {
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+    PROCESS_POWER_THROTTLING_STATE state{};
+    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    state.ControlMask =
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    state.StateMask = 0; // both off: full speed, timer requests honoured
+    if (SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state,
+                              sizeof(state))) {
+        return 2;
+    }
+    // Before Windows 11 the timer bit is unknown: execution speed alone still applies.
+    state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    return SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state,
+                                 sizeof(state))
+               ? 1
+               : 0;
+}
+
+int PreferPerformanceCores() {
+    // The fastest cores, read once: the CPU sets with the highest efficiency class. Empty when
+    // every core has the same class, so nothing is preferred.
+    // VR_ANY_CORE=1: no preference, for A/B tests.
+    static const std::vector<ULONG> fastest = [] {
+        std::vector<ULONG> ids;
+        if (const char* any = std::getenv("VR_ANY_CORE"); any && *any == '1') {
+            return ids;
+        }
+        ULONG length = 0;
+        GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+        if (length == 0) {
+            return ids;
+        }
+        std::vector<u8> buffer(length);
+        auto* const first = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data());
+        if (!GetSystemCpuSetInformation(first, length, &length, GetCurrentProcess(), 0)) {
+            return ids;
+        }
+        BYTE lowest = 0xff;
+        BYTE highest = 0;
+        for (ULONG offset = 0; offset < length;) {
+            const auto* const set = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(
+                buffer.data() + offset);
+            if (set->Type == CpuSetInformation) {
+                lowest = std::min(lowest, set->CpuSet.EfficiencyClass);
+                highest = std::max(highest, set->CpuSet.EfficiencyClass);
+            }
+            offset += set->Size;
+        }
+        if (lowest >= highest) {
+            return ids;
+        }
+        for (ULONG offset = 0; offset < length;) {
+            const auto* const set = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(
+                buffer.data() + offset);
+            if (set->Type == CpuSetInformation && set->CpuSet.EfficiencyClass == highest) {
+                ids.push_back(set->CpuSet.Id);
+            }
+            offset += set->Size;
+        }
+        return ids;
+    }();
+    static const bool logged = [] {
+        LOG_BENCHMARK_INFO(Common, "Fast-core preference for the render threads: {}",
+                           fastest.empty() ? std::string{"none (all cores alike)"}
+                                           : fmt::format("{} cores", fastest.size()));
+        return true;
+    }();
+    (void)logged;
+    if (fastest.empty() ||
+        !SetThreadSelectedCpuSets(GetCurrentThread(), fastest.data(),
+                                  static_cast<ULONG>(fastest.size()))) {
+        return 0;
+    }
+    return static_cast<int>(fastest.size());
 }
 
 bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
@@ -136,6 +227,14 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 }
 
 #else
+
+int DisableProcessPowerThrottling() {
+    return 0;
+}
+
+int PreferPerformanceCores() {
+    return 0;
+}
 
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
     pthread_t this_thread = pthread_self();

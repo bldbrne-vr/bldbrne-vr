@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <thread>
+#include <utility>
 #include <immintrin.h>
 #include "video_core/fast/b_handler_profile.h"
 #include "video_core/fast/busy_clock.h"
@@ -17,6 +18,7 @@
 #include "common/logging/log.h"
 #include "common/rdtsc.h"
 #include "common/thread.h"
+#include "video_core/diag_delay.h"
 #include "video_core/fast_render.h"
 
 namespace Vulkan {
@@ -33,6 +35,17 @@ inline const bool g_pipe_idle_clock = [] {
 inline const bool g_pipe_idle_clock_verify = [] {
     const char* value = std::getenv("FAST_CPU_IDLE_CLOCK_VERIFY");
     return value && value[0] == '1';
+}();
+// FAST_CPU_PIPE_PREFETCH=<cache lines> (default 128, 0 off; read once at start-up): before
+// handling a packet, stage B prefetches that many 64-byte lines of the next one, if published
+// (ByteRing::PrefetchNext). Decoding a packet was mostly cache misses on what stage A had just
+// written on another core: 2026-10-23, the B profile's `replay` 675 -> 348 us per frame at 64
+// lines (24: 507, 48: 386, 128: 294, 256: 281); FPS +2.8% at 64 against off and +0.5% more at 128
+// (3 rounds each).
+inline const unsigned g_pipe_prefetch_lines = [] {
+    const char* value = std::getenv("FAST_CPU_PIPE_PREFETCH");
+    const long lines = value ? std::strtol(value, nullptr, 10) : 128;
+    return unsigned(std::clamp(lines, 0l, 256l));
 }();
 
 class DrawPipe {
@@ -74,6 +87,7 @@ public:
             std::memcpy(destination + sizeof(envelope), packet.data(), packet.size());
         ring.Commit();
         Signal();
+        FastRender::DiagDelay::At(FastRender::DiagDelay::A);
         return ring.Published();
     }
     template <class Encode>
@@ -84,6 +98,7 @@ public:
         encode(destination + sizeof(envelope));
         ring.Commit();
         Signal();
+        FastRender::DiagDelay::At(FastRender::DiagDelay::A);
         return ring.Published();
     }
     bool Pending(u64 ticket) const {
@@ -124,6 +139,11 @@ public:
     u64 Published() const {
         return ring.Published();
     }
+    // Consumer only, from a handler: run once before releasing the final queued packet.
+    // Keep the callback inside that packet's ownership interval so Drain/Wait covers it too.
+    void BeforeIdle(void (*hook)(void*)) {
+        before_idle = hook;
+    }
 
 private:
     void Signal() {
@@ -137,11 +157,18 @@ private:
         FastRender::g_on_stage_b = true;
         Common::SetCurrentThreadName("fast:StageB");
         Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+        Common::PreferPerformanceCores();
         FastRender::RegisterThread(FastRender::Role::StageB);
+        // FAST_PIPE_SPIN_US, else 50 us with 8 or more CPUs to run on and none with fewer, as the
+        // recorder's (vk_recorder.cpp CommandRecorder::Run has the 2026-11-04 A/Bs; 200 us
+        // against 50 on 8c/16t: no difference).
         const auto spin = std::chrono::microseconds([] {
             const char* value = std::getenv("FAST_PIPE_SPIN_US");
-            return value ? std::clamp(std::atoi(value), 0, 1000) : 50;
+            return value ? std::clamp(std::atoi(value), 0, 1000)
+                         : FastRender::ProcessCpus() >= 8 ? 50 : 0;
         }());
+        LOG_INFO(Render_Vulkan, "fast:StageB idle spin {} us ({} CPUs to run on)", spin.count(),
+                 FastRender::ProcessCpus());
         // Fenced timestamps only for the detailed B profile; handler_ticks tolerates the skew.
         const bool b_profile = FastRender::BProfile::Enabled();
         // FAST_CPU_IDLE_CLOCK: the detailed B profile keeps the per-packet timestamps it needs.
@@ -164,11 +191,16 @@ private:
                     idle = true;
                     CloseWindow(busy, check, clock_verify);
                 }
-                const auto until = std::chrono::steady_clock::now() + spin;
+                // In-run A/B switch 6 cleared: no idle spin (straight to the wait), for weak CPUs;
+                // 10 cleared: four times as long (fewer sleeps for stage A's pushes to wake).
+                const auto spin_now = !FastRender::AbOn(6) ? std::chrono::microseconds{0}
+                                      : FastRender::AbOn(10) ? spin
+                                                             : spin * 4;
+                const auto until = std::chrono::steady_clock::now() + spin_now;
                 if (idle_clock) {
                     // The clock every 64 pauses (bbport: 256), not after each one.
                     for (u32 pauses = 1;
-                         spin.count() && packet.empty() && !stop.stop_requested(); ++pauses) {
+                         spin_now.count() && packet.empty() && !stop.stop_requested(); ++pauses) {
                         _mm_pause();
                         packet = ring.Peek();
                         if ((pauses & 63) == 0 && std::chrono::steady_clock::now() >= until)
@@ -190,6 +222,8 @@ private:
                 sleeping.store(false, std::memory_order_seq_cst);
                 continue;
             }
+            if (g_pipe_prefetch_lines)
+                ring.PrefetchNext(g_pipe_prefetch_lines);
             Envelope envelope;
             std::memcpy(&envelope, packet.data(), sizeof(envelope));
             if (task_hook && envelope.handler != default_handler)
@@ -220,7 +254,13 @@ private:
                 total.store(total.load(std::memory_order_relaxed) + handler_ticks,
                             std::memory_order_relaxed);
             }
+            if (before_idle && ring.IsLastPacket()) {
+                // Before publishing completion: a Drain transfers scheduler ownership to A.
+                const auto hook = std::exchange(before_idle, nullptr);
+                hook(default_context);
+            }
             ring.Release();
+            FastRender::DiagDelay::At(FastRender::DiagDelay::B);
             if constexpr (Common::Log::Enabled) {
                 if ((++handled & ((u64{1} << 18) - 1)) == 0)
                     ReportPipe(check, clock_verify);
@@ -308,6 +348,7 @@ private:
     Handler default_handler;
     void* default_context;
     void (*const task_hook)(void*);
+    void (*before_idle)(void*){}; // consumer only
     FastRender::ByteRing<> ring;
     std::atomic<u64> ready{0};
     std::atomic<bool> sleeping{false};

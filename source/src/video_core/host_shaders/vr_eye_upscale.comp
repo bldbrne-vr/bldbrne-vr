@@ -23,6 +23,8 @@
 //   VR_VIGNETTE (with either): this dispatch writes the eye last (the late warp, vr.ini
 //            vignette_in_warp): the frame's vignettes are blended into it on the way out
 //            (renderer_vulkan/vr_vignette_warp.h, mirrored line by line below).
+//   VR_RIPOSTE (with VR_VIGNETTE): while a visceral's burst shows (vr.ini riposte_style), it goes
+//            over the vignettes (vr_riposte.glsl; its brightness from vr_riposte_meter.comp).
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_ARB_shading_language_420pack : enable
@@ -131,7 +133,60 @@ layout(set = 0, binding = 2, std140) uniform VignetteData {
     vec4 vg_tan[2];     // tan of angleLeft, angleRight, angleUp, angleDown
     vec4 vg_item[42];   // 7 per vignette: axis x, y, z (normal), origin (w = distance), colour
                         // (linear rgb, a = opacity), params (x, y, z power, w mode), wedge
+    vec4 vg_riposte;    // x = a visceral's burst (vr.ini riposte_style), 0 .. 1
+    vec4 vg_ritual;     // the Kos ritual's vision (vr_kos_ritual.glsl): rise, burst, clock, seed
 };
+
+#ifdef VR_RIPOSTE
+// The burst variants (with VR_VIGNETTE; vr.ini riposte_style, run only while the burst shows):
+// the view's brightness for both eyes, this frame's (vr_riposte_meter.comp).
+layout(set = 0, binding = 3, std430) readonly buffer RiposteMeter {
+    vec4 riposte_meter;
+};
+
+// The burst's taps (vr_riposte.glsl): the eye's own stored texels in the rect being read
+// (riposte_lo .. riposte_hi), nearest (no sampler in this pass: one fetch each, the spacing whole
+// texels), their sRGB bytes decoded with gamma 2 (only their brightness is used; the meter
+// decodes the same way), in RGB order.
+ivec2 riposte_lo = ivec2(0);
+ivec2 riposte_hi = ivec2(0);
+vec3 RiposteDecode(vec3 e) {
+    return vg_head.y != 0u ? (e * e).bgr : e * e;
+}
+vec3 RiposteFetch(vec2 p) {
+    return RiposteDecode(texelFetch(in_tex, clamp(ivec2(floor(p)), riposte_lo, riposte_hi), 0).rgb);
+}
+#define RIPOSTE_SPACING(size) max(1.0, floor((size).x / 640.0 * 1.5 + 0.5))
+#include "vr_riposte.glsl"
+#endif
+
+#ifdef VR_KOS_IRIS
+layout(set = 0, binding = 4) uniform sampler2D kos_iris;
+#endif
+#include "vr_kos_ritual.glsl"
+#ifdef VR_KOS_IRIS
+float KosRitualPixelSpan() {
+    const vec4 tn = vg_tan[min(pc.vig.x, 1u)];
+    const vec2 span = abs(tn.yw - tn.xz) / max(vec2(pc.dst.zw), vec2(1.0));
+    return max(span.x, span.y) * KosRitualScale;
+}
+#endif
+// The ritual's fold reads the eye's input at a point of the view's frame (KosRitualFetch): its
+// tangent, through the eye's field (kos_tn) into the rect being read (EASU: the eye's own image;
+// RCAS: pc.src, 1:1), nearest (no sampler in this pass), decoded as the vignettes decode.
+vec4 kos_tn = vec4(-1.0, 1.0, 1.0, -1.0);
+vec2 kos_origin = vec2(0.0);
+vec2 kos_size = vec2(1.0);
+ivec2 kos_lo = ivec2(0);
+ivec2 kos_hi = ivec2(0);
+vec3 KosRitualFetch(vec2 c) {
+    const vec2 tc = c / KosRitualScale;
+    const vec2 uv = vec2((tc.x - kos_tn.x) / (kos_tn.y - kos_tn.x),
+                         (tc.y - kos_tn.z) / (kos_tn.w - kos_tn.z));
+    const ivec2 q = clamp(ivec2(floor(kos_origin + uv * kos_size)), kos_lo, kos_hi);
+    const vec3 e = VgSrgbToLinear(clamp(texelFetch(in_tex, q, 0).rgb, 0.0, 1.0));
+    return vg_head.y != 0u ? e.bgr : e;
+}
 
 // The ring mesh's profile (aux.y) at a ring angle (VrOverlay::BuildMesh(MeshId::Vignette)).
 float VgRingProfile(float a) {
@@ -175,11 +230,15 @@ bool VgSampleRing(float r, out float angle, out float profile) {
     return true;
 }
 
-// vr_overlay.frag's ShadeVignette at plane coordinates t of vignette i.
-float VgAlpha(uint i, vec2 t) {
+#include "vr_status_veins.glsl"
+
+// vr_overlay.frag's ShadeVignette at plane coordinates t of vignette i; `col` its colour there
+// (linear, RGB order: the item's, or a status look's own in the corners).
+float VgAlpha(uint i, vec2 t, out vec3 col) {
     const vec4 color = vg_item[7u * i + 4u];
     const vec4 params = vg_item[7u * i + 5u];
     const vec4 wedge_p = vg_item[7u * i + 6u];
+    col = color.rgb;
     const float r = length(t);
     float angle;
     float ring;
@@ -207,9 +266,24 @@ float VgAlpha(uint i, vec2 t) {
         profile = pow(profile, max(params.z, 0.01));
     }
     if (wedge_p.w > 0.0) {
-        const float c = r > 1e-6 ? dot(t / r, wedge_p.xy) : 0.0;
-        const float wedge = pow(max(0.5 + 0.5 * c, 0.0), max(wedge_p.z, 0.01));
-        profile *= (1.0 - wedge_p.w) + wedge_p.w * wedge;
+        if (wedge_p.z < 0.0) {
+            // The four corners of what the headset shows (vr_overlay.frag's): the status's own
+            // look, reaching wedge_p.x in, its beat clock wedge_p.y, its own colours.
+            const vec4 f = vg_field.x > 1.0 ? vg_field : vec4(54.0, 54.0, 44.0, 55.0);
+            const vec2 ang = degrees(atan(t));
+            const vec2 q = vec2(ang.x / max(ang.x < 0.0 ? f.x : f.y, 1.0),
+                                ang.y / max(ang.y > 0.0 ? f.z : f.w, 1.0));
+            const float kind = floor(-wedge_p.z); // the status; the fraction the veins' width
+            // params.x: the zoom into what the lenses show (StatusCornerZoomed).
+            const vec4 look = StatusCornerZoomed(q, params.x, wedge_p.x, wedge_p.y,
+                                                 -wedge_p.z - kind, int(kind));
+            profile = look.a;
+            col = look.rgb;
+        } else {
+            const float c = r > 1e-6 ? dot(t / r, wedge_p.xy) : 0.0;
+            const float wedge = pow(max(0.5 + 0.5 * c, 0.0), max(wedge_p.z, 0.01));
+            profile *= (1.0 - wedge_p.w) + wedge_p.w * wedge;
+        }
     }
     return color.a * profile;
 }
@@ -220,8 +294,15 @@ vec3 ApplyVignettes(vec3 stored, AU2 pos) {
     const uint count = min(vg_head.x, 6u);
     const float health = clamp(uintBitsToFloat(vg_head.z), 0.0, 0.45);
     const float desaturation = clamp(uintBitsToFloat(vg_head.w), 0.0, 0.75);
+#ifdef VR_RIPOSTE
+    const float riposte = clamp(vg_riposte.x, 0.0, 1.0);
+#else
+    const float riposte = 0.0; // the burst variants draw it
+#endif
+    const bool ritual = vg_ritual.x > 0.0001 || vg_ritual.y > 0.0001;
     const bool adjusting = OutputAdjustmentActive();
-    if (count == 0u && health <= 0.0001 && desaturation <= 0.0001 && !adjusting) {
+    if (count == 0u && health <= 0.0001 && desaturation <= 0.0001 && riposte <= 0.0001 &&
+        !ritual && !adjusting) {
         return stored;
     }
     const uint eye = min(pc.vig.x, 1u);
@@ -240,7 +321,8 @@ vec3 ApplyVignettes(vec3 stored, AU2 pos) {
         c = OutputLinear(stored);
         if (uintBitsToFloat(pc.vig.y) != 1.0) {
             const vec3 encoded = EncodeOutput(c);
-            if (count == 0u && health <= 0.0001 && desaturation <= 0.0001) {
+            if (count == 0u && health <= 0.0001 && desaturation <= 0.0001 &&
+                riposte <= 0.0001 && !ritual) {
                 return encoded;
             }
             c = VgSrgbToLinear(encoded);
@@ -274,7 +356,8 @@ vec3 ApplyVignettes(vec3 stored, AU2 pos) {
         }
         const vec3 q = rel_p + s * d;
         const vec2 t = vec2(dot(ax, q), dot(ay, q)) / origin.w;
-        const float a = clamp(VgAlpha(i, t), 0.0, 1.0);
+        vec3 col;
+        const float a = clamp(VgAlpha(i, t, col), 0.0, 1.0);
         if (!(a > 0.0)) {
             continue;
         }
@@ -282,12 +365,60 @@ vec3 ApplyVignettes(vec3 stored, AU2 pos) {
             c = VgSrgbToLinear(stored);
             decoded = true;
         }
-        vec3 col = vg_item[7u * i + 4u].rgb;
         if (vg_head.y != 0u) {
             col = col.bgr;
         }
         c = c + (col - c) * a;
     }
+    // The Kos ritual's vision (kos_visions), at this pixel's place in the view's frame.
+    if (ritual) {
+        if (!decoded) {
+            c = VgSrgbToLinear(stored);
+            decoded = true;
+        }
+#ifdef VR_EASU
+        kos_size = vec2(textureSize(in_tex, 0));
+        kos_origin = vec2(0.0);
+        kos_lo = ivec2(0);
+        kos_hi = textureSize(in_tex, 0) - 1;
+#else
+        kos_size = vec2(pc.src.zw);
+        kos_origin = vec2(pc.src.xy);
+        kos_lo = pc.src.xy;
+        kos_hi = pc.src.xy + pc.src.zw - 1;
+#endif
+        kos_tn = tn;
+        const vec3 rgb =
+            KosRitual(vg_head.y != 0u ? c.bgr : c, d_eye.xy * KosRitualScale, vg_ritual);
+        c = vg_head.y != 0u ? rgb.bgr : rgb;
+    }
+#ifdef VR_RIPOSTE
+    // A visceral's burst (riposte_style), over everything else: its taps in the eye's input
+    // texels (EASU: the eye's own image, enlarged into this rect; RCAS: the rect pc.src, 1:1),
+    // at this pixel's texel; the centre is this pixel as filtered, decoded as the taps are.
+    if (riposte > 0.0001) {
+        if (!decoded) {
+            c = VgSrgbToLinear(stored);
+            decoded = true;
+        }
+#ifdef VR_EASU
+        const ivec2 in_size = textureSize(in_tex, 0);
+        riposte_lo = ivec2(0);
+        riposte_hi = in_size - 1;
+        const vec2 r_size = vec2(in_size);
+        const vec2 r_p = floor((vec2(pos) + 0.5) * r_size / vec2(pc.dst.zw)) + 0.5;
+#else
+        riposte_lo = pc.src.xy;
+        riposte_hi = pc.src.xy + pc.src.zw - 1;
+        const vec2 r_size = vec2(pc.src.zw);
+        const vec2 r_p = vec2(pc.src.xy + ivec2(pos)) + 0.5;
+#endif
+        const vec3 rgb = RiposteStyle(vg_head.y != 0u ? c.bgr : c,
+                                      RiposteLuma(RiposteDecode(stored)), r_p, r_size,
+                                      riposte_meter.x, riposte, vg_riposte.y > 0.5);
+        c = vg_head.y != 0u ? rgb.bgr : rgb;
+    }
+#endif
     return decoded ? clamp(VgLinearToSrgb(c), 0.0, 1.0) : stored;
 }
 #endif

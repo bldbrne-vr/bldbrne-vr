@@ -6,6 +6,7 @@
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
+#include "core/vr/messenger_gift.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -16,6 +17,9 @@
 
 #include "common/logging/log.h"
 #include "core/vr/arm_ik.h"
+#include "core/vr/blood_draw_channel.h"
+#include "core/vr/bloodborne_heal.h"
+#include "core/vr/bloodborne_quickitems.h"
 #include "core/vr/bloodborne_vitals.h"
 #include "core/vr/c0000_skeleton.h"
 #include "core/vr/body_channel.h"
@@ -87,6 +91,31 @@ constexpr s32 ElbowDummy = 153;
 using FindItemFn = s32(PS4_SYSV_ABI*)(u8* inventory, const u32* item);
 using DmyPolyFn = s32(PS4_SYSV_ABI*)(u8* chr, float* out, const s32* id, u32 max);
 
+// Blood bullets by hand (core/vr/blood_draw.h): the effect the game's blood bullets clip (a00
+// 100141) applies with its TAE event 401 at 0.87 s, SpEffect 2012 (changeHpRate 30: 30% of max HP,
+// regainGaugeDamage: a rally wins it back; addTempBulletNum 5), through the call that event makes:
+// ChrIns::AddSpEffect (bloodborne_pose.cpp: vt+0x3F0 of both PlayerIns vtables; the character its
+// own source, local only, zeros and 1.0f). The clip itself never plays (its arm, its stand-still,
+// its blood spray in the face). The game's own refusals, measured in the mock with its D-pad up:
+// nothing with the five Blood Bullets (EquipParamGoods 901 maxNum) already there, nothing with HP
+// under the cost (its clip plays, the effect is not taken).
+constexpr u64 AddSpEffectRva = 0x18C6DB0;
+constexpr std::array<u8, 32> AddSpEffectSig = {
+    0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xEC,
+    0x28, 0x45, 0x89, 0xCC, 0x44, 0x89, 0xC3, 0xC5, 0xFA, 0x11, 0x65, 0xD4, 0xC5, 0xFA, 0x11, 0x5D,
+};
+constexpr u64 PlayerVtableRva = 0x538F310;
+constexpr u64 PlayerVtableRva2 = 0x538FA80;
+constexpr u32 OffsetVtableAddSpEffect = 0x3F0;
+constexpr u32 OffsetItemUseState = 0x490; // PlayerIns: a quick item's use (0 = none)
+constexpr s32 BloodBulletEffect = 2012;
+constexpr s32 BloodBulletCostPct = 30; // SpEffect 2012 changeHpRate
+constexpr s32 BloodBulletMax = 5;      // EquipParamGoods 901 maxNum
+constexpr s32 VialUseAnim = 26;        // the Blood Vial's goodsUseAnim: its stab and blood sounds
+using AddSpEffectFn = u8(PS4_SYSV_ABI*)(void* chr, s32 id, void* source, u32 a3, u32 local_only,
+                                       s32 a5, float f0, float f1, float f2, float f3, float f4,
+                                       s32 stack0);
+
 s64 NowNs() {
     return VR::Body::SteadyNowNs();
 }
@@ -96,6 +125,12 @@ struct Site {
     bool checked{false};
     FindItemFn find{nullptr};
     DmyPolyFn dmy{nullptr};
+    AddSpEffectFn add{nullptr};
+    u32 bullets_done{0}; // the last blood bullets ask answered
+    // The last ask sent to the game's D-pad up (Answer::Unavailable): its Blood Bullets are
+    // counted for the presenter until fallback_until (the HUD may read none).
+    u32 fallback_ask{0};
+    s64 fallback_until{0};
     u8* base{nullptr};
     V::Status last{};
     u64 serial{0};
@@ -140,16 +175,132 @@ void Check(u8* module) {
     g.base = module;
     const bool find_ok = std::memcmp(module + FindItemRva, FindItemSig.data(), FindItemSig.size()) == 0;
     const bool dmy_ok = std::memcmp(module + DmyPolyRva, DmyPolySig.data(), DmyPolySig.size()) == 0;
+    const bool add_ok =
+        std::memcmp(module + AddSpEffectRva, AddSpEffectSig.data(), AddSpEffectSig.size()) == 0;
     g.find = find_ok ? reinterpret_cast<FindItemFn>(module + FindItemRva) : nullptr;
     g.dmy = dmy_ok ? reinterpret_cast<DmyPolyFn>(module + DmyPolyRva) : nullptr;
+    g.add = add_ok ? reinterpret_cast<AddSpEffectFn>(module + AddSpEffectRva) : nullptr;
     LOG_INFO(Core,
-             "VR vitals: installed (hud_vitals={}): FindItemIndex {}, GetDmyPolyMtx {}{}",
+             "VR vitals: installed (hud_vitals={}): FindItemIndex {}, GetDmyPolyMtx {}{}; blood "
+             "bullets by hand: AddSpEffect {}",
              VR::GetSettings().hud_vitals == 0 ? "classic" : "wrist", find_ok ? "ok" : "MISMATCH",
              dmy_ok ? "ok" : "MISMATCH",
-             find_ok && dmy_ok ? "" : ": the wrist gauge falls back to the classic HUD");
+             find_ok && dmy_ok ? "" : ": the wrist gauge falls back to the classic HUD",
+             add_ok && find_ok ? "ok" : "MISMATCH (the game's own D-pad up instead)");
 }
 
 } // Anonymous namespace
+
+void BloodBulletsSiteA(u8* module, u8* player) {
+    namespace D = VR::BloodDraw;
+    auto& g = g_site;
+    if (!g.checked) {
+        Check(module);
+    }
+    const s64 now = NowNs();
+    if (g.fallback_ask != 0 && player != nullptr) {
+        // The game's D-pad up is making them (or refusing): the presenter sees them rise here.
+        if (now < g.fallback_until) {
+            D::PublishBullets(g.fallback_ask, GoodsCount(player, BloodBullets));
+        } else {
+            g.fallback_ask = 0;
+        }
+    }
+    const u32 ask = D::TakeAsk(g.bullets_done, now);
+    if (ask == 0 || player == nullptr) {
+        return;
+    }
+    g.bullets_done = ask;
+    s32 hp = -1, max_hp = -1, blood = -1;
+    const auto answer = [&](D::Answer a, const char* what) {
+        D::PublishAnswer(ask, a);
+        LOG_INFO(Core, "VR blood draw: {} (HP {}/{}, Blood Bullets {}) | t {:.3f}", what, hp, max_hp,
+                 blood, static_cast<double>(now) * 1e-9);
+    };
+    // The XR request can cross a menu/cinematic transition before Site A takes it.
+    if (!IsImmersive() || IsGameMenuOpen() || MenuPanelActive() || CinematicActive()) {
+        answer(D::Answer::Rejected, "refused: gameplay context changed");
+        return;
+    }
+    if (g.find == nullptr) {
+        // Not even the count to see the D-pad's bullets come by: refused, nothing spent (the
+        // D-pad would take the HP behind a refusal the syringe shows).
+        answer(D::Answer::Rejected, "refused: the Blood Bullets cannot be read (signatures)");
+        return;
+    }
+    const auto fallback = [&](const char* what) {
+        g.fallback_ask = ask;
+        g.fallback_until = now + D::FallbackCountNs;
+        D::PublishBullets(ask, GoodsCount(player, BloodBullets));
+        answer(D::Answer::Unavailable, what);
+    };
+    if (g.add == nullptr) {
+        fallback("no direct path (signatures): the game's D-pad up");
+        return;
+    }
+    // The vtable slot first (as bloodborne_pose.cpp's markers): another character class never
+    // gets the call.
+    u8* const vtable = Read<u8*>(player);
+    u8* const slot = Plausible(vtable) ? Read<u8*>(vtable + OffsetVtableAddSpEffect) : nullptr;
+    if ((vtable != module + PlayerVtableRva && vtable != module + PlayerVtableRva2) ||
+        slot != module + AddSpEffectRva) {
+        g.add = nullptr;
+        fallback("unexpected player vtable: the game's D-pad up from now on");
+        return;
+    }
+    u8* const modules = Read<u8*>(player + OffsetChrModules);
+    u8* const data = Plausible(modules) ? Read<u8*>(modules + OffsetDataModule) : nullptr;
+    if (Plausible(data)) {
+        hp = Read<s32>(data + OffsetHp);
+        max_hp = Read<s32>(data + OffsetMaxHp);
+    }
+    blood = GoodsCount(player, BloodBullets);
+    if (!Plausible(data) || max_hp <= 0 || hp > max_hp || blood < 0) {
+        answer(D::Answer::Rejected, "refused: the player could not be read");
+        return;
+    }
+    if (hp <= 0) {
+        answer(D::Answer::Rejected, "refused: dead");
+        return;
+    }
+    if (blood >= BloodBulletMax) {
+        answer(D::Answer::Full, "refused: the five Blood Bullets are already there");
+        return;
+    }
+    if (hp <= max_hp * BloodBulletCostPct / 100) {
+        answer(D::Answer::LowHp, "refused: too little HP for their cost");
+        return;
+    }
+    if (Read<s32>(player + OffsetItemUseState) != 0) {
+        answer(D::Answer::Busy, "refused: another item is in use");
+        return;
+    }
+    if (ItemUseForbidden(player)) {
+        // The Blood Vial's own refusal (state info 154): where the game takes no items, its
+        // blood bullets clip would not play either.
+        answer(D::Answer::Forbidden, "refused: no items here (state info 154)");
+        return;
+    }
+    // Recheck cancellation after validating the player, immediately before spending HP.
+    if (D::TakeAsk(0, Body::SteadyNowNs()) != ask || !IsImmersive() ||
+        IsGameMenuOpen() || MenuPanelActive() || CinematicActive()) {
+        answer(D::Answer::Rejected, "refused: request cancelled or gameplay context changed");
+        return;
+    }
+    const u8 added = g.add(player, BloodBulletEffect, player, 0, 1, 0, 1.0f, 1.0f, 1.0f, 1.0f,
+                           1.0f, 0);
+    const s32 after = GoodsCount(player, BloodBullets);
+    if (added == 0 || after <= blood) {
+        LOG_WARNING(Core, "VR blood draw: effect {} -> {}, Blood Bullets {} -> {}",
+                    BloodBulletEffect, added, blood, after);
+        answer(D::Answer::Rejected, "refused: the game did not take its effect");
+        return;
+    }
+    // quick_use_sounds: the Blood Vial clip's stab and blood (the bullets clip's own stab).
+    QueueQuickUseSound(BloodBullets, VialUseAnim);
+    blood = after;
+    answer(D::Answer::Made, "the game's blood bullets made (its effect 2012, no clip)");
+}
 
 void VitalsSiteA(u8* module, u8* player) {
     auto& g = g_site;
@@ -419,6 +570,11 @@ void VitalsRenderTick(u64 record_id, const float* rows, const float* position) {
     V::GaugeState state{};
     V::LatestGauge(state);
     state.tick_ns = now;
+    if (VR::MessengerGift::Hidden(now)) {
+        state.drawn_ns = state.anchor_ns = 0;
+        V::PublishGauge(state);
+        return; // wrist attachment hidden; the normal HUD fallback remains available
+    }
     V::Status st{};
     if (!V::LatestStatus(st) || !st.ok || now - st.steady_ns > 1'000'000'000) {
         V::PublishGauge(state);
@@ -672,8 +828,17 @@ void VitalsRenderTick(u64 record_id, const float* rows, const float* position) {
             right = right * -1.0f;
         }
     }
-    const float text_h = V::GaugeDigitMm / 0.53f * mm; // the label row: digits ~53% of it
-    const auto add_digits = [&](s32 number, float shift, float alpha) {
+    const float text_h_base = V::GaugeDigitMm / 0.53f * mm; // the label row: digits ~53% of it
+    // A hunter tool refused for want of bullets (V::BulletsShortNs): the counter blinks bright red
+    // three times over 0.6 s, a little bigger, shown even with the gauge faded, so the "no" points
+    // at the number (the tester's 2026-11-01).
+    const float blink = V::ShortBlink(V::BulletsShortNs(), now);
+    const float text_h = text_h_base * (1.0f + 0.3f * blink);
+    // `current`: the number now (the blink shows it even with the gauge faded; never the one
+    // rolling away).
+    const auto add_digits = [&](s32 number, float shift, float alpha, bool current) {
+        const float shown = current ? blink : 0.0f;
+        alpha = std::max(alpha, shown);
         if (alpha <= 0.01f) {
             return;
         }
@@ -688,16 +853,24 @@ void VitalsRenderTick(u64 record_id, const float* rows, const float* position) {
         digits.tex = F::Tex::Label;
         digits.tex_key = static_cast<u32>(label);
         digits.fit_label = static_cast<s8>(label);
-        digits.color = LinearOf(V::ToneColor(look.tone), alpha * look.alpha);
+        digits.color = LinearOf(V::ToneColor(look.tone), alpha * std::max(look.alpha, shown));
         digits.emissive = LinearOf(V::ColorSoot, 0.85f);
+        if (shown > 0.0f) {
+            const auto red = LinearOf(V::ColorShortBullets, 1.0f);
+            const auto glow = LinearOf(V::ColorBlood, 0.85f);
+            for (std::size_t ch = 0; ch < 3; ++ch) {
+                digits.color[ch] += (red[ch] - digits.color[ch]) * shown;
+                digits.emissive[ch] += (glow[ch] - digits.emissive[ch]) * shown;
+            }
+        }
         digits.depth_pull = pull;
         list.Add(digits);
     };
     if (look.roll < 1.0f) {
-        add_digits(look.digits_old, 0.7f * look.roll, 1.0f - look.roll);
-        add_digits(look.digits, -0.7f * (1.0f - look.roll), look.roll);
+        add_digits(look.digits_old, 0.7f * look.roll, 1.0f - look.roll, false);
+        add_digits(look.digits, -0.7f * (1.0f - look.roll), look.roll, true);
     } else {
-        add_digits(look.digits, 0.0f, 1.0f);
+        add_digits(look.digits, 0.0f, 1.0f, true);
     }
 
     // The depth probe for the next frames' fit: lines out of the axis through the plate, then the

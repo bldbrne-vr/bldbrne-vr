@@ -74,9 +74,23 @@ std::shared_ptr<const FetchShaderSnapshot> FindFetchShaderSnapshot(
     return it->second;
 }
 
+static std::optional<FetchShaderData> ParseFetchShaderImpl(const Shader::Info& info);
+
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
+    auto data = ParseFetchShaderImpl(info);
+    if (g_fetch_capture && data) [[unlikely]] {
+        *g_fetch_capture = data;
+    }
+    return data;
+}
+
+static std::optional<FetchShaderData> ParseFetchShaderImpl(const Shader::Info& info) {
     if (!info.has_fetch_shader) {
         return std::nullopt;
+    }
+    if (info.fetch_override) {
+        // The startup shader build (vk_shader_record.cpp): the recorded parse, no guest code.
+        return *static_cast<const FetchShaderData*>(info.fetch_override);
     }
 
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);

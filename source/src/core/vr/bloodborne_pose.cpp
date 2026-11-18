@@ -6,11 +6,13 @@
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "common/logging/log.h"
 #include "core/vr/anim_classes.h"
@@ -150,6 +152,169 @@ bool Flag(u32 id) {
         return false;
     }
     return g_get_flag(manager, id) != 0;
+}
+
+// VR_SET_FLAGS="9802=1,9800=0" (tests only): the game's flags forced to these values, written the
+// way GetEventFlag reads them (the block of flag / size in the tree at +0x38; its bits at [node +
+// 0x30] (kind 2) or manager +0x28 + [+0x20] * [node + 0x30] (kind 1), most significant bit first).
+struct ForcedFlag {
+    u32 id;
+    bool on;
+    u32 writes;
+};
+std::vector<ForcedFlag> g_forced;
+bool g_forced_read = false;
+// VR_SET_FLAGS_DIE=1 (tests only): the hunter dies 3 s after the flags first hold, so the map
+// reloads with them (the time of day is read at a load).
+bool g_forced_die = false;
+// VR_SET_FLAGS_WARP=<return point> (tests only): instead of a death, the lamp travel's own two calls
+// (the respawn setter, then warp effect 2101) once the flags hold 3 s. A list ("<a>,<b>,...") is a
+// tour: each next warp VR_SET_FLAGS_WARP_EVERY seconds (default 45) after the hunter is in the
+// world again, round and round (a long session through many areas: the memory stress test).
+s32 g_forced_warp = -1;
+s64 g_forced_held_ns = 0;
+std::vector<s32> g_warp_tour;
+size_t g_warp_next = 0;
+s64 g_warp_every_ns = 45'000'000'000;
+s64 g_warp_first_ns = 3'000'000'000;
+
+u8* FlagByte(u8* manager, u32 id, u32& bit) {
+    const u32 size = Read<u32>(manager + OffsetFlagBlockSize);
+    const u32 block = id / size;
+    u8* const root = Read<u8*>(manager + OffsetFlagTree);
+    u8* best = root;
+    // At most 64 steps down the tree (a damaged one never loops).
+    int steps = 0;
+    for (u8* n = Read<u8*>(root + 8); Plausible(n) && Read<u8>(n + 0x19) == 0 && steps++ < 64;) {
+        if (Read<u32>(n + 0x20) < block) {
+            n = Read<u8*>(n + 0x10);
+        } else {
+            best = n;
+            n = Read<u8*>(n);
+        }
+    }
+    if (best == root || Read<u32>(best + 0x20) != block) {
+        return nullptr;
+    }
+    const u32 kind = Read<u32>(best + 0x28);
+    u8* data = nullptr;
+    if (kind == 2) {
+        data = Read<u8*>(best + 0x30);
+    } else if (kind == 1) {
+        data = Read<u8*>(manager + 0x28) + Read<u32>(manager + 0x20) * Read<u32>(best + 0x30);
+    }
+    const u32 off = id - block * size;
+    if (!Plausible(data, 1) || !Plausible(data + (off >> 3), 1)) {
+        return nullptr;
+    }
+    bit = 7 - (off & 7);
+    return data + (off >> 3);
+}
+
+void ForceFlags(u8* player) {
+    if (!g_forced_read) {
+        g_forced_read = true;
+        const char* spec = std::getenv("VR_SET_FLAGS");
+        // "<id>=<0|1>" pairs, comma-separated; anything else ends the list (a malformed "9802="
+        // read past the string's end before: its value, then two characters on).
+        for (const char* p = spec; p != nullptr && *p != 0;) {
+            char* end = nullptr;
+            const unsigned long id = std::strtoul(p, &end, 10);
+            if (end == p || end[0] != '=' || (end[1] != '0' && end[1] != '1') ||
+                (end[2] != ',' && end[2] != '\0')) {
+                break;
+            }
+            g_forced.push_back({static_cast<u32>(id), end[1] == '1', 0});
+            p = end[2] == ',' ? end + 3 : end + 2;
+        }
+        g_forced_die = std::getenv("VR_SET_FLAGS_DIE") != nullptr;
+        if (const char* warp = std::getenv("VR_SET_FLAGS_WARP"); warp != nullptr) {
+            for (const char* p = warp; *p != 0;) {
+                char* end = nullptr;
+                const long point = std::strtol(p, &end, 10);
+                if (end == p) {
+                    break;
+                }
+                g_warp_tour.push_back(static_cast<s32>(point));
+                p = *end == ',' ? end + 1 : end;
+            }
+            g_forced_warp = g_warp_tour.empty() ? -1 : g_warp_tour.front();
+            if (const char* every = std::getenv("VR_SET_FLAGS_WARP_EVERY"); every && *every) {
+                g_warp_every_ns = std::max(10LL, std::atoll(every)) * 1'000'000'000LL;
+            }
+            // VR_SET_FLAGS_WARP_FIRST=<s>: the first warp's wait (default 3 s).
+            if (const char* first = std::getenv("VR_SET_FLAGS_WARP_FIRST"); first && *first) {
+                g_warp_first_ns = std::max(3LL, std::atoll(first)) * 1'000'000'000LL;
+            }
+        }
+        if (!g_forced.empty()) {
+            LOG_INFO(Core, "VR flags: TEST forcing {} flags{}", g_forced.size(),
+                     g_forced_die ? ", then a death" : "");
+        }
+    }
+    // (A warp alone, no flags: 2026-11-12, a save moved to the Grand Cathedral as it is, its time
+    // of day untouched.)
+    if (g_forced.empty() && g_forced_warp < 0) {
+        return;
+    }
+    u8* const manager = Read<u8*>(g_base + EventFlagManRva);
+    if (!Plausible(manager) || Read<u32>(manager + OffsetFlagBlockSize) == 0 ||
+        !Plausible(Read<u8*>(manager + OffsetFlagTree))) {
+        return;
+    }
+    for (ForcedFlag& f : g_forced) {
+        if ((g_get_flag(manager, f.id) != 0) == f.on || f.writes >= 20) {
+            continue;
+        }
+        u32 bit = 0;
+        u8* const byte = FlagByte(manager, f.id, bit);
+        if (byte == nullptr) {
+            if (f.writes == 0) {
+                f.writes = 20;
+                LOG_WARNING(Core, "VR flags: TEST {}: its block was not found", f.id);
+            }
+            continue;
+        }
+        *byte = static_cast<u8>(f.on ? *byte | (1u << bit) : *byte & ~(1u << bit)); // test only
+        ++f.writes;
+        LOG_INFO(Core, "VR flags: TEST {} set to {} (now reads {})", f.id, f.on ? 1 : 0,
+                 g_get_flag(manager, f.id));
+    }
+    if (!g_forced_die && g_forced_warp < 0) {
+        return;
+    }
+    const bool hold = std::ranges::all_of(
+        g_forced, [&](const ForcedFlag& f) { return (g_get_flag(manager, f.id) != 0) == f.on; });
+    const s64 now = NowNs();
+    if (!hold) {
+        g_forced_held_ns = 0;
+        return;
+    }
+    if (g_forced_held_ns == 0) {
+        g_forced_held_ns = now;
+    }
+    const s64 wait_ns = g_warp_next == 0 ? g_warp_first_ns : g_warp_every_ns;
+    if (g_forced_warp >= 0 && now - g_forced_held_ns > wait_ns) {
+        using SetRespawnFn = void(PS4_SYSV_ABI*)(s32);
+        reinterpret_cast<SetRespawnFn>(g_base + 0x156D110)(g_forced_warp);
+        const u8 added = g_add(player, 2101, player, 0, 1, 0, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0);
+        LOG_INFO(Core, "VR flags: TEST warp to return point {} (effect 2101 added {}; tour stop {})",
+                 g_forced_warp, added, g_warp_next + 1);
+        // A tour goes on from the next map: the wait restarts when the hunter is in it.
+        ++g_warp_next;
+        g_forced_warp = g_warp_tour.size() > 1 ? g_warp_tour[g_warp_next % g_warp_tour.size()] : -1;
+        g_forced_held_ns = 0;
+        g_forced_die = false;
+        return;
+    }
+    u8* const data = Module(player, L::OffsetDataModule);
+    if (g_forced_die && now - g_forced_held_ns > 3'000'000'000 && data != nullptr &&
+        Read<s32>(data + OffsetHp) > 0) {
+        const s32 zero = 0;
+        std::memcpy(data + OffsetHp, &zero, sizeof(zero)); // test only
+        g_forced_die = false;
+        LOG_INFO(Core, "VR flags: TEST the hunter dies so the map reloads with the flags");
+    }
 }
 
 bool HasEffect(const u8* player, s32 id) {
@@ -332,6 +497,7 @@ void PoseSiteA(u8* player) {
     if (!g_ready || g_disabled || player == nullptr) {
         return;
     }
+    ForceFlags(player);
     auto& s = g_site;
     const s64 now = NowNs();
     WatchMarker(player, now);

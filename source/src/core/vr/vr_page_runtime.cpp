@@ -10,24 +10,32 @@
 #include "core/vr/lever_settings.h"
 #include "core/vr/lamp_channel.h"
 #include "core/vr/lamp_page.h"
+#include "core/vr/soft_save_channel.h"
+#include "core/vr/soft_save_page.h"
 #include "core/vr/lamp_presentation.h"
 #include "core/vr/gun_settings.h"
 #include "core/vr/color_settings.h"
+#include "core/vr/dlss_model.h"
 #include "core/vr/graphics_status.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <condition_variable>
+#include <filesystem>
+#include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <thread>
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_filesystem.h>
 
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
+#include "common/stb.h"
 #include "common/thread.h"
 #include "core/vr/bloodborne_assets.h"
 #include "core/vr/body_settings.h"
@@ -58,16 +66,20 @@ bool ProviderInstalled(const char* env, const char* folder, const char* file);
 bool UpscalerFilesPresent(const Graphics::Config& c) {
     static const bool dlss = ProviderInstalled("VR_DLSS_DIR", "dlss", "vr_dlss_stereo.dll") &&
                              ProviderInstalled("VR_DLSS_DIR", "dlss", "nvngx_dlss.dll");
-    static const bool neural = ProviderInstalled("VR_DLSS_DIR", "dlss", "nvngx_dlssnr.dll");
+    // DLSS 5: the bridge's forwarder ships; the player's NVIDIA file is checked at start (not -> 0).
+    static const bool neural = ProviderInstalled("VR_DLSS_DIR", "dlss", "nvngx.dll_dlssnr.dll");
     static const bool fsr4 = ProviderInstalled("VR_FSR4_DIR", "fsr4", "vr_fsr4_stereo.dll");
     static const bool fsr31 = ProviderInstalled("VR_FSR31_DIR", "fsr31", "vr_fsr31_stereo.dll");
+    static const bool fsr41 = ProviderInstalled("VR_FSR41_DIR", "fsr41", "vr_fsr41_stereo.dll");
     switch (c.upscaler) {
     case Graphics::Upscaler::Dlss:
-        return dlss && (!c.dlss5 || neural);
+        return dlss && (!c.dlss5 || (neural && Graphics::neural_file.load() != 0));
     case Graphics::Upscaler::Fsr4:
         return fsr4;
     case Graphics::Upscaler::Fsr31:
         return fsr31;
+    case Graphics::Upscaler::Fsr41:
+        return fsr41;
     default:
         return true;
     }
@@ -91,12 +103,24 @@ bool ProviderInstalled(const char* env, const char* folder, const char* file) {
 std::string ValueIn(const Settings &s, const Body::BodySettings &b, const Quick::QuickSettings &q,
                     const Melee::MeleeSettings &m, const Tricks::Settings &t,
                     const std::string &key) {
+    if (key == "play_style")
+        return PlayStyle::Name(static_cast<PlayStyle::Style>(s.play_style));
+    if (key == "tp_distance_pct")
+        return std::to_string(std::lround(s.tp_distance_scale * 100.0f));
+    if (key == "tp_view_follows_pitch")
+        return FormatIni(s.tp_view_follows_pitch);
     if (key == "gun_wrist_reload")
         return Bool(Gun::GunSettings{}.wrist_reload);
     if (key == "color_contrast" || key == "color_saturation" || key == "color_gamma")
         return "0";
     if (key == "two_hand_guide")
         return Bool(TwoHand::Settings{}.guide);
+    if (key == "two_hand_optimized_controls")
+        return Bool(TwoHand::Settings{}.optimized_controls);
+    if (key == "two_hand_trigger_hold")
+        return Bool(TwoHand::Settings{}.trigger_hold);
+    if (key == "two_hand_hold_b_reposition")
+        return Bool(TwoHand::Settings{}.hold_b_reposition);
     if (key == "two_hand_swing_hum")
         return FormatIni(TwoHand::Settings{}.swing_hum);
     if (key == "lamp_travel")
@@ -117,6 +141,8 @@ std::string ValueIn(const Settings &s, const Body::BodySettings &b, const Quick:
         return Bool(s.shoulder_switch);
     if (key == "health_color")
         return Bool(s.health_color);
+    if (key == "riposte_style")
+        return Bool(s.riposte_style);
     if (key == "stamina_color")
         return Bool(s.stamina_color);
     if (key == "health_color_strength")
@@ -127,6 +153,12 @@ std::string ValueIn(const Settings &s, const Body::BodySettings &b, const Quick:
         return FormatIni(q.holster_mode);
     if (key == "holster_haptics")
         return Bool(q.holster_haptics);
+    if (key == "shoulder_vial")
+        return Bool(q.shoulder_vial);
+    if (key == "quick_arc_pick")
+        return q.pick_fan ? "fan" : q.pick_sector ? "sector" : "hover";
+    if (key == "quick_fan_style")
+        return q.fan_style == 1 ? "brass" : "lancet";
     if (key == "body_comfort")
         return Bool(b.body_comfort);
     if (key == "body_align")
@@ -157,14 +189,24 @@ std::string ValueIn(const Settings &s, const Body::BodySettings &b, const Quick:
         return s.controls_classic ? "classic" : "motion";
     } else if (key == "inject") {
         return Bool(s.inject);
+    } else if (key == "x_button") {
+        return s.x_fan ? "fan" : "vial";
     } else if (key == "laser") {
         return Bool(s.laser);
     } else if (key == "grip_adjust") {
         return Bool(b.grip_adjust);
     } else if (key == "vr_grab_attacks") {
         return Bool(s.vr_grab_attacks);
+    } else if (key == "vr_interactions") {
+        return Bool(s.vr_interactions);
+    } else if (key == "upscale_focus") {
+        return std::to_string(s.upscale_focus);
     } else if (key == "cinematic") {
         return Bool(s.cinematic);
+    } else if (key == "cinematic_ladder_skip") {
+        return Bool(s.cinematic_ladder_skip); // (missing: the row read "Custom", the user 11-06)
+    } else if (key == "doll_respec") {
+        return Bool(s.doll_respec);
     } else if (key == "late_warp_motion") {
         return Bool(s.late_warp_motion);
     } else if (key == "body_cutaway") {
@@ -198,6 +240,12 @@ std::string ValueIn(const Settings &s, const Body::BodySettings &b, const Quick:
         return Bool(s.melee_kill_ragdoll);
     } else if (key == "melee_ragdoll_impulse") {
         return FormatIni(s.melee_ragdoll_impulse);
+    } else if (key == "foveation") {
+        return std::to_string(Graphics::foveation.load(std::memory_order_relaxed));
+    } else if (key == "dlss_model") {
+        // The built-in model is M in this runtime (dlss_model.h): the page shows it as Best.
+        const auto model = Graphics::dlss_model.load(std::memory_order_relaxed);
+        return model == Graphics::DlssModelBuiltIn ? std::string("M") : Graphics::DlssModelName(model);
     } else if (key == "aa_mode") {
         return Aa::Name(GetRequestedAaMode());
     } else if (key == "lod_bias") {
@@ -210,14 +258,70 @@ std::string ValueIn(const Settings &s, const Body::BodySettings &b, const Quick:
     } else if (key == "graphics_fsr31_available") {
         static const bool installed = ProviderInstalled("VR_FSR31_DIR", "fsr31", "vr_fsr31_stereo.dll");
         return installed ? "1" : "0";
+    } else if (key == "graphics_fsr41_available") {
+        // AMD cards only (VR_FSR41_ANY_GPU=1: tests on others, through AMD's FSR 3.1.6).
+        static const bool installed = ProviderInstalled("VR_FSR41_DIR", "fsr41", "vr_fsr41_stereo.dll");
+        static const bool any_gpu = std::getenv("VR_FSR41_ANY_GPU") != nullptr;
+        return installed && (any_gpu || Graphics::amd_gpu.load(std::memory_order_relaxed) == 1)
+                   ? "1"
+                   : "0";
     } else if (key == "graphics_neural_available") {
-        // DLSS 5 needs NVIDIA's neural runtime beside the DLSS bridge.
-        static const bool installed = ProviderInstalled("VR_DLSS_DIR", "dlss", "nvngx_dlssnr.dll");
-        return installed ? "1" : "0";
+        // DLSS 5 needs the bridge's forwarder, an RTX 50 card and the player's own NVIDIA-signed
+        // nvngx_dlssnr.dll (vr_dlss_runtime.cpp VerifiedNeuralFile; the launcher adds it).
+        static const bool installed = ProviderInstalled("VR_DLSS_DIR", "dlss", "nvngx.dll_dlssnr.dll");
+        return installed && Graphics::neural_gpu.load(std::memory_order_relaxed) == 1 &&
+                       Graphics::neural_file.load(std::memory_order_relaxed) == 1
+                   ? "1"
+                   : "0";
+    } else if (key == "graphics_neural_note") {
+        // The DLSS 5 tab's status line: why it is greyed, else that it is an experiment.
+        if (Graphics::neural_gpu.load(std::memory_order_relaxed) == 0)
+            return "Needs an RTX 50 GPU";
+        if (Graphics::neural_file.load(std::memory_order_relaxed) == 0)
+            return "Add file in launcher";
+        return "Experimental";
     } else if (key == "ui_enemy_hp_bars") {
         return Bool(s.ui_enemy_hp_bars);
     } else if (key == "ui_boss_bar") {
         return Bool(s.ui_boss_hp_bar);
+    } else if (key == "shadows_far") {
+        return s.shadows_far_reduced ? "reduced" : "full";
+    } else if (key == "water_reflections") {
+        return Bool(s.water_reflections);
+    } else if (key == "frame_overlap") {
+        return Bool(s.frame_overlap);
+    } else if (key == "canted_eyes") {
+        return Bool(s.canted_eyes);
+    } else if (key == "shadows_busy") {
+        return Bool(s.shadows_busy);
+    } else if (key == "light_shadows") {
+        return Bool(s.light_shadows);
+    } else if (key == "light_shadow_detail") {
+        return s.light_shadow_high ? "high" : "low";
+    } else if (key == "moon_shadows") {
+        return Bool(s.moon_shadows);
+    } else if (key == "ambient_occlusion") {
+        return Bool(s.ambient_occlusion);
+    } else if (key == "bounce_light") {
+        return Bool(s.bounce_light);
+    } else if (key == "fog_light") {
+        return Bool(s.fog_light);
+    } else if (key == "moon_shafts") {
+        return Bool(s.moon_shafts); // The page shows the Fog override separately.
+    } else if (key == "fog_banks") {
+        return Bool(s.fog_banks);
+    } else if (key == "ground_mist") {
+        return Bool(s.ground_mist);
+    } else if (key == "cinematic_look") {
+        return std::to_string(s.cinematic_look);
+    } else if (key == "filmic_highlights") {
+        return Bool(s.filmic_highlights);
+    } else if (key == "eye_adaptation") {
+        return Bool(s.eye_adaptation);
+    } else if (key == "wet_streets") {
+        return Bool(s.wet_streets);
+    } else if (key == "raised_bricks") {
+        return Bool(s.raised_bricks);
     }
     return {};
 }
@@ -245,6 +349,12 @@ public:
             return Bool(BladeSound::GetSettings().on);
         if (key == "two_hand_guide")
             return Bool(TwoHand::GetTwoHandSettings().guide);
+        if (key == "two_hand_optimized_controls")
+            return Bool(TwoHand::GetTwoHandSettings().optimized_controls);
+        if (key == "two_hand_trigger_hold")
+            return Bool(TwoHand::GetTwoHandSettings().trigger_hold);
+        if (key == "two_hand_hold_b_reposition")
+            return Bool(TwoHand::GetTwoHandSettings().hold_b_reposition);
         if (key == "two_hand_swing_hum")
             return FormatIni(TwoHand::GetTwoHandSettings().swing_hum);
         if (key == "lamp_travel")
@@ -254,11 +364,20 @@ public:
         if (key == "physical_levers")
             return Bool(Lever::Enabled());
         if (key == "graphics_config")
-            return Graphics::Serialize(Graphics::Accepted());
+            return Graphics::Serialize(Graphics::Saved());
         if (key == "graphics_native_stereo")
             return std::getenv("VR_NATIVE_STEREO") ? "1" : "0";
-        if (key == "graphics_status" && !std::getenv("VR_NATIVE_STEREO"))
-            return "DIBR | Scale applies after restart. DLSS/FSR unavailable; saved settings kept.";
+        // DIBR reconstructs its centre with DLSS / FSR unless VR_DIBR_UPSCALE=0 (vr_dibr_upscale.h).
+        if (key == "graphics_dibr_upscale")
+            return !std::getenv("VR_NATIVE_STEREO") && Graphics::DibrUpscaleAllowed() ? "1" : "0";
+        if (key == "graphics_status" && !std::getenv("VR_NATIVE_STEREO")) {
+            if (!Graphics::DibrUpscaleAllowed())
+                return "DIBR | Scale applies after restart. DLSS/FSR unavailable; saved settings kept.";
+            const auto accepted = Graphics::Accepted();
+            if (accepted.upscaler == Graphics::Upscaler::Dlss && accepted.dlss5)
+                return "DIBR | DLSS 5 needs native stereo. Pick DLSS or FSR for DIBR.";
+            return "DIBR | " + Graphics::RuntimeStatusText(UpscalerFilesPresent(accepted));
+        }
         if (key == "graphics_status")
             return Graphics::RuntimeStatusText(UpscalerFilesPresent(Graphics::Accepted()));
         if (key == "graphics_resolution")
@@ -276,7 +395,19 @@ public:
             Set(key, "1"); // the default: on
             return;
         }
-        static const Settings defaults{};
+        if (key == "foveation") {
+            // Live (vr_foveation.h): Auto again at once, the key gone from vr.ini (ValueIn reads
+            // the level in force, not its default).
+            ApplySetting(key, "-1");
+            RemoveSetting(key);
+            return;
+        }
+        // (The new graphics' by the card's memory: core/vr/card_tier.h.)
+        static const Settings defaults = [] {
+            Settings d{};
+            ApplyCardDefaults(d);
+            return d;
+        }();
         static const Body::BodySettings body_defaults{};
         const std::string value = ValueIn(defaults, body_defaults, Quick::QuickSettings{},
                                           Melee::MeleeSettings{}, Tricks::Settings{}, key);
@@ -299,10 +430,102 @@ constexpr float SlidePx = 0.0f;
 constexpr std::array<const char*, 4> TextureNames{"MENU_Common_00003", "MENU_Common_00001",
                                                   "KG_L_LR", "KG_L_UD"};
 
+// VR_PAGE_TEST_DUMP (tests): the page's values read through, its edits kept here (nothing reaches
+// vr.ini or the game; a removed key reads the live value again).
+class DumpStore final : public Store {
+public:
+    explicit DumpStore(Store& source_) : source{source_} {}
+    std::string ControlName(Thumbs::Control physical) override {
+        return source.ControlName(physical);
+    }
+    std::string Get(const std::string& key) override {
+        const auto it = edits.find(key);
+        return it != edits.end() ? it->second : source.Get(key);
+    }
+    void Set(const std::string& key, const std::string& value) override {
+        edits[key] = value;
+    }
+    void Remove(const std::string& key) override {
+        edits.erase(key);
+    }
+
+private:
+    Store& source;
+    std::map<std::string, std::string> edits;
+};
+
+// One image of the dump: a page's view, or Show VR controls'.
+struct DumpPage {
+    std::string name;
+    std::optional<View> page;
+    std::optional<ControlsView::View> controls;
+};
+
+// A tab's name as a file name ("HUD & feedback" -> "hud_feedback").
+std::string FileName(std::string_view name) {
+    std::string out;
+    for (const char c : name) {
+        if (std::isalnum(static_cast<unsigned char>(c))) {
+            out += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        } else if (!out.empty() && out.back() != '_') {
+            out += '_';
+        }
+    }
+    while (!out.empty() && out.back() == '_') {
+        out.pop_back();
+    }
+    return out;
+}
+
+// The dump's images drawn with the game's art and font, each over a dark world (the page's
+// premultiplied colour over it, its glow added) into <dir>/<name>.png.
+void DrawDump(const Assets& assets, const std::filesystem::path& dir,
+              const std::vector<DumpPage>& pages) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    size_t written = 0;
+    for (const DumpPage& d : pages) {
+        Image page, glow;
+        const bool ok = d.controls ? ControlsView::Render(assets, *d.controls, page, glow)
+                                   : d.page && Render(assets, *d.page, page, glow);
+        const size_t n = static_cast<size_t>(std::max(page.width, 0)) *
+                         static_cast<size_t>(std::max(page.height, 0)) * 4;
+        if (!ok || n == 0 || page.rgba.size() != n || glow.rgba.size() != n) {
+            LOG_WARNING(Core, "VR page dump: {} not drawn", d.name);
+            continue;
+        }
+        constexpr float World = 24.0f; // the dark world behind the page
+        std::vector<u8> out(n);
+        for (size_t i = 0; i < n; i += 4) {
+            const float k = 1.0f - static_cast<float>(page.rgba[i + 3]) / 255.0f;
+            for (size_t c = 0; c < 3; ++c) {
+                const float x = static_cast<float>(page.rgba[i + c]) + World * k +
+                                static_cast<float>(glow.rgba[i + c]);
+                out[i + c] = static_cast<u8>(std::clamp(x, 0.0f, 255.0f) + 0.5f);
+            }
+            out[i + 3] = 255;
+        }
+        const std::string path = (dir / (d.name + ".png")).string();
+        if (stbi_write_png(path.c_str(), page.width, page.height, 4, out.data(),
+                           page.width * 4) != 0) {
+            ++written;
+        } else {
+            LOG_WARNING(Core, "VR page dump: {} not written", path);
+        }
+    }
+    LOG_INFO(Core, "VR page dump: {} of {} images written to {}", written, pages.size(),
+             dir.string());
+}
+
 } // Anonymous namespace
 
 struct Runtime::Impl {
     std::optional<Lamps::Model> lamp;
+    u64 death{}, death_revision{}, death_presented{};
+    s64 death_offer_ns{}; // the death choice's offer (steady clock): back escapes a stalled page
+    bool live_presentation{}; // latched for the page session, including its closing fade
+    int death_focus{};
+    Hover death_hover{};
     Hover lamp_hover{};
     Lamps::Presentation lamp_presentation;
     SettingsStore store;
@@ -312,7 +535,7 @@ struct Runtime::Impl {
     // (SecondsSinceRequest: the UI layer holds the game's menu-less frames after the A).
     std::atomic<s64> request_ns{0};
     u32 handled{0};
-    bool open{false};
+    std::atomic_bool open{false}; // set on the frame thread; the game's pad reads check it
     bool closing{false};
     float opacity{0.0f};
     float slide{0.0f};
@@ -331,6 +554,7 @@ struct Runtime::Impl {
     bool controls_b{false}; // B held (the physical B returns to the page)
     std::string profile;    // the interaction profile bound (SetController)
     bool dpad{false};
+    ControlsView::Family family{ControlsView::Family::Touch}; // its family on this headset
 
     // The render worker.
     std::mutex mutex;
@@ -347,6 +571,10 @@ struct Runtime::Impl {
     std::thread worker;
     bool stop{false};
     Stats stats{};
+    // VR_PAGE_TEST_DUMP: the images the worker draws once (with `mutex`); posted at the first open.
+    std::vector<DumpPage> dump;
+    std::filesystem::path dump_dir;
+    bool dump_posted{false}; // the owner's thread
 
     Impl() = default; // the worker starts with the first page drawn (vr_menu=0: never)
     ~Impl() {
@@ -361,6 +589,138 @@ struct Runtime::Impl {
     }
 
     View LampView() { return Lamps::MakePage(*lamp, glyphs, lamp_hover); }
+
+    // VR_PAGE_TEST_DUMP=<dir> (tests, 2026-10-30): every tab's pages, a few states (the sub-tab
+    // strip selected, the Defaults and restart questions, ACCEPT selected), Show VR controls' tabs
+    // and the lamp and death pages, drawn once by the worker into <dir>; and every row selected and
+    // stepped through all its values, its texts measured against their room (TextFitReport), the
+    // ones wider at full size logged. On a store of its own: nothing reaches vr.ini or the game.
+    void PostDump(const std::filesystem::path& dir) {
+        dump_posted = true;
+        DumpStore scratch{store};
+        Model m{scratch};
+        m.Reset();
+        const GameText::GameFont* font = VR::Assets::GetPageFont();
+        std::vector<DumpPage> pages;
+        std::set<std::string> lines;
+        size_t measured = 0;
+        const auto measure = [&](const View& v, const std::string& where) {
+            ++measured;
+            for (const auto& l : TextFitReport(v, font)) {
+                lines.insert(where + ": " + l);
+            }
+        };
+        const auto add = [&](const std::string& name, View v) {
+            measure(v, name);
+            pages.push_back({name, std::move(v), std::nullopt});
+        };
+        const auto tab_index = [](std::string_view name) {
+            for (size_t t = 0; t < Tabs().size(); ++t) {
+                if (name == Tabs()[t].name) {
+                    return static_cast<int>(t);
+                }
+            }
+            return 0;
+        };
+        for (int t = 0; t < static_cast<int>(Tabs().size()); ++t) {
+            const Tab& tab = Tabs()[static_cast<size_t>(t)];
+            for (int p = 0; p < tab.Pages(); ++p) {
+                m.SetTab(t);
+                m.PageTo(p);
+                const std::string name =
+                    fmt::format("{:02}_{}_{}", t + 1, FileName(tab.name), p + 1);
+                add(name, MakeView(m, glyphs));
+                // Each row selected (its help) and stepped through every value both ways (a
+                // Number's whole range, at most 60 steps): measured, not drawn.
+                for (int s = 0; s < Slots; ++s) {
+                    const Row* row = m.RowAt(s);
+                    if (row == nullptr || !m.Focusable(s)) {
+                        continue;
+                    }
+                    m.SetHover({Target::Row, s});
+                    measure(MakeView(m, glyphs), name);
+                    int steps = 0;
+                    if (row->widget == Widget::Choice) {
+                        steps = static_cast<int>(row->options.size());
+                    } else if (row->widget == Widget::Number) {
+                        steps = std::min(60, (row->max - row->min) / std::max(row->step, 1) + 1);
+                    }
+                    for (int k = 0; k < steps; ++k) {
+                        m.Value(-1);
+                    }
+                    for (int k = 0; k < 2 * steps; ++k) {
+                        m.Value(1);
+                        measure(MakeView(m, glyphs), name);
+                    }
+                    m.SetHover({});
+                }
+            }
+        }
+        // The states.
+        m.SetTab(tab_index("You")); // its sub-tab strip selected (a tab with pages)
+        add("state_strip_selected", MakeView(m, glyphs));
+        m.SetTab(tab_index("Combat"));
+        m.SetHover({Target::ButtonRight, -1});
+        m.Confirm();
+        add("state_defaults_question", MakeView(m, glyphs));
+        m.Back();
+        m.SetTab(tab_index("Upscaling"));
+        m.SetHover({Target::ButtonRight, -1});
+        add("state_accept_selected", MakeView(m, glyphs));
+        m.SetHover({Target::ButtonLeft, -1});
+        m.Confirm();
+        add("state_restart_question", MakeView(m, glyphs));
+        m.Back();
+        ControlsView::Model controls_model;
+        for (int t = 0; t < ControlsView::TabCount; ++t) {
+            controls_model.SetTab(t);
+            pages.push_back({fmt::format("controls_{}", t + 1), std::nullopt,
+                             ControlsView::MakeView(controls_model, glyphs)});
+        }
+        // The gamepad's view (a gamepad play style): an Xbox and a PlayStation pad, first and
+        // third person, every tab; then the Xbox one with A and RT held (its lights).
+        for (const bool xbox : {true, false}) {
+            for (const bool third : {false, true}) {
+                ControlsView::Config pc = ControlsView::CurrentConfig();
+                pc.gamepad = true;
+                pc.gamepad_xbox = xbox;
+                pc.third_person = third;
+                ControlsView::Model pad_model;
+                pad_model.Open(pc, family, profile, dpad, ControlsView::Live{});
+                for (int t = 0; t < ControlsView::TabCount; ++t) {
+                    pad_model.SetTab(t);
+                    pages.push_back({fmt::format("controls_pad_{}_{}_{}", xbox ? "xbox" : "ps",
+                                                 third ? "third" : "first", t + 1),
+                                     std::nullopt, ControlsView::MakeView(pad_model, glyphs)});
+                }
+                if (xbox && !third) {
+                    pad_model.SetTab(0);
+                    ControlsView::Live held;
+                    held.pad = PagePad::Bit::Cross | PagePad::Bit::R2;
+                    pad_model.Update(held);
+                    pages.push_back({"controls_pad_xbox_first_lit", std::nullopt,
+                                     ControlsView::MakeView(pad_model, glyphs)});
+                }
+            }
+        }
+        add("lamp", Lamps::MakePage(Lamps::Model{}, glyphs));
+        add("death", SoftSave::DeathPage(0, glyphs));
+        add("death_soft_save", SoftSave::DeathPage(1, glyphs, {}, "Sep 30 2025, 12:59 PM"));
+        if (font == nullptr) {
+            LOG_WARNING(Core, "VR page dump: no font yet: texts not measured");
+        }
+        LOG_INFO(Core, "VR page dump: {} views measured, {} texts wider than their room", measured,
+                 lines.size());
+        for (const auto& l : lines) {
+            LOG_INFO(Core, "VR page dump: {}", l);
+        }
+        {
+            std::scoped_lock lk{mutex};
+            dump_dir = dir;
+            dump = std::move(pages);
+        }
+        cv.notify_all();
+    }
 
     void Redraw() {
         if (!worker.joinable()) {
@@ -379,9 +739,9 @@ struct Runtime::Impl {
             cv.notify_all();
             return;
         }
-        view = lamp ? LampView() : MakeView(model, glyphs);
+        view = death ? SoftSave::DeathPage(death_focus, glyphs, death_hover, SoftSave::Mailbox().When()) : lamp ? LampView() : MakeView(model, glyphs);
         boxes = HitBoxes(view, VR::Assets::GetPageFont());
-        const u64 lamp_revision = lamp ? lamp_presentation.Update(*lamp) : 0;
+        const u64 lamp_revision = death ? (++death_revision | (u64{1} << 63)) : lamp ? lamp_presentation.Update(*lamp) : 0;
         {
             std::scoped_lock lk{mutex};
             wanted = view;
@@ -398,10 +758,12 @@ struct Runtime::Impl {
             View v;
             u64 lamp_revision{};
             std::optional<ControlsView::View> cview; // Show VR controls instead of the page
+            bool have_view = false;                  // else woken by the dump alone
             {
                 std::unique_lock lk{mutex};
                 cv.wait(lk, [this] {
-                    return stop || wanted.has_value() || wanted_controls.has_value();
+                    return stop || wanted.has_value() || wanted_controls.has_value() ||
+                           !dump.empty();
                 });
                 if (stop) {
                     return;
@@ -409,8 +771,9 @@ struct Runtime::Impl {
                 lamp_revision = wanted_lamp_revision;
                 if (wanted_controls.has_value()) {
                     cview = *wanted_controls;
-                } else {
+                } else if (wanted.has_value()) {
                     v = *wanted;
+                    have_view = true;
                 }
             }
             // The game's art and font (loaded on the assets thread; asked for at the tile's
@@ -441,6 +804,21 @@ struct Runtime::Impl {
             assets.dpad_lr = tex(textures[2]);
             assets.dpad_ud = tex(textures[3]);
             assets.font = font;
+            {
+                std::vector<DumpPage> dump_now;
+                std::filesystem::path dir;
+                {
+                    std::scoped_lock lk{mutex};
+                    dump_now.swap(dump);
+                    dir = dump_dir;
+                }
+                if (!dump_now.empty()) {
+                    DrawDump(assets, dir, dump_now);
+                }
+            }
+            if (!cview && !have_view) {
+                continue;
+            }
             const auto start = std::chrono::steady_clock::now();
             auto page = std::make_shared<Image>();
             auto glow = std::make_shared<Image>();
@@ -534,7 +912,9 @@ struct Runtime::Impl {
     static bool SameView(const View& a, const View& b) {
         if (a.tabs != b.tabs || a.headers != b.headers || a.tab != b.tab || a.help != b.help ||
             a.graphics_status != b.graphics_status || a.confirm != b.confirm ||
-            a.hover != b.hover) {
+            a.hover != b.hover || a.page != b.page || a.pages != b.pages ||
+            a.graphics != b.graphics || a.subtabs != b.subtabs ||
+            a.strip_selected != b.strip_selected) {
             return false;
         }
         for (size_t i = 0; i < a.rows.size(); ++i) {
@@ -561,7 +941,22 @@ struct Runtime::Impl {
         return a.tab == b.tab && a.focus == b.focus && a.hover == b.hover &&
                a.hover_tab == b.hover_tab && a.lights == b.lights && a.help == b.help &&
                a.family == b.family && a.callouts.size() == b.callouts.size() &&
-               a.glyphs == b.glyphs;
+               a.glyphs == b.glyphs && a.pad_xbox == b.pad_xbox && a.gestures == b.gestures &&
+               a.note == b.note;
+    }
+
+    // One frame of the controllers (and the gamepad) for the controls view.
+    static ControlsView::Live LiveOf(const Input& in) {
+        ControlsView::Live live;
+        live.held = in.held;
+        live.touched = in.touched;
+        live.right_speed = in.right_speed;
+        live.left_speed = in.left_speed;
+        live.dt = in.dt;
+        live.pad = in.pad_held;
+        live.pad_stick_l = in.pad_stick_l;
+        live.pad_stick_r = in.pad_stick_r;
+        return live;
     }
 
     // The A on "Show VR controls": the view of the layout and the controllers in use now. The
@@ -569,13 +964,7 @@ struct Runtime::Impl {
     // not select).
     void OpenControls(const Input& in) {
         const ControlsView::Config config = ControlsView::CurrentConfig();
-        const ControlsView::Family family = ControlsView::FamilyOf(profile);
-        ControlsView::Live live;
-        live.held = in.held;
-        live.touched = in.touched;
-        live.right_speed = in.right_speed;
-        live.left_speed = in.left_speed;
-        live.dt = in.dt;
+        const ControlsView::Live live = LiveOf(in);
         controls.Open(config, family, profile, dpad, live);
         controls.Update(live);
         controls_open = true;
@@ -597,8 +986,7 @@ struct Runtime::Impl {
             list += fmt::format("{}{}{}", list.empty() ? "" : " | ", c.title,
                                 c.sub.empty() ? std::string{} : " (" + c.sub + ")");
         }
-        LOG_INFO(Core, "VR controls: tab {}: {}",
-                 ControlsView::TabNames[static_cast<size_t>(controls.GetTab())], list);
+        LOG_INFO(Core, "VR controls: tab {}: {}", controls.TabName(), list);
     }
 
     void CloseControls(const char* why) {
@@ -673,12 +1061,7 @@ struct Runtime::Impl {
             controls.Move(Dir::Right);
         }
         // The lights (after a tab step: the grip that stepped lights on the new tab).
-        ControlsView::Live live;
-        live.held = in.held;
-        live.touched = in.touched;
-        live.right_speed = in.right_speed;
-        live.left_speed = in.left_speed;
-        live.dt = in.dt;
+        const ControlsView::Live live = LiveOf(in);
         controls.Update(live);
         if (controls.GetTab() != tab_before) {
             LogControlsTab();
@@ -686,13 +1069,13 @@ struct Runtime::Impl {
         if ((controls.Focus() != focus_before || controls.GetTab() != tab_before) &&
             controls.Focus() >= 0) {
             const auto& c = controls.Callouts()[static_cast<size_t>(controls.Focus())];
-            LOG_INFO(Core, "VR controls: {} selected ({}{})", c.title,
-                     ControlsView::TabNames[static_cast<size_t>(controls.GetTab())],
+            LOG_INFO(Core, "VR controls: {} selected ({}{})", c.title, controls.TabName(),
                      c.help.empty() ? std::string{} : ": " + c.help);
         }
-        // B (the physical B; without the live state: the page's B or Y) returns to the page.
+        // B (the physical B; without the live state: the page's B or Y), or the gamepad's
+        // Circle, returns to the page.
         const bool b = in.held[static_cast<size_t>(Thumbs::Control::B)];
-        const bool back = in.live ? (b && !controls_b) : in.back;
+        const bool back = (in.live ? (b && !controls_b) : in.back) || in.pad_back;
         controls_b = b;
         if (back) {
             CloseControls("B");
@@ -738,6 +1121,17 @@ double Runtime::SecondsSinceRequest() const {
 }
 
 bool Runtime::PollOpen() {
+    if (auto offer = SoftSave::Mailbox().TakeOffer()) {
+        if (impl->open) Close("death choice");
+        impl->death = *offer;
+        impl->death_focus = 0;
+        impl->death_hover = {};
+        impl->death_presented = 0;
+        impl->death_offer_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
+        RequestOpen();
+    }
     if (auto offer = Lamps::Mailbox().TakeOffer()) {
         if (impl->open) {
             Lamps::Mailbox().Cancel(offer->serial);
@@ -758,6 +1152,7 @@ bool Runtime::PollOpen() {
     }
     impl->open = true;
     impl->closing = false;
+    impl->live_presentation = impl->death != 0;
     impl->opacity = 0.0f;
     {
         std::scoped_lock lk{impl->mutex};
@@ -768,7 +1163,26 @@ bool Runtime::PollOpen() {
     impl->pulse_t = 0.0f;
     impl->trigger_down = false;
     impl->model.Reset();
+    // VR_PAGE_TEST_OPEN=<tab>[,<page>] (tests: the mock's view of each tab): the page opens on that
+    // tab (its name as in Tabs()) and page (0 = the first).
+    if (const char* test = std::getenv("VR_PAGE_TEST_OPEN"); test != nullptr && test[0] != '\0') {
+        const std::string spec{test};
+        const size_t comma = spec.find(',');
+        const std::string name = spec.substr(0, comma);
+        const int page = comma == std::string::npos ? 0 : std::atoi(spec.c_str() + comma + 1);
+        for (int t = 0; t < static_cast<int>(Tabs().size()); ++t) {
+            if (name == Tabs()[static_cast<size_t>(t)].name) {
+                impl->model.SetTab(t);
+                impl->model.PageStep(page);
+                LOG_INFO(Core, "VR page: VR_PAGE_TEST_OPEN: {} page {}", name, page + 1);
+            }
+        }
+    }
     impl->Redraw();
+    if (const char* dir = std::getenv("VR_PAGE_TEST_DUMP");
+        dir != nullptr && dir[0] != '\0' && !impl->dump_posted) {
+        impl->PostDump(dir);
+    }
     {
         std::scoped_lock lk{impl->mutex};
         ++impl->stats.opens;
@@ -785,6 +1199,10 @@ bool Runtime::Visible() const {
     return impl->open || impl->opacity > 0.0f;
 }
 
+bool Runtime::RequiresLivePresentation() const {
+    return impl->live_presentation && Visible();
+}
+
 void Runtime::Close(const char* why) {
     if (!impl->open) {
         return;
@@ -797,6 +1215,10 @@ void Runtime::Close(const char* why) {
     if (impl->lamp) {
         Lamps::Mailbox().Cancel(impl->lamp->offer.serial);
         impl->lamp.reset();
+    }
+    if (impl->death) {
+        SoftSave::Mailbox().Choose(impl->death, false);
+        impl->death = 0;
     }
     impl->lamp_presentation.Reset();
     impl->model.DiscardGraphics();
@@ -820,6 +1242,36 @@ void Runtime::GameMenuClosed() {
 
 Event Runtime::HandleInput(const Input& in) {
     if (!impl->open) {
+        return Event::None;
+    }
+    if (impl->death) {
+        if (!SoftSave::Mailbox().Active(impl->death)) {
+            Close("soft save context ended"); return Event::Closed;
+        }
+        // Input only on a view already shown; back once the page was seen (DeathInputTaken).
+        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        if (!DeathInputTaken(in.back,
+                             impl->death_presented == (impl->death_revision | (u64{1} << 63)),
+                             impl->death_presented != 0, now - impl->death_offer_ns))
+            return Event::None;
+        impl->death_hover = in.ray_on_page ? HitTest(impl->boxes, in.ray_x, in.ray_y) : Hover{};
+        int choice = -1;
+        if (in.back) choice = 0;
+        else if (in.confirm) choice = impl->death_focus;
+        else if (in.trigger_pressed && impl->death_hover.target == Target::Row && impl->death_hover.index >= 0 && impl->death_hover.index < 2)
+            choice = impl->death_hover.index;
+        // Up the lantern, down the soft save: a held D-pad's repeat never flips it back.
+        else if (in.up) impl->death_focus = 0;
+        else if (in.down) impl->death_focus = 1;
+        if (choice >= 0) {
+            SoftSave::Mailbox().Choose(impl->death, choice == 1);
+            impl->death = 0;
+            Close("death choice submitted"); return Event::Closed;
+        }
+        if (!Impl::SameView(SoftSave::DeathPage(impl->death_focus, impl->glyphs, impl->death_hover, SoftSave::Mailbox().When()), impl->view))
+            impl->Redraw();
         return Event::None;
     }
     if (impl->lamp) {
@@ -929,6 +1381,21 @@ Event Runtime::HandleInput(const Input& in) {
         }
     }
     switch (action) {
+    case Action::SoftSave:
+        if (SoftSave::Mailbox().Save()) m.SetNotice("Saving...");
+        else m.SetNotice(SoftSave::Mailbox().Status());
+        impl->Redraw();
+        return Event::Clicked;
+    case Action::FreeCamera:
+        // On or off, then straight into the view: the page and the game's menu close (CloseAll).
+        VR::SetFreeCamera(!VR::IsFreeCamera(), "the VR page");
+        Close("free camera");
+        return Event::CloseAll;
+    case Action::ClearSoftSave:
+        if (SoftSave::Mailbox().Clear()) m.SetNotice("Clearing soft save...");
+        else m.SetNotice(SoftSave::Mailbox().Status());
+        impl->Redraw();
+        return Event::Clicked;
     case Action::RestartGraphics: {
         // Let the main thread flush settings and perform the normal save/VR teardown.
         Graphics::restart_requested.store(true, std::memory_order_release);
@@ -978,6 +1445,11 @@ void Runtime::SetNotice(const std::string& text) {
 }
 
 void Runtime::Tick(float dt) {
+    if (impl->death && !SoftSave::Mailbox().Active(impl->death)) Close("soft save context ended");
+    if (impl->open && !impl->death && !impl->lamp && std::string_view(impl->model.CurrentTab().name) == "Save") {
+        const auto status = SoftSave::Mailbox().Status();
+        if (impl->model.GetState().notice != status) SetNotice(status);
+    }
     if (impl->lamp) {
         if (!Lamps::Mailbox().Active(impl->lamp->offer.serial))
             Close("lamp context ended");
@@ -1030,13 +1502,15 @@ void Runtime::SetGlyphs(const Glyphs& glyphs) {
     }
 }
 
-void Runtime::SetController(const std::string& profile, bool dpad) {
-    if (profile == impl->profile && dpad == impl->dpad) {
+void Runtime::SetController(const std::string& profile, bool dpad, std::string_view system) {
+    const ControlsView::Family family = ControlsView::FamilyOf(profile, system);
+    if (profile == impl->profile && dpad == impl->dpad && family == impl->family) {
         return;
     }
     impl->profile = profile;
     impl->dpad = dpad;
-    impl->store.controller_parts = ControlsView::PartsOf(ControlsView::FamilyOf(profile), profile, dpad);
+    impl->family = family;
+    impl->store.controller_parts = ControlsView::PartsOf(family, profile, dpad);
     if (impl->open) {
         impl->Redraw();
     }
@@ -1060,6 +1534,8 @@ bool Runtime::TakeImage(u64& serial, std::shared_ptr<const Image>& page,
 }
 
 void Runtime::ImagePresented(u64 lamp_revision) {
+    if (impl->death && lamp_revision == (impl->death_revision | (u64{1} << 63)))
+        impl->death_presented = lamp_revision;
     impl->lamp_presentation.Presented(lamp_revision);
     if (impl->lamp && impl->lamp_presentation.Ready(*impl->lamp))
         Lamps::Mailbox().Present(impl->lamp->offer.serial);

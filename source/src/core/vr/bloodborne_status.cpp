@@ -18,6 +18,7 @@
 #include "core/vr/conditions_channel.h"
 #include "core/vr/hook_util.h"
 #include "core/vr/live_tune.h"
+#include "core/vr/status_corners.h"
 #include "core/vr/status_drain.h"
 #include "core/vr/vr_session.h"
 
@@ -168,6 +169,56 @@ void StatusSiteA(u8* player) {
     for (u32 i = 0; i < D::Types; ++i) {
         cur[i] = Read<s32>(resist + OffsetResistCur + 4 * i);
         max[i] = Read<s32>(resist + OffsetResistMax + 4 * i);
+    }
+    // VR_TUNE_FILE (tests, core/vr/status_corners.h): status.test_type (0..4) at
+    // status.test_build (0..1, 1 takes hold) once per change of the pair: the game's own build-up.
+    if (VR::Tune::Active()) {
+        static float done_type = -1.0f, done_build = -1.0f;
+        const float type = VR::Tune::Get("status.test_type", -1.0f);
+        const float build = VR::Tune::Get("status.test_build", -1.0f);
+        if (type >= 0.0f && type < 4.5f && build >= 0.0f && (type != done_type || build != done_build)) {
+            done_type = type;
+            done_build = build;
+            const u32 t = static_cast<u32>(type + 0.5f);
+            const s32 top = Read<s32>(resist + OffsetResistMax + 4 * t);
+            const s32 want = std::max<s32>(0, static_cast<s32>(std::lround(top * (1.0f - std::min(build, 1.0f)))));
+            *reinterpret_cast<s32*>(resist + OffsetResistCur + 4 * t) = want;
+            LOG_INFO(Core, "VR status: test build-up {} at {:.2f} ({} of {})", VR::StatusCorners::TypeName(int(t)),
+                     build, top - want, top);
+        }
+    }
+    // The status corners (core/vr/status_corners.h): this update's five build-ups and the game's
+    // meter rows (who is on the hunter now), for the presenter's overlay.
+    {
+        VR::StatusCorners::Reading reading{};
+        reading.steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+        reading.valid = true;
+        for (u32 i = 0; i < VR::StatusCorners::Count; ++i) {
+            reading.cur[i] = Read<s32>(resist + OffsetResistCur + 4 * i);
+            reading.max[i] = Read<s32>(resist + OffsetResistMax + 4 * i);
+        }
+        if (const u8* const rows = g_rows.load(std::memory_order_acquire)) {
+            for (u32 i = 0; i < reading.row_icon.size(); ++i) {
+                reading.row_icon[i] = Read<s32>(rows + RowStride * i + OffsetRowIcon);
+                reading.row_len[i] = Read<s32>(rows + RowStride * i + OffsetRowLen);
+            }
+        }
+        VR::StatusCorners::Channel().Store(reading);
+        // VR_STATUS_LOG=1: the meter's rows as they change (which icon is which status).
+        static const bool rows_log = std::getenv("VR_STATUS_LOG") != nullptr;
+        static std::array<s32, 5> logged{-2, -2, -2, -2, -2};
+        if (rows_log && logged != reading.row_icon) {
+            logged = reading.row_icon;
+            LOG_INFO(Core, "VR status: meter rows icon {} {} {} {} {} len {} {} {} {} {} | build-ups "
+                           "{}/{} {}/{} {}/{} {}/{} {}/{}",
+                     logged[0], logged[1], logged[2], logged[3], logged[4], reading.row_len[0],
+                     reading.row_len[1], reading.row_len[2], reading.row_len[3], reading.row_len[4],
+                     reading.max[0] - reading.cur[0], reading.max[0], reading.max[1] - reading.cur[1],
+                     reading.max[1], reading.max[2] - reading.cur[2], reading.max[2],
+                     reading.max[3] - reading.cur[3], reading.max[3], reading.max[4] - reading.cur[4],
+                     reading.max[4]);
+        }
     }
     const s32 rate = g_rate != nullptr ? Read<s32>(reinterpret_cast<const u8*>(g_rate))
                                        : D::DefaultRate;

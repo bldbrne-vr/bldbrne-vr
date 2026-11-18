@@ -6,6 +6,7 @@
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #pragma once
+#include <array>
 #include "common/types.h"
 namespace VR::Bloodborne {
 // Checks retail hit-part layout; piggybacks on the existing final-damage hook.
@@ -14,4 +15,8 @@ void InitHeadshots(VAddr base, u64 size);
 // Called once for a confirmed player hit AFTER the existing offhand multiplier.
 // Resolves the target's collision bone; only left-hand firearm head hits get the bonus.
 float GunHeadshotDamage(const u8* result, const u8* target, float damage);
+// The struck collision body's ragdoll name of a damage result (+0x1B0, fault-safe reads; the
+// same verified layout as the headshots'), NUL-terminated into `name`; false when the layout is
+// unverified or it cannot be read (Beast Claw dismemberment: core/vr/sever_policy.h SiteOf).
+bool HitBodyName(const u8* result, const u8* target, std::array<char, 64>& name);
 } // namespace VR::Bloodborne

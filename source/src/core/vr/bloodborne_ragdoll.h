@@ -8,7 +8,9 @@
 
 #pragma once
 
+#include <atomic>
 #include "common/types.h"
+#include "core/vr/amygdalan_hook.h"
 
 // Bloodborne (v1.09 eboot): instant ragdoll on a right-hand melee kill (vr.ini melee_kill_ragdoll,
 // melee_ragdoll_impulse; the pure rules are core/vr/ragdoll_kill.h).
@@ -34,7 +36,7 @@
 // sounds, its effects), the blood echoes, drops, flags, the lock-on release, the enemy staying dead.
 // Deaths by bullets, fire, bolt paper, thrown items, the left hand, falls, viscerals and backstabs,
 // deaths that end animated, bosses, dissolves and NPC hunters stay as they are. A kill that would go
-// limp rolls once (melee_ragdoll_vanilla_pct, 22% by default): on it, it keeps the game's own death
+// limp rolls once (melee_ragdoll_vanilla_pct, 18% by default): on it, it keeps the game's own death
 // too (nothing written, no push).
 //
 // Every site is signature-checked at install; a mismatch leaves every death vanilla and is logged.
@@ -48,10 +50,50 @@ void InstallRagdoll(VAddr base, u64 size);
 // True when melee_kill_ragdoll asks for it now (the final-damage detour must be installed for it).
 [[nodiscard]] bool RagdollWanted();
 
+// The ChrCtrl ragdoll update's entry stub is in (InstallRagdoll): it also calls CorpseStep
+// (core/vr/bloodborne_corpse.h) for the corpses watched here, on each one's own update.
+[[nodiscard]] bool RagdollUpdateHooked();
+inline constexpr size_t CorpseWatchSlots = 4;
+// Corpse watch `slot` (< CorpseWatchSlots) is this ChrCtrl from now on (nullptr: none).
+void WatchCorpse(size_t slot, u8* ctrl);
+
+// Experimental, isolated-runtime proof: one living enemy, two seconds dynamic,
+// then the game's event-228 blend back to animation. No damage or position writes.
+// Only accepted with VR_AMYGDALA_HOOK_TEST=1; called on the game thread.
+bool AmygdalanRecoveryTest(u8* target);
+// OnEbootLoaded, after InstallStaggerSpeed. Publishes input ownership atomically.
+void ArmHookHooksReady();
+
+// Living Arm hook. Input is produced on the hunter's pose thread; native
+// impulses and ragdoll requests run only on the watched enemy's own update.
+using ArmHookInput = AmygdalanHook::HoldInput;
+struct ArmHookStatus {
+    s64 ns{};
+    u64 player{};
+    u32 target{0xffffffffu};
+    Body::Vec3 point{}, pelvis{}, original_root{}, root{};
+    bool attached{};
+};
+// `rope`: the tether's length (m, world scale removed; below 0: the contact's distance from the
+// grip now), e.g. the latch's from before the yank that stretched it.
+bool BeginArmHook(u8* target, const ArmHookInput& input, Body::Vec3 contact, float rope = -1.f);
+void UpdateArmHook(const ArmHookInput& input);
+ArmHookStatus ArmHookNow();
+// Game:Main only, after the native handle resolver confirms it no longer exists.
+void ForgetArmHook(u32 missing_handle);
+const std::atomic<u64>* ArmHookTargetSlot();
+float ArmHookAnimationRate(u8* chr);
+
 // The final-damage detour (DamageStep, Game:Main), for every hit whose attacker is the main player,
 // after the physical swing's scaling: a lethal right-hand weapon attack arms its target. Returns the
 // damage to apply: unchanged (test aids: VR_RAGDOLL_ONESHOT=1 makes such a hit lethal, =any every
 // hit of the hunter's; VR_RAGDOLL_LOG=1 logs the armed blow and the ragdoll's state after it).
 float RagdollOnPlayerHit(u8* res, u8* player, float damage);
+
+// Beast Claw dismemberment (core/vr/sever_policy.h), the same detour with the hit's FINAL damage:
+// LOG ONLY for now (no enemy's mesh is verified for cutting yet). VR_SEVER_LOG=1 logs each of the
+// claw's heavy or lethal physical hits: the struck body, the limb and the verdict. Independent of
+// the instant ragdoll (melee_kill_ragdoll) and its die. Changes nothing.
+void SeverOnPlayerHit(u8* res, u8* player, float damage);
 
 } // namespace VR::Bloodborne

@@ -46,11 +46,11 @@ GrindFrame LatestGrind();
 std::span<const char> GrindPcm();
 bool GrindReady();
 
-// The decoded loop (24 kHz mono S16LE) with its seam crossfaded: the last LoopFade samples folded
+// The decoded loop (24 kHz mono S16LE) with its seam crossfaded: the last `fade` samples folded
 // into the first, equal power (the sparks are noise-like). Too short a clip: unchanged.
-inline std::vector<char> MakeSeamless(const std::vector<char>& pcm) {
+inline std::vector<char> MakeSeamless(const std::vector<char>& pcm, std::size_t fade = LoopFade) {
     const std::size_t n = pcm.size() / 2;
-    if (n < 4 * LoopFade) {
+    if (fade == 0 || n < 4 * fade) {
         return pcm;
     }
     const auto at = [&](std::size_t i) {
@@ -58,12 +58,12 @@ inline std::vector<char> MakeSeamless(const std::vector<char>& pcm) {
             static_cast<std::uint16_t>(static_cast<unsigned char>(pcm[2 * i]) |
                                        (static_cast<unsigned char>(pcm[2 * i + 1]) << 8))));
     };
-    const std::size_t m = n - LoopFade;
+    const std::size_t m = n - fade;
     std::vector<char> out(m * 2);
     for (std::size_t i = 0; i < m; ++i) {
         float v = at(i);
-        if (i < LoopFade) {
-            const float u = (static_cast<float>(i) + 0.5f) / static_cast<float>(LoopFade);
+        if (i < fade) {
+            const float u = (static_cast<float>(i) + 0.5f) / static_cast<float>(fade);
             v = v * std::sin(1.5707963f * u) + at(m + i) * std::cos(1.5707963f * u);
         }
         const auto q = static_cast<std::int16_t>(std::clamp(std::lround(v), -32768L, 32767L));

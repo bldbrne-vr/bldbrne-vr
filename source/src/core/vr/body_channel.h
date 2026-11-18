@@ -46,6 +46,8 @@ struct BodyStatus {
     BodyMounts::Pose mounts{};
     std::uint64_t seq{0};
     std::int64_t steady_ns{0};
+    std::int64_t kos_ritual_start_ns{0}; // confirmed game animation, never a trigger prediction
+    std::int64_t kos_ritual_sample_ns{0}; // last fresh animation-ring read
     bool driven{false}; // the body is written into the hunter's pose (first-person VR view)
     // C0000::Left, C0000::Right: 1 = your hand, 0 = the game's. For using the hand (items, the
     // crank, the grip adjust): 0 while a kept hit or dodge (arm_keep_on_hit / arm_keep_on_dodge)
@@ -54,6 +56,10 @@ struct BodyStatus {
     // How much of the drawn arm is yours (the IK weight; the ghost hands, the late body, the
     // hurtboxes): 1 through a kept hit or dodge.
     std::array<float, 2> drawn_weight{};
+    // The game would take an item use now (core/vr/anim_classes.h GateOut::items_ok: its item
+    // window): a hunter tool used with no animation waits for it (not mid-attack, mid-roll or in
+    // a stagger).
+    bool items_ok{true};
     std::array<bool, 2> detached{};    // the hand is off the controller (out of the arm's reach)
     std::array<bool, 2> tracked{};     // tracked or held (not lost)
     std::int32_t weapon_id{-1};        // right hand's EquipParamWeapon id, -1 unknown
@@ -135,6 +141,18 @@ void NoteMark();
 void PublishBodyStatus(const BodyStatus& status);
 // Any thread. False before the first status.
 bool LatestBodyStatus(BodyStatus& out);
+
+inline std::int64_t ConfirmedKosRitualStart(const BodyStatus& s, std::int64_t now) {
+    return s.driven && s.kos_ritual_start_ns > 0 &&
+                   s.kos_ritual_sample_ns >= s.kos_ritual_start_ns &&
+                   now >= s.kos_ritual_sample_ns &&
+                   now - s.kos_ritual_sample_ns < 250'000'000
+               ? s.kos_ritual_start_ns : 0;
+}
+inline std::int64_t LatestKosRitualStart(std::int64_t now) {
+    BodyStatus s{};
+    return LatestBodyStatus(s) ? ConfirmedKosRitualStart(s, now) : 0;
+}
 
 // Any thread. A full queue (64 events) drops the new one.
 void PushBodyEvent(const BodyEvent& event);

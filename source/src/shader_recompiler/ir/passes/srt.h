@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <span>
 #include <boost/container/set.hpp>
 #include <boost/container/small_vector.hpp>
 #include "common/types.h"
@@ -30,6 +31,19 @@ struct PersistentSrtInfo {
 
     void Serialize(Serialization::Archive& ar) const;
     bool Deserialize(Serialization::Archive& ar);
+};
+
+/// A translation away from the thread that owns guest memory (VR_MERGED_EYES' compile thread,
+/// vr_merged_eyes.h), from words that thread copied. FlattenExtendedUserdataPass then neither runs
+/// its walker (the tables it reads may change or be unmapped meanwhile) nor adds it to the shared
+/// walker code: it emits the walker into memory of its own and compares it with `walker`, the one
+/// the owner ran. Equal bytes are the same reads into the same flattened dwords, so `flat`, what
+/// the owner's walk produced, is this translation's flattened user data. Otherwise it sets
+/// `differs`, and TranslateProgram stops after that pass (no later pass may read sharps then).
+struct SrtSnapshot {
+    std::span<const u32> flat;
+    std::span<const u8> walker;
+    bool differs{};
 };
 
 } // namespace Shader

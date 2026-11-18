@@ -22,6 +22,9 @@ struct Channel {
     SeqLock<Request> request;
     SeqLock<Result> result;
     SeqLock<Scene> scene;
+    SeqLock<ShamanBlade::Contact> blade_contact;
+    SeqLock<ShamanBlade::Contact> glove_contact;
+    SeqLock<HunterRelics::DropPlan> relic_drop;
     SeqLock<Holsters::Targets> holsters; // render-camera hook is the only writer
     SeqLock<Hover> hover;
     SeqLock<Launch> launch;
@@ -69,12 +72,19 @@ bool LatestResult(Result& out) {
     return C().result.Load(out);
 }
 
+void PublishBladeContact(const ShamanBlade::Contact& c) { C().blade_contact.Store(c); }
+bool LatestBladeContact(ShamanBlade::Contact& c) { return C().blade_contact.Load(c); }
+void PublishGloveContact(const ShamanBlade::Contact& c) { C().glove_contact.Store(c); }
+bool LatestGloveContact(ShamanBlade::Contact& c) { return C().glove_contact.Load(c); }
+
 void PublishScene(const Scene& scene) {
     C().scene.Store(scene);
 }
 bool LatestScene(Scene& out) {
     return C().scene.Load(out);
 }
+void PublishRelicDrop(const HunterRelics::DropPlan& plan) { C().relic_drop.Store(plan); }
+bool LatestRelicDrop(HunterRelics::DropPlan& out) { return C().relic_drop.Load(out); }
 
 void PublishHolsterTargets(const Holsters::Targets& targets) {
     C().holsters.Store(targets);

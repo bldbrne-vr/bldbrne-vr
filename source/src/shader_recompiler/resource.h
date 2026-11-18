@@ -27,7 +27,52 @@ enum class BufferType : u32 {
     GdsBuffer,
     SharedMemory,
     ClipPlanes,
+    VrFogLights, // the light composite's lights in the air (ir/passes/fog_light.h)
+    VrMoonShafts, // the light composite's moonlight in the air (ir/passes/moon_shafts.h)
+    VrGrade, // cinematic grade parameters
+    VrParticleLights, // the soft particles' lights (ir/passes/particle_air.h)
+    VrAdaptation,     // eye adaptation's state, written by the tone map (ir/passes/cinematic_look.h)
+    VrBodyCapsules,   // the hunter's body for the lamp shadows (ir/passes/body_shadow.h)
+    VrBodyMaps,       // his body's depth maps from the lamps near him (body_shadow.h MaxMaps)
+    VrSceneMaps,
+    VrShadowMask,     // each half-res pixel's shadow from the slot lamps (light_shadow.h SceneMaps::Mask)
+    VrShadowCasters,  // enemies and NPCs out of view, as capsules (light_shadow.h SceneMaps::Caster*)      // the lamps' cubes of the nearest surfaces (light_shadow.h SceneMaps)
+    VrShadowGrid,     // the blockers both eyes have seen round him (light_shadow.h Grid), written
+                      // by the lamp programs themselves
+    VrDepthPyramid,   // the AO pass's depth in blocks, nearest and farthest (light_shadow.h
+                      // SceneMaps::Pyramid; vr_depth_pyramid.h)
+    VrAir,            // the air pass's parameters (ir/passes/air_light.h)
+    VrAirCells,       // its half-size cells: the moonlight in the air, written by the shadow
+                      // mask's blur, read by the scene's copy
+    VrAirProbe,       // the moon's colour, summed by the light composite (host-visible)
+    VrFogGrid,        // the fog grid's cells, both eyes' (ir/passes/fog_grid.h; vr_fog_grid.h):
+                      // written by a dispatch of our own, read by the scene's copy
 };
+
+// VR host images (vr_host_image.cpp): an image a shader reads that is none of its draw's own, a
+// slot the rasterizer fills with a T# it captured at another draw (the moon's shadow atlas for
+// the light composite, ir/passes/moon_shafts.h). Such an ImageResource has sharp_idx
+// VrHostImageBase + slot, never a user-data index; GetSharp gives the slot's T#, or a null image
+// while it has none. The T# stays until another one is captured (a preparation worker that reads
+// it ahead of the draw sees the same image).
+inline constexpr u32 VrHostImageBase = 0xFFFFFF00u;
+enum class VrHostImage : u32 {
+    MoonAtlas = 0,
+    AirDepth, // the eye depth the moon's shadow pass reads (ir/passes/air_light.h)
+    Count,
+};
+AmdGpu::Image GetVrHostImage(VrHostImage slot);
+// True when the slot's T# changed.
+bool SetVrHostImage(VrHostImage slot, const AmdGpu::Image& image);
+// The same for a buffer (a guest buffer of another draw, bound as that draw binds it: its GPU
+// contents): a BufferResource of type Guest with sharp_idx VrHostBufferBase + slot.
+inline constexpr u32 VrHostBufferBase = 0xFFFFFF00u;
+enum class VrHostBuffer : u32 {
+    MoonSets = 0, // the directional light's light-set table (ir/passes/moon_shafts.h)
+    Count,
+};
+AmdGpu::Buffer GetVrHostBuffer(VrHostBuffer slot);
+bool SetVrHostBuffer(VrHostBuffer slot, const AmdGpu::Buffer& buffer);
 
 struct Info;
 
@@ -44,6 +89,11 @@ struct BufferResource {
         return buffer_type != BufferType::Guest;
     }
 
+    constexpr bool IsVrHost() const noexcept {
+        return !inline_cbuf && sharp_idx >= VrHostBufferBase &&
+               sharp_idx < VrHostBufferBase + static_cast<u32>(VrHostBuffer::Count);
+    }
+
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
         AmdGpu::Buffer buffer{};
         if (inline_cbuf) {
@@ -51,6 +101,8 @@ struct BufferResource {
             if (inline_cbuf.base_address != 1) {
                 buffer.base_address += info.ProgramBase(); // address fixup
             }
+        } else if (IsVrHost()) {
+            buffer = GetVrHostBuffer(static_cast<VrHostBuffer>(sharp_idx - VrHostBufferBase));
         } else {
             buffer = info.template ReadUdSharp<AmdGpu::Buffer>(sharp_idx);
         }
@@ -75,9 +127,16 @@ struct ImageResource {
     MipStorageFallbackMode mip_fallback_mode{};
     u32 constant_mip_index{};
 
+    constexpr bool IsVrHost() const noexcept {
+        return sharp_idx >= VrHostImageBase &&
+               sharp_idx < VrHostImageBase + static_cast<u32>(VrHostImage::Count);
+    }
+
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
         AmdGpu::Image image{};
-        if (!is_r128) {
+        if (IsVrHost()) {
+            image = GetVrHostImage(static_cast<VrHostImage>(sharp_idx - VrHostImageBase));
+        } else if (!is_r128) {
             image = info.template ReadUdSharp<AmdGpu::Image>(sharp_idx);
         } else {
             const auto raw = info.template ReadUdSharp<u128>(sharp_idx);
@@ -144,6 +203,9 @@ struct PushData {
     static constexpr u32 NativeWorld = 1;
     static constexpr u32 NativeCameraPaired = 2;
     static constexpr u32 NativeProjectionPaired = 4;
+    // Layer draws (NativeStereo::LayerDraws): the right eye's copy of a both-eye draw pushes
+    // vr_hud with its sign bit set (the flags are >= 0: their value is its absolute value).
+    static constexpr u32 NativeRightEyeBit = 0x8000'0000u;
 
     float xoffset;
     float yoffset;

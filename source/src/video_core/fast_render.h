@@ -78,6 +78,12 @@ enum Bit : u32 {
     GpuPassProfile = 38, // per-pass GPU timestamps; also needs FAST_GPU_PASS_PROFILE=1.
     TileFromImage = 39, // re-tile image-to-buffer copies straight from the image.
     AsyncPipelines = 40, // background graphics pipeline compiles, kicked by the bit-31 workers.
+    MergeScaledHud = 42, // pass merge also for the HUD at S1's output size (VrUiShadowDraw).
+    LazyReplayWake = 47, // the recorder wakes its replay only while it sleeps (CommandRecorder::Publish).
+    IndirectNoDrain = 48, // indirect draws and dispatches overlap stage B (Liverpool::ProcessGraphics).
+    PublishSmall = 49,    // the recorder publishes every 4 KB (CommandRecorder::Commit).
+    BackgroundFree = 50,  // freed buffer/image memory released on a background thread.
+    PooledBuffers = 52,   // cache buffers under 64 MB from VMA blocks, not dedicated (buffer.cpp).
     // A5 image candidate; never part of kDefaultMask without headset acceptance.
     TightNativeFrustum = 20,
     TextureDescTwoWay = 18,  // A4 pure-value cache candidate
@@ -86,12 +92,14 @@ enum Bit : u32 {
     NumBits = 64,
 };
 
-/// The default adds measured borrowed packet views and the bbport ports measured faster in
-/// in-run A/B (2026-10-13): 12,16,17,23-28,30-37,39-41,43-45,53-57,59-63. 19, 29, 42, 46-52, 58 and
-/// the diagnostic 38 stay off. 41 SmaaRecorder (vr_smaa.cpp), 43 PassContinue (vk_pass_breaks.h),
+/// Scratchpad default adds measured borrowed packet views and the bbport ports measured faster in
+/// in-run A/B (2026-10-13): 12,16,17,23-28,30-37,39-41,43-46,53-57,59-63. 0.5.5
+/// (2026-10-24, soaked, headset-checked) adds 42 MergeScaledHud, 47 LazyReplayWake, 48
+/// IndirectNoDrain, 50 BackgroundFree and 52 PooledBuffers. 19, 29, 49, 51, 58 and the diagnostic
+/// 38 stay off. 41 SmaaRecorder (vr_smaa.cpp), 43 PassContinue (vk_pass_breaks.h),
 /// 44 SmallReadSettle (buffer.h), 45 Fsr4Interleave (vr_fsr4_interleave.h) and 46 DlssDirect
-/// (vr_dlss_direct.h, CPU-only win so far, not yet verified bit-exact) are declared next to their code.
-/// Known unresolved startup flip and death/loading-transition failures: see MORNING.md.
+/// (vr_dlss_direct.h; on since 2026-10-23: models K and M reconstruct, images within run-to-run
+/// noise, colour and left depth copies no longer allocated) are declared next to their code.
 /// FAST_TOGGLES=0x307 selects serial + recorder; 0x7 disables the recorder too.
 constexpr u64 kDefaultMask =
     (u64{1} << FaultWindow) | (u64{1} << UpdateImageFast) | (u64{1} << BeginStateMemo) |
@@ -106,13 +114,37 @@ constexpr u64 kDefaultMask =
     (u64{1} << GraphicsPrep) | (u64{1} << PacketPrep) | (u64{1} << SmallReadDirect) |
     (u64{1} << IndexBind) | (u64{1} << BindFilter) | (u64{1} << MotionFast) |
     (u64{1} << UpscalerFast) | (u64{1} << TileFromImage) | (u64{1} << AsyncPipelines) |
-    (u64{1} << 41) | (u64{1} << 43) | (u64{1} << 44) | (u64{1} << 45) | (u64{1} << 53) |
+    (u64{1} << 41) | (u64{1} << 43) | (u64{1} << 44) | (u64{1} << 45) | (u64{1} << 46) |
+    (u64{1} << MergeScaledHud) | (u64{1} << LazyReplayWake) | (u64{1} << IndirectNoDrain) |
+    (u64{1} << BackgroundFree) | (u64{1} << PooledBuffers) | (u64{1} << 53) |
     (u64{1} << 54) | (u64{1} << 55) | (u64{1} << 56) | (u64{1} << 57) | (u64{1} << 59) |
     (u64{1} << 60) | (u64{1} << 61) | (u64{1} << 62) | (u64{1} << 63);
-static_assert(kDefaultMask == 0xfbe03bbfdfc3dbf7);
+static_assert(kDefaultMask == 0xfbf5ffbfdfc3dbf7);
 static_assert((kDefaultMask & (u64{1} << CopyThreads)) == 0);
 
 inline std::atomic<u64> g_mask{kDefaultMask};
+/// FAST_TOGGLE_FILE's optional second word (2026-11-02): the switches of changes under in-run A/B,
+/// each on unless the file clears its bit (AbOn); the "FAST stats" line ends with ab=<mask>.
+/// 0: the HLE copy overlap bitmap (vk_shader_hle.cpp DestinationsOverlapBitmap); 1: the per-draw
+/// shared hold of the mapping lock (memory.cpp SparseReadHold); 2: the copy shader's written pages
+/// without a sort (vk_rasterizer.cpp AddCopyShaderWrites); 4: the recorder's idle spin reading the
+/// clock every 64 pauses (vk_recorder.cpp CommandRecorder::Run); 5: the recorder's idle spin at
+/// all (cleared: straight to the wait); 6: stage B's idle spin at all (vk_draw_pipe.h DrawPipe::Run);
+/// 7: S1's in-frame items drawn in place in its depth, no private copy per eye
+/// (vk_rasterizer_vr.cpp VrInjectInFrame); 8: both eyes' light probe chains built level by level
+/// together, one barrier per level (vr_inframe.cpp VrInFrame::ProbeScenes); 9: the recorder's idle
+/// spin at its length (cleared: 5x); 10: stage B's idle spin at its length (cleared: 4x). The spins'
+/// lengths hang on ProcessCpus (none with fewer than 8 CPUs to run on). 11: water reflections off
+/// never take an sRGB target for the reflection (vk_rasterizer.cpp WaterReflectionSkipped; cleared:
+/// as before, the blood-paint textures wiped too, for benchmarks only). 16: VR_EYE_SPEC's variants
+/// used (vr_eye_spec_variants.h UseBit; cleared: every draw binds its base pipeline). 13: the copy
+/// shader's copies inside a render pass kept for the pass's end (vk_shader_hle.cpp CopySink; also
+/// off with FAST_HLE_COPY_SINK=0; every one of the 64 FAST bits is taken).
+/// Tried and removed: a PM4 stream prefetch (0%).
+inline std::atomic<u64> g_ab_mask{~u64{0}};
+[[nodiscard]] inline bool AbOn(unsigned bit) noexcept {
+    return ((g_ab_mask.load(std::memory_order_relaxed) >> bit) & 1) != 0;
+}
 
 [[nodiscard]] inline bool On(Bit bit) noexcept {
     return (g_mask.load(std::memory_order_relaxed) >> bit) & 1;
@@ -159,6 +191,10 @@ void Start();
 
 /// On the thread itself.
 void RegisterThread(Role role);
+/// The logical CPUs the process may run on (its affinity mask), read once, at the first call (the
+/// renderer threads' start, after a launcher or benchmark set the mask). The idle spins' default
+/// hangs on it: spinning threads cost a weak CPU the time its other threads need.
+unsigned ProcessCpus();
 void NoteRecorderFlush(std::string_view reason, std::source_location site, bool pending);
 void NoteRecorderEncoded(u64 packets, u64 bytes, u64 sampled_ns, u64 samples);
 void NoteRecorderReplay(u64 ns);
@@ -221,6 +257,12 @@ inline void NoteFrame() noexcept {
 }
 inline void NoteFault() noexcept {
     g_counters.faults.fetch_add(1, std::memory_order_relaxed);
+}
+// Every guest page fault the renderer's handler sees, hooked or not, before it acts on it
+// (FAST_CPU_REPEAT_DRAW: memory may have changed for the renderer since it was read).
+inline std::atomic<u64> g_fault_epoch{};
+inline void NoteAnyFault() noexcept {
+    g_fault_epoch.fetch_add(1, std::memory_order_acq_rel);
 }
 
 } // namespace FastRender

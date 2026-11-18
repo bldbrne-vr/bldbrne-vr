@@ -25,7 +25,7 @@
 //
 // This header is the pure part, unit-tested in tests/test_melee_window.cpp:
 //  - ChooseMove: which of the weapon's rows (core/vr/melee_moves.h) a swing opens: light, heavy
-//    (a wound-up stroke, or the right trigger held 0.35 s) or charged (the trigger held
+//    (a wound-up stroke, or the right trigger held 0.36 s) or charged (the trigger held
 //    melee_charge_s), in the weapon's current form; a missing heavier move falls back to a lighter
 //    one of the same form.
 //  - WindowTracker (the presenter, every XR frame): when a swing's window opens and closes. It
@@ -43,8 +43,8 @@
 //  - ComboBudget (melee_budget, the default): the swing rate. Each weapon has two quick charges
 //    that come back at the weapon's own pace in the game (core/vr/melee_moves.h Paces); a swing
 //    with too few left does not register (no attack, a dull buzz). Transforms never use them.
-//  - DamageFactor: hits scaled by the blade tip's speed (0.75 at a gentle tap .. 1.10 at full
-//    speed); with melee_budget=0 (and for a flick's transform attack, as before the budget) also
+//  - DamageFactor: hits scaled by the blade tip's speed (0.90 at a gentle tap, the row's own for
+//    an ordinary swing, 1.08 at full speed, the bonus also needing the arm's speed); with melee_budget=0 (and for a flick's transform attack, as before the budget) also
 //    by the swing cadence (swinging faster than the game's own recovery lowers each hit, down to
 //    0.5), so waggling never beats the game's own damage per second.
 //  - BiteFollow: the blade "bites" on a hit: for a moment the hunter's hand follows the controller
@@ -87,12 +87,17 @@ inline MoveChoice ChooseMove(const WeaponMoves& moves, bool form_b, MoveKind wan
     return {};
 }
 
-// Resolve stamina before creating the hit list: an unaffordable strong swing must use
-// the light row itself (damage, poise, rally, capsule and sound), not just a smaller bill.
+// Resolve stamina before creating the hit list: an unaffordable ordinary strong swing
+// uses the light row itself. A powered charged discharge retains its native attack.
 inline MoveChoice AffordableMove(MoveChoice choice, const MoveRow* light,
-                                 std::int32_t stamina) {
-    if (choice.row && choice.kind != MoveKind::Light && stamina < choice.row->stamina)
+                                 std::int32_t stamina, bool powered = false) {
+    // Powered releases use the native charged attack even with less than its full cost.
+    // The caller still refuses empty stamina; the game performs the actual deduction.
+    const bool native_discharge = powered && choice.kind == MoveKind::Charged;
+    if (!native_discharge && choice.row && choice.kind != MoveKind::Light &&
+        stamina < choice.row->stamina) {
         return {light, MoveKind::Light, true};
+    }
     return choice;
 }
 
@@ -101,13 +106,26 @@ inline MoveChoice AffordableMove(MoveChoice choice, const MoveRow* light,
 struct DamageConfig {
     bool speed{true};     // melee_speed_damage
     bool cadence{true};   // ... and by the swing rate (melee_budget=0, a flick's attack)
-    float tip_slow{3.5f}; // m/s blade tip: the floor's speed ...
-    float tip_fast{9.0f}; // ... and full speed
-    float floor{0.75f};   // the factor of a gentle tap that still committed
-    float full{1.10f};    // ... and of a full-speed swing
-    float min{0.5f};      // the total factor's bounds
-    float max{1.10f};
-    float max_heavy{1.15f};
+    float tip_slow{3.5f};   // m/s blade tip: the floor's speed ...
+    float tip_normal{6.0f}; // ... an ordinary swing's, the row's own damage (< 0: one ramp) ...
+    float tip_fast{12.0f};  // ... and full speed (9 until 2026-11-04)
+    // The factor of a gentle tap that still committed, and of a full-speed swing: -10% .. +8%, an
+    // ordinary swing (tip_normal) the row's own (2026-11-04: "make it be -10% to +8%
+    // (but also expand its range like the limits of arc speed)", "they should be weighted nicely,
+    // like users shouldn't constantly do -8%"; -5% .. +5% on one ramp from 2026-11-01, "cap the
+    // speed bonus to +5% but also do a -5% penalty if the swing is too anemic and slow"; 0.75 ..
+    // 1.10 before, when every VR swing, far past tip_fast, had +10%: enemies "died too easily").
+    float floor{0.90f};
+    float full{1.08f};
+    // The bonus also needs the arm (2026-11-04: a wrist flick could earn it, "gate the
+    // bonus"): its share is the lower of the blade's (tip_normal .. tip_fast) and the swing's peak
+    // hand speed's (head-relative, hand_normal .. hand_fast m/s); the penalty is the blade's alone.
+    // hand_fast <= hand_normal: no gate (a two-handed swing's lever, a whip's chain).
+    float hand_normal{0.0f};
+    float hand_fast{0.0f};
+    float min{0.5f}; // the total factor's bounds (the cadence's floor)
+    float max{1.08f};
+    float max_heavy{1.08f};
 };
 
 // The game's own recovery after each move (its R1 cancel start: the Saw Cleaver's 0.57 s, its
@@ -124,8 +142,55 @@ inline float RecoverSeconds(MoveKind k) {
     return 0.57f;
 }
 
-inline float SpeedFactor(float tip_speed, const DamageConfig& c) {
-    return c.floor + (c.full - c.floor) * Smoothstep(c.tip_slow, c.tip_fast, tip_speed);
+// The speed scale per kind of swing (bloodborne_melee.cpp MeleeDamage):
+//  - a one-handed blade: -10% at OneHandTipSlow or less, the row's own at OneHandTipNormal, +8%
+//    from OneHandTipFast. The 2026-11-01 headset log had committed hits with the 80 cm tip at
+//    18-47 m/s and the slowest swing that opened at 12.7: an ordinary hit never loses damage, only
+//    a swing that barely counted does (the user: one "too anemic and slow"), and the bonus grows
+//    across the real swings (0 at 18, about +2% at 25, +4.5% at 30, +7% at 35);
+//  - a two-handed grip's swing: the defaults, -10% at 3.5 m/s, its own at 6, +8% from 12;
+//  - a whip's chain (its blade-equivalent tip, whip_spin.h): its factor as before 2026-11-01,
+//    0.75 .. 1.10 on one ramp over 3.5 .. 9 m/s (the user: the Beast Cutter not changed yet).
+constexpr float OneHandTipSlow = 10.0f;
+constexpr float OneHandTipNormal = 18.0f;
+constexpr float OneHandTipFast = 40.0f;
+// ... and its arm: a swing opens at 2 m/s of the hand (TrackerConfig::onset_hand), slow real
+// forehands peak about 2.6-3, solid strikes 4-8: no bonus at 3 m/s or less, all of it from 7.
+constexpr float OneHandArmNormal = 3.0f;
+constexpr float OneHandArmFast = 7.0f;
+inline DamageConfig SwingDamageConfig(bool whip, bool two_hand) {
+    DamageConfig c{};
+    if (whip) {
+        c.tip_normal = -1.0f;
+        c.tip_fast = 9.0f;
+        c.floor = 0.75f;
+        c.full = 1.10f;
+        c.max = 1.10f;
+        c.max_heavy = 1.15f;
+    } else if (!two_hand) {
+        c.tip_slow = OneHandTipSlow;
+        c.tip_normal = OneHandTipNormal;
+        c.tip_fast = OneHandTipFast;
+        c.hand_normal = OneHandArmNormal;
+        c.hand_fast = OneHandArmFast;
+    }
+    return c;
+}
+
+// The penalty eases in below an ordinary swing, the bonus above it (its share the lower of the
+// blade's and the arm's, `hand_peak` < 0: unknown, the blade's); one ramp without an ordinary swing.
+inline float SpeedFactor(float tip_speed, const DamageConfig& c, float hand_peak = -1.0f) {
+    if (!(c.tip_normal > c.tip_slow && c.tip_normal < c.tip_fast)) {
+        return c.floor + (c.full - c.floor) * Smoothstep(c.tip_slow, c.tip_fast, tip_speed);
+    }
+    if (tip_speed <= c.tip_normal) {
+        return c.floor + (1.0f - c.floor) * Smoothstep(c.tip_slow, c.tip_normal, tip_speed);
+    }
+    float share = Smoothstep(c.tip_normal, c.tip_fast, tip_speed);
+    if (c.hand_fast > c.hand_normal && hand_peak >= 0.0f) {
+        share = std::min(share, Smoothstep(c.hand_normal, c.hand_fast, hand_peak));
+    }
+    return 1.0f + (c.full - 1.0f) * share;
 }
 
 // `since_s`: from the previous window that counted (it committed or hit) to this one's opening.
@@ -139,11 +204,12 @@ inline float CadenceFactor(float since_s, float recover_s) {
     return std::clamp(since_s / recover_s, 0.5f, 1.0f);
 }
 
-inline float DamageFactor(float tip_speed, float since_s, MoveKind kind, const DamageConfig& c) {
+inline float DamageFactor(float tip_speed, float since_s, MoveKind kind, const DamageConfig& c,
+                         float hand_peak = -1.0f) {
     if (!c.speed) {
         return 1.0f;
     }
-    const float f = SpeedFactor(tip_speed, c) *
+    const float f = SpeedFactor(tip_speed, c, hand_peak) *
                     (c.cadence ? CadenceFactor(since_s, RecoverSeconds(kind)) : 1.0f);
     return std::clamp(f, c.min, kind == MoveKind::Light ? c.max : c.max_heavy);
 }
@@ -196,7 +262,8 @@ inline float SwingRadius(float row_radius, float blade, float span, float span_n
 // x melee_budget_scale + melee_budget_offset_ms (-80 ms: 0.487 s), counted from the swing or from
 // the previous block's return, whichever is later. So swings at the game's own pace always
 // register, two quick ones in a row do too, and flailing gets the game's own rate (plus the banked
-// charge); a light then a heavy waits for the light's charge, as the game's R1 -> R2. A wound-up
+// charge); a light then a heavy waits for the light's charge, as the game's R1 -> R2. A charged
+// attack's come back a little sooner (BudgetConfig::charged_scale, x0.85). A wound-up
 // stroke (not trigger-armed) with one charge left is a light swing. Swings that never committed
 // (and hit nothing), the game refused, or that became a flick's transform attack before their own
 // attack hit anything give theirs back. Transforms (a squeeze, a flick and its transform attack)
@@ -226,7 +293,25 @@ struct BudgetConfig {
     float quick_s{0.64f};    // melee_budget_quick_s: a light recovery this short is quick
     float quick_gap_s{0.10f};       // the third charge waits this long after the swing before
     float quick_last_scale{1.25f};  // ... and comes back this much slower
+    // melee_budget_miss_refund: a swing that hit nothing gives its charges back as it ends
+    // (2026-11-11, the user: a miss, then a retry that did not register, gave pause). The game's
+    // stamina and the trigger's charge stay spent; misses do no damage, so the pace of hits is
+    // the same. A hit reported up to MissLateHitS after it ended uses them again. Off in the
+    // struct (a miss uses them like a hit, as before); the setting's default is on.
+    bool miss_refund{false};
+    // A charged attack's charges come back this much sooner (x its refill; a light's and a
+    // heavy's keep theirs): after a charged hit a quick follow-up passed through for the whole
+    // charged recovery (2026-11-13, the user: "shorten it a tiny bit ... not by too much"). The
+    // Saw Cleaver's 0.853 s -> 0.725 s, the Boom Hammer's 1.587 -> 1.349.
+    float charged_scale{0.85f};
 };
+
+// A swing's enemy hit can be reported after its window closed: the game keeps a window closed up
+// to 150 ms before it opens (bloodborne_melee.cpp StaleCloseNs) and takes its hits 120 ms past its
+// end (HitGraceNs), then the report's own frame or two.
+inline constexpr float MissLateHitS = 0.40f;
+// How many windows given back as misses wait for a late hit at once (TrackerInput::recent_hits).
+inline constexpr int MissPending = 4;
 
 // The charges of a weapon whose light swing recovers in `light_recover_s` in the game (its form's
 // own pace; 0: none, not quick).
@@ -317,10 +402,12 @@ public:
         return 0;
     }
     // Window `serial` uses `charges`; they come back `refill_s` after now or after the previous
-    // block, whichever is later. False (nothing used) when fewer are free.
-    bool Spend(std::uint32_t serial, int charges, float refill_s, double now) {
+    // block, whichever is later. False (nothing used) when fewer are free, unless `force` (a hit
+    // reported after its window was given back as a miss: it pays even if the next swing took the
+    // charges, which then come back that much later).
+    bool Spend(std::uint32_t serial, int charges, float refill_s, double now, bool force = false) {
         Prune(now);
-        if (charges <= 0 || Available(now) < charges || count >= BudgetMaxCharges) {
+        if (charges <= 0 || count >= BudgetMaxCharges || (!force && Available(now) < charges)) {
             return false;
         }
         Block& b = blocks[count];
@@ -404,6 +491,11 @@ private:
 
 // ---- The presenter's window ---------------------------------------------------------------------
 
+// The right hand's wound-up heavies at most one in this many seconds (TrackerConfig::
+// heavy_cooldown_s; the tester, 2026-11-01: wide, large swings may be heavies, "but in that case
+// that needs to have a cooldown so not all of them count"). The whip forms keep theirs.
+constexpr float HeavyCooldownS = 4.0f;
+
 struct TrackerConfig {
     bool onset{true};            // melee_open=onset (else the window opens at the commit)
     float onset_rate{3.0f};      // rad/s: the blade turning this fast (the stroke's start) ...
@@ -419,16 +511,21 @@ struct TrackerConfig {
     // (2026-10-18). The one after a flurry's light may be heavy again (feedback: heavy,
     // light, heavy...). Trigger-armed swings are never changed.
     float flurry_s{0.0f};
+    // A wound-up stroke is a heavy at most this often (s since the last such heavy committed;
+    // 0: always). The trigger's charge is never held back.
+    float heavy_cooldown_s{0.0f};
     float keep_rate{1.5f};       // open while the blade turns faster than max(keep_rate,
     float keep_frac{0.30f};      //   keep_frac x the stroke's peak) ...
     float keep_hand{1.4f};       // ... or the hand moves this fast
     float end_hold{0.03f};       // both slower this long: closed
     float max_open{0.6f};        // s
+    bool contact_hold{false};   // Cane/Cutter whip: a committed moving chain keeps its attack
+    float contact_follow_s{0.25f}; // protect the same multi-enemy sweep after its first hit
     float min_interval{0.35f};   // between windows that counted (melee_budget=0 only)
     float merge_s{0.5f};         // a commit this soon after a window that hit stays that window
-    float charge_heavy_s{0.35f}; // right trigger held: heavy
-    float charge_full_s{1.0f};   // ... charged (melee_charge_s)
-    float charge_keep_s{1.5f};   // armed this long after it is let go
+    float charge_heavy_s{0.36f}; // right trigger held: heavy
+    float charge_full_s{1.25f};  // ... charged (melee_charge_s)
+    float charge_keep_s{0.9f};   // armed this long after it is let go (a fresh squeeze restarts)
     BudgetConfig budget{};       // the swing rate (melee_budget; replaces min_interval)
     float hold_s{0.15f};         // melee_left's counter-motion window (TrackerInput::hold_ago)
 };
@@ -453,9 +550,16 @@ struct TrackerInput {
     V3 hand_v{};
     V3 fwd_flat{0.0f, 0.0f, -1.0f};
     float tip_speed{0.0f}; // m/s, the blade's far end
+    float stroke_arc{0.0f}; // rad: the classifier's stroke, swept so far (CurrentArcDeg)
+    bool chain_motion{false}; // fresh, extended, fast chain; false during recall
     bool trigger{false};   // the right trigger held
     // The game: the newest window serial that hit an enemy (Hit events).
     std::uint32_t hit_serial{0};
+    // ... and the last few Hit events' serials, any order (0: none): a hit of a window given back
+    // as a miss, reported after a newer window's (the newest alone hid it).
+    std::array<std::uint32_t, MissPending> recent_hits{};
+    // ... and the newest whose contact-held attack it ended (Ended events: a dodge, a kept hit).
+    std::uint32_t ended_serial{0};
     // The weapon in hand (its current form): the game's recovery of its light, heavy and charged
     // move (s; PaceRecover), the pace of the combo budget.
     std::array<float, 3> recover{RecoverSeconds(MoveKind::Light), RecoverSeconds(MoveKind::Heavy),
@@ -492,8 +596,13 @@ struct Window {
     float close_t{0.0f};
     float tip_speed{0.0f};      // now
     float tip_peak{0.0f};       // the window's peak so far
+    float hand_peak{0.0f};      // m/s: the weapon hand's peak (head-relative) so far
+    float arc_peak{0.0f};       // rad: the widest its stroke swept while it was open
     float since_counted{10.0f}; // from the last window that counted to this one's opening (s)
     bool hit{false};            // the game reported an enemy hit by it
+    bool carried{false};       // this attack has followed a contact-held chain
+    bool contact_hold{false};  // policy frozen when this window opened
+    float hit_t{0.0f};         // first reported enemy contact, on the tracker clock
     const char* why{""};        // how it opened / closed
     bool armed{false};          // the right trigger chose its kind (heavy / charged)
     bool powered{false};        // a released Stake Driver charge: independent of hand speed
@@ -503,11 +612,15 @@ struct Window {
     bool late{false};         // paid at its commit (nothing was free at the stroke's start)
     bool downgraded{false};   // wound up with one charge left: a light swing
     bool flurry{false};       // wound up right after the last lash (TrackerConfig::flurry_s): light
+    bool cooled{false};       // wound up within heavy_cooldown_s of the last heavy: light
     std::uint8_t charges{0};  // the charges it holds (0: none, given back, or no budget)
     std::uint8_t left{0};     // free after it was paid (or when it could not be)
     std::uint8_t capacity{0}; // melee_budget_charges (0: no budget)
     float refill_s{0.0f};     // its charges come back this long after they are used
     float next_s{0.0f};       // not paid: the next charge back in this long (s)
+    // Its attack lands long after it closes (KeepCharges: a plunge, at the landing): a miss never
+    // gives its charges back.
+    bool keep_charges{false};
     // A transform flick was squeezed during it or just before it opened (NoteFlick): its stroke
     // is the transform's. Opened after the squeeze: never paid; open at the squeeze: never paid
     // at its commit, no empty buzz (what it paid at its start comes back from the game when the
@@ -527,6 +640,7 @@ struct TrackerOutput {
     bool empty{false};    // a swing the combo budget could not pay committed (the dull buzz)
     bool paid_late{false}; // ... or it could at the commit (it registers after all)
     bool refunded{false};  // the window's charges came back this frame (aborted, judged light)
+    bool miss_refunded{false}; // ... because the swing ended having hit nothing (miss_refund)
 };
 
 class WindowTracker {
@@ -608,11 +722,19 @@ public:
         return true;
     }
 
+    // A wound-up stroke now would open light (the heavy's wait runs, no trigger charge armed):
+    // the presenter keeps the heavy's cues, the ready click and the arc's buzz, quiet.
+    bool HeavyCooling() const {
+        return charge == Charge::None && heavy_cooldown_s > 0.0f &&
+               t - last_heavy_t < heavy_cooldown_s;
+    }
+
     // The game-side stamina check can downgrade after the XR thread reserved a strong
     // swing. Rebill that same window as a light, without creating another attack.
     bool ResolveLightAttack(std::uint32_t serial, const BudgetConfig& cfg) {
         if (!serial || w.serial != serial || w.kind == MoveKind::Light)
             return false;
+        GiveBackHeavy(serial);
         w.kind = MoveKind::Light;
         w.verdict = MoveKind::Light;
         w.verdict_known = true;
@@ -623,7 +745,16 @@ public:
             w.refill_s = refill;
             w.left = static_cast<std::uint8_t>(Pool().Available(Clock()));
         }
+        RebillMiss(serial, refill); // given back as a miss: a late hit pays a light's
         return true;
+    }
+
+    // The open window's attack lands long after it closes (a plunge: at the landing): it keeps its
+    // charges whether or not it hits (no miss refund).
+    void KeepCharges() {
+        if (w.open) {
+            w.keep_charges = true;
+        }
     }
 
     // Time that passed with no Step (a game menu, the virtual screen, focus loss, the R1 / R2
@@ -650,9 +781,10 @@ public:
     TrackerOutput OpenRevolution(const TrackerInput& in, const TrackerConfig& cfg,
                                  const char* why = "a whip revolution") {
         TrackerOutput out{};
-        if (!in.swings) {
+        if (!in.swings || KeepsContactSweep(in, cfg)) {
             return out;
         }
+        refund_misses = cfg.budget.miss_refund;
         if (w.open) {
             Close(out, "a new revolution");
         }
@@ -670,6 +802,7 @@ public:
         if (!in.swings || in.top != MoveKind::Charged) {
             return out;
         }
+        refund_misses = cfg.budget.miss_refund;
         if (w.open) {
             Close(out, "a powered discharge");
         }
@@ -690,9 +823,21 @@ public:
         if (w.open) {
             Close(out, why);
         }
-        charge = Charge::None;
+        charge = charge_used = Charge::None;
         charge_hold = 0.0f;
+        charge_trigger_down = false;
         return out;
+    }
+
+    // The classifier feeding this tracker was reset (Classifier::Reset, a context switch): it
+    // numbers its strokes from 1 again, so the onset and refused strokes remembered are from
+    // before and must not block a new stroke of the same number (2026-10-31 review: a refused
+    // stroke 1, a reset, a new stroke 1 had no onset window). The tracker's own Reset keeps them:
+    // a hand transform or the bow going up does not renumber the strokes.
+    void StrokesRestart() {
+        contact_covered_stroke = 0;
+        onset_stroke = 0;
+        refused_stroke = 0;
     }
 
     TrackerOutput Step(const TrackerInput& in, const TrackerConfig& cfg) {
@@ -707,17 +852,51 @@ public:
         if (cfg.budget.enabled && pool == nullptr) {
             Pool().SetCapacity(BudgetCapacity(cfg.budget, in.light_pace));
         }
+        refund_misses = cfg.budget.miss_refund;
         StepCharge(in, cfg, out);
         if (in.hit_serial != 0 && in.hit_serial == w.serial && !w.hit) {
             w.hit = true;
+            w.hit_t = t;
             if (!w_counted) {
                 w_counted = true;
                 last_counted_t = w.open_t;
             }
         }
+        for (MissRefund& m : misses) {
+            if (m.serial == 0) {
+                continue;
+            }
+            const bool late_hit =
+                in.hit_serial == m.serial ||
+                std::find(in.recent_hits.begin(), in.recent_hits.end(), m.serial) !=
+                    in.recent_hits.end();
+            if (late_hit) {
+                // The swing given back as a miss hit after all (reported after it ended): its
+                // charges are used again, even if the next swing took them (they come back that
+                // much later): a hit is never free.
+                if (Pool().Spend(Key(m.serial), m.charges, m.refill_s, Clock(), true) &&
+                    w.serial == m.serial) {
+                    w.charges = m.charges;
+                    w.left = static_cast<std::uint8_t>(Pool().Available(Clock()));
+                }
+                m = {};
+            } else if (t - m.t > MissLateHitS) {
+                m = {};
+            }
+        }
+        // The swing detector turned this stroke down (not a swing; a non-whip's "too soon", as the
+        // abort below): no onset window opens for it from now on. Its verdict comes in one frame
+        // only; an onset opening in that frame (below) or later in the stroke escaped the abort and
+        // could hit for a stroke already refused (2026-10-30 review). A window already open is
+        // aborted below unless its blade hit first (the damage is done: the hit commits it).
+        if (in.gate == Kind::Ignored || (in.gate == Kind::Rejected && cfg.commit_tip <= 0.0f)) {
+            refused_stroke = in.stroke;
+        }
         if (w.open) {
             w.tip_speed = in.tip_speed;
             w.tip_peak = std::max(w.tip_peak, in.tip_speed);
+            w.hand_peak = std::max(w.hand_peak, in.hand_speed);
+            w.arc_peak = std::max(w.arc_peak, in.stroke_arc);
         }
         if (w.open && !in.swings) {
             Close(out, "swings off");
@@ -755,6 +934,33 @@ public:
                 }
             }
         }
+        // Contact-held whips carry one accepted attack across strokes/revolutions until contact.
+        // Once its chain settles or recalls, it cannot leave a stored attack behind.
+        if (w.open && w.carried && (!cfg.contact_hold || !in.chain_motion)) {
+            Close(out, "chain settled or recalled");
+        }
+        // ... nor one the game has ended (a dodge, a kept hit): the moving chain would keep the
+        // window and turn down every new lash until it slowed.
+        if (w.open && w.contact_hold && in.ended_serial != 0 && in.ended_serial == w.serial) {
+            Close(out, "the game ended its attack");
+        }
+        const bool keep_contact = KeepsContactSweep(in, cfg);
+        if (keep_contact) {
+            // These strokes belong to the continuing sweep, including a verdict delivered
+            // after its grace expires. Classifier IDs increase until StrokesRestart().
+            contact_covered_stroke = std::max(contact_covered_stroke, w.stroke);
+            if (in.stroke_live) {
+                contact_covered_stroke = std::max(contact_covered_stroke, in.stroke);
+            }
+            if (in.fired) {
+                contact_covered_stroke = std::max(
+                    contact_covered_stroke, in.fired_stroke != 0 ? in.fired_stroke : in.stroke);
+            }
+        }
+        const auto covered = [&](unsigned stroke) {
+            return cfg.contact_hold && contact_covered_stroke != 0 &&
+                   stroke <= contact_covered_stroke;
+        };
         // A commit with no window of its own: a new one (the previous stroke's ends). A commit
         // that follows a window which hit, in the same motion (the classifier split it into two
         // strokes), stays that window: one hit list, one stamina cost for one motion.
@@ -763,7 +969,9 @@ public:
             // (A whip's next stroke is a lash of its own, never the last one's.)
             w.stroke = in.fired_stroke != 0 ? in.fired_stroke : w.stroke;
         }
-        if (in.fired && in.swings && !(w.open && w.committed && w.stroke == in.fired_stroke)) {
+        if (!keep_contact && in.fired && in.swings &&
+            !covered(in.fired_stroke != 0 ? in.fired_stroke : in.stroke) &&
+            !(w.open && w.committed && w.stroke == in.fired_stroke)) {
             if (!(w.open && !w.committed)) { // (an onset window of this stroke committed above)
                 if (w.open) {
                     Close(out, "a new swing");
@@ -778,8 +986,11 @@ public:
         // down (a quick reversal never stays slow long enough for it to close).
         const bool whip_takeover =
             cfg.commit_tip > 0.0f && w.open && w.committed && in.stroke != w.stroke;
-        if ((!w.open || whip_takeover) && cfg.onset && in.swings && in.stroke_live && !in.recovery &&
-            in.stroke != onset_stroke && in.blade_rate >= cfg.onset_rate &&
+        if (!keep_contact && (!w.open || whip_takeover) && cfg.onset && in.swings &&
+            !covered(in.stroke) &&
+            in.stroke_live && !in.recovery &&
+            in.stroke != onset_stroke && in.stroke != refused_stroke &&
+            in.blade_rate >= cfg.onset_rate &&
             in.hand_speed >= cfg.onset_hand && t - last_counted_t >= min_interval &&
             DirectionOk(in)) {
             onset_stroke = in.stroke;
@@ -797,7 +1008,10 @@ public:
             }
             w_peak = std::max(w_peak, in.blade_rate);
             slow = fast ? 0.0f : slow + std::clamp(in.dt, 0.0f, 0.1f);
-            if (slow >= cfg.end_hold) {
+            if (CarriesContact(in, cfg)) {
+                w.carried = true;
+                slow = 0.0f;
+            } else if (slow >= cfg.end_hold) {
                 Close(out, w.committed ? "slowed" : "slowed before the commit");
             } else if (t - w.open_t >= cfg.max_open) {
                 Close(out, w.committed ? "maximum duration" : "maximum duration before the commit");
@@ -814,6 +1028,11 @@ public:
             // A wound-up swing judged light holds a light's charges and refill (from when it was
             // used; a heavy of one charge too, BudgetConfig::heavy_cost 1: its refill is a light's).
             if (cfg.budget.enabled && w.kind == MoveKind::Heavy && w.verdict == MoveKind::Light &&
+                !w.armed && w.charges == 0) {
+                // Given back as a miss already: a late hit pays a light's (RebillMiss).
+                RebillMiss(w.serial, BudgetRefill(w_recover[0], cfg.budget) * w_refill_mult);
+            }
+            if (cfg.budget.enabled && w.kind == MoveKind::Heavy && w.verdict == MoveKind::Light &&
                 !w.armed && w.charges > 0) {
                 const float refill = BudgetRefill(w_recover[0], cfg.budget) * w_refill_mult;
                 if (Pool().Rebill(Key(w.serial), 1, refill, Clock())) {
@@ -824,11 +1043,23 @@ public:
                 }
             }
         }
+        if (CarriesContact(in, cfg) && w.unpaid && PayLate(cfg)) {
+            out.paid_late = true;
+            out.empty = false;
+        }
         out.charge = charge;
         return out;
     }
 
 private:
+    bool CarriesContact(const TrackerInput& in, const TrackerConfig& cfg) const {
+        return cfg.contact_hold && in.swings && in.chain_motion && w.open && w.committed &&
+               !w.powered && !w.flick;
+    }
+    bool KeepsContactSweep(const TrackerInput& in, const TrackerConfig& cfg) const {
+        return CarriesContact(in, cfg) &&
+               (!w.hit || t - w.hit_t < cfg.contact_follow_s);
+    }
     // Not a pull-back toward the body, not a raise (the swing gate's own direction tests).
     static bool DirectionOk(const TrackerInput& in) {
         const V3 v = in.hand_v;
@@ -852,6 +1083,12 @@ private:
     void StepCharge(const TrackerInput& in, const TrackerConfig& cfg, TrackerOutput& out) {
         const float dt = std::clamp(in.dt, 0.0f, 0.1f);
         if (in.trigger) {
+            if (!charge_trigger_down) {
+                // A fresh squeeze starts over, even inside the release grace. An older
+                // unconfirmed swing must not refund its charge into this new squeeze.
+                charge = charge_used = Charge::None;
+                charge_hold = 0.0f;
+            }
             charge_hold += dt;
             if (charge_hold >= cfg.charge_full_s && charge != Charge::Full) {
                 charge = Charge::Full;
@@ -867,6 +1104,7 @@ private:
                 charge = Charge::None;
             }
         }
+        charge_trigger_down = in.trigger;
     }
 
     void Open(const TrackerInput& in, const TrackerConfig& cfg, TrackerOutput& out, bool committed,
@@ -882,17 +1120,25 @@ private:
         w = {};
         w.serial = ++serial;
         w.open = true;
+        w.contact_hold = cfg.contact_hold;
         w.committed = committed;
         w.stroke = stroke;
         w.cocked = in.cocked;
         w.open_t = t;
         w.tip_speed = in.tip_speed;
         w.tip_peak = in.tip_speed;
+        w.hand_peak = in.hand_speed;
+        w.arc_peak = in.stroke_arc;
         w.since_counted = std::min(since, 10.0f);
         w.why = why;
-        w.kind = charge == Charge::Full                 ? MoveKind::Charged
-                 : charge == Charge::Heavy || in.cocked ? MoveKind::Heavy
-                                                        : MoveKind::Light;
+        // A wound-up stroke is a heavy once its cooldown has run (TrackerConfig::heavy_cooldown_s).
+        const bool cooled = in.cocked && charge == Charge::None && cfg.heavy_cooldown_s > 0.0f &&
+                            t - last_heavy_t < cfg.heavy_cooldown_s;
+        const bool cocked = in.cocked && !cooled;
+        w.cooled = cooled;
+        w.kind = charge == Charge::Full              ? MoveKind::Charged
+                 : charge == Charge::Heavy || cocked ? MoveKind::Heavy
+                                                     : MoveKind::Light;
         if (charge != Charge::None) {
             // Trigger-armed: the classifier's light / heavy does not change it.
             w.armed = true;
@@ -902,7 +1148,7 @@ private:
                 charge_used = charge;
                 charge = Charge::None; // used up (held: every swing keeps it)
             }
-        } else if (!in.cocked) {
+        } else if (!cocked) {
             w.verdict_known = true; // a stroke that did not start wound up is light at once
             w.verdict = MoveKind::Light;
         } else if (cfg.flurry_s > 0.0f && since < cfg.flurry_s &&
@@ -988,7 +1234,8 @@ private:
             w.verdict = kind;
         }
         w_refill_mult = past_two ? std::max(b.quick_last_scale, 1.0f) : 1.0f;
-        w.refill_s = BudgetRefill(w_recover[static_cast<std::size_t>(kind)], b) * w_refill_mult;
+        w.refill_s = BudgetRefill(w_recover[static_cast<std::size_t>(kind)], b) *
+                     (kind == MoveKind::Charged ? b.charged_scale : 1.0f) * w_refill_mult;
         pay.Spend(Key(w.serial), need, w.refill_s, now);
         w.charges = static_cast<std::uint8_t>(need);
         w.left = static_cast<std::uint8_t>(free - need);
@@ -1009,6 +1256,28 @@ private:
             out.paid_late = !w.unpaid;
             out.empty = w.unpaid;
         }
+        // A wound-up heavy that registered as one starts the next one's wait (heavy_cooldown_s):
+        // not one the budget could not pay or made light, or a transform's flick. The classifier's
+        // later light (it stopped short of the arc) never gives it back: its hits land in the
+        // first milliseconds, as the heavy (the 2026-11-02 headset log: two short heavy chops
+        // that hit 1 ms after their open, the next heavy 1.8 and 2.6 s later). Only the game's
+        // stamina, making it light before it opens, does (ResolveLightAttack).
+        if (w.kind == MoveKind::Heavy && !w.armed && !w.unpaid && !w.flick &&
+            heavy_serial != w.serial) {
+            heavy_prev_t = last_heavy_t;
+            last_heavy_t = t;
+            heavy_serial = w.serial;
+            heavy_cooldown_s = cfg.heavy_cooldown_s;
+        }
+    }
+
+    // The window that started the heavy's wait was made light by the game's stamina before its
+    // attack opened (ResolveLightAttack): the wait is as it was before it.
+    void GiveBackHeavy(std::uint32_t serial) {
+        if (serial != 0 && heavy_serial == serial) {
+            last_heavy_t = heavy_prev_t;
+            heavy_serial = 0;
+        }
     }
 
     void Close(TrackerOutput& out, const char* why) {
@@ -1018,11 +1287,34 @@ private:
         w.aborted = !w.committed;
         out.closed = true;
         out.aborted = w.aborted;
-        if (w.aborted && !w.hit && w.charges > 0 && Pool().Refund(Key(w.serial), Clock())) {
+        const bool unhit = !w.hit && w.charges > 0;
+        if (w.aborted && unhit && Pool().Refund(Key(w.serial), Clock())) {
             // Not a swing (a wind-up, a reach, a gesture): its charges come back.
             w.charges = 0;
             w.left = static_cast<std::uint8_t>(Pool().Available(Clock()));
             out.refunded = true;
+        } else if (refund_misses && w.committed && unhit && !w.flick && !w.keep_charges) {
+            // A swing that hit nothing (BudgetConfig::miss_refund): its charges come back, so the
+            // next swing registers. Kept a moment for a late hit report (Step).
+            const std::uint8_t held = w.charges;
+            if (Pool().Refund(Key(w.serial), Clock())) {
+                // A free slot, else the oldest.
+                MissRefund* slot = &misses[0];
+                for (MissRefund& m : misses) {
+                    if (m.serial == 0) {
+                        slot = &m;
+                        break;
+                    }
+                    if (m.t < slot->t) {
+                        slot = &m;
+                    }
+                }
+                *slot = {w.serial, held, w.refill_s, t};
+                w.charges = 0;
+                w.left = static_cast<std::uint8_t>(Pool().Available(Clock()));
+                out.refunded = true;
+                out.miss_refunded = true;
+            }
         }
         if ((w.aborted || w.unpaid) && !w.hit && charge_used != Charge::None &&
             charge == Charge::None) {
@@ -1051,16 +1343,42 @@ private:
     }
 
     Window w{};
+    // The windows whose charges came back because they hit nothing, waiting MissLateHitS for a
+    // late hit (Close; serial 0: a free slot).
+    struct MissRefund {
+        std::uint32_t serial{0};
+        std::uint8_t charges{0};
+        float refill_s{0.0f};
+        float t{0.0f}; // when it ended (tracker clock)
+    };
+    std::array<MissRefund, MissPending> misses{};
+    // Window `serial`, given back as a miss, was judged light after: a late hit pays a light's.
+    void RebillMiss(std::uint32_t serial, float refill_s) {
+        for (MissRefund& m : misses) {
+            if (m.serial != 0 && m.serial == serial) {
+                m.charges = 1;
+                m.refill_s = refill_s;
+            }
+        }
+    }
+    bool refund_misses{false}; // BudgetConfig::miss_refund, from the last Step / Open*
     std::uint32_t serial{0};
     float t{0.0f};
     float last_counted_t{-10.0f};
     MoveKind last_counted_kind{MoveKind::Light}; // the kind of that window (flurry_s)
+    float last_heavy_t{-1000.0f};                // the last wound-up heavy's commit (cooldown)
+    float heavy_prev_t{-1000.0f};                // ... the one before it (GiveBackHeavy)
+    std::uint32_t heavy_serial{0};               // the window that set last_heavy_t
+    float heavy_cooldown_s{0.0f};                // its wait (HeavyCooling)
     bool w_counted{false};
     float w_peak{0.0f};
     float slow{0.0f};
     unsigned onset_stroke{0};
+    unsigned contact_covered_stroke{0};
+    unsigned refused_stroke{0}; // the stroke the swing detector turned down (0: none)
     Charge charge{Charge::None};
     Charge charge_used{Charge::None}; // the charge the open window used up
+    bool charge_trigger_down{false};
     float charge_hold{0.0f};
     float released_t{-10.0f};
     ComboBudget budget{};

@@ -123,6 +123,23 @@ public:
         /// the strip and leave both halves (vr_ui_resolve.comp FLAG_CONDITIONS). Needs `strip`
         /// and cut_count 4.
         bool conditions{false};
+        /// The HUD widgets' slots above and below the band (ui_hud_slots, core/vr/ui_slots.h):
+        /// the slot sheet in rows of a half this frame does not show, from atlas row `sheet_row`
+        /// (the presenter's UiFrame::strip_top). Render rows and sheet px from
+        /// VR::Ui::Slots::SheetOf.
+        struct Slots {
+            bool on{false};
+            s32 sheet_row{};
+            s32 top_src{}, top_rows{}, bottom_src{}, bottom_rows{};
+            s32 status_home_dy{}; ///< a cluster's sheet row + this = its home row (band px)
+            std::array<s32, 4> status_left{};  ///< the clusters' cut-outs (sheet px) ...
+            std::array<s32, 4> status_right{}; ///< ... measured as cut-outs 0 and 1
+            std::array<s32, 4> area{};         ///< the area name's slot (sheet px)
+            s32 banner_y0{}, banner_y1{};      ///< the banners' rows (sheet px)
+            [[nodiscard]] u32 Rows() const {
+                return static_cast<u32>(top_rows + bottom_rows);
+            }
+        } slots;
     };
 
     /// The bounding box of the UI in the dialog region, or a full menu's (band px, end
@@ -147,6 +164,9 @@ public:
         u32 opaque{};
         /// The box of the opaque UI alone (band px, end exclusive; all 0: none).
         std::array<s32, 4> opaque_box{};
+        /// With the slot sheet: UI pixels in the area name's slot and in the banners' rows.
+        u32 slot_area{};
+        u32 slot_banner{};
         u64 seq{}; ///< the frame it was measured in (ResolveParams::seq, cls)
         u8 cls{};
     };
@@ -290,7 +310,11 @@ public:
         vk::ImageView storage{};
         vk::Extent2D extent{};
     };
-    Atlas AtlasFor(u32 slot, vk::Extent2D band, bool strip = false);
+    /// `sheet_rows` > 0: the slot sheet's rows below the halves instead of the strip
+    /// (ResolveParams::slots).
+    Atlas AtlasFor(u32 slot, vk::Extent2D band, bool strip = false, u32 sheet_rows = 0);
+    /// The atlas's height for these (AtlasFor; Resolve checks the atlas it is given against it).
+    static u32 AtlasRows(vk::Extent2D band, bool strip, u32 sheet_rows);
     /// The mono eye image of presentation frame `slot` (the scene without the UI, post-processed
     /// like the frame itself): `format`, colour attachment + sampled + transfer source.
     struct EyeImage {
@@ -341,6 +365,11 @@ private:
     void Retire(VideoCore::UniqueImage& image, std::vector<vk::UniqueImageView> views);
     void EnsureTargets(vk::Format format, vk::Extent2D extent, const vk::ComponentMapping& comps,
                        u32 layers);
+    /// Creates target `i` at the current format, size, mapping and layers. The lock-on marker's
+    /// pair is made at its first draw (TargetView): two full-size images a run without a lock-on
+    /// never needs (139 MB at 2848x3136).
+    void CreateTarget(u32 i);
+    void EnsureHudKeep(vk::Extent2D required);
     void CollectStats();
     void Timestamp(vk::CommandBuffer cmdbuf, u32 query);
     void CollectTimes();
@@ -351,14 +380,16 @@ private:
     VmaAllocator allocator{};
 
     std::array<Target, 4> targets; ///< K, W and the lock-on marker's pair (Which)
-    /// K and W kept before a menu's first draw (SnapshotHud): K's and W's format, size and
-    /// mapping, created with them.
+    /// K and W kept before a menu's first draw. Allocated at setup, at the copied
+    /// rectangle's size, with the source's format and component mapping (no resampling).
     struct HudKeep {
         HudKeep() = default;
         VideoCore::UniqueImage image;
         vk::UniqueImageView sampled;
     };
     std::array<HudKeep, 2> hud_keep;
+    vk::Extent2D hud_keep_extent{}; ///< capacity, retained across menus; grows only as needed
+    vk::Rect2D hud_keep_rect{};    ///< this frame's source rectangle; copied to (0, 0)
     HudSnap hud_snap{HudSnap::Whole};
     vk::Format format{vk::Format::eUndefined};
     vk::Extent2D extent{};
@@ -391,11 +422,13 @@ private:
 
     vk::UniqueDescriptorSetLayout set_layout{};
     vk::UniquePipelineLayout pipeline_layout{};
-    /// veil estimate, atlas, scene veil, check, split rows, split, menu gone, menu HUD, marker box
-    std::array<vk::UniquePipeline, 9> pipelines{};
+    /// veil estimate, atlas, scene veil, check, split rows, split, menu gone, menu HUD, marker box,
+    /// slot sheet, the original veil estimate, its check and the split rows check
+    /// (VR_UI_RESOLVE_FAST)
+    std::array<vk::UniquePipeline, 13> pipelines{};
 
     // Stats: the device-side words the passes write, copied per frame into a host-visible ring.
-    static constexpr u32 StatsWords = 64;
+    static constexpr u32 StatsWords = 72;
     static constexpr u32 ReadbackSlots = 8;
     vk::Buffer stats_buffer{};
     VmaAllocation stats_allocation{};

@@ -24,6 +24,10 @@ namespace VR::Bloodborne {
 // Site A: the main player's update. `module` = the eboot base.
 void VitalsSiteA(u8* module, u8* player);
 
+// Site A: the empty syringe's stab (core/vr/blood_draw_channel.h): the game's own blood bullets
+// effect for the newest ask, under the game's rules, and its answer back.
+void BloodBulletsSiteA(u8* module, u8* player);
+
 // Render-camera hook (loop thread), every driven frame: the gauge's list for this camera.
 void VitalsRenderTick(u64 record_id, const float* rows, const float* position);
 

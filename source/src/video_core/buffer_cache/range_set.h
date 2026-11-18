@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <boost/icl/discrete_interval.hpp>
 #include <boost/icl/interval_map.hpp>
 #include <boost/icl/split_interval_map.hpp>
@@ -10,7 +11,10 @@
 #include <boost/pool/pool.hpp>
 #include <boost/pool/pool_alloc.hpp>
 #include <boost/pool/poolfwd.hpp>
+#include "common/logging/log.h"
+#include "common/rdtsc.h"
 #include "common/types.h"
+#include "video_core/ds_ab.h"
 
 namespace VideoCore {
 
@@ -35,14 +39,100 @@ struct RangeSet {
         m_ranges_set.add(interval);
     }
 
+    /// VR_RANGESET_FAST (on by default; '0' plain Add; 'v' every skip checked with icl::contains,
+    /// with how often each path decides; 'a' plain Add and this on alternate calls, timed):
+    /// Add for a range that is usually in the set already (a buffer range written again, as the
+    /// HLE copy's destinations every frame). The member that contained the last such range is
+    /// remembered (its bounds, not an iterator) until a Subtract or Clear; otherwise one lookup of
+    /// the member holding the first byte. Exact: adding a contained range changes nothing, and Add
+    /// only grows or joins members, so a remembered member stays inside the set.
+    void AddIfNew(VAddr base_address, size_t size) {
+        static const char mode = [] {
+            const char* v = std::getenv("VR_RANGESET_FAST");
+            return v && (v[0] == '0' || v[0] == 'v' || v[0] == 'a') ? v[0] : '1';
+        }();
+        const VAddr end_address = base_address + size;
+        if (mode == '0' || size == 0 || !DsAb::FixesOn()) {
+            Add(base_address, size);
+            return;
+        }
+        if (mode == 'a') {
+            // Both leave the same set: plain Add on odd calls, this path on even ones, timed.
+            static u64 calls = 0, add_ticks = 0, fast_ticks = 0;
+            const bool fast = (++calls & 1) == 0;
+            const u64 start = Common::FencedRDTSC();
+            if (fast) {
+                AddIfNewFast(base_address, end_address);
+            } else {
+                Add(base_address, size);
+            }
+            (fast ? fast_ticks : add_ticks) += Common::FencedRDTSC() - start;
+            if ((calls & 0x3FFFF) == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "VR_RANGESET_FAST timing: {} calls, Add {:.0f} cycles a call, AddIfNew "
+                         "{:.0f}",
+                         calls, double(add_ticks) / double(calls / 2),
+                         double(fast_ticks) / double(calls / 2));
+            }
+            return;
+        }
+        if (mode == '1') {
+            AddIfNewFast(base_address, end_address);
+            return;
+        }
+        const bool by_memo = m_known_generation == m_generation && m_known_lo <= base_address &&
+                             end_address <= m_known_hi;
+        bool contained = by_memo || Known(base_address, end_address);
+        if (mode == 'v') {
+            // How often each path decides (memo, one lookup, the full add), logged every 2^16.
+            static u64 memo_hits = 0, find_hits = 0, adds = 0;
+            if (contained && !Contains(base_address, size)) {
+                LOG_ERROR(Render_Vulkan, "VR_RANGESET_FAST verify: {:#x}+{:#x} taken as contained",
+                          base_address, size);
+                contained = false;
+            }
+            (contained ? (by_memo ? memo_hits : find_hits) : adds)++;
+            if (((memo_hits + find_hits + adds) & 0xFFFF) == 0) {
+                LOG_INFO(Render_Vulkan, "VR_RANGESET_FAST verify: memo {} lookup {} added {}",
+                         memo_hits, find_hits, adds);
+            }
+        }
+        if (!contained) {
+            Add(base_address, size);
+        }
+    }
+
+    /// AddIfNew's decision and add, no counting: the memo, one lookup, else the full add.
+    void AddIfNewFast(VAddr base_address, VAddr end_address) {
+        if (!(m_known_generation == m_generation && m_known_lo <= base_address &&
+              end_address <= m_known_hi) &&
+            !Known(base_address, end_address)) {
+            m_ranges_set.add(IntervalType{base_address, end_address});
+        }
+    }
+
+    /// The member holding base_address contains [base_address, end_address): remembered.
+    bool Known(VAddr base_address, VAddr end_address) {
+        const auto it = m_ranges_set.find(base_address);
+        if (it == m_ranges_set.end() || it->lower() > base_address || end_address > it->upper()) {
+            return false;
+        }
+        m_known_lo = it->lower();
+        m_known_hi = it->upper();
+        m_known_generation = m_generation;
+        return true;
+    }
+
     void Subtract(VAddr base_address, size_t size) {
         const VAddr end_address = base_address + size;
         IntervalType interval{base_address, end_address};
         m_ranges_set.subtract(interval);
+        ++m_generation; // AddIfNew's remembered member may be gone
     }
 
     void Clear() {
         m_ranges_set.clear();
+        ++m_generation;
     }
 
     bool Contains(VAddr base_address, size_t size) const {
@@ -111,6 +201,9 @@ struct RangeSet {
     }
 
     IntervalSet m_ranges_set;
+    // AddIfNew: a member known to be in the set while m_known_generation == m_generation.
+    VAddr m_known_lo{}, m_known_hi{};
+    u64 m_generation{1}, m_known_generation{};
 };
 
 template <typename T>

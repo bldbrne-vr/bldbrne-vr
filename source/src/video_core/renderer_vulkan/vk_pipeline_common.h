@@ -8,6 +8,7 @@
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_push_template.h"
 
+#include <memory>
 #include <span>
 #include <vector>
 #include <boost/container/small_vector.hpp>
@@ -19,11 +20,15 @@ struct PushData;
 
 namespace NativeStereo {
 struct Handles;
+struct Descriptors;
 }
 
 namespace Vulkan {
 namespace EyeOverlap {
 struct Check;
+}
+namespace StereoSetCodec {
+struct Rights;
 }
 
 static constexpr auto AllGraphicsStageBits =
@@ -74,6 +79,24 @@ public:
 
     std::span<const u8> NativeWritableBindings() const;
 
+    /// What the stages may write: raw memory (DMA), a buffer, a storage image. Fixed after
+    /// construction, so worked out once (recording thread) instead of at every draw.
+    struct StageWrites {
+        bool dma, buffers, images;
+    };
+    const StageWrites& Writes() const;
+
+    /// The VR buffers the fragment stage binds, worked out once (recording thread): the
+    /// rasterizer's per-draw VR hooks test a bit instead of scanning its buffer list at every
+    /// draw. ShadowMaskRead: its first VrShadowMask buffer is read, not written.
+    enum VrFsBuffer : u32 {
+        VrFsBodyMaps = 1u << 0,
+        VrFsSceneMaps = 1u << 1,
+        VrFsShadowMaskRead = 1u << 2,
+        VrFsDepthPyramid = 1u << 3,
+    };
+    u32 VrFsBuffers() const;
+
     bool IsCompute() const {
         return is_compute;
     }
@@ -88,9 +111,57 @@ public:
     void BindResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
                        const Shader::PushData& push_data, const Shader::VrPushData& vr_push,
                        const NativeStereo::Handles* native_handles = nullptr,
-                       EyeOverlap::Check* eye_check = nullptr) const;
+                       EyeOverlap::Check* eye_check = nullptr,
+                       std::span<const vk::DescriptorBufferInfo> flat_buffers = {},
+                       std::span<const vk::DescriptorImageInfo> flat_images = {}) const;
+
+    /// FAST_CPU_STAGEB_SPLIT (stage 2): BindResources
+    /// in its two halves. PairResources: native stereo's pairing of the writes and barriers (the
+    /// registry; resolve side) into `out`, which owns copies of every descriptor info the writes
+    /// point at. EncodeResources: the barriers, push constants and descriptors from it (the
+    /// recorder and the scheduler's push memo; encode side). Together they record what
+    /// BindResources records.
+    struct Prepared {
+        DescriptorWrites writes;
+        BufferBarriers barriers;
+        std::vector<vk::DescriptorBufferInfo> buffers;
+        std::vector<vk::DescriptorImageInfo> images;
+        // Native stereo: the pairing writes into this one's own arrays, which the writes then
+        // point into (no copy; made at first use). The bulk arrays: these, or buffers/images.
+        std::shared_ptr<NativeStereo::Descriptors> native;
+        std::span<const vk::DescriptorBufferInfo> bulk_buffers;
+        std::span<const vk::DescriptorImageInfo> bulk_images;
+        bool bulk{};
+    };
+    void PairResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
+                       const NativeStereo::Handles* native_handles, EyeOverlap::Check* eye_check,
+                       Prepared& out) const;
+    void EncodeResources(Prepared& in, const Shader::PushData& push_data,
+                         const Shader::VrPushData& vr_push) const;
+    /// EncodeResources' barriers alone (they end the render pass first): FAST_CPU_STAGEB_SPLIT=2
+    /// records them on stage B, which owns the pass, and leaves the rest to fast:StageB2.
+    void EncodeBarriers(const BufferBarriers& barriers) const;
 
 protected:
+    // BindResources' halves: the pairing (set_writes then points into `native`, barriers into
+    // `paired_barriers` or `buffer_barriers`), and the encode from writes, barriers and infos.
+    void PairInto(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
+                  const NativeStereo::Handles* native_handles, EyeOverlap::Check* eye_check,
+                  NativeStereo::Descriptors& native, bool reuse_native, bool bulk,
+                  BufferBarriers& paired_barriers, const BufferBarriers*& barriers) const;
+    void EncodeBound(DescriptorWrites& set_writes, const BufferBarriers& barriers,
+                     std::span<const vk::DescriptorBufferInfo> bulk_buffers,
+                     std::span<const vk::DescriptorImageInfo> bulk_images, bool bulk,
+                     const Shader::PushData& push_data, const Shader::VrPushData& vr_push,
+                     const StereoSetCodec::Rights* compact = nullptr,
+                     u64 compact_check = 0) const;
+    // VR_COMPACT_SETS (vk_stereo_set_codec.h): BindResources for a native stereo draw whose set
+    // pairs without side effects, its set written unpaired with the right eye's handles. False,
+    // having recorded nothing: BindResources pairs and writes as before.
+    bool BindCompactSet(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
+                        const Shader::PushData& push_data, const Shader::VrPushData& vr_push,
+                        const NativeStereo::Handles* native_handles,
+                        EyeOverlap::Check* eye_check) const;
     [[nodiscard]] std::string GetDebugString() const;
 
     // Scratch: pipeline-owned push template and host payload; used only on the
@@ -133,6 +204,10 @@ protected:
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     mutable std::vector<u8> native_writable_bindings;
     mutable bool native_bindings_ready{};
+    mutable StageWrites stage_writes{};
+    mutable bool stage_writes_ready{};
+    mutable u32 vr_fs_buffers{};
+    mutable bool vr_fs_buffers_ready{};
     bool uses_push_descriptors{};
     bool is_compute;
     // Graphics: the layout's one push constant range is 0..push_range for AllGraphicsStageBits

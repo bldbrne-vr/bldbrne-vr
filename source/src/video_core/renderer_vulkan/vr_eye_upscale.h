@@ -15,9 +15,8 @@
 #include "common/types.h"
 #include "core/vr/color_settings.h"
 #include "video_core/renderer_vulkan/vk_common.h"
-
-VK_DEFINE_HANDLE(VmaAllocator)
-VK_DEFINE_HANDLE(VmaAllocation)
+#include "video_core/renderer_vulkan/vr_riposte_meter.h"
+#include "video_core/renderer_vulkan/vr_kos_iris.h"
 
 namespace Vulkan {
 
@@ -48,6 +47,7 @@ public:
         vk::Buffer buffer;
         vk::DeviceSize offset{0};
         vk::DeviceSize range{0};
+        float riposte{0.0f}; // the block's riposte.x: > 0, the burst variants draw the burst
     };
 
     VrEyeUpscale() = default;
@@ -55,8 +55,10 @@ public:
     VrEyeUpscale(const VrEyeUpscale&) = delete;
     VrEyeUpscale& operator=(const VrEyeUpscale&) = delete;
 
-    // Compiles both pipelines. False (logged): the caller copies the eyes as they are.
-    bool Init(vk::Device device, VmaAllocator allocator);
+    // Compiles both pipelines; with `vignettes` (the late warp) also the vignette variants and
+    // the riposte burst's (with their meter). False (logged): the caller copies the eyes as they
+    // are.
+    bool Init(vk::Device device, VmaAllocator allocator, bool vignettes = false);
     // The caller has waited for its GPU work.
     void Shutdown();
     [[nodiscard]] bool Ready() const {
@@ -66,6 +68,10 @@ public:
     [[nodiscard]] bool VignettesReady() const {
         return ready && easu_vig[0] && easu_vig[1] && easu_vig[2] &&
                rcas_vig[0] && rcas_vig[1] && rcas_vig[2];
+    }
+    // The riposte burst's pipelines and meter too (Vignettes::riposte draws).
+    [[nodiscard]] bool RiposteReady() const {
+        return VignettesReady() && riposte_meter.Ready() && easu_rip && rcas_rip;
     }
 
     // The output size of an eye of `in` pixels at `scale` (1 = the same), even, at most 4x.
@@ -120,6 +126,10 @@ private:
     std::array<vk::Pipeline, 3> rcas{};
     std::array<vk::Pipeline, 3> easu_vig{}; // VR_VIGNETTE variants (vignette_in_warp)
     std::array<vk::Pipeline, 3> rcas_vig{};
+    vk::Pipeline easu_rip; // ... with VR_RIPOSTE, while a burst shows (colour variant 2 only)
+    vk::Pipeline rcas_rip;
+    VrRiposteMeter riposte_meter;
+    VrKosIris kos_iris;
     Image mid{};                 // EASU's output when RCAS follows (both eyes side by side)
     std::vector<Retired> retired; // smaller `mid`s work in flight may still read
 };

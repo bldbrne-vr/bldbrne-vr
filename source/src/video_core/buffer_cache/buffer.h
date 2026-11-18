@@ -34,6 +34,8 @@ struct BufferEntry;
 
 namespace VideoCore {
 
+class SparsePool;
+
 /// Hints and requirements for the backing memory type of a commit
 enum class MemoryUsage {
     DeviceLocal, ///< Requests device local buffer.
@@ -85,9 +87,20 @@ struct UniqueBuffer {
         return buffer;
     }
 
+    // The buffer and its memory taken out without destroying them, after its native stereo entry
+    // is forgotten here (the recording thread), for DestroyReleased on another thread
+    // (FAST_BACKGROUND_FREE): this object is empty afterwards. VMA locks internally.
+    struct Released {
+        VmaAllocator allocator{};
+        vk::Buffer buffer{};
+        VmaAllocation allocation{};
+    };
+    Released Release();
+    static void DestroyReleased(const Released& released);
+
     vk::Device device;
     VmaAllocator allocator;
-    VmaAllocation allocation;
+    VmaAllocation allocation{}; // null for a sparse view (no allocation of its own)
     vk::Buffer buffer{};
     vk::DeviceAddress bda_addr = 0;
     // Native stereo registry entry of `buffer` (null when not registered); lives as long as
@@ -100,6 +113,12 @@ public:
     explicit Buffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                     MemoryUsage usage, VAddr cpu_addr_, vk::BufferUsageFlags flags,
                     u64 size_bytes_, bool host_cached = false);
+
+    /// A sparse view of the buffer cache (SparsePool::CreateView made `view`; its memory is the
+    /// pool's pieces, not an allocation of its own). Destroying it drops its binds.
+    explicit Buffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
+                    VAddr cpu_addr_, u64 size_bytes_, vk::Buffer view, SparsePool* pool,
+                    std::vector<u32>&& pieces);
 
     Buffer& operator=(const Buffer&) = delete;
     Buffer(const Buffer&) = delete;
@@ -232,12 +251,17 @@ public:
 
 public:
     VAddr cpu_addr = 0;
+    bool sparse_view{}; // SparsePool: its blocks are the pool's pieces (a merge binds, not copies)
+    std::vector<u32> sparse_pieces; // the pieces it binds (SparsePool::ReleaseView gives them back)
     bool is_picked{};
     bool is_coherent{};
     bool is_deleted{};
     int stream_score = 0;
     size_t size_bytes = 0;
     u64 lru_id = 0;
+    // The buffer cache's gc_tick when it was last looked up or bound (FindBuffer, ObtainBuffer):
+    // the lru tick moves only with CPU uploads. Read by VR_VRAM_REPORT (atomic_ref, relaxed).
+    u64 last_used_tick = 0;
     std::span<u8> mapped_data;
     const Vulkan::Instance* instance;
     Vulkan::Scheduler* scheduler;

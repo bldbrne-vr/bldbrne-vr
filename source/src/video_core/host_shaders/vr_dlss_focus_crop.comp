@@ -1,0 +1,37 @@
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// DLSS focus (renderer_vulkan/vr_dlss_focus.h): this eye's rectangle cut out of DLSS's inputs into
+// images of its own, so DLSS gets them as it gets any whole eye (origin at the corner, the
+// rectangle's size), the same way for both eyes. Texel for texel: the colour (the render, in what
+// its view reads), the depth (the depth aspect or a canonical R32F copy: its first channel) and
+// the motion vectors (render pixels, unchanged: they are offsets).
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D color_in;
+layout(set = 0, binding = 1) uniform texture2D depth_in;
+layout(set = 0, binding = 2) uniform texture2D motion_in;
+#ifdef CROP_RGBA8
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D color_out;
+#else
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D color_out;
+#endif
+layout(set = 0, binding = 4, r32f) uniform writeonly image2D depth_out;
+layout(set = 0, binding = 5, rg16f) uniform writeonly image2D motion_out;
+
+layout(push_constant) uniform CropPush {
+    ivec4 rect; // the rectangle in the eye's inputs: x, y, width, height
+} pc;
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.rect.z || p.y >= pc.rect.w)
+        return;
+    const ivec2 src = p + pc.rect.xy;
+    imageStore(color_out, p, texelFetch(color_in, src, 0));
+    imageStore(depth_out, p, vec4(texelFetch(depth_in, src, 0).r, 0.0, 0.0, 0.0));
+    imageStore(motion_out, p, vec4(texelFetch(motion_in, src, 0).rg, 0.0, 0.0));
+}

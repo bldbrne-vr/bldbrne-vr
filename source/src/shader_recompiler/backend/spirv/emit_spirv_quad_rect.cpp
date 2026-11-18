@@ -11,8 +11,9 @@ using Sirit::Id;
 constexpr u32 SPIRV_VERSION_1_5 = 0x00010500;
 
 struct QuadRectListEmitter : public Sirit::Module {
-    explicit QuadRectListEmitter(u64 location_mask_)
-        : Sirit::Module{SPIRV_VERSION_1_5}, location_mask{location_mask_} {
+    explicit QuadRectListEmitter(u64 location_mask_, bool layer_from_hud_ = false)
+        : Sirit::Module{SPIRV_VERSION_1_5}, location_mask{location_mask_},
+          layer_from_hud{layer_from_hud_} {
         void_id = TypeVoid();
         bool_id = TypeBool();
         float_id = TypeFloat(32);
@@ -193,6 +194,14 @@ struct QuadRectListEmitter : public Sirit::Module {
             OpStore(outputs[i], param);
         }
 
+        if (layer_from_hud) {
+            // gl_Layer = floatBitsToUint(push_data.vr_hud) >> 31: the layer draw's eye.
+            const Id push_float{TypePointer(spv::StorageClass::PushConstant, float_id)};
+            const Id hud{OpLoad(float_id, OpAccessChain(push_float, push_hud, Int(0)))};
+            OpStore(output_layer, OpShiftRightLogical(uint_id, OpBitcast(uint_id, hud),
+                                                      Constant(uint_id, 31U)));
+        }
+
         OpReturn();
         OpFunctionEnd();
     }
@@ -250,6 +259,19 @@ private:
             Decorate(gl_tess_level_outer, spv::Decoration::Patch);
         } else {
             gl_per_vertex = AddOutput(gl_per_vertex_type);
+            if (layer_from_hud) {
+                // Layer draws (NativeStereo::LayerDraws): vr_hud of the pipeline's push block
+                // (Shader::PushData, offset 124), the eye in its sign bit.
+                AddCapability(spv::Capability::ShaderLayer);
+                output_layer = AddOutput(uint_id);
+                Decorate(output_layer, spv::Decoration::BuiltIn, spv::BuiltIn::Layer);
+                const Id block{TypeStruct(float_id)};
+                Decorate(block, spv::Decoration::Block);
+                MemberDecorate(block, 0U, spv::Decoration::Offset, 124U);
+                push_hud = AddGlobalVariable(TypePointer(spv::StorageClass::PushConstant, block),
+                                             spv::StorageClass::PushConstant);
+                interfaces.push_back(push_hud);
+            }
         }
         outputs.reserve(33);
         for (u32 i = 0; i < 33; i++) {
@@ -286,6 +308,9 @@ private:
 
 private:
     u64 location_mask;
+    bool layer_from_hud;
+    Id output_layer;
+    Id push_hud;
     Id main;
     Id void_id;
     Id bool_id;
@@ -316,8 +341,9 @@ private:
     std::vector<Id> interfaces;
 };
 
-std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type, u64 location_mask) {
-    QuadRectListEmitter ctx{location_mask};
+std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type, u64 location_mask,
+                                        bool layer_from_hud) {
+    QuadRectListEmitter ctx{location_mask, layer_from_hud && type == AuxShaderType::PassthroughTES};
     switch (type) {
     case AuxShaderType::RectListTCS:
         ctx.EmitRectListTCS();

@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -524,6 +525,106 @@ inline std::optional<Frame0> ParseFrame0(std::span<const u8> hkx, std::string& w
         }
     }
     return f;
+}
+
+// ---- A whole clip (the Amygdalan Arm's strike: core/vr/amygdalan_strike.h) -------------------
+
+// An hkaSplineCompressedAnimation sampled at any time (ParseFrame0 above is its first frame only):
+// the block holding it and the frame inside the block, each track's B-spline there.
+struct Clip {
+    float duration{0.0f}, block_duration{0.0f}, frame_duration{0.0f};
+    s32 tracks{0}, blocks{0};
+    std::vector<s32> offsets; // each block's start in `data`
+    std::span<const u8> data;
+    std::vector<s16> track_to_bone; // empty: track i is bone i
+};
+
+inline std::optional<Clip> ParseClip(std::span<const u8> hkx, std::string& why) {
+    const auto p = ParsePackfile(hkx, why);
+    if (!p) {
+        return std::nullopt;
+    }
+    const auto o = p->Find("hkaSplineCompressedAnimation");
+    if (!o) {
+        why = "not a spline-compressed animation";
+        return std::nullopt;
+    }
+    Clip c;
+    s32 n_offsets{}, n_data{};
+    const auto offsets = p->Target(*o + 0x58);
+    const auto data = p->Target(*o + 0x98);
+    if (!p->At(*o + 0x10, c.duration) || !p->At(*o + 0x14, c.tracks) ||
+        !p->At(*o + 0x3C, c.blocks) || !p->At(*o + 0x48, c.block_duration) ||
+        !p->At(*o + 0x50, c.frame_duration) || !p->At(*o + 0x60, n_offsets) ||
+        !p->At(*o + 0xA0, n_data) || !offsets || !data || c.tracks <= 0 || c.tracks > 256 ||
+        c.blocks <= 0 || n_offsets < c.blocks || n_data <= 0 ||
+        *data + static_cast<std::size_t>(n_data) > hkx.size() || !(c.duration > 0.0f) ||
+        !(c.duration < 60.0f) || !(c.block_duration > 0.0f) || !(c.frame_duration > 0.0f)) {
+        why = "spline animation header";
+        return std::nullopt;
+    }
+    c.offsets.resize(static_cast<std::size_t>(c.blocks));
+    for (s32 i = 0; i < c.blocks; ++i) {
+        s32& start = c.offsets[static_cast<std::size_t>(i)];
+        if (!R::ReadLe(hkx, *offsets + 4 * static_cast<std::size_t>(i), start) || start < 0 ||
+            start >= n_data) {
+            why = "spline animation block offsets";
+            return std::nullopt;
+        }
+    }
+    c.data = hkx.subspan(*data, static_cast<std::size_t>(n_data));
+    if (const auto b = p->Find("hkaAnimationBinding")) {
+        s32 n{};
+        const auto map = p->Target(*b + 0x20);
+        if (p->At(*b + 0x28, n) && n > 0 && n <= 256 && map) {
+            c.track_to_bone.resize(static_cast<std::size_t>(n));
+            for (s32 i = 0; i < n; ++i) {
+                if (!R::ReadLe(hkx, *map + 2 * static_cast<std::size_t>(i),
+                               c.track_to_bone[static_cast<std::size_t>(i)])) {
+                    why = "animation binding out of bounds";
+                    return std::nullopt;
+                }
+            }
+        }
+    }
+    return c;
+}
+
+// Every track at `t` s (clamped into the clip); none if its data runs out of bounds.
+inline std::optional<std::vector<TrackPose>> SampleClip(const Clip& c, double t) {
+    t = std::clamp(t, 0.0, static_cast<double>(c.duration));
+    const s32 b = std::clamp(static_cast<s32>(t / c.block_duration), 0, c.blocks - 1);
+    const double u = (t - b * static_cast<double>(c.block_duration)) / c.frame_duration;
+    const auto start = static_cast<std::size_t>(c.offsets[static_cast<std::size_t>(b)]);
+    Detail::Reader r{c.data, start, start};
+    std::vector<std::array<u8, 4>> masks(static_cast<std::size_t>(c.tracks));
+    for (auto& m : masks) {
+        for (u8& x : m) {
+            x = r.Get<u8>();
+        }
+    }
+    r.Pad(4);
+    std::vector<TrackPose> out(static_cast<std::size_t>(c.tracks));
+    for (s32 i = 0; i < c.tracks && r.ok; ++i) {
+        const auto& m = masks[static_cast<std::size_t>(i)];
+        const int pq = m[0] & 3, rq = (m[0] >> 2) & 0xF, sq = (m[0] >> 6) & 3;
+        TrackPose& tp = out[static_cast<std::size_t>(i)];
+        tp.t = Detail::VecTrack(r, m[1], pq, {0.0, 0.0, 0.0}, u);
+        auto q = Detail::RotTrack(r, m[2], rq, u);
+        (void)Detail::VecTrack(r, m[3], sq, {1.0, 1.0, 1.0}, u);
+        const double norm = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+        if (!(norm > 0.0)) {
+            return std::nullopt;
+        }
+        for (double& x : q) {
+            x /= norm;
+        }
+        tp.q = q;
+    }
+    if (!r.ok) {
+        return std::nullopt;
+    }
+    return out;
 }
 
 // ---- The idle line ----------------------------------------------------------------------------

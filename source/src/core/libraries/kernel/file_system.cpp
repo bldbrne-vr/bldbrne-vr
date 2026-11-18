@@ -24,6 +24,8 @@
 #include "core/file_sys/directories/normal_directory.h"
 #include "core/file_sys/directories/pfs_directory.h"
 #include "core/file_sys/fs.h"
+#include "core/file_sys/backends/host_fs.h"
+#include "core/vr/soft_save.h"
 #include "core/libraries/kernel/file_system.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/posix_error.h"
@@ -118,6 +120,7 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
     }
 
     std::string_view path{raw_path};
+    auto soft_save_io = VR::SoftSave::LockIo(path);
     u32 handle = h->CreateHandle();
     auto* file = h->GetFile(handle);
 
@@ -134,6 +137,7 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
     }
 
     bool read_only = false;
+    bool snapshot_read = false;
     file->m_guest_name = path;
     file->m_host_name = mnt->GetHostPath(file->m_guest_name, &read_only);
     bool exists = mnt->Exists(file->m_guest_name);
@@ -236,7 +240,16 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
             access_mode = Common::FS::FileAccessMode::Read;
         }
 
-        file->handle = mnt->Open(file->m_guest_name, access_mode);
+        const auto snapshot_source = VR::SoftSave::ReadOverride(
+            file->m_guest_name, read && !write && !rdwr && !truncate && !create && !append);
+        snapshot_read = !snapshot_source.empty();
+        if (snapshot_read) {
+            file->m_host_name = snapshot_source;
+            file->handle = std::make_unique<Core::FileSys::HostFile>(
+                snapshot_source, Common::FS::FileAccessMode::Read, true);
+        } else {
+            file->handle = mnt->Open(file->m_guest_name, access_mode);
+        }
         if (!file->handle || !file->handle->IsOpen()) {
             h->DeleteHandle(handle);
             *__Error() = (write || rdwr || truncate) ? POSIX_EROFS : POSIX_EIO;
@@ -252,6 +265,9 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
     }
 
     file->is_opened = true;
+    if (file->type == Core::FileSys::FileType::Regular) {
+        VR::SoftSave::NoteOpen(handle, file->m_guest_name, write || rdwr || truncate, snapshot_read);
+    }
     return handle;
 }
 
@@ -278,6 +294,7 @@ s32 PS4_SYSV_ABI close(s32 fd) {
         *__Error() = POSIX_EPERM;
         return -1;
     }
+    auto soft_save_io = VR::SoftSave::LockIo(file->m_guest_name);
     if (file->type == Core::FileSys::FileType::Regular) {
         file->handle.reset();
     } else if (file->type == Core::FileSys::FileType::Socket) {
@@ -285,6 +302,7 @@ s32 PS4_SYSV_ABI close(s32 fd) {
     }
     file->is_opened = false;
     LOG_INFO(Kernel_Fs, "Closing {}", file->m_guest_name);
+    VR::SoftSave::NoteClose(fd, file->m_guest_name);
     // FIXME: Lock file mutex before deleting it?
     h->DeleteHandle(fd);
     return ORBIS_OK;
@@ -577,6 +595,7 @@ s64 PS4_SYSV_ABI sceKernelRead(s32 fd, void* buf, u64 nbytes) {
 }
 
 s32 PS4_SYSV_ABI posix_mkdir(const char* path, u16 mode) {
+    auto soft_save_io = VR::SoftSave::LockIo(path ? path : "");
     LOG_INFO(Kernel_Fs, "path = {} mode = {:#o}", path, mode);
     if (strlen(path) > 255) {
         *__Error() = POSIX_ENAMETOOLONG;
@@ -625,6 +644,7 @@ s32 PS4_SYSV_ABI sceKernelMkdir(const char* path, u16 mode) {
 }
 
 s32 PS4_SYSV_ABI posix_rmdir(const char* path) {
+    auto soft_save_io = VR::SoftSave::LockIo(path ? path : "");
     if (strlen(path) > 255) {
         *__Error() = POSIX_ENAMETOOLONG;
         return -1;
@@ -734,9 +754,30 @@ s32 PS4_SYSV_ABI posix_stat(const char* path, OrbisKernelStat* sb) {
         // TODO incomplete
     } else {
         sb->st_mode = 0000777u | 0100000u;
-        if (auto handle = mnt->Open(path, /*writable=*/false)) {
-            Core::FileSys::FileStat fst{};
-            handle->Stat(fst);
+        // A save file: its size and times from the path, as HostFile::Stat reports them. A second
+        // handle opened here denies writers, so on Windows it failed while the game held the file
+        // open to write it - logged as "permission denied" at every save (2026-11-03; the save
+        // itself was written, this fell back to the size on disk). Other paths keep the open: a
+        // file the emulator serves itself (file_override.h) differs from the one on disk.
+        Core::FileSys::FileStat fst{};
+        bool save_file = false;
+        if (std::error_code save_ec; std::string_view{path}.starts_with("/savedata") &&
+                                     fs::is_regular_file(path_name, save_ec)) {
+            const auto size = fs::file_size(path_name, save_ec);
+            save_file = !save_ec;
+            if (save_file) {
+                fst.size = size;
+                Core::FileSys::HostFile::StatTimes(path_name, fst);
+            }
+        }
+        std::unique_ptr<Core::FileSys::IFile> handle;
+        if (!save_file) {
+            handle = mnt->Open(path, /*writable=*/false);
+            if (handle) {
+                handle->Stat(fst);
+            }
+        }
+        if (save_file || handle) {
             sb->st_size = static_cast<s64>(fst.size);
             if (fst.mtime_sec != 0 || fst.mtime_nsec != 0) {
                 sb->st_mtim.tv_sec = fst.mtime_sec;
@@ -912,6 +953,7 @@ s32 PS4_SYSV_ABI sceKernelFtruncate(s32 fd, s64 length) {
 }
 
 s32 PS4_SYSV_ABI posix_rename(const char* from, const char* to) {
+    auto soft_save_io = VR::SoftSave::LockIo(from ? from : "", to ? to : "");
     auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
     bool ro = false;
     const auto src_path = mnt->GetHostPath(from, &ro);
@@ -1223,6 +1265,7 @@ s64 PS4_SYSV_ABI sceKernelPwritev(s32 fd, const OrbisKernelIovec* iov, s32 iovcn
 }
 
 s32 PS4_SYSV_ABI posix_unlink(const char* path) {
+    auto soft_save_io = VR::SoftSave::LockIo(path ? path : "");
     if (strlen(path) > 255) {
         *__Error() = POSIX_ENAMETOOLONG;
         return -1;

@@ -77,7 +77,14 @@ class VrTemporalImages {
     };
     using Eye = std::array<Surface, 4>; // colour, depth, motion, output
     bool Init();
-    bool Allocate(const VrTemporalPair::Plan &plan);
+    bool InitInput8();
+    vk::Format InputColorFormat(const VR::Graphics::Config& accepted,
+                                const VrTemporalPair::Plan& plan,
+                                const std::array<Source, 2>& sources);
+    bool Allocate(const VrTemporalPair::Plan &plan, vk::Format output_format,
+                  vk::Format color_format);
+    // The colour (bit e per eye) and depth copies this frame writes, made on first need.
+    bool EnsureCopies(const VrTemporalPair::Plan &plan, uint32_t copy_color, uint32_t copy_depth);
     bool Create(Surface &surface, vk::Format format, uint32_t width, uint32_t height);
     static BbDlssImage Canonical(const Surface &surface);
     void CompareVerify();
@@ -94,9 +101,12 @@ class VrTemporalImages {
     VerifyKind verify_kind{VerifyKind::Fsr4Post};
     bool verify_pending{}, verify_direct{}, verify_interleaved{};
     VrTemporalPair::Plan allocated{};
+    vk::Format allocated_output{}; // the output's format (OutputFormat), part of the key
     vk::UniqueDescriptorSetLayout descriptors;
     vk::UniquePipelineLayout layout;
-    vk::UniquePipeline pipeline, merge_pipeline;
+    vk::UniquePipeline pipeline, merge_pipeline, input8_pipeline;
+    bool input8_attempted{};
+    vk::Format allocated_color{};
     // Bit 46: this frame's sources when the provider reads them in place.
     std::array<Source, 2> direct_sources;
     // Eyes whose colour/depth were copied into canonical images this frame (bit e = eye e), and

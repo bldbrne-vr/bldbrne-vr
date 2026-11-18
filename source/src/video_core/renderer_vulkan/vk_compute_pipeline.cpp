@@ -8,6 +8,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vr_merged_eyes.h"
 
 namespace Vulkan {
 
@@ -32,39 +33,15 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .pName = "main",
     };
 
+    const auto bindings = LayoutBindings(*info);
+    // The binding numbers used (an image takes one per binding it needs, its pairs in one array).
     u32 binding{};
-    boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
-    for (const auto& buffer : info->buffers) {
-        // During deserialization, we don't have access to the UD to fetch sharp data. To address
-        // this properly we need to track shaprs or portion of them in `sdata`, but since we're
-        // interested only in "is storage" flag (which is not even effective atm), we can take a
-        // shortcut there.
-        const auto sharp = preloading ? AmdGpu::Buffer{} : buffer.GetSharp(*info);
-        bindings.push_back({
-            .binding = binding++,
-            .descriptorType = vk::DescriptorType::eStorageBuffer,
-            .descriptorCount = NativeStereo::Enabled() ? 2u : 1u,
-            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        });
-    }
-    for (const auto& image : info->images) {
-        const u32 num_bindings = image.NumBindings(*info);
-        bindings.push_back({
-            .binding = binding,
-            .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage
-                                               : vk::DescriptorType::eSampledImage,
-            .descriptorCount = num_bindings * (NativeStereo::Enabled() ? 2 : 1),
-            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        });
-        binding += num_bindings;
-    }
-    for (const auto& sampler : info->samplers) {
-        bindings.push_back({
-            .binding = binding++,
-            .descriptorType = vk::DescriptorType::eSampler,
-            .descriptorCount = 1,
-            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        });
+    if (!bindings.empty()) {
+        const auto& last = bindings.back();
+        const bool image = last.descriptorType == vk::DescriptorType::eStorageImage ||
+                           last.descriptorType == vk::DescriptorType::eSampledImage;
+        binding = last.binding +
+                  (image ? last.descriptorCount / (NativeStereo::Enabled() ? 2u : 1u) : 1u);
     }
 
     const vk::PushConstantRange push_constants = {
@@ -133,8 +110,50 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Compute Pipeline {}", debug_str);
+
+    if (NativeStereo::Enabled() && MergedEyes::Mode() != '0') {
+        merged = std::make_shared<MergedEyes::Variant>();
+        merged->bindings.assign(bindings.begin(), bindings.end());
+        merged->flags = flags;
+        merged->subgroup64 = instance.IsSubgroupSize64Supported();
+        merged->hash = info->pgm_hash;
+    }
 }
 
 ComputePipeline::~ComputePipeline() = default;
+
+std::vector<vk::DescriptorSetLayoutBinding> ComputePipeline::LayoutBindings(
+    const Shader::Info& info) {
+    std::vector<vk::DescriptorSetLayoutBinding> bindings;
+    u32 binding{};
+    for (size_t i = 0; i < info.buffers.size(); ++i) {
+        bindings.push_back({
+            .binding = binding++,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = NativeStereo::Enabled() ? 2u : 1u,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        });
+    }
+    for (const auto& image : info.images) {
+        const u32 num_bindings = image.NumBindings(info);
+        bindings.push_back({
+            .binding = binding,
+            .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage
+                                               : vk::DescriptorType::eSampledImage,
+            .descriptorCount = num_bindings * (NativeStereo::Enabled() ? 2 : 1),
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        });
+        binding += num_bindings;
+    }
+    for (size_t i = 0; i < info.samplers.size(); ++i) {
+        bindings.push_back({
+            .binding = binding++,
+            .descriptorType = vk::DescriptorType::eSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        });
+    }
+    return bindings;
+}
 
 } // namespace Vulkan

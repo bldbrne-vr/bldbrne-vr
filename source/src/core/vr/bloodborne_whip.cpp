@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -16,32 +17,40 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <miniz.h>
 #include <xbyak/xbyak.h>
 
 #include "common/logging/log.h"
+#include "common/scope_exit.h"
 #include "common/singleton.h"
 #include "common/thread.h"
 #include "core/file_sys/fs.h"
+#include "core/vr/amygdalan_arm.h"
+#include "core/vr/amygdalan_hook.h"
 #include "core/vr/arm_ik.h"
 #include "core/vr/bb_weapons.h"
 #include "core/vr/bloodborne_layout.h"
 #include "core/vr/bloodborne_melee.h"
-#include "core/vr/bow.h"
-#include "core/vr/bow_channel.h"
+#include "core/vr/bloodborne_ragdoll.h"
 #include "core/vr/bloodborne_whip.h"
 #include "core/vr/body_channel.h"
+#include "core/vr/bow.h"
+#include "core/vr/bow_channel.h"
 #include "core/vr/c0000_skeleton.h"
 #include "core/vr/combat_channel.h"
+#include "core/vr/cutter_path.h"
 #include "core/vr/hook_util.h"
+#include "core/vr/kos_lash.h"
+#include "core/vr/kos_grip.h"
 #include "core/vr/melee_window.h"
 #include "core/vr/seqlock.h"
 #include "core/vr/tpf_patch.h"
 #include "core/vr/vr_session.h"
-#include "core/vr/whip_chain.h"
 #include "core/vr/whip_audio.h"
+#include "core/vr/whip_chain.h"
 #include "core/vr/whip_flick.h"
 #include "core/vr/whip_idle.h"
 #include "core/vr/whip_input.h"
@@ -103,6 +112,11 @@ constexpr u32 OffsetMainPlayer = 0x60;
 constexpr u32 OffsetChrAsm = 0x4D0;
 constexpr u32 OffsetAsmParts = 0x28;
 constexpr s32 WhipPartSlot = 13;
+// The Kos Parasite (its family's variation, core/vr/bb_weapons.h): the game draws its tendrils with
+// a hidden weapon's four parts in the right weapon's slots (core/vr/kos_lash.h); form A's tendril
+// is part 0 (B_Rarm_Bone_Chain_1-9 on the right hand).
+constexpr s32 KosVariation = 101;
+constexpr s32 KosFormAPartSlot = 11;
 constexpr u64 WeaponPartVtableRva = 0x539D100;
 constexpr u32 OffsetPartMode = 0x138;
 constexpr u32 OffsetPartDummy = 0x13C;
@@ -147,6 +161,11 @@ constexpr s64 TipRecentNs = 120 * Ms;
 constexpr s64 HoldAfterCloseNs = 300 * Ms;
 // ... the Beast Cutter's heavy chain: 350 ms (2026-10-15: the tester, a little more forgiving).
 constexpr s64 CutterHoldAfterCloseNs = 350 * Ms;
+// ... the Amygdalan Arm's lash: its crack lands about as the hand stops (0.3 s into the swing, its
+// window closed by then: it never hurt) and it carries on round 0.3 s more; it hurts while out with
+// its tip this fast.
+constexpr s64 ArmHoldAfterCloseNs = 400 * Ms;
+constexpr float ArmHurtTipMps = 8.0f;
 constexpr float BlendS = 0.15f; // the chain eases in / out over this
 
 using DmyPolyFn = s32(PS4_SYSV_ABI*)(void* chr, void* out, const s32* ids, u32 max);
@@ -191,8 +210,12 @@ struct Rig {
     std::array<s16, MaxBones> parents{};
     std::array<s16, W::MaxPoints> chain{};
     bool drive{false}; // the pose tick wants the chain driven
+    bool arm_release{false}; // form A, with every other Arm drive safety gate still satisfied
     W::Frame grip{};
     s64 grip_ns{0}; // current body pose; zero means use the legacy attachment fallback
+    B::Vec3 carry_position{};
+    float carry_yaw{0.0f}; // tracking-space yaw, not the animated hunter's facing
+    bool carry_valid{false};
 };
 SeqLock<Rig> g_rig;
 
@@ -222,6 +245,17 @@ struct HookOut {
     float tip_recent{0.0f}; // the tip's fastest over the last TipRecentNs (a hit's speed)
 };
 SeqLock<HookOut> g_out;
+// The Amygdalan Arm's lash (the window hold): out (a strike, a jab, a hook or folding back), and
+// the last frame its tip went ArmHurtTipMps; `lashing`: out but not holding an enemy (no stamina
+// regen then: ArmLashNow); `grip`: the hand (world).
+struct ArmOut {
+    s64 ns{0};
+    bool out{false};
+    s64 fast_ns{0};
+    bool lashing{false};
+    B::Vec3 grip{};
+};
+SeqLock<ArmOut> g_arm_out;
 std::atomic<u64> g_hook_calls{0};
 
 s64 NowNs() {
@@ -317,6 +351,63 @@ s32 Variation(const u8* chr) {
 
 // ---- The hook (Game:Main, inside the part update) -----------------------------------------------
 
+// The hunter turning more than this in one game frame carries the chain round with him (a snap
+// turn is 30 degrees at once; a smooth turn at 120 deg/s is 2 a frame).
+constexpr float CarryTurnDeg = 12.0f;
+
+// The Kos Parasite's swing read off your controller (KosSwingFrame, below): its last place, held
+// a moment while the runtime loses it.
+struct KosSwingHold {
+    B::Vec3 rel{};  // the controller from your head (tracking space, m)
+    B::Vec3 line{}; // its line (grip -Z)
+    s64 ns{0};
+    bool have{false};
+};
+constexpr s64 KosSwingGraceNs = 250 * Ms;
+
+// A snap turn: the view's heading jumps and the hand with it, round your eye; the hunter's facing
+// need not (MockXR 2026-11-09: no carry on his turn in four snaps), so the chain was dragged
+// behind and sprang back (a review, 2026-11-09). In the frame the hand jumps the tendrils go with
+// it rigidly, its last frame with it. The jump can reach the bones a frame or two after the
+// heading: a window of SnapWindow frames, the first jump of SnapJumpM in it carried.
+class KosSnap {
+public:
+    static constexpr int SnapWindow = 3;
+    static constexpr float SnapJumpM = 0.05f;
+
+    // True when the hand's move from `prev` to `grip` this frame is a snap's.
+    bool Step(const W::Frame& prev, const W::Frame& grip) {
+        B::Anchor at{};
+        if (B::LatestAnchor(at) && at.valid && std::isfinite(at.base_yaw)) {
+            if (have_ && std::abs(std::remainder(at.base_yaw - yaw_, 2.0f * B::Pi)) >
+                             CarryTurnDeg * B::Deg) {
+                window_ = SnapWindow;
+            }
+            yaw_ = at.base_yaw;
+            have_ = true;
+        }
+        if (window_ <= 0) {
+            return false;
+        }
+        --window_;
+        if (!(B::Length(grip.t - prev.t) >= SnapJumpM)) {
+            return false;
+        }
+        window_ = 0;
+        ++carries_;
+        return true;
+    }
+    u32 Carries() const {
+        return carries_;
+    }
+
+private:
+    float yaw_{0.0f};
+    bool have_{false};
+    int window_{0};
+    u32 carries_{0};
+};
+
 struct HookState {
     W::Chain chain{};
     W::ChainConfig cfg{};
@@ -325,6 +416,7 @@ struct HookState {
     std::array<B::Vec3, W::MaxPoints> rest{};   // the simulation's idle shape (RestToBlade)
     std::array<B::Quat, W::MaxPoints> rest_q{};
     std::array<B::Vec3, W::MaxPoints> rest_raw{}; // ... as the idle clip has it
+    std::array<W::Kos::BoneScale, W::MaxPoints> kos_scale{};
     bool flipped{false};                        // turned to the blade side (the cane)
     float links{0.84f}; // the idle chain's length along its links (m)
     W::DriveState drive{}; // driven through a transform's clip (a flick into the whip)
@@ -352,6 +444,29 @@ struct HookState {
     bool have_raw{false};
     W::RecallSoundGate recall_sound{};
     W::PullRecall recall{};
+    W::CutterStrokeTurn turn{}; // the Beast Cutter's stroke turning back
+    float throw_left{0.0f};     // s left of a Beast Cutter throw's front drive
+    // The Beast Cutter's momentum length (whip_cutter_lab): the meter, the chain's front half's
+    // speed around the hand last frame (and what it is measured from), a lockout after a recall.
+    float meter{0.0f};
+    float front{0.0f};
+    float front_s{1.0f};
+    float meter_lock{0.0f};
+    float impact_left{0.0f}; // s the meter is held after the chain hit the ground
+    float hand_speed{0.0f};  // m/s, the hand's own movement around the hunter (no wrist turn)
+    bool have_front{false};
+    B::Vec3 front_root{};
+    std::array<B::Vec3, W::MaxPoints> front_prev{};
+    W::CutterPath path{};  // the Beast Cutter's swing-path lash (whip_cutter_lab model=path)
+    W::Kos::Recoil kos_recoil{}; // the Kos Parasite's tendril: its recoil, its sway, its return
+    W::Kos::Sway kos_sway{};
+    W::Kos::Return kos_return{};
+    W::Kos::Pulse kos_pulse{};
+    W::CutterLab kos_lab{}; // its dials this frame (the stroke's own return)
+    bool kos_tracked{false}; // its path read off the controller (KosSwingFrame) last frame
+    KosSwingHold kos_hold{};
+    KosSnap kos_snap{};
+    bool forced_in{false}; // this frame: the trigger, the flick back or a recall pull (the trace)
     W::WristFlick flick{}; // the Beast Cutter's flick recall (core/vr/whip_flick.h)
     W::Payout payout{}; // the extension the swing's speed asks for
     bool full{false};   // at the full payout (locked out)
@@ -366,12 +481,18 @@ struct HookState {
     bool have_body{false};
     s64 body_ns{0};
     u32 carries{0};
+    u32 teleports{0}; // the hand's frame jumped (TeleportMs): the chain carried with it
     bool compact_logged{false}; // the Cutter's compact state, as last logged
 };
 HookState g_hs{};
 
 // Opt-in, bounded recording of the ACTUAL game-side input and solver output. Replay this when
 // headset feel disagrees with a scripted mock. Never enabled during normal play or benchmarks.
+bool HunterFrame(const u8* chr, B::Vec3& pos, B::Vec3& fwd, B::Vec3& left); // (below)
+
+// The recording also carries the head (its eye, forward and up in the world), the hunter (his feet
+// and facing) and the chain's points, every frame: the offline replay is seen from the player's
+// eye and checked against what the game's chain did.
 void TraceMotion(const Rig& rig, const HookState& h, const W::Frame& grip,
                  const W::GazeAssist& gaze, s64 now, float dt, float speed, float target,
                  bool current_pose) {
@@ -381,23 +502,51 @@ void TraceMotion(const Rig& rig, const HookState& h, const W::Frame& grip,
         if (f) {
             std::fputs("ns,variation,pose_ns,current_pose,dt,px,py,pz,qx,qy,qz,qw,speed,target,"
                        "extension,floor,tip_x,tip_y,tip_z,tip_speed,bend,carries,gaze,"
-                       "eye_x,eye_y,eye_z,forward_x,forward_y,forward_z,compact\n", f);
-            LOG_INFO(Core, "VR whip: recording up to 9000 live motion samples to {}", path);
+                       "eye_x,eye_y,eye_z,forward_x,forward_y,forward_z,compact,"
+                       "head_ok,head_x,head_y,head_z,head_fx,head_fy,head_fz,head_ux,head_uy,"
+                       "head_uz,body_ok,body_x,body_y,body_z,body_fx,body_fz,chain_n", f);
+            for (int i = 0; i < W::MaxPoints; ++i) std::fprintf(f, ",c%d_x,c%d_y,c%d_z", i, i, i);
+            std::fputs(",forced\n", f);
+            LOG_INFO(Core, "VR whip: recording up to 30000 live motion samples to {}", path);
         }
         return f;
     }();
     static unsigned count = 0;
-    if (!file || count >= 9000 || !rig.drive || dt <= 0.0f) return;
+    if (!file || count >= 30000 || !rig.drive || dt <= 0.0f) return;
     const auto tip = h.chain.Point(h.chain.Count() - 1);
+    // The head (as the gaze assist reads it) and the hunter.
+    B::HandsSample hands{};
+    B::Anchor anchor{};
+    B::Vec3 eye{}, fwd{}, up{};
+    const bool head_ok = B::LatestHands(hands) && hands.head_valid && B::LatestAnchor(anchor) &&
+                         anchor.valid && B::IsFinite(hands.head_q) &&
+                         B::Dot(hands.head_q, hands.head_q) > 0.5f;
+    if (head_ok) {
+        const B::Quat hq = B::Normalize(hands.head_q);
+        eye = anchor.eye_world + B::TrackingToWorld(hands.head_p - anchor.head_k, anchor.base_yaw,
+                                                    anchor.world_scale);
+        fwd = B::TrackingToWorld(B::Rotate(hq, {0.0f, 0.0f, -1.0f}), anchor.base_yaw, 1.0f);
+        up = B::TrackingToWorld(B::Rotate(hq, {0.0f, 1.0f, 0.0f}), anchor.base_yaw, 1.0f);
+    }
+    B::Vec3 feet{}, facing{}, side{};
+    const bool body_ok = HunterFrame(rig.chr, feet, facing, side) && B::IsFinite(feet);
     std::fprintf(file,
         "%lld,%d,%lld,%d,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
-        "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%u,%d,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%d\n",
+        "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%u,%d,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%d",
         static_cast<long long>(now), rig.variation, static_cast<long long>(rig.grip_ns),
         int(current_pose), dt, grip.t.x, grip.t.y, grip.t.z, grip.q.x, grip.q.y, grip.q.z,
         grip.q.w, speed, target, h.chain.Extension(), h.cfg.floor_y, tip.x, tip.y, tip.z,
         h.chain.TipSpeed(), h.chain.MaxBend(), h.carries, int(gaze.active), gaze.eye.x,
         gaze.eye.y, gaze.eye.z, gaze.forward.x, gaze.forward.y, gaze.forward.z,
         int(h.cfg.lock_closed));
+    std::fprintf(file, ",%d,%.6g,%.6g,%.6g,%.5g,%.5g,%.5g,%.5g,%.5g,%.5g,%d,%.6g,%.6g,%.6g,%.5g,%.5g,%d",
+                 int(head_ok), eye.x, eye.y, eye.z, fwd.x, fwd.y, fwd.z, up.x, up.y, up.z,
+                 int(body_ok), feet.x, feet.y, feet.z, facing.x, facing.z, h.chain.Count());
+    for (int i = 0; i < W::MaxPoints; ++i) {
+        const B::Vec3 c = i < h.chain.Count() ? h.chain.Point(i) : B::Vec3{};
+        std::fprintf(file, ",%.6g,%.6g,%.6g", c.x, c.y, c.z);
+    }
+    std::fprintf(file, ",%d\n", int(h.forced_in));
     if (++count % 60 == 0) std::fflush(file);
 }
 
@@ -409,6 +558,7 @@ struct RestCache {
     s32 n{0};
     std::array<B::Vec3, W::MaxPoints> rest{};
     std::array<B::Quat, W::MaxPoints> rest_q{};
+    std::array<W::Kos::BoneScale, W::MaxPoints> kos_scale{};
     std::array<B::Vec3, W::MaxPoints> raw{};
     bool flipped{false};
     float links{0.0f};
@@ -420,9 +570,12 @@ std::array<RestCache, 4> g_rest_cache{};
 // part was never seen in its idle clip yet. None: the hook waits for the idle clip.
 std::array<std::optional<W::WhipRest>, W::WhipParts.size()> g_idle{};
 
-std::optional<W::WhipRest> ReadIdle(const W::WhipPart& part, std::string& why) {
+// A part's form-B anibnd (parts/<model>.partsbnd.dcx -> <model>_2.anibnd), inflated; `anibnd` its
+// span in the returned BND.
+std::optional<std::vector<u8>> ReadPartBnd(std::string_view model, std::span<const u8>& anibnd,
+                                           std::string& why) {
     auto* const mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
-    const std::string path = fmt::format("/app0/dvdroot_ps4/parts/{}.partsbnd.dcx", part.model);
+    const std::string path = fmt::format("/app0/dvdroot_ps4/parts/{}.partsbnd.dcx", model);
     const auto file = mnt->ReadFile(path);
     if (!file) {
         why = path + " not readable";
@@ -440,13 +593,26 @@ std::optional<W::WhipRest> ReadIdle(const W::WhipPart& part, std::string& why) {
         why = path + ": the zlib stream does not inflate";
         return std::nullopt;
     }
-    const std::string anibnd = fmt::format("{}_2.anibnd", part.model);
-    const auto inner = VR::Body::C0000::Rig::Bnd4Find(bnd, anibnd);
+    const std::string name = fmt::format("{}_2.anibnd", model);
+    const auto inner = VR::Body::C0000::Rig::Bnd4Find(bnd, name);
     if (!inner) {
-        why = fmt::format("{} holds no {}", path, anibnd);
+        why = fmt::format("{} holds no {}", path, name);
         return std::nullopt;
     }
-    return W::Idle::FromAnibnd(part.variation, *inner, why);
+    const auto offset = static_cast<std::size_t>(inner->data() - bnd.data());
+    const auto size = inner->size();
+    auto out = std::make_optional(std::move(bnd));
+    anibnd = std::span<const u8>(out->data() + offset, size);
+    return out;
+}
+
+std::optional<W::WhipRest> ReadIdle(const W::WhipPart& part, std::string& why) {
+    std::span<const u8> anibnd;
+    const auto bnd = ReadPartBnd(part.model, anibnd, why);
+    if (!bnd) {
+        return std::nullopt;
+    }
+    return W::Idle::FromAnibnd(part.variation, anibnd, why);
 }
 
 void LoadIdleLines() {
@@ -507,6 +673,13 @@ const W::WhipRest* FindIdle(s32 variation) {
 }
 
 float MaxExtension(const Rig& r, u8 kind) {
+    if (r.variation == KosVariation) {
+        // The game's own reach: 1.95 m swung, 2.7 m on a charged swing (core/vr/kos_lash.h), over
+        // the tendril's rest length along its links.
+        const float reach = kind == 2 ? W::Kos::ChargedReachM : W::Kos::ReachM;
+        return std::max(reach * W::GetWhipSettings().reach_scale / std::max(g_hs.links, 0.05f),
+                        1.0f);
+    }
     const W::WhipMoves* const w = W::FindWhip(r.variation);
     if (w == nullptr) {
         return 1.0f;
@@ -526,13 +699,595 @@ float MaxExtension(const Rig& r, u8 kind) {
 bool HunterFrame(const u8* chr, B::Vec3& pos, B::Vec3& fwd, B::Vec3& left); // (below)
 // The chain lies on the ground at the hunter's feet, this far above them (its links' thickness).
 constexpr float FloorLiftM = 0.03f;
-// The hunter turning more than this in one game frame carries the chain round with him (a snap
-// turn is 30 degrees at once; a smooth turn at 120 deg/s is 2 a frame).
-constexpr float CarryTurnDeg = 12.0f;
+// Faster than any hand moves or turns (the user's fastest real swings: 25 m/s, 5,400 deg/s): a
+// jump of the hand's frame, carried rigidly instead of thrown through. The traces of 2026-11-08
+// showed 107 cm / 67 deg in one frame as the drive started on the weapon bone and went over to
+// the controller, and 62 cm / 115 deg the frame after a turnaround's carried one.
+constexpr float TeleportMs = 40.0f;
+constexpr float TeleportDegS = 8000.0f;
+
+// ---- The Kos Parasite's form B: a whip on each hand, three tendrils each ----------------------
+// (core/vr/kos_lash.h). With the Milkweed rune the game swaps in the hidden weapon whose parts 2
+// (slot 13, on the right hand's dummy 304: B_RarmA, B and C, 9 joints each) and 3 (slot 14, on the
+// left's 344: Finger0 and Finger2, 9 joints each, and the short Finger1, 3; their common root
+// Finger0_00, the parent of every left tendril, stays the game's) are form B's tendrils. Each
+// hand's swing throws its bundle on the Cutter's swing-path lash; each tendril has a mind of its
+// own (its lag, curl, side, reach, recoil, sway, return and mood). None of the game's attack
+// animations play. The pose tick finds the parts; the stub sends their pose nodes here.
+
+constexpr std::array<s32, 2> KosBundleSlot{13, 14};
+constexpr std::array<s32, 2> KosBundleDummy{304, 344};
+
+// The two bundles' pose nodes (right, left) and the mouth tendril's (KosMouthTick) for the stub;
+// 0 = none.
+alignas(8) volatile u64 g_kos_node_cmp[3] = {0, 0, 0};
+
+struct KosBundleRig {
+    u8* chr{nullptr};
+    std::array<u8*, 2> node{};
+    std::array<u8*, 2> state{};
+    std::array<s32, 2> dummy{};
+    std::array<s32, 2> count{};
+    std::array<std::array<s16, MaxBones>, 2> parents{};
+    std::array<std::array<std::array<s16, W::MaxPoints>, 3>, 2> bones{};
+    std::array<std::array<s32, 3>, 2> n{};
+    bool drive{false};
+};
+SeqLock<KosBundleRig> g_kos_rig;
+
+// A bundle part's three tendrils by their bones' names, each joint the child of the one before.
+bool ResolveBundle(const u8* skel, int hand, KosBundleRig& rig, std::string& why) {
+    const s32 count = Read<s32>(skel + OffsetSkelCount);
+    const u8* const parents = Read<const u8*>(skel + OffsetSkelParents);
+    const u8* const bones = Read<const u8*>(skel + OffsetSkelBones);
+    if (count <= 3 || count > MaxBones || !Plausible(parents, 2) || !Plausible(bones)) {
+        why = fmt::format("skeleton not readable (count {})", count);
+        return false;
+    }
+    rig.count[hand] = count;
+    for (s32 i = 0; i < count; ++i) {
+        rig.parents[hand][i] = Read<s16>(parents + 2 * i);
+    }
+    struct Want {
+        const char* prefix;
+        int first, last;
+        bool pad; // two digits
+    };
+    static constexpr std::array<Want, 3> right{{{"B_RarmA_Bone_Chain_", 1, 9, false},
+                                                {"B_RarmB_Bone_Chain_", 1, 9, false},
+                                                {"B_RarmC_Bone_Chain_", 1, 9, false}}};
+    static constexpr std::array<Want, 3> left{{{"B_Larm_Finger0_", 1, 9, true},
+                                               {"B_Larm_Finger2_", 1, 9, true},
+                                               {"B_Larm_Finger1_", 1, 3, true}}};
+    const auto& wants = hand == 0 ? right : left;
+    // (The game's own names may end in white space: the left part's B_Larm_Finger1_01 has a tab.)
+    std::array<std::string, MaxBones> names{};
+    for (s32 i = 0; i < count; ++i) {
+        names[i] = BoneName(bones, i);
+        while (!names[i].empty() && std::isspace(static_cast<unsigned char>(names[i].back()))) {
+            names[i].pop_back();
+        }
+    }
+    for (int t = 0; t < 3; ++t) {
+        const Want& w = wants[t];
+        s32 prev = -1;
+        int n = 0;
+        for (int k = w.first; k <= w.last; ++k) {
+            const std::string name =
+                std::string{w.prefix} + (w.pad && k < 10 ? "0" : "") + std::to_string(k);
+            s32 found = -1;
+            for (s32 i = 0; i < count; ++i) {
+                if (names[i] == name) {
+                    found = i;
+                    break;
+                }
+            }
+            if (found < 0 || (prev >= 0 && rig.parents[hand][found] != prev)) {
+                why = fmt::format("no tendril ({} {})", name,
+                                  found < 0 ? "missing" : "not under the one before");
+                return false;
+            }
+            rig.bones[hand][t][n++] = static_cast<s16>(found);
+            prev = found;
+        }
+        rig.n[hand][t] = n;
+    }
+    return true;
+}
+
+// ---- The Kos Parasite's mouth tendril: third person only --------------------------------------
+// (2026-11-09: "Mouth tendril third person only"). The hidden weapon's part 1 (slot 12,
+// on the face's dummy 7) plays in the ritual, form B's leap and its step R2; in first person it
+// swept through your view. There its pose collapses to nothing (its root's scale, KosMouthHook).
+constexpr s32 KosMouthSlot = 12;
+constexpr s32 KosMouthDummy = 7;
+constexpr float KosMouthHiddenScale = 1e-3f;
+
+// The main player's pose update: the mouth tendril's pose node for the stub while `hide`.
+void KosMouthTick(u8* chr, bool hide) {
+    static u64 logged = 1; // (a change logs once)
+    u8* node = nullptr;
+    u8* const parts = hide && g_hooked ? Read<u8*>(chr + OffsetChrAsm) : nullptr;
+    u8* const part =
+        Plausible(parts) ? Read<u8*>(parts + OffsetAsmParts + 8 * KosMouthSlot) : nullptr;
+    if (Plausible(part) && Read<u8*>(part) == g_base + WeaponPartVtableRva &&
+        Read<s32>(part + OffsetPartMode) == 2 &&
+        Read<s32>(part + OffsetPartDummy) == KosMouthDummy) {
+        u8* const anim = Read<u8*>(part + OffsetPartAnim);
+        u8* const state = Plausible(anim) ? Read<u8*>(anim) : nullptr;
+        u8* const player = Plausible(state) ? Read<u8*>(state + OffsetStatePlayer) : nullptr;
+        u8* const found = Plausible(player) ? Read<u8*>(player + OffsetPlayerNode) : nullptr;
+        node = Plausible(found) ? found : nullptr;
+    }
+    g_kos_node_cmp[2] = reinterpret_cast<u64>(node);
+    if ((node != nullptr) != (logged != 0)) {
+        logged = node != nullptr ? 1 : 0;
+        LOG_INFO(Core, "VR whip: the Kos Parasite's mouth tendril {}",
+                 node != nullptr ? "hidden (first person)" : "the game's");
+    }
+}
+
+// The mouth tendril's pose (Game:Main, inside its animation update): collapsed. True when `node`
+// is it.
+bool KosMouthHook(u8* node) {
+    if (node == nullptr || reinterpret_cast<u64>(node) != g_kos_node_cmp[2]) {
+        return false;
+    }
+    u8* const pose = node + OffsetNodePose;
+    auto* const local = Read<B::HkQsTransform*>(pose + OffsetPoseLocal);
+    const s32 count = Read<s32>(pose + OffsetPoseLocalSize);
+    if (count < 1 || count > MaxBones || !Plausible(reinterpret_cast<u8*>(local), 16)) {
+        return true;
+    }
+    B::QsTransform root = B::FromHavok(local[0]);
+    root.s = {KosMouthHiddenScale, KosMouthHiddenScale, KosMouthHiddenScale};
+    B::ToHavok(root, local[0]);
+    return true;
+}
+
+// The main player's pose update: finds form B's two parts and publishes them for the hook.
+void KosBundleTick(u8* chr, bool kos_b, bool body_on) {
+    static std::array<u8*, 2> resolved{};
+    static std::array<u8*, 2> failed{}; // a node whose bones were not found (tried once)
+    static KosBundleRig rig{};
+    static bool logged_drive = false;
+    static const char* logged_why = "";
+    const char* why = nullptr;
+    std::array<u8*, 2> nodes{};
+    std::array<u8*, 2> states{};
+    std::array<s32, 2> dummies{};
+    u8* const parts = kos_b ? Read<u8*>(chr + OffsetChrAsm) : nullptr;
+    if (!kos_b) {
+        why = "not the Kos Parasite's form B";
+    } else if (!g_hooked || !g_physical) {
+        why = "the whip hook is off";
+    } else if (!Plausible(parts)) {
+        why = "no ChrAsm";
+    } else {
+        for (int hand = 0; hand < 2 && why == nullptr; ++hand) {
+            u8* const part = Read<u8*>(parts + OffsetAsmParts + 8 * KosBundleSlot[hand]);
+            if (!Plausible(part) || Read<u8*>(part) != g_base + WeaponPartVtableRva) {
+                why = "no tendril part (the Milkweed rune not worn?)";
+                break;
+            }
+            const s32 dummy = Read<s32>(part + OffsetPartDummy);
+            if (Read<s32>(part + OffsetPartMode) != 2 || dummy != KosBundleDummy[hand]) {
+                why = "a tendril part not on its hand";
+                break;
+            }
+            u8* const anim = Read<u8*>(part + OffsetPartAnim);
+            u8* const state = Plausible(anim) ? Read<u8*>(anim) : nullptr;
+            u8* const player = Plausible(state) ? Read<u8*>(state + OffsetStatePlayer) : nullptr;
+            u8* const node = Plausible(player) ? Read<u8*>(player + OffsetPlayerNode) : nullptr;
+            if (!Plausible(node)) {
+                why = "a tendril part has no animation";
+                break;
+            }
+            if (node == failed[hand]) {
+                why = "a tendril part's bones not found";
+                break;
+            }
+            if (node != resolved[hand]) {
+                std::string err;
+                const u8* const skel = Read<u8*>(node + OffsetNodePose + OffsetPoseSkeleton);
+                if (!Plausible(skel) || !ResolveBundle(skel, hand, rig, err)) {
+                    resolved[hand] = nullptr;
+                    failed[hand] = node;
+                    why = "a tendril part's bones not found";
+                    LOG_INFO(Core, "VR whip: Kos form B part {}: {}", hand, err);
+                    break;
+                }
+                resolved[hand] = node;
+            }
+            nodes[hand] = node;
+            states[hand] = state;
+            dummies[hand] = dummy;
+        }
+    }
+    const bool drive = why == nullptr && body_on;
+    if (why == nullptr && !body_on)
+        why = "body off";
+    if (nodes[0] != nullptr && nodes[1] != nullptr && why == nullptr) {
+        rig.chr = chr;
+        rig.node = nodes;
+        rig.state = states;
+        rig.dummy = dummies;
+        rig.drive = drive;
+        g_kos_rig.Store(rig);
+        g_kos_node_cmp[0] = reinterpret_cast<u64>(nodes[0]);
+        g_kos_node_cmp[1] = reinterpret_cast<u64>(nodes[1]);
+    } else {
+        g_kos_node_cmp[0] = g_kos_node_cmp[1] = 0;
+        KosBundleRig off{};
+        g_kos_rig.Store(off);
+    }
+    if (kos_b && (drive != logged_drive || (why != nullptr && logged_why != why))) {
+        logged_drive = drive;
+        logged_why = why != nullptr ? why : "";
+        LOG_INFO(Core, "VR whip: Kos form B: {}",
+                 drive ? std::string{"driving both hands' tendrils"}
+                       : fmt::format("not driving ({})", why));
+    }
+}
+
+// The Kos Parasite's swing, read off your own arm (2026-11-09: "when I walk around or
+// run, or snap turn - I do not want the tentacle to swing or extend.. only when I swing my
+// arms"): the controller and its line (a held stick's, grip -Z), from your head, in the tracking
+// space turned to the game's heading; that frame (your eye, the heading) is the path's body
+// frame, so his walk, a snap turn and his own turning never read as a swing. (His feet and facing
+// did, MockXR 2026-11-09: 10 strokes with one swing; the hunter turns to run sideways while your
+// hands stay with the view, and a snap turns them round your eye, not his feet.) A controller the
+// runtime only infers (a fast swing behind you) still counts; one lost for a moment holds its last
+// place (no swing) for KosSwingGraceNs before the path goes back to the hand bone, since each
+// switch restarts it (a review, 2026-11-09: a flapping source wiped strokes mid-swing). False: no
+// head or view, or no controller for that long; the path reads the hand bone and his frame.
+bool KosSwingFrame(int xr_hand, s64 now, KosSwingHold& hold, W::PathFrame& pf) {
+    B::Anchor at{};
+    if (!pf.head_ok || !B::LatestAnchor(at) || !at.valid) {
+        return false;
+    }
+    B::HandsSample hs{};
+    if (B::LatestHands(hs) && hs.head_valid && now >= hs.steady_ns &&
+        now - hs.steady_ns < 100 * Ms && B::IsFinite(hs.head_p) &&
+        hs.hand[xr_hand].position_valid && hs.hand[xr_hand].orientation_valid) {
+        const B::TrackedHand& c = hs.hand[xr_hand];
+        const B::Vec3 rel = c.p - hs.head_p;
+        const B::Vec3 line = B::Rotate(B::Normalize(c.q), {0.0f, 0.0f, -1.0f});
+        if (B::IsFinite(rel) && B::IsFinite(line)) {
+            hold = {rel, line, now, true};
+        }
+    }
+    if (!hold.have || now - hold.ns > KosSwingGraceNs) {
+        hold.have = false;
+        return false;
+    }
+    pf.hand = pf.eye + B::TrackingToWorld(hold.rel, at.base_yaw, at.world_scale);
+    pf.weapon = B::TrackingToWorld(hold.line, at.base_yaw, 1.0f);
+    pf.feet = pf.eye;
+    pf.facing = B::TrackingToWorld({0.0f, 0.0f, -1.0f}, at.base_yaw, 1.0f);
+    pf.body_ok = true;
+    return true;
+}
+
+struct KosTendrilState {
+    W::Chain chain{};
+    std::array<B::Vec3, W::MaxPoints> rest{};
+    std::array<B::Quat, W::MaxPoints> rest_q{};
+    std::array<W::Kos::BoneScale, W::MaxPoints> scale{};
+    float links{0.0f};
+    bool have_rest{false};
+    W::Kos::Recoil recoil{};
+    W::Kos::Sway sway{};
+    W::Kos::Pulse pulse{};
+    W::Kos::Return back{};
+    W::Kos::Wiggle wiggle{};
+    float peak_ext{1.0f}; // the last stroke's (logs)
+    float peak_reach{0.0f};
+    float peak_share{0.0f};
+};
+struct KosHandState {
+    u8* node{nullptr};
+    s64 stamp{0};
+    float clock{0.0f};
+    W::Frame prev{};
+    bool have_prev{false};
+    float weight{0.0f};
+    W::CutterPath path{};
+    bool path_tracked{false}; // the path read off the controller (KosSwingFrame) last frame
+    KosSwingHold swing_hold{};
+    KosSnap snap{};
+    W::Kos::Bundle bundle{};
+    std::array<KosTendrilState, 3> t{};
+    s64 bad_log_ns{0};
+};
+std::array<KosHandState, 2> g_kos_hands{}; // (the hook's thread only)
+W::Kos::GripFit<MaxBones> g_kos_right_fit{}; // bounded pose cache, right bundle only
+
+// One bundle part's pose (Game:Main, inside its animation update). True when `node` is one of them.
+bool KosBundleHook(u8* node) {
+    KosBundleRig r{};
+    if (node == nullptr || !g_kos_rig.Load(r)) {
+        return false;
+    }
+    const int hand = r.node[0] == node ? 0 : r.node[1] == node ? 1 : -1;
+    if (hand < 0) {
+        return false;
+    }
+    KosHandState& h = g_kos_hands[hand];
+    const s64 now = NowNs();
+    const auto& looks = hand == 0 ? W::Kos::RightLooks : W::Kos::LeftLooks;
+    if (node != h.node) {
+        if (hand == 0) g_kos_right_fit = {};
+        h = {};
+        h.node = node;
+        h.bundle.Seed(static_cast<unsigned>(now) ^ (hand != 0 ? 0x5BD1E995u : 0u));
+        for (int i = 0; i < 3; ++i) {
+            h.t[i].back.Seed(static_cast<unsigned>(now) +
+                             7919u * static_cast<unsigned>(i + 1 + 3 * hand));
+            h.t[i].wiggle.Seed(static_cast<unsigned>(now) ^
+                               (104729u * static_cast<unsigned>(i + 1 + 3 * hand)));
+            h.t[i].wiggle.Stroke();
+            h.t[i].recoil.hz = looks[i].hz;
+            h.t[i].recoil.amp = looks[i].amp;
+        }
+    }
+    u8* const pose = node + OffsetNodePose;
+    auto* const local = Read<B::HkQsTransform*>(pose + OffsetPoseLocal);
+    const s32 count = Read<s32>(pose + OffsetPoseLocalSize);
+    if (!Plausible(reinterpret_cast<u8*>(local), 16) || count != r.count[hand] ||
+        count <= 0 || count > MaxBones) {
+        return true;
+    }
+    const std::span<B::HkQsTransform> fit_pose{local, static_cast<std::size_t>(count)};
+    if (hand == 0) g_kos_right_fit.Restore(fit_pose);
+    const s32 playing = Read<s32>(r.state[hand] + OffsetStatePlaying);
+    const bool idle = playing == IdleClip;
+    std::array<B::QsTransform, MaxBones> loc{};
+    std::array<B::QsTransform, MaxBones> mod{};
+    for (s32 i = 0; i < count; ++i) {
+        loc[i] = B::FromHavok(local[i]);
+    }
+    if (!B::LocalToModel(loc.data(), r.parents[hand].data(), count, mod.data())) {
+        return true;
+    }
+    W::Frame grip{};
+    if (!GripFrame(r.chr, grip, r.dummy[hand])) {
+        return true;
+    }
+    // Keep cached rest shapes and chain simulation in their original units. The
+    // approved +6% fit is applied once to the finished right pose, including its
+    // stationary base and native clips. The left hand and form A are unchanged.
+    SCOPE_EXIT {
+        if (hand == 0)
+            g_kos_right_fit.Apply(fit_pose,
+                std::span<const s16>{r.parents[hand].data(), static_cast<std::size_t>(count)});
+    };
+    // Its rest shapes, from the idle clip (the tendrils as the game holds them at rest).
+    bool rest_ok = true;
+    for (int i = 0; i < 3; ++i) {
+        KosTendrilState& t = h.t[i];
+        const s32 n = r.n[hand][i];
+        if (!t.have_rest && idle && n >= 3) {
+            float links = 0.0f;
+            bool scales_ok = true;
+            for (s32 k = 0; k < n; ++k) {
+                t.rest[k] = mod[r.bones[hand][i][k]].t;
+                t.rest_q[k] = B::Normalize(mod[r.bones[hand][i][k]].q);
+                if (k > 0)
+                    links += B::Length(t.rest[k] - t.rest[k - 1]);
+            }
+            for (s32 k = 0; k < n; ++k) {
+                const s32 j = std::min(k + 1, n - 1);
+                scales_ok = t.scale[k].Set(mod[r.bones[hand][i][k]].s,
+                    B::Length(t.rest[j] - t.rest[j - 1])) && scales_ok;
+            }
+            t.links = links;
+            t.have_rest = scales_ok && t.chain.Init(t.rest.data(), n);
+        }
+        rest_ok = rest_ok && t.have_rest;
+    }
+    const float dt =
+        h.stamp != 0 ? std::clamp(static_cast<float>(now - h.stamp) * 1e-9f, 0.0f, 1.0f) : 0.0f;
+    h.stamp = now;
+    h.clock += dt;
+    const bool want = r.drive && idle && rest_ok;
+    h.weight = std::clamp(h.weight + (want ? 1.0f : -1.0f) * dt / BlendS, 0.0f, 1.0f);
+    if (h.weight <= 0.0f || !rest_ok || dt <= 0.0f) {
+        // Not driven: the clip's pose; the chains wait at it.
+        for (int i = 0; i < 3 && rest_ok; ++i) {
+            std::array<B::Vec3, W::MaxPoints> pts{};
+            for (s32 k = 0; k < r.n[hand][i]; ++k) {
+                pts[k] = W::Apply(grip, mod[r.bones[hand][i][k]].t);
+            }
+            h.t[i].chain.ResetTo(pts.data(), 1.0f);
+        }
+        // ... and the swing starts afresh (across the gap a hand's move read as one frame's swing).
+        h.path.Reset();
+        h.path_tracked = false;
+        h.bundle.Reset();
+        for (auto& t : h.t) {
+            t.recoil.Reset();
+            t.sway.Reset();
+            t.pulse.Reset();
+            t.back.Reset();
+        }
+        h.prev = grip;
+        h.have_prev = true;
+        return true;
+    }
+    // The hand's swing (the Cutter's path model on this hand): one share for its bundle.
+    W::PathFrame pf{};
+    pf.dt = dt;
+    pf.hand = grip.t;
+    const auto& lead = h.t[0];
+    pf.weapon =
+        B::Rotate(B::Normalize(grip.q), B::Normalize(lead.rest[r.n[hand][0] - 1] - lead.rest[0]));
+    pf.impact = lead.chain.Impact();
+    pf.cap = 2.0f;
+    B::Vec3 feet{}, fwd{}, left{};
+    const bool hunter =
+        HunterFrame(r.chr, feet, fwd, left) && B::IsFinite(feet) && B::IsFinite(fwd);
+    pf.body_ok = hunter;
+    pf.feet = feet;
+    pf.facing = fwd;
+    B::HandsSample head{};
+    B::Anchor at{};
+    if (B::LatestHands(head) && head.head_valid && B::LatestAnchor(at) && at.valid &&
+        B::IsFinite(head.head_q) && B::Dot(head.head_q, head.head_q) > 0.5f) {
+        pf.eye =
+            at.eye_world + B::TrackingToWorld(head.head_p - at.head_k, at.base_yaw, at.world_scale);
+        pf.forward = B::TrackingToWorld(B::Rotate(B::Normalize(head.head_q), {0.0f, 0.0f, -1.0f}),
+                                        at.base_yaw, 1.0f);
+        pf.head_ok = true;
+    }
+    // (A change of source restarts the path: one frame across two frames is no swing.)
+    const bool tracked = KosSwingFrame(hand == 0 ? 1 : 0, now, h.swing_hold, pf);
+    if (tracked != h.path_tracked) {
+        h.path.Reset();
+        h.path_tracked = tracked;
+    }
+    W::CutterLab hand_lab = W::Kos::Lab();
+    hand_lab.pkeep = 0.5f;
+    hand_lab.pturn = W::Kos::BundleHoldS;
+    const float share = std::clamp(h.path.Step(pf, hand_lab) - 1.0f, 0.0f, 1.0f);
+    h.bundle.Step(dt, share, 0);
+    // A heavy swing (the right hand's R2 rows) reaches the game's R2.
+    Combat::MeleeWindow w{};
+    const bool heavy = hand == 0 && Combat::LatestMeleeWindow(w) && now - w.ns < WindowFreshNs &&
+                       w.committed && !w.unpaid && w.kind > 0 &&
+                       (w.open || (w.close_ns != 0 && now - w.close_ns < HeavyHoldNs));
+    const float floor_y = hunter ? feet.y + FloorLiftM : W::ChainConfig{}.floor_y;
+    if (h.have_prev && h.snap.Step(h.prev, grip)) {
+        const B::Quat rq =
+            B::Normalize(B::Normalize(grip.q) * B::Conjugate(B::Normalize(h.prev.q)));
+        for (auto& t : h.t) {
+            if (t.have_rest)
+                t.chain.Carry(rq, h.prev.t, grip.t);
+        }
+        if (g_log >= 1) {
+            LOG_INFO(Core,
+                     "VR whip: Kos form B {}: a snap turn: its tendrils carried round with the "
+                     "hand (#{})",
+                     hand == 0 ? "right" : "left", h.snap.Carries());
+        }
+        h.prev = grip;
+    }
+    for (int i = 0; i < 3; ++i) {
+        KosTendrilState& t = h.t[i];
+        const auto& look = looks[i];
+        const s32 n = r.n[hand][i];
+        const float cap =
+            std::max((heavy ? look.heavy : look.reach) / std::max(t.links, 0.05f), 1.01f);
+        const float out = std::clamp((t.chain.Extension() - 1.0f) / (cap - 1.0f), 0.0f, 1.0f);
+        const bool stroke = t.back.Step(out);
+        if (stroke)
+            t.wiggle.Stroke();
+        t.wiggle.Step(dt, look.hz);
+        if (stroke && g_log >= 1) {
+            LOG_INFO(
+                Core,
+                "VR whip: Kos form B {} tendril {}: returns in {:.0f} ms, {}, writhing at x{:.2f} "
+                "(the last stroke: x{:.2f} of x{:.2f}, {:.2f} m from the hand, the hand's share "
+                "{:.2f})",
+                hand == 0 ? "right" : "left", i, t.back.Seconds() * 1000.0f,
+                W::Kos::MoodName(t.back.Current()),
+                t.wiggle.Rate() * look.hz / W::Kos::Wiggle::BaseHz, t.peak_ext, cap, t.peak_reach,
+                t.peak_share);
+            t.peak_ext = 1.0f;
+            t.peak_reach = t.peak_share = 0.0f;
+        }
+        if (t.chain.Ready()) { // (not its points before its first step)
+            t.peak_ext = std::max(t.peak_ext, t.chain.Extension());
+            t.peak_reach = std::max(t.peak_reach, B::Length(t.chain.Point(n - 1) - grip.t));
+        }
+        t.peak_share = std::max(t.peak_share, h.bundle.Share(i));
+        W::CutterLab lab = W::Kos::Lab();
+        t.back.Apply(lab);
+        lab.pkeep = 0.5f;
+        lab.pdelay = look.delay * W::Kos::BundleCurlK;
+        lab.pcurl *= look.curl;
+        lab.tout = h.bundle.PayoutTime(i, 0.12f);
+        const bool turned = t.recoil.Step(dt, out);
+        t.sway.Step(dt, turned, out);
+        t.pulse.Step(dt, turned, out);
+        const float s = std::clamp(1.0f + (cap - 1.0f) * h.bundle.Share(i) +
+                                       t.recoil.Offset() / std::max(t.links, 0.05f),
+                                   1.0f, cap);
+        W::ChainConfig cfg = W::ConfigFor(2400);
+        W::ApplyLabChain(lab, cfg);
+        h.path.Apply(lab, cfg);
+        const W::Kos::MoodGain gain = W::Kos::GainOf(t.back.Current());
+        cfg.sway = t.sway.Amplitude(out, gain) * t.wiggle.Gain(out);
+        cfg.sway_phase = look.phase;
+        cfg.sway_clock = t.wiggle.Clock();
+        cfg.fan = W::Kos::FanAngle(out, t.recoil.Rising());
+        cfg.fan_roll = look.side + 0.6f * std::sin(0.8f * h.clock + look.phase);
+        cfg.floor_y = floor_y;
+        t.chain.Step(h.have_prev ? h.prev : grip, grip, dt, s, cfg);
+        // Its bones: positions and rotations from the chain, scales thickening and pulsing.
+        std::array<B::Vec3, W::MaxPoints> p{};
+        for (s32 k = 0; k < n; ++k)
+            p[k] = W::ApplyInverse(grip, t.chain.Point(k));
+        std::array<B::Quat, W::MaxPoints> q{};
+        W::ChainRotations(p.data(), t.rest_q.data(), n, q.data());
+        std::array<B::QsTransform, W::MaxPoints> clip{};
+        std::array<B::Vec3, W::MaxPoints> want_s{}, clip_s{}, local_s{};
+        const float girth = W::Kos::Girth(t.chain.Extension());
+        for (s32 k = 0; k < n; ++k) {
+            const s32 b = r.bones[hand][i][k];
+            clip[k] = loc[b];
+            const s32 j = std::min(k + 1, n - 1);
+            const float g = girth * t.pulse.At(static_cast<float>(k) / (n - 1), gain.pulse);
+            want_s[k] = t.scale[k].At(B::Length(p[j] - p[j - 1]), g);
+            clip_s[k] = mod[b].s;
+        }
+        const s32 parent = r.parents[hand][r.bones[hand][i][0]];
+        if (parent < 0 || parent >= count)
+            continue;
+        W::Kos::LocalScales(want_s.data(), clip_s.data(), mod[parent].s, n, h.weight,
+                            local_s.data());
+        for (s32 k = 0; k < n; ++k)
+            clip[k].s = local_s[k];
+        std::array<B::QsTransform, W::MaxPoints> outs{};
+        W::ChainLocals(mod[parent], p.data(), q.data(), clip.data(), n, h.weight, outs.data());
+        // Each link against its own resting length stretched (a tendril's links are uneven: the
+        // left's longest failed against the average every few strokes, a flicker).
+        const float stretch = std::max(t.chain.Extension(), 1.0f) * 1.5f;
+        const char* bad = nullptr;
+        for (s32 k = 0; k < n && bad == nullptr; ++k) {
+            if (!B::IsFinite(outs[k])) {
+                bad = "not finite";
+            } else if (k > 0 && B::Length(outs[k].t) >
+                                    std::max(B::Length(t.rest[k] - t.rest[k - 1]) * stretch + 0.02f,
+                                             B::Length(clip[k].t) * 1.5f + 0.02f)) {
+                bad = "a link too long";
+            }
+        }
+        if (bad != nullptr) {
+            if (g_log >= 1 && now - h.bad_log_ns > 1000 * Ms) {
+                h.bad_log_ns = now;
+                LOG_WARNING(Core, "VR whip: Kos form B {} tendril {}: pose not written ({})",
+                            hand == 0 ? "right" : "left", i, bad);
+            }
+            continue;
+        }
+        for (s32 k = 0; k < n; ++k)
+            B::ToHavok(outs[k], local[r.bones[hand][i][k]]);
+    }
+    h.prev = grip;
+    h.have_prev = true;
+    return true;
+}
 
 void PS4_SYSV_ABI WhipHook(u8* node) {
     MeleeBowPartPose(node); // native bowstring shares this signature-checked pose tail
     g_hook_calls.fetch_add(1, std::memory_order_relaxed);
+    if (KosMouthHook(node)) {
+        return;
+    }
+    if (KosBundleHook(node)) {
+        return; // the Kos Parasite's form B (its own rig)
+    }
     Rig r{};
     if (!g_rig.Load(r) || r.node != node || r.n < 3) {
         return;
@@ -562,13 +1317,156 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
     } else if (!GripFrame(r.chr, grip, r.dummy)) {
         return;
     }
+    // The Arm's tentacle and bladed tip have fixed lengths. Reuse the checked
+    // part-animation tail so skinning and native hit dummies see the same pose.
+    static AmygdalanArm::Motion arm;
+    static u8* arm_node = nullptr;
+    static s64 arm_stamp = 0;
+    static s32 arm_clip = -1;
+    static std::array<B::QsTransform, 3> arm_bones{}; // the lash stretches links 2 and 3 too
+    static bool arm_cached = false, arm_hunter = false;
+    static B::Vec3 arm_position{};
+    static float arm_yaw{};
+    static u8* arm_chr = nullptr;
+    if (r.variation == 2500) {
+        if (arm_node != node || arm_chr != r.chr) {
+            arm.Clear(); // a new part or hunter: its neutral pose again
+            arm_node = node;
+            arm_chr = r.chr;
+            arm_stamp = 0;
+            arm_cached = arm_hunter = false;
+        }
+        const bool closing = playing == AmygdalanArm::ClosingClip;
+        if ((!r.drive && !(r.arm_release && closing)) || !pose_grip || count != 4) {
+            // A gap: the chain starts again after it, the neutral pose kept (Motion::Pause).
+            if (arm_stamp != 0) arm.Pause();
+            arm_stamp = 0;
+            arm_cached = arm_hunter = false;
+            return;
+        }
+        const s64 stamp = r.grip_ns;
+        // A duplicate update must not advance physics or reset it.
+        if (stamp == arm_stamp && closing == (arm_clip == AmygdalanArm::ClosingClip) && arm_cached) {
+            loc[1] = arm_bones[0];
+            loc[2] = arm_bones[1];
+            loc[3] = arm_bones[2];
+            B::ToHavok(loc[1], local[1]);
+            B::ToHavok(loc[2], local[2]);
+            B::ToHavok(loc[3], local[3]);
+            return;
+        }
+        const float dt = arm_stamp ? static_cast<float>(stamp - arm_stamp) * 1e-9f : 0.0f;
+        arm_stamp = stamp;
+        arm_clip = playing;
+        // The right trigger held in form B (core/vr/amygdalan_hook.h OwnsTrigger): the tentacle
+        // lashes out, taking the arm over from an attack's clip too (AmygdalanArm::Motion).
+        const auto intent = W::LatestSwingInput(now, SpeedFreshNs);
+        const bool lash = !closing && intent.arm_lash;
+        // Ours while out (a strike, a jab, a hook or folding back), a clip started or not.
+        // Opening must first reach idle: never capture a transform's pose as the permanent rest.
+        const bool ours = !closing && (idle || arm.HasNeutralPose());
+        float floor_y = -1e9f;
+        if (ours) {
+            // These values were captured alongside grip, from the same body pose. Reading the
+            // live character matrix here mixed two frames and interpreted walking turns as swings.
+            const B::Vec3 position = r.carry_position;
+            const bool hunter = r.carry_valid;
+            if (hunter && arm_hunter && dt > 0.0f && dt <= 0.1f)
+                arm.Carry(B::AxisAngle({0, 1, 0}, std::remainder(r.carry_yaw - arm_yaw, 2 * B::Pi)),
+                          arm_position, position);
+            arm_hunter = hunter;
+            arm_position = position;
+            arm_yaw = r.carry_yaw;
+            if (hunter) floor_y = position.y + FloorLiftM; // the lash never goes through it
+        } else {
+            arm_hunter = false; // an attack's clip: the chain restarts from its pose, not carried
+        }
+        // Latched on (the enemy still on its feet) or caught (limp, pulled): the tentacle held out
+        // to it, the tip on it. The hand's turn goes to the caught enemy's lever.
+        B::Vec3 hooked{};
+        bool on_enemy = false;
+        if (AmygdalanHook::Enabled() && B::IsFinite(grip.q))
+            AmygdalanHook::hand_turn.Store({now, reinterpret_cast<u64>(r.chr), grip.q});
+        if (AmygdalanHook::Enabled() && !closing) {
+            const auto fresh = [&](s64 ns, u64 player) {
+                return ns > 0 && now >= ns && now - ns <= AmygdalanHook::MaxAgeNs &&
+                       player == reinterpret_cast<u64>(r.chr);
+            };
+            const auto hook = ArmHookNow();
+            const auto latch = AmygdalanHook::LatchNow();
+            if (hook.attached && fresh(hook.ns, hook.player)) {
+                hooked = hook.point;
+                on_enemy = true;
+            } else if (latch.attached && fresh(latch.ns, latch.player)) {
+                hooked = latch.point;
+                on_enemy = true;
+            }
+        }
+        std::array<B::QsTransform, 4> clip{}, out{};
+        std::copy_n(loc.begin(), 4, clip.begin());
+        // Once initialized at idle, controller motion owns form B, including native attack clips.
+        // Closing still blends back to the game's actual transformation.
+        const bool was_out = arm.Out();
+        AmygdalanArm::LaunchInput launch{};
+        if (r.carry_valid) {
+            launch.direction = B::TrackingToWorld(
+                {intent.arm_direction[0], intent.arm_direction[1], intent.arm_direction[2]},
+                r.carry_yaw, 1.0f);
+            launch.velocity = B::TrackingToWorld(
+                {intent.arm_velocity[0], intent.arm_velocity[1], intent.arm_velocity[2]},
+                r.carry_yaw, 1.0f);
+            // The hunter's facing (the Beast Cutter's throw reads the same): a free throw goes only
+            // ahead of him, a wind-up behind keeps the limb coiled (AmygdalanArm::ThrowAhead).
+            B::Vec3 feet{}, facing{}, side{};
+            if (HunterFrame(r.chr, feet, facing, side) && B::IsFinite(facing))
+                launch.heading = facing;
+        }
+        arm_cached = closing ? arm.Close(clip, grip, dt, out)
+                     : ours
+                         ? arm.Update(clip, grip, dt, out, lash, floor_y,
+                                      on_enemy ? &hooked : nullptr, intent.arm_speed, &launch)
+                         : arm.Attack(clip, grip, dt, out);
+        if (g_log >= 1 && was_out != arm.Out())
+            LOG_INFO(Core, "VR Arm motion: {} (controller {:.2f} m/s, trigger {})",
+                     arm.Out() ? "out" : "folded", intent.arm_speed, lash);
+        if (arm_cached) {
+            if (on_enemy) AmygdalanArm::AimTip(out, W::ApplyInverse(grip, hooked));
+            arm_bones = {out[1], out[2], out[3]};
+            B::ToHavok(out[1], local[1]);
+            B::ToHavok(out[2], local[2]);
+            B::ToHavok(out[3], local[3]);
+        }
+        {
+            static B::Vec3 arm_tip{};
+            static bool arm_have_tip = false;
+            static s64 arm_fast_ns = 0;
+            const B::Vec3 tip = W::Apply(grip, AmygdalanArm::TipOf(arm_cached ? out : clip));
+            if (arm_have_tip && dt > 0.0f && dt <= 0.1f &&
+                B::Length(tip - arm_tip) >= ArmHurtTipMps * dt)
+                arm_fast_ns = now;
+            arm_tip = tip;
+            arm_have_tip = B::IsFinite(tip);
+            g_arm_out.Store({now, arm.Out(), arm_fast_ns, arm.Out() && !on_enemy, grip.t});
+        }
+        g_out.Store(HookOut{}); // never inherit the previous whip's damage-window hold
+        return;
+    }
+    if (arm_node != nullptr) {
+        arm.Clear();
+        arm_node = nullptr;
+        arm_stamp = 0;
+        arm_chr = nullptr;
+        arm_cached = arm_hunter = false;
+    }
     if (node != h.node) {
         h = {}; // another part (a weapon switch, a load): start again
         h.node = node;
+        h.kos_return.Seed(static_cast<unsigned>(now));
         for (const RestCache& c : g_rest_cache) {
             if (c.variation == r.variation && c.n == r.n && r.variation >= 0) {
                 std::copy_n(c.rest.begin(), c.n, h.rest.begin());
                 std::copy_n(c.rest_q.begin(), c.n, h.rest_q.begin());
+                if (r.variation == KosVariation) h.kos_scale = c.kos_scale;
                 std::copy_n(c.raw.begin(), c.n, h.rest_raw.begin());
                 h.flipped = c.flipped;
                 h.links = c.links;
@@ -597,6 +1495,13 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
             }
         }
         if (changed) {
+            if (r.variation == KosVariation) {
+                for (s32 k = 0; k < r.n; ++k) {
+                    const s32 j = std::min(k + 1, r.n - 1);
+                    if (!h.kos_scale[k].Set(mod[r.chain[k]].s,
+                            B::Length(h.rest[j] - h.rest[j - 1]))) return;
+                }
+            }
             h.flipped = W::RestToBlade(h.rest.data(), h.rest_q.data(), r.n);
             h.have_rest = h.chain.Init(h.rest.data(), r.n);
             h.links = links;
@@ -614,6 +1519,7 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
                 slot->n = r.n;
                 std::copy_n(h.rest.begin(), r.n, slot->rest.begin());
                 std::copy_n(h.rest_q.begin(), r.n, slot->rest_q.begin());
+                if (r.variation == KosVariation) slot->kos_scale = h.kos_scale;
                 std::copy_n(h.rest_raw.begin(), r.n, slot->raw.begin());
                 slot->flipped = h.flipped;
                 slot->links = links;
@@ -696,10 +1602,15 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
                          (w.open || (w.close_ns != 0 && now - w.close_ns < HeavyHoldNs));
     const u8 kind = heavy_w ? w.kind : 0;
     W::PayoutConfig pc{};
-    pc.v_full = ws.payout_speed;
-    pc.v_start = ws.payout_speed * W::PayoutStartShare;
-    pc.v_keep = ws.payout_speed * W::PayoutKeepShare;
-    pc.hold_s = W::HoldFor(r.variation, ws.hold_s);
+    // The Beast Cutter's chain is thrown (whip_chain.h); the Kos Parasite's tendril too, on the
+    // Cutter's swing-path lash with its own dials (core/vr/kos_lash.h).
+    const bool kos = r.variation == KosVariation;
+    const bool thrown = r.variation == 2400 || kos;
+    pc.v_full = thrown && ws.cutter_full > 0.0f ? ws.cutter_full : ws.payout_speed;
+    pc.v_start = ws.payout_speed * (thrown ? ws.cutter_start : W::PayoutStartShare);
+    pc.v_keep = ws.payout_speed * (thrown ? ws.cutter_keep : W::PayoutKeepShare);
+    pc.hold_s = thrown && ws.cutter_hold_s > 0.0f ? ws.cutter_hold_s
+                                                  : W::HoldFor(r.variation, ws.hold_s);
     const W::SwingInput input = W::LatestSwingInput(now, SpeedFreshNs);
     const float speed = r.drive ? input.speed : 0.0f;
     const bool compact = W::CompactCutter(r.variation, true, r.drive, input.compact);
@@ -714,6 +1625,8 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
     const float cap = MaxExtension(r, kind);
     const float light_cap = MaxExtension(r, 0);
     bool recall = false;
+    float throw_share = 1.0f; // of the swing's speed that may start a payout
+    bool turning = false;     // a stroke turning back: the chain comes in for the next
     if (r.variation == 2400 && r.drive && !compact && h.have_prev && h.chain.Ready()) {
         B::Vec3 feet{}, fwd{}, left{};
         const bool body = HunterFrame(r.chr, feet, fwd, left) && B::IsFinite(feet) &&
@@ -730,11 +1643,22 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
                                         B::Dot(velocity, B::Rotate(grip.q, axis)));
             recall = h.recall.Step(pull, B::Length(velocity), speed,
                                    h.chain.Extension(), dt, pc);
+            h.hand_speed = B::Length(grip.t - h.prev.t - (feet - h.body_pos)) / dt;
+            // The weapon's far end (its idle line's tip) relative to the hunter, and its line.
+            const auto& far_end = h.rest[r.n - 1];
+            const auto far_v = (W::Apply(grip, far_end) - W::Apply(h.prev, far_end) -
+                                (feet - h.body_pos)) * (1.0f / dt);
+            turning = h.turn.Step(far_v, pc.v_full, dt) && ws.cutter_turn;
+            const auto line = B::Rotate(grip.q, B::Normalize(far_end - h.rest[0]));
+            throw_share = ws.cutter_throw ? W::CutterThrowShare(line, fwd) : 1.0f;
         } else {
             recall = h.recall.Step(0, 0, 0, h.chain.Extension(), 0, pc);
+            turning = h.turn.Step({}, pc.v_full, dt) && ws.cutter_turn;
+            h.hand_speed = 0.0f;
         }
     } else {
         h.recall.Reset();
+        h.turn.Reset();
     }
     // Beast Cutter only (the Threaded Cane has none since 2026-10-15): a snap of the wrist with
     // the chain out reels it straight in (the passive reel-in, now: the whip's own t_in). The
@@ -788,8 +1712,111 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
     } else {
         h.flick.Reset();
     }
-    // Do not let the speed of the recall flick immediately pay the chain out again.
-    const float s_target = h.payout.Step(speed, cap, dt, pc, compact || recall || flick);
+    // Do not let the speed of the recall flick immediately pay the chain out again. A payout
+    // starts only on a throw ahead (W::CutterThrowShare); out, the swing's own speed keeps it.
+    const bool closed = h.payout.Target() <= 1.05f;
+    const float pay_speed = closed ? speed * throw_share : speed;
+    // The Beast Cutter's own flight keeps it out (whip_cutter_tip_keep): it comes back once its
+    // momentum is spent, not as the hand stops.
+    if (thrown && ws.cutter_tip_keep > 0.0f && h.chain.Ready() &&
+        h.chain.TipSpeed() > ws.cutter_tip_keep) {
+        h.payout.KeepOut();
+    }
+    // (The swing-path lash has no pull-back recall: every turn of a stroke pulls back a little and
+    // snapped the chain in; its length follows the momentum, the trigger and the flick still bring
+    // it in at once.)
+    const float kos_out =
+        kos ? std::clamp((h.chain.Extension() - 1.0f) / std::max(cap - 1.0f, 0.01f), 0.0f, 1.0f)
+            : 0.0f;
+    if (kos) {
+        // The Kos's dials, its reel set per stroke, and its mood (core/vr/kos_lash.h Return).
+        if (h.kos_return.Step(kos_out) && g_log >= 1) {
+            LOG_INFO(Core, "VR whip: Kos stroke: returns in {:.0f} ms, {}",
+                     h.kos_return.Seconds() * 1000.0f, W::Kos::MoodName(h.kos_return.Current()));
+        }
+        h.kos_lab = W::Kos::Lab();
+        h.kos_return.Apply(h.kos_lab);
+    }
+    const W::CutterLab& lab = kos ? h.kos_lab : ws.cutter_lab;
+    if (thrown && lab.on && lab.path_model) recall = false;
+    const bool forced_in = compact || recall || flick || turning;
+    float s_target = h.payout.Step(pay_speed, cap, dt, pc, forced_in);
+    h.forced_in = forced_in;
+    if (thrown && lab.on && lab.path_model) {
+        // The swing-path lash: its length from the swing's momentum (core/vr/cutter_path.h; the
+        // head and the hunter read as the trace records them, so a replay sees the same).
+        W::PathFrame pf{};
+        pf.dt = dt;
+        pf.hand = grip.t;
+        pf.weapon = B::Rotate(B::Normalize(grip.q), B::Normalize(h.rest[r.n - 1] - h.rest[0]));
+        pf.forced_in = forced_in;
+        pf.impact = h.chain.Impact();
+        pf.cap = cap;
+        B::Vec3 feet{}, fwd{}, left{};
+        pf.body_ok = HunterFrame(r.chr, feet, fwd, left) && B::IsFinite(feet) && B::IsFinite(fwd);
+        pf.feet = feet;
+        pf.facing = fwd;
+        B::HandsSample head{};
+        B::Anchor at{};
+        if (B::LatestHands(head) && head.head_valid && B::LatestAnchor(at) && at.valid &&
+            B::IsFinite(head.head_q) && B::Dot(head.head_q, head.head_q) > 0.5f) {
+            pf.eye = at.eye_world + B::TrackingToWorld(head.head_p - at.head_k, at.base_yaw,
+                                                       at.world_scale);
+            pf.forward = B::TrackingToWorld(B::Rotate(B::Normalize(head.head_q), {0.0f, 0.0f, -1.0f}),
+                                            at.base_yaw, 1.0f);
+            pf.head_ok = true;
+        }
+        if (kos) {
+            const bool tracked = KosSwingFrame(1, now, h.kos_hold, pf);
+            if (tracked != h.kos_tracked) {
+                h.path.Reset();
+                h.kos_tracked = tracked;
+            }
+        }
+        s_target = h.path.Step(pf, lab);
+        if (kos) {
+            // The Kos's recoil and sway (core/vr/kos_lash.h): its stroke turning back in kicks
+            // both; the recoil rides on the length asked for.
+            const bool turned = h.kos_recoil.Step(dt, kos_out);
+            h.kos_sway.Step(dt, turned, kos_out);
+            h.kos_pulse.Step(dt, turned, kos_out);
+            s_target = std::clamp(s_target + h.kos_recoil.Offset() / std::max(h.links, 0.05f),
+                                  1.0f, std::max(cap, 1.0f));
+        }
+        h.payout.SetTarget(s_target);
+    } else if (thrown && lab.on && lab.mompay) {
+        // The length follows the chain's momentum, which only the hand's swing gives it: while
+        // the hand swings (vact) the meter follows the chain's front speed; the hand stopped, it
+        // halves every mhold (the chain comes back, its own swinging never keeping it out); the
+        // chain just hit the ground, it is held hithold first (a smash keeps its force a moment).
+        // Fully out above mout, in below min. The trigger and the flick back bring it in, and
+        // the swing that brought it in does not throw it out again for 0.3 s.
+        if (forced_in) {
+            h.meter = 0.0f;
+            h.meter_lock = 0.3f;
+            h.impact_left = 0.0f;
+        } else {
+            const float step = std::max(dt, 0.0f);
+            h.meter_lock = std::max(0.0f, h.meter_lock - step);
+            h.impact_left = h.chain.Impact() > 2.0f ? lab.hithold
+                                                     : std::max(0.0f, h.impact_left - step);
+            // The hand's own movement, not the controller's far end (a wrist turn swings that).
+            const bool swung = h.hand_speed >= lab.vact && h.meter_lock <= 0.0f;
+            if (swung) {
+                h.meter = std::max(h.front, h.meter * std::exp2(-step / 0.15f));
+            } else if (h.impact_left <= 0.0f) {
+                h.meter *= std::exp2(-step / std::max(lab.mhold, 0.02f));
+            }
+            const float f = std::clamp((h.meter - lab.min) / std::max(lab.mout - lab.min, 0.1f),
+                                       0.0f, 1.0f);
+            s_target = 1.0f + (cap - 1.0f) * f * f * (3.0f - 2.0f * f);
+            h.payout.SetTarget(s_target);
+        }
+    }
+    // A payout from closed is a throw: its front follows the hand for CutterThrowS.
+    h.throw_left = r.variation == 2400 && closed && s_target > 1.05f
+                       ? W::CutterThrowS
+                       : std::max(0.0f, h.throw_left - std::max(dt, 0.0f));
     if (h.payout.Reeled()) {
         ++h.reels;
     }
@@ -819,6 +1846,11 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
         h.have_prev = true;
         h.payout.Reset();
         h.recall.Reset();
+        h.turn.Reset();
+        h.throw_left = 0.0f;
+        h.meter = 0.0f;
+        h.have_front = false;
+        h.path.Reset();
         h.flick.Reset();
         h.recall_sound.Reset();
         W::PublishRecallAudio({}, false, 0, now);
@@ -835,11 +1867,50 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
     }
     // The payout: the chain to the extension the swing's speed asks for.
     const bool lash = want && swing;
-    h.cfg = W::ConfigFor(r.variation);
-    if (recall) h.cfg.t_in = 0.24f;
+    h.cfg = W::ConfigFor(kos ? 2400 : r.variation);
+    if (r.variation == 2400 && lash && !recall && !compact && !turning && !lab.on) {
+        W::TuneCutterFlight(speed, pc.v_keep, pc.v_full, h.cfg);
+    }
+    if (thrown && lab.on) {
+        // The lab's free chain (Cutter Chain Lab; whip_cutter_lab), or its swing-path lash.
+        W::ApplyLabChain(lab, h.cfg);
+        if (lab.path_model) h.path.Apply(lab, h.cfg);
+        if (kos) {
+            h.cfg.sway = h.kos_sway.Amplitude(
+                std::clamp((h.chain.Extension() - 1.0f) / std::max(cap - 1.0f, 0.01f), 0.0f, 1.0f),
+                W::Kos::GainOf(h.kos_return.Current()));
+            h.cfg.sway_phase = 1.3f;
+        }
+        // The arm's line, chest to hand (the head 35 cm down), for the drive and the guide.
+        B::HandsSample head{};
+        B::Anchor at{};
+        if (!lab.path_model && lab.aim > 0.0f && B::LatestHands(head) && head.head_valid &&
+            B::LatestAnchor(at) &&
+            at.valid && now - at.steady_ns < 100 * Ms) {
+            const B::Vec3 eye = at.eye_world + B::TrackingToWorld(head.head_p - at.head_k,
+                                                                  at.base_yaw, at.world_scale);
+            const B::Vec3 arm = grip.t - (eye - B::Vec3{0.0f, 0.35f, 0.0f});
+            if (B::IsFinite(arm) && B::LengthSq(arm) > 0.01f) {
+                h.cfg.aim = B::Normalize(arm);
+                h.cfg.aim_share = lab.aim;
+            }
+        }
+    }
+    if (thrown && !kos && ws.cutter_reel_s > 0.0f) h.cfg.t_in = ws.cutter_reel_s;
+    if (recall) h.cfg.t_in = std::min(h.cfg.t_in, 0.24f);
+    if (turning) h.cfg.t_in = std::min(h.cfg.t_in, W::CutterStrokeTurn::ReelS);
+    if (r.variation == 2400 && h.throw_left > 0.0f && lash && !recall && !turning &&
+        !h.flick.Lifting() && ws.cutter_follow > 0.0f) {
+        W::CutterThrowDrive(h.cfg, ws.cutter_follow);
+    }
+    if (thrown && !kos) {
+        h.cfg.spine = ws.cutter_spine;
+        h.cfg.unfold = ws.cutter_unfold;
+    }
     if (compact) { h.cfg.t_in = 0.18f; h.cfg.lock_closed = true; }
     h.cfg.release = W::ReleaseForSpeed(speed, pc.v_keep, h.cfg); // slow: the chain hangs
     h.cfg.side_damp = W::SideDampForSpeed(speed, pc.v_keep, h.cfg); // ... and stops circling
+    if (thrown && lab.on) h.cfg.side_damp = 0.0f; // the lab's chain keeps its own swing
     // The ground at the hunter's feet: the chain out and slow lies on it instead of hanging
     // through the floor (an approximation: a flat floor at his feet; walls still pass).
     {
@@ -856,6 +1927,7 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
             if (std::abs(turn) > CarryTurnDeg * B::Deg) {
                 const B::Quat rq = B::AxisAngle({0.0f, 1.0f, 0.0f}, turn);
                 h.chain.Carry(rq, h.body_pos, feet);
+                h.have_front = false; // the carry is no swing of the chain
                 h.prev = {feet + B::Rotate(rq, h.prev.t - h.body_pos),
                           B::Normalize(rq * h.prev.q)};
                 ++h.carries;
@@ -871,10 +1943,23 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
         h.have_body = body;
         h.body_ns = now;
     }
+    // The Kos Parasite's tendril on a snap turn (KosSnap): rigidly round with the hand.
+    if (kos && h.have_prev && h.chain.Ready() && h.kos_snap.Step(h.prev, grip)) {
+        const B::Quat rq =
+            B::Normalize(B::Normalize(grip.q) * B::Conjugate(B::Normalize(h.prev.q)));
+        h.chain.Carry(rq, h.prev.t, grip.t);
+        h.prev = grip;
+        h.have_front = false;
+        if (g_log >= 1) {
+            LOG_INFO(Core, "VR whip: Kos tendril: a snap turn: carried round with the hand (#{})",
+                     h.kos_snap.Carries());
+        }
+    }
     W::GazeAssist gaze{};
     B::HandsSample hands{};
     B::Anchor anchor{};
-    if (r.variation == 2400 && lash && speed >= pc.v_keep && B::LatestHands(hands) &&
+    if (r.variation == 2400 && lash && speed >= pc.v_keep && !ws.cutter_lab.on &&
+        B::LatestHands(hands) &&
         hands.head_valid && now >= hands.steady_ns && now - hands.steady_ns < 100 * Ms &&
         B::LatestAnchor(anchor) && anchor.valid && now >= anchor.steady_ns &&
         now - anchor.steady_ns < 100 * Ms && B::IsFinite(hands.head_q) &&
@@ -885,8 +1970,54 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
         gaze.forward = B::TrackingToWorld(
             B::Rotate(B::Normalize(hands.head_q), {0.0f, 0.0f, -1.0f}), anchor.base_yaw, 1.0f);
     }
+    if (r.variation == 2400 && h.have_prev && h.chain.Ready() && dt > 0.0f) {
+        const float moved = B::Length(grip.t - h.prev.t) / dt;
+        const float turned = B::AngleBetween(h.prev.q, B::Normalize(grip.q)) / B::Deg / dt;
+        // (The swing-path lash: also every frame the chain itself would restart closed on - a
+        // swing's fastest frames and wrist snaps at a turn, 15 in 3.5 min on 2026-11-08.)
+        const bool lash_jump = thrown && ws.cutter_lab.on && ws.cutter_lab.path_model &&
+                               W::HandJump(h.prev, grip, dt);
+        if (moved > TeleportMs || turned > TeleportDegS || lash_jump) {
+            // A jump of the hand's frame (a source change, a turn not carried above): the chain
+            // goes with it rigidly, then steps from there.
+            const float jump_cm = B::Length(grip.t - h.prev.t) * 100.0f;
+            const B::Quat r = B::Normalize(B::Normalize(grip.q) * B::Conjugate(B::Normalize(h.prev.q)));
+            h.chain.Carry(r, h.prev.t, grip.t);
+            h.prev = grip;
+            h.have_front = false;
+            ++h.teleports;
+            if (g_log >= 1 || h.teleports <= 5) {
+                LOG_INFO(Core, "VR whip: the hand jumped {:.0f} cm and {:.0f} deg in {:.1f} ms: the "
+                               "chain carried with it (#{})",
+                         jump_cm, turned * dt, dt * 1000.0f,
+                         h.teleports);
+            }
+        }
+    }
     h.chain.Step(h.prev, grip, dt, want ? s_target : 1.0f, h.cfg, gaze);
     TraceMotion(r, h, grip, gaze, now, dt, speed, want ? s_target : 1.0f, pose_grip);
+    if (thrown && lab.on) {
+        // The momentum meter's input: the front half's speed around the hand, the payout's own
+        // growth taken out (it would keep itself out).
+        const int half = r.n / 2;
+        const B::Vec3 root = h.chain.Point(0);
+        const float s_now = h.chain.Extension();
+        if (h.have_front && dt > 0.0f && dt < 0.1f && h.front_s > 0.0f) {
+            const float k = s_now / h.front_s;
+            float sum = 0.0f;
+            for (s32 i = half; i < r.n; ++i) {
+                const B::Vec3 was = (h.front_prev[i - half] - h.front_root) * k;
+                sum += B::Length((h.chain.Point(i) - root) - was);
+            }
+            h.front = sum / static_cast<float>(r.n - half) / dt;
+        } else {
+            h.front = 0.0f;
+        }
+        for (s32 i = half; i < r.n; ++i) h.front_prev[i - half] = h.chain.Point(i);
+        h.front_root = root;
+        h.front_s = s_now;
+        h.have_front = true;
+    }
     h.prev = grip;
     // Locked out (the full payout reached: the presenter's tick), and free again below half.
     const float ext = h.chain.Extension();
@@ -929,6 +2060,25 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
     std::array<B::QsTransform, W::MaxPoints> clip{};
     for (s32 k = 0; k < r.n; ++k) {
         clip[k] = loc[r.chain[k]];
+    }
+    if (r.variation == KosVariation && r.n >= 2) {
+        // The Kos's tendril thickens as it stretches, as the game's own attacks make it, and
+        // pulses as it comes home: each bone's model scale, turned into locals and blended with
+        // the clip's as the pose is (core/vr/kos_lash.h LocalScales).
+        const float girth = W::Kos::Girth(h.chain.Extension());
+        std::array<B::Vec3, W::MaxPoints> want{}, clip_model{}, local{};
+        for (s32 k = 0; k < r.n; ++k) {
+            const s32 j = std::min(k + 1, r.n - 1);
+            const float g = girth * h.kos_pulse.At(static_cast<float>(k) / (r.n - 1),
+                                                   W::Kos::GainOf(h.kos_return.Current()).pulse);
+            want[k] = h.kos_scale[k].At(B::Length(p[j] - p[j - 1]), g);
+            clip_model[k] = mod[r.chain[k]].s;
+        }
+        W::Kos::LocalScales(want.data(), clip_model.data(), mod[r.parents[r.chain[0]]].s, r.n,
+                            h.weight, local.data());
+        for (s32 k = 0; k < r.n; ++k) {
+            clip[k].s = local[k];
+        }
     }
     std::array<B::QsTransform, W::MaxPoints> out{};
     const B::QsTransform end = W::ChainLocals(mod[r.parents[r.chain[0]]], p.data(), q.data(),
@@ -1079,7 +2229,8 @@ void PS4_SYSV_ABI WhipHook(u8* node) {
     g_out.Store(o);
     W::PublishWhipFeel({now, light_cap > 1.0f ? (ext - 1.0f) / (light_cap - 1.0f) : 0.0f,
                         tip_speed, h.locks, h.reels, want, h.lash, lash,
-                        lash && h.flick.Lifting()});
+                        lash && h.flick.Lifting(), r.variation,
+                        h.fast_ns != 0 && now - h.fast_ns <= FastRecentNs});
 }
 
 bool InstallHook(u8* module) {
@@ -1090,6 +2241,13 @@ bool InstallHook(u8* module) {
     Xbyak::Label original, override_pose;
     c.mov(rax, reinterpret_cast<u64>(&g_node_cmp));
     c.cmp(rbx, ptr[rax]);
+    c.je(override_pose, Xbyak::CodeGenerator::T_NEAR);
+    c.mov(rax, reinterpret_cast<u64>(&g_kos_node_cmp[0])); // the Kos's form B bundles
+    c.cmp(rbx, ptr[rax]);
+    c.je(override_pose, Xbyak::CodeGenerator::T_NEAR);
+    c.cmp(rbx, ptr[rax + 8]);
+    c.je(override_pose, Xbyak::CodeGenerator::T_NEAR);
+    c.cmp(rbx, ptr[rax + 16]); // ... and its mouth tendril
     c.je(override_pose, Xbyak::CodeGenerator::T_NEAR);
     c.mov(rax, reinterpret_cast<u64>(&Combat::BowPartNode()));
     c.cmp(rbx, ptr[rax]);
@@ -1180,6 +2338,45 @@ bool ResolveChain(const u8* skel, Rig& r, std::string& why) {
             why = "the skeleton's parents are not in order";
             return false;
         }
+    }
+    if (r.variation == 2500) {
+        constexpr std::array<std::string_view, 4> names{"handle", "Dummy001", "Dummy002", "Dummy003"};
+        if (count != 4) { why = "unexpected Amygdalan Arm bone count"; return false; }
+        for (int i = 0; i < 4; ++i) {
+            if (r.parents[i] != i - 1 || BoneName(bones, i) != names[i]) {
+                why = "unexpected Amygdalan Arm hierarchy";
+                return false;
+            }
+        }
+        r.n = 3;
+        r.chain = {1, 2, 3};
+        return true;
+    }
+    if (r.variation == KosVariation) {
+        // The Kos Parasite's form-A tendril (the hidden weapon's part 0): B_Rarm_Bone_Chain_1-9,
+        // each the child of the one before.
+        s32 prev = -1;
+        r.n = 0;
+        for (s32 k = 1; k <= 9; ++k) {
+            const std::string name = fmt::format("B_Rarm_Bone_Chain_{}", k);
+            s32 found = -1;
+            for (s32 i = 0; i < count; ++i) {
+                if (BoneName(bones, i) == name) {
+                    found = i;
+                    break;
+                }
+            }
+            if (found < 0 || (prev >= 0 && r.parents[found] != prev)) {
+                why = fmt::format("no Kos tendril ({} {})", name,
+                                  found < 0 ? "missing" : "not under the one before");
+                return false;
+            }
+            r.chain[r.n++] = static_cast<s16>(found);
+            prev = found;
+        }
+        r.tip_blade = -1;
+        r.mid_blade = -1;
+        return true;
     }
     s32 root = -1;
     for (s32 i = 0; i < count; ++i) {
@@ -1378,17 +2575,88 @@ void InstallWhip(VAddr base, u64 size) {
              g_lead ? " lead" : "");
 }
 
+// VR_KOS_PROBE (diagnostics): the Kos Parasite's parts. The game swaps a hidden weapon's model
+// (40000000, wp_a_1711: four parts) in for it; this logs the right weapon's part slots 11-14 (and
+// the left's 15-18): the dummy each hangs on, its clip, and its skeleton's bones (once per node).
+void KosProbe(u8* chr, s32 variation, s64 now) {
+    static s64 last_ns = 0;
+    static std::array<u8*, 8> seen{};
+    static std::array<s32, 8> seen_clip{};
+    u8* const parts = Read<u8*>(chr + OffsetChrAsm);
+    if (!Plausible(parts)) {
+        return;
+    }
+    const u8* const equip = Read<u8*>(chr + OffsetEquip);
+    const s32 hand = Plausible(equip) ? Read<s32>(equip + 0x10) : -1;
+    const s32 id = Plausible(equip) && hand >= 0 && hand <= 2
+                       ? Read<s32>(equip + 0x64 + 4 * (hand * 2 + 1))
+                       : -1;
+    bool changed = false;
+    std::array<u8*, 8> nodes{};
+    std::array<s32, 8> clips{};
+    std::string line;
+    for (s32 k = 0; k < 8; ++k) {
+        u8* const part = Read<u8*>(parts + OffsetAsmParts + 8 * (11 + k));
+        if (!Plausible(part) || Read<u8*>(part) != g_base + WeaponPartVtableRva) {
+            line += fmt::format(" | {}: -", 11 + k);
+            continue;
+        }
+        u8* const anim = Read<u8*>(part + OffsetPartAnim);
+        u8* const state = Plausible(anim) ? Read<u8*>(anim) : nullptr;
+        u8* const player = Plausible(state) ? Read<u8*>(state + OffsetStatePlayer) : nullptr;
+        u8* const node = Plausible(player) ? Read<u8*>(player + OffsetPlayerNode) : nullptr;
+        nodes[k] = Plausible(node) ? node : nullptr;
+        clips[k] = Plausible(state) ? Read<s32>(state + OffsetStatePlaying) : -1;
+        const u8* const skel = nodes[k] ? Read<u8*>(nodes[k] + OffsetNodePose + OffsetPoseSkeleton)
+                                        : nullptr;
+        const s32 count = Plausible(skel) ? Read<s32>(skel + OffsetSkelCount) : -1;
+        line += fmt::format(" | {}: mode {} dummy {} clip {} asked {} bones {}", 11 + k,
+                            Read<s32>(part + OffsetPartMode), Read<s32>(part + OffsetPartDummy),
+                            clips[k], Plausible(state) ? Read<s32>(state + OffsetStateAsked) : -1,
+                            count);
+        if (nodes[k] != seen[k] && Plausible(skel) && count > 0 && count <= 128) {
+            const u8* const bones = Read<const u8*>(skel + OffsetSkelBones);
+            const s16* const parents = Read<const s16*>(skel + OffsetSkelParents);
+            std::string names;
+            for (s32 i = 0; i < count && Plausible(bones); ++i) {
+                names += fmt::format(" {}:{}<{}", i, BoneName(bones, i),
+                                     Plausible(reinterpret_cast<const u8*>(parents)) ? parents[i]
+                                                                                     : -9);
+            }
+            LOG_INFO(Core, "VR kos probe: slot {} node {} skeleton of {}:{}", 11 + k,
+                     fmt::ptr(nodes[k]), count, names);
+        }
+        changed = changed || nodes[k] != seen[k] || clips[k] != seen_clip[k];
+    }
+    if (changed || now - last_ns > 1500 * Ms) {
+        last_ns = now;
+        seen = nodes;
+        seen_clip = clips;
+        LOG_INFO(Core, "VR kos probe: weapon {} variation {} style {}{}", id, variation, Style(chr),
+                 line);
+    }
+}
+
 void WhipPoseTick(u8* chr, const MeleeBody& body) {
     if (!g_checked || chr == nullptr) {
         return;
     }
     auto& t = g_tick;
     const s64 now = NowNs();
+    const s32 variation = Variation(chr);
+    static const bool kos_probe = std::getenv("VR_KOS_PROBE") != nullptr;
+    if (kos_probe) {
+        KosProbe(chr, variation, now);
+    }
     if (chr != t.chr) {
         t = {};
         t.chr = chr;
     }
-    // The right weapon's form-B part and its animation.
+    // The right weapon's form-B part and its animation (the Kos Parasite in form A: its tendril).
+    const bool kos = variation == KosVariation;
+    const bool kos_a = kos && Style(chr) == 1;
+    KosBundleTick(chr, kos && Style(chr) >= 3 && Style(chr) <= 5, body.body);
+    KosMouthTick(chr, kos && VR::IsFirstPerson());
     const char* why = nullptr;
     u8* part = nullptr;
     u8* state = nullptr;
@@ -1398,9 +2666,9 @@ void WhipPoseTick(u8* chr, const MeleeBody& body) {
     if (!Plausible(parts)) {
         why = "no ChrAsm";
     } else {
-        part = Read<u8*>(parts + OffsetAsmParts + 8 * WhipPartSlot);
+        part = Read<u8*>(parts + OffsetAsmParts + 8 * (kos_a ? KosFormAPartSlot : WhipPartSlot));
         if (!Plausible(part) || Read<u8*>(part) != g_base + WeaponPartVtableRva) {
-            why = "no form-B part";
+            why = kos_a ? "no Kos tendril part" : "no form-B part";
         } else {
             u8* const anim = Read<u8*>(part + OffsetPartAnim);
             state = Plausible(anim) ? Read<u8*>(anim) : nullptr;
@@ -1414,10 +2682,17 @@ void WhipPoseTick(u8* chr, const MeleeBody& body) {
             }
         }
     }
-    if (node != nullptr && node != t.node) {
+    if (kos && !kos_a) {
+        // Out of form A the Kos's tendrils are form B's parts, not this chain (its rest shape is
+        // cached per variation: theirs would become form A's).
+        node = nullptr;
+        why = "the Kos Parasite out of form A";
+    }
+    if (node != nullptr && (node != t.node || variation != t.rig.variation)) {
         t.node = node;
         t.part = part;
         t.rig = {};
+        t.rig.variation = variation;
         t.rig_ok = false;
         u8* const skel = Read<u8*>(node + OffsetNodePose + OffsetPoseSkeleton);
         std::string err;
@@ -1443,16 +2718,18 @@ void WhipPoseTick(u8* chr, const MeleeBody& body) {
     }
     RefTrace(chr, t, playing, now);
     // Driven: whip=physical, a whip with rows in the table, its form B in the right hand.
-    const s32 variation = Variation(chr);
     const W::WhipMoves* const whip = W::FindWhip(variation);
+    const bool arm = variation == 2500;
     const s32 style = Style(chr);
     if (why == nullptr) {
         why = !g_physical                         ? "whip=canned"
-              : whip == nullptr                   ? "not a whip"
-              : !(whip->tested || g_untested)     ? "an untested whip (VR_WHIP_UNTESTED)"
-              : style < 3 || style > 5            ? "not in form B"
+              : whip == nullptr && !arm && !kos   ? "not a whip"
+              : !arm && !kos && !(whip->tested || g_untested)
+                  ? "an untested whip (VR_WHIP_UNTESTED)"
+              : !kos && (style < 3 || style > 5)  ? "not in form B"
               : !t.rig_ok                         ? "no whip chain on the part"
               : !body.body                        ? "body off"
+              : arm && !body.driven               ? "arm not driven"
               : Read<s32>(part + OffsetPartMode) != 2 ||
                         Read<s32>(part + OffsetPartDummy) < 300 ||
                         Read<s32>(part + OffsetPartDummy) >= 340
@@ -1463,10 +2740,17 @@ void WhipPoseTick(u8* chr, const MeleeBody& body) {
     if (t.rig_ok) {
         t.rig.variation = variation;
         t.rig.drive = drive && g_hooked;
+        // Relax only the form-B requirement, and only for the Arm's closing clip
+        // (checked again in the hook). Body/tracking/physics/attachment stops stay hard.
+        t.rig.arm_release = arm && style == 1 && g_physical && g_hooked &&
+            body.body && body.driven && Read<s32>(part + OffsetPartMode) == 2 &&
+            Read<s32>(part + OffsetPartDummy) >= 300 &&
+            Read<s32>(part + OffsetPartDummy) < 340;
         // The part's model space is the hand dummy it hangs on (300; the Threaded Cane's too).
         const s32 dummy = Read<s32>(part + OffsetPartDummy);
         t.rig.dummy = dummy >= 300 && dummy < 340 ? dummy : GripDummy;
         t.rig.grip_ns = 0;
+        t.rig.carry_valid = false;
         // The body has just written this pose; its synchronized dummy is still one frame old.
         // Copy only the attachment frame into the seqlock, never the borrowed pose pointers.
         const auto* skeleton = B::C0000::Active();
@@ -1480,6 +2764,10 @@ void WhipPoseTick(u8* chr, const MeleeBody& body) {
                     {d.forward[0], d.forward[1], d.forward[2]},
                     {d.up[0], d.up[1], d.up[2]}, t.rig.grip)) {
                 t.rig.grip_ns = body.pose_ns;
+                t.rig.carry_position = body.pose_frame->t;
+                t.rig.carry_yaw = body.base_yaw;
+                t.rig.carry_valid = B::IsFinite(t.rig.carry_position) &&
+                                    std::isfinite(t.rig.carry_yaw);
             }
         }
         g_rig.Store(t.rig);
@@ -1487,13 +2775,17 @@ void WhipPoseTick(u8* chr, const MeleeBody& body) {
     g_node_cmp = g_hooked && t.rig_ok ? reinterpret_cast<u64>(t.node) : 0;
     // Always logged while a whip is in the hand (a chain that never pays out says why; at most
     // 4 a second, a start or stop of the drive at once); every weapon with VR_WHIP_LOG.
-    if ((g_log >= 1 || whip != nullptr) && (drive != t.logged_drive || why != t.logged_why) &&
+    if ((g_log >= 1 || whip != nullptr || kos) &&
+        (drive != t.logged_drive || why != t.logged_why) &&
         (g_log >= 1 || drive != t.logged_drive || now - t.logged_ns >= 250 * Ms)) {
         t.logged_drive = drive;
         t.logged_why = why;
         t.logged_ns = now;
         LOG_INFO(Core, "VR whip: {} (variation {} style {}, part on dummy {}, hooked {}, thread '{}')",
-                 drive ? fmt::format("driving the {}'s chain", whip != nullptr ? whip->name : "?")
+                 drive ? fmt::format("driving the {}'s chain",
+                                     whip != nullptr ? whip->name
+                                     : kos           ? "Kos Parasite's tendril"
+                                                     : "?")
                        : fmt::format("not driving ({})", why),
                  variation, style, t.rig_ok ? t.rig.dummy : -1, g_hooked,
                  Common::GetCurrentThreadName());
@@ -1605,12 +2897,22 @@ bool WhipHoldsWindow(const Combat::MeleeWindow& w, s64 now_ns) {
     if (!g_hooked || w.open || w.close_ns == 0) {
         return false;
     }
+    // The Amygdalan Arm's lash: out and fast (its own state; the chain's is empty then).
+    ArmOut a{};
+    if (g_arm_out.Load(a) && now_ns >= a.ns && now_ns - a.ns <= 100 * Ms) {
+        return a.out && now_ns - w.close_ns < ArmHoldAfterCloseNs &&
+               now_ns - a.fast_ns <= FastRecentNs;
+    }
     HookOut o{};
     if (!g_out.Load(o) || !o.driving || o.compact || now_ns - o.ns > 100 * Ms) {
         return false;
     }
     // Still out after the window (the lash's follow-through) and still fast enough to hurt.
     const s64 hold = o.variation == 2400 ? CutterHoldAfterCloseNs : HoldAfterCloseNs;
+    if (W::ContactHeldWhip(o.variation) &&
+        !W::WhipContactMotion(W::LatestWhipFeel(), now_ns, o.variation)) {
+        return false; // a cancelled/recalling chain must not revive the attack through the tail
+    }
     return now_ns - w.close_ns < hold && o.s > 1.3f &&
            now_ns - o.fast_ns <= FastRecentNs;
 }
@@ -1653,6 +2955,15 @@ bool WhipWipePoints(u8* chr, std::span<B::Vec3> points, int& count) {
     }
     count = r.n;
     return true;
+}
+
+ArmLashState ArmLashNow(s64 now_ns) {
+    ArmOut a{};
+    if (!g_hooked || !g_arm_out.Load(a) || now_ns < a.ns || now_ns - a.ns > 100 * Ms ||
+        !B::IsFinite(a.grip)) {
+        return {};
+    }
+    return {true, a.lashing, a.grip};
 }
 
 WhipChainState WhipChainNow(s64 now_ns) {

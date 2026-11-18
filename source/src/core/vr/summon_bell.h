@@ -104,5 +104,16 @@ inline bool KeepBellInVR(double now, int clip) {
     return state.committed>0 && now>=state.committed && now-state.committed<10 &&
            clip>=0 && clip%1000000==100111;
 }
+// The summon event's ringing on the hunter (ForceAnimationPlayback 100111, 8 s with the bell in
+// his right hand), requested right after our accepted physical ring: the bell already rang in your
+// hand, so the ForceAnimationPlayback handlers drop it (bloodborne_summon_bell.cpp). The event goes
+// on to the summon without waiting for the clip. Only within 2 s of that ring; any other 100111
+// (or the same clip with the physical bell off) plays as the game's.
+inline constexpr double RingSkipSeconds = 2.0;
+inline bool SkipRingAnimation(double now, int anim) {
+    std::scoped_lock lock{mutex};
+    return enabled.load() && state.committed>0 && now>=state.committed &&
+           now-state.committed<RingSkipSeconds && anim>=0 && anim%1000000==100111;
+}
 }
 namespace VR::Bloodborne { void InstallSummonBell(std::uint64_t base, std::uint64_t size); }

@@ -180,7 +180,12 @@ void ClearFileOverride(const std::string& guest_path) {
 
 namespace {
 std::atomic<s64> g_cutscene_open_ns{0};
+std::atomic<CutsceneOpenObserver> g_cutscene_observer{nullptr};
 } // namespace
+
+void SetCutsceneOpenObserver(CutsceneOpenObserver observer) {
+    g_cutscene_observer.store(observer, std::memory_order_release);
+}
 
 void NoteGuestOpen(std::string_view guest_path) {
     // "/app0/dvdroot_ps4/remo/s24_01_0010.remobnd.dcx": a cutscene's data, opened as it starts.
@@ -191,6 +196,9 @@ void NoteGuestOpen(std::string_view guest_path) {
                         std::chrono::steady_clock::now().time_since_epoch())
                         .count();
     g_cutscene_open_ns.store(now, std::memory_order_release);
+    if (const auto observer = g_cutscene_observer.load(std::memory_order_acquire)) {
+        observer(guest_path);
+    }
 }
 
 s64 LastCutsceneOpenNs() {

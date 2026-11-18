@@ -9,6 +9,7 @@
 #include <memory>
 #include <span>
 #include <tsl/robin_map.h>
+#include "video_core/renderer_vulkan/vr_depth_rescale.h"
 #include "video_core/renderer_vulkan/vr_scene_proxy.h"
 #include "video_core/renderer_vulkan/vr_temporal_failure.h"
 #include "video_core/renderer_vulkan/vr_temporal_scene.h"
@@ -49,6 +50,9 @@ struct VrTemporalCapture {
     uint32_t width{}, height{}, input_width{}, input_height{}, draws{}, motion_draws{}, refused{}, reduced_draws{};
     std::vector<std::pair<VideoCore::ImageId,uint64_t>> proxies;
     uint32_t index_syncs{}, index_writes{}, incomplete_frames{};
+    // The last frame's BufferCache::ReadForMotion answers: snapshots, waiting, copies, replaced,
+    // no room, full.
+    std::array<uint32_t, 6> last_reads{};
     uint32_t motion_characters{}, motion_player{}, motion_camera_only{};
     bool object_candidate{}, gbuffer{}, active{}, resolved{}, reconstructed{}, faulted{};
     std::chrono::steady_clock::time_point last_resolve{};
@@ -63,6 +67,7 @@ struct VrTemporalCapture {
         bool valid{};   // this frame's `color` holds the reconstruction
         uint32_t width{}, height{}; // output
         VideoCore::UniqueImage color, depth;
+        std::array<vk::UniqueImageView, 2> depth_targets; // per layer, for VrDepthRescale::Draw
         // DLSS 5 only: the provider's linear eyes are blitted into this sRGB twin of X's format
         // (the blit encodes), then copied bit for bit into `color` (S1Encode).
         VideoCore::UniqueImage encode;
@@ -71,7 +76,7 @@ struct VrTemporalCapture {
         std::array<vk::UniqueImageView, 2> srgb; // per layer, the in-frame items' targets
         VideoCore::ImageId x_id{};
         uint64_t x_uid{};
-        bool depth_blit{true}; // the scene depth's format can be blitted (else no items)
+        bool depth_blit{true}; // the scene depth can be scaled (S1ScaleDepth; else no items)
         uint64_t frames{}, reconstructed{}, failed{}, missed{}, inframe{}, ui_scene{};
         // FAST_GPU_S1_ASYM (vr_temporal_failure.h): the soft latch's retry, and its counters
         // (latches, retries started, retries that reconstructed, frames waited idle;
@@ -87,9 +92,10 @@ struct VrTemporalCapture {
         double verify_same{}, verify_cross{};
         // FAST bit 59 (S1HudOutput, vk_rasterizer_vr.cpp VrUiArm): the HUD's K/W at the output
         // size; the UI passes' depth/stencil is this output-size twin of the game's, refreshed
-        // by nearest blits when the game may have written it (S1UiDepth).
+        // by nearest scaling (S1ScaleDepth) when the game may have written it (S1UiDepth).
         VideoCore::UniqueImage ui_ds;
         vk::UniqueImageView ui_ds_view;
+        std::vector<vk::UniqueImageView> ui_ds_targets; // per layer, for VrDepthRescale::Draw
         vk::Image ui_ds_source{}; // the image whose contents the twin last copied
         vk::ImageAspectFlags ui_ds_valid_aspects{};
         vk::Format ui_ds_format{};
@@ -97,13 +103,31 @@ struct VrTemporalCapture {
         uint32_t ui_ds_layers{};
         bool ui_ds_dirty{true};
         bool ui_ds_failed{};
-        uint64_t hud_frames{}, hud_syncs{}, hud_draws{};
+        bool ui_ds_prepared{}; // this draw's twin is ready (S1UiDepth with copy, VrUiDepthBefore)
+        uint64_t hud_frames{}, hud_syncs{}, hud_draws{}, hud_masks{};
     } s1;
+    // `copy`: before the draw's binds (VrUiDepthBefore), the twin is made ready, copying when the
+    // game may have written its image. Without: inside the shadow draw, nothing is recorded; the
+    // twin that preparation made ready, or null.
     vk::ImageView S1UiDepth(VideoCore::Image& ds, vk::ImageAspectFlags tested_aspects,
-                            bool shared_view_only);
+                            bool shared_view_only, bool copy);
     bool S1Color(const VideoCore::Image& x);
     bool S1Depth(const VideoCore::Image& depth);
     bool S1SrgbViews(vk::Format srgb);
+    // Layer `layer` of `depth` as a depth/stencil attachment, every aspect of its format (the
+    // in-frame items draw straight into it); made on first use and kept in depth_targets, the
+    // views VrDepthRescale::Draw writes through. Null: the view could not be made.
+    vk::ImageView S1DepthTarget(uint32_t layer);
+    // `aspects` of layers [0, layers) nearest-scaled from src into dst, outside a render pass, in
+    // the layouts `mode` needs (VrDepthRescale::Choose): a blit, or where the card cannot blit
+    // the format (AMD) VrDepthRescale's draw or buffer copy. `targets`: dst's per-layer views
+    // for a draw (kept and destroyed with dst); `keep`: dst's aspects a draw must keep (the
+    // others not drawn are left undefined). False: nothing recorded.
+    bool S1ScaleDepth(const RecorderProxy& cmd, VrDepthRescale::Mode mode, VideoCore::Image& src,
+                      vk::Extent2D src_size, vk::Image dst, vk::Extent2D dst_size,
+                      uint32_t layers, vk::Format format, vk::ImageAspectFlags aspects,
+                      std::span<vk::UniqueImageView> targets, vk::ImageAspectFlags keep);
+    std::unique_ptr<VrDepthRescale> depth_rescale; // made at the first unblittable copy
     bool S1Encode(vk::Format srgb);
     void S1ColorTo(vk::ImageLayout layout, vk::PipelineStageFlags2 stage, vk::AccessFlags2 access);
     void S1Verify(const VideoCore::Image& x, uint64_t frame);

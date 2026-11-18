@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include "video_core/renderer_vulkan/vr_dlss_focus.h"
 #include "video_core/renderer_vulkan/vr_dlss_session.h"
 #include "video_core/renderer_vulkan/vr_fsr4_session.h"
 
@@ -16,7 +17,7 @@ namespace Vulkan {
 // sleeps, GPU waits or allocations in the steady-state path. Image ownership is external.
 class VrTemporalPair {
 public:
-    enum class Result { Disabled, Invalid, Unavailable, Pending, Ready, Failed };
+    enum class Result { Disabled, Invalid, Unavailable, Pending, Ready, Failed, FocusFailed };
     struct Size {
         uint32_t input_width{}, input_height{}, output_width{}, output_height{};
         bool operator==(const Size&) const = default;
@@ -48,6 +49,10 @@ public:
         // DLSS model (vr_dlss_preset.h, FAST bit 52); 0 = the bridge's own. DLSS only.
         uint32_t dlss_preset{};
         uint32_t views{2}; // 1: DIBR center; 2: native stereo. Part of the resource key.
+        // Foveated upscaling (vr_dlss_focus.h; DLSS or FSR, both eyes or none): each eye's
+        // feature or context is its rectangle's size, fed the rectangle cut out of the eye
+        // (VrTemporalScene). Zero: the whole eye.
+        std::array<DlssFocus::Rect, 2> focus{};
         bool operator==(const Plan&) const = default;
     };
     struct Device { VkDevice logical{}; VkPhysicalDevice physical{}; };
@@ -97,10 +102,14 @@ public:
             fsr_spd_state = 0;
             dlss_twin_state = 0;
             dlss_twin_current = false;
+            focus = false;
             if (key.provider == VR::Graphics::Upscaler::Off) return Result::Disabled;
-            if (!Valid(plan) || (plan.views == 1 &&
-                (accepted.upscaler != VR::Graphics::Upscaler::Dlss || accepted.dlss5 || plan.provider_flags)) ||
-                uint32_t(key.profile) > 2 || !device.logical || !device.physical ||
+            // One view (the DIBR centre): plain DLSS or FSR with FSR's performance options,
+            // without DLSS 5's chain or the diagnostic twins (they assume a left/right pair).
+            if (!Valid(plan) || (plan.views == 1 && (accepted.upscaler == VR::Graphics::Upscaler::Off ||
+                (accepted.upscaler == VR::Graphics::Upscaler::Dlss && accepted.dlss5) ||
+                (plan.provider_flags & ~uint32_t(Fsr4OptimizedPost | Fsr4FencedSpd)))) ||
+                uint32_t(key.profile) >= uint32_t(VR::Graphics::ProfileCount) || !device.logical || !device.physical ||
                 !command || ticket <= completed) {
                 failed = true;
                 return Result::Invalid;
@@ -109,19 +118,26 @@ public:
                 dlss = activate_dlss();
                 if (!dlss) { failed = true; return Result::Unavailable; }
                 dlss->Completed(completed_tick);
+                // Foveated upscaling: both eyes or neither. Each eye's feature is its rectangle's
+                // size, and the owner hands it that rectangle cut out into images of its own
+                // (origin at the corner, as any whole eye): both eyes take the same path.
+                focus = plan.focus[0].On() && plan.focus[1].On() && plan.views == 2;
                 const auto feature = [&](unsigned eye) {
                     const auto& s = plan.eyes[eye];
                     // Native input/output is DLAA. Reduced input uses the selected SR profile.
                     const int quality = s.input_width == s.output_width &&
                                                 s.input_height == s.output_height
-                                            ? 0 : 3 - int(key.profile);
+                                            ? 0 : VR::Graphics::DlssQuality(key.profile);
+                    if (const auto& f = plan.focus[eye]; focus)
+                        return BbDlssFeature{f.in_w, f.in_h, f.out_w, f.out_h, quality,
+                                             int(plan.inverted), 0, 1};
                     return BbDlssFeature{s.input_width, s.input_height, s.output_width,
                                          s.output_height, quality, int(plan.inverted), 0, 1};
                 };
                 for (unsigned eye = 0; eye < plan.views; ++eye) {
                     if (dlss->Create(eye, command, feature(eye), ticket) != VrDlssSession::Result::Ready) {
                         failed = true;
-                        return Result::Failed;
+                        return focus ? Result::FocusFailed : Result::Failed;
                     }
                 }
                 // Diagnostic only: a bridge without a third view refuses the twin and the pair
@@ -144,19 +160,24 @@ public:
                                        (fence ? VR_FSR4_FLAG_FENCED_SPD : 0u);
                 fsr_post_state = post ? 1u : requested ? 2u : 0u;
                 fsr_spd_state = fence ? 2u : fence_requested ? 3u : 1u;
+                // Foveated upscaling, as DLSS's above: each eye's context its rectangle's size.
+                focus = plan.focus[0].On() && plan.focus[1].On() && plan.views == 2;
                 const auto describe = [&](unsigned eye, uint32_t desc_flags) {
                     const auto& s = plan.eyes[eye];
                     const bool native = s.input_width == s.output_width &&
                                         s.input_height == s.output_height;
-                    return VrFsr4Desc{s.output_width, s.output_height,
-                                      native ? 3u : uint32_t(key.profile), uint32_t(plan.inverted),
+                    const auto& f = plan.focus[eye];
+                    return VrFsr4Desc{focus ? f.out_w : s.output_width,
+                                      focus ? f.out_h : s.output_height,
+                                      native ? 3u : VR::Graphics::FsrProfile(key.profile), uint32_t(plan.inverted),
                                       desc_flags};
                 };
-                for (unsigned eye = 0; eye < 2; ++eye) {
+                fsr->SetViews(plan.views);
+                for (unsigned eye = 0; eye < plan.views; ++eye) {
                     if (fsr->Create(eye, device.logical, device.physical, activated.assets,
                                     describe(eye, flags)) != VrFsr4Session::Result::Ready) {
                         failed = true;
-                        return Result::Failed;
+                        return focus ? Result::FocusFailed : Result::Failed;
                     }
                 }
                 // Diagnostic only: a failed twin leaves the pair usable, without verification.
@@ -170,6 +191,17 @@ public:
                 else if ((post || same) && (plan.provider_flags & Fsr4VerifyTwin))
                     fsr->CreateTwin(device.logical, device.physical, activated.assets,
                                     describe(0, twin_flags));
+                const std::array<std::array<uint32_t, 2>, 2> input =
+                    focus ? std::array<std::array<uint32_t, 2>, 2>{{
+                                {plan.focus[0].in_w, plan.focus[0].in_h},
+                                {plan.focus[1].in_w, plan.focus[1].in_h}}}
+                          : std::array<std::array<uint32_t, 2>, 2>{{
+                                {plan.eyes[0].input_width, plan.eyes[0].input_height},
+                                {plan.eyes[1].input_width, plan.eyes[1].input_height}}};
+                if (fsr->Prepare(input) != VrFsr4Session::Result::Ready) {
+                    failed = true;
+                    return focus ? Result::FocusFailed : Result::Failed;
+                }
             } else { failed = true; return Result::Invalid; }
         }
         if (key.provider == VR::Graphics::Upscaler::Off) return Result::Disabled;
@@ -195,7 +227,7 @@ public:
         last_frame = frame_id;
         seen_frame = true;
         reset = true;
-        if (fsr && frame.fsr4_pair && fsr->SupportsPair()) {
+        if (fsr && frame.fsr4_pair && key.plan.views == 2 && fsr->SupportsPair()) {
             // FAST bit 45: the same two eye frames as the loop below, recorded by the bridge in
             // lockstep; the twin follows the left eye whenever it recorded, as in the loop.
             const auto image = [](const BbDlssImage& i) {
@@ -290,6 +322,9 @@ public:
     // in step with its eye (its output is then comparable).
     uint32_t DlssTwinState() const { return dlss_twin_state; }
     bool DlssTwinCurrent() const { return dlss && dlss_twin_current; }
+    // Foveated upscaling (Plan::focus): the eyes' features or contexts are their rectangles'
+    // size, so each frame's eyes are the rectangles' cut-outs. False with the whole eyes.
+    bool FocusOn() const { return (dlss || fsr) && focus; }
     void RefreshCompletion(uint64_t completed) { Complete(completed); }
     uint64_t ReuseTicket() const { return fsr ? fsr->ReuseTicket() : 0; }
     void ResetHistory() { reset = true; }
@@ -342,7 +377,9 @@ private:
         if (frame.direct_inputs && (!dlss || key.neural)) return false;
         for (unsigned eye = 0; eye < key.plan.views; ++eye) {
             const auto& f = frame.eyes[eye];
-            const auto& size = key.plan.eyes[eye];
+            // Foveated upscaling: the eye's inputs and output are its rectangle's cut-outs.
+            const auto& r = key.plan.focus[eye];
+            const Size size = focus ? Size{r.in_w, r.in_h, r.out_w, r.out_h} : key.plan.eyes[eye];
             // A direct input is this eye's array layer of the scene, in a format whose values
             // the canonical copy kept exactly: RGBA16F colour, D32 depth aspect; or, for an input
             // FAST_DLSS_DIRECT_LAYER_COPY keeps copied (the right eye's depth by default), its
@@ -354,19 +391,37 @@ private:
                        i.range.levelCount == 1 && i.range.baseArrayLayer == eye &&
                        i.range.layerCount == 1;
             };
+            // Plain DLSS also reads 8-bit UNORM colour (S1's composite) and writes an RGBA8 output
+            // (VrTemporalImages::OutputFormat): NGX takes any format it can view.
+            const bool eight_bit = dlss && !key.neural;
+            const bool color_format = f.color.format == VK_FORMAT_R16G16B16A16_SFLOAT ||
+                                      (eight_bit && (f.color.format == VK_FORMAT_R8G8B8A8_UNORM ||
+                                                     f.color.format == VK_FORMAT_B8G8R8A8_UNORM));
+            const bool output_ok =
+                valid(f.output, VK_FORMAT_R16G16B16A16_SFLOAT, size.output_width, size.output_height) ||
+                (eight_bit &&
+                 valid(f.output, VK_FORMAT_R8G8B8A8_UNORM, size.output_width, size.output_height));
+            // Ordinary DLSS may also read an exact UNORM canonical colour copy. Keep all
+            // layer/aspect/extent checks, and keep neural/FSR/verification inputs on RGBA16F.
+            const bool canonical_eight_bit = eight_bit &&
+                !(key.plan.provider_flags & (DlssVerifyTwin | Fsr4VerifyTwin | Fsr4VerifyInterleave));
+            const bool canonical_color =
+                valid(f.color, VK_FORMAT_R16G16B16A16_SFLOAT, size.input_width, size.input_height) ||
+                (canonical_eight_bit &&
+                 valid(f.color, VK_FORMAT_R8G8B8A8_UNORM, size.input_width, size.input_height));
             const bool inputs = frame.direct_inputs
                 ? ((layer(f.color, VK_IMAGE_ASPECT_COLOR_BIT, size.input_width, size.input_height) &&
-                    f.color.format == VK_FORMAT_R16G16B16A16_SFLOAT) ||
-                   valid(f.color, VK_FORMAT_R16G16B16A16_SFLOAT, size.input_width, size.input_height)) &&
+                    color_format) ||
+                   canonical_color) &&
                   ((layer(f.depth, VK_IMAGE_ASPECT_DEPTH_BIT, size.input_width, size.input_height) &&
                     (f.depth.format == VK_FORMAT_D32_SFLOAT ||
                      f.depth.format == VK_FORMAT_D32_SFLOAT_S8_UINT)) ||
                    valid(f.depth, VK_FORMAT_R32_SFLOAT, size.input_width, size.input_height))
-                : valid(f.color, VK_FORMAT_R16G16B16A16_SFLOAT, size.input_width, size.input_height) &&
+                : canonical_color &&
                       valid(f.depth, VK_FORMAT_R32_SFLOAT, size.input_width, size.input_height);
             if (!inputs ||
                 !valid(f.motion, VK_FORMAT_R16G16_SFLOAT, size.input_width, size.input_height) ||
-                !valid(f.output, VK_FORMAT_R16G16B16A16_SFLOAT, size.output_width, size.output_height) ||
+                !output_ok ||
                 !std::isfinite(f.jitter_x) || !std::isfinite(f.jitter_y) ||
                 !std::isfinite(f.frame_ms) || f.frame_ms <= 0 ||
                 !std::isfinite(f.sharpness) || f.sharpness < 0 || f.sharpness > 1) return false;
@@ -437,5 +492,6 @@ private:
     VrFsr4PairResult fsr_pair{};
     bool fsr_pair_used{};
     bool configured{}, ready{}, failed{}, reset{true}, seen_frame{}, dlss_twin_current{};
+    bool focus{}; // FocusOn
 };
 } // namespace Vulkan

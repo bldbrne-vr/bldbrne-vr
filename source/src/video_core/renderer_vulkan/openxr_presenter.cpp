@@ -1,4 +1,5 @@
 #include "common/render_diagnostic.h"
+#include "video_core/vram_report.h"
 // SPDX-FileCopyrightText: 2026 BB-VR contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
@@ -10,6 +11,7 @@
 #include "core/vr/graphics_settings.h"
 #include "core/vr/eye_distance.h"
 #include "core/vr/eye_history.h"
+#include "core/vr/free_camera.h"
 #include "video_core/renderer_vulkan/openxr_presenter.h"
 
 #include <algorithm>
@@ -37,20 +39,29 @@
 #include <SDL3/SDL_stdinc.h>
 #include <vk_mem_alloc.h>
 #include "common/logging/log.h"
+#include "common/scm_rev.h"
+#include "core/vr/amygdalan_hook.h"
 #include "common/slow_scope.h"
 #include "common/sync_log.h"
 #include "common/singleton.h"
+#include "common/scope_exit.h"
 #include "common/rdtsc.h"
 #include "common/thread.h"
 #include "core/libraries/pad/pad.h"
 #include "core/vr/bb_weapons.h"
 #include "core/vr/belt_vial.h"
+#include "core/emulator_settings.h"
 #include "core/vr/bloodborne_facing.h"
+#include "core/vr/bloodborne_frame_rate.h"
 #include "core/vr/bloodborne_heal.h"
 #include "core/vr/bloodborne_iframes.h"
 #include "core/vr/bloodborne_motion.h"
+#include "core/vr/bloodborne_quickitems.h"
+#include "core/vr/monocular.h"
+#include "core/vr/monocular_audio.h"
 #include "core/vr/bloodborne_tuning.h"
 #include "core/vr/body_channel.h"
+#include "core/vr/controls_view.h"
 #include "core/vr/weapon_hand_filter.h"
 #include "core/vr/weapon_handling.h"
 #include "core/vr/body_feedback.h"
@@ -59,14 +70,20 @@
 #include "core/vr/combat_channel.h"
 #include "core/vr/daze.h"
 #include "core/vr/exit_sequence.h"
+#include "core/vr/eye_cant.h"
 #include "core/vr/eye_fov_cache.h"
 #include "core/vr/feature_cost.h"
+#include "core/vr/furnace_audio.h"
 #include "core/vr/grip_adjust.h"
 #include "core/vr/gun_aim.h"
 #include "core/vr/gun_settings.h"
 #include "core/vr/gun_reload.h"
 #include "core/vr/gun_reload_audio.h"
+#include "core/vr/hand_rig.h"
+#include "core/vr/bloodborne_corpse.h"
+#include "core/vr/bloodborne_wheelchair.h"
 #include "core/vr/haptic_output.h"
+#include "core/vr/object_break_haptics.h"
 #include "core/vr/held_item.h"
 #include "core/vr/hit_direction.h"
 #include "core/vr/hit_stun.h"
@@ -78,8 +95,18 @@
 #include "core/vr/live_tune.h"
 #include "core/vr/grip_preview.h"
 #include "core/vr/melee_settings.h"
+#include "core/vr/charge_audio.h"
+#include "core/vr/thunder_audio.h"
+#include "core/vr/tonitrus_charge.h"
+#include "core/vr/dual_blades.h"
+#include "core/vr/bowblade_moves.h"
+#include "core/vr/sever_feel.h"
 #include "core/vr/melee_window.h"
 #include "core/vr/music_box.h"
+#include "core/vr/blood_draw_channel.h"
+#include "core/vr/status_corners.h"
+#include "core/vr/pad_menu.h"
+#include "core/vr/page_pad.h"
 #include "core/vr/player_body.h"
 #include "core/vr/pose_channel.h"
 #include "core/vr/pose_gestures.h"
@@ -88,7 +115,11 @@
 #include "core/vr/summon_bell.h"
 #include "core/vr/quick_settings.h"
 #include "core/vr/quick_use_audio.h"
+#include "core/vr/respec_feel.h"
+#include "core/vr/tool_empty_audio.h"
 #include "core/vr/bell_audio.h"
+#include "core/vr/game_sounds.h"
+#include "core/vr/whistle_audio.h"
 #include "core/vr/render_steady.h"
 #include "core/vr/render_tilt.h"
 #include "core/vr/roll_chord.h"
@@ -113,16 +144,20 @@
 #include "core/vr/ui_conditions.h"
 #include "core/vr/ui_layout.h"
 #include "core/vr/ui_rest_curve.h"
+#include "core/vr/ui_slots.h"
 #include "core/vr/bloodborne_enemy_bars.h"
 #include "core/vr/vial_drain.h"
 #include "core/vr/vial_zones.h"
+#include "core/vr/riposte_style.h"
 #include "core/vr/visceral_channel.h"
 #include "core/vr/visceral_thrust.h"
 #include "core/vr/visceral_pull.h"
 #include "core/vr/bow.h"
 #include "core/vr/bow_channel.h"
 #include "core/vr/bow_pose.h"
+#include "core/vr/stake_driver.h"
 #include "core/vr/trick_weapons.h"
+#include "core/vr/wheel_rev.h"
 #include "core/vr/sparks.h"
 #include "core/vr/weapon_wall.h"
 #include "core/vr/vital_color.h"
@@ -133,7 +168,9 @@
 #include "core/vr/vr_page_runtime.h"
 #include "core/vr/menu_exit_input.h"
 #include "core/vr/lamp_channel.h"
+#include "core/vr/soft_save_channel.h"
 #include "core/vr/whip_moves.h"
+#include "core/vr/windup_weapon.h"
 #include "core/vr/whip_settings.h"
 #include "core/vr/whip_spin.h"
 #include "core/vr/xr_bindings.h"
@@ -146,6 +183,7 @@
 #include "video_core/renderer_vulkan/vr_device_lost.h"
 #include "video_core/renderer_vulkan/vr_eye_scale.h"
 #include "video_core/renderer_vulkan/vr_eye_upscale.h"
+#include "video_core/renderer_vulkan/vr_eye_cant.h"
 #include "video_core/renderer_vulkan/vr_late_warp.h"
 #include "video_core/renderer_vulkan/vr_overlay.h"
 #include "video_core/renderer_vulkan/vr_ui_compose.h"
@@ -251,6 +289,7 @@ struct OpenXRRuntime {
     std::vector<std::string> device_extensions;
     bool initialization_attempted{false};
     bool available{false};
+    std::chrono::steady_clock::time_point boot_missing_since{};
     bool has_touch_plus{false};
     bool has_frame_controller{false};
     // Other controllers' profiles (core/vr/xr_bindings.h), each enabled when offered:
@@ -261,6 +300,9 @@ struct OpenXRRuntime {
     bool has_color_scale{false};  // XR_KHR_composition_layer_color_scale_bias enabled
     bool has_cylinder{false};     // XR_KHR_composition_layer_cylinder enabled (menu panel)
     bool has_depth{false};        // XR_KHR_composition_layer_depth enabled (DIBR eye depth)
+    // XR_KHR_visibility_mask enabled: what each eye's lens shows (the status looks zoomed into
+    // it; OpenXRPresenter QueryVisibleAreas).
+    bool has_visibility_mask{false};
     // XR_KHR_win32_convert_performance_counter_time enabled: XrTime against the steady clock
     // (OpenXRPresenter MeasureXrClock).
     bool has_qpc_time{false};
@@ -275,53 +317,51 @@ struct OpenXRRuntime {
     }
 
     template <typename Function>
-    bool LoadFunction(const char* name, Function& function) {
+    XrResult LoadFunction(const char* name, Function& function) {
         PFN_xrVoidFunction raw_function{};
         const XrResult result = xrGetInstanceProcAddr(instance, name, &raw_function);
         if (XR_FAILED(result) || raw_function == nullptr) {
             LOG_ERROR(Render_Vulkan, "OpenXR failed to load {} ({})", name,
                       static_cast<s32>(result));
-            return false;
+            return XR_FAILED(result) ? result : XR_ERROR_FUNCTION_UNSUPPORTED;
         }
         function = reinterpret_cast<Function>(raw_function);
-        return true;
+        return XR_SUCCESS;
     }
 
     template <typename Query>
-    std::vector<std::string> QueryExtensions(Query query, std::string_view kind) {
-        u32 size = 0;
-        XrResult result = query(instance, system_id, 0, &size, nullptr);
-        if (XR_FAILED(result) || size == 0) {
-            LOG_ERROR(Render_Vulkan, "OpenXR failed to query Vulkan {} extensions ({})", kind,
-                      static_cast<s32>(result));
-            return {};
+    XrResult QueryExtensions(Query query, std::string_view kind, std::vector<std::string>& out) {
+        out.clear();
+        std::vector<char> buffer;
+        XrResult result = XR_SUCCESS;
+        // The runtime can grow its list between the count and fill calls while starting.
+        for (unsigned attempt = 0; attempt < 3; ++attempt) {
+            u32 size = 0;
+            result = query(instance, system_id, 0, &size, nullptr);
+            if (XR_FAILED(result)) break;
+            if (size == 0) return XR_SUCCESS;
+            buffer.resize(size);
+            u32 written = 0;
+            result = query(instance, system_id, size, &written, buffer.data());
+            if (result == XR_ERROR_SIZE_INSUFFICIENT) continue;
+            if (XR_FAILED(result)) break;
+            if (written == 0) return XR_SUCCESS;
+            if (written > size || buffer[written - 1] != '\0') return XR_ERROR_RUNTIME_FAILURE;
+            out = SplitExtensions(buffer);
+            return XR_SUCCESS;
         }
-
-        std::vector<char> buffer(size);
-        result = query(instance, system_id, size, &size, buffer.data());
-        if (XR_FAILED(result)) {
-            LOG_ERROR(Render_Vulkan, "OpenXR failed to read Vulkan {} extensions ({})", kind,
-                      static_cast<s32>(result));
-            return {};
-        }
-        return SplitExtensions(buffer);
+        LOG_ERROR(Render_Vulkan, "OpenXR failed to enumerate Vulkan {} extensions ({})", kind,
+                  static_cast<s32>(result));
+        return result;
     }
 
-    bool Initialize() {
-        if (!g_openxr_requested.load(std::memory_order_relaxed)) {
-            return false;
-        }
-        if (initialization_attempted) {
-            return available;
-        }
-        initialization_attempted = true;
-
+    XrResult CreateInstance() {
         u32 extension_count = 0;
         XrResult result =
             xrEnumerateInstanceExtensionProperties(nullptr, 0, &extension_count, nullptr);
         if (XR_FAILED(result)) {
             LOG_ERROR(Render_Vulkan, "OpenXR loader is unavailable ({})", static_cast<s32>(result));
-            return false;
+            return result;
         }
 
         std::vector<XrExtensionProperties> properties(extension_count);
@@ -333,7 +373,7 @@ struct OpenXRRuntime {
         if (XR_FAILED(result)) {
             LOG_ERROR(Render_Vulkan, "OpenXR failed to enumerate instance extensions ({})",
                       static_cast<s32>(result));
-            return false;
+            return result;
         }
 
         const bool supports_vulkan =
@@ -344,7 +384,7 @@ struct OpenXRRuntime {
         if (!supports_vulkan) {
             LOG_ERROR(Render_Vulkan,
                       "The active OpenXR runtime does not support XR_KHR_vulkan_enable");
-            return false;
+            return XR_ERROR_EXTENSION_NOT_PRESENT;
         }
 
         const auto has_extension = [&properties](std::string_view name) {
@@ -405,6 +445,12 @@ struct OpenXRRuntime {
         if (has_depth) {
             enabled_extensions.push_back(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
         }
+        // What each eye's lens shows: the status looks are zoomed into it (status_corners.h
+        // StatusCornerZoomed); without it a Quest 3's, estimated.
+        has_visibility_mask = has_extension(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME);
+        if (has_visibility_mask) {
+            enabled_extensions.push_back(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME);
+        }
 #ifdef _WIN32
         // The runtime's time for a QPC value: whether XrTime is the steady clock (MeasureXrClock).
         has_qpc_time = has_extension("XR_KHR_win32_convert_performance_counter_time");
@@ -413,7 +459,7 @@ struct OpenXRRuntime {
         }
 #endif
         XrInstanceCreateInfo create_info{XR_TYPE_INSTANCE_CREATE_INFO};
-        std::strncpy(create_info.applicationInfo.applicationName, "shadPS4 Bloodborne VR",
+        std::strncpy(create_info.applicationInfo.applicationName, Common::g_application_name,
                      XR_MAX_APPLICATION_NAME_SIZE - 1);
         std::strncpy(create_info.applicationInfo.engineName, "shadPS4",
                      XR_MAX_ENGINE_NAME_SIZE - 1);
@@ -423,38 +469,60 @@ struct OpenXRRuntime {
         create_info.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
         create_info.enabledExtensionNames = enabled_extensions.data();
 
-        result = xrCreateInstance(&create_info, &instance);
+        XrInstance created{XR_NULL_HANDLE};
+        result = xrCreateInstance(&create_info, &created);
         if (result == XR_ERROR_API_VERSION_UNSUPPORTED) {
             // A runtime that only implements OpenXR 1.0 (nothing here needs 1.1): ask for that.
             LOG_INFO(Render_Vulkan, "OpenXR: the runtime does not support OpenXR 1.1; using 1.0");
             create_info.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-            result = xrCreateInstance(&create_info, &instance);
+            result = xrCreateInstance(&create_info, &created);
         }
         if (XR_FAILED(result)) {
             LOG_ERROR(Render_Vulkan, "OpenXR failed to create an instance ({})",
                       static_cast<s32>(result));
-            return false;
+            return result;
         }
+        instance = created;
         if (XrInstanceProperties properties{XR_TYPE_INSTANCE_PROPERTIES};
             XR_SUCCEEDED(xrGetInstanceProperties(instance, &properties))) {
             runtime_name.assign(properties.runtimeName,
                                 strnlen(properties.runtimeName, XR_MAX_RUNTIME_NAME_SIZE));
         }
 
+        return XR_SUCCESS;
+    }
+
+    bool Initialize() {
+        if (!g_openxr_requested.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        if (initialization_attempted) {
+            return available;
+        }
+        initialization_attempted = true;
+
+        if (instance == XR_NULL_HANDLE && XR_FAILED(CreateInstance())) {
+            return false;
+        }
         XrSystemGetInfo system_info{XR_TYPE_SYSTEM_GET_INFO};
         system_info.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
-        result = xrGetSystem(instance, &system_info, &system_id);
+        const XrResult result = xrGetSystem(instance, &system_info, &system_id);
         if (XR_FAILED(result)) {
             LOG_ERROR(Render_Vulkan, "OpenXR could not find a connected HMD ({})",
                       static_cast<s32>(result));
             return false;
         }
 
-        if (!LoadFunction("xrGetVulkanInstanceExtensionsKHR", get_instance_extensions) ||
-            !LoadFunction("xrGetVulkanDeviceExtensionsKHR", get_device_extensions) ||
-            !LoadFunction("xrGetVulkanGraphicsDeviceKHR", get_graphics_device) ||
-            !LoadFunction("xrGetVulkanGraphicsRequirementsKHR", get_graphics_requirements)) {
-            return false;
+        return XR_SUCCEEDED(FinishInitialization(false));
+    }
+
+    XrResult FinishInitialization(bool require_extension_queries) {
+        XrResult result;
+        if (XR_FAILED(result = LoadFunction("xrGetVulkanInstanceExtensionsKHR", get_instance_extensions)) ||
+            XR_FAILED(result = LoadFunction("xrGetVulkanDeviceExtensionsKHR", get_device_extensions)) ||
+            XR_FAILED(result = LoadFunction("xrGetVulkanGraphicsDeviceKHR", get_graphics_device)) ||
+            XR_FAILED(result = LoadFunction("xrGetVulkanGraphicsRequirementsKHR", get_graphics_requirements))) {
+            return result;
         }
 
         XrGraphicsRequirementsVulkanKHR requirements{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
@@ -462,7 +530,7 @@ struct OpenXRRuntime {
         if (XR_FAILED(result)) {
             LOG_ERROR(Render_Vulkan, "OpenXR failed to query Vulkan requirements ({})",
                       static_cast<s32>(result));
-            return false;
+            return result;
         }
 
         const XrVersion target_version =
@@ -477,7 +545,7 @@ struct OpenXRRuntime {
                       VK_API_VERSION_MAJOR(TargetVulkanApiVersion),
                       VK_API_VERSION_MINOR(TargetVulkanApiVersion),
                       VK_API_VERSION_PATCH(TargetVulkanApiVersion));
-            return false;
+            return XR_ERROR_GRAPHICS_DEVICE_INVALID;
         }
         if (target_version > requirements.maxApiVersionSupported) {
             LOG_INFO(Render_Vulkan,
@@ -488,11 +556,20 @@ struct OpenXRRuntime {
                      VK_API_VERSION_MINOR(TargetVulkanApiVersion));
         }
 
-        instance_extensions = QueryExtensions(get_instance_extensions, "instance");
-        device_extensions = QueryExtensions(get_device_extensions, "device");
+        // At ordinary renderer startup an unavailable extension list has always meant empty.
+        // During Link startup a lost instance here must go back through headset discovery.
+        result = QueryExtensions(get_instance_extensions, "instance", instance_extensions);
+        if (XR_FAILED(result) && require_extension_queries) {
+            return result;
+        }
+        result = QueryExtensions(get_device_extensions, "device", device_extensions);
+        if (XR_FAILED(result) && require_extension_queries) {
+            return result;
+        }
+        initialization_attempted = true;
         available = true;
         LOG_INFO(Render_Vulkan, "OpenXR runtime initialized");
-        return true;
+        return XR_SUCCESS;
     }
 
     void Disable(std::string_view reason) {
@@ -808,10 +885,12 @@ public:
     // One deliberate gesture = one press that lasts long enough for the game to sample it
     // (the game reads the pad once per frame). A press requested while the button is down
     // first releases it so the game sees a new edge. Returns false when dropped.
-    bool Press(PadButton button) {
+    // `deliberate`: a press the player made on purpose on its own (the gamepad's Options tap) goes
+    // through a context switch's suppression, which is for VR controls held through the switch.
+    bool Press(PadButton button, bool deliberate = false) {
         const int bit = std::countr_zero(static_cast<u32>(button));
         auto& pulse = pulses[bit];
-        if (suppress_left > 0.0f || pulse.queued) {
+        if ((suppress_left > 0.0f && !deliberate) || pulse.queued) {
             return false;
         }
         if (pulse.left > 0.0f || (last_mask & (1u << bit)) != 0) {
@@ -904,17 +983,21 @@ public:
         if (pad_log) {
             LogPad(mask, axes);
         }
+        // Our own layer of the pad (Input::GameController::InjectButton): a gamepad held through
+        // our press or stick shows again when we let go.
         const u32 changed = mask ^ last_mask;
         for (int bit = 0; bit < 32; ++bit) {
             if (changed & (1u << bit)) {
-                controller->Button(static_cast<PadButton>(1u << bit), (mask & (1u << bit)) != 0);
+                controller->InjectButton(static_cast<PadButton>(1u << bit),
+                                         (mask & (1u << bit)) != 0);
             }
             released[bit] = (mask & (1u << bit)) != 0 ? 0.0f : std::min(released[bit] + dt, 10.0f);
         }
         last_mask = mask;
+        VR::PagePad::SetInjected(mask); // the page's gamepad gate keeps our own presses
         for (size_t i = 0; i < axes.size(); ++i) {
             if (axes[i] != last_axes[i]) {
-                controller->Axis(static_cast<Input::Axis>(i), axes[i], false);
+                controller->InjectAxis(static_cast<Input::Axis>(i), axes[i]);
                 last_axes[i] = axes[i];
             }
         }
@@ -992,10 +1075,12 @@ private:
     u8 last_connections{0xFF};
 };
 
-// Haptic patterns: a few linear segments of amplitude over time.
+// Haptic patterns: a few linear segments of amplitude over time, each with its frequency (Hz;
+// 0: VR::Haptics::DefaultHz picks it from the segment, a short one crisp, a strong long one deep).
 struct HapticPattern {
     struct Segment {
         float from, to, seconds;
+        float hz{0.0f};
     };
     std::array<Segment, 8> segments{};
     u32 count{0};
@@ -1007,10 +1092,21 @@ struct HapticPattern {
     // A landed hit (a melee impact, a visceral): while it plays (its guard included) only another
     // impact replaces it (VR::Haptics::Combat::Replaces).
     bool impact{false};
+    // A cut's bite (MeleeEventKind::SeverBite: its cut's serial; 0 anything else): its own tear
+    // continues it (HandHaptics::Continue) where any other pattern would have to replace it, after
+    // its full blow (blow_s: its crack and its impact's hold).
+    u32 sever{0};
+    float blow_s{0.0f};
+    float next_hz{0.0f}; // (Hz: the frequency of the segments added next)
 
+    // The segments added after it play at `hz` (0: their DefaultHz again).
+    HapticPattern& Hz(float hz) {
+        next_hz = hz;
+        return *this;
+    }
     HapticPattern& Ramp(float from, float to, float ms) {
         if (count < segments.size()) {
-            segments[count++] = {from, to, ms * 0.001f};
+            segments[count++] = {from, to, ms * 0.001f, next_hz};
         }
         return *this;
     }
@@ -1123,9 +1219,13 @@ constexpr float GripSwingSpeed = 1.5f; // m/s
 constexpr float GripAfterAttack = 0.4f;
 // weapon_wall: a strike's thud and a swing's own wall clank this close together are one feel.
 constexpr s64 WallThudMergeNs = 120'000'000;
+// The lit Boom Hammer: a squeeze this soon after it lit is no fire-out (mashing it alight
+// overshoots a squeeze or two; UpdateRightGrip).
+constexpr s64 BoomRelitGraceNs = 600'000'000;
 // melee=physical (UpdatePhysicalMelee): the blade's far end is this far along the blade from the
 // grip, and the game gets its fastest speed of the last MeleeTipWindowS (the damage by speed).
 constexpr float MeleeBladeM = 0.8f;
+constexpr float TipMaxMps = 60.0f; // no blade tip is faster (TipSpeed)
 // A plunge with the blade held down (UpdatePhysicalMelee): fallen this far, the blade this close to
 // straight down (cos of 45 degrees), the fist no lower than this below the eyes (held up to drive
 // it down: an arm hanging relaxed is no plunge).
@@ -1196,9 +1296,23 @@ struct HandHaptics {
         fresh = true;
     }
 
+    // The bite of cut `sever` still playing: true, and `next` (its tear) plays on from here in its
+    // place, whatever their priorities (one pattern at a time: never two summed). Else nothing.
+    bool Continue(u32 sever, const HapticPattern& next) {
+        if (!playing || sever == 0 || pattern.sever != sever) {
+            return false;
+        }
+        pattern = next;
+        time = 0.0f;
+        fresh = true;
+        return true;
+    }
+
     // The strongest level the pattern reaches over this frame (`dt` from now): a segment shorter
     // than a frame (an 8 ms crack, the second click of the double tick) is never stepped over.
-    float Sample(float dt) {
+    // `hz`: the frequency of the segment that gave it (its own, or DefaultHz).
+    float Sample(float dt, float& hz) {
+        hz = 0.0f;
         if (!playing) {
             return 0.0f;
         }
@@ -1214,8 +1328,15 @@ struct HandHaptics {
                 const auto at = [&segment](float t) {
                     return segment.from + (segment.to - segment.from) * (t / segment.seconds);
                 };
-                level = std::max({level, at(std::max(from - start, 0.0f)),
-                                  at(std::min(to - start, segment.seconds))});
+                const float here = std::max(at(std::max(from - start, 0.0f)),
+                                            at(std::min(to - start, segment.seconds)));
+                if (here > level || hz == 0.0f) {
+                    hz = segment.hz > 0.0f
+                             ? segment.hz
+                             : VR::Haptics::DefaultHz(std::max(segment.from, segment.to),
+                                                      segment.seconds);
+                }
+                level = std::max(level, here);
             }
             start = end;
         }
@@ -1292,6 +1413,10 @@ const char* SessionStateName(XrSessionState state) {
 struct EyeSource {
     u64 record{0};
     s64 tick_ns{0};       // camera update time
+    s32 monocular_eye{-1}; // DIBR optical crop belongs to this image, not the latest hand pose
+    float monocular_zoom{1.0f};
+    float monocular_strength{0.0f};
+    std::array<float, 2> monocular_shift{}; // the crop's stabilized slide (CameraRecord's)
     float base_yaw{0.0f}; // game heading of tracking-space forward
     u32 turn_serial{0};
     bool has_camera{false};
@@ -1324,6 +1449,44 @@ struct EyeContent {
     float near_m{0.0f};
     float far_m{0.0f};
 };
+
+// DIBR has one centre-eye scene, so the Monocular can only magnify pixels already reconstructed.
+// Cropping the touched eye's submitted image uses the runtime's image sampling and
+// leaves the free eye (and the game's separate UI layers) at their normal size.
+XrRect2Di MonocularImageRect(XrRect2Di rect, XrFovf fov, float zoom,
+                             std::array<float, 2> shift) {
+    if (!std::isfinite(zoom) || zoom <= 1.0f || rect.extent.width <= 0 ||
+        rect.extent.height <= 0) {
+        return rect;
+    }
+    zoom = std::clamp(zoom, 1.0f, VR::Monocular::MaxZoom);
+    const s32 width = std::max(1, static_cast<s32>(std::lround(rect.extent.width / zoom)));
+    const s32 height = std::max(1, static_cast<s32>(std::lround(rect.extent.height / zoom)));
+    // In an asymmetric eye FOV, straight ahead is not at the image centre. Keep the source
+    // pixel for the zero-angle ray under that same ray after the compositor expands the crop.
+    const float l = std::tan(fov.angleLeft), r = std::tan(fov.angleRight);
+    const float u = std::tan(fov.angleUp), d = std::tan(fov.angleDown);
+    const bool usable_x = std::isfinite(l + r) && r > l;
+    const bool usable_y = std::isfinite(u + d) && u > d;
+    const float x = usable_x ? -l / (r - l) : 0.5f;
+    const float y = usable_y ? u / (u - d) : 0.5f;
+    // The stabilized aim's slide (core/vr/monocular.h ZoomWindow: kept within the eye's image),
+    // in pixels; none for an unusable FOV.
+    float slide_x = 0.0f, slide_y = 0.0f;
+    if (usable_x && usable_y) {
+        const auto w = VR::Monocular::ZoomWindow({l, r, u, d}, zoom, shift);
+        slide_x = (w[0] - l / zoom) / (r - l) * static_cast<float>(rect.extent.width);
+        slide_y = -(w[2] - u / zoom) / (u - d) * static_cast<float>(rect.extent.height);
+        if (!std::isfinite(slide_x) || !std::isfinite(slide_y)) slide_x = slide_y = 0.0f;
+    }
+    const s32 room_x = rect.extent.width - width, room_y = rect.extent.height - height;
+    rect.offset.x += std::clamp(
+        static_cast<s32>(std::lround(room_x * std::clamp(x, 0.0f, 1.0f) + slide_x)), 0, room_x);
+    rect.offset.y += std::clamp(
+        static_cast<s32>(std::lround(room_y * std::clamp(y, 0.0f, 1.0f) + slide_y)), 0, room_y);
+    rect.extent = {width, height};
+    return rect;
+}
 
 } // Anonymous namespace
 
@@ -1430,6 +1593,8 @@ struct OpenXRPresenter::Impl {
         bool screen{false};
         bool dialogue{false};
         bool area_name{false};                       // UiFrame::area_name
+        bool slots{false};                           // UiFrame::slots
+        u32 slot_banner{0};                          // UiFrame::slot_banner
         u32 regions{0x1F};                           // UiFrame::regions
         bool keep{false};                            // an AER right eye's frame: the shown UI stays
         std::array<std::array<s32, 4>, 4> cut_box{}; // UiFrame::cut_box
@@ -1493,9 +1658,10 @@ struct OpenXRPresenter::Impl {
         XrAction grip_pose_right{XR_NULL_HANDLE};
         XrAction haptic_left{XR_NULL_HANDLE};
         XrAction haptic_right{XR_NULL_HANDLE};
-        // The touch sensors (XrBindings::Act::TouchTriggerLeft .. TouchStickRight, in that order):
-        // only the VR page's controls view reads them; XR_NULL_HANDLE when not created.
-        std::array<XrAction, 8> touch{};
+        // The touch sensors (XrBindings::Act::TouchTriggerLeft .. TouchRestRight, in that order):
+        // the VR page's controls view and the bare hands' fingers (ApplyFingerRig) read them;
+        // XR_NULL_HANDLE when not created.
+        std::array<XrAction, 10> touch{};
         XrSpace aim_space_left{XR_NULL_HANDLE};
         XrSpace aim_space_right{XR_NULL_HANDLE};
         XrSpace grip_space_left{XR_NULL_HANDLE};
@@ -1633,6 +1799,7 @@ struct OpenXRPresenter::Impl {
         VR::Graphics::SetHeadset(1, 0, 0);
         StopWarpDoneWatcher();
         late.Shutdown();
+        eye_cant.Shutdown();
         if (warp_done_semaphore) {
             late.SetDoneSemaphore({});
             instance.GetDevice().destroySemaphore(warp_done_semaphore);
@@ -1661,7 +1828,7 @@ struct OpenXRPresenter::Impl {
                              stamp_allocation);
         }
         for (XrSpace space : {actions.aim_space_left, actions.aim_space_right, view_space,
-                              local_space, retired_space, floor_space}) {
+                              local_space, retired_space, floor_space, stage_space}) {
             if (space != XR_NULL_HANDLE) {
                 xrDestroySpace(space);
             }
@@ -1700,6 +1867,7 @@ struct OpenXRPresenter::Impl {
                                      "runtime shares the graphics queue, as before");
         }
         xr_runtime = VrXrQueuePolicy::Classify(runtime.runtime_name);
+        runtime_y_menu = VR::YMenu::RuntimeUsesY(runtime.runtime_name);
         swapchain_mips = VrXrQueuePolicy::SwapchainMips(
             xr_runtime, std::getenv("VR_UI_NO_MIPS"), std::getenv("VR_SWAPCHAIN_MIPS"));
         if (!swapchain_mips && std::getenv("VR_UI_NO_MIPS") == nullptr) {
@@ -1824,11 +1992,27 @@ struct OpenXRPresenter::Impl {
                          : std::string{": panel size not known (eye_size=panel follows the "
                                        "runtime's recommended size)"});
         }
-        VR::Graphics::SetHeadsetLimit(
-            std::min({8192u, max_swapchain_w, view_config[0].maxImageRectWidth,
-                      view_config[1].maxImageRectWidth}),
-            std::min({8192u, max_swapchain_h, view_config[0].maxImageRectHeight,
-                      view_config[1].maxImageRectHeight}));
+        // The boot resolution patch keeps the eyes inside this (graphics_resolution.h
+        // OutputResolution), so no pixels are rendered that the headset cannot take. A view
+        // limit the runtime left at 0 is not reported (VrXrSize::EyeLimit): until 2026-11 it made
+        // this 0, which switched the cap off and left the template's uncapped size.
+        const VrXrSize::Size eye_limit = NativeEyeLimitNow();
+        VR::Graphics::SetHeadsetLimit(std::min(8192u, eye_limit.width),
+                                      std::min(8192u, eye_limit.height));
+        Common::RenderDiagnostic::WriteHeadset(
+            system_name, view_config[0].recommendedImageRectWidth,
+            view_config[0].recommendedImageRectHeight, view_config[1].recommendedImageRectWidth,
+            view_config[1].recommendedImageRectHeight, std::min(8192u, eye_limit.width),
+            std::min(8192u, eye_limit.height));
+        RENDER_DIAGNOSTIC_ONCE("OpenXR eye limits: largest image rect L={}x{} R={}x{}, largest "
+                               "swapchain {}x{}, eye limit {}x{}, recommended L={}x{} R={}x{}",
+                               view_config[0].maxImageRectWidth, view_config[0].maxImageRectHeight,
+                               view_config[1].maxImageRectWidth, view_config[1].maxImageRectHeight,
+                               max_swapchain_w, max_swapchain_h, eye_limit.width, eye_limit.height,
+                               view_config[0].recommendedImageRectWidth,
+                               view_config[0].recommendedImageRectHeight,
+                               view_config[1].recommendedImageRectWidth,
+                               view_config[1].recommendedImageRectHeight);
         XrInstanceProperties properties{XR_TYPE_INSTANCE_PROPERTIES};
         if (XR_SUCCEEDED(xrGetInstanceProperties(runtime.instance, &properties))) {
             LOG_INFO(Render_Vulkan, "OpenXR runtime: {} {}.{}.{}", properties.runtimeName,
@@ -1853,9 +2037,9 @@ struct OpenXRPresenter::Impl {
             fov_mutable = view_properties.fovMutable == XR_TRUE ? 1 : 0;
         }
         if (runtime.has_refresh_rate &&
-            !(runtime.LoadFunction("xrEnumerateDisplayRefreshRatesFB", enumerate_refresh_rates) &&
-              runtime.LoadFunction("xrGetDisplayRefreshRateFB", get_refresh_rate) &&
-              runtime.LoadFunction("xrRequestDisplayRefreshRateFB", request_refresh_rate))) {
+            (XR_FAILED(runtime.LoadFunction("xrEnumerateDisplayRefreshRatesFB", enumerate_refresh_rates)) ||
+             XR_FAILED(runtime.LoadFunction("xrGetDisplayRefreshRateFB", get_refresh_rate)) ||
+             XR_FAILED(runtime.LoadFunction("xrRequestDisplayRefreshRateFB", request_refresh_rate)))) {
             enumerate_refresh_rates = nullptr;
         }
         LOG_BENCHMARK_INFO(
@@ -1888,7 +2072,7 @@ struct OpenXRPresenter::Impl {
         }
         using ConvertQpc = XrResult(XRAPI_PTR*)(XrInstance, const LARGE_INTEGER*, XrTime*);
         ConvertQpc convert{};
-        if (!runtime.LoadFunction("xrConvertWin32PerformanceCounterToTimeKHR", convert)) {
+        if (XR_FAILED(runtime.LoadFunction("xrConvertWin32PerformanceCounterToTimeKHR", convert))) {
             return;
         }
         std::array<VrXrLayers::ClockSample, 8> samples{};
@@ -1972,7 +2156,7 @@ struct OpenXRPresenter::Impl {
         handles[static_cast<size_t>(XB::Act::GripPoseRight)] = actions.grip_pose_right;
         handles[static_cast<size_t>(XB::Act::HapticLeft)] = actions.haptic_left;
         handles[static_cast<size_t>(XB::Act::HapticRight)] = actions.haptic_right;
-        static_assert(static_cast<size_t>(XB::Act::TouchStickRight) -
+        static_assert(static_cast<size_t>(XB::Act::TouchRestRight) -
                           static_cast<size_t>(XB::Act::TouchTriggerLeft) + 1 ==
                       std::tuple_size_v<decltype(actions.touch)>);
         for (size_t i = 0; i < actions.touch.size(); ++i) {
@@ -2128,11 +2312,12 @@ struct OpenXRPresenter::Impl {
         if (!ok) {
             return false;
         }
-        // The touch sensors (the VR page's controls view lights what a finger or thumb rests on),
-        // with the VR page only (vr_menu=1; 0: the action set as before). Optional: one that
-        // cannot be created is left out and nothing else changes.
-        const bool touch_sensors = VR::GetSettings().vr_menu != 0;
-        static constexpr std::array<std::array<const char*, 2>, 8> TouchActions{{
+        // The touch sensors (the VR page's controls view lights what a finger or thumb rests on;
+        // the bare hands' fingers follow them), with the VR page or hand_rig (both 0: the action
+        // set as before). Optional: one that cannot be created is left out and nothing else
+        // changes.
+        const bool touch_sensors = VR::GetSettings().vr_menu != 0 || VR::GetSettings().hand_rig;
+        static constexpr std::array<std::array<const char*, 2>, 10> TouchActions{{
             {"touch_trigger_left", "Touch: left trigger"},
             {"touch_trigger_right", "Touch: right trigger"},
             {"touch_a", "Touch: A"},
@@ -2141,6 +2326,8 @@ struct OpenXRPresenter::Impl {
             {"touch_y", "Touch: Y"},
             {"touch_stick_left", "Touch: left stick"},
             {"touch_stick_right", "Touch: right stick"},
+            {"touch_rest_left", "Touch: left thumb rest"},
+            {"touch_rest_right", "Touch: right thumb rest"},
         }};
         for (size_t i = 0; i < actions.touch.size() && touch_sensors; ++i) {
             if (!CreateAction(actions.touch[i], XR_ACTION_TYPE_BOOLEAN_INPUT, TouchActions[i][0],
@@ -2503,6 +2690,92 @@ struct OpenXRPresenter::Impl {
         ClearQueue();
     }
 
+    // XR_KHR_visibility_mask: what each eye's lens shows (its visible triangle mesh), for the
+    // status looks zoomed into it (StatusLensDiagonal). When the session begins and when the
+    // runtime says it changed; frame thread. Empty (the default) without the extension or on a
+    // failure.
+    void QueryVisibleAreas() {
+        ++visible_areas_serial;
+        for (u32 eye = 0; eye < 2; ++eye) {
+            visible_vertices[eye].clear();
+            visible_indices[eye].clear();
+        }
+        auto& runtime = Runtime();
+        if (!runtime.has_visibility_mask || session == XR_NULL_HANDLE) {
+            return;
+        }
+        PFN_xrGetVisibilityMaskKHR get_mask = nullptr;
+        if (XR_FAILED(xrGetInstanceProcAddr(runtime.instance, "xrGetVisibilityMaskKHR",
+                                            reinterpret_cast<PFN_xrVoidFunction*>(&get_mask))) ||
+            get_mask == nullptr) {
+            return;
+        }
+        std::vector<XrVector2f> points;
+        for (u32 eye = 0; eye < 2; ++eye) {
+            XrVisibilityMaskKHR mask{XR_TYPE_VISIBILITY_MASK_KHR};
+            XrResult result = get_mask(session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye,
+                                       XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR, &mask);
+            if (XR_SUCCEEDED(result) && mask.vertexCountOutput > 0 && mask.indexCountOutput > 0) {
+                points.resize(mask.vertexCountOutput);
+                visible_indices[eye].resize(mask.indexCountOutput);
+                mask.vertexCapacityInput = mask.vertexCountOutput;
+                mask.vertices = points.data();
+                mask.indexCapacityInput = mask.indexCountOutput;
+                mask.indices = visible_indices[eye].data();
+                result = get_mask(session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye,
+                                  XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR, &mask);
+            }
+            if (XR_FAILED(result) || mask.vertexCountOutput == 0 || mask.indexCountOutput == 0) {
+                LOG_INFO(Render_Vulkan, "OpenXR: no visible area for eye {} ({})", eye,
+                         static_cast<s32>(result));
+                for (u32 e = 0; e < 2; ++e) {
+                    visible_vertices[e].clear();
+                    visible_indices[e].clear();
+                }
+                return;
+            }
+            visible_indices[eye].resize(mask.indexCountOutput);
+            visible_vertices[eye].reserve(mask.vertexCountOutput);
+            for (u32 i = 0; i < mask.vertexCountOutput; ++i) {
+                visible_vertices[eye].push_back({points[i].x, points[i].y});
+            }
+        }
+        LOG_INFO(Render_Vulkan, "OpenXR: the lenses' visible areas: {} / {} triangles",
+                 visible_indices[0].size() / 3, visible_indices[1].size() / 3);
+    }
+
+    // How far the lenses show each corner's diagonal (status_corners.h LensDiagonal: from their
+    // visible areas for this field, measured again when the field moves or the areas change;
+    // LensDiagonalDefault without them). VR_TUNE status.lens overrides it. The status looks'
+    // zoom and reach follow (ZoomFor, ReachFor).
+    float StatusLensDiagonal(const std::array<float, 4>& field) {
+        namespace SC = VR::StatusCorners;
+        bool moved = status_fit_serial != visible_areas_serial;
+        for (u32 i = 0; i < 4; ++i) {
+            moved = moved || std::abs(field[i] - status_fit_field[i]) > 0.25f;
+        }
+        if (moved) {
+            status_fit_field = field;
+            status_fit_serial = visible_areas_serial;
+            const float measured = SC::LensDiagonal(
+                field, {SC::EyeMask{visible_vertices[0], visible_indices[0]},
+                        SC::EyeMask{visible_vertices[1], visible_indices[1]}});
+            status_fit = measured > 0.0f ? measured : SC::LensDiagonalDefault;
+            if (field[0] > 1.0f) {
+                const float hidden = SC::HiddenBand(status_fit);
+                LOG_INFO(Render_Vulkan,
+                         "VR status corners: the lenses show each corner's diagonal out to {:.2f} "
+                         "of the field (left {:.0f}, right {:.0f}, up {:.0f}, down {:.0f} deg; {}): "
+                         "the looks zoomed x{:.2f}",
+                         status_fit, field[0], field[1], field[2], field[3],
+                         measured > 0.0f ? "the runtime's visibility mask"
+                                         : "no visibility mask from the runtime, the default",
+                         SC::ZoomFor(hidden));
+            }
+        }
+        return VR::Tune::Get("status.lens", status_fit);
+    }
+
     XrResult PollEvents() {
         auto& runtime = Runtime();
         XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
@@ -2543,7 +2816,10 @@ struct OpenXRPresenter::Impl {
                         XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                     if (CheckXr(xrBeginSession(session, &begin_info), "session begin")) {
                         session_running = true;
+                        session_refresh_hz = 0.0f;
+                        shortest_period = 0;
                         RequestRefreshRate();
+                        QueryVisibleAreas();
                     }
                 } else if (session_state == XR_SESSION_STATE_STOPPING && session_running) {
                     CheckXr(xrEndSession(session), "session end");
@@ -2581,13 +2857,21 @@ struct OpenXRPresenter::Impl {
                              static_cast<s32>(change.referenceSpaceType));
                 }
             } else if (event.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
+                // A replacement controller may not have the previous one's touch sensors.
+                // Relearn them while preserving the smoothed pose through the transition.
+                finger_senses = {};
                 LogInteractionProfiles();
+                RefreshHapticHz();
             } else if (event.type == XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB) {
                 const auto& changed =
                     *reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB*>(&event);
                 LOG_INFO(Render_Vulkan, "OpenXR display refresh rate changed {:.1f} -> {:.1f} Hz",
                          changed.fromDisplayRefreshRate, changed.toDisplayRefreshRate);
+                session_refresh_hz = changed.toDisplayRefreshRate;
+                shortest_period = 0;   // (the fallback measures the new rate afresh)
                 logged_period = false; // log the frame period again
+            } else if (event.type == XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR) {
+                QueryVisibleAreas();
             }
             UpdateSessionPause();
             event = XrEventDataBuffer{XR_TYPE_EVENT_DATA_BUFFER};
@@ -2889,6 +3173,7 @@ struct OpenXRPresenter::Impl {
         std::ranges::sort(rates);
         float current = 0.0f;
         get_refresh_rate(session, &current);
+        session_refresh_hz = current; // (a requested change reports itself: the event below)
         std::string list;
         for (const float rate : rates) {
             list += fmt::format(" {:.1f}", rate);
@@ -2935,7 +3220,9 @@ struct OpenXRPresenter::Impl {
     }
 
     void ResetInput() {
+        if (VR::IsFreeCamera()) VR::SetFreeCameraInput(0,0,0,0,false);
         pad.ReleaseAll();
+        pad_menu_hold.Resume(true); // a press held through this never taps on its release
         ResetMachines();
         input_was_reset = true; // the next focused frame is a context switch (UpdateInput)
         stick_armed = true;
@@ -3103,13 +3390,25 @@ struct OpenXRPresenter::Impl {
     }
 
     void UpdateSessionPause() {
-        const bool pause = pause_policy.Update(session_state == XR_SESSION_STATE_FOCUSED,
-                                               ready && !exit_requested);
-        if (pause != VR::HeadsetPause().Requested()) {
-            LOG_INFO(Render_Vulkan, "VR: headset focus {}: game {} at a frame boundary",
-                     pause ? "lost" : "returned or session ended", pause ? "pauses" : "resumes");
+        const bool focus_pause = pause_policy.Update(session_state == XR_SESSION_STATE_FOCUSED,
+                                                     ready && !exit_requested);
+        const bool choice_pause = ready && !exit_requested && VR::SoftSave::Mailbox().Prompt();
+        if (soft_save_choice_pause && !choice_pause) {
+            const auto tick = VR::HeadsetPause().ReadClock([] { return Common::FencedRDTSC(); });
+            LOG_INFO(Render_Vulkan, "VR soft save: choice pause ended game_ticks={} boundary={}",
+                     tick - soft_save_choice_clock, soft_save_choice_boundary);
         }
-        SetSessionPause(pause);
+        SetSessionPause(focus_pause || choice_pause);
+        if (choice_pause && !soft_save_choice_pause) {
+            soft_save_choice_clock = VR::HeadsetPause().ReadClock([] { return Common::FencedRDTSC(); });
+            soft_save_choice_boundary = false;
+            LOG_INFO(Render_Vulkan, "VR soft save: choice pause requested");
+        }
+        if (choice_pause && !soft_save_choice_boundary && VR::HeadsetPause().Waiting()) {
+            soft_save_choice_boundary = true;
+            LOG_INFO(Render_Vulkan, "VR soft save: choice pause reached frame boundary");
+        }
+        soft_save_choice_pause = choice_pause;
     }
 
     void FrameLoop(std::stop_token token) {
@@ -3248,6 +3547,8 @@ struct OpenXRPresenter::Impl {
                                                 std::exchange(ui_layers_submitted, 0) / seconds);
                 }
                 overlay_text += Perf::Summary(seconds); // the game GPU's resyncs (vr_perf.h)
+                overlay_text += fmt::format("; {} images in memory of their own",
+                                            VideoCore::DedicatedImages());
                 overlay_text += xrq.TakeSummary(seconds); // the runtime's own queue only
                 if (empty_frames != 0) {
                     // Submitted without a layer (none rendered, or without the colour scale
@@ -3255,6 +3556,7 @@ struct OpenXRPresenter::Impl {
                     overlay_text += fmt::format("; {} XR frames without a layer",
                                                std::exchange(empty_frames, 0));
                 }
+                VideoCore::VramReport::MaybeDump(instance.GetAllocator());
                 LOG_BENCHMARK_INFO(Render_Vulkan,
                          "VR perf: game frames {:.1f}/s, XR frames {:.1f}/s ({:.1f}/s with the "
                          "eyes' depth), copy {:.2f} ms, release lock {:.2f} ms, end frame {:.2f} "
@@ -3395,8 +3697,23 @@ struct OpenXRPresenter::Impl {
             floor_space = XR_NULL_HANDLE;
             return false;
         }
-        LOG_INFO(Render_Vulkan, "VR height: the floor from {} (the runtime lists:{})", floor_kind,
-                 list);
+        // VR_FLOOR_STAGE_CHECK=0: LOCAL_FLOOR alone, as before.
+        static const bool stage_check = [] {
+            const char* value = std::getenv("VR_FLOOR_STAGE_CHECK");
+            return !(value && value[0] == '0');
+        }();
+        if (stage_check && info.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR &&
+            listed(XR_REFERENCE_SPACE_TYPE_STAGE)) {
+            XrReferenceSpaceCreateInfo stage{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+            stage.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+            stage.poseInReferenceSpace = IdentityPose;
+            if (!CheckXr(xrCreateReferenceSpace(session, &stage, &stage_space),
+                         "stage-space creation")) {
+                stage_space = XR_NULL_HANDLE;
+            }
+        }
+        LOG_INFO(Render_Vulkan, "VR height: the floor from {}{} (the runtime lists:{})", floor_kind,
+                 stage_space != XR_NULL_HANDLE ? ", STAGE when they disagree" : "", list);
         return true;
     }
 
@@ -3419,10 +3736,33 @@ struct OpenXRPresenter::Impl {
             return false;
         }
         y = loc.pose.position.y;
+        // STAGE (the room's floor) wins when it is located and more than 10 cm from LOCAL_FLOOR.
+        bool from_stage = false;
+        float stage_y = 0.0f;
+        if (stage_space != XR_NULL_HANDLE) {
+            XrSpaceLocation stage{XR_TYPE_SPACE_LOCATION};
+            if (XR_SUCCEEDED(xrLocateSpace(stage_space, local_space, time, &stage)) &&
+                (stage.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 &&
+                std::isfinite(stage.pose.position.y)) {
+                stage_y = stage.pose.position.y;
+                from_stage = std::abs(stage_y - y) > 0.10f;
+            }
+        }
+        if (from_stage != floor_from_stage) {
+            LOG_INFO(Render_Vulkan,
+                     "VR height: {} (LOCAL_FLOOR at y {:.3f} m, STAGE at {:.3f} m, space {})",
+                     from_stage ? "the floor from STAGE: LOCAL_FLOOR is off by more than 10 cm"
+                                : "LOCAL_FLOOR and STAGE agree again",
+                     y, stage_y, recenter_serial);
+            floor_from_stage = from_stage;
+        }
+        if (from_stage) {
+            y = stage_y;
+        }
         if (!floor_located || std::abs(y - floor_y) > 0.05f) {
             LOG_INFO(Render_Vulkan,
                      "VR height: the floor ({}) at y {:.3f} m in the tracking space (space {})",
-                     floor_kind, y, recenter_serial);
+                     from_stage ? "STAGE" : floor_kind, y, recenter_serial);
         }
         floor_located = true;
         floor_y = y;
@@ -3563,6 +3903,10 @@ struct OpenXRPresenter::Impl {
             state.floor_y = y;
         }
         PublishHands(time, head, weight_head_velocity);
+        // The space it was located in, as the hands' sample has it (PublishHead stamps only the
+        // session's copy). Unstamped, last_head stayed in space 0 while the grips moved to the
+        // startup recenter's 1: the Monocular's gate never passed in a headset (2026-10-30).
+        state.space_serial = recenter_serial;
         last_head = state;
         VR::PublishHead(state);
     }
@@ -3648,6 +3992,7 @@ struct OpenXRPresenter::Impl {
         }
         ApplyBowString(sample);
         ApplyMusicBoxHand(sample);
+        ApplyFingerRig(sample, time);
         ApplyPhysicalLever(sample);
         const auto intent_hand = sample.hand[1];
         ApplyWeaponWeight(sample);
@@ -3856,6 +4201,26 @@ struct OpenXRPresenter::Impl {
         views_logged = true;
         ++view_logs;
         logged_fov = state.eye_fov;
+        // Called only with fully valid head/eye poses. Format once, independently of
+        // normal logging (which release builds disable); never log world-space tracking.
+        if (VR::EyeFov::Valid(state.eye_fov[0]) && VR::EyeFov::Valid(state.eye_fov[1])) {
+            const auto describe = [&](u32 eye) {
+                const auto& p = state.eye_pose[eye];
+                const auto& f = state.eye_fov[eye];
+                return fmt::format("pos_mm=({:.2f},{:.2f},{:.2f}) quat_xyzw=({:.5f},{:.5f},{:.5f},{:.5f}) "
+                                   "fov_deg_LRUD=({:.2f},{:.2f},{:.2f},{:.2f})",
+                    p.position.x * 1000.0f, p.position.y * 1000.0f, p.position.z * 1000.0f,
+                    p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w,
+                    f.angle_left * RadToDeg, f.angle_right * RadToDeg,
+                    f.angle_up * RadToDeg, f.angle_down * RadToDeg);
+            };
+            RENDER_DIAGNOSTIC_ONCE(
+                "OpenXR tracked eye geometry (head-relative): ipd_mm={:.2f} effective_ipd_mm={:.2f} "
+                "signed_R_minus_L_x_mm={:.2f} angled_screens={} L[{}] R[{}]",
+                state.ipd * 1000.0f, VR::EffectiveIpd(state) * 1000.0f,
+                (state.eye_pose[1].position.x - state.eye_pose[0].position.x) * 1000.0f,
+                VR::GetSettings().canted_eyes, describe(0), describe(1));
+        }
         std::string eyes;
         for (u32 i = 0; i < 2; ++i) {
             const VR::Fov& f = state.eye_fov[i];
@@ -3872,15 +4237,17 @@ struct OpenXRPresenter::Impl {
                             f.angle_right * RadToDeg, f.angle_up * RadToDeg,
                             f.angle_down * RadToDeg, p.position.x * 1000.0f, p.position.y * 1000.0f,
                             p.position.z * 1000.0f, angle, yaw * RadToDeg, pitch * RadToDeg);
-            if (angle > 0.1f && !cant_warned) {
-                // The eyes are submitted with the head's orientation and cropped from a render
-                // that faces the head's forward: a canted display would be off by this angle.
+            if (VR::Cant::Canted(p.orientation) && !cant_warned) {
+                // core/vr/eye_cant.h: the eyes are rendered parallel over each eye's whole turned
+                // view; with vr.ini canted_eyes each is turned into the eye's own (VrEyeCant).
                 cant_warned = true;
-                LOG_WARNING(Render_Vulkan,
-                            "OpenXR: the {} eye is rotated {:.2f} deg from the head (canted "
-                            "displays are not supported yet): the view is off by about that "
-                            "angle in that eye",
-                            i == 0 ? "left" : "right", angle);
+                LOG_INFO(Render_Vulkan,
+                         "OpenXR: the {} eye is rotated {:.2f} deg from the head (a canted "
+                         "display): each eye is rendered parallel over its whole view{}",
+                         i == 0 ? "left" : "right", angle,
+                         VR::GetSettings().canted_eyes
+                             ? " and turned into the eye's own (canted_eyes=1)"
+                             : ", for the runtime to turn (canted_eyes=0)");
             }
         }
         LOG_INFO(Render_Vulkan,
@@ -3925,6 +4292,7 @@ struct OpenXRPresenter::Impl {
 
     struct HandState {
         bool valid{false};      // position tracked and linear velocity valid
+        bool position_tracked{false}; // pickup may use position without a reported velocity
         bool pose_valid{false}; // orientation and position valid (an inferred position is fine
                                 // for drawing the overlay)
         XrVector3f position{};
@@ -3965,7 +4333,8 @@ struct OpenXRPresenter::Impl {
         hand.position = location.pose.position;
         hand.velocity = velocity.linearVelocity;
         const bool has_velocity = (velocity.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT);
-        hand.valid = (location.locationFlags & tracked) == tracked && has_velocity;
+        hand.position_tracked = (location.locationFlags & tracked) == tracked;
+        hand.valid = hand.position_tracked && has_velocity;
         hand.orientation = location.pose.orientation;
         hand.orientation_valid =
             (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0;
@@ -4090,19 +4459,15 @@ struct OpenXRPresenter::Impl {
     }
 
     // y_menu in effect: the motion layout's left_scheme=2 with a Y button, and y_menu=on, or auto
-    // on a runtime that owns the left Menu button (SteamVR: its dashboard; Meta's right Oculus
-    // button is never ours either). Then Y does Menu's jobs wherever Menu does them
+    // on SteamVR or VDXR, whose Menu button has runtime dashboard gestures; Meta's right Oculus
+    // button is never ours either. Then Y does Menu's jobs wherever Menu does them
     // (UpdateYGesture, called from UpdateInput in every context: tap = Options, 0.7 s hold = the
     // recenter, 2.5 s hold on a flat screen = the escape); on Meta Link (auto) Menu stays the
     // menu and Y's tap the quick-item arc.
     bool YMenuActive() const {
         const auto& s = VR::GetSettings();
-        if (s.controls_classic || s.left_scheme != 2 || !left_y_bound) {
-            return false;
-        }
-        const s32 setting = YMenuSetting();
-        return setting == 1 ||
-               (setting == 0 && xr_runtime == VrXrQueuePolicy::Runtime::SteamVr);
+        return VR::YMenu::Enabled(YMenuSetting(), runtime_y_menu,
+                                 !s.controls_classic && s.left_scheme == 2, left_y_bound);
     }
 
     // Reads the hands' controls into their logical slots (UpdateInput, every focused frame). A
@@ -4128,8 +4493,8 @@ struct OpenXRPresenter::Impl {
         }
         const bool y_menu = YMenuActive();
         y_menu_now = y_menu;
-        // SteamVR's dashboard takes the left Menu button (none of Menu's jobs reach us there).
-        const bool menu_runtime = xr_runtime == VrXrQueuePolicy::Runtime::SteamVr;
+        // Prefer Y where Menu has runtime dashboard gestures (SteamVR / VDXR).
+        const bool menu_runtime = runtime_y_menu;
         const VR::Thumbs::Layout layout{settings.left_scheme, settings.controls_classic, swap,
                                         settings.inject, y_menu, menu_runtime};
         VR::SetYMenu(y_menu, menu_runtime); // the VR page's controls view
@@ -4142,7 +4507,7 @@ struct OpenXRPresenter::Impl {
                      layout.classic ? "-" : (layout.left_scheme == 2 ? "left_scheme=2"
                                                                      : "left_scheme=1"),
                      swap ? 1 : 0, VR::YMenu::SettingName(y_menu_setting),
-                     VrXrQueuePolicy::Name(xr_runtime),
+                     Runtime().runtime_name,
                      y_menu ? "Y is the menu wherever Menu would be: tap = Options, hold 0.7 s = "
                               "recenter, hold 2.5 s on a flat screen = back to VR; B alone is "
                               "Back in the game's menus; the virtual screen chosen with Tab keeps "
@@ -4158,7 +4523,12 @@ struct OpenXRPresenter::Impl {
         }
     }
 
+    bool free_camera_sticks_armed = false;
+
     void ResetMachines() {
+        free_camera_y.Reset();
+        free_camera_sticks_armed = false;
+        ResetMenuThumbs();
         melee.Reset();
         if (melee_window.Current().open) {
             melee_window.Reset("a context switch");
@@ -4166,6 +4536,7 @@ struct OpenXRPresenter::Impl {
         } else {
             melee_window.Reset("a context switch");
         }
+        melee_window.StrokesRestart(); // melee numbers its strokes from 1 again
         melee_telegraph.Reset();
         melee_charge_sustain = false;
         melee_whip_sustain = false;
@@ -4199,6 +4570,14 @@ struct OpenXRPresenter::Impl {
         grab_transform_ns = 0;
         near_hold_ns = slip_ns = 0;
         two_hand_support.Reset();
+        optimized_attachment.Reset(true);
+        optimized_trigger_owned = false;
+        optimized_special_wait = false;
+        optimized_special_trigger.Reset();
+        two_hand_reposition.Reset(true); // require a fresh press after a context switch
+        two_hand_reposition_out = {};
+        two_hand_push.Reset(true);
+        two_hand_push_out = {};
         two_hand_blade_motion.Reset();
         two_hand_physical_motion.Reset();
         two_hand_intent_blade = {};
@@ -4217,7 +4596,20 @@ struct OpenXRPresenter::Impl {
         VR::Combat::PublishSawRequest({});
         saw_sustain_l = saw_sustain_r = 0.0f;
         saw_trigger_r = false;
+        // The empty syringe is put away (a menu mid-stab never thumps or holds the hands after
+        // it closes; an ask the game has not taken yet never spends HP), the right weapon back.
+        if (blood_draw.State() != VR::BloodDraw::Phase::Idle) {
+            LOG_INFO(Render_Vulkan, "VR blood draw: the syringe put away (a context switch)");
+        }
+        VR::BloodDraw::CancelAsk(blood_draw_ask);
+        blood_draw.PutAway();
+        blood_draw_gate.Reset();
+        blood_draw_hit = {};
+        blood_draw_out = {};
+        blood_draw_zone = false;
+        VR::BloodDraw::PublishScene({VR::Body::SteadyNowNs(), false, 0.0f, VR::BloodDraw::Phase::Idle});
         melee_left.Reset();
+        melee_window_left.StrokesRestart(); // melee_left numbers its strokes from 1 again
         left_dropped_stroke = 0;
         shield.Reset();
         shield_up = false;
@@ -4236,6 +4628,7 @@ struct OpenXRPresenter::Impl {
         b_down = b_to_touch = touch_fired = false;
         r3_down = r3_used = r3_switched = false;
         swing_ready = hand_at_face = left_at_face = left_face_hold = false;
+        left_face_quiet = 0.0f;
         melee_shadow.Reset();
         grip_r_block = nullptr;
         whip_transform_hold.Reset();
@@ -4249,6 +4642,7 @@ struct OpenXRPresenter::Impl {
         stick_armed = false;
         up_hold = 0.0f;
         quick_turn_gesture.Reset();
+        pad_quick_turn.Reset();
         menu_armed = false;
         menu_dir = PadButton{};
         drawn = sticky_drawn = grip_r_down = false;
@@ -4257,12 +4651,14 @@ struct OpenXRPresenter::Impl {
         vial_grip_release = -1.0f;
         vial_belt_draw = false;
         vial_button.Reset();
+        vial_rearm_pending = false;
         inject_hold = gun_hold = 0.0f;
         EndInjectFreeze("controls reset", VR::Body::SteadyNowNs());
         EndInjectDrain("controls reset");
         QuickCancel("controls reset");
         (void)VR::RoomscaleWalkInput(false);
         lean.Reset();
+        duck_iframes.Reset();
         lean_stick_left = lean_circle_in = 0.0f;
         if (grip_adjust.Cancel()) {
             LOG_INFO(Render_Vulkan, "VR grip: adjust cancelled (controls reset), nothing saved");
@@ -4340,7 +4736,33 @@ struct OpenXRPresenter::Impl {
     // is about to run out (one xrApplyHapticFeedback for a whole steady tick, one per 0.1 s or
     // per step for a hum, the rumble or a ramp), xrStopHapticFeedback when it falls silent, never
     // before haptic_min_ms after the newest tick began.
+    // The Doll's respec in the hands (core/vr/respec_feel.h): a light pull for a level freed and a
+    // firmer set for one placed (the stick's hand, the left), the deny double tick for a refused
+    // confirm (A's hand, the right), and a heartbeat in both hands for a new build.
+    void UpdateRespecFeel() {
+        namespace F = VR::Respec::Feel;
+        const auto moved = [this](const std::atomic<u32>& counter, size_t k) {
+            const u32 now = counter.load(std::memory_order_relaxed);
+            return std::exchange(respec_feel_seen[k], now) != now;
+        };
+        if (moved(F::freed, 0))
+            haptics[0].Play(Tick(0.22f, 12.0f, 0));
+        if (moved(F::placed, 1))
+            haptics[0].Play(Tick(0.36f, 16.0f, 0));
+        if (moved(F::refused, 2))
+            haptics[1].Play(Repeat(2, 0.3f, 15.0f, 60.0f, 3));
+        if (moved(F::kept, 3)) {
+            HapticPattern beat{};
+            beat.priority = 2;
+            beat.Pulse(0.9f, 30.0f).Ramp(0.45f, 0.0f, 80.0f).Gap(110.0f).Pulse(0.7f, 25.0f).Ramp(
+                0.35f, 0.0f, 120.0f);
+            haptics[0].Play(beat);
+            haptics[1].Play(beat);
+        }
+    }
+
     void UpdateHaptics(float dt) {
+        UpdateRespecFeel();
         const auto& settings = VR::GetSettings();
         float small_motor{}, large_motor{};
         VR::GetPadRumble(small_motor, large_motor);
@@ -4373,7 +4795,7 @@ struct OpenXRPresenter::Impl {
             VR::Haptics::Input in{};
             in.fresh = std::exchange(h.fresh, false);
             in.steady_s = h.SteadyFor(); // of the level Sample returns now
-            in.tick = h.Sample(dt);
+            in.tick = h.Sample(dt, in.tick_hz);
             // Swing feel is a background layer, never the owner of another effect's sustain.
             in.hum = h.sustain > 0.0f || h.playing ? h.sustain : two_hand_hum_level;
             // A failure pattern (priority 3: the deny double tick, the combo budget's dull buzz)
@@ -4384,6 +4806,11 @@ struct OpenXRPresenter::Impl {
             // An impact, a gunshot or the injection's thump owns its hand (the hum and the
             // rumble too) while it plays: its crack and decay keep their shape.
             in.own = h.playing && h.pattern.own;
+            if (!haptic_hz) {
+                // No frequencies (every controller but PS VR2's, RefreshHapticHz): none, so no
+                // frequency change is a call and they get exactly the calls they always did.
+                in.tick_hz = in.hum_hz = in.rumble_hz = 0.0f;
+            }
             if (h.out.vibrating) {
                 stats.on_s += dt;
             }
@@ -4392,8 +4819,9 @@ struct OpenXRPresenter::Impl {
             stats.hum = std::max(stats.hum, d.hum);
             stats.rumble = std::max(stats.rumble, d.rumble);
             if (d.call == VR::Haptics::Call::Apply) {
-                const XrResult result = ApplyHaptic(hand, d.amplitude, d.duration_ns, test);
-                h.out.Applied(result == XR_SUCCESS, d.amplitude, d.duration_ns, now);
+                const XrResult result =
+                    ApplyHaptic(hand, d.amplitude, d.duration_ns, test, d.hz);
+                h.out.Applied(result == XR_SUCCESS, d.amplitude, d.duration_ns, now, d.hz);
             } else if (d.call == VR::Haptics::Call::Stop) {
                 StopHaptic(hand);
             }
@@ -4416,27 +4844,78 @@ struct OpenXRPresenter::Impl {
         LogHapticStats();
     }
 
-    XrResult ApplyHaptic(u32 hand, float level, s64 duration_ns, bool test) {
+    // Which controllers get the vibration's frequency (core/vr/haptic_output.h: crisp ticks high,
+    // deep thumps low): the PS VR2 Sense controllers only (their wideband actuators; on PC through
+    // SteamVR, where PSVR2 Toolkit draws each vibration's waveform at it, and Sony's own driver's
+    // basic rumble is the same either way). Every other controller keeps its driver's own
+    // frequency, as always: Quest on Link, Virtual Desktop or SteamVR (Meta's runtime ignores it),
+    // Index, Steam Frame, Vive, WMR. Most of them have a resonant motor, which goes weak away from
+    // its sweet spot, and their drivers pick it (2026-11-03 review). Refreshed on a controller
+    // change (XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED).
+    void RefreshHapticHz() {
+        const auto [profile, dpad] = PageController();
+        const bool sense = VR::ControlsView::FamilyOf(profile, system_name) ==
+                           VR::ControlsView::Family::Sense;
+        const bool on = sense && xr_runtime != VrXrQueuePolicy::Runtime::Meta && !haptic_hz_refused;
+        if (on != haptic_hz) {
+            LOG_INFO(Render_Vulkan,
+                     "VR haptics: {} ({}, {})", on
+                         ? "each vibration carries its frequency (crisp ticks, deep thumps)"
+                         : "the vibrations leave their frequency to the controller's driver",
+                     profile.empty() ? std::string{"no controller profile"} : profile,
+                     system_name.empty() ? std::string{"no system name"} : system_name);
+        }
+        haptic_hz = on;
+    }
+
+    // `hz`: the vibration's frequency (0 unspecified), sent where RefreshHapticHz says. A runtime
+    // that refuses a call with it gets the call again without, and none with one for the session.
+    XrResult ApplyHaptic(u32 hand, float level, s64 duration_ns, bool test, float hz = 0.0f) {
+        // A gamepad style: the VR controllers vibrate only while in use (played as a pad), never
+        // rattling on the desk with every hit (vr_idle_s; a test from the VR page always does).
+        if (!test && pad_play_style && vr_idle_s > PadStyleHapticIdleS) {
+            return XR_SUCCESS;
+        }
         auto& stats = haptic_stats[hand];
         const char* name = hand == 0 ? "left" : "right";
         XrHapticActionInfo info{XR_TYPE_HAPTIC_ACTION_INFO};
         info.action = hand == 0 ? actions.haptic_left : actions.haptic_right;
         XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
         vibration.amplitude = level;
-        vibration.frequency = XR_FREQUENCY_UNSPECIFIED; // simple haptics: Meta ignores it
+        vibration.frequency = haptic_hz && hz > 0.0f ? hz : XR_FREQUENCY_UNSPECIFIED;
         vibration.duration = duration_ns;
-        const XrResult result =
-            info.action != XR_NULL_HANDLE
-                ? xrApplyHapticFeedback(session, &info,
-                                        reinterpret_cast<const XrHapticBaseHeader*>(&vibration))
-                : XR_ERROR_HANDLE_INVALID;
+        const auto apply = [&] {
+            return info.action != XR_NULL_HANDLE
+                       ? xrApplyHapticFeedback(
+                             session, &info, reinterpret_cast<const XrHapticBaseHeader*>(&vibration))
+                       : XR_ERROR_HANDLE_INVALID;
+        };
+        XrResult result = apply();
+        if (vibration.frequency > 0.0f && info.action != XR_NULL_HANDLE && XR_FAILED(result) &&
+            result != XR_ERROR_SESSION_LOST && result != XR_ERROR_INSTANCE_LOST &&
+            result != XR_ERROR_SESSION_NOT_RUNNING) {
+            const float refused = vibration.frequency;
+            vibration.frequency = XR_FREQUENCY_UNSPECIFIED;
+            result = apply();
+            if (XR_SUCCEEDED(result)) {
+                haptic_hz = false;
+                haptic_hz_refused = true;
+                LOG_WARNING(Render_Vulkan,
+                            "VR haptics: the runtime refused a vibration at {:.0f} Hz and took it "
+                            "without: frequencies off for this session",
+                            refused);
+            }
+        }
         ++stats.calls;
         if (!haptic_first_logged[hand]) {
             haptic_first_logged[hand] = true;
             LOG_INFO(Render_Vulkan,
                      "VR haptics: first vibration on the {} controller: xrApplyHapticFeedback "
-                     "-> {} (amplitude {:.2f} for {:.0f} ms; {})",
-                     name, XrResultText(result), level, duration_ns * 1e-6, HandProfile(hand));
+                     "-> {} (amplitude {:.2f} for {:.0f} ms at {}; {})",
+                     name, XrResultText(result), level, duration_ns * 1e-6,
+                     vibration.frequency > 0.0f ? fmt::format("{:.0f} Hz", vibration.frequency)
+                                                : std::string{"the runtime's frequency"},
+                     HandProfile(hand));
         }
         if (test) {
             auto& t = haptic_test_hands[hand];
@@ -4700,6 +5179,12 @@ struct OpenXRPresenter::Impl {
     void UpdateInput(XrTime time, float dt, float input_dt) {
         two_hand_hum_level = 0.0f; // menus/early exits cannot leave a swing buzz running
         overlay_in.valid = false;
+        // The smooth turn's speed this frame (the free camera or UpdateGameplay sets it), once:
+        // a menu, the page or an early exit turns nothing.
+        smooth_turn_rate = 0.0f;
+        SCOPE_EXIT {
+            VR::SetSmoothTurnRate(smooth_turn_rate);
+        };
         if (!actions.ready || session_state != XR_SESSION_STATE_FOCUSED) {
             ResetInput();
             return;
@@ -4709,6 +5194,8 @@ struct OpenXRPresenter::Impl {
         sync.countActiveActionSets = 1;
         sync.activeActionSets = &active;
         if (const XrResult result = xrSyncActions(session, &sync); XR_FAILED(result)) {
+            free_camera_y.Reset();
+            if (VR::IsFreeCamera()) VR::SetFreeCameraInput(0,0,0,0,false);
             whip_transform_hold.Reset(); // no continuous hold across missing input samples
             if (++sync_failures <= 5) {
                 LOG_ERROR(Render_Vulkan, "OpenXR xrSyncActions failed ({})",
@@ -4765,6 +5252,16 @@ struct OpenXRPresenter::Impl {
 
         XrVector2f move = GetVector(actions.move);
         XrVector2f look = GetVector(actions.look);
+        // The gamepad's (and keyboard's) own buttons and sticks, without our presses, in one read
+        // for this frame (the page, its Options, the first-person turnaround).
+        pad_phys = (*Common::Singleton<Input::GameControllers>::Instance())[0]->Physical();
+        // A gamepad play style: a resting VR stick's drift never reaches the game (the emulated
+        // pad shows a stick we drive off its rest over the gamepad's: Input::GameController).
+        pad_play_style = VR::CurrentPlayStyle() != VR::PlayStyle::Style::Motion;
+        if (pad_play_style) {
+            move = StickDeadZone(move);
+            look = StickDeadZone(look);
+        }
         const std::array<float, 4> analog{
             GetFloat(actions.trigger_left, &bow_trigger_active[0]),
             GetFloat(actions.trigger_right, &bow_trigger_active[1]),
@@ -4791,6 +5288,14 @@ struct OpenXRPresenter::Impl {
         const XrVector2f look_hands = look;
         bool thumbs_switch = false;
         ReadThumbs(raw, move, look, thumbs_switch);
+        // The VR controllers in use (a button, a trigger or grip past its latch, a stick pushed):
+        // in a gamepad style only then do they vibrate (ApplyHaptic), never lying on a desk.
+        bool vr_used = move.x * move.x + move.y * move.y > 0.25f ||
+                       look.x * look.x + look.y * look.y > 0.25f; // past half way
+        for (u32 i = 0; i < PhysCount; ++i) {
+            vr_used = vr_used || raw[i];
+        }
+        vr_idle_s = vr_used ? 0.0f : std::min(vr_idle_s + dt, 60.0f);
         if (thumbs_switch && !input_was_reset) { // (the focus switch below covers a start)
             SwitchContext(raw, thumbs_swapped ? "move with the right stick"
                                               : "move with the left stick");
@@ -4844,7 +5349,7 @@ struct OpenXRPresenter::Impl {
         // the menu controls stay 100 ms after a close (the game's own close already takes about
         // 0.2 s, so a roll right after closing a menu is still a roll).
         const bool lamp_owned = VR::Lamps::Mailbox().Input().has_value();
-        const bool menu_open = VR::IsGameMenuOpen() || lamp_owned;
+        const bool menu_open = VR::IsGameMenuOpen() || lamp_owned || VR::SoftSave::Mailbox().Prompt();
         const float closed_for = menu_closed_time;
         menu_closed_time = menu_open ? 0.0f : std::min(menu_closed_time + dt, 10.0f);
         const bool game_menu = menu_open || (menu_context && menu_closed_time < 0.1f);
@@ -4863,13 +5368,31 @@ struct OpenXRPresenter::Impl {
         // up it owns the controllers (UpdatePage) and the game gets a neutral pad. Buttons held
         // through the switch wait for their release (the A that opened it never confirms on it).
         auto& page = VR::Page::Runtime::Get();
+        // VR_PAGE_TEST_OPEN (tests): the page opens once, when the game's menu is first up (a
+        // scripted Menu press in the mock), on the tab it names (vr_page_runtime.cpp).
+        static const bool page_test = [] {
+            const char* e = std::getenv("VR_PAGE_TEST_OPEN");
+            return e != nullptr && e[0] != '\0';
+        }();
+        if (page_test && game_menu && !page_test_opened && !page.IsOpen()) {
+            page_test_opened = true;
+            page.RequestOpen();
+        }
         if (page.PollOpen() && page_layer.Failed()) {
             page.Close("its layer failed earlier"); // never an invisible page owning the input
         } else if (page.IsOpen() && !page_input_owned) {
             page_input_owned = true;
-            page.SetGlyphs(PageGlyphs());
+            // A gamepad play style opens on the gamepad's button names (the death choice opens
+            // by itself, before any press could tell which controller is in your hands).
+            page_pad_names = pad_play_style;
+            page.SetGlyphs(page_pad_names ? PadPageGlyphs() : PageGlyphs());
+            // Gamepad buttons held through the switch (the Cross that opened it, an L2 / R2 that
+            // would step a value at once) count only once let go.
+            page_pad_blocked = pad_phys.buttons;
+            page_pad_prev = 0;
+            page_pad_l2_pace = page_pad_r2_pace = {};
             const auto [controller_profile, controller_dpad] = PageController();
-            page.SetController(controller_profile, controller_dpad);
+            page.SetController(controller_profile, controller_dpad, system_name);
             page_a = page_b = page_trigger_l = page_trigger_r = false;
             page_point_pace = page_other_pace = page_grip_l_pace = page_grip_r_pace = {};
             page_armed = false;
@@ -4877,16 +5400,82 @@ struct OpenXRPresenter::Impl {
             page_placed_logged = false;
             page_pointer_active = page_ray_seen = false;
             SwitchContext(raw, "VR page", true);
-        } else if (!page.IsOpen()) {
-            page_input_owned = false;
         }
-        if (page.IsOpen() && !menu_open && menu_closed_time > 0.3f) {
+        if (page.IsOpen() && !VR::SoftSave::Mailbox().Prompt() && !menu_open && menu_closed_time > 0.3f) {
             page.GameMenuClosed(); // the game left its menu under the page
         }
-        // Escape hatch: hold both stick clicks for 1 s to switch motion <-> classic.
+        if (!page.IsOpen() && (page_input_owned || page_close_all)) {
+            // The context switch either way: a button still held from the page's click stays
+            // ignored until released, also when the page closed before it took the controls.
+            ReleasePageInput(raw);
+            if (page_close_all) {
+                // The page closed with the game's grid under it (its Free camera button): the
+                // grid closes by the game's Options, as with Menu's tap (whether or not the page
+                // had taken the controls yet).
+                page_close_all = false;
+                pad.LimitSuppress(0.0f);
+                pad.Press(PadButton::Options);
+                if (!screen_context) VR::Ui::BeginMenuPop(ui_menu_pop);
+            }
+        }
+        // Free camera owns gameplay controls before any physical/combat gesture runs.
+        // Title/loading and open menus retain the normal menu path.
+        if (VR::IsFreeCamera() && !game_menu && !page.IsOpen() &&
+            (!screen || VR::IsCameraActive() || VR::CinematicActive())) {
+            for (size_t i=0; i<blocked.size(); ++i) if (!raw[i]) blocked[i]=false;
+            if (std::hypot(move.x,move.y)<.2f && std::hypot(look.x,look.y)<.2f)
+                free_camera_sticks_armed = true;
+            const bool fly = VR::IsImmersive() && !VR::CinematicActive() &&
+                             context_age > .4f && free_camera_sticks_armed;
+            if (fly) {
+                // Speed buttons: the right trigger, either grip, the left stick pressed; one is
+                // fast, two at once faster.
+                int speed = 0;
+                for (const u32 b : {static_cast<u32>(PhysTriggerR), static_cast<u32>(PhysGripL),
+                                    static_cast<u32>(PhysGripR), static_cast<u32>(PhysStickL)})
+                    speed += raw[b] && !blocked[b] ? 1 : 0;
+                VR::SetFreeCameraInput(move.x, move.y, look.y, speed,
+                    raw[PhysX] && !blocked[PhysX]);
+                // Use the user's existing snap/smooth turn preference; no roll or stick pitch.
+                if (std::abs(look.x)<.3f) stick_armed=true;
+                if (settings.snap_turn_deg>0) {
+                    if (stick_armed && std::abs(look.x)>.7f) {
+                        VR::AddTurn(std::copysign(settings.snap_turn_deg * .01745329252f, look.x));
+                        stick_armed=false;
+                    }
+                } else {
+                    smooth_turn_rate = (std::abs(look.x)>.2f ? look.x : 0.f) *
+                        settings.smooth_turn_deg_per_s * .01745329252f;
+                }
+            }
+            if (!fly) VR::SetFreeCameraInput(0,0,0,0,false);
+            // Y (FreeCamera::YButton): its tap is back to the hunter (free camera off). Where Y
+            // does Menu's jobs (y_menu: SteamVR) holding it recenters, as Menu's hold. Every button
+            // held then stays ignored until released (SwitchContext): a speed button (the
+            // trigger, a grip, the left stick) is not a fresh press for the hunter.
+            switch (free_camera_y.Update(raw[PhysY] && !blocked[PhysY], dt, YMenuActive())) {
+            case VR::FreeCamera::YButton::Event::Recenter:
+                StartRecenter("Y held in the free camera (y_menu)");
+                break;
+            case VR::FreeCamera::YButton::Event::Back:
+                VR::SetFreeCamera(false, "Y");
+                SwitchContext(raw, "free camera off (Y): back to the hunter");
+                return;
+            case VR::FreeCamera::YButton::Event::None:
+                break;
+            }
+            const u32 held = raw[PhysMenu] && !blocked[PhysMenu]
+                                 ? static_cast<u32>(PadButton::Options) : 0;
+            pad.Apply(held, {128,128,128,128,0,0}, dt);
+            return;
+        }
+        free_camera_y.Reset(); // the free camera does not have Y this frame
+        if (VR::IsFreeCamera()) VR::SetFreeCameraInput(0,0,0,0,false);
+        // Escape hatch: hold both stick clicks for 1 s to switch motion <-> classic (not while a
+        // gamepad play style sets the controls).
         if (raw[PhysStickL] && raw[PhysStickR]) {
             chord_time += dt;
-            if (chord_time >= 1.0f && !chord_fired) {
+            if (chord_time >= 1.0f && !chord_fired && !VR::PlayStyleForces("controls")) {
                 chord_fired = true;
                 settings.controls_classic = !settings.controls_classic;
                 SwitchContext(raw, "switched controls");
@@ -4936,13 +5525,20 @@ struct OpenXRPresenter::Impl {
         gesture.grip_pose = actions.grip_space_right != XR_NULL_HANDLE;
 
         PhysicalState in = Gate(raw);
-        if (menu_context && !page.IsOpen()) {
+        if (!page.IsOpen() && (menu_context || menu_exit_guard.Settling())) {
             // Only Back owns the closing press. With y_menu, physical Y is Options:
             // keep other buttons visible so they cancel its tap/recenter gesture.
             // The closing tail still blocks every control until it is released.
             const auto back = thumbs_swapped ? PhysY : PhysB;
+            // The grips (the menu's Square / Triangle) also wait for a Back's menu to close
+            // (ExitGuard::GripHoldSeconds: no blood vial from a quick Back).
             menu_exit_guard.Update(raw, in, blocked, menu_open,
-                                   y_menu_now ? back : PhysB, y_menu_now ? back : PhysY, dt);
+                                   y_menu_now ? back : PhysB, y_menu_now ? back : PhysY, dt,
+                                   PhysGripR, PhysGripL);
+            if (menu_exit_guard.TakeGripCaught()) {
+                LOG_INFO(Core, "VR menu: a grip squeezed after Back while the menu closed: held "
+                               "back (no item)");
+            }
         } else {
             menu_exit_guard.Reset();
         }
@@ -4988,8 +5584,98 @@ struct OpenXRPresenter::Impl {
         }
         ui_menu_accept_down = menu_accept;
         ui_menu_back_down = menu_back;
-        UpdateShoulderSwitch(in, raw_hands, left, right, gesture, dt);
-        if (!screen_context && !menu_context) {
+        // Physical right B is a reposition clutch only on an attached two-handed
+        // weapon. Reserve its whole press before shoulder/lever/item consumers.
+        // Short taps are replayed into the normal logical slot (including swapped thumbs).
+        const auto reposition_key = thumbs_swapped ? PhysY : PhysB;
+        const auto modifier_key = settings.left_scheme == 2 ? PhysY : PhysStickL;
+        const auto& two_settings = VR::TwoHand::GetTwoHandSettings();
+        VR::TwoHand::GameStatus reposition_status{};
+        const s64 reposition_now = VR::Body::SteadyNowNs();
+        const bool reposition_fresh = VR::TwoHand::LatestGameStatus(reposition_status) &&
+            reposition_now >= reposition_status.ns &&
+            reposition_now - reposition_status.ns < 1'000'000'000;
+        if (OptimizedTwoHand()) {
+            two_hand_reposition.Reset(raw_hands[PhysB]);
+            two_hand_push.Reset(raw_hands[PhysY]);
+        }
+        const bool clutch_ok = !OptimizedTwoHand() && two_settings.enabled &&
+            !classic && !settings.right_grip_draw && !screen_context && !menu_context &&
+            !page.IsOpen() && !VR::CinematicActive() && VR::IsImmersive() && VR::IsFirstPerson() &&
+            !in[PhysMenu] && !grip_adjust.Frozen() && !in[PhysStickR] &&
+            !in[PhysA] && !in[PhysX] &&
+            left.valid && left.orientation_valid && right.valid && right.orientation_valid &&
+            (in[PhysGripL] || in[PhysGripR]) && two_hand.Engaged() && two_hand_support.Seated() &&
+            reposition_fresh && reposition_status.two_handed &&
+            reposition_status.family == two_hand_status.family &&
+            quick.GetPhase() == VR::Quick::Phase::Idle && !vial_armed;
+        const bool reposition_eligible = clutch_ok && !blocked[reposition_key] &&
+            !(modifier_key != reposition_key && in[modifier_key]);
+        // Y's push on a long handle (2026-10-28): the rear hand grips, the lead fist
+        // loosens. Not where Y is already the clutch (swapped thumbs) or the menu. left_scheme=2
+        // (the default) makes held Y the modifier too: a chord during the press hands it back
+        // (two_hand_push_chord, below).
+        const bool push_eligible = clutch_ok && !thumbs_swapped && !YMenuOwns(PhysY) &&
+            !blocked[PhysY] && !(modifier_key != PhysY && in[modifier_key]) &&
+            !two_hand_push_chord && two_hand_support.LongHandle();
+        // Since this press began (nothing on its first frame: the places of the last press are no
+        // measure of this one, and a still tap must stay Y's own action).
+        const bool y_press_edge = raw_hands[PhysY] && !two_hand_push_y_was;
+        const float push_moved = y_press_edge ? 0.0f :
+            std::abs(two_hand_support.RightSlide() - two_hand_push_from[0]) +
+            std::abs(two_hand_support.RightSlide() + two_hand_support.Slide() - two_hand_push_from[1]);
+        two_hand_push_out = two_hand_push.Step(push_eligible, raw_hands[PhysY], dt, push_moved);
+        // Each Y press while two-handing, and how it ended (a warning: the trial log keeps it).
+        const bool y_edge = raw_hands[PhysY] && !two_hand_push_y_was;
+        if (y_edge && (two_hand.Engaged() || two_hand_support.Seated())) {
+            LOG_WARNING(Render_Vulkan,
+                        "VR two-hand push: Y {} (engaged {} seated {} long {} rail {:.2f} m; "
+                        "clutch {} swapped {} scheme {} y_menu {} blocked {} modifier {} grips {}/{} "
+                        "quick idle {} vial {} A/X {}/{} stick {} menu {} status {} family {}/{})",
+                        two_hand_push_out.active ? "PUSH" : "refused", two_hand.Engaged(),
+                        two_hand_support.Seated(), two_hand_support.LongHandle(),
+                        two_hand_support.RailLength(), clutch_ok, thumbs_swapped,
+                        settings.left_scheme, YMenuOwns(PhysY), blocked[PhysY], in[modifier_key],
+                        in[PhysGripL], in[PhysGripR],
+                        quick.GetPhase() == VR::Quick::Phase::Idle, vial_armed, in[PhysA], in[PhysX],
+                        in[PhysStickR], in[PhysMenu], reposition_fresh && reposition_status.two_handed,
+                        reposition_status.family, two_hand_status.family);
+        }
+        if (!raw_hands[PhysY] && two_hand_push_y_was && two_hand_push_logged) {
+            LOG_WARNING(Render_Vulkan, "VR two-hand push: Y released (moved {:.1f} cm, tap {})",
+                        push_moved * 100.0f, two_hand_push_out.tap);
+        }
+        if (y_edge) two_hand_push_logged = two_hand.Engaged() || two_hand_support.Seated();
+        two_hand_push_y_was = raw_hands[PhysY];
+        if (two_hand_push_out.started) {
+            two_hand_push_from = {two_hand_support.RightSlide(),
+                                  two_hand_support.RightSlide() + two_hand_support.Slide()};
+            if (two_settings.haptics) haptics[1].Play(Tick(0.12f, 10.0f, 0)); // the fist loosens
+        }
+        two_hand_reposition_out = two_hand_reposition.Step(
+            reposition_eligible, raw_hands[PhysB], dt, true,
+            two_hand.Engaged() && two_hand_support.Seated());
+        PhysicalState shoulder_buttons = raw_hands;
+        if (two_hand_reposition_out.consume) {
+            in[reposition_key] = two_hand_reposition_out.tap;
+            shoulder_buttons[PhysB] = false;
+        }
+        // left_scheme=2: X, A or the right stick during the press makes it the modifier's: no push
+        // for the rest of the press, Y held through for the chord (and no tap on its release).
+        if (two_hand_push_out.consume && raw_hands[PhysY] && modifier_key == PhysY &&
+            (in[PhysX] || in[PhysA] || in[PhysStickR] || std::hypot(look.x, look.y) > 0.5f)) {
+            two_hand_push_chord = true;
+            two_hand_push_out.active = false;
+        }
+        if (two_hand_push_out.consume) {
+            in[PhysY] = two_hand_push_chord ? raw_hands[PhysY] : two_hand_push_out.tap;
+            shoulder_buttons[PhysY] = false;
+        }
+        if (!raw_hands[PhysY]) two_hand_push_chord = false;
+        if (two_hand_reposition_out.changed && two_settings.haptics)
+            haptics[1].Play(Tick(0.2f, 12.0f, 1));
+        UpdateShoulderSwitch(in, shoulder_buttons, left, right, gesture, dt);
+        if (!screen_context && !menu_context && !page.IsOpen()) {
             UpdateRollChord(in, move, dt);
             UpdateGripAdjust(in, dt);
         }
@@ -5116,7 +5802,14 @@ struct OpenXRPresenter::Impl {
                 !(menu_hold_cancelled && menu_time > MenuHoldS)) {
                 // Over the VR page too, like the game's own menus: everything closes (the page
                 // here, the grid by the game's Options).
-                page.Close("Menu");
+                if (page.IsOpen()) {
+                    page.Close("Menu");
+                    ReleasePageInput(raw);
+                    in = Gate(raw);
+                    // The synthetic Options press is the intentional close of the
+                    // underlying grid. Preserve it after clearing the page's input.
+                    pad.LimitSuppress(0.0f);
+                }
                 pad.Press(PadButton::Options);
                 if (!screen_context) VR::Ui::BeginMenuPop(ui_menu_pop);
             }
@@ -5145,6 +5838,44 @@ struct OpenXRPresenter::Impl {
                 haptics[0].Play(Repeat(3, 0.5f, 30.0f, 60.0f, 2));
                 haptics[1].Play(Repeat(3, 0.5f, 30.0f, 60.0f, 2));
             }
+        }
+        // The gamepad's Options as Menu (core/vr/pad_menu.h): taken from the game and decided
+        // here: a tap is one Options press, a 0.7 s hold the recenter with nothing to the game,
+        // 2.5 s on a flat screen back to first-person VR.
+        // A press already down when the deciding resumes (Taken() had lapsed) reached the game
+        // as its own: it is spent (PadMenu::Hold::Resume), never a second press on its release.
+        const bool pad_options = (pad_phys.buttons & VR::PagePad::Bit::Options) != 0;
+        if (!VR::PadMenu::Taken()) {
+            pad_menu_hold.Resume(pad_options);
+        }
+        VR::PadMenu::Take();
+        const VR::PadMenu::Out pad_menu = pad_menu_hold.Step(pad_options, dt);
+        if (pad_menu.recenter) {
+            StartRecenter("Options held on the gamepad");
+        }
+        if (pad_menu.escape) {
+            const auto cine = VR::CinematicPhase();
+            if (VR::GetDisplayMode() == VR::DisplayMode::Screen ||
+                cine == VR::Cinematic::Phase::Flat || cine == VR::Cinematic::Phase::FadeOut) {
+                LOG_INFO(Render_Vulkan, "VR input: Options held {:.1f} s on the gamepad on the "
+                                        "flat screen: back to first-person VR",
+                         VR::PadMenu::EscapeS);
+                VR::ToggleScreenMode("Options held on the flat screen");
+            }
+        }
+        if (pad_menu.tap) {
+            if (page.IsOpen()) {
+                page.Close("Options on the gamepad");
+                ReleasePageInput(raw);
+                in = Gate(raw);
+                pad.LimitSuppress(0.0f);
+            }
+            // Deliberate: also right after a recenter or a context switch (their suppression is
+            // for VR controls held through them; this gamepad's Options was hidden meanwhile).
+            if (!pad.Press(PadButton::Options, true)) {
+                LOG_INFO(Render_Vulkan, "VR input: the gamepad's Options tap dropped (one queued)");
+            }
+            if (!screen_context) VR::Ui::BeginMenuPop(ui_menu_pop);
         }
         // This frame's press edges of the gated buttons (Y's combos, UpdateGameplay's Y + X),
         // then Y's own gesture: y_menu does Menu's tap, hold and long hold here, in every
@@ -5175,7 +5906,12 @@ struct OpenXRPresenter::Impl {
         if (in[PhysMenu]) {
             look_game = {0.0f, 0.0f};
         }
-        if (screen_context || menu_context) {
+        if (page_input_owned && !page.IsOpen()) {
+            ReleasePageInput(raw);
+            in = Gate(raw);
+        }
+        const auto native_menu = VR::PagePad::NativeMenuButtons(EmulatorSettings.IsCircleEnter());
+        if (screen_context || menu_context || page.IsOpen()) {
             // Virtual screen: Quest menu conventions. While the game itself shows its title,
             // menus or a loading screen (no gameplay camera updates), the left stick steps
             // through menus as the D-pad (its analog axes stay neutral so the cursor never moves
@@ -5191,28 +5927,80 @@ struct OpenXRPresenter::Impl {
             }
             if (page.IsOpen()) {
                 // The VR page has the controllers; the game's grid under it gets nothing.
-                UpdatePage(in, raw, move_game, look_game, time, dt);
+                UpdatePage(in, move_game, look_game, time, dt);
                 axes[0] = axes[1] = axes[2] = axes[3] = 128;
+                ResetMenuThumbs(); // a click or X held into the page is no tap after it
             } else if (menu_context && !menu_open) {
                 pad.ReleaseAll(); // discard menu repeats queued before the close as well
                 axes[0] = axes[1] = axes[2] = axes[3] = 128;
                 menu_armed = false;
                 menu_dir = PadButton{};
+                ResetMenuThumbs();
             } else if (menu_stick) {
                 // Game menus (title, splash, loading): accept and back on both hands (A or X
-                // accepts, B or Y goes back; y_menu: B alone, Y is the menu, UpdateYGesture), the
-                // grips give Square and Triangle, and both sticks step through the menu as the
-                // D-pad (whichever is pushed further). Menus keep the standard layout with
-                // swap_sticks too: the hands' own clicks.
+                // accepts, X the touchpad in a game menu, below; B or Y goes back; y_menu: B
+                // alone, Y is the menu, UpdateYGesture), the grips give Square and Triangle, and
+                // both sticks step through the menu as the D-pad (whichever is pushed further).
+                // Menus keep the standard layout with swap_sticks too: the hands' own clicks.
+                // In a game menu (2026-11-12, a player: the storage box's L2 / R2 could not be
+                // pressed in VR; the inventory's own Controls help names R3 Help and the touchpad's
+                // halves, Controls and Sort), with the user's picks:
+                // - a stick click tapped is L3 / R3, held MenuClickHoldS it is L2 / R2 until let
+                //   go (the storage box's moves of everything, safer as a hold);
+                // - X tapped is the touchpad's left half (Controls), held MenuTouchHoldS its right
+                //   half (Sort), as the gestures' B combo in gameplay; A alone confirms.
+                // Elsewhere here (the title, loading, a flat moment with no menu) the clicks are
+                // L3 / R3 as pressed and X confirms, as A.
                 const PhysicalState hin = thumbs_swapped ? SwapThumbs(in) : in;
-                hold(PadButton::Cross, hin[PhysA] || hin[PhysX]);
-                hold(PadButton::Circle, hin[PhysB] || (hin[PhysY] && y_menu_slot < 0));
+                // A stays Confirm, regardless of the game's Cross/Circle assignment.
+                hold(static_cast<PadButton>(native_menu.confirm),
+                     hin[PhysA] || (hin[PhysX] && !menu_context));
+                hold(static_cast<PadButton>(native_menu.back),
+                     hin[PhysB] || (hin[PhysY] && y_menu_slot < 0));
                 hold(PadButton::Square, hin[PhysGripL]);
                 hold(PadButton::Triangle, hin[PhysGripR]);
                 hold(PadButton::L1, hin[PhysTriggerL]);
                 hold(PadButton::R1, hin[PhysTriggerR]);
-                hold(PadButton::L3, hin[PhysStickL]);
-                hold(PadButton::R3, hin[PhysStickR]);
+                if (menu_context) {
+                    // Both clicks at once are the controls switch (held 1 s): neither is a tap or
+                    // a hold here until both are let go (-1).
+                    const bool chord = hin[PhysStickL] && hin[PhysStickR];
+                    for (int h = 0; h < 2; ++h) {
+                        const bool down = hin[h == 0 ? PhysStickL : PhysStickR];
+                        float& t = menu_click_s[h];
+                        if (chord) {
+                            t = -1.0f;
+                        }
+                        if (down) {
+                            if (t >= 0.0f) {
+                                t += dt;
+                                hold(h == 0 ? PadButton::L2 : PadButton::R2,
+                                     t >= MenuClickHoldS);
+                            }
+                        } else {
+                            if (t > 0.0f && t < MenuClickHoldS) {
+                                pad.Press(h == 0 ? PadButton::L3 : PadButton::R3);
+                            }
+                            t = 0.0f;
+                        }
+                    }
+                    if (hin[PhysX]) {
+                        menu_x_s += dt;
+                        if (!menu_x_fired && menu_x_s >= MenuTouchHoldS) {
+                            menu_x_fired = true;
+                            FireTouch(0.75f); // the right half: Sort
+                        }
+                    } else {
+                        if (menu_x_s > 0.0f && !menu_x_fired) {
+                            FireTouch(0.25f); // the left half: Controls
+                        }
+                        ResetMenuThumbs(false);
+                    }
+                } else {
+                    ResetMenuThumbs();
+                    hold(PadButton::L3, hin[PhysStickL]);
+                    hold(PadButton::R3, hin[PhysStickR]);
+                }
                 const float left_len = std::hypot(move_game.x, move_game.y);
                 const float right_len = std::hypot(look_game.x, look_game.y);
                 MenuStick(left_len >= right_len ? move_game : look_game, dt);
@@ -5242,13 +6030,31 @@ struct OpenXRPresenter::Impl {
         } else {
             UpdateGameplay(in, move_game, look_game, left, right, gesture, held, axes, dt, input_dt);
         }
-        if (screen_context || menu_context) {
+        // Page closure can happen inside UpdatePage or earlier through Menu. Re-gate
+        // this same sample before downstream held-item/injection consumers see it.
+        if (page_input_owned && !page.IsOpen()) {
+            ReleasePageInput(raw);
+            in = Gate(raw);
+            held = 0;
+            axes = {128, 128, 128, 128, 0, 0};
+        }
+        if (screen_context || menu_context || page.IsOpen()) {
             whip_transform_hold.Reset(raw[classic || settings.right_grip_draw ? PhysGripL : PhysGripR]);
             two_hand_guide_gesture.Reset(raw[PhysGripR]);
             QuickCancel(menu_context ? "game menu" : "virtual screen");
         }
+        // cinematic_ladder_skip: behind the black the climb goes on by itself, the stick held
+        // his way with the dodge button (the game's fast climb up, its slide down), to where the
+        // flat view would end (and on to the dismount after a lead return).
+        if (const auto ladder_skip = VR::LadderSkipNow();
+            ladder_skip.climb != 0 && !menu_context && !page.IsOpen()) {
+            axes[0] = 128;
+            axes[1] = axis(ladder_skip.climb > 0 ? -1.0f : 1.0f);
+            hold(PadButton::Circle, true);
+        }
         PollInject(dt);
-        UpdateHeldRequest(in, analog[0], dt, !screen_context && !menu_context);
+        UpdateHeldRequest(in, analog[0], dt,
+                          !screen_context && !menu_context && !page.IsOpen());
 
         if (touch_left > 0.0f) {
             touch_left -= dt;
@@ -5306,12 +6112,18 @@ struct OpenXRPresenter::Impl {
             axes[0] = axis(walk.x);
             axes[1] = axis(-walk.z);
         }
-        if (!VR::Lamps::Mailbox().ApplyInput([&](VR::Lamps::Pad lamp_pad) {
+        if (VR::SoftSave::Mailbox().ApplyInput([&](bool confirm, bool allow_back) {
+                const u32 mask = confirm ? native_menu.confirm
+                    : (allow_back && menu_back) ? native_menu.back : 0;
+                pad.ApplyLamp(mask, dt);
+        })) {
+            // Soft-save input owns the VR pad; failed-load recovery allows only Back.
+        } else if (!VR::Lamps::Mailbox().ApplyInput([&](VR::Lamps::Pad lamp_pad) {
                 u32 mask = 0;
                 if (lamp_pad == VR::Lamps::Pad::Back)
-                    mask = static_cast<u32>(PadButton::Circle);
+                    mask = native_menu.back;
                 if (lamp_pad == VR::Lamps::Pad::Yes)
-                    mask = static_cast<u32>(PadButton::Cross);
+                    mask = native_menu.confirm;
                 if (lamp_pad == VR::Lamps::Pad::Left)
                     mask = static_cast<u32>(PadButton::Left);
                 pad.ApplyLamp(mask, dt);
@@ -5349,6 +6161,7 @@ struct OpenXRPresenter::Impl {
                 VR::ShoulderSwitch::Input disabled{};
                 disabled.b = physical[physical_key];
                 if (gate.Update(disabled, dt).consume) in[key] = false;
+                if (is_left) shoulder_y_near_miss = false;
                 confirmation.Reset();
                 continue;
             }
@@ -5379,8 +6192,10 @@ struct OpenXRPresenter::Impl {
             q.b = physical[physical_key];
             q.available = fresh && body.driven && body.arm_weight[side] > .9f && slot >= 0 &&
                           !confirmation.Pending() && !blocked[key];
-            q.attacking = physical[is_left ? PhysTriggerL : PhysTriggerR] ||
-                          (!is_left && melee_window.Current().open) || grip_adjust.Frozen() ||
+            // A swing going out, the grip adjust, a stagger, the game's facing: not yet (a press
+            // waits ShoulderSwitch::RememberS). The hand's own trigger and grip never stop it (the
+            // user, 2026-11-10).
+            q.attacking = (!is_left && melee_window.Current().open) || grip_adjust.Frozen() ||
                           body.daze != 0 || body.facing_block != nullptr;
             q.chord = physical[PhysA] || physical[PhysX] ||
                       physical[is_left ? PhysB : PhysY] || physical[PhysMenu] ||
@@ -5397,6 +6212,9 @@ struct OpenXRPresenter::Impl {
             q.scale = VR::PlayerBody::BodyScaleFor(VR::HeightBodyOffsetM());
             const auto out = gate.Update(q, dt);
             if (out.consume) in[key] = false;
+            // The latest left-hand Y press: a near miss of the shoulder never becomes the game's
+            // Square (UpdateGameplay's untaken quick-item tap); the fan may still take it.
+            if (is_left && out.fresh) shoulder_y_near_miss = out.near_miss && key == PhysY;
             if (out.request) {
                 // Holding while already sheathed is a no-op. Only a tap restores the remembered weapon.
                 if (out.unarm && unarmed) continue;
@@ -5819,6 +6637,36 @@ struct OpenXRPresenter::Impl {
 
     // ---- The VR settings page (vr_menu=1, core/vr/vr_page_runtime.h) ----
 
+    // A VR stick with a radial dead zone (`dead` of its travel; the rest rescaled from 0): a gamepad
+    // style's resting controllers never pass on their drift.
+    static XrVector2f StickDeadZone(XrVector2f v, float dead = 0.15f) {
+        const float r2 = v.x * v.x + v.y * v.y;
+        if (!(r2 > dead * dead)) {
+            return {0.0f, 0.0f}; // at rest (and NaN): no square root
+        }
+        const float r = std::sqrt(r2);
+        const float scale = (std::min(r, 1.0f) - dead) / (1.0f - dead) / r;
+        return {v.x * scale, v.y * scale};
+    }
+
+    // The page's button names for the gamepad: Xbox-style for an Xbox (or generic) pad, else
+    // PlayStation's, the game's own (a PlayStation or Nintendo pad, or only the keyboard).
+    static VR::Page::Glyphs PadPageGlyphs() {
+        const SDL_GamepadType type =
+            (*Common::Singleton<Input::GameControllers>::Instance())[0]->GamepadType();
+        const VR::PagePad::Names n =
+            VR::PagePad::NamesFor(Input::UsesXboxNames(type) ? VR::PagePad::Kind::Xbox
+                                                             : VR::PagePad::Kind::PlayStation);
+        VR::Page::Glyphs g{};
+        g.confirm = n.confirm;
+        g.back = n.back;
+        g.prev = n.prev;
+        g.next = n.next;
+        g.value_prev = n.value_prev;
+        g.value_next = n.value_next;
+        return g;
+    }
+
     // The controller's own names for the page's buttons (the Quest's A / B / LT / RT; the
     // trackpad controllers: Pad / Menu).
     VR::Page::Glyphs PageGlyphs() {
@@ -5904,12 +6752,30 @@ struct OpenXRPresenter::Impl {
     // the right controller points (its ray on the page: the halo, the trigger clicks, a held
     // trigger drags a slider; on nothing that reacts its value step).
     // VR_PAGE_POINTER=left (tests): the left controller points and its trigger clicks.
-    void UpdatePage(const PhysicalState& in, const PhysicalState& raw, const XrVector2f& move,
+    void ReleasePageInput(const PhysicalState& raw) {
+        page_input_owned = false;
+        SwitchContext(raw, "VR page closed: release controls before reuse", true);
+        menu_exit_guard.BeginClose();
+    }
+
+    void UpdatePage(const PhysicalState& in, const XrVector2f& move,
                     const XrVector2f& look, XrTime time, float dt) {
         auto& page = VR::Page::Runtime::Get();
         VR::Page::Input pi{};
-        const XrVector2f stick =
+        // A gamepad drives the page too (core/vr/page_pad.h): its left stick or D-pad as the
+        // stick, Cross confirms, Circle goes back, L1 / R1 the tabs, L2 / R2 the value.
+        page_pad_blocked &= pad_phys.buttons;
+        const u32 pad_now = pad_phys.buttons & ~page_pad_blocked;
+        const VR::PagePad::Nav pad_nav = VR::PagePad::ReadNav(
+            pad_now, page_pad_prev, pad_phys.axes[static_cast<size_t>(Input::Axis::LeftX)],
+            pad_phys.axes[static_cast<size_t>(Input::Axis::LeftY)]);
+        page_pad_prev = pad_now;
+        XrVector2f stick =
             std::hypot(move.x, move.y) >= std::hypot(look.x, look.y) ? move : look;
+        const bool vr_stick = std::hypot(stick.x, stick.y) > 0.5f;
+        if (std::hypot(pad_nav.x, pad_nav.y) > std::hypot(stick.x, stick.y)) {
+            stick = {pad_nav.x, pad_nav.y};
+        }
         const float ax = std::abs(stick.x), ay = std::abs(stick.y);
         s32 dir = -1;
         if (ay > 0.6f && ay > 1.5f * ax) {
@@ -5941,8 +6807,25 @@ struct OpenXRPresenter::Impl {
         pi.right = step == 3;
         const bool a = in[PhysA] || in[PhysX];
         const bool b = (in[PhysB] && !YMenuOwns(PhysB)) || (in[PhysY] && !YMenuOwns(PhysY));
-        pi.confirm = a && !page_a;
-        pi.back = b && !page_b;
+        pi.confirm = (a && !page_a) || pad_nav.confirm;
+        pi.back = (b && !page_b) || pad_nav.back;
+        // The gamepad for the controls view (its lights): held, the sticks past half way.
+        pi.pad_held = pad_phys.buttons;
+        const auto past_half = [this](Input::Axis x, Input::Axis y) {
+            const int dx = pad_phys.axes[static_cast<size_t>(x)] - 128;
+            const int dy = pad_phys.axes[static_cast<size_t>(y)] - 128;
+            return dx * dx + dy * dy > 64 * 64;
+        };
+        pi.pad_stick_l = past_half(Input::Axis::LeftX, Input::Axis::LeftY);
+        pi.pad_stick_r = past_half(Input::Axis::RightX, Input::Axis::RightY);
+        pi.pad_back = pad_nav.back;
+        // The button names follow the controller you last used: the gamepad's or the VR ones.
+        // They switch once this frame's input has reached the page (below): their redraw would
+        // hold back the press that switched them (the death choice and the lamp page take input
+        // only on a view already shown).
+        const bool vr_used = a || b || vr_stick || in[PhysGripL] || in[PhysGripR] ||
+                             in[PhysTriggerL] || in[PhysTriggerR];
+        const bool switch_names = pad_nav.used != vr_used && pad_nav.used != page_pad_names;
         page_a = a;
         page_b = b;
         static const bool left_pointer = [] {
@@ -6002,8 +6885,8 @@ struct OpenXRPresenter::Impl {
         pi.ray_on_page = pointing;
         // The grips: the tabs (right: next, left: previous), one step per squeeze (their latches'
         // press / release thresholds debounce the squeeze).
-        pi.tab_next = page_grip_r_pace.Step(in[PhysGripR], dt, false);
-        pi.tab_prev = page_grip_l_pace.Step(in[PhysGripL], dt, false);
+        pi.tab_next = page_grip_r_pace.Step(in[PhysGripR], dt, false) || pad_nav.tab_next;
+        pi.tab_prev = page_grip_l_pace.Step(in[PhysGripL], dt, false) || pad_nav.tab_prev;
         // The triggers: the value (the left trigger: previous; the right one: next), at the
         // stick's pace. The pointing trigger: a click while pointing (no value step from that
         // press, even if the ray leaves the page while it is held), else its own value step.
@@ -6020,6 +6903,8 @@ struct OpenXRPresenter::Impl {
         }
         pi.trigger_released = !point_trigger && page_trigger_r;
         page_trigger_r = point_trigger;
+        pi.value_next = page_pad_r2_pace.Step(pad_nav.value_next_held, dt) || pi.value_next;
+        pi.value_prev = page_pad_l2_pace.Step(pad_nav.value_prev_held, dt) || pi.value_prev;
         if (pointing && page_logs < 400) {
             static u64 last_ns = 0;
             const u64 now = static_cast<u64>(
@@ -6033,12 +6918,15 @@ struct OpenXRPresenter::Impl {
         }
         FillControlsLive(pi, time, dt);
         const VR::Page::Event ev = page.HandleInput(pi);
+        if (switch_names) {
+            page_pad_names = pad_nav.used;
+            page.SetGlyphs(page_pad_names ? PadPageGlyphs() : PageGlyphs());
+        }
+        if (ev == VR::Page::Event::CloseAll) {
+            page_close_all = true; // the game's grid closes too, once the page has let go
+        }
         if (ev == VR::Page::Event::Clicked) {
             haptics[left_pointer ? 0 : 1].Play(Tick(0.12f, 10.0f, 0));
-        } else if (ev == VR::Page::Event::Closed) {
-            // B: back to the grid; B (still held) waits for its release, so the game's grid does
-            // not close with the same press.
-            SwitchContext(raw, "VR page closed: back to the Options grid", true);
         }
     }
 
@@ -6173,9 +7061,27 @@ struct OpenXRPresenter::Impl {
         std::array<XrCompositionLayerQuad, 2> quads{};
         std::array<XrCompositionLayerColorScaleBiasKHR, 2> scales{};
     };
+    // The page's bake images (VrPageLayer): one may be written when no unfinished bake samples
+    // it. Empty, so no bake copies, unless the game's UI is baked into the eyes (ui_compose=eyes).
+    std::function<bool(u32)> PageBakeWritable() {
+        if (!VR::GetSettings().ui_compose_eyes || compose_failed) {
+            return {};
+        }
+        return [this](u32 image) {
+            for (u32 slot = 0; slot < 2; ++slot) {
+                if (page_bake_reads[slot] == static_cast<s32>(image) && !ui_compose.SlotDone(slot)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+    }
+
+    // `baked`: the eye pair shown carries the page (ComposeAdoptedUi): its pieces are still placed
+    // (for the next pair) and the pointer's surface kept, but no layer goes up.
     u32 BuildPageLayers(PageLayerStorage& st, float brightness,
                         std::array<const XrCompositionLayerBaseHeader*, 12>& layers,
-                        u32& layer_count) {
+                        u32& layer_count, bool baked = false) {
         auto& page = VR::Page::Runtime::Get();
         const auto now = std::chrono::steady_clock::now();
         const float dt = page_tick.time_since_epoch().count() == 0
@@ -6190,15 +7096,19 @@ struct OpenXRPresenter::Impl {
             return 0;
         }
         // The newest image, staged before the lock (PreparePage): copied in now.
+        const auto bake_writable = PageBakeWritable();
         if (page_layer.Staged()) {
             const auto upload_start = std::chrono::steady_clock::now();
-            if (page_layer.Upload()) {
+            if (page_layer.Upload(page_staged_revision, bake_writable)) {
                 page_uploaded_revision = page_staged_revision;
                 page_diag.upload_ms_max = std::max(
                     page_diag.upload_ms_max, std::chrono::duration<double, std::milli>(
                                                  std::chrono::steady_clock::now() - upload_start)
                                                  .count());
             }
+        }
+        if (bake_writable) {
+            page_layer.RetryBake(bake_writable); // a copy that found every bake image busy
         }
         if (page_layer.Failed()) {
             page.Close("its layer failed");
@@ -6284,10 +7194,9 @@ struct OpenXRPresenter::Impl {
         page_diag.distance_m = distance;
         page_diag.curved = curved;
         page_diag.opacity = opacity;
-        if (!scale_ext && opacity < 0.5f) {
-            page_surface_valid = false;
-            return 0;
-        }
+        // As layers on a runtime that cannot fade one (no colour scale), the page waits for half
+        // its opacity; baked, it fades with its own tint on any runtime.
+        const bool add_layers = !baked && (scale_ext || opacity >= 0.5f);
         page_surface.curved = curved;
         page_surface.radius = distance;
         page_surface.central_angle = width;
@@ -6308,10 +7217,8 @@ struct OpenXRPresenter::Impl {
         page_surface.quad_h = page_surface.quad_w * h_px / w_px;
         page_surface_valid = true;
         u32 added = 0;
+        page_piece_count = 0;
         for (u32 i = 0; i < 2; ++i) {
-            if (layer_count >= layers.size() - 1) { // the overlay keeps its place
-                break;
-            }
             const float a = i == 0 ? opacity : opacity * page.GlowPulse();
             const void* next = nullptr;
             if (scale_ext && a < 0.999f) {
@@ -6324,6 +7231,7 @@ struct OpenXRPresenter::Impl {
             const XrRect2Di rect{{0, static_cast<s32>(i * page_layer.Height())},
                                  {static_cast<s32>(page_layer.Width()),
                                   static_cast<s32>(page_layer.Height())}};
+            const XrCompositionLayerBaseHeader* layer = nullptr;
             if (curved) {
                 auto& y = st.cylinders[i];
                 y = {XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
@@ -6337,7 +7245,7 @@ struct OpenXRPresenter::Impl {
                 y.radius = distance;
                 y.centralAngle = width;
                 y.aspectRatio = w_px / h_px;
-                layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&y);
+                layer = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&y);
             } else {
                 auto& q = st.quads[i];
                 q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
@@ -6349,23 +7257,37 @@ struct OpenXRPresenter::Impl {
                 q.subImage.imageRect = rect;
                 q.pose = pose;
                 q.size = {page_surface.quad_w, page_surface.quad_h};
-                layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&q);
+                layer = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&q);
             }
-            ++added;
+            // The same place for the bake (the next pair's), its opacity in the tint
+            // (premultiplied: all four channels).
+            if (auto piece = VrUiGeometry::FromLayer(*layer, view_space)) {
+                piece->tint = {a, a, a, a};
+                page_pieces[page_piece_count++] = *piece;
+            }
+            if (add_layers && layer_count < layers.size() - 1) { // the overlay keeps its place
+                layers[layer_count++] = layer;
+                ++added;
+            }
         }
-        if (!page_placed_logged && added > 0) {
+        if (!baked && !add_layers) {
+            page_surface_valid = false; // not shown: nothing for the pointer to hit
+            return 0;
+        }
+        if (!page_placed_logged && (added > 0 || baked)) {
             page_placed_logged = true;
             LOG_INFO(Render_Vulkan,
                      "VR page: shown at yaw {:.1f} pitch {:.1f} deg ({}: yaw {:.1f} pitch {:.1f}; "
                      "kept in view: yaw {:+.1f}, pitch {:+.1f}), {:.1f} x {:.1f} deg at {:.2f} m, "
-                     "{}, text {:.2f} deg, {} mip level{}",
+                     "{}, text {:.2f} deg, {} mip level{}{}",
                      yaw * RadToDeg, pitch * RadToDeg,
                      ui_canvas.valid ? "the menu canvas's place" : "where you looked",
                      page_yaw * RadToDeg, page_pitch * RadToDeg, page_yaw_offset * RadToDeg,
                      (anchor_pitch - page_pitch) * RadToDeg, width * RadToDeg,
                      h_px * deg_per_px, distance, curved ? "curved" : "flat",
                      24.0f * VR::Page::PageScale * deg_per_px, page_layer.MipLevels(),
-                     page_layer.MipLevels() > 1 ? "s" : "");
+                     page_layer.MipLevels() > 1 ? "s" : "",
+                     baked ? ", baked into the eyes" : ", as layers");
         }
         return added;
     }
@@ -6385,10 +7307,15 @@ struct OpenXRPresenter::Impl {
         case F::Piercing:
             return p.Pulse(std::min(1.0f * k, 1.0f), 40.0f).Ramp(0.6f * k, 0.0f, 140.0f);
         case F::Cannon:
-            return p.Pulse(std::min(1.0f * k, 1.0f), 90.0f).Ramp(0.8f * k, 0.0f, 300.0f);
+            // A brief impact, then a deeper, weaker tail while the visible gun recovers.
+            // Explicit Hz use the existing controller gate and unspecified-frequency fallback.
+            return p.Hz(160.0f).Pulse(std::min(1.0f * k, 1.0f), 30.0f)
+                .Hz(80.0f).Ramp(0.45f * k, 0.0f, 150.0f);
         case F::ChurchCannon:
-            return p.Pulse(std::min(0.9f * k, 1.0f), 60.0f).Ramp(0.6f * k, 0.0f, 180.0f);
+            return p.Hz(180.0f).Pulse(std::min(0.9f * k, 1.0f), 30.0f)
+                .Hz(100.0f).Ramp(0.4f * k, 0.0f, 120.0f);
         case F::Gatling:
+            // A separate short pulse for each shot; no tail bridging successive rounds.
             return p.Pulse(0.7f * k, 18.0f);
         default:
             return p.Pulse(std::min(1.0f * k, 1.0f), 25.0f).Ramp(0.55f * k, 0.0f, 90.0f);
@@ -6452,8 +7379,40 @@ struct OpenXRPresenter::Impl {
         const auto* weapon = special ? VR::Body::Weapons::FindFamily(right_family) : nullptr;
         const bool canned =
             right_family != VR::Tricks::SawFamily && weapon != nullptr &&
+            CannedSpecialAvailable(right_family) &&
             VR::Tricks::InKeyList(VR::Tricks::GetTrickSettings().l2_canned, weapon->key);
-        const bool no_special = special && !canned && !bow_string;
+        // Logarius' Wheel (core/vr/wheel_rev.h; the tester, 2026-11-06): in its two-handed form each
+        // quick left-trigger pull is the next of its five spin steps (its L2 chain), played on the
+        // weapon only with the step's buff; each a stronger buzz in both hands. With the wheel in
+        // l2_canned the trigger stays the game's L2 (the hunter's animation). The right trigger
+        // stays the melee's.
+        const bool wheel_rev_on = special && right_family == WheelFamily && !canned &&
+                                  !bow_string && !quick.block_l2;
+        {
+            const float rev_dt =
+                wheel_rev_ns != 0 ? std::clamp(static_cast<float>(now - wheel_rev_ns) * 1e-9f,
+                                               0.0f, 0.1f)
+                                  : 0.0f;
+            wheel_rev_ns = now;
+            if (!wheel_rev_on) {
+                wheel_rev.Reset();
+            } else if (const auto rev = wheel_rev.Update(in[PhysTriggerL], rev_dt);
+                       rev.step > 0) {
+                if (VR::Tricks::GetTrickSettings().haptics) {
+                    const float k = static_cast<float>(rev.step) / VR::WheelRev::Steps;
+                    const auto buzz = Tick(0.25f + 0.55f * k, 15.0f + 30.0f * k,
+                                           rev.step == VR::WheelRev::Steps ? 2 : 1);
+                    haptics[0].Play(buzz);
+                    haptics[1].Play(buzz);
+                }
+                VR::Combat::PublishWheelSpin({++wheel_spin_serial, rev.step, now});
+                LOG_INFO(Render_Vulkan,
+                         "VR gun: Logarius' Wheel spin step {} of {} (left trigger; the weapon "
+                         "only)",
+                         rev.step, VR::WheelRev::Steps);
+            }
+        }
+        const bool no_special = special && !canned && !bow_string && !wheel_rev_on;
         // A pull of it: a soft no in the hand, never silence (the saw's spin is its own).
         const bool l_press = in[PhysTriggerL] && !l2_trigger_prev;
         l2_trigger_prev = in[PhysTriggerL];
@@ -6467,6 +7426,12 @@ struct OpenXRPresenter::Impl {
                      "the game's canned L2; add it to l2_canned to play it)",
                      VR::Body::WeaponName(right_family));
         }
+        // The Kos Parasite with the Milkweed rune (its tendril weapon, variation 3800; the user,
+        // 2026-11-09): the left trigger spits the game's own poison glob from your mouth where you
+        // look, with no animation (bloodborne_gun.cpp KosSpit): in form A at once, in form B on a
+        // tap; held KosRitualHoldS in form B it is the game's ritual (the canned L2) from then on.
+        // Never the left hand's gun meanwhile.
+        const bool kos_spit_on = UpdateKosSpit(in[PhysTriggerL] && !quick.block_l2, now);
         // The left hand the right grip freed (for the handle, the hilt) holds no gun meanwhile.
         const bool freed = right_grip_ready && VR::Tricks::GripUseOf(right_family, RightFormB()) ==
                                                    VR::Tricks::GripUse::Free;
@@ -6488,8 +7453,13 @@ struct OpenXRPresenter::Impl {
         const bool unarmed = !special && VR::Body::LatestBodyStatus(body) &&
                              now - body.steady_ns < 250'000'000 &&
                              body.left_weapon_family == 10; // Bare Fists
-        const bool no_gun = unarmed || freed || no_special || (two_hand.Engaged() && !canned);
+        // The Wheel's spin owns the trigger: never the game's L2 too (its canned spin, the hunter's).
+        const bool no_gun = unarmed || freed || no_special || wheel_rev_on ||
+                            (two_hand.Engaged() && !canned) || (kos_spit_on && !kos_spit.ritual);
         gun_trigger_wait = in[PhysTriggerL] && (gun_trigger_wait || no_gun);
+        if (kos_spit_on && kos_spit.ritual) {
+            gun_trigger_wait = false; // the hold became the ritual: the game's L2 from here
+        }
         const bool gun = in[PhysTriggerL] && !quick.block_l2 && !bow_string && !gun_trigger_wait;
         const bool pulled = gun && !trigger_l_down;
         Cb::GunStatus st{};
@@ -6504,14 +7474,18 @@ struct OpenXRPresenter::Impl {
             reload_seen_shot_ns = 0;
         }
         wrist_reload.SetEnabled(reload_enabled);
-        Gn::PublishReloadAudio(Gn::ReloadCue::None, reload_enabled, now);
+        Gn::PublishReloadAudio(Gn::ReloadCue::None, reload_enabled,
+                               now);
         // Gameplay state cannot depend on the lossy haptic/log queue. Observe the latest
         // confirmed shot before accepting input, including after menus and queue overflow.
         const s64 confirmed_shot_ns = Cb::LatestReloadShotNs();
         if (confirmed_shot_ns > reload_seen_shot_ns && confirmed_shot_ns <= now) {
             reload_seen_shot_ns = confirmed_shot_ns;
             if (reload_enabled && confirmed_shot_ns >= st.player_since_ns) {
-                wrist_reload.Shot(confirmed_shot_ns);
+                const auto trim = VR::Body::DefaultWeaponGrip();
+                const auto barrel = Gn::BarrelInGrip(fresh ? st.attach : 347,
+                    VR::GetSettings().blade_pitch_deg, trim.yaw_deg, trim.pitch_deg, trim.roll_deg);
+                wrist_reload.Shot(confirmed_shot_ns, barrel, family);
             }
         }
         // The game's answers.
@@ -6614,7 +7588,11 @@ struct OpenXRPresenter::Impl {
                               reload_ok ? VR::Gun::ReloadEnd::OrientationLost
                                         : VR::Gun::ReloadEnd::Blocked)) {
             Gn::PublishReloadAudio(Gn::ReloadCue::Reload, true, now);
-            if (gs.haptics) gun_hand.Play(Tick(0.3f, 20.0f));
+            if (gs.haptics) {
+                // Successful reload only: a light, crisp click in the gun hand.
+                // Keep the normal action priority and the runtime's frequency fallback.
+                gun_hand.Play(HapticPattern{}.Hz(VR::Haptics::TickHz).Pulse(0.22f, 20.0f));
+            }
         }
         if (VR::Gun::ReloadAttempt attempt{}; wrist_reload.TakeAttempt(attempt)) {
             LogReloadAttempt(attempt, now);
@@ -6793,6 +7771,15 @@ struct OpenXRPresenter::Impl {
                         const HandState& left, const HandState& right, const GestureFrame& gesture,
                         u32& held, std::array<s32, 6>& axes, float dt, float input_dt) {
         const auto& settings = VR::GetSettings();
+        // VR_TEST_SMOOTH_TURN=<deg/s> (tests only): a smooth turn held all the time, as the right
+        // stick's below.
+        static const float test_turn = [] {
+            const char* v = std::getenv("VR_TEST_SMOOTH_TURN");
+            return v ? static_cast<float>(std::atof(v)) : 0.0f;
+        }();
+        if (test_turn != 0.0f) {
+            smooth_turn_rate = test_turn * (3.14159265f / 180.0f);
+        }
         const bool classic = settings.controls_classic;
         // The motion layout's right grip transforms the weapon and the left grip is free (the
         // user's layout); right_grip=draw keeps the old clutch (UpdateMotionWeapon).
@@ -6821,7 +7808,9 @@ struct OpenXRPresenter::Impl {
         // Motion controls: X arms a Blood Vial for self-injection (X again disarms; held, nothing
         // more: never Triangle); classic or inject=0: X is the game's vial button (Triangle).
         // y_menu, where the arc cannot answer: X pressed with Y held is the game's Square
-        // instead (y_x_combo, below).
+        // instead (y_x_combo, below). left_scheme=2 with inject=1 where the arc can answer (x_fan,
+        // the tester's 2026-11-01 layout: the vial is at the pouch and the shoulder): X is the
+        // quick-item fan's, as Y's tap.
         const bool inject = !classic && settings.inject;
         const auto& quick_settings = VR::Quick::GetQuickSettings();
         const float tap_max_s = quick_settings.l3_tap_ms * 0.001f;
@@ -6904,9 +7893,21 @@ struct OpenXRPresenter::Impl {
                      "answer here)",
                      ThumbName(TC::Y), ThumbName(TC::X));
         }
+        // left_scheme=2 with the stab (inject=1): X opens and closes the quick-item fan as Y's tap
+        // does (puts an item away, disarms a vial), decided at the press where the arc can
+        // answer, kept until X is let go. Elsewhere (third person, quick_arc=0, no quick-item
+        // state) X is as before; inject=0 keeps X the game's vial button (the pouch and the
+        // shoulder draw only the stab's vial). x_button=vial (2026-11-03): X arms the
+        // vial again, as before 2026-11-01.
+        if (!scheme2 || !in[PhysX]) {
+            x_fan = false;
+        } else if (in_press[PhysX]) {
+            x_fan = inject && settings.x_fan && quick_arc_ready && !y_x_combo;
+        }
+        bool x_tap = x_fan && in_press[PhysX];
         // Circle: the sprint, the dodge, A's leap and the second click.
         UpdateLocomotion(in, move, scheme2, l3.jump, held, axes, dt);
-        hold(PadButton::Triangle, in[PhysX] && !inject && !y_x_combo);
+        hold(PadButton::Triangle, in[PhysX] && !inject && !y_x_combo && !x_fan);
 
         // The quick-item arc (UpdateQuickItems): Y (left_scheme=1) or Y's tap (2), and the left
         // stick click's tap (1); quick_arc=0, L3 + Y (1) / Y + X (2 with y_menu, where the arc
@@ -6914,14 +7915,46 @@ struct OpenXRPresenter::Impl {
         // vial: Y disarms an armed vial, X puts an item away (the vial then arms on the same
         // press). A tap is never Square. y_menu: Y's tap is Options (above), never the arc's.
         PhysicalState qin = in;
+        const bool supported_before = OptimizedTwoHand() && two_hand.Engaged();
         bool arc_tap = l3.arc;
         u32 tap_ms = static_cast<u32>(l3.held_s * 1000.0f);
         if (scheme2) {
             qin[PhysY] = y_x_combo; // the quick items' L3 + Y: the game's Square
             qin[PhysStickL] = y_x_combo;
-            qin[PhysX] = in[PhysX] && !y_x_combo;
+            qin[PhysX] = in[PhysX] && !y_x_combo && !x_fan; // the fan's: no vial either
             arc_tap = ymod.arc;
             tap_ms = static_cast<u32>(ymod.held_s * 1000.0f);
+        }
+        // Two-handing (2026-10-28): the left hand holds the weapon and cannot take an
+        // item, so Y opens no quick-item fan, nor the game's Square in its place. Y's chords stay.
+        if (two_hand_out.engaged && two_hand_support.Seated()) {
+            if (!scheme2) qin[PhysY] = false; // left_scheme=1: Y itself opens the fan
+            if (arc_tap || x_tap) {
+                LOG_INFO(Render_Vulkan, "VR input: {} while two-handing: no quick items",
+                         x_tap ? "X" : "Y tap");
+            }
+            arc_tap = false;
+            x_tap = false;
+        }
+        // The Kos Parasite's form B (2026-11-09): the parasite has taken both hands, so
+        // they take no item (form A's left hand is free: its items stay). 101: the Kos Parasite;
+        // 3800: the tendril weapon the game swaps in for it with the Milkweed rune.
+        VR::Combat::MeleeStatus kos_status{};
+        const s64 kos_now = VR::Body::SteadyNowNs();
+        const bool kos_hands = VR::Combat::LatestMeleeStatus(kos_status) && kos_status.form_b &&
+                               kos_now >= kos_status.ns && kos_now - kos_status.ns < 250'000'000 &&
+                               (kos_status.variation == 101 || kos_status.variation == 3800);
+        if (kos_hands) {
+            if (!scheme2)
+                qin[PhysY] = false;
+            if (arc_tap || x_tap) {
+                LOG_INFO(Render_Vulkan,
+                         "VR input: {} with the Kos Parasite in both hands: no quick "
+                         "items",
+                         x_tap ? "X" : "Y tap");
+            }
+            arc_tap = false;
+            x_tap = false;
         }
         // A squeeze on a two-handed weapon's handle is the two-handed grip's, never the arc's;
         // nor is one a hand transform takes (the dual blades' hilt).
@@ -6930,11 +7963,26 @@ struct OpenXRPresenter::Impl {
             UpdateTwoHand(in, left, right, gesture, dt);
         }
         UpdateHandTransform(in, left, right, gesture, dt);
-        const VR::Quick::Output& quick = UpdateQuickItems(qin, left, gesture, dt, arc_tap);
+        // Y cannot open/use quick items while the left hand holds the handle.
+        // Own through release so detaching during a held Y cannot replay its tap.
+        const bool block_item_y = supported_before || (OptimizedTwoHand() && two_hand.Engaged()) ||
+                                  optimized_item_y_wait || kos_hands;
+        optimized_item_y_wait = in[PhysY] && block_item_y;
+        if (block_item_y) {
+            qin[PhysY] = false;
+            if (scheme2) {
+                arc_tap = false;
+                x_tap = false;
+                y_click.NoteCombo();
+            }
+        }
+        const VR::Quick::Output& quick =
+            UpdateQuickItems(qin, left, gesture, dt, arc_tap, x_tap, kos_hands);
         // The Tiny Music Box in the left hand frees the right one (quick_music_box_crank): this
         // frame's transform and swings below already see it, and its putting away.
         UpdateMusicBox(left, right, dt);
         UpdateVialGeometry(right, gesture, dt); // the stab zones (the vial, the bloods)
+        UpdateBloodDraw(in, left, right, gesture, kos_hands); // the right hand's empty syringe (this frame's zones)
         UpdateQuickStab(left, dt);              // quick_use_stab: the blood's stab zones
         UpdatePoseGestures(left, right, gesture, dt); // pose_gestures: the Brain, the Doll
         if (arc_tap) {
@@ -6944,6 +7992,13 @@ struct OpenXRPresenter::Impl {
                          "VR input: {} tap ({} ms): the quick-item arc, as {}{} | t {:.3f}",
                          modifier_name, tap_ms, ThumbName(TC::Y),
                          scheme2 ? "" : " (quick_arc_l3)", t);
+            } else if (scheme2 && shoulder_y_near_miss) {
+                // Y pressed just short of the left shoulder (a weapon switch a moment early): the
+                // fan could not open, and the game's own item use is no answer either.
+                shoulder_y_near_miss = false;
+                LOG_INFO(Render_Vulkan,
+                         "VR input: {} tap ({} ms) just short of the shoulder: nothing | t {:.3f}",
+                         modifier_name, tap_ms, t);
             } else if (scheme2 && quick.tap_outside) {
                 // A cinematic, Menu held, grip adjust: nothing (a reflex tap after a visceral
                 // never uses an item, as Y did there in left_scheme=1).
@@ -6972,7 +8027,14 @@ struct OpenXRPresenter::Impl {
                      quick.square_goods, VR::Quick::CannedClipOf(quick.square_goods),
                      static_cast<double>(VR::Quick::NowNs()) * 1e-9);
         }
-        if (inject) {
+        if (kos_hands) {
+            // Consume X edges while occupied; a held button must not draw on detransform.
+            vial_button.Update(qin[PhysX], false, inject_waiting, dt);
+            vial_rearm_pending = false;
+            vial_belt_draw = false;
+            vial_grip_release = -1.0f;
+            if (vial_armed) DisarmVial();
+        } else if (inject) {
             UpdateVial(qin, left, dt);
         } else if (vial_armed) {
             DisarmVial();
@@ -7001,6 +8063,16 @@ struct OpenXRPresenter::Impl {
             }
             r3_time = 0.0f;
             r3_used = r3_switched = false;
+            r3_immediate_transform = OptimizedTwoHand() &&
+                               (RightFamily() == 320 || VR::Transform::GripHoldRequired(RightFamily())) &&
+                               r3_to_game && look_push < 0.35f;
+            if (r3_immediate_transform) {
+                // The deliberate stick click needs no release/hold delay. Own the
+                // whole click even if blocked: never retry on release after a draw.
+                r3_used = true;
+                if (GripTransformBlock(true) == nullptr && right.valid && right.orientation_valid)
+                    HandTransformNow("bow/whip right-stick press");
+            }
             if (!classic && look_push >= 0.35f) {
                 // A click during a flick or a smooth turn (the thumb pressing down on the way):
                 // the stick must centre before a push selects a weapon, so it never switches one.
@@ -7019,13 +8091,16 @@ struct OpenXRPresenter::Impl {
         } else if (r3_down && r3_to_game) {
             stick_armed = false; // a stick still pushed must centre before it turns
             if (!r3_used && r3_time <= R3TapSeconds) {
-                if (!pad.Press(PadButton::R3)) {
+                if (OptimizedTwoHand()) {
+                    if (GripTransformBlock(true) == nullptr && right.valid && right.orientation_valid)
+                        HandTransformNow("right-stick tap");
+                } else if (!pad.Press(PadButton::R3)) {
                     LOG_INFO(Render_Vulkan, "VR input: R3 tap dropped (input suppressed)");
                 } else {
                     LOG_INFO(Render_Vulkan, "VR input: {} tap ({:.0f} ms): R3 (lock on)",
                              ThumbName(TC::ClickR), r3_time * 1000.0f);
                 }
-            } else if (!r3_switched) {
+            } else if (!r3_switched && !r3_immediate_transform) {
                 // Neither a lock-on nor a weapon switch: felt, not silent.
                 ThumbHaptics(TC::ClickR).Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
                 LOG_INFO(Render_Vulkan,
@@ -7036,7 +8111,7 @@ struct OpenXRPresenter::Impl {
             }
         }
         r3_down = click;
-        const bool r3_switch = !classic && click && r3_to_game;
+        const bool r3_switch = !classic && click && r3_to_game && !r3_immediate_transform;
 
         // B = Cross (interact). Modifier + B: tap = touchpad left (gestures), hold 0.6 s =
         // touchpad right.
@@ -7059,21 +8134,48 @@ struct OpenXRPresenter::Impl {
         }
         b_down = in[PhysB];
         hold(PadButton::Cross, in[PhysB] && !b_to_touch && !summon_bell_block_b);
+        // The deferred tap lasts one input frame; enqueue it so a slower game tick
+        // cannot miss it. Other B consumers may already have claimed it above.
+        if (two_hand_reposition_out.tap && !thumbs_swapped && in[PhysB] &&
+            !b_to_touch && !summon_bell_block_b)
+            pad.Press(PadButton::Cross);
 
         // A shield held up blocks (shield_raise: UpdateShield, the game's L2).
         UpdateShield(left, gesture, held, dt);
         // Gun / parry (the left trigger: UpdateGun). Not while the quick-item arc is open or an
         // item is in the hand (the trigger is the item's use there), and after an item action only
         // from a new pull.
-        UpdateGun(in, quick, held);
-        UpdateSawSpin(in, quick, dt); // either trigger, both hands on the Whirligig
+        PhysicalState weapon_in = in;
+        const bool optimized_special = OptimizedCannedSpecial();
+        const bool special_trigger = optimized_special_trigger.Step(
+            optimized_special, in[PhysTriggerR], RightFamily());
+        if (OptimizedTwoHand() && RightFamily() != 320) {
+            const bool special = optimized_special;
+            optimized_special_wait = in[PhysTriggerR] && (special || optimized_special_wait);
+            weapon_in[PhysTriggerL] = special ? special_trigger
+                                            : (in[PhysTriggerL] && !optimized_trigger_owned);
+        } else {
+            optimized_special_wait = false;
+        }
+        UpdateGun(weapon_in, quick, held);
+        // The attachment trigger never starts the saw in the optimized scheme.
+        if (OptimizedTwoHand() && RightFamily() != 320) weapon_in[PhysTriggerL] = false;
+        UpdateSawSpin(weapon_in, quick, dt);
         // Transform, with a clack. Motion: the right grip; the left grip does nothing in gameplay
         // (kept free for the quick-item arc). transform=native: the weapon-only transform
         // (StartNativeTransform: no L1, the clack comes with the form's lock); otherwise, and for a
         // weapon without a native clip, L1. Classic and right_grip=draw: the left grip is L1
         // (grabbed next to the right hand of a drawn weapon: "two hands on the hilt" on both).
         const auto clack = HapticPattern{}.Pulse(0.6f, 25.0f).Gap(50.0f).Pulse(0.4f, 25.0f);
-        if (grip_transform) {
+        if (grip_transform && OptimizedTwoHand()) {
+            right_grip.Reset(in[PhysGripR]);
+            right_grip_ready = false;
+            grip_r_down = in[PhysGripR];
+            grip_l_down = in[PhysGripL];
+            two_hand_guide_gesture.Reset(in[PhysGripR]);
+            whip_transform_hold.Reset();
+            HandleTransformEvents(clack);
+        } else if (grip_transform) {
             // The weapon's own use of the right grip (hand_transform: frees the left hand, arms the
             // stab, held to charge): never a transform or L1 of its own.
             const bool own_use = UpdateRightGrip(in, left, right, gesture, dt);
@@ -7173,7 +8275,9 @@ struct OpenXRPresenter::Impl {
             hold(PadButton::R2, in[PhysGripR]);
             drawn = false;
         } else {
-            UpdateMotionWeapon(in, right, left, gesture, held, dt);
+            PhysicalState motion_in = in;
+            if (optimized_special_wait) motion_in[PhysTriggerR] = false;
+            UpdateMotionWeapon(motion_in, right, left, gesture, held, dt);
         }
 
         // Lock-on feedback.
@@ -7186,12 +8290,10 @@ struct OpenXRPresenter::Impl {
         // Right stick: X turns; short down flick = item on release; hold down = blink turnaround.
         // Hold up 0.5 s = blood bullets
         // (it costs HP, so a turn that drifts up must never fire it). With the modifier
-        // (left_scheme=1 and classic: the left stick click held) all four directions are instant
-        // D-pad presses; left_scheme=2 has no such modifier since 2026-10-15 (Y held, the stick
-        // does its own job). With the right stick click held (motion) left / right are D-pad
-        // left / right, the left / right hand's next weapon, and (left_scheme=2) up / down D-pad
-        // up / down, the blood bullets and the next item, locked on too (hold Y + right stick
-        // reached them there before). While the game owns the camera (lock-on, cutscenes) the
+        // (left_scheme=1 and classic: the left stick click held) up/down are instant D-pad
+        // presses; Classic also retains left/right. Motion switches weapons at the shoulders.
+        // With the right stick click held, left_scheme=2 retains D-pad up/down for blood
+        // bullets and the next item, locked on too. While the game owns the camera (lock-on, cutscenes) the
         // stick goes to the game, e.g. to switch targets.
         const float x = look.x;
         const float y = look.y;
@@ -7218,36 +8320,59 @@ struct OpenXRPresenter::Impl {
             quick_turn_fade.Start();
             stick_armed = false;
         }
+        // The gamepad's right stick in first person, as the VR controllers': held back, the same
+        // blink turnaround (its left / right turn the view in vr_session.cpp PollPadTurn; in third
+        // person its up / down raise the camera there). Its short flick does nothing: the
+        // gamepad's own D-pad has the items. VR_TUNE_FILE's pad.right_y: the stick as if held.
+        if (!quick_turn_input || !VR::IsFirstPerson() ||
+            quick_turn_fade.phase != VR::Space::Fade::Phase::Idle) {
+            pad_quick_turn.Reset();
+        } else {
+            const auto stick = [this](Input::Axis a) {
+                return (static_cast<float>(pad_phys.axes[static_cast<size_t>(a)]) - 128.0f) /
+                       127.0f;
+            };
+            float pad_y = stick(Input::Axis::RightY); // + = down
+            if (const float t = VR::Tune::Get("pad.right_y", NAN); std::isfinite(t)) {
+                pad_y = std::clamp(t, -1.0f, 1.0f);
+            }
+            if (pad_quick_turn.Step(stick(Input::Axis::RightX), -pad_y, dt, true) ==
+                VR::QuickTurn::Gesture::Event::Turn) {
+                quick_turn_fade.Start();
+                LOG_INFO(Render_Vulkan, "VR input: the gamepad's right stick held back (blink "
+                                        "turnaround)");
+            }
+        }
         if (game_camera) {
             axes[2] = axis(x);
             axes[3] = axis(-y);
         } else if (dpad_modifier) {
             if (stick_armed && (vertical || horizontal)) {
-                const PadButton dpad = vertical ? (y > 0 ? PadButton::Up : PadButton::Down)
-                                                : (x > 0 ? PadButton::Right : PadButton::Left);
-                const bool ok = pad.Press(dpad);
-                modifier_hand.Play(Tick(0.25f, 15.0f, 0));
-                stick_armed = false;
-                note_combo();
-                LOG_INFO(Render_Vulkan, "VR input: {} + {}: D-pad {}{}", modifier_name,
-                         ThumbName(TC::StickR),
-                         dpad == PadButton::Up     ? "up"
-                         : dpad == PadButton::Down ? "down"
-                         : dpad == PadButton::Right ? "right"
-                                                    : "left",
-                         ok ? "" : " dropped");
+                if (!classic && horizontal) {
+                    stick_armed = false;
+                    note_combo();
+                } else {
+                    const PadButton dpad = vertical ? (y > 0 ? PadButton::Up : PadButton::Down)
+                                                    : (x > 0 ? PadButton::Right : PadButton::Left);
+                    const bool ok = pad.Press(dpad);
+                    modifier_hand.Play(Tick(0.25f, 15.0f, 0));
+                    stick_armed = false;
+                    note_combo();
+                    LOG_INFO(Render_Vulkan, "VR input: {} + {}: D-pad {}{}", modifier_name,
+                             ThumbName(TC::StickR),
+                             dpad == PadButton::Up     ? "up"
+                             : dpad == PadButton::Down ? "down"
+                             : dpad == PadButton::Right ? "right"
+                                                        : "left",
+                             ok ? "" : " dropped");
+                }
             }
         } else if (r3_switch) {
-            if (stick_armed && horizontal && r3_time >= R3SwitchSeconds) {
-                const bool right_hand = x > 0.0f;
-                const bool ok = pad.Press(right_hand ? PadButton::Right : PadButton::Left);
-                (right_hand ? weapon_hand : gun_hand)
-                    .Play(ok ? Tick(0.3f, 15.0f, 0) : Repeat(2, 0.15f, 10.0f, 50.0f, 3));
+            if (stick_armed && horizontal) {
+                // Weapon changes belong to shoulder gestures. Consume the deflection
+                // so releasing the click cannot also transform or lock on.
                 stick_armed = false;
                 r3_used = r3_switched = true;
-                LOG_INFO(Render_Vulkan, "VR input: weapon switch, {} hand (D-pad {}){}",
-                         right_hand ? "right" : "left", right_hand ? "right" : "left",
-                         ok ? "" : " dropped");
             } else if (scheme2 && stick_armed && vertical && r3_time >= R3SwitchSeconds) {
                 // left_scheme=2: up / down are D-pad up / down (the blood bullets, the next
                 // quick item), the rest of the D-pad hold Y + right stick gave, locked on too.
@@ -7276,7 +8401,8 @@ struct OpenXRPresenter::Impl {
                              ThumbName(TC::StickR));
                 }
             } else if (std::abs(x) > 0.2f && std::abs(x) > std::abs(y)) {
-                VR::AddTurn(x * settings.smooth_turn_deg_per_s * (3.14159265f / 180.0f) * dt);
+                // By time at each camera update (VR::SetSmoothTurnRate), not this frame's dt.
+                smooth_turn_rate = x * settings.smooth_turn_deg_per_s * (3.14159265f / 180.0f);
             }
             auto& turn_hand = ThumbHaptics(TC::StickR);
             if (quick_event == VR::QuickTurn::Gesture::Event::Item) {
@@ -7397,7 +8523,9 @@ struct OpenXRPresenter::Impl {
         lf.window = loco_seq.Active() ? -1 : window_now;
         lf.facing_off_deg = facing_off;
         lf.jump = jump_now;
-        lf.game_rate = (1.0f / 60.0f) / game_frame;
+        // The game's speed: 60 FPS++ runs slow below 60 fps, the frame hooks only below 30.
+        lf.game_rate =
+            (VR::Bloodborne::FrameHooksActive() ? 1.0f / 30.0f : 1.0f / 60.0f) / game_frame;
         lf.ladder = VR::Bloodborne::LadderActive();
         const bool was_latched = loco.Latched();
         const L::Out o = loco.Update(c, lf);
@@ -7558,6 +8686,9 @@ struct OpenXRPresenter::Impl {
         }
     }
 
+    // VR_LEAN_LOG=1: the lean's and the duck's near misses too. Their lines (all "VR lean:") log on
+    // Core with the i-frame hook's, not on Render.Vulkan, which the headset trials filter to
+    // warnings.
     static bool LeanLogEnabled() {
         static const bool enabled = std::getenv("VR_LEAN_LOG") != nullptr;
         return enabled;
@@ -7583,7 +8714,7 @@ struct OpenXRPresenter::Impl {
         const bool active = settings.lean_dodge && !settings.seated && !settings.controls_classic;
         if (settings.lean_dodge && !lean_logged) {
             lean_logged = true;
-            LOG_INFO(Render_Vulkan,
+            LOG_INFO(Core,
                      "VR lean: lean to dodge {} (head speed >= {:.2f} m/s for 80 ms, travel >= "
                      "{:.2f} m within 250 ms, yaw < 90 deg/s, cooldown {:.0f} ms){}",
                      active ? "on" : "inactive", settings.lean_dodge_speed,
@@ -7635,13 +8766,13 @@ struct OpenXRPresenter::Impl {
             lean_stick_left = std::max(0.15f, frame + pad.MinPress() + 2.0f * frame);
             haptics[0].Play(Tick(0.3f, 20.0f));
             haptics[1].Play(Tick(0.3f, 20.0f));
-            LOG_INFO(Render_Vulkan,
+            LOG_INFO(Core,
                      "VR lean: DODGE {} ({:+.0f} deg from the view) stick {:+.2f},{:+.2f} | head "
                      "{:.2f} m/s travel {:.2f} m yaw {:.0f} deg/s{}",
                      direction(out.angle_deg), out.angle_deg, out.stick_x, out.stick_y, out.speed,
                      out.dist, out.yaw_rate * 57.2957795f, VR::IsLockedOn() ? " (locked on)" : "");
         } else if (out.rejected[0] != '\0' && LeanLogEnabled()) {
-            LOG_INFO(Render_Vulkan,
+            LOG_INFO(Core,
                      "VR lean: no dodge ({}) {} ({:+.0f} deg) | head {:.2f} m/s travel {:.2f} m "
                      "yaw {:.0f} deg/s",
                      out.rejected, direction(out.angle_deg), out.angle_deg, out.speed, out.dist,
@@ -7652,7 +8783,7 @@ struct OpenXRPresenter::Impl {
             if (lean_circle_in <= 0.0f) {
                 lean_circle_in = 0.0f;
                 if (!pad.Press(PadButton::Circle)) {
-                    LOG_INFO(Render_Vulkan, "VR lean: Circle press dropped (input suppressed)");
+                    LOG_INFO(Core, "VR lean: Circle press dropped (input suppressed)");
                 }
             }
         }
@@ -7674,20 +8805,96 @@ struct OpenXRPresenter::Impl {
         VR::Lean::Config iframes_config = config;
         iframes_config.cooldown_s = settings.lean_iframes_cooldown_ms * 0.001f;
         const VR::Lean::Output iframes_out = lean_iframes.Update(iframes_input, iframes_config);
-        if (iframes_out.fire) {
+        // One cooldown for the lean's and the duck's grants: mixing them never protects more often
+        // than leaning alone.
+        const auto iframes_ready = [&] {
+            return input.t - iframes_granted_t >= iframes_config.cooldown_s;
+        };
+        // A lean just after a duck (a duck to the side trips both): the lean's length counted from
+        // the duck's start, so a sideways duck protects as long as a lean, never longer.
+        const s32 after_duck_ms =
+            iframes_granted_duck
+                ? settings.lean_iframes_ms -
+                      static_cast<s32>(std::lround((input.t - iframes_granted_t) * 1000.0))
+                : 0;
+        if (iframes_out.fire && !iframes_ready() && after_duck_ms > 0) {
+            const char* const name = direction(iframes_out.angle_deg);
+            const bool granted =
+                VR::Bloodborne::IframesLeanGrant(static_cast<u32>(after_duck_ms), name);
+            iframes_granted_duck = false; // the cooldown still runs from the duck
+            LOG_INFO(Core,
+                     "VR lean: I-FRAMES {} ms {} ({:+.0f} deg), {:.0f} ms after a duck: the lean's "
+                     "{} ms from the duck | head {:.2f} m/s travel {:.2f} m{}",
+                     after_duck_ms, name, iframes_out.angle_deg,
+                     (input.t - iframes_granted_t) * 1000.0, settings.lean_iframes_ms,
+                     iframes_out.speed, iframes_out.dist,
+                     granted ? "" : " - NOT GIVEN (the i-frame hook is not installed)");
+        } else if (iframes_out.fire && !iframes_ready()) {
+            LOG_INFO(Core,
+                     "VR lean: no i-frames (cooldown: a duck's {:.0f} ms ago) {} | head {:.2f} m/s "
+                     "travel {:.2f} m",
+                     (input.t - iframes_granted_t) * 1000.0, direction(iframes_out.angle_deg),
+                     iframes_out.speed, iframes_out.dist);
+        } else if (iframes_out.fire) {
             const char* const name = direction(iframes_out.angle_deg);
             const bool granted =
                 VR::Bloodborne::IframesLeanGrant(static_cast<u32>(settings.lean_iframes_ms), name);
-            LOG_INFO(Render_Vulkan,
+            iframes_granted_t = input.t;
+            iframes_granted_duck = false;
+            LOG_INFO(Core,
                      "VR lean: I-FRAMES {} ms {} ({:+.0f} deg from the view) | head {:.2f} "
                      "m/s travel {:.2f} m yaw {:.0f} deg/s{}",
                      settings.lean_iframes_ms, name, iframes_out.angle_deg, iframes_out.speed,
                      iframes_out.dist, iframes_out.yaw_rate * 57.2957795f,
                      granted ? "" : " - NOT GIVEN (the i-frame hook is not installed)");
         } else if (iframes_out.rejected[0] != '\0' && LeanLogEnabled()) {
-            LOG_INFO(Render_Vulkan, "VR lean: no i-frames ({}) {} | head {:.2f} m/s travel {:.2f} m",
+            LOG_INFO(Core, "VR lean: no i-frames ({}) {} | head {:.2f} m/s travel {:.2f} m",
                      iframes_out.rejected, direction(iframes_out.angle_deg), iframes_out.speed,
                      iframes_out.dist);
+        }
+
+        // Duck i-frames (duck_iframes_ms, 135 by default; the tester 2026-10-26): a quick duck
+        // (core/vr/lean_dodge.h DuckDetector, the neck pivot: looking down moves nothing) makes
+        // the hunter invulnerable for that many ms of game time, through the lean's grant and its
+        // cooldown. With lean_dodge too (a duck is no dodge).
+        if (duck_space != recenter_serial) {
+            duck_space = recenter_serial; // a recenter moves LOCAL: the neck's history starts again
+            duck_iframes.Reset();
+        }
+        VR::Lean::DuckInput duck_input{};
+        duck_input.t = input.t;
+        duck_input.enabled = settings.duck_iframes_ms > 0 && !settings.seated &&
+                             !settings.controls_classic && VR::IsImmersive() &&
+                             !VR::CinematicActive() && !in[PhysMenu];
+        duck_input.neck_ok = gesture.head_ok;
+        const auto& hp = gesture.head_position;
+        const auto& hq = gesture.head_orientation;
+        duck_input.neck_y =
+            VR::VialZones::NeckFromEye({hp.x, hp.y, hp.z}, {hq.x, hq.y, hq.z, hq.w}).y;
+        // A swing: an attack measured or just sent, or the weapon hand itself fast. Not the hand's
+        // speed against the head (the lean's): a duck takes the head away from still hands.
+        const float hand_world =
+            right.valid ? std::hypot(right.velocity.x, right.velocity.y, right.velocity.z) : 0.0f;
+        duck_input.swing = melee.Pending() || since_attack < 0.35f || hand_world > 2.5f;
+        VR::Lean::DuckConfig duck_config{};
+        duck_config.speed = settings.duck_speed;
+        const VR::Lean::DuckOutput duck_out = duck_iframes.Update(duck_input, duck_config);
+        if (duck_out.fire && !iframes_ready()) {
+            LOG_INFO(Core,
+                     "VR lean: no duck i-frames (cooldown: {:.0f} ms since the last) | neck {:.2f} "
+                     "m/s down, {:.2f} m",
+                     (input.t - iframes_granted_t) * 1000.0, duck_out.speed, duck_out.drop);
+        } else if (duck_out.fire) {
+            const bool granted =
+                VR::Bloodborne::IframesLeanGrant(static_cast<u32>(settings.duck_iframes_ms), "duck");
+            iframes_granted_t = input.t;
+            iframes_granted_duck = true;
+            LOG_INFO(Core, "VR lean: I-FRAMES {} ms duck | neck {:.2f} m/s down, {:.2f} m{}",
+                     settings.duck_iframes_ms, duck_out.speed, duck_out.drop,
+                     granted ? "" : " - NOT GIVEN (the i-frame hook is not installed)");
+        } else if (duck_out.rejected[0] != '\0' && LeanLogEnabled()) {
+            LOG_INFO(Core, "VR lean: no duck i-frames ({}) | neck {:.2f} m/s down, {:.2f} m",
+                     duck_out.rejected, duck_out.speed, duck_out.drop);
         }
     }
 
@@ -7727,14 +8934,30 @@ struct OpenXRPresenter::Impl {
         // A physical pouch or legacy belt draw from UpdateQuickItems, this frame.
         const bool belt_draw = std::exchange(vial_belt_draw, false);
         const float grip_release = std::exchange(vial_grip_release, -1.0f);
+        vial_rearm_wait = std::max(0.0f, vial_rearm_wait - dt);
         if (!vial_armed) {
-            if ((key == VialKey::Arm || belt_draw) && !inject_waiting) {
+            // X within VialRearmS of a heal (the injection takes no time, so X, stab, X, stab
+            // healed nonstop: the tester, 2026-10-27): the press arms once the wait is over. The
+            // pouch and the shoulder are never held back.
+            if (key == VialKey::Arm && vial_rearm_wait > 0.0f && !vial_rearm_pending) {
+                vial_rearm_pending = true;
+                LOG_INFO(Render_Vulkan, "VR inject: X {:.0f} ms after a heal: armed in {:.0f} ms",
+                         (VialRearmS - vial_rearm_wait) * 1000.0f, vial_rearm_wait * 1000.0f);
+            }
+            const bool x_arm =
+                (key == VialKey::Arm || vial_rearm_pending) && vial_rearm_wait <= 0.0f;
+            if ((x_arm || belt_draw) && !inject_waiting) {
                 // X or a left-grip draw: the same armed vial and injection path.
+                vial_rearm_pending = false;
+                // A fresh draw replaces the spent vial and any previous gun's visual tail.
+                // Returning this one must not reveal the previous injection's held vial.
+                inject_hold = gun_hold = 0.0f;
+                EndInjectFreeze("a new vial armed", VR::Body::SteadyNowNs());
                 vial_armed = true;
                 vial_time = 0.0f;
                 vial_reach_age = 10.0f;
                 vial_gate.Reset();
-                vial_belt = key != VialKey::Arm;
+                vial_belt = !x_arm;
                 vial_grip_hold.Reset();
                 if (vial_belt && grip_release >= 0.0f)
                     vial_grip_hold.Start(grip_release);
@@ -7760,7 +8983,7 @@ struct OpenXRPresenter::Impl {
         // Return wins over a stab on the same frame. InjectVial already disarms before
         // submitting to the game, so release cannot cancel/refund a pending injection or
         // shorten the confirmed injection's timed hand pause.
-        if (vial_grip_hold.Return(body_analog[2], left.valid)) {
+        if (vial_grip_hold.Return(body_analog[2], vial_pose_ok)) {
             DisarmVial();
             vial_events |= VrOverlay::VialEventDisarmed;
             if (left.valid)
@@ -8179,6 +9402,234 @@ struct OpenXRPresenter::Impl {
     // its tune; a soft swell on both hands). Released grip: the knob let go. The box put away (or
     // any context switch, QuickCancel): everything back on this very frame.
     static constexpr const char* MusicBoxBlock = "the right hand is on the music box";
+    static constexpr const char* BloodDrawBlock = "the right hand has the empty syringe";
+
+    // Blood bullets by hand (core/vr/blood_draw.h): the right hand at the left shoulder squeezes
+    // its grip: an empty syringe in the fist (the right weapon put away while it is there: the
+    // pose hook, as the music box's; no swings, no transform, no right trigger). Stabbed into the
+    // left arm, the body or a leg (VialContact::LeftArmGate on the syringe's tip, which the
+    // render-camera hook publishes on the right grip), it draws blood and asks the game for its
+    // own blood bullets (their effect, applied by the main player's update: BloodDraw::AskBullets;
+    // without that path the game's D-pad up); once they come and the blood is drawn up, the
+    // view's edges pulse white (the overlay, BloodDrawPulse). Only while the right weapon can be put away (MusicBox::HideReady) and the
+    // shoulder vial is on (vr.ini shoulder_vial: both shoulder draws).
+    void UpdateBloodDraw(const PhysicalState& in, const HandState& left, const HandState& right,
+                         const GestureFrame& gesture, bool hands_occupied) {
+        namespace D = VR::BloodDraw;
+        const s64 now = VR::Body::SteadyNowNs();
+        // Only where the right grip is free for it (not classic controls' R2, not right_grip_draw's
+        // clutch) and the hunter's body is ours in first person (its tip is sampled on his hand).
+        const auto& settings = VR::GetSettings();
+        VR::Body::BodyStatus status{};
+        const bool body = VR::Body::LatestBodyStatus(status) && now >= status.steady_ns &&
+                          now - status.steady_ns < 250'000'000 && status.driven &&
+                          VR::IsFirstPerson();
+        const bool enabled = VR::Quick::GetQuickSettings().shoulder_vial &&
+                             VR::MusicBox::HideReady().load(std::memory_order_relaxed) &&
+                             !settings.controls_classic && !settings.right_grip_draw && body;
+        D::Input bd{};
+        bd.now = now;
+        bd.gameplay = !hands_occupied && enabled && !screen_context && !menu_context && VR::IsImmersive() &&
+                      !VR::CinematicActive() && !VR::MenuPanelActive() &&
+                      !VR::IsGameMenuOpen() && !VR::Page::Runtime::Get().IsOpen();
+        bd.tracked = right.valid && right.orientation_valid &&
+                     VR::Body::IsTracked(grip_right_located);
+        // Busy: another act has the hands, or a swing just ended (a cross-body swing ends at the
+        // left shoulder, and the grip squeezed there then is a transform, not a draw).
+        constexpr float DrawAfterAttackS = 0.6f;
+        // Only a committed swing: the reach to the shoulder itself opens an onset window that
+        // is then aborted, and counting that made the first squeeze there a transform flick (the
+        // user's headset run, 2026-11-04).
+        const auto& swing_now = melee_window.Current();
+        bd.busy = two_hand_out.engaged || bow_up || music_box_free || grip_adjust.Frozen() ||
+                  physical_lever_out.owns_grip[1] || (swing_now.open && swing_now.committed) ||
+                  in[PhysTriggerR] || inject_freeze.On() || vial_armed || inject_waiting ||
+                  VialReaching() || since_committed_attack < DrawAfterAttackS;
+        // The left shoulder: the shoulder switch's zone of it (from the eyes along the torso's
+        // lazy heading), the hand slowed there (a swing past it never draws).
+        blood_draw_zone = false;
+        if (bd.gameplay && bd.tracked && gesture.head_ok && belt_torso.Valid()) {
+            const VR::Belt::P3 f = belt_torso.Forward();
+            const auto& h = gesture.head_position;
+            const auto zone = VR::ShoulderSwitch::ZoneAt(
+                {h.x, h.y, h.z}, {f.x, 0.0f, f.z},
+                VR::PlayerBody::BodyScaleFor(VR::HeightBodyOffsetM()), true);
+            const float reach = VR::ShoulderSwitch::Reach(
+                zone, {right.position.x, right.position.y, right.position.z});
+            const float vx = right.velocity.x - gesture.head_velocity.x,
+                        vy = right.velocity.y - gesture.head_velocity.y,
+                        vz = right.velocity.z - gesture.head_velocity.z;
+            blood_draw_zone = reach < VR::ShoulderSwitch::RadiusM * zone.k &&
+                              std::sqrt(vx * vx + vy * vy + vz * vz) < 1.5f && !bd.busy;
+        }
+        // VR_TUNE_FILE (tests, the mock has no free right hand): bd.zone=1 counts the hand as at
+        // the shoulder, bd.stab=1 as stabbed once the syringe is out.
+        if (VR::Tune::Get("bd.zone", 0.0f) >= 0.5f) {
+            blood_draw_zone = bd.gameplay && bd.tracked && !bd.busy;
+        }
+        bd.at_shoulder = blood_draw_zone;
+        bd.grip = body_analog[3];
+        // The syringe's stab: its tip (the hook's attachment on the right grip) against the left
+        // arm on the left controller, the body and the legs.
+        if (blood_draw.State() == D::Phase::Held && bd.gameplay && bd.tracked) {
+            VR::VialContact::Sample source{}, contact{};
+            VR::Body::BodyStatus body{};
+            if (D::ContactChannel().Load(source) && VR::Body::LatestBodyStatus(body)) {
+                const auto& anatomy = body.driven && body.injection_body.valid
+                                          ? body.injection_body : source.body;
+                contact = VR::VialContact::AtGrip(source, anatomy, grip_right_located.p,
+                                                  grip_right_located.q, now, recenter_serial);
+                VR::VialContact::SeatedLap(contact.body, vial_geo, now);
+                if (VR::Body::IsTracked(grip_left_located))
+                    VR::VialContact::AtLeftGrip(contact.body, grip_left_located.p,
+                                                grip_left_located.q, now);
+            }
+            // The stabbed arm swinging into a still needle is no stab (the vial's arm guard, for
+            // the left arm here).
+            const float lvx = left.velocity.x - gesture.head_velocity.x,
+                        lvy = left.velocity.y - gesture.head_velocity.y,
+                        lvz = left.velocity.z - gesture.head_velocity.z;
+            const bool arm_swinging =
+                left.valid && std::sqrt(lvx * lvx + lvy * lvy + lvz * lvz) >
+                                  VR::VialZones::SwingGuardSpeed;
+            blood_draw_hit = blood_draw_gate.Update(contact, now, recenter_serial,
+                                                    VR::Body::IsTracked(grip_right_located),
+                                                    arm_swinging, settings.vial_zone_scale);
+            bd.stab = blood_draw_hit.stab || VR::Tune::Get("bd.stab", 0.0f) >= 0.5f;
+            if (!blood_draw_hit.stab && blood_draw_hit.refused)
+                LogVialNearMiss("VR blood draw", blood_draw_hit.miss);
+        } else {
+            blood_draw_gate.Reset();
+            blood_draw_hit = {};
+        }
+        VR::Vitals::Status vitals{};
+        bd.bullets_valid = VR::Vitals::LatestStatus(vitals) && vitals.ok &&
+                           now - vitals.steady_ns < 500'000'000;
+        bd.bullets = vitals.blood_bullets;
+        // The game's D-pad up instead: site A's own count (the HUD may read none).
+        if (std::int32_t count = -1; D::BulletsFor(blood_draw_ask, count) && count >= 0) {
+            bd.bullets = count;
+            bd.bullets_valid = true;
+        }
+        bd.answer = D::AnswerFor(blood_draw_ask);
+        blood_draw_out = blood_draw.Update(bd);
+        if (blood_draw_hit.stab) {
+            if (blood_draw_out.stab_too_soon) {
+                // The gate fires once per draw: give it back, or this syringe never stabs.
+                blood_draw_gate.Unfire();
+            } else if (blood_draw_out.ask_bullets) {
+                LogVialStab("VR blood draw: STAB", blood_draw_hit.hit);
+            }
+        }
+        auto& hand = haptics[1];
+        const float k = VR::Quick::GetQuickSettings().haptics; // the quick items' own strength
+        switch (blood_draw_out.feel) {
+        case D::Feel::Draw: hand.Play(QuickHaptic(VR::Quick::Haptic::Grab, k)); break; // a vial's
+        case D::Feel::PutBack: hand.Play(Tick(0.18f * k, 18.0f)); break;
+        case D::Feel::Stab: break; // the thump comes with the game's answer (made, below), as a vial's
+        case D::Feel::Filled: {
+            // The syringe full and the bullets made: a warm surge, then the second beat.
+            HapticPattern p{};
+            p.priority = 2;
+            hand.Play(p.Ramp(0.3f * k, 0.85f * k, 60.0f).Ramp(0.85f * k, 0.15f * k, 200.0f)
+                          .Gap(40.0f).Ramp(0.15f * k, 0.55f * k, 40.0f).Ramp(0.55f * k, 0.0f, 220.0f));
+            blood_draw_pulse_ns = blood_draw.BulletsAt();
+            break;
+        }
+        case D::Feel::Refused:
+            hand.Play(Repeat(2, 0.3f * k, 15.0f, 60.0f, 3));
+            D::CancelAsk(blood_draw_ask); // a late answer never spends HP behind it
+            break;
+        case D::Feel::None: break;
+        }
+        if (blood_draw_out.made) {
+            // The game took it: the Blood Vial's THUMP on both hands (the stabbing right hand the
+            // stronger), then a soft pull rising in it as the blood is drawn up, and the vial's
+            // hold where the needle went in (StartInjectHold: the syringe hand, and the stabbed arm
+            // with vial_inject_hold_hands=both; a yank lets the syringe go at once). Only for an
+            // answer at the stab: the D-pad's comes about 0.9 s later, the hand gone from there.
+            if (k > 0.0f) {
+                hand.Play(InjectThump(InjectThumpStab * std::min(k, 1.0f))
+                              .Gap(40.0f)
+                              .Ramp(0.06f * k, 0.2f * k, 440.0f));
+                haptics[0].Play(InjectThump(InjectThumpOther * std::min(k, 1.0f)));
+            }
+            if (now - blood_draw.StabAt() <= D::HoldAnswerNs) StartInjectHold(true);
+        }
+        if (blood_draw_out.ask_bullets) {
+            // The game's own blood bullets effect, applied by the main player's update (core/vr/
+            // bloodborne_vitals.cpp BloodBulletsSiteA: no clip, the game's rules).
+            blood_draw_ask = D::AskBullets(now);
+            blood_draw_pad_up = false;
+            LOG_INFO(Render_Vulkan, "VR blood draw: the game's blood bullets asked for (ask {}); "
+                                    "Blood Bullets {} now",
+                     blood_draw_ask, bd.bullets_valid ? bd.bullets : -1);
+        } else if (bd.gameplay && bd.tracked &&
+                   bd.answer == D::Answer::Unavailable && !blood_draw_pad_up &&
+                   blood_draw.State() == D::Phase::Drawing) {
+            // No direct path (its signatures): the game's own D-pad up, its clip and all; the
+            // machine waits for the Blood Bullets to rise.
+            blood_draw_pad_up = true;
+            const bool ok = pad.Press(PadButton::Up);
+            LOG_INFO(Render_Vulkan, "VR blood draw: the game's D-pad up instead{}",
+                     ok ? "" : " (DROPPED)");
+        }
+        if (blood_draw_out.log != nullptr) {
+            LOG_INFO(Render_Vulkan, "VR blood draw: {} | t {:.3f}", blood_draw_out.log,
+                     static_cast<double>(now) * 1e-9);
+        }
+        D::PublishScene({now, blood_draw_out.shown, blood_draw_out.fill, blood_draw_out.phase});
+        // VR_TUNE_FILE (tests): a new bd.pulse_test value pulses the edges now (its look:
+        // bd.pulse_inner / bd.pulse_power / bd.pulse_alpha, DrawOverlay).
+        if (VR::Tune::Active()) {
+            const float test = VR::Tune::Get("bd.pulse_test", 0.0f);
+            if (test != blood_draw_pulse_test && test > 0.0f) blood_draw_pulse_ns = now;
+            blood_draw_pulse_test = test;
+        }
+    }
+    // The white edge pulse once the blood bullets came (0..1).
+    float BloodDrawPulse() const {
+        if (VR::Tune::Active() && VR::Tune::Get("bd.pulse_hold", 0.0f) > 0.0f) {
+            return std::min(VR::Tune::Get("bd.pulse_hold", 0.0f), 1.0f); // tests: its peak held
+        }
+        return blood_draw_pulse_ns > 0
+                   ? VR::BloodDraw::Pulse(VR::Body::SteadyNowNs() - blood_draw_pulse_ns)
+                   : 0.0f;
+    }
+
+    // Tonitrus charged (core/vr/tonitrus_charge.h): a new charge (the game thread saw the game's
+    // own begin) claps the thunder and bumps the weapon hand once, quick and strong, as the bolt
+    // strikes (2026-11-09). Its flash is the world's own (the in-frame renderer), no
+    // overlay. A start long gone (a pause, a load) never claps late.
+    void UpdateTonitrusCharge() {
+        namespace T = VR::TonitrusCharge;
+        T::State st{};
+        const s64 now = VR::Body::SteadyNowNs();
+        if (T::Latest(st) && st.serial != tonitrus_serial) {
+            tonitrus_serial = st.serial;
+            if (now >= st.start_ns && now - st.start_ns < 500'000'000) {
+                VR::ThunderAudio::Play(now);
+                if (VR::Tricks::GetTrickSettings().haptics) {
+                    // A crack as the bolt lands, the slam of it, then the thunder rolling off
+                    // through the hand: about 0.2 s, steps of 30 ms or more (a Touch motor over
+                    // Link blurs shorter ones), the hum waiting until it has played. Where the
+                    // controller plays a frequency (PS VR2's Sense, haptic_output.h), the crack
+                    // crisp and the slam and the roll deep.
+                    HapticPattern bump{};
+                    bump.priority = 2;
+                    bump.own = true;
+                    haptics[1].Play(bump.Hz(280.0f)
+                                        .Pulse(1.0f, 30.0f)
+                                        .Hz(65.0f)
+                                        .Pulse(1.0f, 45.0f)
+                                        .Hz(55.0f)
+                                        .Ramp(0.7f, 0.0f, 120.0f));
+                }
+                LOG_INFO(Render_Vulkan, "VR Tonitrus: the strike, {:.0f} ms after the charge began",
+                         static_cast<double>(now - st.start_ns) * 1e-6);
+            }
+        }
+    }
 
     void UpdateMusicBox(const HandState& left, const HandState& right, float dt) {
         namespace MB = VR::MusicBox;
@@ -8363,6 +9814,74 @@ struct OpenXRPresenter::Impl {
                  why != nullptr ? why : "", turned, plays);
     }
 
+    // The bare hands' fingers (core/vr/hand_rig.h; hand_rig): in unarmed mode (the shoulder's empty
+    // slot, that hand's weapon family 10) a hand's thumb, index and other three follow its touches
+    // and squeeze, eased in and out over FingerBlendS; the body bends them over the game's own
+    // (bloodborne_body.cpp ApplyFingerRig). The touches and analog values are the last input
+    // sync's. An armed hand at rest costs no XR call (its touches are not read), and the shoulder's
+    // lock is only taken for a hand holding the bare fists.
+    static constexpr float FingerBlendS = 0.15f;
+    void ApplyFingerRig(VR::Body::HandsSample& sample, XrTime time) {
+        namespace R = VR::Body::Rig;
+        namespace XB = VR::XrBindings;
+        const float dt =
+            finger_time != 0 && time > finger_time
+                ? std::min(static_cast<float>(time - finger_time) * 1e-9f, 0.1f)
+                : 0.0f;
+        finger_time = time;
+        const bool on = VR::GetSettings().hand_rig;
+        if (!on && finger_weight[0] <= 0.0f && finger_weight[1] <= 0.0f) {
+            return; // off and faded out: the game's fingers (sample.fingers stays zero)
+        }
+        VR::Body::BodyStatus body{};
+        const bool fresh = on && VR::Body::LatestBodyStatus(body) &&
+                           sample.steady_ns >= body.steady_ns &&
+                           sample.steady_ns - body.steady_ns < 500'000'000;
+        const auto touch = [this](XB::Act act) {
+            const size_t i =
+                static_cast<size_t>(act) - static_cast<size_t>(XB::Act::TouchTriggerLeft);
+            return actions.touch[i] != XR_NULL_HANDLE && GetBool(actions.touch[i]);
+        };
+        for (size_t h = 0; h < 2; ++h) {
+            const bool left = h == 0;
+            const bool unarmed = fresh &&
+                                 (left ? body.left_weapon_family : body.weapon_family) == 10 &&
+                                 VR::Bloodborne::ShoulderUnarmed(static_cast<unsigned>(h));
+            if (!unarmed && finger_weight[h] <= 0.0f) {
+                continue; // armed and faded out: nothing read, nothing published
+            }
+            R::Input in{};
+            in.thumb_touch = left ? touch(XB::Act::TouchX) || touch(XB::Act::TouchY) ||
+                                        touch(XB::Act::TouchStickLeft) ||
+                                        touch(XB::Act::TouchRestLeft)
+                                  : touch(XB::Act::TouchA) || touch(XB::Act::TouchB) ||
+                                        touch(XB::Act::TouchStickRight) ||
+                                        touch(XB::Act::TouchRestRight);
+            in.trigger_touch =
+                touch(left ? XB::Act::TouchTriggerLeft : XB::Act::TouchTriggerRight);
+            in.trigger = sample.hand[h].trigger;
+            in.squeeze = sample.hand[h].grip;
+            finger_senses[h].Note(in);
+            const R::Curl want = R::Target(in, finger_senses[h]);
+            const float was = finger_weight[h];
+            finger_weight[h] =
+                std::clamp(was + (unarmed ? dt : -dt) / FingerBlendS, 0.0f, 1.0f);
+            // Coming in: from where the hand is now, not from the last time it was bare.
+            finger_curl[h] = was > 0.0f ? R::Follow(finger_curl[h], want, dt) : want;
+            if ((was > 0.0f) != (finger_weight[h] > 0.0f)) {
+                LOG_INFO(Render_Vulkan,
+                         "VR fingers: the {} hand's fingers {} (sensors: thumb {}, trigger {})",
+                         left ? "left" : "right",
+                         finger_weight[h] > 0.0f ? "follow the controller (unarmed)"
+                                                 : "back to the game's",
+                         finger_senses[h].thumb ? "yes" : "not yet",
+                         finger_senses[h].trigger ? "yes" : "not yet");
+            }
+            const R::Curl& c = finger_curl[h];
+            sample.fingers[h] = {finger_weight[h], c.thumb, c.index, c.grip};
+        }
+    }
+
     // Contact is applied by the body solver using the hunter's real finger-pad
     // centre, not by putting the weapon/controller origin on the knob.
     void ApplyMusicBoxHand(VR::Body::HandsSample& sample) {
@@ -8377,12 +9896,17 @@ struct OpenXRPresenter::Impl {
     // the game would queue it and turn the weapon straight back (a reflex clench at the join).
     static constexpr s64 HandTransformLockNs = 1'000'000'000;
 
-    const char* GripTransformBlock() const {
+    // `stick`: the right stick's click asks (the optimized scheme), not a grip squeeze: the hand
+    // merely resting at the left shoulder (where a squeeze would draw the syringe) does not stop it.
+    const char* GripTransformBlock(bool stick = false) const {
         if (VialReaching()) {
             return "the vial is at the wrist";
         }
         if (music_box_free) {
             return MusicBoxBlock; // the right grip takes the crank
+        }
+        if (blood_draw_out.owns_grip || (!stick && blood_draw_zone)) {
+            return BloodDrawBlock; // the right grip draws / holds the empty syringe
         }
         if (bow_up && (bow.State() == VR::Bow::Phase::Nocked ||
                        (bow_at_bow && (bow.State() == VR::Bow::Phase::Holding ||
@@ -8406,7 +9930,7 @@ struct OpenXRPresenter::Impl {
             right_grip.CancelCooldown();
             charge_serial = 0;
         }
-        if (VR::Tricks::GrabFamily(RightFamily()) && RightFormB() && !two_hand.Engaged() &&
+        if (!OptimizedTwoHand() && VR::Tricks::GrabFamily(RightFamily()) && RightFormB() && !two_hand.Engaged() &&
             revert_tries < 3) {
             ++revert_tries;
             hold_form.pending = true;
@@ -8420,6 +9944,30 @@ struct OpenXRPresenter::Impl {
     }
     bool RightFormB() const {
         return two_hand_status_ok && two_hand_status.style >= 3 && two_hand_status.style <= 5;
+    }
+
+    bool OptimizedTwoHand() const {
+        const auto& settings = VR::GetSettings();
+        return VR::TwoHand::GetTwoHandSettings().optimized_controls &&
+               !settings.controls_classic && !settings.right_grip_draw;
+    }
+
+    bool CannedSpecialAvailable(s32 family) const {
+        if (!VR::Tricks::KosFamily(family)) return true;
+        VR::Combat::MeleeStatus ms{};
+        const s64 now = VR::Body::SteadyNowNs();
+        const bool fresh = VR::Combat::LatestMeleeStatus(ms) && now >= ms.ns &&
+                           now - ms.ns < 250'000'000;
+        return VR::Tricks::CannedSpecialAvailable(family, fresh ? ms.variation : -1);
+    }
+
+    bool OptimizedCannedSpecial() const {
+        if (!OptimizedTwoHand() || !two_hand_status_ok ||
+            two_hand_status.style != VR::TwoHand::StyleTwoHanded ||
+            RightFamily() == 320 || RightFamily() == VR::Tricks::SawFamily) return false;
+        const auto* weapon = VR::Body::Weapons::FindFamily(RightFamily());
+        return weapon && CannedSpecialAvailable(RightFamily()) &&
+               VR::Tricks::InKeyList(VR::Tricks::GetTrickSettings().l2_canned, weapon->key);
     }
 
     // A transform the hands made (a grab, a let-go, a charge, a gesture): the weapon-only one at
@@ -8447,6 +9995,14 @@ struct OpenXRPresenter::Impl {
         return native || l1;
     }
 
+    // Whether a Combat::FurnaceQuench is carried out now: the game's pose tick runs the
+    // weapon-only transform (TransformStatus::native, fresh). With transform=vanilla or the hook
+    // not installed it never is (the lit Boom Hammer's squeeze then stays the game's L1).
+    bool BoomQuenchCarriedOut(s64 now) const {
+        VR::Combat::TransformStatus st{};
+        return VR::Combat::LatestTransformStatus(st) && st.native && now - st.ns < 250'000'000;
+    }
+
     // hand_transform (core/vr/trick_weapons.h RightGrip), the right grip every gameplay frame of
     // the motion layout: per weapon (GripUseOf) it frees the left hand for the handle or the hilt
     // (a latch's click in both hands), arms the Bloodletter's stab, or, held, charges: Tonitrus
@@ -8461,6 +10017,53 @@ struct OpenXRPresenter::Impl {
         auto& lh = haptics[0];
         auto& rh = haptics[1];
         const s32 family = RightFamily();
+        bool boom_owns_grip = false;
+        {
+            // The Boom Hammer's fire (boom_fire_hits): lit afresh, its hits count from 0; gone
+            // cold after the hits that spent it (HandleMeleeEvents) or a squeeze, a fizzle and a
+            // puff of sparks. A fire-out that never came (the switch refused) is forgotten after
+            // 6 s.
+            const s64 now = VR::Body::SteadyNowNs();
+            const bool lit = family == Tr::BoomFamily && RightFormB();
+            if (lit && !boom_was_lit) {
+                boom_lit_hits = 0;
+                boom_lit_ns = now;
+            }
+            // Lit, the grip squeezed again puts the fire out (2026-11-06: "if I press
+            // grip button again (the transformation) while it is lit, it should go unlit
+            // again"): the weapon only, as a spent fire (Combat::FurnaceQuench), never the game's
+            // L1 (its B->A has no clip). Not within BoomRelitGraceNs of lighting (mashing it
+            // alight overshoots a squeeze or two). The grip is its own while lit either way, but
+            // only where the fire-out is carried out (BoomQuenchCarriedOut): with
+            // transform=vanilla or the hook not installed the squeeze stays the game's L1.
+            boom_owns_grip = lit && ts.hand_transform && BoomQuenchCarriedOut(now);
+            if (boom_owns_grip && in[PhysGripR] && !grip_r_down && boom_quench_ns == 0 &&
+                now - boom_lit_ns >= BoomRelitGraceNs) {
+                VR::Combat::PublishFurnaceQuench({++boom_quench_serial, now});
+                boom_quench_ns = now;
+                boom_quench_why = "the squeeze";
+                LOG_INFO(Core, "VR right grip: Boom Hammer: squeezed while lit: its fire put out");
+            }
+            if (!lit && boom_was_lit && boom_quench_ns > 0) {
+                if (ts.haptics) {
+                    rh.Play(HapticPattern{}.Pulse(0.3f, 14.0f).Gap(50.0f).Ramp(0.2f, 0.0f, 160.0f));
+                }
+                VR::FurnaceAudio::Play(VR::FurnaceAudio::Snap, now, 0.5f * ts.boom_volume,
+                                       VR::FurnaceAudio::PullPitch(0.6f));
+                const Tr::Frame f = TrickFrame(left, right, gesture, false, dt);
+                if (VR::Body::LengthSq(f.axis) > 0.5f && f.right.valid) {
+                    wall_sparks.Strike(f.right.p + f.axis * 0.70f, f.axis, f.right.v, 3.0f);
+                }
+                LOG_INFO(Core, "VR right grip: Boom Hammer: its fire went out ({:.0f} ms after "
+                               "{})",
+                         static_cast<double>(now - boom_quench_ns) * 1e-6, boom_quench_why);
+                boom_quench_ns = 0;
+            }
+            if (boom_quench_ns > 0 && now - boom_quench_ns > 6'000'000'000) {
+                boom_quench_ns = 0;
+            }
+            boom_was_lit = lit;
+        }
         if (Tr::GripUseOf(family, RightFormB()) == Tr::GripUse::None) {
             if (family == Tr::FistFamily) {
                 // Switching to fists mid-squeeze must also stop the previous weapon's
@@ -8513,8 +10116,9 @@ struct OpenXRPresenter::Impl {
             right_grip.Reset(true); // this squeeze is none (a cooldown runs on)
             right_grip_ready = false;
             end_sustain();
-            if (ts.haptics) {
-                rh.Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3)); // not now: the deny
+            // Not now: the deny (the syringe's draw has its own feel instead).
+            if (ts.haptics && block != BloodDrawBlock) {
+                rh.Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
             }
             LOG_INFO(Render_Vulkan, "VR right grip: {} ignored ({})", VR::Body::WeaponName(family),
                      block);
@@ -8522,9 +10126,42 @@ struct OpenXRPresenter::Impl {
         }
         Tr::Frame f = TrickFrame(left, right, gesture, false, dt);
         f.right.grip = in[PhysGripR];
+        // The Boom Hammer's head struck by the left hand's gun or torch counts along its length.
+        const bool left_known = now - body.steady_ns < 1'000'000'000;
+        const s32 left_family = left_known ? body.left_weapon_family : -1;
+        f.left_reach = Tr::LeftReachOf(left_family);
+        if (use == Tr::GripUse::Pull && !ts.boom_pull) {
+            use = Tr::GripUse::Hold; // (boom_pull=0: held 1.5 s, as before)
+        }
+        if (!furnace_seeded) { // the catches differ each session
+            right_grip.Seed(static_cast<u32>(now ^ (now >> 32)));
+            furnace_seeded = true;
+        }
         const Tr::RightGrip::Out o = right_grip.Step(f, use, family, ts);
         right_grip_ready = o.ready;
-        if (o.charging && ts.haptics) {
+        const bool engine = use == Tr::GripUse::Pull;
+        // The furnace's growl while it idles, louder, higher and brighter revved up
+        // (core/vr/furnace_audio.h; unpublished, it falls silent).
+        if (engine) {
+            VR::FurnaceAudio::PublishGrowl({now, o.charging ? 0.55f + 0.45f * o.progress : 0.0f,
+                                            0.0f, 0.85f + 0.4f * o.progress, ts.boom_volume});
+        }
+        // Sparks out of the furnace's head (the weapon walls' field): `speed` throws more.
+        const auto furnace_sparks = [&](float speed) {
+            if (VR::Body::LengthSq(f.axis) > 0.5f && f.right.valid) {
+                wall_sparks.Strike(f.right.p + f.axis * 0.70f, f.axis, f.right.v, speed);
+            }
+        };
+        if (o.charging && engine && ts.haptics) {
+            // Caught, the furnace idles: a low rumble and its putter, faster and harder as it
+            // revs up (8 to 22 beats a second).
+            rh.sustain = grip_sustain_r = 0.10f + 0.30f * o.progress;
+            furnace_beat_s += dt;
+            if (furnace_beat_s >= 1.0f / (8.0f + 14.0f * o.progress)) {
+                furnace_beat_s = 0.0f;
+                rh.Play(Tick(0.18f + 0.3f * o.progress, 8.0f, 1));
+            }
+        } else if (o.charging && ts.haptics) {
             // The build: felt from its start (a steady level gets no haptic floor) and rising
             // with the charge, a detent at each quarter (Tonitrus' crackle, the furnace, the beast).
             rh.sustain = grip_sustain_r = 0.12f + 0.30f * o.progress;
@@ -8588,10 +10225,30 @@ struct OpenXRPresenter::Impl {
                          : fmt::format("held: {:.1f} s to go", Tr::HoldSOf(family)));
             break;
         case E::Fire: {
+            if (o.struck) {
+                if (feel) { // the knock of the strike in the striking hand
+                    lh.Play(HapticPattern{big}.Pulse(0.75f, 12.0f).Ramp(0.3f, 0.0f, 60.0f));
+                }
+                // (Core: the headset logs keep it.)
+                LOG_INFO(Core, "VR right grip: {}: its head struck by the left {} ({:.1f} m/s): lit",
+                         weapon,
+                         f.left_reach <= 0.0f ? "hand"
+                         : left_family == 200 || left_family == 201 ? "torch"
+                         : left_family == 190 || left_family == 191 ? "shield"
+                                                                    : "gun",
+                         o.strike_speed);
+            } else if (engine) {
+                LOG_INFO(Core, "VR right grip: {}: revved up: lit", weapon);
+            }
+            if (engine) {
+                furnace_sparks(6.0f);
+            }
             const u32 serial_before = hand_transform_serial;
             const bool sent =
                 HandTransformNow(use == Tr::GripUse::Lift ? "lifted up: charged"
                                  : family == 320          ? "held: the bow"
+                                 : o.struck               ? "struck: lit"
+                                 : engine                 ? "revved up: lit"
                                                           : "held: charged");
             charge_serial = sent && hand_transform_serial != serial_before ? hand_transform_serial
                                                                             : 0;
@@ -8623,14 +10280,77 @@ struct OpenXRPresenter::Impl {
             LOG_INFO(Render_Vulkan, "VR right grip: {}: let go before it charged", weapon);
             break;
         case E::Cooling:
-            if (feel) {
+            if (engine) { // too soon: a dry cough
+                if (feel) {
+                    rh.Play(HapticPattern{}.Pulse(0.22f, 14.0f).Ramp(0.1f, 0.0f, 40.0f));
+                }
+                VR::FurnaceAudio::Play(VR::FurnaceAudio::Snap, now, 0.3f * ts.boom_volume,
+                                       VR::FurnaceAudio::PullPitch(0.75f));
+            } else if (feel) {
                 rh.Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
             }
             LOG_INFO(Render_Vulkan, "VR right grip: {}: cooling down ({:.1f} s left)", weapon,
                      o.cooldown_s);
             break;
+        case E::Cough:
+            // A pull that did not catch: the flint's dry snap and a cough in the hand, a little
+            // harder each pull (the user's pick: the snap on the misses, the whoomph on the catch,
+            // both about 80% pitch, each pull a little different).
+            if (feel) {
+                rh.Play(HapticPattern{}
+                            .Pulse(std::min(0.3f + 0.12f * static_cast<float>(o.pull), 0.7f), 22.0f)
+                            .Gap(35.0f)
+                            .Pulse(0.15f, 12.0f));
+            }
+            VR::FurnaceAudio::Play(
+                VR::FurnaceAudio::Snap, now,
+                std::min(0.8f + 0.1f * static_cast<float>(o.pull), 1.0f) * ts.boom_volume,
+                VR::FurnaceAudio::PullPitch(VR::FurnaceAudio::SnapPitch));
+            furnace_sparks(1.0f + 0.8f * static_cast<float>(o.pull));
+            LOG_INFO(Core, "VR right grip: {}: pull {}: a cough", weapon, o.pull);
+            break;
+        case E::Catch:
+            // It caught: the snap and its whoomph; the furnace roars up (the growl from now on,
+            // published above).
+            if (feel) {
+                rh.Play(HapticPattern{big}.Pulse(0.6f, 30.0f).Ramp(0.45f, 0.2f, 120.0f));
+            }
+            VR::FurnaceAudio::Play(VR::FurnaceAudio::Whoomph, now, ts.boom_volume,
+                                   VR::FurnaceAudio::PullPitch(VR::FurnaceAudio::WhoomphPitch));
+            furnace_beat_s = 0.0f;
+            furnace_sparks(4.0f);
+            LOG_INFO(Core, "VR right grip: {}: pull {}: it caught (hold it to rev it up, squeeze "
+                           "it again, or strike its head)",
+                     weapon, o.pull);
+            break;
+        case E::Pump:
+            // Caught, squeezed again: pumped up, a whoomph higher the more it is revved.
+            if (feel) {
+                rh.Play(HapticPattern{}.Pulse(0.35f + 0.35f * o.progress, 20.0f));
+            }
+            VR::FurnaceAudio::Play(
+                VR::FurnaceAudio::Whoomph, now, (0.6f + 0.3f * o.progress) * ts.boom_volume,
+                VR::FurnaceAudio::PullPitch(VR::FurnaceAudio::WhoomphPitch +
+                                            0.2f * o.progress));
+            furnace_sparks(2.0f + 2.0f * o.progress);
+            LOG_INFO(Core, "VR right grip: {}: pumped up ({:.0f}%)", weapon, 100.0f * o.progress);
+            break;
+        case E::Die:
+            // Idled out: it sputters and dies.
+            if (feel) {
+                rh.Play(HapticPattern{}
+                            .Pulse(0.25f, 12.0f)
+                            .Gap(70.0f)
+                            .Pulse(0.15f, 10.0f)
+                            .Gap(110.0f)
+                            .Pulse(0.08f, 8.0f));
+            }
+            VR::FurnaceAudio::Play(VR::FurnaceAudio::Snap, now, 0.4f * ts.boom_volume,
+                                   VR::FurnaceAudio::PullPitch(0.7f));
+            LOG_INFO(Core, "VR right grip: {}: it died out unrevved: pull again", weapon);
+            break;
         }
-        return use != Tr::GripUse::Transform;
+        return use != Tr::GripUse::Transform || boom_owns_grip;
     }
 
     // right_grip=transform: why a right-grip squeeze starting now happens mid-swing (a flick for
@@ -8666,10 +10386,12 @@ struct OpenXRPresenter::Impl {
     // newest intent wins). Needs the motion layout with right_grip=transform (the left grip is
     // free there); otherwise, with quick_arc=0, or without the hunter's hand, Y is Square.
     // `l3_tap`: the left stick click was tapped this frame (quick_arc_l3): a Y press for the arc;
-    // Output::tap_taken says whether it was one (else the caller sends L3).
+    // Output::tap_taken says whether it was one (else the caller sends L3). `x_tap`: X pressed as
+    // the fan's (left_scheme=2, UpdateGameplay's x_fan).
     const VR::Quick::Output& UpdateQuickItems(const PhysicalState& in, const HandState& left,
                                               const GestureFrame& gesture, float dt,
-                                              bool l3_tap) {
+                                              bool l3_tap, bool x_tap = false,
+                                              bool hand_occupied = false) {
         namespace Q = VR::Quick;
         const auto& settings = VR::GetSettings();
         const auto& qs = Q::GetQuickSettings();
@@ -8688,6 +10410,22 @@ struct OpenXRPresenter::Impl {
             quick_inframe_warned = true;
             LOG_WARNING(Render_Vulkan, "VR quick: the in-frame renderer cannot draw the arc; Y is "
                                        "the game's Square until it can");
+        }
+        // Each time it goes and comes back (headset tuning: the arc, the pouches and the shoulder
+        // vial go with it).
+        if constexpr (Common::Log::Enabled) {
+            if (shown != quick_inframe_shown && quick_inframe_flips < 200) {
+                ++quick_inframe_flips;
+                const auto stats = VR::InFrame::GetStats();
+                LOG_INFO(Render_Vulkan,
+                         "VR quick: the in-frame renderer {} (lists submitted {}, taken {}) | t "
+                         "{:.3f}",
+                         shown ? "is back: the arc, pouches and shoulder vial are on"
+                               : "refused 30 item lists in a row: the arc, pouches and shoulder "
+                                 "vial are off (tried again in 20 s)",
+                         stats.submitted, stats.taken, static_cast<double>(now) * 1e-9);
+            }
+            quick_inframe_shown = shown;
         }
         c.enabled = qs.quick_items && qs.quick_arc && !settings.controls_classic &&
                     !settings.right_grip_draw && shown;
@@ -8717,6 +10455,11 @@ struct OpenXRPresenter::Impl {
         c.idle_close_s = qs.idle_close_s;
         c.late_hover_s = qs.grace_ms * 0.001f;
         c.nearest_max = qs.nearest;
+        // quick_arc_pick=fan: the arc's cards picked by direction round the controller
+        // (Config::fan).
+        c.fan = qs.pick_fan;
+        c.fan_span_deg = qs.span_deg; // the render hook's PlaceFan uses the same
+        c.fan_radius_m = qs.radius_m * (settings.seated ? 0.875f : 1.0f); // ... and this
         // left_scheme=2: the left grip opens the arc and the trigger takes (core/vr/quick_items.h
         // Config::left_scheme); the grip at the left hip draws a Blood Vial where the vial is
         // X's (inject on, motion controls, the left grip free: right_grip=transform).
@@ -8787,24 +10530,48 @@ struct OpenXRPresenter::Impl {
         // once the right weapon can be put away (HideReady); before that, the game's way. Read
         // as the box is taken: a box already in the hand keeps its way.
         c.crank = qs.music_box_crank && VR::MusicBox::HideReady().load(std::memory_order_relaxed);
+        // The Monocular is looked through at the eye wherever UpdateGameplay's optic works
+        // (native stereo with asymmetric eyes, or DIBR): its trigger does nothing there.
+        // Elsewhere the trigger still uses it the game's way.
+        static const bool native_optic = std::getenv("VR_NATIVE_STEREO") != nullptr &&
+                                         std::getenv("VR_NATIVE_ASYMMETRIC") != nullptr;
+        const VR::StereoConfig optic_stereo = VR::GetStereo();
+        c.optic = native_optic || (std::getenv("VR_NATIVE_STEREO") == nullptr &&
+                                   optic_stereo.stereo && optic_stereo.mode == 2);
+        // quick_tap_pick / quick_tool_keep / quick_tool_gestures: pick, then use; the hunter tools
+        // stay in the hand and wait for their acts (Q::ToolKeepOf, Q::ToolGestureOf).
+        c.tap_pick = qs.tap_pick;
+        c.tap_use_s = qs.tap_use_ms * 0.001f;
+        // The grip takes from the fan and holds; the fan is back after a quick use (Q::Config).
+        c.grip_hold = qs.grip_hold;
+        c.fan_return_s = qs.fan_return_ms * 0.001f;
+        c.grip_open_s = qs.grip_open_ms * 0.001f;
+        c.tool_keep = qs.tool_keep;
+        c.tool_gestures = qs.tool_gestures;
+        c.tool_direct = qs.tool_direct;
+        // The Madaras Whistle is blown through its call once that is decoded (0 before: at once).
+        c.whistle_s = VR::GameSounds::WhistleCallS();
         Q::Input q{};
         q.t = static_cast<double>(now) * 1e-9;
         q.dt = dt;
-        q.gameplay = !VR::CinematicActive() && !in[PhysMenu] && !grip_adjust.Frozen() &&
-                     VR::IsImmersive();
+        q.gameplay = !hand_occupied && !VR::CinematicActive() && !in[PhysMenu] &&
+                     !grip_adjust.Frozen() && VR::IsImmersive();
         VR::Body::BodyStatus status{};
         const bool fresh = VR::Body::LatestBodyStatus(status) &&
                            VR::Body::SteadyNowNs() - status.steady_ns < 250'000'000;
         q.body = fresh && status.driven && VR::IsFirstPerson();
         q.arm_weight = fresh ? status.arm_weight[0] : 0.0f;
-        q.y = in[PhysY];
+        // The game's item window (anim_classes.h GateOut::items_ok): the tools wait for it.
+        q.items_ok = !fresh || status.items_ok;
+        q.y = !hand_occupied && in[PhysY];
         q.l3 = in[PhysStickL];
         q.arc_tap = l3_tap;
         // left_scheme=2: the tap is Y's (UpdateGameplay), for the log.
         q.arc_tap_by = settings.left_scheme == 2 && !settings.controls_classic ? "Y" : "L3";
         q.x_edge = in[PhysX] && !quick_x_down;
         quick_x_down = in[PhysX];
-        q.trigger_latch = in[PhysTriggerL];
+        q.x_fan = x_tap;
+        q.trigger_latch = in[PhysTriggerL] && !optimized_trigger_owned;
         // Held through a context switch (a menu, the screen, the headset off): 0 until let go, as
         // the gate holds the buttons back (else the first gameplay frame is a squeeze: the arc
         // opens, a vial is drawn). The raw trigger still says a clench (no arc, no vial).
@@ -8813,12 +10580,7 @@ struct OpenXRPresenter::Impl {
         // arrow nocked (UpdateShield, UpdateBow), is never the arc's (with left_scheme=2 Y still
         // opens it).
         const bool bow_grip = bow_up && (bow_hand_i == 0 || ArrowInHand());
-        q.grip = blocked[PhysGripL] || physical_lever_out.owns_grip[0] ||
-                         two_hand_out.owns_grip || hand_owns_grip || shield_up ||
-                         bow_grip
-                     ? 0.0f
-                     : body_analog[2];
-        q.trigger = blocked[PhysTriggerL] ? 0.0f : body_analog[0];
+        q.trigger = blocked[PhysTriggerL] || optimized_trigger_owned ? 0.0f : body_analog[0];
         q.trigger_raw = body_analog[0];
         // left_scheme=2: a swing (an attack went out since the last frame) or a leap / dodge
         // (UpdateLocomotion, this frame) closes the open arc.
@@ -8829,6 +10591,14 @@ struct OpenXRPresenter::Impl {
         q.dodge = loco_combat != nullptr; // (quick_hold_use: cancels the ring filling)
         loco_combat = nullptr;
         q.hand_valid = left.valid;
+        vial_pose_ok = vial_pose_grace.Update(
+            now, recenter_serial,
+            q.gameplay && q.body && c.enabled && c.holster_mode != 0 && settings.inject,
+            left.position_tracked || left.valid,
+            (left.position_tracked || left.valid || left.pose_valid) &&
+                std::isfinite(left.position.x) && std::isfinite(left.position.y) &&
+                std::isfinite(left.position.z));
+        q.vial_pose_valid = vial_pose_ok;
         q.hand_p = {left.position.x, left.position.y, left.position.z};
         q.hand_v = {left.velocity.x, left.velocity.y, left.velocity.z};
         // The pose is predicted for the display time, the grip read now: a throw's release
@@ -8850,6 +10620,16 @@ struct OpenXRPresenter::Impl {
         // change is re-prediction noise, not motion).
         q.hand_q = {left.orientation.x, left.orientation.y, left.orientation.z,
                     left.orientation.w};
+        // These two tools can fire along the controller's pointing ray.
+        if ((quick_out.held_goods == VR::Augur::Goods || quick_out.held_goods == VR::BlackskyEye::Goods) &&
+            actions.aim_space_left != XR_NULL_HANDLE) {
+            const HandState aim = LocateHand(actions.aim_space_left, gesture.time);
+            if (aim.orientation_valid) {
+                q.aim_valid = true;
+                q.aim_q = {aim.orientation.x, aim.orientation.y, aim.orientation.z,
+                           aim.orientation.w};
+            }
+        }
         const float pose_dt = quick_prev_time != 0
                                   ? static_cast<float>(gesture.time - quick_prev_time) * 1e-9f
                                   : 0.0f;
@@ -8927,7 +10707,8 @@ struct OpenXRPresenter::Impl {
         q.vial_armed = vial_armed;
         // The belt vial: where the left hand is against the hip's box (the torso's heading
         // follows the view lazily, so a glance down at the hip leaves the box where the hip is).
-        q.vial_busy = vial_armed || inject_waiting || inject_hold > 0.0f;
+        q.vial_held = vial_armed || inject_waiting; // UpdateVial's own rule for a new vial
+        q.vial_busy = q.vial_held || inject_hold > 0.0f;
         if (gesture.head_ok) {
             belt_torso.Update({gesture.forward.x, gesture.forward.y, gesture.forward.z}, dt);
         }
@@ -8950,6 +10731,8 @@ struct OpenXRPresenter::Impl {
             for (int &a : hc.assignment)
                 if (a == 1)
                     a = 0;
+        if (!qs.shoulder_vial)
+            hc.assignment[VR::Holsters::ShoulderSlot] = 0;
         hc.scale = VR::PlayerBody::BodyScaleFor(VR::HeightBodyOffsetM());
         hc.reach = qs.holster_reach_cm * 0.01f;
         const bool holsters_enabled =
@@ -8957,27 +10740,79 @@ struct OpenXRPresenter::Impl {
         VR::Holsters::Targets mounted{};
         const bool mounted_fresh =
             Q::LatestHolsterTargets(mounted) && VR::Holsters::Fresh(mounted, now, recenter_serial);
-        // A setting change must not leave yesterday's assignment active for one render frame.
-        const bool assignments_match = mounted.layout.assignment == hc.assignment;
         const auto& lp = left.position;
-        const auto holsters = holster_tracker.Follow(mounted.layout, {lp.x, lp.y, lp.z},
-                                                     holsters_enabled && left.valid &&
-                                                         mounted_fresh && assignments_match,
-                                                     hc.reach, hc.scale);
+        // The right-shoulder vial: the shoulder switch's own zone of the right shoulder (from the
+        // eyes along the torso's lazy heading, at the same body scale). Actual weapon-grab
+        // ownership wins; clenching the right grip alone must not hide the healing target.
+        VR::ShoulderSwitch::Zone shoulder_zone{};
+        const bool shoulder_free = !two_hand_out.engaged &&
+                                   (!two_hand_out.owns_grip || two_hand_out.held_near) &&
+                                   !hand_weapon_grab && !hand_owns_grip && gesture.head_ok &&
+                                   belt_torso.Valid();
+        if (shoulder_free) {
+            const VR::Belt::P3 f = belt_torso.Forward();
+            const auto& h = gesture.head_position;
+            shoulder_zone = VR::ShoulderSwitch::ZoneAt({h.x, h.y, h.z}, {f.x, 0.0f, f.z},
+                                                       hc.scale, false);
+        }
+        const auto pickup_layout =
+            VR::Holsters::PickupLayout(mounted.layout, mounted_fresh, hc, shoulder_free);
+        const auto holsters = holster_tracker.Follow(
+            pickup_layout, {lp.x, lp.y, lp.z},
+            holsters_enabled && (left.valid || vial_pose_ok),
+            hc.reach, hc.scale, shoulder_free ? &shoulder_zone : nullptr, !left.valid);
         q.holster_assignment = holsters.hover >= 0 ? hc.assignment[holsters.hover] : 0;
-        q.holster_entered = holsters.entered;
+        // No touch tick at the right shoulder (2026-10-27); the pouches keep theirs, but
+        // the waist pocket's only while the hunter stands still (2026-11-03: walking, running or
+        // dodging it kept buzzing as the hand swung in and out of it). Its grab is untouched.
+        VR::Body::Anchor walk{};
+        const bool anchored = VR::Body::LatestAnchor(walk) && walk.valid;
+        const bool moving = hunter_moving.Update(anchored, walk.steady_ns,
+                                                 {walk.chr_t.x, walk.chr_t.y, walk.chr_t.z},
+                                                 walk.world_scale, now);
+        q.holster_entered = holsters.entered && holsters.hover != VR::Holsters::ShoulderSlot &&
+                            !(moving && holsters.hover == VR::Holsters::WaistSlot);
+        q.holster_near_assignment = q.holster_assignment > 0 ? q.holster_assignment
+                                                           : holsters.near_assignment;
+        q.holster_late_mask = holsters.late_mask;
+        q.holster_space = recenter_serial;
+        q.holster_targets_fresh = holsters.valid;
         q.carried_vials = VR::Bloodborne::CarriedBloodVials();
-
         q.snapshot_fresh = Q::LatestSnapshot(q.snapshot) && q.snapshot.valid &&
                            now - q.snapshot.steady_ns < 300'000'000;
+        // A near-handle miss is only a reservation, not a held weapon. A real vial
+        // target wins that overlap on the original squeeze; held weapons/transforms
+        // still own their inputs. Use the same targets and freshness as pickup below.
+        if (q.holster_assignment == 1 && holsters.valid && holsters_enabled &&
+            q.snapshot_fresh && q.snapshot.alive && !q.y && !q.arc_tap && !q.x_fan &&
+            left.valid && q.arm_weight >= c.arm_min && !q.vial_held &&
+            q.carried_vials > 0 && !hand_owns_grip && !hand_weapon_grab &&
+            !blocked[PhysGripL] && !physical_lever_out.owns_grip[0] &&
+            !optimized_grip_wait && !shield_up && !bow_grip &&
+            two_hand.YieldNearGrab(two_hand_out)) {
+            near_hold_ns = 0;
+        }
+        q.grip = blocked[PhysGripL] || physical_lever_out.owns_grip[0] ||
+                         two_hand_out.owns_grip || optimized_grip_wait || hand_owns_grip || shield_up ||
+                         bow_grip
+                     ? 0.0f
+                     : body_analog[2];
+
         q.hover_fresh = Q::LatestHover(q.hover) && now - q.hover.steady_ns < 250'000'000;
         q.have_result = Q::LatestResult(q.result);
+        Q::LatestRelicDrop(q.relic_drop);
         // quick_use_wipe: the newest sample of the paper against the blade, and the two-handed
         // grip on the handle (the left hand is there: no wipe until it lets go).
         q.wipe_fresh = c.wipe && Q::LatestWipe(q.wipe) &&
                        now - q.wipe.steady_ns < static_cast<s64>(c.wipe_cfg.stale_s * 1e9f);
         q.two_hand = two_hand_out.engaged;
         q.weapon_grab = two_hand_out.grabbed || hand_weapon_grab;
+        q.corpse_grab = q.gameplay && q.body && q.hand_valid &&
+                        status.left_weapon_family == 10 &&
+                        VR::Bloodborne::ShoulderUnarmed(0) &&
+                        ((VR::GetSettings().corpse_hands && VR::Bloodborne::CorpseGrabAvailable(0, now)) ||
+                         VR::Bloodborne::GehrmanChairGrabAvailable(0, now));
+        q.cigarette_gift = VR::Cigarette::gift_serial.load(std::memory_order_relaxed);
         // quick_use_stab: the blood in the hand went into a stab zone (UpdateQuickStab, the last
         // input frame).
         q.stab = quick_stab_zone != nullptr;
@@ -8986,8 +10821,9 @@ struct OpenXRPresenter::Impl {
         // quick_use_mouth: the mouth below and in front of the eyes, in the head's frame (its
         // pitch: a head tilted back to drink brings it forward). The head's velocity whatever
         // quick_use_mouth says: the mouth's speed and the shake's forearm channel (Q::ShakeGate:
-        // the hand against the head, so walking or leaning never counts) both read it.
-        if (c.mouth && gesture.head_ok) {
+        // the hand against the head, so walking or leaning never counts) both read it. The Madaras
+        // Whistle is blown there too (quick_tool_gestures).
+        if ((c.mouth || c.tool_gestures) && gesture.head_ok) {
             const auto& h = gesture.head_position;
             q.mouth_valid = true;
             q.mouth = Q::MouthPoint({h.x, h.y, h.z},
@@ -8997,6 +10833,41 @@ struct OpenXRPresenter::Impl {
         if (gesture.head_ok && gesture.head_velocity_ok) {
             q.head_v = {gesture.head_velocity.x, gesture.head_velocity.y,
                         gesture.head_velocity.z};
+        }
+        // quick_arc_pick=fan: the fan's frame faces you from the eyes (Q::MakeFanFrame).
+        if (gesture.head_ok) {
+            q.head_valid = true;
+            q.head_p = {gesture.head_position.x, gesture.head_position.y,
+                        gesture.head_position.z};
+            q.head_forward = {gesture.forward.x, gesture.forward.y, gesture.forward.z};
+        }
+        // The Blacksky Eye held to your eye (Q::ToolGesture::Eye) is measured as the Monocular's
+        // optic is (below): the item's drawn centre (else the grip) to each of your eyes, the
+        // headset's own eye poses, in the poses the held item is drawn with.
+        q.blade_motion_valid = left.valid && gesture.head_ok && gesture.head_velocity_ok;
+        if (quick_out.held_goods == VR::ShamanBlade::Goods)
+            Q::LatestBladeContact(q.blade_contact);
+        if (quick_out.held_goods == VR::HunterRelics::Gloves)
+            Q::LatestGloveContact(q.glove_contact);
+        q.eye_tracked = VR::Body::IsTracked(grip_left_located);
+        if (grip_head_tracked && last_head.valid && last_head.space_serial == grip_located_space) {
+            std::array<float, 3> drawn{};
+            const bool from_item =
+                quick_out.held_goods >= 0 &&
+                VR::Bloodborne::HeldItemPoint(grip_located_space, VR::Body::SteadyNowNs(),
+                                              quick_out.held_goods, drawn);
+            if (from_item || q.eye_tracked) {
+                const VR::Body::Vec3 at = from_item
+                                              ? VR::Body::Vec3{drawn[0], drawn[1], drawn[2]}
+                                              : grip_left_located.p;
+                const auto head_q = VR::Body::Normalize(grip_head_q);
+                for (u32 eye = 0; eye < 2; ++eye) {
+                    const VR::Vec3& p = last_head.eye_pose[eye].position;
+                    const auto offset = VR::Body::Rotate(head_q, VR::Body::Vec3{p.x, p.y, p.z});
+                    q.eye_d[eye] = VR::Body::Length(at - grip_head_p - offset);
+                }
+                q.eye_valid = true;
+            }
         }
         // quick_music_box_crank: the crank went round last frame (UpdateMusicBox): the box plays.
         q.crank_play = music_box_play;
@@ -9046,7 +10917,7 @@ struct OpenXRPresenter::Impl {
         if (quick_out.disarm_vial && vial_armed) {
             DisarmVial();
             vial_events |= VrOverlay::VialEventDisarmed;
-            LOG_INFO(Render_Vulkan, "VR quick: Y while the vial was armed: vial disarmed");
+            LOG_INFO(Render_Vulkan, "VR quick: Y or X while the vial was armed: vial disarmed");
         }
         if (quick_out.grip_edge && c.belt_vial) {
             // Where every left-grip squeeze was against the hip's box (headset tuning).
@@ -9062,6 +10933,105 @@ struct OpenXRPresenter::Impl {
             vial_belt_draw = true; // UpdateVial arms it this frame, as X would
             vial_grip_release = quick_out.vial_grip_release;
         }
+        // Every left squeeze near the right shoulder (within the zone's near-miss margin): a
+        // vial within 250 ms (an early squeeze waits for the hand), or none and what stood in the
+        // way, as the squeeze's frame saw it (headset tuning, 2026-11-03: pulls missed while
+        // looking around). The raw grip: a squeeze another hold took counts too.
+        if constexpr (Common::Log::Enabled) {
+            if (left.position_tracked)
+                shoulder_log_tracked_ns = now;
+            const float raw = body_analog[2];
+            const bool squeeze = shoulder_log_grip ? raw > c.hold_release : raw >= c.hold_press;
+            const bool squeeze_edge = squeeze && !shoulder_log_grip;
+            shoulder_log_grip = squeeze;
+            const bool from_shoulder =
+                quick_out.draw_vial && holsters.hover == VR::Holsters::ShoulderSlot;
+            if (squeeze_edge && shoulder_log_until >= 0.0) {
+                LOG_INFO(Render_Vulkan,
+                         "VR shoulder vial: squeeze at the right shoulder: no vial (squeezed "
+                         "again) | {} | t {:.3f}",
+                         shoulder_log_what, q.t);
+                shoulder_log_until = -1.0;
+            }
+            if (squeeze_edge && gesture.head_ok && belt_torso.Valid()) {
+                namespace S = VR::ShoulderSwitch;
+                const VR::Belt::P3 f = belt_torso.Forward();
+                const auto& h = gesture.head_position;
+                const auto zone = S::ZoneAt({h.x, h.y, h.z}, {f.x, 0.0f, f.z}, hc.scale, false);
+                const float reach = S::Reach(zone, {lp.x, lp.y, lp.z});
+                const float radius = S::RadiusM * zone.k;
+                if (reach < radius + S::NearMissM * zone.k) {
+                    constexpr float Deg = 57.29578f;
+                    const auto& v = gesture.forward;
+                    // + the head turned right of the zone's facing (the torso's lazy heading).
+                    const float turn =
+                        -std::remainder(std::atan2(v.x, v.z) - std::atan2(f.x, f.z), 6.2831853f) *
+                        Deg;
+                    const float pitch =
+                        std::atan2(v.y, std::max(std::hypot(v.x, v.z), 1e-6f)) * Deg;
+                    static constexpr const char* Pocket[] = {"pouch", "left pocket", "chest",
+                                                             "shoulder"};
+                    const char* hover = holsters.hover >= 0 && holsters.hover < 4
+                                            ? Pocket[holsters.hover]
+                                            : "none";
+                    const std::string tracked =
+                        left.position_tracked
+                            ? std::string{"yes"}
+                            : fmt::format("no ({} ms since tracked)",
+                                          shoulder_log_tracked_ns > 0
+                                              ? (now - shoulder_log_tracked_ns) / 1'000'000
+                                              : -1);
+                    // The pockets' layout may be from before a setting change (PickupLayout keeps
+                    // the shoulder pickup working through it): noted, not a reason for a miss.
+                    const bool assignments_match = mounted.layout.assignment == hc.assignment;
+                    std::string taken;
+                    if (two_hand_out.engaged)
+                        taken += " two-handed";
+                    if (two_hand_out.owns_grip)
+                        taken += " two-hand grip";
+                    if (hand_weapon_grab)
+                        taken += " weapon grab";
+                    if (hand_owns_grip)
+                        taken += " hand grip";
+                    if (q.grip < c.hold_press)
+                        taken += " grip held back";
+                    shoulder_log_what = fmt::format(
+                        "hand {:.1f} cm from the zone (inside under {:.1f}), tracked {}, vial pose "
+                        "{} | head {:+.0f} deg right of the zone's facing, pitch {:+.0f} | hover {}, "
+                        "pouches {} (mounts {} ms old{}) | taken:{} | quick items {} | body {}, arm "
+                        "{:.2f}, items {}{}, vial busy {}, at hip {}, vials {}, gameplay {}, {}, "
+                        "shoulder_vial {}",
+                        reach * 100.0f, radius * 100.0f, tracked, vial_pose_ok ? "yes" : "no",
+                        turn, pitch, hover, holsters_enabled ? "on" : "off",
+                        mounted.ns > 0 ? (now - mounted.ns) / 1'000'000 : -1,
+                        assignments_match ? "" : ", old assignment", taken.empty() ? " no" : taken,
+                        c.enabled ? "on"
+                        : !shown  ? "off (the in-frame renderer refused)"
+                                  : "off",
+                        q.body ? "yes" : "no", q.arm_weight, q.snapshot_fresh ? "fresh" : "stale",
+                        q.snapshot.busy ? " busy" : "", q.vial_busy ? "yes" : "no",
+                        q.at_hip ? "yes" : "no", q.carried_vials, q.gameplay ? "yes" : "no",
+                        Q::PhaseName(quick.GetPhase()), qs.shoulder_vial ? "on" : "off");
+                    shoulder_log_until = q.t + 0.25;
+                }
+            }
+            // Its vial (on the squeeze's own frame too), or none by the deadline.
+            if (shoulder_log_until >= 0.0 &&
+                (quick_out.draw_vial || q.t >= shoulder_log_until)) {
+                LOG_INFO(Render_Vulkan,
+                         "VR shoulder vial: squeeze at the right shoulder: {} | {} | t {:.3f}",
+                         !quick_out.draw_vial ? "no vial"
+                         : from_shoulder      ? "a vial from the shoulder"
+                                              : "a vial from the pouch",
+                         shoulder_log_what, q.t);
+                shoulder_log_until = -1.0;
+            } else if (from_shoulder) {
+                LOG_INFO(Render_Vulkan,
+                         "VR shoulder vial: a vial from the shoulder (squeezed further out) | t "
+                         "{:.3f}",
+                         q.t);
+            }
+        }
         return quick_out;
     }
 
@@ -9074,6 +11044,12 @@ struct OpenXRPresenter::Impl {
         Q::PublishScene(quick_out.scene);
         if (quick_out.bell_audio != Q::Haptic::None && VR::IsFirstPerson() && VR::IsImmersive())
             Q::PublishBellAudio(quick_out.bell_audio == Q::Haptic::BellToll, Q::NowNs());
+        // Magic has its own short denial cue. Firearm empty/reload audio remains independent.
+        VR::ToolEmptyAudio::Publish(quick_out.no_bullets,
+            qs.use_sounds && VR::IsFirstPerson() && VR::IsImmersive(), Q::NowNs());
+        if (const s64 dry_now = Q::NowNs(); quick_out.no_bullets) {
+            VR::Vitals::NoteBulletsShort(dry_now);
+        }
         if (!quick_out.log.empty()) {
             LOG_INFO(Render_Vulkan, "VR quick: {} | t {:.3f}", quick_out.log,
                      static_cast<double>(Q::NowNs()) * 1e-9);
@@ -9119,7 +11095,13 @@ struct OpenXRPresenter::Impl {
         // quick_hold_use: the left hand's hum rises with the ring (Q::HoldHum; the vial, the
         // other owner of that hand's hum, is never armed with an item in the hand).
         QuickHoldHum(quick_out.hold_hum * k);
-        Q::PublishUseAudio(quick_out.use_whoosh, qs.use_whoosh, Q::NowNs());
+        QuickToolFeel(quick_out.tool_charge, k);
+        Q::PublishUseAudio(quick_out.use_whoosh, qs.use_whoosh, Q::NowNs(),
+                           quick_out.tool_charge.kind, quick_out.tool_charge.full);
+        static_assert(static_cast<int>(Q::WhistleState::Blowing) == VR::WhistleAudio::Blowing &&
+                      static_cast<int>(Q::WhistleState::Done) == VR::WhistleAudio::Done);
+        VR::WhistleAudio::Publish(quick_out.whistle_id, static_cast<u8>(quick_out.whistle),
+                                  Q::NowNs());
     }
 
     // quick_use_wipe: the rasp while the paper touches the blade, on both hands: a light hum
@@ -9168,6 +11150,86 @@ struct OpenXRPresenter::Impl {
         quick_wipe_cue_ns = now + static_cast<s64>((0.40f - 0.32f * n) * 1e9f);
     }
 
+    // A hunter tool charging in the left hand (Output::tool_charge): pulses that quicken and firm
+    // as it gathers, each tool's own grain, then a slow beat while it is full and waiting (the
+    // user's 2026-11-04 "becoming faster, becoming stronger"). Light ticks (priority 0): a use's,
+    // a thump's or a deny's own pattern plays over them. Beast Roar keeps its strain hum; the
+    // ticks add its tremor.
+    void QuickToolFeel(const VR::Quick::Output::ToolCharge& c, float k) {
+        using F = VR::Quick::ToolFeel;
+        const auto kind = static_cast<F>(c.kind);
+        if (kind == F::None || k <= 0.0f) {
+            quick_tool_feel_ns = 0;
+            return;
+        }
+        const s64 now = VR::Body::SteadyNowNs();
+        if (quick_tool_feel_ns != 0 && now < quick_tool_feel_ns) {
+            return;
+        }
+        const float p = std::clamp(c.progress, 0.0f, 1.0f);
+        const auto random = [this] {
+            quick_tool_feel_seed = quick_tool_feel_seed * 1664525u + 1013904223u;
+            return float(quick_tool_feel_seed >> 8) / 16777216.0f;
+        };
+        HapticPattern feel{};
+        feel.priority = 0;
+        float every = 0.2f;
+        switch (kind) {
+        case F::Augur: { // the grip: a soft tremble tightening (the squish's crunch is its own)
+            feel.Pulse((0.10f + 0.22f * p) * k, 12.0f);
+            every = 0.11f - 0.05f * p;
+            break;
+        }
+        case F::Roar: { // the claw's strain: a shuddering tremor over the hum
+            const float a = (0.12f + 0.24f * p) * k;
+            feel.Pulse(a, 30.0f).Pulse(a * (0.45f + 0.3f * random()), 30.0f);
+            every = 0.16f - 0.07f * p;
+            break;
+        }
+        case F::Tonitrus: { // static gathering: crackles, irregular, quickening, bursts of 1..3
+            const float a = (c.full ? 0.34f : 0.12f + 0.34f * p) * k;
+            const int sparks = 1 + int(random() * (c.full ? 3.0f : 1.0f + 2.0f * p));
+            for (int i = 0; i < sparks; ++i) { // dips, not silences (Crunch's 30 ms steps)
+                if (i > 0) feel.Pulse(a * 0.25f, 30.0f);
+                feel.Pulse(a * (0.6f + 0.4f * random()), 30.0f);
+            }
+            every = (c.full ? 0.08f : 0.22f - 0.15f * p) * (0.55f + 0.9f * random());
+            break;
+        }
+        case F::Gloves: { // a heartbeat (lub-dub) quickening; full: on the glow's 1.4 Hz beat
+            const float a = (c.full ? 0.36f : 0.16f + 0.30f * p) * k;
+            feel.Pulse(a, 40.0f).Gap(c.full ? 95.0f : 80.0f - 25.0f * p).Pulse(a * 0.65f, 35.0f);
+            if (!c.full) {
+                every = 0.40f - 0.22f * p;
+            } else {
+                // The glow peaks at (n + 1/4) / 1.4 s on the 10 s clock it is drawn by
+                // (bloodborne_quickitems.cpp, same steady clock): thump with the light.
+                constexpr s64 Cycle = 10'000'000'000LL;
+                const double in = double(now % Cycle) * 1e-9;
+                double next = (std::floor(in * 1.4 - 0.25) + 1.0 + 0.25) / 1.4;
+                if (next - in < 0.2) next += 1.0 / 1.4;
+                every = float(next - in);
+            }
+            break;
+        }
+        case F::CallBeyond: { // a shimmer swelling; gathered: a slow, heavy throb until raised
+            if (!c.full) {
+                const float a = (0.08f + 0.30f * p) * k;
+                feel.Ramp(0.0f, a, 30.0f).Ramp(a, 0.0f, 30.0f);
+                every = (0.18f - 0.12f * p) * (0.8f + 0.4f * random());
+            } else {
+                feel.Ramp(0.05f * k, 0.30f * k, 90.0f).Ramp(0.30f * k, 0.0f, 140.0f);
+                every = 0.62f;
+            }
+            break;
+        }
+        case F::None:
+            return;
+        }
+        haptics[0].Play(feel);
+        quick_tool_feel_ns = now + static_cast<s64>(std::max(every, 0.03f) * 1e9f);
+    }
+
     void QuickHoldHum(float level) {
         if (level > 0.0f) {
             haptics[0].sustain = level;
@@ -9188,6 +11250,8 @@ struct OpenXRPresenter::Impl {
         quick_out.scene.holsters = {};
         quick_out.scene.holsters_enabled = false;
         holster_tracker.Reset();
+        vial_pose_grace.Reset();
+        vial_pose_ok = false;
         quick_out.scene.state = VR::Quick::SceneState::Closed;
         quick_out.scene.hold_from_ns = 0;
         quick_out.held_goods = quick_out.held_ffx = -1;
@@ -9196,6 +11260,7 @@ struct OpenXRPresenter::Impl {
         quick_out.hold_hum = 0.0f;
         quick_out.use_whoosh = -1.0f;
         VR::Quick::PublishUseAudio(-1.0f, 0.0f, VR::Quick::NowNs());
+        VR::WhistleAudio::Publish(quick_out.whistle_id, VR::WhistleAudio::Off, VR::Quick::NowNs());
         QuickHoldHum(0.0f);
         quick_out.wipe_touch = false;
         quick_out.wipe_near = 0.0f;
@@ -9302,6 +11367,80 @@ struct OpenXRPresenter::Impl {
         case Haptic::Inject:
             // quick_use_stab (QuickApply plays it on both hands, with the hand hold): the vial's.
             return InjectThump(InjectThumpStab * std::min(k, 1.0f));
+        case Haptic::Charged:
+            // Tiny Tonitrus charged: a sharp crackle in the hand (two snaps, a fizz), strike now.
+            // Steps of 30 ms or more, as Crunch's (a Touch motor over Link blurs shorter ones).
+            p.priority = 1;
+            return p.Pulse(0.5f * k, 30.0f)
+                .Pulse(0.12f * k, 30.0f)
+                .Pulse(0.6f * k, 30.0f)
+                .Ramp(0.3f * k, 0.0f, 70.0f);
+        case Haptic::Thunder:
+            // ... struck: a full crack as the bolt leaves, then the thunder rolling off with a
+            // second, weaker clap (its restrike), about 0.4 s.
+            // (The cracks crisp and the roll deep where the controller plays a frequency.)
+            p.priority = 2;
+            return p.Pulse(1.0f * k, 40.0f)
+                .Ramp(0.8f * k, 0.4f * k, 80.0f)
+                .Pulse(0.7f * k, 30.0f)
+                .Hz(70.0f)
+                .Ramp(0.5f * k, 0.15f * k, 110.0f)
+                .Ramp(0.15f * k, 0.0f, 120.0f);
+        case Haptic::Roar:
+            // Beast Roar clenched to the full: the claw bursts open (a full, deep blow), then the
+            // roar shuddering through the hand (dips, not silences: steps of 30 ms or more, as
+            // Crunch's) and rolling off, about half a second.
+            p.priority = 2;
+            return p.Pulse(1.0f * k, 70.0f)
+                .Hz(70.0f)
+                .Pulse(0.55f * k, 30.0f)
+                .Pulse(0.85f * k, 40.0f)
+                .Pulse(0.5f * k, 30.0f)
+                .Pulse(0.7f * k, 40.0f)
+                .Ramp(0.6f * k, 0.0f, 260.0f);
+        case Haptic::Spirits:
+            // The Gloves landed and the spirits burst up from the ground: a heavy blow, then
+            // the eruption rolling off with a second surge (steps of 30 ms or more), ~0.55 s.
+            p.priority = 2;
+            return p.Pulse(1.0f * k, 50.0f)
+                .Hz(60.0f)
+                .Ramp(0.75f * k, 0.45f * k, 90.0f)
+                .Pulse(0.8f * k, 40.0f)
+                .Ramp(0.6f * k, 0.0f, 300.0f);
+        case Haptic::Stars:
+            // A Call Beyond called, with the game's call (2026-11-06: "a nice strong
+            // vibration on left hand when it gets lifted up sync'ed to the sound"; the same answer
+            // starts both): a blow at full for 115 ms as the call cuts in, rolling off, a second
+            // surge (~0.25 s), the stars' glints flickering through the hand, then a short fade
+            // (0.4 s: a long one felt like a "vzzz", the tester, 2026-11-06), gone by ~0.77 s. It
+            // owns the hand.
+            p.priority = 2;
+            p.own = true;
+            return p.Hz(60.0f)
+                .Ramp(0.6f * k, 1.0f * k, 25.0f)
+                .Pulse(1.0f * k, 90.0f)
+                .Ramp(0.85f * k, 0.55f * k, 110.0f)
+                .Hz(140.0f)
+                .Ramp(0.55f * k, 0.9f * k, 60.0f)
+                .Hz(220.0f)
+                .Pulse(0.6f * k, 25.0f)
+                .Pulse(0.3f * k, 30.0f)
+                .Pulse(0.6f * k, 25.0f)
+                .Hz(140.0f)
+                .Ramp(0.5f * k, 0.0f, 400.0f);
+        case Haptic::Meteor:
+            // The Blacksky Eye fired: a sharp kick (a gunshot's crispness), a short tail.
+            p.priority = 2;
+            return p.Pulse(0.95f * k, 35.0f).Ramp(0.55f * k, 0.0f, 150.0f);
+        case Haptic::Tentacles:
+            // The Augur's tentacles burst out: a wet slap, then their squirm in the fist.
+            p.priority = 2;
+            return p.Pulse(0.9f * k, 40.0f)
+                .Pulse(0.3f * k, 30.0f)
+                .Pulse(0.65f * k, 35.0f)
+                .Pulse(0.25f * k, 30.0f)
+                .Pulse(0.5f * k, 35.0f)
+                .Ramp(0.4f * k, 0.0f, 200.0f);
         case Haptic::Bite:
             // ... a pellet or an antidote eaten: a crunch (two cracks), then a swallow. The feel
             // review (2026-10-06): the cracks were 12 and 10 ms with a 30 ms silence between,
@@ -9327,8 +11466,12 @@ struct OpenXRPresenter::Impl {
     // or vial_inject_hold_s after a stab; only in gameplay (a context switch disarms it anyway).
     void UpdateHeldRequest(const PhysicalState& in, float trigger_l, float dt, bool gameplay) {
         inject_hold = std::max(inject_hold - dt, 0.0f);
-        gun_hold = in[PhysTriggerL] || trigger_l > HeldGunTrigger ? HeldGunHold
-                                                                  : std::max(gun_hold - dt, 0.0f);
+        // A trigger owned by two-handing or a pocket clench is no gun. Use the same ownership
+        // as the pad path: a vial draw must not hide itself when the fist closes around it.
+        const bool gun_trigger =
+            !optimized_trigger_owned && !quick_out.block_l2 &&
+            (in[PhysTriggerL] || trigger_l > HeldGunTrigger);
+        gun_hold = gun_trigger ? HeldGunHold : std::max(gun_hold - dt, 0.0f);
         if (gun_hold >= HeldGunHold) {
             EndInjectFreeze("the gun", VR::Body::SteadyNowNs()); // his hands ease back at once
         }
@@ -9339,14 +11482,222 @@ struct OpenXRPresenter::Impl {
         // model with its blood level) from the moment it is armed, full, so the injection only
         // lowers its level: nothing is handed over at the THUMP. The drain lasts as long as the
         // injection's vial is in the hand (inject_hold, extended by StartInjectDrain to cover
-        // it); a new vial (armed) is full again (the drain ends below, after the request: the
-        // game's update reads the word first, so a cleared word never meets the request that
-        // still holds the drained vial). VR_TUNE_FILE drain.game=1 (tests): the game's own
-        // vial instead, for the eye dumps' comparison.
+        // it). FlagArmed makes a new vial ignore any old drain still in flight. The drain ends
+        // below, after the request: the game's update reads the word first, so a cleared word
+        // never meets the request that still holds the drained vial. drain.game=1 (tests):
+        // the game's own vial instead, for the eye dumps' comparison.
         const bool drained = vial && VR::GetSettings().vial_inject_drain &&
                              VR::Tune::Get("drain.game", 0.0f) < 0.5f;
         // A quick item in the hand (the arc's controller; never with the vial).
         const bool item = gameplay && !vial && quick_out.held_goods >= 0;
+        // The optical gate is sampled with the same tracked grip/head poses as the held item.
+        // Keep the current eye near the midpoint, but transfer when the other eye is clearly
+        // closer. Invalid item/tracking state clears immediately;
+        // moving a valid Monocular away from the eye retains the short optical fade.
+        s32 monocular_eye = -1;
+        static const bool native_monocular = std::getenv("VR_NATIVE_STEREO") != nullptr &&
+                                              std::getenv("VR_NATIVE_ASYMMETRIC") != nullptr;
+        const VR::StereoConfig stereo = VR::GetStereo();
+        const bool dibr_monocular = std::getenv("VR_NATIVE_STEREO") == nullptr &&
+                                     stereo.stereo && stereo.mode == 2;
+        const bool space_changed = monocular_render_eye >= 0 &&
+                                   monocular_space_serial != grip_located_space;
+        std::array<float, 3> lens_tracking{};
+        const bool monocular_held = (native_monocular || dibr_monocular) && item &&
+                                    quick_out.held_goods == 1411;
+        bool optical_source_valid = monocular_held &&
+                                    VR::Bloodborne::MonocularEyepiece(
+                                        grip_located_space, VR::Body::SteadyNowNs(),
+                                        lens_tracking) &&
+                                    // Held against the headset the controller often
+                                    // loses its optical tracking (2026-10-30): an optic
+                                    // already at the eye stays through it, the body
+                                    // holding the hand's last tracked pose meanwhile
+                                    // (bloodborne_body.cpp MonocularHoldNs).
+                                    (VR::Body::IsTracked(grip_left_located) ||
+                                     (monocular_render_eye >= 0 &&
+                                      grip_left_located.orientation_valid)) &&
+                                    grip_head_tracked && last_head.valid &&
+                                    last_head.space_serial == grip_located_space &&
+                                    !space_changed;
+        if (optical_source_valid) {
+            std::array<float, 2> distance{};
+            const auto head_q = VR::Body::Normalize(grip_head_q);
+            const VR::Body::Vec3 lens{lens_tracking[0], lens_tracking[1], lens_tracking[2]};
+            for (u32 eye = 0; eye < 2; ++eye) {
+                const VR::Vec3& p = last_head.eye_pose[eye].position;
+                const auto offset = VR::Body::Rotate(head_q, VR::Body::Vec3{p.x, p.y, p.z});
+                distance[eye] = VR::Body::Length(lens - grip_head_p - offset);
+            }
+            const s32 previous = VR::MonocularEye(grip_located_space, grip_located_ns);
+            monocular_eye = VR::Monocular::SelectEye(distance, previous);
+        }
+        // Twist relative to the headset, so looking around does not adjust the zoom. Capture
+        // the wrist's initial roll at the eye: clockwise as the wearer sees it (looking through
+        // the tube) zooms in, counter-clockwise out (2026-10-30; it was reversed).
+        if (monocular_eye >= 0 && grip_left_located.orientation_valid &&
+            grip_left_located.orientation_tracked) {
+            const auto relative = VR::Body::Normalize(
+                VR::Body::Conjugate(VR::Body::Normalize(grip_head_q)) *
+                VR::Body::Normalize(grip_left_located.q));
+            if (monocular_roll_eye != monocular_eye) {
+                monocular_roll_eye = monocular_eye;
+                monocular_previous_orientation = relative;
+                // A direct eye transfer or recovered orientation starts a fresh wrist
+                // reference at the current zoom, without snapping back to 2.5x.
+                monocular_wrist_turn = monocular_render_eye >= 0
+                                           ? 2.5f - monocular_target_zoom : 0.0f;
+            } else {
+                // Extract the twist around the grip's forward axis from the relative rotation.
+                // Unlike Euler roll, this remains well behaved when the tube points steeply up.
+                const auto delta = VR::Body::Normalize(
+                    VR::Body::Conjugate(monocular_previous_orientation) * relative);
+                const float change = std::remainder(2.0f * std::atan2(delta.z, delta.w),
+                                                    6.283185307179586f);
+                // Discard a tracking jump rather than jumping from minimum to maximum zoom.
+                if (std::abs(change) < 1.2f) {
+                    // The trigger held is the lens's coarse ring (2026-10-30: "by
+                    // rotating your wrist you do it softly, but if you press and hold ... it can
+                    // go much further"): the same twist moves the zoom three times as far, within
+                    // the same limits (1.25x .. Monocular::MaxZoom).
+                    constexpr float CoarseGain = 3.0f;
+                    const bool coarse = trigger_l > HeldGunTrigger;
+                    const float gain = coarse ? CoarseGain : 1.0f;
+                    // The trigger reaches MaxZoom, the wrist alone FineMaxZoom: past that the
+                    // plain twist zooms out but never further in (a zoom the trigger left there
+                    // stays; turn = 2.5 - zoom, so the closest limit is the lowest turn).
+                    const float closest =
+                        std::min(monocular_wrist_turn,
+                                 2.5f - (coarse ? VR::Monocular::MaxZoom
+                                                : VR::Monocular::FineMaxZoom));
+                    // Stop accumulating at the zoom limits: reversing the wrist should
+                    // respond immediately, even after turning farther at maximum zoom.
+                    // (A twist about the grip's +Z is counter-clockwise to the wearer: out.)
+                    monocular_wrist_turn =
+                        std::clamp(monocular_wrist_turn - change * gain, closest, 1.25f);
+                }
+                monocular_previous_orientation = relative;
+            }
+            monocular_target_zoom =
+                std::clamp(2.5f - monocular_wrist_turn, 1.25f, VR::Monocular::MaxZoom);
+        } else {
+            monocular_roll_eye = -1;
+        }
+        // Lens ticks (core/vr/monocular_audio.h): one each time the wrist has moved the zoom a
+        // detent since the last, so the trigger's coarse ring ticks three times as fast and the
+        // limits are silent. Arriving at an eye (or the wrist's reference restarting) ticks
+        // nothing.
+        {
+            const s64 tick_now = VR::Body::SteadyNowNs();
+            bool tick = false;
+            if (monocular_eye >= 0 && monocular_roll_eye == monocular_eye &&
+                monocular_tick_eye == monocular_eye) {
+                if (std::abs(monocular_target_zoom - monocular_tick_zoom) >=
+                        VR::Monocular::DetentZoom - 1e-4f &&
+                    tick_now - monocular_tick_ns >= VR::Monocular::MinTickGapNs) {
+                    tick = true;
+                    monocular_tick_zoom = monocular_target_zoom;
+                    monocular_tick_ns = tick_now;
+                }
+            } else {
+                monocular_tick_zoom = monocular_target_zoom;
+            }
+            monocular_tick_eye = monocular_roll_eye == monocular_eye ? monocular_eye : -1;
+            VR::Monocular::PublishLensAudio(monocular_eye >= 0, tick,
+                                            monocular_eye == 1 ? 0.35f : -0.35f, tick_now);
+        }
+        // VR_FORCE_MONOCULAR=<eye>[,<zoom>] (test switch: the mock has no hand to raise it): the
+        // optic at that eye through gameplay without the item, at that zoom (default 2.5).
+        static const std::array<float, 2> forced_monocular = [] {
+            std::array<float, 2> out{-1.0f, 2.5f};
+            if (const char* v = std::getenv("VR_FORCE_MONOCULAR")) {
+                float eye = -1.0f, zoom = 2.5f;
+                const int n = std::sscanf(v, "%f,%f", &eye, &zoom);
+                if (n >= 1 && (eye == 0.0f || eye == 1.0f)) {
+                    out = {eye, n >= 2 && std::isfinite(zoom) ? zoom : 2.5f};
+                    LOG_WARNING(Render_Vulkan, "VR_FORCE_MONOCULAR: the optic at eye {} ({}x)",
+                                eye, out[1]);
+                }
+            }
+            return out;
+        }();
+        if (forced_monocular[0] >= 0.0f && (native_monocular || dibr_monocular) && gameplay &&
+            grip_head_tracked && last_head.valid &&
+            last_head.space_serial == grip_located_space) {
+            optical_source_valid = true;
+            monocular_eye = static_cast<s32>(forced_monocular[0]);
+            monocular_target_zoom =
+                std::clamp(forced_monocular[1], 1.25f, VR::Monocular::MaxZoom);
+        }
+        const float optical_dt = std::clamp(dt, 0.0f, 0.05f);
+        if (!optical_source_valid) {
+            monocular_render_eye = -1;
+            monocular_roll_eye = -1;
+            monocular_strength = 0.0f;
+            monocular_zoom_smoothed = 1.0f;
+        } else if (monocular_eye >= 0) {
+            if (monocular_render_eye != monocular_eye) {
+                monocular_render_eye = monocular_eye;
+                monocular_space_serial = grip_located_space;
+                monocular_strength = 0.0f;
+                monocular_zoom_smoothed = 1.0f;
+            }
+            monocular_strength = std::min(1.0f, monocular_strength + optical_dt / 0.18f);
+        } else {
+            monocular_strength = std::max(0.0f, monocular_strength - optical_dt / 0.18f);
+            if (monocular_strength == 0.0f) {
+                monocular_render_eye = -1;
+                monocular_zoom_smoothed = 1.0f;
+            }
+        }
+        if (monocular_render_eye >= 0) {
+            monocular_zoom_smoothed += (monocular_target_zoom - monocular_zoom_smoothed) *
+                                       (1.0f - std::exp(-optical_dt / 0.08f));
+            const float eased = monocular_strength * monocular_strength *
+                                (3.0f - 2.0f * monocular_strength);
+            const float zoom = 1.0f + (monocular_zoom_smoothed - 1.0f) * eased;
+            // The stabilized aim (core/vr/monocular.h Stabilizer), once per new head sample and
+            // from the optic's own head; published only then (it changes only then). Untracked
+            // or switched off, it restarts at the head when it resumes. VR_TUNE: mono.stab=0
+            // off; mono.world and mono.lag live.
+            if (grip_located_ns != monocular_stab_ns) {
+                const float step_s =
+                    monocular_stab_ns > 0
+                        ? static_cast<float>(grip_located_ns - monocular_stab_ns) * 1e-9f
+                        : 0.0f;
+                monocular_stab_ns = grip_located_ns;
+                const auto forward = VR::Body::Rotate(VR::Body::Normalize(grip_head_q),
+                                                      VR::Body::Vec3{0.0f, 0.0f, -1.0f});
+                monocular_aim_head = {forward.x, forward.y, forward.z};
+                monocular_aim_valid = false;
+                if (grip_head_tracked && VR::Tune::Get("mono.stab", 1.0f) >= 0.5f) {
+                    VR::Monocular::StabilizerTune tune{};
+                    tune.world = VR::Tune::Get("mono.world", tune.world);
+                    tune.max_lag_deg = VR::Tune::Get("mono.lag", tune.max_lag_deg);
+                    monocular_aim_valid = monocular_stabilizer.Update(
+                        monocular_aim_head, zoom, step_s, tune, monocular_aim);
+                } else {
+                    monocular_stabilizer.Reset();
+                }
+                VR::PublishMonocularAim(monocular_aim_valid, monocular_aim, monocular_aim_head,
+                                        monocular_stabilizer.Gain());
+            }
+            VR::PublishMonocularEye(monocular_render_eye, grip_located_space, grip_located_ns,
+                                    zoom, eased);
+        } else {
+            if (monocular_stab_ns != 0) { // once per release
+                monocular_stabilizer.Reset();
+                monocular_aim_valid = false;
+                monocular_stab_ns = 0;
+                VR::PublishMonocularAim(false, monocular_aim, monocular_aim_head, 1.0f);
+            }
+            VR::PublishMonocularEye(-1, grip_located_space, grip_located_ns);
+        }
+        if (monocular_eye != monocular_log_eye) {
+            LOG_INFO(Render_Vulkan, "VR Monocular: {} eye {}",
+                     monocular_eye < 0 ? "released" : "at", monocular_eye);
+            monocular_log_eye = monocular_eye;
+        }
         // The arc open with quick_arc_hide_gun_open=1 (opt-in): the gun out of the hand that
         // reaches for the cards; an item request with no item hides it and closes no fingers. By
         // default the gun stays in the hand (the cards show through it) and fires at the pull.
@@ -9361,6 +11712,7 @@ struct OpenXRPresenter::Impl {
                                        : VR::Held::Kind::None;
         request.flags = vial && gun_hold > 0.0f ? VR::Held::FlagGun : 0; // an item: the trigger uses it
         request.flags |= drained ? VR::Held::FlagDrain : 0;
+        request.flags |= vial && vial_armed ? VR::Held::FlagArmed : 0;
         request.ms = VR::Body::SteadyNowNs() / 1'000'000;
         VR::PublishHeldRequest(VR::Held::PackRequest(request));
         if (inject_drain.On() && (vial_armed || inject_hold <= 0.0f)) {
@@ -9378,16 +11730,21 @@ struct OpenXRPresenter::Impl {
         const bool have = s.vial_in_hand_game && VR::LatestHeldStatus(status);
         const bool fresh = have && VR::Body::SteadyNowNs() - status.steady_ns <= HeldStatusMaxAgeNs;
         const State state = fresh ? static_cast<State>(status.state) : State::Unavailable;
-        const bool game = state != State::Failed && state != State::Unavailable;
+        const std::string_view reason = status.reason != nullptr ? status.reason : "";
+        // Held back for a two-handed attack clip (vial_hide_two_handed): the game shows none, and
+        // the drawn left hand is yours, so the overlay vial is (2026-10-28: X while
+        // two-handing showed no vial at all).
+        const bool two_handed_clash = state == State::Suppressed && reason == "two-handed attack";
+        const bool game = state != State::Failed && state != State::Unavailable && !two_handed_clash;
         const bool wanted = vial_armed || inject_hold > 0.0f;
         held_shown = game && state == State::Shown && wanted; // the vial (not a quick item)
         if (state != held_state && wanted) {
-            const std::string_view reason = status.reason != nullptr ? status.reason : "";
             LOG_INFO(Render_Vulkan, "VR overlay: game vial {}{}{}{} -> {}",
                      VR::Held::StateName(state), reason.empty() ? "" : " (", reason,
                      reason.empty() ? "" : ")",
                      !s.vial_in_hand_game ? "the overlay vial (vial_in_hand=overlay)"
                      : !fresh             ? "the overlay vial (no fresh status)"
+                     : two_handed_clash   ? "the overlay vial (two-handed attack)"
                      : game               ? "no overlay vial"
                                           : "the overlay vial (fallback)");
         }
@@ -9443,6 +11800,7 @@ struct OpenXRPresenter::Impl {
         vial_events |= healed ? VrOverlay::VialEventInjectHealed : VrOverlay::VialEventInjectDenied;
         if (healed) {
             heal_trigger = "injection"; // the heal vignette (DrawOverlay)
+            vial_rearm_wait = VialRearmS; // X's next vial waits (UpdateVial); the pouch's does not
             haptics[0].Play(InjectThump(InjectThumpStab));
             haptics[1].Play(InjectThump(InjectThumpOther));
             StartInjectDrain();
@@ -9499,7 +11857,9 @@ struct OpenXRPresenter::Impl {
     // (vial_inject_hold_hands=both) where the weapon was - for a fixed wall-clock duration, then ease back to the
     // controllers over vial_inject_release_ms. The input runs after this frame's PublishHands, so
     // grip_*_located are the newest grips the game can have seen: no jump when the freeze starts.
-    void StartInjectHold() {
+    // `right_stab`: the right hand went in (the empty syringe): it is held whatever
+    // vial_inject_hold_hands says, the left with =both.
+    void StartInjectHold(bool right_stab = false) {
         const auto& s = VR::GetSettings();
         const s64 now = VR::Body::SteadyNowNs();
         // The pose the game last saw (this frame's published grips): a hold still running or
@@ -9516,13 +11876,14 @@ struct OpenXRPresenter::Impl {
         inject_freeze.Start(now, s.vial_inject_hold_ms);
         const s64 hold_ns = inject_freeze.EndNs() - now;
         const s64 release_ns = s64{s.vial_inject_release_ms} * 1'000'000;
-        const bool left =
-            inject_hands[0].Start(at_left, grip_located_space, now, hold_ns, release_ns);
+        const bool left = (!right_stab || s.vial_inject_hold_both) &&
+                          inject_hands[0].Start(at_left, grip_located_space, now, hold_ns, release_ns);
         // The grip adjust holds the weapon itself (PublishHands).
-        const bool right = s.vial_inject_hold_both && !grip_adjust.Frozen() &&
+        const bool right = (right_stab || s.vial_inject_hold_both) && !grip_adjust.Frozen() &&
                            inject_hands[1].Start(at_right, grip_located_space, now, hold_ns,
                                                  release_ns);
         inject_let_go = {};
+        inject_right_stab = right_stab;
         for (size_t i = 0; i < 2; ++i) {
             inject_hand_phase[i] = inject_hands[i].On() ? VR::Body::InjectHold::Phase::Held
                                                         : VR::Body::InjectHold::Phase::Off;
@@ -9560,6 +11921,8 @@ struct OpenXRPresenter::Impl {
             channel.RequestUnpark(VR::Body::SteadyNowNs());
             physical_lever_ready = false;
         }
+        if (!lever_enabled)
+            physical_lever_approach.Clear();
         if (!lever_enabled &&
             !physical_lever_out.owns_grip[0] && !physical_lever_out.owns_grip[1] &&
             physical_lever_feedback_pending.ns == 0) {
@@ -9571,7 +11934,7 @@ struct OpenXRPresenter::Impl {
             idle.hands[h].grip_valid = physical_lever_grip_valid[h];
         }
         const bool motion_test = channel.motion_test.load(std::memory_order_relaxed);
-        const bool need_candidate = physical_lever.NeedsCandidate(idle.hands);
+        bool need_candidate = physical_lever.NeedsCandidate(idle.hands);
         const bool pending = physical_lever_acquisition.Stamp() != 0;
         // B still serves ordinary interactions (e.g. nearby loot); it must not restore a
         // supported lever's button prompt or disable its hand pull.
@@ -9589,7 +11952,18 @@ struct OpenXRPresenter::Impl {
                                     VR::IsFirstPerson();
         const bool busy = quick.GetPhase() != VR::Quick::Phase::Idle || vial_armed ||
                           inject_waiting || inject_hold > 0.0f || two_hand_out.owns_grip ||
-                          hand_owns_grip || shield_up || bow_up || music_box_free;
+                          hand_owns_grip || shield_up || bow_up || music_box_free ||
+                          blood_draw_out.shown;
+        const auto fresh_edges = physical_lever.GrabEdges(idle.hands);
+        std::array<bool, 2> approach_allowed{};
+        const std::array<const HandState*, 2> approach_hands{&left, &right};
+        for (int h = 0; h < 2; ++h) {
+            idle.hands[h].tracked = approach_hands[h]->valid && approach_hands[h]->orientation_valid;
+            approach_allowed[h] = lever_enabled && reach_gameplay && !in[PhysB] &&
+                !in[PhysMenu] && !busy && !pending && !physical_lever_out.holding &&
+                !blocked[h == 0 ? PhysGripL : PhysGripR];
+        }
+        physical_lever_approach.Step(fresh_edges, idle.hands, approach_allowed, dt);
         physical_lever_armed_near = false;
         physical_lever_reaching = {};
         if (lever_enabled && !motion_test && !physical_lever_out.holding && !pending) {
@@ -9599,6 +11973,7 @@ struct OpenXRPresenter::Impl {
                           physical_lever.CanSqueeze(h);
             }
             UpdatePhysicalLeverReach(left, right, reach_gameplay, free);
+            need_candidate = physical_lever.NeedsCandidate(idle.hands);
         } else if (!lever_enabled || motion_test) {
             physical_lever_arm = {};
         }
@@ -9679,6 +12054,7 @@ struct OpenXRPresenter::Impl {
         const bool lever_near = motion_test || physical_lever_armed_near;
         if (!pending && try_grab && lever_near &&
             physical_lever_acquisition.Begin(physical_lever, input, recenter_serial, now)) {
+            physical_lever_approach.Clear();
             if (motion_test) {
                 L::ProbeHands request{};
                 request.ns = now;
@@ -9743,8 +12119,8 @@ struct OpenXRPresenter::Impl {
             physical_lever_space = recenter_serial;
             physical_lever_hold_log_ns = 0;
         }
-        // The held fist's contact, at rest: frozen at the grab on a lever stick; a capstan's slides
-        // along its bar with the hand, so the pinned fist follows it.
+        // The held fist's contact, at rest: it slides along a capstan's bar or a lever's stem with
+        // the hand, so the pinned fist follows it (frozen at the grab without a stem).
         if (out.grabbed || out.holding) {
             physical_lever_rig.rest = out.contact_rest;
         }
@@ -9829,6 +12205,12 @@ struct OpenXRPresenter::Impl {
             VR::Body::LatestBodyStatus(body) && L::Fresh(body.steady_ns, now) && body.driven &&
             VR::Body::LatestAnchor(anchor) && L::Space::From(anchor, now).has_value();
         if (ready) {
+            // How high a hand reaches (levers out of it keep their prompt), with the word it
+            // goes with.
+            channel.reach_top.store(
+                physical_lever_reach.Update(anchor.chr_t.y, anchor.eye_world.y - anchor.chr_t.y,
+                                            anchor.world_scale, now),
+                std::memory_order_relaxed);
             channel.hand_pull_ready.store(now, std::memory_order_release);
         } else if (!mode && channel.hand_pull_ready.load(std::memory_order_relaxed) != 0) {
             channel.hand_pull_ready.store(0, std::memory_order_release);
@@ -9884,6 +12266,10 @@ struct OpenXRPresenter::Impl {
             }
         }
         const auto out = L::Arm(physical_lever_arm, arm);
+        if (out.armed_near) {
+            for (int h = 0; h < 2; ++h)
+                physical_lever_approach.Retry(physical_lever, h, out.distance[h]);
+        }
         if (out.request_check) {
             channel.RequestNearbyCheck(now);
         }
@@ -9907,6 +12293,10 @@ struct OpenXRPresenter::Impl {
         }
         physical_lever_armed_near = out.armed_near;
         physical_lever_reaching = out.reaching;
+        // During the approach window, do not consume an early press as a near miss.
+        for (int h = 0; h < 2; ++h)
+            if (physical_lever_approach.WaitingForReach(h, out.distance[h]))
+                physical_lever_reaching[h] = false;
         for (int h = 0; h < 2; ++h) {
             if (out.tick[h]) {
                 haptics[h].Play(Tick(0.2f, 12.0f, 0));
@@ -10027,6 +12417,28 @@ struct OpenXRPresenter::Impl {
         namespace Q = VR::Quick;
         const auto& settings = VR::GetSettings();
         const T::Settings& ts = T::GetTwoHandSettings();
+        const bool optimized = OptimizedTwoHand();
+        if (optimized != optimized_mode_was) {
+            two_hand.Reset();
+            two_hand_support.Reset();
+            two_hand_out = {};
+            optimized_attachment.Reset(in[PhysTriggerL]);
+            optimized_trigger_owned = false;
+            near_hold_ns = slip_ns = grab_transform_ns = 0;
+            hold_form = {};
+            revert_on_open = false;
+            right_grip_ready = false;
+            r3_down = in[PhysStickR];
+            right_grip.Reset(in[PhysGripR]);
+            grip_r_down = in[PhysGripR];
+            if (in[PhysTriggerL]) {
+                blocked[PhysTriggerL] = true;
+                gun_trigger_wait = true;
+            }
+            if (in[PhysGripL]) blocked[PhysGripL] = true;
+            if (in[PhysGripR]) blocked[PhysGripR] = true;
+            optimized_mode_was = optimized;
+        }
         static const bool trace = std::getenv("VR_TWOHAND_LOG") != nullptr;
         const s64 now = VR::Body::SteadyNowNs();
         T::GameStatus st{};
@@ -10039,6 +12451,7 @@ struct OpenXRPresenter::Impl {
         two_hand_update_ns = now;
         if (gap_ns > 1'000'000'000) {
             two_hand_guide_gesture.Reset(in[PhysGripR]);
+            optimized_attachment.Reset(in[PhysTriggerL]);
         }
         if (gap_ns > 1'000'000'000 && two_hand.Drop()) {
             two_hand_out = {};
@@ -10066,7 +12479,7 @@ struct OpenXRPresenter::Impl {
         // The grab group (hand_transform, core/vr/trick_weapons.h GrabFamily): the left hand the
         // right grip freed takes form A's handle, and that grab turns it into its two-handed form
         // (held as one meanwhile); letting go of it turns it back (HoldForm, below).
-        const bool grab_family = two_hand_status_ok && VR::Tricks::GrabFamily(st.family) &&
+        const bool grab_family = !optimized && two_hand_status_ok && VR::Tricks::GrabFamily(st.family) &&
                                  (VR::Tricks::GetTrickSettings().hand_transform ||
                                   st.family == VR::Tricks::SawFamily);
         // The grab's transform still on its way (an L1 or a native pull not yet run): the hold
@@ -10108,12 +12521,60 @@ struct OpenXRPresenter::Impl {
             }
         }
         const float blade_clear = two_hand_blade_clear.Get(st.family);
-        ti.handle = T::HandleAt(TwoHandPose(right), st.right, st.grip, st.scale);
+        // Logarius' Wheel's second handle sits across the wheel, 83 cm out: the weapon's weight
+        // (and the arm's reach) holds the drawn wheel a few degrees off the controller, more than
+        // the zone at that reach, so the hand missed the handle where it shone (the user,
+        // 2026-11-06). Its zone follows the weapon as drawn, the guide's own pose (this frame's or
+        // the last one's); the other handles sit at the fist, where the controller's is the same.
+        const bool drawn_handle = st.grip.fixed_support && guide_weapon_frame + 1 >= xr_frames &&
+                                  VR::Body::IsTracked(guide_weapon_hand);
+        ti.handle = T::HandleAt(drawn_handle
+                                    ? T::Pose{guide_weapon_hand.p, guide_weapon_hand.q}
+                                    : TwoHandPose(right),
+                                st.right, st.grip, st.scale);
         ti.handle.blade_clear = blade_clear;
         ti.left_bone = T::BoneOrigin(TwoHandPose(left), st.left);
         ti.right_q_ok = ti.right_tracked;
         ti.right_q = TwoHandPose(right).q;
+        if (optimized) {
+            // Open item interfaces win over attachment; the bow owns both of its triggers.
+            ti.busy = ti.busy || phase != Q::Phase::Idle;
+            ti.enabled = ti.enabled && T::OptimizedHandle(st.family);
+            ti.blocked = blocked[PhysTriggerL] || physical_lever_out.owns_grip[0];
+            ti.hold_near = ti.grab_held = ti.grab_transforms = false;
+            const bool context = ti.enabled && ti.gameplay && ti.two_handed &&
+                                 !ti.busy && !ti.blocked;
+            const auto attachment = optimized_attachment.Step(
+                context, ti.left_tracked && ti.right_tracked,
+                T::ZoneOf(ti.handle, ti.left_bone, ts.zone_m).inside,
+                in[PhysTriggerL], ti.family, ts.trigger_hold);
+            optimized_trigger_owned = attachment.consume;
+            ti.grip = attachment.held ? 1.0f : 0.0f;
+            ti.right_grip = 0.0f; // grip buttons loosen hands; never retain attachment
+        } else {
+            optimized_trigger_owned = false;
+        }
         two_hand.Update(ts, ti, two_hand_out);
+        // VR_TWOHAND_LOG (tests): where the handle's grip point is from the left hand, once a
+        // second while a two-handed form waits for it (scripted grabs aim with it).
+        if (trace && ti.two_handed && !two_hand_out.engaged && ti.handle.valid) {
+            static s64 zone_log_ns = 0;
+            if (now - zone_log_ns >= 1'000'000'000) {
+                zone_log_ns = now;
+                const auto d = ti.handle.left - ti.left_bone;
+                LOG_INFO(Render_Vulkan,
+                         "VR two-hand: zone: the grip point {:.3f} {:.3f} {:.3f} (LOCAL), the "
+                         "left hand's bone {:.3f} {:.3f} {:.3f}: {:+.3f} {:+.3f} {:+.3f} m to go "
+                         "({:.1f} cm off the zone's line)",
+                         ti.handle.left.x, ti.handle.left.y, ti.handle.left.z, ti.left_bone.x,
+                         ti.left_bone.y, ti.left_bone.z, d.x, d.y, d.z,
+                         T::ZoneOf(ti.handle, ti.left_bone, ts.zone_m).off * 100.0f);
+            }
+        }
+        if (optimized && !two_hand_out.engaged) optimized_attachment.Cancel();
+        // A squeeze used to slide must be released before it can open the item arc.
+        optimized_grip_wait = in[PhysGripL] &&
+                              (optimized_grip_wait || (optimized && two_hand_out.engaged));
         const T::Output& o = two_hand_out;
         const double t = static_cast<double>(now) * 1e-9;
         if (o.grabbed) {
@@ -10202,7 +12663,14 @@ struct OpenXRPresenter::Impl {
         T::SupportGrip::Input support{};
         support.held = two_hand_out.engaged;
         support.ready = two_hand_status_ok && st.two_handed && st.measured && !seating_busy;
+        support.transforming = seating_busy || (two_hand_status_ok && !st.two_handed);
         support.tracked = ti.left_tracked && ti.right_tracked;
+        support.reposition = two_hand_reposition_out.active;
+        support.grip_locked = false; // old scheme: B holds slide mode, never toggles a lock
+        support.push = two_hand_push_out.active;
+        support.explicit_slide = optimized;
+        support.slide_left = in[PhysGripL] && !blocked[PhysGripL];
+        support.slide_right = in[PhysGripR] && !blocked[PhysGripR];
         support.family = st.family;
         support.target = st.grip;
         support.scale = st.scale;
@@ -10215,6 +12683,19 @@ struct OpenXRPresenter::Impl {
         // speed locks both during a swing.
         support.swing_mps = two_hand_blade.valid ? two_hand_blade.lever_speed : 0.0f;
         const bool seated = two_hand_support.Update(ts, support, dt);
+        if (two_hand_support.AcquisitionFailed()) {
+            optimized_attachment.Cancel();
+            two_hand.Drop();
+            two_hand_out = {};
+            two_hand_out.owns_grip = true; // keep the failed squeeze away from quick items
+            two_hand_out.released = T::Why::MissedGrip;
+            near_hold_ns = slip_ns = 0;
+            two_hand_reposition.Reset(in[PhysB]);
+            two_hand_reposition_out = {};
+            two_hand_push.Reset(in[PhysY]);
+            two_hand_push_out = {};
+            two_hand_turn_ok = false;
+        }
         two_hand_out.weight = two_hand_support.Weight();
         if (seated) {
             two_hand_tip_known = false;
@@ -10285,8 +12766,10 @@ struct OpenXRPresenter::Impl {
             // Let go: the grip, the hands apart, twisted; or, after any other release (the hand
             // unseen, a vial, a menu), the left grip opening (the grip still squeezed never grabs
             // again by itself: only a new squeeze does).
+            // A missed grip is a let-go too: the hand never reached the handle (after the grab's
+            // transform), so the weapon turns back rather than staying two-handed without it.
             const bool let_go = o.released == T::Why::Grip || o.released == T::Why::Apart ||
-                                o.released == T::Why::Twist;
+                                o.released == T::Why::Twist || o.released == T::Why::MissedGrip;
             if (o.released != T::Why::None && !let_go && o.released != T::Why::Form &&
                 o.released != T::Why::Off) {
                 revert_on_open = true;
@@ -10396,13 +12879,14 @@ struct OpenXRPresenter::Impl {
         VR::Combat::TransformStatus running{};
         const bool busy = VR::Combat::LatestTransformStatus(running) &&
                           now - running.ns < 200'000'000 && running.busy;
-        const bool on = ts.hand_transform && !settings.controls_classic &&
+        const bool on = !OptimizedTwoHand() && ts.hand_transform && !settings.controls_classic &&
                         !settings.right_grip_draw && kind != Tr::Kind::None && arms && !busy &&
                         now - transform_request_ns >= HandTransformLockNs &&
                         gesture.head_ok && !VR::CinematicActive() && VR::IsImmersive() &&
                         !grip_adjust.Frozen() &&
                         VR::Quick::WeaponGrabAvailable(quick.GetPhase()) &&
-                        !vial_armed && !inject_waiting && inject_hold <= 0.0f && !music_box_free;
+                        !vial_armed && !inject_waiting && inject_hold <= 0.0f && !music_box_free &&
+                        !blood_draw_out.shown;
         auto& lh = haptics[0];
         auto& rh = haptics[1];
         // Only the levels it wrote (an armed vial's buzz, a charge's build stay theirs).
@@ -10653,7 +13137,8 @@ struct OpenXRPresenter::Impl {
         const bool eligible = sample.head_valid && VR::IsImmersive() && !menu_context &&
             !VR::IsGameMenuOpen() && !VR::CinematicActive() && !grip_adjust.Frozen() &&
             !inject_freeze.On() && !inject_waiting && inject_hold <= 0.0f &&
-            !music_box_free && !physical_lever_out.owns_grip[1] && !hold_form.pending &&
+            !music_box_free && !blood_draw_out.shown && !physical_lever_out.owns_grip[1] &&
+            !hold_form.pending &&
             VR::TwoHand::LatestGameStatus(st) && fresh(st.ns) &&
             VR::Combat::LatestMeleeStatus(melee_status) && fresh(melee_status.ns) &&
             melee_status.ok && melee_status.physical &&
@@ -10674,6 +13159,7 @@ struct OpenXRPresenter::Impl {
         B::Weight::Input input{st.family, melee_status.form_b, eligible, strength,
             sample.two_hand, B::Length(grip_left_located.p-grip_right_located.p),
             B::Rotate(target,local_axis), sample.head_p, sample.head_valid};
+        input.sliding = sample.two_hand_slide ? sample.two_hand : 0.0f;
         input.gravity = preset ? 1.0f : settings.weapon_gravity;
         input.load_response = preset ? 1.0f : settings.weapon_load_response;
         input.lift_response = preset ? 1.0f : settings.weapon_lift_response;
@@ -10701,10 +13187,10 @@ struct OpenXRPresenter::Impl {
 
     // PublishHands (frame thread, before the input): while the left grip holds the handle
     // (UpdateTwoHand, the last input frame), the right hand published for the game's arms points
-    // the handle at the left hand (its own position and roll kept) and the left one sits on the
+    // handle using both hands, with the front hand leading, and the left one sits on the
     // grip rail only after its real controller reaches it; eased in and out over
-    // two_hand_blend_ms. The left grip slides at its signed distance from the dominant hand;
-    // its wrist follows tracking. The rail calibration stays fixed for this hold.
+    // two_hand_blend_ms. Both grips slide within the reviewed handle range;
+    // the rail/contact calibration stays fixed; the left wrist follows its controller.
     // With the left controller occluded the weapon keeps its last turn and the
     // hunter's left hand stays on the handle. Combat samples this same steered pose.
     void RecordTwoHandMotion(const VR::Body::HandsSample& sample,
@@ -10718,7 +13204,8 @@ struct OpenXRPresenter::Impl {
         // the weapon then keeps its last turn on the right hand (ApplyTwoHand), so the swing
         // goes on.
         const bool tracked = sample.head_valid && sample.two_hand >= 0.999f &&
-                             VR::Body::IsTracked(grip_right_located);
+                             VR::Body::IsTracked(grip_right_located) &&
+                             two_hand_support.MotionStable();
         if (!active || two_hand_tip_family != st.family) {
             two_hand_tip_known = false;
             two_hand_tip_family = st.family;
@@ -10738,7 +13225,8 @@ struct OpenXRPresenter::Impl {
         const VR::Body::Vec3 native = two_hand_tip_known ? two_hand_native_tip :
             VR::Body::Vec3{0, -MeleeBladeM * st.scale, 0};
         // The weapon's grip, moved in the right fist when the right hand slid on it.
-        const VR::Body::Vec3 origin = st.right.offset + two_hand_support.WeaponShiftGrip();
+        const VR::Body::Vec3 origin = st.right.offset;
+        const VR::Body::Vec3 grip_shift = two_hand_support.WeaponShiftGrip();
         VR::Body::Vec3 dir = T::BoneToGripLocal(st.right, native, st.scale) - origin;
         dir = VR::Body::Length(dir) > 1e-4f
                   ? VR::Body::Normalize(dir)
@@ -10750,13 +13238,13 @@ struct OpenXRPresenter::Impl {
         // and contact use the final displayed blade, so weight cannot turn a heavy into a stab.
         two_hand_intent_blade = two_hand_blade_motion.Step(active, tracked, sample.xr_time,
             sample.space_serial, st.family, st.style, {intent_hand.p, intent_hand.q},
-            tip, lever, sample.head_p);
+            tip, lever, sample.head_p, grip_shift);
         two_hand_intent_blade.head_forward = VR::Body::Rotate(sample.head_q, {0, 0, -1});
         // Excluded forms and inactive frames must use the original motion history.
         if (weapon_weight_active && weapon_weight_frame == xr_frames) {
             two_hand_blade = two_hand_physical_motion.Step(active, tracked, sample.xr_time,
                 sample.space_serial, st.family, st.style, {hand.p, hand.q},
-                tip, lever, sample.head_p);
+                tip, lever, sample.head_p, grip_shift);
             two_hand_blade.head_forward = two_hand_intent_blade.head_forward;
         } else {
             two_hand_physical_motion.Reset();
@@ -10767,10 +13255,33 @@ struct OpenXRPresenter::Impl {
 
     void ApplyTwoHand(VR::Body::HandsSample& sample) {
         namespace T = VR::TwoHand;
+        sample.suppress_self_clash = OptimizedTwoHand() && two_hand_out.engaged &&
+            VR::Body::SteadyNowNs() - two_hand_update_ns < 1'000'000'000;
         // The weapon's place in the right fist goes out every frame, whatever else holds below
         // (a frame without the right controller must not snap the weapon back for a moment);
         // zero once the hold has eased out.
         sample.two_hand_weapon_shift = two_hand_support.WeaponShift();
+        // The weapon transforming under the grab: the hunter's left hand stays where it squeezed,
+        // rigid with the right hand (the weapon moves in both); after the seat it blends onto
+        // the handle over CarryOutS (2026-10-28: no jump up and back down).
+        const bool fresh_input = VR::Body::SteadyNowNs() - two_hand_update_ns < 1'000'000'000;
+        const bool carrying = two_hand_out.engaged && two_hand_support.Carrying() && fresh_input &&
+                              VR::Body::IsTracked(sample.hand[1]);
+        if (carrying) {
+            auto& r = sample.hand[1];
+            auto& l = sample.hand[0];
+            const T::Pose held = two_hand_support.CarriedLeft({r.p, r.q});
+            l.p = held.p;
+            l.q = held.q;
+            l.v = r.v;
+            l.velocity_valid = r.velocity_valid;
+            l.position_valid = l.position_tracked = true;
+            l.orientation_valid = l.orientation_tracked = true;
+            two_hand_carry_out_s = 0.0f;
+            // The held hand is on the weapon: the weight, the walls and the arms' reach carry it
+            // with the weapon as drawn (CarrySupport, SolidWeapons, the solver's coupling).
+            sample.two_hand = 1.0f;
+        }
         if (two_hand_out.weight <= 0.0f) {
             two_hand_turn_ok = false;
             return;
@@ -10801,17 +13312,33 @@ struct OpenXRPresenter::Impl {
                 ? static_cast<float>(static_cast<double>(sample.xr_time - two_hand_apply_time) * 1e-9)
                 : 0.0f;
             two_hand_apply_time = sample.xr_time;
+            two_hand_apply_dt = apply_dt;
             a = two_hand_support.ApplyTracked(rp, lp, st.right, st.left, apply_dt);
             two_hand_turn = a.turn_local;
             two_hand_turn_ok = true;
         } else if (two_hand_turn_ok) {
-            a = T::Place(rp, lp, st.right, st.left, two_hand_support.Grip(),
-                         two_hand_support.Scale(), 1.0f,
-                         VR::Body::ScaleRotation(two_hand_turn, w));
+            a = two_hand_support.ApplyUntracked(rp, lp, st.right, st.left);
             l.position_valid = l.position_tracked = true;
             l.orientation_valid = l.orientation_tracked = true;
         } else {
             return;
+        }
+        // ApplyTracked can slide either hand this frame. Publish its matching weapon
+        // offset with these poses, not the offset sampled before the sliding update.
+        sample.two_hand_weapon_shift = two_hand_support.WeaponShift();
+        float carried_support = 0.0f;
+        if (two_hand_carry_out_s < CarryOutS && two_hand_support.CarryKnown()) {
+            // Just seated after a carried transform: from where the hand was held onto the handle.
+            const float k = VR::Body::Smoothstep(0.0f, 1.0f, two_hand_carry_out_s / CarryOutS);
+            carried_support = 1.0f - k; // still on the weapon while the attach eases in
+            const T::Pose held = two_hand_support.CarriedLeft(rp);
+            a.left.p = VR::Body::Lerp(held.p, a.left.p, k);
+            a.left.q = VR::Body::Slerp(held.q, a.left.q, k);
+            const float step = two_hand_apply_dt > 0.0f && two_hand_apply_dt < 0.1f
+                ? two_hand_apply_dt : 1.0f / 90.0f;
+            two_hand_carry_out_s += step;
+        } else {
+            two_hand_carry_out_s = CarryOutS;
         }
         r.p = a.right.p;
         r.q = a.right.q;
@@ -10819,7 +13346,10 @@ struct OpenXRPresenter::Impl {
         l.q = a.left.q;
         l.v = VR::Body::Lerp(l.v, r.v, w);
         l.velocity_valid = l.velocity_valid || r.velocity_valid;
-        sample.two_hand = w; // the body moves the left hand with the right weapon (weapon_wall)
+        // the body moves the left hand with the right weapon (weapon_wall)
+        sample.two_hand = std::max(w, carried_support);
+        sample.two_hand_slide = two_hand_support.SlideMode();
+        sample.two_hand_left_lead = two_hand_support.LeftLeadWeight();
         two_hand_turn_deg = a.turn_deg;
     }
 
@@ -10909,7 +13439,10 @@ struct OpenXRPresenter::Impl {
         if (phase == inject_hand_phase[i]) {
             return;
         }
-        const char* name = i == 0 ? "left hand (the vial)" : "right hand (the weapon)";
+        const char* name = inject_right_stab ? (i == 0 ? "left hand (the stabbed arm)"
+                                                       : "right hand (the syringe)")
+                           : i == 0                  ? "left hand (the vial)"
+                                                     : "right hand (the weapon)";
         const s64 since_ms = (sample.steady_ns - hold.StartNs()) / 1'000'000;
         if (phase == Phase::Release) {
             const char* why = inject_let_go[i];
@@ -11062,19 +13595,9 @@ struct OpenXRPresenter::Impl {
             HandleMeleeEvents();
         }
 
-        // talk_guard: while an NPC is talking a swing never attacks (a friendly NPC hit turns
-        // hostile for good); the trigger and the buttons still do. A hand still moving when it
-        // ends must slow down first, as when the weapon is drawn (SwingGate does the same).
-        const bool talking = settings.talk_guard && VR::IsNpcTalking();
-        if (talking != talk_paused) {
-            talk_paused = talking;
-            if (!talking && clutch) {
-                melee.OnDraw();
-            }
-            LOG_INFO(Render_Vulkan, "VR input: swings {} (an NPC {})", talking ? "paused" : "back",
-                     talking ? "is talking" : "stopped talking");
-        }
-
+        // (Swings attack while an NPC is talking too: the talk guard that held them back is gone,
+        // 2026-11-11; the tester: "When an NPC is talking, hits don't register", hunters who talk
+        // mid-fight included.)
         bool heavy_trigger = settings.gestures; // the trigger is the heavy button, not R1
         bool swings = false;                    // a swing may attack this frame
         if (clutch) {
@@ -11096,28 +13619,61 @@ struct OpenXRPresenter::Impl {
             }
             drawn = now_drawn;
             heavy_trigger = drawn;
-            swings = settings.gestures && drawn && !talking;
+            swings = settings.gestures && drawn;
         } else {
-            swings = SwingGate(in, right, gesture, talking, dt);
+            swings = SwingGate(in, right, gesture, dt);
             drawn = swings; // logs and the trace: swings armed
         }
+        // Only the right hand's face hold is private to it. All earlier SwingGate
+        // reasons (menus, talk, context, vial, tracking re-arm, etc.) still gate
+        // the left hand. Its own face hold is handled in UpdateLeftMelee.
+        bool left_swings = swings || (!clutch && swing_block == FaceBlock);
 
         // Holding grip reserves the Bloodletter's inward motion for its transform. Otherwise
         // that same thrust can commit a melee swing before the chest gesture recognizes it.
         if (VR::Tricks::GetTrickSettings().hand_transform && RightFamily() == 290 &&
             !RightFormB() && right_grip_ready) {
             swings = false;
+            left_swings = false;
         }
 
         // Grinding has its own hit cadence, never an ordinary swing/charged attack as well.
         if (saw_spin.Spinning()) {
             swings = false;
+            left_swings = false;
         }
 
         // Simon's Bowblade's bow form (vr.ini bow, core/vr/bow.h): your hands are the bow and its
-        // string; no swing or trigger attack while it is up (UpdateBow presses the game's shots).
-        if (UpdateBow(in, right, left, gesture, held, dt)) {
+        // string; no trigger attack while it is up (UpdateBow presses the game's shots). The one
+        // swing: the arrow in the right hand, before it is nocked, hits like a light melee attack
+        // (2026-11-12; core/vr/bowblade_moves.h). The trigger stays the bow's (the
+        // string's squeeze masks it below), the left hand holds the bow (no left swings), and no
+        // blade shot or visceral thrust comes from the arrow.
+        // (The right grip squeezed is the bow closing into the blade, a flick its transform
+        // attack: never an arrow swing as well.)
+        const bool bow_form = UpdateBow(in, right, left, gesture, held, dt);
+        const bool arrow_swing = bow_form && bow_up && bow_hand_i == 0 &&
+                                 bow.State() == VR::Bow::Phase::Holding && !in[PhysGripR] &&
+                                 PhysicalMeleeRoute();
+        if (arrow_swing != arrow_swing_was) {
+            // Picked up, nocked, the grip squeezed or the bow put away: a stroke under way is
+            // no swing of the other.
+            melee.DropStroke();
+            melee_shadow.DropStroke();
+            if (melee_window.Current().open) {
+                melee_window.Reset(arrow_swing ? "the arrow in hand" : "the arrow no swing now");
+                PublishMeleeWindowNow();
+            }
+            LOG_INFO(Render_Vulkan, "VR bow: the arrow in the right hand {}",
+                     arrow_swing ? "hits like a light melee swing (until it is nocked)"
+                                 : "is no swing now");
+            arrow_swing_was = arrow_swing;
+        }
+        if (bow_form && !arrow_swing) {
             return;
+        }
+        if (arrow_swing) {
+            left_swings = false;
         }
 
         // melee=physical (UpdatePhysicalMelee): the swing is the attack, the trigger charges it;
@@ -11158,22 +13714,26 @@ struct OpenXRPresenter::Impl {
 
         // Right trigger: the route is fixed when it is pressed. (Not while the music box frees
         // the right hand: its weapon is put away.)
-        // A trigger squeezed with the fist on the crank and still held as the box is put away is
-        // no attack (R1, or a heavy tap on its release): only a new pull is.
-        if (music_box_free) {
+        // A trigger squeezed with the fist on the crank (or round the empty syringe) and still
+        // held as it is put away is no attack (R1, or a heavy tap on its release): only a new
+        // pull is.
+        if (music_box_free || blood_draw_out.shown) {
             music_box_trigger_wait = in[PhysTriggerR];
         } else if (!in[PhysTriggerR]) {
             music_box_trigger_wait = false;
         }
         const bool bow_string = bow_trigger_wait && bow_hand_i == 0; // UpdateBow
         const bool trigger =
-            in[PhysTriggerR] && !music_box_free && !music_box_trigger_wait && !bow_string;
+            in[PhysTriggerR] && !music_box_free && !music_box_trigger_wait && !bow_string &&
+            !blood_draw_out.shown;
         // The right hand's shots (UpdateBladeShots): a gun-blade's trigger fires it, a blast's
         // charges it, and neither charges a swing there.
-        const VR::Tricks::Shot blade_shot = physical ? BladeShotNow() : VR::Tricks::Shot::None;
+        const VR::Tricks::Shot blade_shot =
+            physical && !arrow_swing ? BladeShotNow() : VR::Tricks::Shot::None;
         const bool gun_blade = blade_shot == VR::Tricks::Shot::GunBlade ||
                                blade_shot == VR::Tricks::Shot::StakeBlast;
         since_attack += dt;
+        since_committed_attack += dt;
         const bool trigger_edge = trigger && !trigger_r_down && !physical;
         if (trigger_edge) {
             trigger_route = !heavy_trigger          ? Route::R1
@@ -11207,6 +13767,19 @@ struct OpenXRPresenter::Impl {
         config.windup_turn = settings.swing_windup_turn_deg * VR::Melee::Deg;
         config.toward_front = settings.swing_toward_front_deg * VR::Melee::Deg;
         config.rejudge = settings.swing_windup_rejudge;
+        {
+            // The wind-up rule (2026-11-11): softer for everyone, softer still for the
+            // Amygdalan Arm's lash, none for the whips (core/vr/windup_weapon.h). The left hand
+            // has its own (UpdateLeftMelee).
+            static_assert(VR::Melee::KosTendrilVariation == VR::Tricks::KosRuneVariation);
+            const VR::Melee::WindupWeapon weapon = VR::Melee::RightWindupWeapon(
+                melee_variation, melee_form_b, physical, VR::Whip::GetWhipSettings().physical,
+                trigger);
+            const auto rule = VR::Melee::WindupFor(weapon.whip, weapon.arm_lash,
+                                                   settings.swing_windup_share);
+            config.windups = rule.on;
+            config.windup_share = rule.share;
+        }
         VR::Melee::Input input{};
         input.t = static_cast<double>(gesture.time) * 1e-9;
         input.active = swings;
@@ -11251,18 +13824,26 @@ struct OpenXRPresenter::Impl {
             const auto axis = VR::Body::Normalize(VR::TwoHand::BoneToGripLocal(
                 two_hand_status.right, {0, -1, 0}, 1.0f) - two_hand_status.right.offset);
             swing_config.blade_local = {axis.x, axis.y, axis.z};
+            // Y's push: the rear hand driving the weapon through the lead fist is a thrust.
+            if (two_hand_support.PushActive()) {
+                swing_config.stab_speed =
+                    std::min(swing_config.stab_speed, VR::TwoHand::PushStabSpeed);
+                swing_config.min_travel =
+                    std::min(swing_config.min_travel, VR::TwoHand::PushMinTravelM);
+            }
         }
         const VR::Melee::Output out = melee.Update(input, swing_config);
         if (!clutch) {
             // Swings held back by SwingGate for a reason the player may not see (the vial at the
-            // wrist, an NPC talking, a context switch, the hand at the face, the hand not still
+            // wrist, a context switch, the hand at the face, the hand not still
             // yet): a second classifier judges the same motion as if they were on, and a swing
             // that would have attacked gets the deny double tick and a log line, never a press.
             // Menus, cinematics, Menu held and the grip adjust are plain to see: no tick.
-            // (The music box: the weapon is visibly put away, and the crank's ticks are its own.)
+            // (The music box and the empty syringe: the weapon is visibly put away, and their
+            // own ticks are theirs.)
             const bool plain = !settings.gestures || menu_context || VR::IsGameMenuOpen() ||
                                VR::CinematicActive() || in[PhysMenu] || grip_adjust.Frozen() ||
-                               music_box_free || saw_spin.Spinning();
+                               music_box_free || blood_draw_out.shown || saw_spin.Spinning();
             VR::Melee::Input shadow = input;
             shadow.active = !plain;
             shadow.trigger_heavy_edge = false;
@@ -11277,10 +13858,14 @@ struct OpenXRPresenter::Impl {
             }
         }
 
-        if (out.ready_click) {
+        // While the heavy's wait runs (melee_window.h HeavyCooldownS, physical melee), a
+        // wound-up stroke opens light: no click and no arc buzz that promise a heavy. Nor for the
+        // Bowblade's arrow, which has no heavy.
+        const bool heavy_cooling = (physical && melee_window.HeavyCooling()) || arrow_swing;
+        if (out.ready_click && !heavy_cooling) {
             weapon_hand.Play(Tick(0.12f, 12.0f, 0)); // wound up: a big swing from here is heavy
         }
-        if (out.sustain > 0.0f) {
+        if (out.sustain > 0.0f && !heavy_cooling) {
             weapon_hand.sustain = out.sustain; // rising buzz while a big swing builds its arc
             arc_sustain = true;
         } else if (arc_sustain) {
@@ -11308,7 +13893,7 @@ struct OpenXRPresenter::Impl {
             two_hand_blade.speed, dt, two_settings.swing_hum);
         UpdateWeaponHum(physical, RightTipSpeed(physical_right, physical_gesture, config), dt);
         UpdateLeftMelee(left, gesture, config,
-                        physical && swings && !physical_lever_out.owns_grip[0], dt);
+                        physical && left_swings && !physical_lever_out.owns_grip[0], dt);
         if (!physical) {
             UpdateBladeShots(physical_right, physical_gesture, trigger, blade_shot, swings, dt); // (its end)
         }
@@ -11328,17 +13913,33 @@ struct OpenXRPresenter::Impl {
                 UpdateBladeShots(physical_right, physical_gesture, trigger, blade_shot, swings, dt,
                                  punch);
             // A charged punch owns this stroke: don't spend an ordinary light attack first.
-            UpdatePhysicalMelee(physical_right, physical_gesture, out, config,
-                                swings && !(stake_melee && trigger && !discharge &&
-                                            !(melee_window.Current().open &&
-                                              melee_window.Current().powered)),
-                                trigger && !gun_blade && !saw_trigger_r, dt, discharge);
+            // The Amygdalan Arm in form B (its hook on): the right trigger throws the tentacle out
+            // (core/vr/amygdalan_arm.h, the lash); while it is held the arm's motion swings the
+            // tentacle, never an attack.
+            const bool arm_owns = VR::AmygdalanHook::OwnsTrigger(
+                VR::AmygdalanHook::ProbeEnabled() || VR::AmygdalanHook::Active(),
+                physical && VR::Whip::GetWhipSettings().physical, melee_variation, melee_form_b);
+            arm_lash = arm_owns && trigger;
+            UpdatePhysicalMelee(
+                physical_right, physical_gesture, out, config,
+                swings &&
+                    !(stake_melee && trigger && !discharge &&
+                      !(melee_window.Current().open && melee_window.Current().powered)),
+                trigger && !gun_blade && !saw_trigger_r && !arm_owns, dt, discharge,
+                swings && melee_variation == 2500 && melee_form_b
+                    ? ArmSwingInput(right, gesture, config) : VR::Whip::SwingInput{});
             if (!stake_melee) {
                 UpdateBladeShots(physical_right, physical_gesture, trigger, blade_shot, swings, dt);
             }
             {
                 VR::FeatureCost::Scope cost{VR::FeatureCost::ThrustUpdate};
-                UpdateVisceralThrust(physical_right, physical_gesture, config, swings, dt);
+                // The affected grips' visceral is controller intent, not the weighted model's
+                // lag/sag. Ordinary attacks above still use their existing inputs and contacts.
+                const bool visceral_intent = VR::Melee::Thrust::ForwardAssistWeapon(
+                    melee_variation, melee_form_b);
+                UpdateVisceralThrust(visceral_intent ? right : physical_right,
+                                     visceral_intent ? gesture : physical_gesture, config,
+                                     swings && !arrow_swing, dt);
             }
             return;
         }
@@ -11509,26 +14110,39 @@ struct OpenXRPresenter::Impl {
         namespace Tr = VR::Tricks;
         const auto& ms = M::GetMeleeSettings();
         const s64 now = VR::Body::SteadyNowNs();
-        melee_window_left.PayFrom(&melee_window); // one pace for both hands
+        // One pace for both hands, or, the Blade of Mercy or Rakuyo split in two
+        // (melee_dual_hands), a budget of each hand's own (core/vr/dual_blades.h).
+        const bool dual_hands = DualSplit() && ms.dual_hands;
+        melee_window_left.PayFrom(dual_hands ? nullptr : &melee_window);
+        UpdateSharpen(now);
         Cb::MeleeStatus st{};
         const bool fresh = Cb::LatestMeleeStatus(st) && now - st.ns < 250'000'000;
         left_single = fresh && !st.left_dual;
         const s64 counter_ns = static_cast<s64>(Tr::CounterSwingS * 1e9f);
-        // The left hand at the face (the strap, the headset): no left swings until it is away and
-        // slow again (lowered from there it would look like a chop), as the right hand's.
+        // A gun may punch forward out of a raised guard without settling first.
+        // Lowering it from the headset still needs quiet re-arm. Other left-hand
+        // weapons keep their existing quiet re-arm, including shields.
         if (HandAtFace(left, gesture, left_at_face)) {
             left_face_hold = true;
             left_face_quiet = 0.0f;
-        } else if (left_face_hold) {
-            const float speed = left.valid ? std::hypot(left.velocity.x - gesture.head_velocity.x,
-                                                        left.velocity.y - gesture.head_velocity.y,
-                                                        left.velocity.z - gesture.head_velocity.z)
-                                           : SwingQuietSpeed;
+        } else if (left_face_hold && left.valid && gesture.head_ok) {
+            const M::V3 relative_velocity{left.velocity.x - gesture.head_velocity.x,
+                                          left.velocity.y - gesture.head_velocity.y,
+                                          left.velocity.z - gesture.head_velocity.z};
+            const bool strike = fresh && st.left_gun && !st.left_shield && M::PunchLeavesFace(
+                {left.position.x - gesture.head_position.x,
+                 left.position.y - gesture.head_position.y,
+                 left.position.z - gesture.head_position.z}, relative_velocity,
+                {gesture.forward.x, gesture.forward.y, gesture.forward.z}, FaceStrikeSpeed);
+            const float speed = M::Length(relative_velocity);
             left_face_quiet = speed < SwingQuietSpeed ? left_face_quiet + dt : 0.0f;
-            if (left_face_quiet >= SwingQuietTime) {
+            if (strike || left_face_quiet >= SwingQuietTime) {
                 left_face_hold = false;
-                melee_left.OnDraw(); // the detector re-arms with the hand slow
+                left_face_quiet = 0.0f;
+                if (!strike) melee_left.OnDraw(); // preserve a deliberate punch already underway
             }
+        } else if (left_face_hold) {
+            left_face_quiet = 0.0f; // missing tracking is not a quiet hand
         }
         const bool free = allowed && fresh && !left_face_hold &&
                           quick.GetPhase() == VR::Quick::Phase::Idle && !vial_armed &&
@@ -11571,6 +14185,16 @@ struct OpenXRPresenter::Impl {
         M::Config left_config = config;
         if (st.left_gun) {
             left_config.stab_speed = Tr::GunPunchSpeed;
+        }
+        {
+            // The left hand's own wind-up rule (M::WindupFor, core/vr/windup_weapon.h): a whip
+            // only with the Kos Parasite's form-B tendrils on it; a gun or an off-hand blade has
+            // the general one, whatever the right hand holds (its whip or the Arm's lash).
+            const auto rule =
+                M::WindupFor(M::LeftWindupWhip(melee_variation, melee_form_b, st.left_gun), false,
+                             VR::GetSettings().swing_windup_share);
+            left_config.windups = rule.on;
+            left_config.windup_share = rule.share;
         }
         const M::Output out = melee_left.Update(input, left_config);
         // (Not for the off hand's counter-motion to a right swing: that one is never a request.)
@@ -11623,6 +14247,9 @@ struct OpenXRPresenter::Impl {
         ti.recovery = melee_left.Recovery();
         ti.blade_rate = melee_left.Rate();
         ti.stroke_peak = melee_left.StrokePeak();
+        // (At its commit the classifier may have moved on: the committed sweep, in deg.)
+        ti.stroke_arc = std::max(melee_left.CurrentArcDeg() * M::Deg,
+                                 out.fired ? out.stats.theta_eff * M::Deg : 0.0f);
         ti.fired = fired;
         ti.fired_stroke = out.fired_stroke;
         ti.kind = out.kind;
@@ -11637,6 +14264,7 @@ struct OpenXRPresenter::Impl {
         ti.fwd_flat = M::Normalize({gesture.forward.x, 0.0f, gesture.forward.z});
         ti.tip_speed = TipSpeed(left, gesture, config);
         ti.hit_serial = melee_left_hit_serial;
+        ti.recent_hits = melee_left_recent_hits;
         ti.top = M::MoveKind::Light; // one row: every left swing is a light one
         const float recover =
             M::PaceRecover(M::FindPace(melee_variation), melee_form_b, M::MoveKind::Light);
@@ -11650,6 +14278,21 @@ struct OpenXRPresenter::Impl {
         tc.budget.offset_s = ms.budget_offset_ms * 0.001f;
         tc.budget.quick_charges = ms.budget_quick_charges;
         tc.budget.quick_s = ms.budget_quick_s;
+        tc.budget.miss_refund = ms.budget_miss_refund;
+        if (dual_hands) {
+            DualBudget(tc.budget, ms); // its own (PayFrom nullptr)
+        }
+        // Its own budget (split blades) on real time too, by its own clock: the time since its
+        // last Step this frame's dt does not cover (a game menu, the virtual screen, focus loss).
+        // It steps every frame the right hand may not (no physical swings), so the right's gap
+        // (UpdatePhysicalMelee) would count those frames twice.
+        if (dual_hands && melee_left_step_ns != 0) {
+            const double gap = static_cast<double>(now - melee_left_step_ns) * 1e-9 - dt;
+            if (gap > 0.02) {
+                melee_window_left.Advance(gap);
+            }
+        }
+        melee_left_step_ns = now;
         const M::Window before = melee_window_left.Current();
         const M::TrackerOutput to = melee_window_left.Step(ti, tc);
         const M::Window& w = melee_window_left.Current();
@@ -11721,6 +14364,114 @@ struct OpenXRPresenter::Impl {
         return true;
     }
 
+    // The Blade of Mercy or Rakuyo split in two (core/vr/dual_blades.h): the right weapon in its
+    // form B, its second blade in the left hand.
+    bool DualSplit() const {
+        return VR::DualBlades::IsDualBlades(melee_variation) && melee_form_b;
+    }
+
+    // A split blade hand's budget (melee_dual_charges at the game's own pace: no third quick
+    // charge, no melee_budget_offset_ms).
+    static void DualBudget(VR::Melee::BudgetConfig& b, const VR::Melee::MeleeSettings& ms) {
+        b.charges = ms.dual_charges;
+        b.quick_charges = ms.dual_charges;
+        b.offset_s = 0.0f;
+    }
+
+    // A window's damage scale (Combat::MeleeWindow::damage_scale) for `hand` (0 left, 1 right):
+    // a split blade's, with its hone while honed (the game takes it as the attack starts; the
+    // first hit that lands with it spends the hone: NoteDualHit).
+    float DualScale(int hand) const {
+        if (!DualSplit()) {
+            return 1.0f;
+        }
+        const auto& ms = VR::Melee::GetMeleeSettings();
+        const bool honed = ms.dual_sharpen && dual_honed_until_ns[hand] > VR::Body::SteadyNowNs();
+        return VR::DualBlades::DamageScale(ms.dual_hands, ms.dual_damage_pct, honed,
+                                           ms.dual_sharpen_pct);
+    }
+
+    // A hit of `hand`'s window `serial` landed with its attack's scale `scale`: one that carried
+    // the hone spends it (one whose attack started before the hone, or a transform's, does not;
+    // a hone spent, the next windows are published unhoned again).
+    void NoteDualHit(int hand, u32 serial, float scale) {
+        const auto& ms = VR::Melee::GetMeleeSettings();
+        if (dual_honed_until_ns[hand] == 0 || !DualSplit() ||
+            !VR::DualBlades::CarriesHone(scale, ms.dual_hands, ms.dual_damage_pct,
+                                         ms.dual_sharpen_pct)) {
+            return;
+        }
+        dual_honed_until_ns[hand] = 0;
+        dual_spent_ns[hand] = VR::Body::SteadyNowNs(); // its shine goes with it
+        PublishShine();
+        LOG_INFO(Render_Vulkan, "VR dual blades: the {} blade's honed hit (#{}: +{:.0f}%)",
+                 hand == 0 ? "left" : "right", serial, ms.dual_sharpen_pct);
+    }
+
+    // The hones on the steel (core/vr/dual_blades.h Shine), for the in-frame list.
+    void PublishShine() {
+        VR::DualBlades::Shine shine{};
+        shine.honed_ns = dual_honed_at_ns;
+        shine.until_ns = dual_honed_until_ns;
+        shine.spent_ns = dual_spent_ns;
+        VR::DualBlades::ShineChannel().Store(shine);
+    }
+
+    // Rubbing the split blades together (core/vr/dual_blades.h Sharpener, on the body's blade
+    // sounds' strokes) hones both: the full charge's ring and a buzz in both hands. Joined (or
+    // another weapon), the rubs and the hones are forgotten.
+    void UpdateSharpen(s64 now) {
+        namespace D = VR::DualBlades;
+        const auto& ms = VR::Melee::GetMeleeSettings();
+        const u32 strokes = D::Strokes();
+        const u32 fresh = strokes - dual_strokes_seen;
+        dual_strokes_seen = strokes;
+        if (!DualSplit() || !ms.dual_sharpen) {
+            dual_sharpener.Reset();
+            const bool shown = dual_honed_at_ns[0] != 0 || dual_honed_at_ns[1] != 0;
+            dual_honed_until_ns = {0, 0};
+            dual_honed_at_ns = {0, 0};
+            dual_spent_ns = {0, 0};
+            if (shown) {
+                PublishShine(); // joined, or another weapon: no shine left on it
+            }
+            return;
+        }
+        for (int h = 0; h < 2; ++h) {
+            if (dual_honed_until_ns[h] != 0 && now >= dual_honed_until_ns[h]) {
+                dual_honed_until_ns[h] = 0;
+                PublishShine();
+                LOG_INFO(Render_Vulkan, "VR dual blades: the {} blade's hone faded unused",
+                         h == 0 ? "left" : "right");
+            }
+        }
+        const double t = static_cast<double>(now) * 1e-9;
+        for (u32 i = 0; i < std::min(fresh, 8u); ++i) {
+            if (!dual_sharpener.Stroke(t, ms.dual_sharpen_rubs)) {
+                continue;
+            }
+            const bool both = dual_honed_until_ns[0] > now && dual_honed_until_ns[1] > now;
+            dual_honed_until_ns.fill(now + static_cast<s64>(D::HonedS * 1e9f));
+            if (both) {
+                PublishShine(); // the lines stay (no new glint without the ring)
+                LOG_INFO(Render_Vulkan, "VR dual blades: rubbed again: the hones renewed");
+                continue;
+            }
+            dual_honed_at_ns.fill(now); // the glint runs with the ring
+            dual_spent_ns = {0, 0};
+            PublishShine();
+            VR::ChargeAudio::Play(now); // the strong attack's ring
+            if (ms.haptics) {
+                haptics[0].Play(Repeat(3, 0.6f, 20.0f, 40.0f, 2));
+                haptics[1].Play(Repeat(3, 0.6f, 20.0f, 40.0f, 2));
+            }
+            LOG_INFO(Render_Vulkan,
+                     "VR dual blades: sharpened ({} rubs): each blade's next hit +{:.0f}% (for "
+                     "{:.0f} s)",
+                     ms.dual_sharpen_rubs, ms.dual_sharpen_pct, D::HonedS);
+        }
+    }
+
     // The left window for the game (bloodborne_melee.cpp LeftMeleeTick).
     void PublishLeftWindow(s64 now) {
         namespace Cb = VR::Combat;
@@ -11738,6 +14489,8 @@ struct OpenXRPresenter::Impl {
         p.verdict = static_cast<u8>(w.verdict);
         p.tip_speed = w.tip_speed;
         p.tip_peak = w.tip_peak;
+        p.hand_peak = w.hand_peak;
+        p.arc_peak = w.arc_peak;
         p.since_counted_s = w.since_counted;
         p.open_ns = melee_left_open_ns;
         p.close_ns = w.open ? 0 : melee_left_close_ns;
@@ -11745,6 +14498,7 @@ struct OpenXRPresenter::Impl {
         p.prev_aborted = melee_left_prev_aborted;
         p.ns = now;
         p.unpaid = w.unpaid;
+        p.damage_scale = DualScale(0);
         Cb::PublishMeleeWindowLeft(p);
     }
 
@@ -11759,6 +14513,94 @@ struct OpenXRPresenter::Impl {
             return p.Pulse(std::min(1.0f * k, 1.0f), 55.0f).Ramp(0.85f * k, 0.0f, 220.0f);
         }
         return GunThump(VR::Gun::Family::Pistol, k);
+    }
+
+    void UpdateKosRitualFeedback(s64 now, s64 start) {
+        namespace Tr = VR::Tricks;
+        if (start == 0) return; // interrupted/stale; remember consumed beats if tracking resumes
+        if (start != kos_feedback_ns) {
+            kos_feedback_ns = start;
+            kos_feedback_beat = 0;
+        }
+        // The ritual's heartbeat in both hands, quickening, then the burst's deep pulse.
+        if (kos_feedback_ns != 0) {
+            const float age = static_cast<float>(now - kos_feedback_ns) * 1e-9f;
+            const bool feel = VR::Tricks::GetTrickSettings().haptics;
+            while (kos_feedback_beat < Tr::KosRitualBeatsS.size() &&
+                   age >= Tr::KosRitualBeatsS[kos_feedback_beat]) {
+                const float k = static_cast<float>(kos_feedback_beat) /
+                                static_cast<float>(Tr::KosRitualBeatsS.size() - 1);
+                if (feel && age - Tr::KosRitualBeatsS[kos_feedback_beat] < 0.1f) {
+                    const auto lub = HapticPattern{}
+                                         .Pulse(0.3f + 0.3f * k, 24.0f)
+                                         .Gap(85.0f - 25.0f * k)
+                                         .Pulse(0.2f + 0.25f * k, 18.0f);
+                    haptics[0].Play(lub);
+                    haptics[1].Play(lub);
+                }
+                ++kos_feedback_beat;
+            }
+            if (kos_feedback_beat == Tr::KosRitualBeatsS.size() && age >= Tr::KosRitualBurstS) {
+                if (feel && age - Tr::KosRitualBurstS < 0.1f) {
+                    const auto burst = HapticPattern{}.Pulse(1.0f, 70.0f).Ramp(0.6f, 0.0f, 260.0f);
+                    haptics[0].Play(burst);
+                    haptics[1].Play(burst);
+                }
+                ++kos_feedback_beat;
+            }
+        }
+    }
+
+    // The Kos Parasite's spit (UpdateGun): true while the Kos with the Milkweed rune owns the left
+    // trigger. `down`: the trigger (not while quick items take it).
+    bool UpdateKosSpit(bool down, s64 now) {
+        namespace Tr = VR::Tricks;
+        VR::Combat::MeleeStatus ms{};
+        const bool on = VR::Combat::LatestMeleeStatus(ms) && now >= ms.ns &&
+                        now - ms.ns < 250'000'000 && ms.ok && ms.variation == Tr::KosRuneVariation;
+        if (!on) {
+            kos_spit = {};
+            return false;
+        }
+        const bool press = down && !kos_spit.down;
+        const bool release = !down && kos_spit.down;
+        if (press) {
+            kos_spit.press_ns = now;
+            kos_spit.ritual = false;
+        }
+        if (down && ms.form_b && !kos_spit.ritual &&
+            now - kos_spit.press_ns >= static_cast<s64>(Tr::KosRitualHoldS * 1e9f)) {
+            kos_spit.ritual = true;
+            LOG_INFO(Render_Vulkan, "VR Kos: the left trigger held {:.2f} s: the ritual (L2)",
+                     Tr::KosRitualHoldS);
+        }
+        const bool spit = (press && !ms.form_b) || (release && ms.form_b && !kos_spit.ritual);
+        if (release) {
+            kos_spit.ritual = false;
+        }
+        kos_spit.down = down;
+        if (spit) {
+            VR::Combat::BladeShot req{};
+            req.shot = static_cast<u8>(Tr::Shot::KosSpit);
+            req.press_ns = now;
+            req.space_serial = recenter_serial;
+            req.serial = ++blade_shots;
+            const VR::Body::Vec3 look = VR::Body::Rotate(grip_head_q, {0.0f, 0.0f, -1.0f});
+            req.dir_valid = grip_head_tracked && VR::Body::IsFinite(look);
+            req.dir = look;
+            VR::Combat::PublishBladeShot(req);
+            if (VR::Tricks::GetTrickSettings().haptics) {
+                // A gag and a heave in both hands, then the wet pop.
+                const auto heave =
+                    HapticPattern{}.Pulse(0.3f, 30.0f).Gap(25.0f).Pulse(0.55f, 22.0f);
+                haptics[0].Play(heave);
+                haptics[1].Play(heave);
+            }
+            LOG_INFO(Render_Vulkan, "VR Kos: spit #{} ({}){}", req.serial,
+                     ms.form_b ? "a tap in form B" : "the left trigger in form A",
+                     req.dir_valid ? "" : " (no view: refused)");
+        }
+        return true;
     }
 
     // The right hand's shot of the weapon in hand (core/vr/trick_weapons.h ShotWeaponOf, from the
@@ -11781,7 +14623,8 @@ struct OpenXRPresenter::Impl {
         case Tr::Shot::StakeBlast:
             on = ts.stake_blast;
             break;
-        case Tr::Shot::Bow: // the bow's own path (UpdateBow)
+        case Tr::Shot::Bow:     // the bow's own path (UpdateBow)
+        case Tr::Shot::KosSpit: // the left trigger's (UpdateKosSpit)
         case Tr::Shot::None:
             break;
         }
@@ -11795,14 +14638,17 @@ struct OpenXRPresenter::Impl {
     // triple buzz), releasing discharges it (BlastCooldownS after it). A verified stake also
     // accepts a committed forward punch while held. Its melee
     // row returns true to open a powered contact window; projectile rows use BladeShotTick.
-    // moon_wave: a charged swing (the trigger held 1 s) of the transformed Holy Moonlight Sword
-    // lets its wave go at the stroke's fastest, where you look or out through the blade. The
-    // kick comes with the game's answer (HandleMeleeEvents: Shot).
+    // moon_wave: a charged swing of the transformed Holy Moonlight Sword lets its wave go as the
+    // blade crosses where you face (Tricks::ViewCrossing), along your heading at the sword's own
+    // up/down (Tricks::MoonWaveLine), or when the trigger is let go mid-stroke, along the blade
+    // (Tricks::MoonReleaseFires); the game side turns it at a target in front
+    // (Tricks::MoonWaveAim). The kick comes with the game's answer (HandleMeleeEvents: Shot).
     bool UpdateBladeShots(const HandState& right, const GestureFrame& gesture, bool trigger,
                           VR::Tricks::Shot shot, bool swings, float dt, bool stake_punch = false) {
         namespace Tr = VR::Tricks;
         namespace Bd = VR::Body;
         const bool edge = trigger && !blade_trigger_down;
+        const bool released = !trigger && blade_trigger_down; // (the moonlight wave's let-go)
         blade_trigger_down = trigger;
         const Tr::ShotWeapon* sw = Tr::ShotWeaponOf(melee_variation);
         const bool blast_weapon = shot != Tr::Shot::None && sw != nullptr && sw->charge_s > 0.0f;
@@ -11824,7 +14670,7 @@ struct OpenXRPresenter::Impl {
             return UpdateBlast(trigger, shot, *sw, swings, dt, req, stake_punch);
         }
         if (shot == Tr::Shot::GunBlade) {
-            // Not while swings are held back (an NPC talking, Menu held; the hand at the face is
+            // Not while swings are held back (Menu held; the hand at the face is
             // sighting down the blade: that pull shoots) or the vial reaches the wrist (a clench
             // for the needle): that pull is no shot.
             if (edge && (swings || swing_block == FaceBlock) && !VialReaching()) {
@@ -11856,18 +14702,34 @@ struct OpenXRPresenter::Impl {
         }
         const VR::Melee::Window& w = melee_window.Current();
         const Tr::Frame f = TrickFrame(right, right, gesture, false, 0.0f);
-        const Bd::Vec3 chest = f.head + Bd::Vec3{0.0f, -Tr::ChestDownM, 0.0f};
         const Bd::Vec3 gaze{gesture.forward.x, gesture.forward.y, gesture.forward.z};
+        // This frame, the blade swept across where you face (a slash) or down through your eye
+        // line in front of you (a chop).
+        auto crossing = Tr::ViewCrossing::Kind::None;
         if (shot == Tr::Shot::MoonWave) {
-            // The wave's line: where you look if this swing's blade swept through it, else the
-            // blade's at its fastest (WaveSweep, fed every frame of the window).
+            // The wave's slash (its crescent's tilt) and the blade crossing your view, fed every
+            // frame of the window.
             if (w.serial != wave_window) {
                 wave_window = w.serial;
-                wave_sweep = {};
+                wave_slash = {};
+                wave_cross = {};
+            }
+            if (wave_slash_space != recenter_serial) {
+                wave_slash_space = recenter_serial;
+                wave_slash = {};
             }
             if (w.open) {
-                wave_sweep.Step(f.head, gaze, chest, f.right.p + f.axis * 0.5f, f.forward,
-                                w.tip_speed);
+                // (Untracked, the head or the hand: start afresh, never a jump back as a crossing.)
+                if (gesture.head_ok && right.valid) {
+                    crossing = wave_cross.Step(f.head, gaze, f.right.p + f.axis * 0.5f);
+                } else {
+                    wave_cross = {};
+                }
+                if (right.valid && right.orientation_valid && gesture.head_ok) {
+                    wave_slash.Step(f.right.p + f.axis * 0.5f - f.head, dt, w.tip_speed, f.axis);
+                } else {
+                    wave_slash = {};
+                }
             }
         }
         // The wave: a charged swing only (the trigger held the full charge first: the tester,
@@ -11876,12 +14738,19 @@ struct OpenXRPresenter::Impl {
                           w.kind == VR::Melee::MoveKind::Charged;
         const bool wants = w.open && w.committed && !w.unpaid && !w.flick &&
                            w.serial != blade_shot_window && kind;
-        // At the stroke's fastest: the blade's far end slowing from its peak.
-        if (!wants || w.tip_peak < 1.5f || w.tip_speed > 0.85f * w.tip_peak) {
+        // As the blade crosses where you face: along your heading, the sword's up/down (a chop:
+        // level). Never crossing it, the trigger let go mid-stroke: along the blade, hilt to tip.
+        // (The game side turns it at a target in front either way.)
+        const bool crossed = crossing != Tr::ViewCrossing::Kind::None;
+        const bool let_go = !crossed && Tr::MoonReleaseFires(w.tip_peak, released);
+        if (!wants || !(crossed || let_go)) {
             return false;
         }
         blade_shot_window = w.serial;
-        req.dir = wave_sweep.Aim(f.head, gaze, f.forward);
+        req.dir = crossed ? Tr::MoonWaveLine(gaze, f.axis, f.forward,
+                                             crossing == Tr::ViewCrossing::Kind::Chop)
+                          : Tr::BladeWaveAim(f.axis, f.forward);
+        req.slash = Tr::LevelSlash(wave_slash.Across(req.dir)); // (flat within FlatCrescentDeg)
         req.dir_valid = Bd::LengthSq(req.dir) > 0.5f;
         req.serial = ++blade_shots;
         req.charged = w.kind == VR::Melee::MoveKind::Charged;
@@ -11889,18 +14758,19 @@ struct OpenXRPresenter::Impl {
         VR::Combat::PublishBladeShot(req);
         LOG_INFO(Render_Vulkan,
                  "VR blade shot: #{} the moonlight wave of swing #{} at {:.1f} m/s (its peak "
-                 "{:.1f}) along ({:.2f},{:.2f},{:.2f}){}",
-                 req.serial, w.serial, w.tip_speed, w.tip_peak, req.dir.x, req.dir.y, req.dir.z,
-                 wave_sweep.AtGaze()
-                     ? fmt::format(" where you look (the blade {:.0f} deg from it)",
-                                   wave_sweep.gaze_deg)
-                     : fmt::format(" along the swing at its fastest (your view {:.0f} deg off)",
-                                   wave_sweep.gaze_deg));
+                 "{:.1f}) {} ({:.2f},{:.2f},{:.2f})",
+                 req.serial, w.serial, w.tip_speed, w.tip_peak,
+                 crossing == Tr::ViewCrossing::Kind::Slash
+                     ? "as the blade crossed where you face"
+                 : crossing == Tr::ViewCrossing::Kind::Chop
+                     ? "as the chop came down through your eye line"
+                     : "the trigger let go, along the blade",
+                 req.dir.x, req.dir.y, req.dir.z);
         return false;
     }
 
     // saw_spin (core/vr/trick_weapons.h SawSpin): the transformed Whirligig Saw held with both
-    // hands (the two-handed grip on its handle): either trigger held spins it up (the pull-start's
+    // hands (the two-handed grip on its handle): the scheme's spin trigger spins it up (the pull-start's
     // catch, then the rumble rising to speed with the teeth's grain in both hands), let go (or the
     // left hand off the handle) it spins down (the whir dying away). The game's L2 never plays
     // (UpdateGun). SawAttackTick runs the weapon-only loop and its native contact attacks.
@@ -11938,7 +14808,8 @@ struct OpenXRPresenter::Impl {
         const bool left_pull = in[PhysTriggerL] && !quick.block_l2 && !saw_left_down;
         saw_left_down = in[PhysTriggerL];
         if (!saw) {
-            saw_trigger_r = RightFamily() == Tr::SawFamily && two_hand.Engaged();
+            saw_trigger_r = OptimizedTwoHand() && RightFamily() == Tr::SawFamily &&
+                            two_hand.Engaged();
             if (saw_spin.Spinning()) {
                 LOG_INFO(Render_Vulkan, "VR saw: stopped (no longer the Whirligig held in its "
                                         "transformed form)");
@@ -11948,26 +14819,28 @@ struct OpenXRPresenter::Impl {
             write(0.0f);
             return;
         }
-        // Either trigger (2026-10-12): with both hands on the saw the right one is the
-        // saw's too, never a swing's charge (UpdateMotionWeapon: saw_trigger_r), and stays so
-        // until let go (a hand off the handle mid-spin never turns it into a held charge).
-        saw_trigger_r = two_hand.Engaged() || (saw_trigger_r && in[PhysTriggerR]);
-        const bool allowed = !quick.block_l2 && !music_box_free && !VialReaching() &&
+        // Standard: left spins, right charges. Optimized: left owns attachment, right spins.
+        // Keep an optimized spin's right trigger reserved until released, even if the hand
+        // leaves the handle: that same hold must never become a charged swing.
+        const bool optimized = OptimizedTwoHand();
+        saw_trigger_r = optimized && (two_hand.Engaged() || (saw_trigger_r && in[PhysTriggerR]));
+        const bool allowed = !quick.block_l2 && !music_box_free && !blood_draw_out.shown &&
+                             !VialReaching() &&
                              !VR::IsGameMenuOpen() && !VR::CinematicActive() &&
                              !grip_adjust.Frozen() && !in[PhysMenu];
         const bool left_trigger = allowed && in[PhysTriggerL];
         const bool right_trigger = allowed && in[PhysTriggerR];
         // A held trigger is a held spin request, including through the off-hand grab.
-        const bool trigger = left_trigger || right_trigger;
-        if (left_pull && !two_hand_support.Seated()) {
+        const bool trigger = Tr::SawSpinTrigger(optimized, left_trigger, right_trigger);
+        if (!optimized && left_pull && !two_hand_support.Seated()) {
             if (ts.haptics) {
                 lh.Play(Tick(0.12f, 10.0f, 0));
             }
             LOG_INFO(Render_Vulkan, "VR saw: no spin: put your left hand on the handle (the left "
-                                    "grip) and pull a trigger");
+                                    "grip) and pull the left trigger");
         }
         const Tr::SawSpin::Out o =
-            saw_spin.Step(left_trigger, right_trigger, two_hand_support.Seated(), dt);
+            saw_spin.Step(trigger, two_hand_support.Seated(), dt);
         VR::Combat::PublishSawRequest(
             {VR::Body::SteadyNowNs(), o.rev, trigger && two_hand_support.Seated()});
         write(o.level);
@@ -11978,7 +14851,8 @@ struct OpenXRPresenter::Impl {
             if (ts.haptics) {
                 rh.Play(Tick(0.4f, 15.0f, 1)); // the pull-start's catch
             }
-            LOG_INFO(Render_Vulkan, "VR saw: spinning up (a trigger, both hands on it)");
+            LOG_INFO(Render_Vulkan, "VR saw: spinning up ({} trigger, both hands on it)",
+                     optimized ? "right" : "left");
             break;
         case E::Full:
             if (ts.haptics) {
@@ -11996,6 +14870,17 @@ struct OpenXRPresenter::Impl {
         }
     }
 
+    // A charge held at full (a blast's, a swing's) settles from its peak hum to ChargeSettleShare
+    // of it over ChargeSettleS: a long-held charge (a stake lined up for its punch) no longer
+    // buzzes hard enough to shake the hand, and the full charge's triple buzz still marks it (the
+    // user, 2026-11-09: softer, not too weak).
+    static constexpr float ChargeSettleS = 0.5f;
+    static constexpr float ChargeSettleShare = 0.6f;
+    static float SettledChargeHum(float peak, float full_s) {
+        const float settle = std::clamp(full_s / ChargeSettleS, 0.0f, 1.0f);
+        return peak * (1.0f - (1.0f - ChargeSettleShare) * settle);
+    }
+
     // A blast (core/vr/trick_weapons.h Blast): the trigger held builds in the sword hand, a triple
     // buzz once charged, the blast on release or a verified stake punch (kick on game answer); let go early,
     // a soft tick; during the cooldown or while swings are held back, the deny.
@@ -12011,9 +14896,12 @@ struct OpenXRPresenter::Impl {
                              !VialReaching();
         const Tr::Blast::Out o = blast.Step(trigger, allowed, dt, sw.charge_s, sw.cadence_s,
                                           stake_melee && stake_punch);
+        blast_full_s = o.charging && o.progress >= 1.0f ? blast_full_s + dt : 0.0f;
         if (o.charging && feel) {
-            // Felt from its start (no haptic floor for a steady level), a detent each quarter.
-            rh.sustain = blast_sustain = 0.12f + 0.28f * o.progress;
+            // Felt from its start (no haptic floor for a steady level), a detent each quarter;
+            // held at full, it settles softer.
+            rh.sustain = blast_sustain =
+                SettledChargeHum(0.12f + 0.28f * o.progress, blast_full_s);
             const int q = std::min(static_cast<int>(o.progress * 4.0f), 3);
             if (q > blast_quarter) {
                 rh.Play(Tick(0.15f + 0.1f * static_cast<float>(q), 10.0f, 1));
@@ -12040,6 +14928,11 @@ struct OpenXRPresenter::Impl {
                      sw.charge_s);
             break;
         case E::Full:
+            // A blast (the Stake Driver's, the Rifle Spear's) has its own charge tracker, so
+            // ordinary melee never rings for it: the full charge's ring here (the user,
+            // 2026-11-09: the Rifle Spear's too). Full is a one-shot event; sound is independent
+            // of the haptics setting.
+            VR::ChargeAudio::Play(VR::Body::SteadyNowNs());
             if (feel) {
                 rh.Play(Repeat(3, 0.6f, 20.0f, 40.0f, 2));
             }
@@ -12087,13 +14980,47 @@ struct OpenXRPresenter::Impl {
         }
         M::V3 v{right.velocity.x - g.head_velocity.x, right.velocity.y - g.head_velocity.y,
                 right.velocity.z - g.head_velocity.z};
-        if (right.angular_valid && right.orientation_valid) {
+        // A turn rate no human blade has (swing_detector.h GlitchMax: a pose jump, a sample over
+        // a sliver of time) never counts, and no tip is faster than TipMaxMps (the headset log,
+        // 2026-10-28: one-handed tips of 10^8 m/s on the window).
+        const M::V3 w{right.angular.x, right.angular.y, right.angular.z};
+        if (right.angular_valid && right.orientation_valid &&
+            M::Length(w) <= M::GlitchMax) {
             const M::Q4 q{right.orientation.x, right.orientation.y, right.orientation.z,
                           right.orientation.w};
             const M::V3 blade = M::Normalize(M::Rotate(q, config.blade_local)) * MeleeBladeM;
-            v = v + M::Cross({right.angular.x, right.angular.y, right.angular.z}, blade);
+            v = v + M::Cross(w, blade);
         }
-        return M::Length(v);
+        const float speed = M::Length(v);
+        return std::isfinite(speed) ? std::min(speed, TipMaxMps) : 0.0f;
+    }
+
+    static VR::Whip::SwingInput ArmSwingInput(const HandState& right, const GestureFrame& g,
+                               const VR::Melee::Config& config) {
+        namespace M = VR::Melee;
+        VR::Whip::SwingInput result{};
+        if (!right.valid || !right.orientation_valid) return result;
+        const M::V3 v{right.velocity.x - g.head_velocity.x, right.velocity.y - g.head_velocity.y,
+                      right.velocity.z - g.head_velocity.z};
+        float speed = M::Length(v);
+        const M::Q4 q{right.orientation.x, right.orientation.y, right.orientation.z,
+                      right.orientation.w};
+        const M::V3 blade = M::Normalize(M::Rotate(q, config.blade_local));
+        M::V3 launch = v;
+        const M::V3 w{right.angular.x, right.angular.y, right.angular.z};
+        if (right.angular_valid && right.orientation_valid && M::Length(w) <= M::GlitchMax) {
+            // Match Motion's thresholds: translation OR swing rotation. Adding them counted
+            // a gentle wind-up twice; shaft roll contributes no whipping speed.
+            speed = std::max(speed, M::Length(M::Cross(w, blade)) * 0.5f);
+            launch = launch + M::Cross(w, blade) * 0.5f;
+        }
+        if (!std::isfinite(speed) || !std::isfinite(M::Length(launch))) return result;
+        const float length = M::Length(launch);
+        if (length > 15.0f) launch = launch * (15.0f / length);
+        result.arm_speed = std::min(speed, TipMaxMps);
+        result.arm_direction = {blade.x, blade.y, blade.z};
+        result.arm_velocity = {launch.x, launch.y, launch.z};
+        return result;
     }
 
     float RightTipSpeed(const HandState& right, const GestureFrame& g,
@@ -12121,6 +15048,7 @@ struct OpenXRPresenter::Impl {
                            w.charges,
                            w.downgraded ? " as a light: wound up with one left"
                            : w.flurry   ? " as a light: a flurry's lash"
+                           : w.cooled   ? " as a light: wound up within the heavy's cooldown"
                                         : "",
                            w.refill_s);
     }
@@ -12149,6 +15077,8 @@ struct OpenXRPresenter::Impl {
         p.verdict = static_cast<u8>(w.verdict);
         p.tip_speed = w.open ? tip : w.tip_speed;
         p.tip_peak = w.tip_peak;
+        p.hand_peak = w.hand_peak;
+        p.arc_peak = w.arc_peak;
         p.since_counted_s = w.since_counted;
         p.open_ns = melee_open_ns;
         p.close_ns = w.open ? 0 : melee_close_ns;
@@ -12163,10 +15093,19 @@ struct OpenXRPresenter::Impl {
         p.budget_late = w.late;
         p.budget_downgraded = w.downgraded;
         p.powered = w.powered;
+        p.contact_hold = w.contact_hold && !w.powered && !w.flick;
+        p.unsupported_family = VR::TwoHand::UnsupportedFamily(
+            OptimizedTwoHand() && VR::TwoHand::GetTwoHandSettings().enabled &&
+                two_hand_status_ok && p.ns >= two_hand_status.ns &&
+                p.ns - two_hand_status.ns < 250'000'000,
+            two_hand.Engaged(), RightFamily(), two_hand_status.style);
         // A two-handed swing (UpdateTwoHand's SwingMark): its hits x two_hand_damage.
+        p.two_handed = two_hand_swing.serial == w.serial &&
+                       two_hand_swing.TwoHanded(VR::TwoHand::GetTwoHandSettings());
         p.two_hand = two_hand_swing.serial == w.serial
                          ? two_hand_swing.Factor(VR::TwoHand::GetTwoHandSettings())
                          : 1.0f;
+        p.damage_scale = DualScale(1);
         Cb::PublishMeleeWindow(p);
     }
 
@@ -12214,6 +15153,8 @@ struct OpenXRPresenter::Impl {
             switch (e.kind) {
             case Cb::MeleeEventKind::Hit: {
                 melee_hit_serial = std::max(melee_hit_serial, e.serial);
+                melee_recent_hits[melee_recent_hit_next++ % melee_recent_hits.size()] = e.serial;
+                NoteDualHit(1, e.serial, e.scale);
                 // The hit landing: THE impact on the hand holding the weapon (both with the
                 // two-handed grip), a sharp near-full crack that decays, by the hit's damage
                 // (e.a) and its row's hit stop (e.b, the weapon's weight class); owning the hand
@@ -12227,6 +15168,33 @@ struct OpenXRPresenter::Impl {
                 const bool dealt = std::isfinite(e.a) && e.a >= HC::ImpactMinDamage;
                 const float weight = HC::ImpactWeight(e.a, e.b, both);
                 const s64 at = VR::Body::SteadyNowNs();
+                if (RightFamily() == VR::Tricks::BoomFamily) {
+                    // The Boom Hammer: its fire spent after boom_fire_hits swings that landed
+                    // while lit (one swing hitting two counts once), put out once the swing is
+                    // over (Combat::FurnaceQuench). Each hit's damage, lit or not (the logs: does
+                    // the lit hammer burn?).
+                    const bool lit = RightFormB();
+                    const int need = VR::Tricks::GetTrickSettings().boom_fire_hits;
+                    const bool counts = lit && dealt && need > 0 && boom_quench_ns == 0 &&
+                                        e.serial != boom_hit_serial;
+                    if (counts) {
+                        boom_hit_serial = e.serial;
+                        ++boom_lit_hits;
+                    }
+                    // (Only where it is carried out: transform=vanilla keeps the game's fire.)
+                    const bool spent =
+                        counts && boom_lit_hits >= need && BoomQuenchCarriedOut(at);
+                    if (spent) {
+                        Cb::PublishFurnaceQuench({++boom_quench_serial, at});
+                        boom_quench_ns = at;
+                        boom_quench_why = "the hit";
+                    }
+                    LOG_INFO(Core, "VR right grip: Boom Hammer: #{} hit for {:.1f} ({}{})",
+                             e.serial, e.a, lit ? "lit" : "unlit",
+                             spent ? fmt::format(", hit {} of {}: its fire is spent", boom_lit_hits,
+                                                 need)
+                                   : std::string{});
+                }
                 const bool again = e.serial != 0 && e.serial == melee_impact_serial &&
                                    at - melee_impact_ns < 60'000'000 &&
                                    weight <= melee_impact_weight;
@@ -12265,6 +15233,71 @@ struct OpenXRPresenter::Impl {
                 }
                 break;
             }
+            case Cb::MeleeEventKind::Ricochet: {
+                // A bullet the blade sent back at its shooter (bloodborne_deflect.cpp). As it goes
+                // (e.a 0): a bright crack and ring, over the deflection's thud (an impact: the
+                // thud cannot cut it). When its blast hits him (e.a 1): a heavy thump, the hit
+                // landing far away. Both hands with the two-handed grip, by haptic_melee_hit.
+                const float gain = std::clamp(VR::GetSettings().haptic_melee_hit, 0.0f, 1.5f);
+                const bool hit = e.a > 0.5f;
+                if (feel && gain > 0.0f) {
+                    const auto level = [gain](float a) { return std::min(a * gain, 1.0f); };
+                    HapticPattern p{};
+                    p.priority = 2;
+                    p.own = true;
+                    p.impact = true;
+                    if (hit) {
+                        p.Pulse(level(0.95f), 40.0f).Ramp(level(0.6f), 0.0f, 180.0f);
+                    } else {
+                        p.Pulse(level(1.0f), 16.0f)
+                            .Gap(18.0f)
+                            .Pulse(level(0.8f), 12.0f)
+                            .Ramp(level(0.55f), 0.0f, 120.0f);
+                    }
+                    weapon_hand.Play(p);
+                    if (two_hand_out.engaged) {
+                        haptics[0].Play(p);
+                    }
+                }
+                LOG_INFO(Render_Vulkan, "VR deflect: {} in the hand{}",
+                         hit ? fmt::format("the return hit its shooter ({:.0f} damage): the thump",
+                                           e.b)
+                             : fmt::format("sent back ({}): the crack",
+                                           e.b < 1.0f ? fmt::format("a swing's return, {:.0f}%",
+                                                                    e.b * 100.0f)
+                                                      : std::string{"straight back"}),
+                         feel && gain > 0.0f ? "" : " (haptics off)");
+                break;
+            }
+            case Cb::MeleeEventKind::Corpse: {
+                // A bare hand on a corpse (bloodborne_corpse.cpp; serial: the hand): a soft tap as
+                // it touches one (firmer the faster it moved in), a firm squeeze as it takes hold,
+                // a hum while it holds one that grows with the weight on it, a double tick as it
+                // slips out.
+                if (!feel || e.serial > 1) {
+                    break;
+                }
+                auto& hand = haptics[e.serial];
+                switch (static_cast<int>(e.a + 0.5f)) {
+                case 0:
+                    hand.Play(Tick(0.12f + 0.25f * std::clamp(e.b * 0.5f, 0.0f, 1.0f), 14.0f));
+                    break;
+                case 1:
+                    hand.Play(Tick(0.45f, 24.0f));
+                    break;
+                case 2:
+                    hand.Play(Repeat(2, 0.5f, 12.0f, 40.0f, 2));
+                    break;
+                case 3:
+                    if (e.b > 0.15f) {
+                        hand.Play(Tick(0.05f + 0.3f * std::clamp(e.b, 0.0f, 1.0f), 95.0f, 0));
+                    }
+                    break;
+                default:
+                    break;
+                }
+                break;
+            }
             case Cb::MeleeEventKind::Wall:
                 if (feel && weapon_hand.playing && weapon_hand.pattern.impact) {
                     LOG_INFO(Render_Vulkan,
@@ -12282,6 +15315,131 @@ struct OpenXRPresenter::Impl {
                     wall_thud_ns = VR::Body::SteadyNowNs();
                 }
                 break;
+            case Cb::MeleeEventKind::SeverBite: {
+                // A killing blow that cuts, at the hit (core/vr/sever_feel.h SeverBite): the hit's
+                // own impact made sharper and fuller (a high crack, the full blow, fading), in its
+                // place whichever comes first: an impact one above a hit's (the hit's cannot cut it
+                // short, another cut's or a visceral's can), guarded as a hit's. Tagged with its
+                // cut: its tear continues it (MeleeEventKind::Sever). The hands its hit uses; by
+                // haptic_melee_hit (0: none, as the hit's).
+                namespace HC = VR::Haptics::Combat;
+                const auto& vs = VR::GetSettings();
+                const float gain = std::clamp(vs.haptic_melee_hit, 0.0f, 1.5f);
+                const auto hands = VR::Sever::Feel::RouteHaptics(
+                    e.b, VR::TwoHand::GetTwoHandSettings().haptics);
+                if (feel && gain > 0.0f) {
+                    // Its hit's own impact (that blow's Hit, the same frame's: its weight; else a
+                    // heavy one's), exactly as the hit would have played it, its crunch included,
+                    // led by the crack.
+                    const s64 at = VR::Body::SteadyNowNs();
+                    const float weight =
+                        at - melee_impact_ns < 150'000'000 ? melee_impact_weight : 0.75f;
+                    const HC::Shape s = HC::MeleeImpact(weight, gain, vs.haptic_melee_hit_ms,
+                                                        vs.haptic_melee_crunch);
+                    const auto& crack = VR::Sever::Feel::SeverCrack;
+                    HapticPattern p{};
+                    p.priority = 3;
+                    p.own = true;
+                    p.impact = true;
+                    p.sever = e.serial;
+                    p.Hz(crack.frequency_hz)
+                        .Pulse(crack.amplitude * std::min(gain, 1.0f), crack.duration_s * 1000.0f);
+                    std::array<HC::Segment, 8> segments{};
+                    const int count = HC::ShapeSegments(
+                        s, HC::ImpactGuardMs - crack.duration_s * 1000.0f, segments.data());
+                    p.Hz(0.0f);
+                    for (int i = 0; i < count; ++i) {
+                        p.Ramp(segments[i].from, segments[i].to, segments[i].ms);
+                    }
+                    p.blow_s = crack.duration_s + s.hold_ms * 0.001f;
+                    // The left claw's cut (the transformed Beast Claw): the left hand.
+                    haptics[hands.primary].Play(p);
+                    if (hands.support) {
+                        haptics[0].Play(p);
+                    }
+                }
+                LOG_INFO(Core, "VR sever: #{} the bite at the blow{}, {}", e.serial,
+                         e.a > 0.5f ? " (charged)" : "",
+                         hands.support ? "both hands" : hands.primary == 0 ? "the left claw's hand"
+                                                                          : "the weapon hand");
+                break;
+            }
+            case Cb::MeleeEventKind::Sever: {
+                // The cut came off (its piece first drawn; core/vr/sever_feel.h SeverTear): the tear
+                // and the weight leaving the hand. Its own bite still playing: after the bite's
+                // full blow, in its place (HandHaptics::Continue: one pattern at a time, never two
+                // summed). Another impact on the hand meanwhile (a newer hit): it gives way, never
+                // over it. Else alone. By haptic_melee_hit.
+                const float gain = std::clamp(VR::GetSettings().haptic_melee_hit, 0.0f, 1.5f);
+                const float level = std::min(gain, 1.0f);
+                const char* how = "not felt";
+                if (feel && gain > 0.0f) {
+                    const auto tear = VR::Sever::Feel::SeverTear(e.a > 0.5f);
+                    const auto pattern = [&](const HandHaptics& on, bool impact) {
+                        // (Continuing its bite: the rest of the bite's full blow first.)
+                        const float blow_left_s =
+                            impact ? VR::Sever::Feel::BiteBlowLeftS(on.time, on.pattern.blow_s)
+                                   : 0.0f;
+                        HapticPattern p{};
+                        p.priority = 2;
+                        p.own = true;
+                        p.impact = impact;
+                        if (blow_left_s > 0.0f) {
+                            p.Hz(0.0f).Pulse(level, blow_left_s * 1000.0f);
+                        }
+                        p.Hz(tear[0].frequency_hz)
+                            .Pulse(tear[0].amplitude * level, tear[0].duration_s * 1000.0f);
+                        p.Hz(tear[1].frequency_hz)
+                            .Ramp(tear[1].amplitude * level, 0.0f, tear[1].duration_s * 1000.0f);
+                        return p;
+                    };
+                    const auto play = [&](HandHaptics& hand, bool support_hand) {
+                        namespace HC = VR::Haptics::Combat;
+                        const auto action = HC::TearFor(hand.playing, hand.pattern.sever,
+                                                        hand.pattern.impact, e.serial, support_hand);
+                        if (action == HC::Tear::Continue) {
+                            hand.Continue(e.serial, pattern(hand, true));
+                            return "after its bite";
+                        }
+                        if (action == HC::Tear::GiveWay) {
+                            return "given way to a newer hit";
+                        }
+                        hand.Play(pattern(hand, false));
+                        return "alone";
+                    };
+                    const auto hands = VR::Sever::Feel::RouteHaptics(
+                        e.b, VR::TwoHand::GetTwoHandSettings().haptics);
+                    how = play(haptics[hands.primary], false);
+                    if (hands.support) {
+                        play(haptics[0], true);
+                    }
+                }
+                LOG_INFO(Core, "VR sever: #{} the tear as the cut comes off{}{}: {}", e.serial,
+                         e.a > 0.5f ? " (charged)" : "",
+                         e.b == 1.0f ? " (left claw)" : e.b == 2.0f ? " (two-handed)" : "", how);
+                break;
+            }
+            case Cb::MeleeEventKind::Blast: {
+                // The lit Boom Hammer exploded (core/vr/boom_blast.h): the blast spends its fire,
+                // on an enemy, a wall or the ground alike (2026-11-11: "if it does a
+                // blast attack it should de-flame itself"), put out once the swing is over
+                // (Combat::FurnaceQuench, as a spent fire; only where it is carried out).
+                const s64 at = VR::Body::SteadyNowNs();
+                const bool lit = RightFamily() == VR::Tricks::BoomFamily && RightFormB();
+                const bool spent = lit && boom_quench_ns == 0 && BoomQuenchCarriedOut(at);
+                if (spent) {
+                    Cb::PublishFurnaceQuench({++boom_quench_serial, at});
+                    boom_quench_ns = at;
+                    boom_quench_why = "the explosion";
+                }
+                LOG_INFO(Core, "VR right grip: Boom Hammer: #{} {}exploded{}", e.serial,
+                         e.a > 0.5f ? "charged, " : "",
+                         spent ? ": its fire is spent"
+                         : !lit ? " (no longer lit)"
+                         : boom_quench_ns != 0 ? " (its fire already going out)"
+                                               : " (the fire-out is not carried out here)");
+                break;
+            }
             case Cb::MeleeEventKind::Denied: {
                 if (feel) {
                     weapon_hand.Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
@@ -12312,10 +15470,38 @@ struct OpenXRPresenter::Impl {
                          e.a, e.b > 0.5f ? " (it hit)" : "");
                 break;
             }
+            case Cb::MeleeEventKind::ObjectBreak: {
+                namespace OB = VR::Haptics::ObjectBreak;
+                namespace HC = VR::Haptics::Combat;
+                const float gain = VR::GetSettings().haptic_melee_hit;
+                if (!feel || !std::isfinite(gain) || gain <= 0.0f ||
+                    !OB::Fresh(VR::Body::SteadyNowNs(), e.ns) ||
+                    (e.a != 0.0f && e.a != 1.0f)) {
+                    break;
+                }
+                const unsigned hand = e.a == 0.0f ? 0 : 1;
+                const bool both = e.b > 0.5f ||
+                    (e.serial != 0 && e.serial == two_hand_bonus_serial);
+                const unsigned hands = OB::Hands(hand, both,
+                    VR::TwoHand::GetTwoHandSettings().haptics);
+                // Crisp contact and a short release as the object gives way. Protect it from
+                // a simultaneous wall clank, but never replace an existing enemy impact.
+                const auto p = CombatPattern(HC::ObjectBreakImpact(gain), 2, true, 80.0f);
+                for (unsigned h = 0; h < 2; ++h) {
+                    if ((hands & (1u << h)) != 0 &&
+                        !(haptics[h].playing && haptics[h].pattern.impact)) {
+                        haptics[h].Play(p);
+                    }
+                }
+                break;
+            }
             case Cb::MeleeEventKind::LeftHit: {
                 // A left swing's hit (melee_left): the impact in the left hand, as the right's.
                 namespace HC = VR::Haptics::Combat;
                 melee_left_hit_serial = std::max(melee_left_hit_serial, e.serial);
+                melee_left_recent_hits[melee_left_recent_hit_next++ %
+                                       melee_left_recent_hits.size()] = e.serial;
+                NoteDualHit(0, e.serial, e.scale);
                 const auto& vs = VR::GetSettings();
                 const float gain = vs.haptic_melee_hit;
                 const bool dealt = std::isfinite(e.a) && e.a >= HC::ImpactMinDamage;
@@ -12379,10 +15565,20 @@ struct OpenXRPresenter::Impl {
                                                // impact over the punch's own hit: never cut by it)
                         p.priority = 3;
                         p.impact = true;
-                        weapon_hand.Play(p.Pulse(1.0f, 60.0f).Ramp(0.8f, 0.0f, 300.0f));
+                        if (VR::Tricks::StakeKickOut()) {
+                            // ... and the stake kicked shut as the form locks (gun_aim.h
+                            // StakeSlamMs): BOOM, then the clack.
+                            weapon_hand.Play(p.Pulse(1.0f, 60.0f)
+                                                 .Ramp(0.8f, 0.3f, 70.0f)
+                                                 .Pulse(1.0f, 25.0f)
+                                                 .Ramp(0.7f, 0.0f, 240.0f));
+                        } else {
+                            weapon_hand.Play(p.Pulse(1.0f, 60.0f).Ramp(0.8f, 0.0f, 300.0f));
+                        }
                         haptics[0].Play(Tick(0.4f, 30.0f, 2));
                         break;
                     case Tr::Shot::Bow: // the release's snap and kick played at the release
+                    case Tr::Shot::KosSpit: // its heave played at the press
                     case Tr::Shot::None:
                         break;
                     }
@@ -12471,6 +15667,9 @@ struct OpenXRPresenter::Impl {
                 break;
             }
             case Cb::MeleeEventKind::Refunded:
+                break;
+            case Cb::MeleeEventKind::Ended:
+                melee_ended_serial = std::max(melee_ended_serial, e.serial);
                 break;
             }
         }
@@ -13014,7 +16213,7 @@ struct OpenXRPresenter::Impl {
             T::Config::Make(ms.visceral_thrust_speed, ms.visceral_thrust_cm,
                             ms.visceral_thrust_align_deg, 30.0f);
         // A visceral open: a little easier to start (visceral_thrust.h EasedForOpenVisceral).
-        const T::Config tc = visceral_open ? made.EasedForOpenVisceral() : made;
+        const T::Config tc = made.ForWeapon(melee_variation, melee_form_b, visceral_open);
         // A visceral opening: the motion under way is judged again from now (Detector::Rejudge).
         if (visceral_open && vo.serial != thrust_rejudged_serial) {
             thrust_rejudged_serial = vo.serial;
@@ -13030,8 +16229,10 @@ struct OpenXRPresenter::Impl {
         // Two hands on the weapon (two_hand_grip): the blade the game shows is the right hand's
         // turned onto the hands' line (ApplyTwoHand, the same turn and weight), so a thrust along
         // it with both hands is judged along that blade, not the right controller's own.
-        // A weighted input already contains ApplyTwoHand's final orientation.
-        if (!(weapon_weight_active && weapon_weight_frame == xr_frames) &&
+        // A weighted input already contains ApplyTwoHand's final orientation. Assisted grips
+        // use raw controller intent instead, so they still need the two-hand turn here.
+        if ((T::ForwardAssistWeapon(melee_variation, melee_form_b) ||
+             !(weapon_weight_active && weapon_weight_frame == xr_frames)) &&
             two_hand_turn_ok && two_hand_out.weight > 0.0f) {
             const VR::Body::Quat turned = VR::Body::Normalize(
                 VR::Body::Normalize(VR::Body::Quat{q.x, q.y, q.z, q.w}) *
@@ -13045,6 +16246,16 @@ struct OpenXRPresenter::Impl {
         in.head_v = {gesture.head_velocity.x, gesture.head_velocity.y, gesture.head_velocity.z};
         in.head_fwd = {gesture.forward.x, gesture.forward.y, gesture.forward.z};
         const T::Output out = thrust_detector.Update(in, tc);
+        st.motion = out.motion;
+        st.motion_verdict = static_cast<u8>(out.verdict);
+        st.motion_age = out.stats.time;
+        st.target = visceral_open ? vo.target : nullptr;
+        st.opportunity = visceral_open ? vo.serial : 0;
+        const M::V3 relative = in.v - in.head_v;
+        const M::V3 facing = M::Normalize({in.head_fwd.x, 0.0f, in.head_fwd.z});
+        const float ahead = M::Dot(relative, facing);
+        st.forward = in.active && in.valid && in.head_ok && ahead > 0.4f &&
+                     ahead >= tc.path_fwd_cos * M::Length(relative);
         const M::Window& w = melee_window.Current();
         const u32 open_window = w.open ? w.serial : 0;
         thrust_verdict.Step(open_window, out, dt);
@@ -13104,12 +16315,13 @@ struct OpenXRPresenter::Impl {
     // melee=physical: this XR frame's swing for the game (core/vr/melee_window.h WindowTracker).
     // No R1 / R2: a window opens as a real stroke starts (or at its commit), the game's own attack
     // follows the blade while it is open, and it closes when the blade slows. The right trigger
-    // held arms the next swing heavy (0.35 s) or charged (melee_charge_s; the old buzz and triple
+    // held arms the next swing heavy (0.36 s) or charged (melee_charge_s; the old buzz and triple
     // tick). A wound-up stroke opens heavy (the classifier may still judge it light). A tick when
     // the swing commits; the game's answers (HandleMeleeEvents) give the hits their feel.
     void UpdatePhysicalMelee(const HandState& right, const GestureFrame& gesture,
                              const VR::Melee::Output& out, const VR::Melee::Config& config,
-                             bool swings, bool trigger, float dt, bool discharge = false) {
+                             bool swings, bool trigger, float dt, bool discharge = false,
+                             const VR::Whip::SwingInput& arm_intent = {}) {
         namespace M = VR::Melee;
         namespace Cb = VR::Combat;
         auto& weapon_hand = haptics[1];
@@ -13124,6 +16336,9 @@ struct OpenXRPresenter::Impl {
         ti.recovery = melee.Recovery(); // bringing the weapon back: no window
         ti.blade_rate = melee.Rate();
         ti.stroke_peak = melee.StrokePeak();
+        // (At its commit the classifier may have moved on: the committed sweep, in deg.)
+        ti.stroke_arc = std::max(melee.CurrentArcDeg() * M::Deg,
+                                 out.fired ? out.stats.theta_eff * M::Deg : 0.0f);
         ti.fired = out.fired;
         ti.fired_stroke = out.fired_stroke;
         ti.kind = out.kind;
@@ -13145,6 +16360,8 @@ struct OpenXRPresenter::Impl {
         ti.fwd_flat = M::Normalize({gesture.forward.x, 0.0f, gesture.forward.z});
         ti.tip_speed = RightTipSpeed(right, gesture, config);
         ti.hit_serial = melee_hit_serial;
+        ti.recent_hits = melee_recent_hits;
+        ti.ended_serial = melee_ended_serial;
         // The physical whip's payout follows this swing speed (core/vr/whip_spin.h, the game's
         // update: core/vr/bloodborne_whip.h); none while swings may not attack.
         const bool whip_form = VR::Whip::GetWhipSettings().physical && melee_form_b &&
@@ -13155,7 +16372,8 @@ struct OpenXRPresenter::Impl {
         ti.trigger = trigger && !cutter_compact;
         VR::Whip::PublishSwingInput({VR::Body::SteadyNowNs(),
                                     swings && right.valid ? ti.tip_speed : 0.0f,
-                                    cutter_compact});
+                                    cutter_compact, arm_lash && right.valid, arm_intent.arm_speed,
+                                    arm_intent.arm_direction, arm_intent.arm_velocity});
         melee_tip_history[melee_tip_next++ % melee_tip_history.size()] = {melee_clock,
                                                                           ti.tip_speed};
         M::TrackerConfig tc{};
@@ -13168,15 +16386,25 @@ struct OpenXRPresenter::Impl {
             // little more forgiving).
             tc.max_open = melee_variation == 2400 ? 0.80f : 0.72f;
             tc.commit_tip = VR::Whip::GetWhipSettings().payout_speed;
+            tc.contact_hold = VR::Whip::ContactHeldWhip(melee_variation);
+            ti.chain_motion = tc.contact_hold &&
+                VR::Whip::WhipContactMotion(VR::Whip::LatestWhipFeel(),
+                                            VR::Body::SteadyNowNs(), melee_variation);
         }
         tc.onset = ms.open_onset;
         tc.charge_full_s = ms.charge_s;
+        // A wound-up heavy at most every HeavyCooldownS (a whip form's lash keeps its own rules).
+        tc.heavy_cooldown_s = whip_form ? 0.0f : M::HeavyCooldownS;
         tc.budget.enabled = ms.budget;
         tc.budget.charges = ms.budget_charges;
         tc.budget.scale = ms.budget_scale;
         tc.budget.offset_s = ms.budget_offset_ms * 0.001f;
         tc.budget.quick_charges = ms.budget_quick_charges;
         tc.budget.quick_s = ms.budget_quick_s;
+        tc.budget.miss_refund = ms.budget_miss_refund;
+        if (DualSplit() && ms.dual_hands) {
+            DualBudget(tc.budget, ms); // the left hand has one of its own (UpdateLeftMelee)
+        }
         // The Beast Cutter's whip: its lash is nearly always heavy: one charge, not two
         // (melee_window.h BudgetConfig::heavy_cost; 2026-10-17) ... and one wound up within 0.8 s
         // of a heavy is a light lash (a flurry's backswing is no wind-up; the one after may be
@@ -13223,8 +16451,11 @@ struct OpenXRPresenter::Impl {
             }
         }
         // The heaviest move the weapon has in this form (a heavy swing without a heavy row opens
-        // the light one: Rakuyo's form B; it costs a light's charge).
-        if (const M::WeaponMoves* moves = M::FindMoves(melee_variation); moves != nullptr) {
+        // the light one: Rakuyo's form B; it costs a light's charge). Simon's Bowblade: its own
+        // moves (core/vr/bowblade_moves.h), so its sword's charged swing DINGs and the arrow in
+        // the bow form is a light.
+        if (const M::WeaponMoves* moves = M::Bowblade::InUse(M::FindMoves(melee_variation));
+            moves != nullptr) {
             const M::MoveChoice top = M::ChooseMove(*moves, melee_form_b, M::MoveKind::Charged);
             ti.top = top.row != nullptr ? top.kind : M::MoveKind::Charged;
         }
@@ -13355,6 +16586,9 @@ struct OpenXRPresenter::Impl {
                     const M::TrackerOutput r =
                         melee_window.OpenRevolution(ti, tc, "a plunge: the blade held down");
                     if (r.opened) {
+                        // Its attack lands at the landing, long after the window closes: never a
+                        // miss given back (melee_budget_miss_refund).
+                        melee_window.KeepCharges();
                         plunge_down_armed = false;
                         to.opened = true;
                         to.closed = to.closed || r.closed;
@@ -13384,6 +16618,8 @@ struct OpenXRPresenter::Impl {
         }
         if (w.open) {
             since_attack = 0.0f; // a squeeze now is a flick (GripMotion)
+            if (w.committed)
+                since_committed_attack = 0.0f; // ... and the shoulder draws no syringe
         }
         // The off hand's counter-motion to this swing (melee_left): dropped now, and a charge it
         // held pays this swing if it could not be (no empty buzz: it registers).
@@ -13393,6 +16629,10 @@ struct OpenXRPresenter::Impl {
                 to.empty = false;
                 to.paid_late = true;
             }
+        }
+        if (to.charge_full && ti.top == M::MoveKind::Charged) {
+            // Fully charged: its ring (core/vr/charge_audio.h), with vibration on or off.
+            VR::ChargeAudio::Play(now);
         }
         if (ms.haptics) {
             if (to.empty && !revolution) {
@@ -13404,19 +16644,28 @@ struct OpenXRPresenter::Impl {
             } else if (to.committed && !w.unpaid) {
                 weapon_hand.Play(Tick(0.2f, 10.0f));
             }
-            if (to.charge_full) {
-                weapon_hand.Play(Repeat(3, 0.6f, 20.0f, 40.0f, 2)); // fully charged
+            if (to.charge_full && ti.top == M::MoveKind::Charged) {
+                // Fully charged - only a form with a charged attack (11 forms have none: held to
+                // full, they open their heaviest move; no cue promising one).
+                weapon_hand.Play(Repeat(3, 0.6f, 20.0f, 40.0f, 2));
             } else if (to.charge_heavy) {
                 weapon_hand.Play(Tick(0.25f, 15.0f));
             }
             if (trigger && !arc_sustain) {
                 const float build = std::clamp(melee_window.ChargeHeld() / tc.charge_full_s, 0.0f,
                                                1.0f);
-                weapon_hand.sustain = 0.06f + 0.30f * build; // the charge builds
+                melee_charge_full_s = build >= 1.0f ? melee_charge_full_s + dt : 0.0f;
+                // The charge builds; held at full, it settles softer (SettledChargeHum).
+                weapon_hand.sustain = SettledChargeHum(0.06f + 0.30f * build, melee_charge_full_s);
                 melee_charge_sustain = true;
             } else if (melee_charge_sustain) {
                 weapon_hand.sustain = 0.0f;
                 melee_charge_sustain = false;
+                // Let go: over. Still held (a swing's arc buzz took the hand), a full charge's hum
+                // comes back as settled as it was, not at its peak after every swing.
+                if (!trigger) {
+                    melee_charge_full_s = 0.0f;
+                }
             }
             // The physical whip: a light hum rising with its payout and speed, a tick as it locks
             // out at its full length, a soft click as it reels back onto its stick.
@@ -13460,7 +16709,7 @@ struct OpenXRPresenter::Impl {
         gi.windup = melee.CurrentWindup();
         gi.stroke_arc = melee.CurrentArcDeg() * M::Deg;
         gi.blade_angle = melee.BladeAngle();
-        gi.wound_up = melee.WoundUpPose(config);
+        gi.wound_up = melee.RaisedPose(config); // the warning as before the heavy's own
         gi.window = &w;
         gi.opened = to.opened;
         gi.spin = revolution;
@@ -13531,7 +16780,7 @@ struct OpenXRPresenter::Impl {
     // right_grip=transform: whether a swing may attack now. Never while a game menu is open, in a
     // cinematic, while the armed Blood Vial reaches for the weapon hand's wrist or is being
     // injected (VialReaching; an armed vial alone keeps swings, so a visceral after a parry still
-    // works), while an NPC talks (talk_guard), while Menu is held or the grip adjust holds the
+    // works), while Menu is held or the grip adjust holds the
     // weapon, in the first SwingContextHold after a context switch, or with the weapon hand at the
     // face (HandAtFace: lowered again from the headset it would look like a chop). Once nothing
     // holds them back the hand must first be slow (SwingQuietSpeed for SwingQuietTime), so a
@@ -13541,7 +16790,7 @@ struct OpenXRPresenter::Impl {
     static constexpr const char* FaceBlock = "the hand at the face";
 
     bool SwingGate(const PhysicalState& in, const HandState& right, const GestureFrame& gesture,
-                   bool talking, float dt) {
+                   float dt) {
         const bool at_face = HandAtFace(right, gesture, hand_at_face);
         const char* why = nullptr;
         if (physical_lever_out.owns_grip[1]) {
@@ -13556,8 +16805,8 @@ struct OpenXRPresenter::Impl {
             why = "the Blood Vial is at the wrist";
         } else if (music_box_free) {
             why = MusicBoxBlock;
-        } else if (talking) {
-            why = "an NPC is talking";
+        } else if (blood_draw_out.shown) {
+            why = BloodDrawBlock;
         } else if (in[PhysMenu]) {
             why = "Menu held";
         } else if (grip_adjust.Frozen()) {
@@ -13593,16 +16842,7 @@ struct OpenXRPresenter::Impl {
                 // Out of the face zone fast and away from the head: a strike from an overhead
                 // wind-up, not the hand lowered from the headset. Swings are on at once and the
                 // stroke under way may still commit (no OnDraw).
-                const VR::Vec3 d{right.position.x - gesture.head_position.x,
-                                 right.position.y - gesture.head_position.y,
-                                 right.position.z - gesture.head_position.z};
-                const float length = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
-                const float away = length > 1e-4f
-                                       ? ((right.velocity.x - gesture.head_velocity.x) * d.x +
-                                          (right.velocity.y - gesture.head_velocity.y) * d.y +
-                                          (right.velocity.z - gesture.head_velocity.z) * d.z) /
-                                             length
-                                       : 0.0f;
+                const float away = SpeedAwayFromHead(right, gesture);
                 if (away >= FaceStrikeSpeed) {
                     swing_ready = true;
                     swing_block = nullptr;
@@ -13622,6 +16862,15 @@ struct OpenXRPresenter::Impl {
             }
         }
         return swing_ready;
+    }
+
+    float SpeedAwayFromHead(const HandState& hand, const GestureFrame& g) const {
+        if (!hand.valid || !g.head_ok) return 0.0f;
+        return VR::Melee::SpeedAwayFromHead(
+            {hand.position.x - g.head_position.x, hand.position.y - g.head_position.y,
+             hand.position.z - g.head_position.z},
+            {hand.velocity.x - g.head_velocity.x, hand.velocity.y - g.head_velocity.y,
+             hand.velocity.z - g.head_velocity.z});
     }
 
     // A hand at the face (touching or adjusting the headset; `at_face` its own state): within
@@ -13651,6 +16900,7 @@ struct OpenXRPresenter::Impl {
     void Attack(PadButton button, const VR::Melee::Output& out, const char* reason = nullptr) {
         auto& weapon_hand = haptics[1];
         since_attack = 0.0f;
+        since_committed_attack = 0.0f;
         const bool ok = pad.Press(button);
         weapon_hand.Play(!ok                       ? Repeat(2, 0.15f, 10.0f, 50.0f, 3)
                          : button == PadButton::R2 ? HeavyThunk()
@@ -13697,8 +16947,25 @@ struct OpenXRPresenter::Impl {
     //  - the hit vignette, a short red flash at the very edges when a hit takes HP (hit_vignette,
     //    UpdateHitVignette; over the heal vignette).
     // No locks are taken; an empty draw list records nothing and submits no layer.
+    void AppendMonocularIris(s32 eye, float strength) {
+        namespace O = VrOverlay;
+        O::Pose pose{};
+        if (eye < 0 || eye > 1 || strength <= 0.0f ||
+            !overlay.EyePose(static_cast<u32>(eye), pose)) return;
+        auto& items = overlay.Items();
+        // Clear out to 36% of the displayed field, black from 50% (2026-10-30: was
+        // 32% / 46%, "a tiny bit bigger"; the whole eye is magnified, so no edge shows).
+        O::AppendVignette(items, pose,
+                          {.color = {0.0f, 0.0f, 0.0f}, .alpha = strength,
+                           .distance_m = 0.3f, .fit_inner = 0.36f, .fit_full = 0.50f});
+        items.back().mesh = O::MeshId::MonocularIris;
+        items.back().material.params.w = 4.0f; // subtle lens wear in the same draw
+        items.back().eye_mask = static_cast<u8>(1u << eye);
+    }
+
     void DrawOverlay(const XrFrameState& fs, float dt) {
         namespace O = VrOverlay;
+        dibr_optical_overlay_pending = false;
         wall_sparks.Step(dt); // every frame, drawn or not: none hangs in the air through a menu
         // vignette_in_warp (VR_TUNE vig.warp, VrVignetteWarp): the vignettes of this frame go to
         // the late warp (into the eyes) when the last frame's warp could take them; else, and
@@ -13709,6 +16976,20 @@ struct OpenXRPresenter::Impl {
                                     !VR::Page::Runtime::Get().IsOpen();
         warp_vignettes.health = colors_visible ? vital_color.health : 0;
         warp_vignettes.desaturation = colors_visible ? vital_color.desaturation : 0;
+        // A visceral's burst (riposte_style): during the throw, so not held back by the cinematic.
+        const auto burst_now = VR::Body::SteadyNowNs();
+        const bool burst_enabled = VR::IsImmersive() && VR::GetSettings().riposte_style;
+        const float visceral = burst_enabled ? VR::Riposte::Strength(burst_now) : 0.0f;
+        const float roar = burst_enabled && colors_visible
+                               ? VR::Bloodborne::BeastRoarScreenStrength(burst_now) : 0.0f;
+        warp_vignettes.riposte = std::max(visceral, roar);
+        warp_vignettes.roar_palette = roar > visceral;
+        const bool ritual_visible = VR::IsImmersive() && !VR::IsGameMenuOpen() &&
+                                    !VR::MenuPanelActive() && !VR::Page::Runtime::Get().IsOpen();
+        const s64 ritual_start = ritual_visible ? VR::Body::LatestKosRitualStart(burst_now) : 0;
+        UpdateKosRitualFeedback(burst_now, ritual_start);
+        warp_vignettes.ritual = VR::Tricks::GetTrickSettings().kos_visions
+            ? VR::Tricks::KosRitualVisionAt(burst_now, ritual_start) : std::array<float, 4>{};
         vignettes_to_warp =
             late_vignettes_ok &&
             VR::Tune::Get("vig.warp", VR::GetSettings().vignette_in_warp ? 1.0f : 0.0f) > 0.5f;
@@ -13716,7 +16997,28 @@ struct OpenXRPresenter::Impl {
         overlay.SetStereoMatch(overlay_match); // the eye images the last Submit showed
         const bool draw_overlay = fs.shouldRender == XR_TRUE &&
                                   session_state == XR_SESSION_STATE_FOCUSED;
-        overlay.BeginFrame(fs.predictedDisplayTime, draw_overlay);
+        // A VR page on layers of its own (the death choice while game frames are paused, or
+        // ui_compose=layers; otherwise the page and the overlay are drawn into the eyes, 0.9.32)
+        // keeps the overlay a second projection layer over the world. Drawn at the runtime's
+        // located eyes it carried the head's roll, the world pair the game's level camera; on
+        // Virtual Desktop (VDXR), which seems to show a frame at one pose, the world tilted and
+        // swayed with the head (2026-11-07 reports; SteamVR fine). Over the game's own pair (no
+        // late warp re-poses it) the overlay is drawn at the pair's poses: one pose for every
+        // projection layer. Ordinary pages drawn into the eyes keep the located eyes, as tested.
+        const auto& page = VR::Page::Runtime::Get();
+        const bool page_layers = page.RequiresLivePresentation() || !VR::GetSettings().ui_compose_eyes;
+        const bool world_pair = content_immersive && content[0].valid && content[1].valid &&
+                                !(content[0].dibr && late_enabled.load(std::memory_order_relaxed));
+        if (draw_overlay && world_pair && page_layers && page.Visible()) {
+            VrOverlayRenderer::EyeViews world{};
+            for (u32 i = 0; i < 2; ++i) {
+                world.pose[i] = content[i].pose;
+                world.fov[i] = content[i].projection.fov;
+            }
+            overlay.BeginFrame(world, true, draw_overlay);
+        } else {
+            overlay.BeginFrame(fs.predictedDisplayTime, draw_overlay);
+        }
         warp_vignettes.field = overlay.FieldDeg(); // what the fitted ones are fitted to
         if (!draw_overlay || !overlay.IsActive()) {
             vial_drawn = false;
@@ -13851,12 +17153,17 @@ struct OpenXRPresenter::Impl {
         const bool guide = two_settings.enabled && two_settings.guide && gameplay &&
                            VR::IsFirstPerson() && colors_visible && in.grip_space &&
                            !s.controls_classic && !s.right_grip_draw && !grip_adjust.Frozen() &&
-                           in.raw[PhysGripR] && !blocked[PhysGripR] && !two_hand_support.Seated() &&
+                           (OptimizedTwoHand() || (in.raw[PhysGripR] && !blocked[PhysGripR])) &&
+                           !two_hand_support.Seated() &&
                            !vial_on && !held_shown &&
                            VR::Quick::WeaponGrabAvailable(quick.GetPhase()) &&
                            !vial_armed && !inject_waiting && inject_hold <= 0.0f &&
                            in.grip[1].valid && in.grip[1].orientation_valid &&
                            two_hand_guide_available && two_hand_status_ok &&
+                           (!OptimizedTwoHand() ||
+                            (two_hand_status.two_handed &&
+                             VR::TwoHand::OptimizedHandle(two_hand_status.family) &&
+                             quick.GetPhase() == VR::Quick::Phase::Idle)) &&
                            VR::Body::SteadyNowNs() - two_hand_status.ns < 1'000'000'000 &&
                            (two_hand_status.two_handed ||
                             (VR::Tricks::GetTrickSettings().hand_transform &&
@@ -13921,9 +17228,12 @@ struct OpenXRPresenter::Impl {
                 // The grabbable rail: off the right fist itself (ZoneOf), across it only when
                 // the blade side has bare shaft.
                 const auto rail = VR::TwoHand::RailOf(handle);
-                const float lo = rail.lo <= -VR::TwoHand::AxisFullM ? rail.lo
-                                                                    : VR::TwoHand::AxisFullM;
-                if (rail.hi > lo) {
+                const float lo = handle.reviewed || rail.lo <= -VR::TwoHand::AxisFullM
+                                     ? rail.lo : VR::TwoHand::AxisFullM;
+                if (handle.fixed_support) {
+                    O::AppendGripGuide(items, {handle.left.x, handle.left.y, handle.left.z},
+                                       {handle.dir.x, handle.dir.y, handle.dir.z}, 0.09f, 0.035f);
+                } else if (rail.hi > lo) {
                     const auto centre = handle.right + handle.dir * ((lo + rail.hi) * 0.5f);
                     O::AppendGripGuide(items, {centre.x, centre.y, centre.z},
                                        {handle.dir.x, handle.dir.y, handle.dir.z}, 0.12f,
@@ -13977,6 +17287,7 @@ struct OpenXRPresenter::Impl {
         const float daze = UpdateStaggerVignette(dt); // first: the hit flash's fade reads it
         const float stun_level = UpdateHitStun(dt); // after it (its status), before the flash
         const float hit_flash = UpdateHitVignette(dt);
+        UpdateTonitrusCharge();
         // The hold at this blow's flash peak (an old blow's: the lowest peak, the plain ring).
         const bool stun_hit_recent = hit_age_s <= VR::HitStun::HitRecentS;
         const float hit =
@@ -14010,6 +17321,15 @@ struct OpenXRPresenter::Impl {
         O::Pose head{};
         const bool head_ok =
             (heal + hit + daze) * heal_context > 0.0f && overlay.HeadPose(head);
+        // The head for a vignette of its own (the blood bullets' pulse, the status corners):
+        // head_ok's when a flash already asked for it, else asked now.
+        const auto vignette_head = [&](O::Pose& out) {
+            if (head_ok) {
+                out = head;
+                return true;
+            }
+            return overlay.HeadPose(out);
+        };
         // (6b) The stagger vignette (stagger_vignette, UpdateStaggerVignette, core/vr/daze.h): the
         // edges darken while a blow's stagger or a knockdown holds the hunter; under the hit flash
         // (drawn first) so the blow's direction still reads; gameplay only like it.
@@ -14046,6 +17366,20 @@ struct OpenXRPresenter::Impl {
                  .profile_power = 2.07f,
                  .fit_inner = O::VignetteInnerDeg / O::VignetteFullDeg,
                  .fit_full = 1.0f});
+        }
+        // The blood bullets drawn by hand (UpdateBloodDraw): the edges pulse white twice, fitted
+        // as the heal glow is (every edge alike) but a rim only: clear inside 62% of the field
+        // (a heal glow's 46% read as a white fog at the peak, the 2026-11-04 mock's held frames).
+        if (const float pulse = BloodDrawPulse() * heal_context; pulse > 0.0f) {
+            if (O::Pose at{}; vignette_head(at)) {
+                PutVignette(items, at,
+                            {.color = {1.0f, 0.96f, 0.92f},
+                             .alpha = pulse * VR::Tune::Get("bd.pulse_alpha", 0.45f),
+                             .distance_m = std::max(s.hud_depth_m, 0.5f),
+                             .profile_power = VR::Tune::Get("bd.pulse_power", 2.2f),
+                             .fit_inner = VR::Tune::Get("bd.pulse_inner", 0.62f),
+                             .fit_full = 1.0f});
+            }
         }
         if (hit * heal_context > 0.0f && head_ok) {
             const auto& c = s.hit_vignette_color;
@@ -14093,6 +17427,7 @@ struct OpenXRPresenter::Impl {
         // with the heartbeat below vitals_low_hp; while the game's rally can win HP back a warm
         // amber rim at 54..62 degrees fades as it drains. Combined by max with the flashes over
         // it (the hit and heal vignettes): the edges never go opaque.
+        float vitals_edge_drawn = 0.0f; // its darkening at the edges (the status corners over it)
         if (vitals_edge_on) {
             namespace V = VR::Vitals;
             const float flash = heal_context * std::max(hit * s.hit_vignette_strength,
@@ -14106,6 +17441,7 @@ struct OpenXRPresenter::Impl {
                 const float d = std::max(s.hud_depth_m, 0.5f);
                 if (e.alpha * strength > 0.002f) {
                     const auto c = V::Linear(V::ColorEdgeDark);
+                    vitals_edge_drawn = std::min(e.alpha * strength, 0.9f);
                     // Fitted like the heal glow: its degrees as fractions of VignetteFullDeg (the
                     // displayed edge), the same squared rise, so it is even on every edge.
                     PutVignette(items, at,
@@ -14136,17 +17472,98 @@ struct OpenXRPresenter::Impl {
                 }
             }
         }
+        // (9) Status build-ups at the corners (core/vr/status_corners.h StatusCorner): each
+        // status its own look grows in from the four corners of what the headset shows (slow
+        // poison's vessels, rapid poison's capillaries, bleed's smears, frenzy's fractures,
+        // beasthood's gashes). It creeps in as it builds, flares as it takes hold and breathes
+        // while it lasts. Drawn after the hit
+        // flash and the low-HP edge, in its own corners only. Thin shapes: VeinGain times the
+        // glow's opacity (at most 0.95), more over a red flash or the low-HP darkening.
+        {
+            VR::StatusCorners::Reading reading{};
+            VR::StatusCorners::Channel().Load(reading);
+            const auto glow = status_corners.Update(VR::Body::SteadyNowNs(), reading);
+            if (O::Pose at{}; glow.alpha * heal_context > 0.002f && vignette_head(at)) {
+                if (glow.type != status_corners_logged) {
+                    status_corners_logged = glow.type;
+                    LOG_INFO(Render_Vulkan, "VR status corners: {} ({:.2f})",
+                             VR::StatusCorners::TypeName(glow.type), glow.alpha);
+                }
+                // The flash's own level (its strength setting scales how red, not whether), the
+                // low-HP darkening by its opacity (at most 0.9).
+                const float under = std::clamp(
+                    std::max(hit * heal_context, 2.0f * vitals_edge_drawn), 0.0f, 1.0f);
+                namespace SC = VR::StatusCorners;
+                const float grow = std::clamp(glow.alpha / SC::BuildAlpha, 0.0f, 1.0f);
+                // The heartbeat quickens as it builds (the beat clock, continuous across it).
+                const s64 beat_now = VR::Body::SteadyNowNs();
+                const float beat_dt = status_beat_ns > 0 ? (beat_now - status_beat_ns) * 1e-9f : 0.0f;
+                status_beat_ns = beat_now;
+                status_beats = SC::AdvanceBeats(status_beats, beat_dt, grow);
+                // Each status its own look, the strongest first; a second one beside it in its
+                // own (one more ring only while two are on).
+                const float gain = VR::Tune::Get("status.gain", SC::VeinGain);
+                // Zoomed about the corners into what the lenses show (2026-11-10: the
+                // veins were never seen in the headset, the red flash was; "make them expand
+                // until they are visible"), creeping in past the hidden band (status.span on
+                // screen at a full build-up).
+                const float hidden = SC::HiddenBand(StatusLensDiagonal(warp_vignettes.field));
+                const float zoom = VR::Tune::Get("status.zoom", SC::ZoomFor(hidden));
+                const float span = VR::Tune::Get("status.span", SC::VisibleSpan);
+                const float width = VR::Tune::Get("status.width", SC::VeinWidth);
+                const auto put = [&](const std::array<float, 3>& color, float alpha, int type) {
+                    const float g = std::clamp(alpha / SC::BuildAlpha, 0.0f, 1.0f);
+                    PutVignette(items, at,
+                                {.color = {color[0], color[1], color[2]},
+                                 .alpha = std::min(alpha * heal_context * gain * (1.0f + 0.8f * under),
+                                                   0.95f),
+                                 .distance_m = std::max(s.hud_depth_m, 0.5f),
+                                 .wedge_focus = 1.0f,
+                                 .corners = true,
+                                 .corner_reach = SC::ReachFor(hidden, zoom, g, span),
+                                 .vein_width = width,
+                                 .vein_beats = static_cast<float>(status_beats),
+                                 .vein_type = type,
+                                 .corner_zoom = zoom,
+                                 .fit_inner = 0.5f,
+                                 .fit_full = 1.0f});
+                };
+                if (glow.second >= 0 && glow.second_alpha * heal_context > 0.002f)
+                    put(glow.second_color, glow.second_alpha, glow.second);
+                put(glow.color, glow.alpha, glow.type);
+            } else if (status_corners_logged >= 0) {
+                status_beat_ns = 0; // the next ones start their clock afresh
+                status_corners_logged = -1;
+                LOG_INFO(Render_Vulkan, "VR status corners: clear");
+            }
+        }
+        // A dark ocular rim belongs only to the eye touching the Monocular. Its transparent
+        // centre exposes the native eye's narrow-field render or DIBR's cropped eye image; the
+        // other eye keeps its ordinary view. The screen pass avoids near-eye depth occlusion.
+        static const bool native_monocular = std::getenv("VR_NATIVE_STEREO") != nullptr &&
+                                              std::getenv("VR_NATIVE_ASYMMETRIC") != nullptr;
+        const VR::StereoConfig stereo = VR::GetStereo();
+        const bool dibr_monocular = std::getenv("VR_NATIVE_STEREO") == nullptr &&
+                                     stereo.stereo && stereo.mode == 2;
+        // DIBR's iris is added in Submit after adopting the displayed pair, using exactly
+        // the state that crops that pair. The live draw record can be several frames newer.
+        dibr_optical_overlay_pending = gameplay && dibr_monocular;
+        if (gameplay && native_monocular) {
+            const VR::CameraRecord optical_record = VR::DrawFrameRecord();
+            AppendMonocularIris(optical_record.monocular_eye, optical_record.monocular_strength);
+        }
         if (s.overlay_compose_eyes) {
             auto& snapshot = overlay_history[overlay_history_next++ % overlay_history.size()];
             snapshot.head_time = last_head.time;
             snapshot.space = recenter_serial;
             snapshot.items = items;
         }
-        // Recorded at Submit only when this frame's eyes can carry it (native stereo, the composer
-        // and the in-eye overlay up): elsewhere (AER, mono, DIBR) it is recorded here, as before.
-        overlay_deferred = s.overlay_compose_eyes && content_immersive && !panel_shown &&
+        // DIBR waits for Submit to append the displayed pair's iris. Native composition
+        // also waits for Submit when the eyes can carry the overlay; other paths record here.
+        overlay_deferred = dibr_optical_overlay_pending ||
+                          (s.overlay_compose_eyes && content_immersive && !panel_shown &&
                            !late_enabled.load() && content[0].native && !compose_failed &&
-                           overlay_in_eye.IsActive();
+                           overlay_in_eye.IsActive());
         if (!overlay_deferred) overlay.EndFrame();
     }
 
@@ -15285,6 +18702,7 @@ struct OpenXRPresenter::Impl {
             {{XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR},
              {XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR}}};
         bool depth_chained = false;
+        const EyeSource* dibr_optical_source = nullptr;
         // Back to front: the game (eyes, virtual screen, or the menu's frozen backdrop + panel),
         // the game's UI on its own layers (over the eyes), then the VR overlay.
         std::array<const XrCompositionLayerBaseHeader*, 12> layers{};
@@ -15475,9 +18893,26 @@ struct OpenXRPresenter::Impl {
                     views[i].subImage.swapchain = swapchains[content[i].swapchain].handle;
                     views[i].subImage.imageRect = content[i].projection.rect;
                 }
+                const EyeSource& optical_source = content[0].source;
+                const bool dibr_optical = content[0].dibr && content[1].dibr &&
+                                          !content[0].native && !content[1].native &&
+                                          optical_source.serial == content[1].source.serial &&
+                                          (optical_source.monocular_eye == 0 ||
+                                           optical_source.monocular_eye == 1) &&
+                                          optical_source.monocular_strength > 0.0f &&
+                                          optical_source.monocular_zoom > 1.0f;
+                if (dibr_optical) {
+                    dibr_optical_source = &optical_source;
+                    auto& image_rect =
+                        views[static_cast<u32>(optical_source.monocular_eye)].subImage.imageRect;
+                    image_rect = MonocularImageRect(
+                        image_rect, views[static_cast<u32>(optical_source.monocular_eye)].fov,
+                        optical_source.monocular_zoom, optical_source.monocular_shift);
+                }
                 if (!late_used && content[0].depth_swapchain >= 0 &&
                     content[1].depth_swapchain >= 0 &&
-                    !depth_disabled.load(std::memory_order_relaxed) && !depth_probe) {
+                    !depth_disabled.load(std::memory_order_relaxed) && !depth_probe &&
+                    !dibr_optical) {
                     for (u32 i = 0; i < 2; ++i) {
                         auto& d = depth_info[i];
                         d.subImage.swapchain = depth_swapchains[content[i].depth_swapchain].handle;
@@ -15530,7 +18965,8 @@ struct OpenXRPresenter::Impl {
                 // the screen shows only the centred 16:9 band.
                 float aspect = std::max(screen_aspect, 0.1f);
                 XrRect2Di rect{{0, 0}, extent};
-                if (aspect < 16.0f / 9.0f - 0.02f) {
+                if (VR::Ui::Slots::CropScreenToBand(
+                        aspect, VR::GetDisplayMode() == VR::DisplayMode::Screen)) {
                     const s32 band = static_cast<s32>(std::lround(extent.width * 9.0f / 16.0f));
                     rect = {{0, std::max(0, (extent.height - band) / 2)},
                             {extent.width, std::min(band, extent.height)}};
@@ -15547,14 +18983,27 @@ struct OpenXRPresenter::Impl {
 
         // The VR settings page (vr_menu=1) over the menu canvas, under the overlay (your
         // controllers stay in front of it).
+        // A death choice stops game frames. Its menu and pointer must keep updating at XR
+        // cadence, even if the last eye pair contains an older baked page/overlay.
+        const bool live_page = VR::Page::Runtime::Get().RequiresLivePresentation();
+        // The game may pause mid cinematic fade; the choice must remain readable.
+        const float page_brightness = live_page ? 1.0f : brightness;
         u64 submitted_page_revision = 0;
         u32 page_added = 0;
         if (frame_state.shouldRender) {
             LockTrace::Phase phase{"page layers"};
-            page_added = BuildPageLayers(page_storage, brightness, layers, layer_count);
-            NotePageDiag(page_added, layer_count);
-            if (page_added && brightness * VR::Page::Runtime::Get().Opacity() >= 0.5f)
-                submitted_page_revision = page_uploaded_revision;
+            // The eye pair shown carries the page (ComposeAdoptedUi) while eyes are what shows.
+            const bool page_baked = !live_page && shown_page_composed && content_immersive &&
+                                    !panel && !late_used && content[0].valid && content[1].valid;
+            page_added =
+                BuildPageLayers(page_storage, page_brightness, layers, layer_count, page_baked);
+            NotePageDiag(page_baked ? 2u : page_added, layer_count);
+            if (page_brightness * VR::Page::Runtime::Get().Opacity() >= 0.5f) {
+                if (page_baked)
+                    submitted_page_revision = shown_page_revision;
+                else if (page_added)
+                    submitted_page_revision = page_uploaded_revision;
+            }
         }
 
         // The VR overlay (vial, controllers, ghost hands, laser) on top of everything, with the
@@ -15564,11 +19013,17 @@ struct OpenXRPresenter::Impl {
         const XrCompositionLayerBaseHeader* overlay_layer = nullptr;
         {
             LockTrace::Phase phase{"overlay submit"};
-            const bool composed = shown_overlay_composed && content_immersive && !panel && !late_used;
+            const bool composed = !live_page && shown_overlay_composed && content_immersive &&
+                                  !panel && !late_used;
             if (!composed) {
+                if (dibr_optical_overlay_pending && dibr_optical_source) {
+                    const auto& source = *dibr_optical_source;
+                    AppendMonocularIris(source.monocular_eye, source.monocular_strength);
+                }
                 if (overlay_deferred) overlay.EndFrame();
                 overlay_layer = overlay.SubmitLayer(
-                    brightness < 0.999f && Runtime().has_color_scale ? &color_scale : nullptr);
+                    !live_page && brightness < 0.999f && Runtime().has_color_scale
+                        ? &color_scale : nullptr);
             }
         }
         // After a frame with the overlay was rejected, the next one goes without it (a probe).
@@ -16136,7 +19591,12 @@ struct OpenXRPresenter::Impl {
         const float aspect = record.aspect > 0.0f ? record.aspect : frame_aspect;
         // The margin the record's vfov was widened by (render_pitch_min_margin_deg while biased).
         const auto& s = VR::GetSettings();
-        return CropToEyes(record.eye_fov, record.vfov, aspect, out, fov_mutable == 1,
+        // A canted display (core/vr/eye_cant.h): eye_fov is each eye's view seen from the head,
+        // never the runtime's own FOV, so it goes up with the FOV of exactly its pixels (the
+        // parallel image the runtime turns into the eye; the late warp turns the eyes itself).
+        const bool canted =
+            VR::Cant::Canted(record.eye_cant[0]) || VR::Cant::Canted(record.eye_cant[1]);
+        return CropToEyes(record.eye_fov, record.vfov, aspect, out, fov_mutable == 1 || canted,
                           VR::Tilt::MarginDeg(s.fov_margin_deg, s.render_pitch_min_margin_deg,
                                               record.pitch_bias) /
                               RadToDeg);
@@ -16403,6 +19863,10 @@ struct OpenXRPresenter::Impl {
         pending.active = true;
         pending.pair = tag.pair;
         pending.source.record = record.id;
+        pending.source.monocular_eye = record.monocular_eye;
+        pending.source.monocular_zoom = record.monocular_zoom;
+        pending.source.monocular_shift = record.monocular_shift;
+        pending.source.monocular_strength = record.monocular_strength;
         pending.source.space = record.space_serial;
         pending.source.tick_ns = record.tick_ns;
         pending.source.base_yaw = record.base_yaw;
@@ -16601,6 +20065,10 @@ struct OpenXRPresenter::Impl {
         pending.image_index = left_index;
         pending.right_index = right_index;
         pending.source.record = record.id;
+        pending.source.monocular_eye = record.monocular_eye;
+        pending.source.monocular_zoom = record.monocular_zoom;
+        pending.source.monocular_shift = record.monocular_shift;
+        pending.source.monocular_strength = record.monocular_strength;
         pending.source.space = record.space_serial;
         pending.source.tick_ns = record.tick_ns;
         pending.source.base_yaw = record.base_yaw;
@@ -16682,7 +20150,7 @@ struct OpenXRPresenter::Impl {
                           pending.source};
             content[0].dibr = content[1].dibr = true;
             // A plain copy (the present thread's fallback): nothing composed into these eyes.
-            shown_ui_composed = shown_overlay_composed = false;
+            shown_ui_composed = shown_overlay_composed = shown_page_composed = false;
             ShowImmersive();
             HidePanel();
             ++pair_stats.dibr;
@@ -16771,7 +20239,8 @@ struct OpenXRPresenter::Impl {
                               left.source};
                 content[1] = {true, pending.eye_poses[1], pending.projections[1], RightSwapchain,
                               pending.source};
-                shown_ui_composed = shown_overlay_composed = false; // AER: never composed
+                shown_ui_composed = shown_overlay_composed = shown_page_composed =
+                    false; // AER: never composed
                 ShowImmersive();
             } else {
                 // The right eye alone: shown to both eyes until the next pair (no double images,
@@ -16839,6 +20308,42 @@ struct OpenXRPresenter::Impl {
         p.pending_miss_ns = 0;
     }
 
+    // game_fps=0's rate: the headset's refresh, held for the session. The rate the session chose
+    // (XR_FB_display_refresh_rate: its start and change events), else the shortest frame period
+    // it has reported: a runtime throttling late frames reports a longer one (45, 30, even
+    // 11 Hz), never a shorter. Not this frame's period (`hz`): a game cap following it kept the
+    // game at that rate, its frames late again, the runtime throttled on (the tester's 2026-11-10
+    // session: 1,448 cap changes in 9 minutes, its menus on a 30 fps beat). The launcher writes
+    // the launch rate since f12708185; this keeps a vr.ini with game_fps=0 safe too. The chosen
+    // rate is read again once a second (a runtime without the change event, a requested rate
+    // just taking effect); a period under 4 ms (250 Hz, above any headset's) is a runtime's
+    // glitch, never the refresh.
+    double SessionRefreshHz(double hz) {
+        if (get_refresh_rate != nullptr && session_running) {
+            const s64 now = SteadyNs();
+            if (now - refresh_read_ns >= 1'000'000'000) {
+                refresh_read_ns = now;
+                float rate = 0.0f;
+                if (XR_SUCCEEDED(get_refresh_rate(session, &rate)) && rate > 1.0f &&
+                    std::abs(rate - session_refresh_hz) > 0.5f) {
+                    LOG_INFO(Render_Vulkan,
+                             "VR pacing: the headset's refresh {:.1f} Hz (game_fps=0 "
+                             "holds the game at it)",
+                             rate);
+                    session_refresh_hz = rate;
+                }
+            }
+        }
+        if (session_refresh_hz > 1.0f) {
+            return session_refresh_hz;
+        }
+        const s64 period = display_period;
+        if (period >= 4'000'000 && (shortest_period == 0 || period < shortest_period)) {
+            shortest_period = period;
+        }
+        return shortest_period > 0 ? 1e9 / static_cast<double>(shortest_period) : hz;
+    }
+
     void UpdatePacing() {
         // Native stereo uses the patched game deadline and can follow every XR refresh.
         static const bool native_stereo = std::getenv("VR_NATIVE_STEREO") != nullptr;
@@ -16892,9 +20397,24 @@ struct OpenXRPresenter::Impl {
         } else if (s.frame_cap < 0) {
             k = native_stereo ? 1u : hz > 110.0 ? p.auto_k : hz > 77.0 ? 2u : 0u;
         }
+        // frame_hooks (bloodborne_frame_rate.h): the game's own pacer holds game_fps (0 = this
+        // refresh). The game flips at most once a vblank, so a free vblank timer slower than that
+        // (config.json vblank_frequency, 60 by default) hands the vblank to the headset; the
+        // launcher and the perf scan set it to the refresh or above, which keeps the timer.
+        VR::Bloodborne::FrameTraceTick(); // VR_FRAME_TRACE (tests)
+        const bool hooks = VR::Bloodborne::FrameHooksActive();
+        if (hooks) {
+            const int target =
+                s.game_fps > 0 ? s.game_fps : static_cast<int>(std::lround(SessionRefreshHz(hz)));
+            VR::Bloodborne::SetGameFrameRate(target);
+            static const u32 vblank_hz = EmulatorSettings.GetVblankFrequency();
+            if (k == 0 && target > static_cast<int>(vblank_hz)) {
+                k = static_cast<u32>(std::max<long>(std::lround(hz / target), 1));
+            }
+        }
         // The legacy path retains its 60-fps ceiling. Nothing while the headset shows nothing of ours
         // (the vblank timer then runs free, so the game never waits on a paused headset loop).
-        while (!native_stereo && k != 0 && hz / k > 60.5) {
+        while (!native_stereo && !hooks && k != 0 && hz / k > 60.5) {
             ++k;
         }
         if (!accepting_frames.load()) {
@@ -16910,10 +20430,20 @@ struct OpenXRPresenter::Impl {
         VR::PaceVblank(k, slot_step);
         if (k != 0 && now - p.last_log_ns > 5'000'000'000) {
             p.last_log_ns = now;
-            LOG_INFO(Render_Vulkan,
-                     "VR pacing: {:.0f} Hz, cap {:.1f} fps (a vblank every {} refreshes), {} game "
-                     "frames a refresh late in the last 5 s",
-                     hz, hz / k, k, std::exchange(p.miss_count, 0u));
+            // A warning when frames came a refresh late: the headset trials keep Render.Vulkan
+            // warnings only, and this shows whether 90 Hz drifts there (2026-11-05).
+            const u32 late = std::exchange(p.miss_count, 0u);
+            if (late != 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "VR pacing: {:.0f} Hz, cap {:.1f} fps (a vblank every {} refreshes), "
+                            "{} game frames a refresh late in the last 5 s",
+                            hz, hz / k, k, late);
+            } else {
+                LOG_INFO(Render_Vulkan,
+                         "VR pacing: {:.0f} Hz, cap {:.1f} fps (a vblank every {} refreshes), 0 "
+                         "game frames a refresh late in the last 5 s",
+                         hz, hz / k, k);
+            }
         }
     }
 
@@ -16934,7 +20464,7 @@ struct OpenXRPresenter::Impl {
         if (pacing.k != 0) {
             return pacing.k;
         }
-        // Scratch experiment: adopt a ready pair after one refresh, without the
+        // Experiment: adopt a ready pair after one refresh, without the
         // measured-period hold. Explicit user frame caps above remain respected.
         static const bool one_hold = [] {
             const char* setting = std::getenv("VR_STEREO_MIN_HOLD_ONE");
@@ -17148,6 +20678,15 @@ struct OpenXRPresenter::Impl {
         return out;
     }
 
+    // The most one eye image may be for this runtime (vr_xr_size.h EyeLimit: its largest swapchain
+    // and both views' largest image rects, a rect it left at 0 ignored; any thread).
+    VrXrSize::Size NativeEyeLimitNow() const {
+        return VrXrSize::EyeLimit(
+            {max_swapchain_w, max_swapchain_h},
+            {view_config[0].maxImageRectWidth, view_config[0].maxImageRectHeight},
+            {view_config[1].maxImageRectWidth, view_config[1].maxImageRectHeight});
+    }
+
     // DIBR eyes of `eyes` pixels (their crops of the render; any thread): each fits the runtime's
     // largest image rect and swapchain (vr_xr_size.h CheckDibrEyes). False: the frame goes mono,
     // with an error line (each new refusal, at most 8 per session) instead of a silent fallback.
@@ -17188,11 +20727,32 @@ struct OpenXRPresenter::Impl {
         }
     }
 
+    // vr.ini canted_eyes on a canted display (core/vr/eye_cant.h): the record's eyes are turned
+    // from the head and each eye image is turned into its own view before the headset
+    // (VrEyeCant). Off: the parallel eyes, for the runtime to turn.
+    static bool TurnEyes(const VR::CameraRecord& record) {
+        return VR::GetSettings().canted_eyes &&
+               (VR::Cant::Canted(record.eye_cant[0]) || VR::Cant::Canted(record.eye_cant[1])) &&
+               VR::EyeFov::Valid(record.eye_located_fov[0]) &&
+               VR::EyeFov::Valid(record.eye_located_fov[1]);
+    }
+
     bool RecordStereoCopy(vk::CommandBuffer cmdbuf, const OpenXRPresenter::StereoEyes& eyes,
                           const VR::FrameTag& tag) {
         if (!ready || !tag.valid || !StereoCopyEnabled() || !accepting_frames.load()) {
             return false;
         }
+        // canted_eyes: each eye turned into its own view on the way into the headset (the turned
+        // eyes go without depth: it is the parallel eyes'). Not while the late warp shows these
+        // eyes (it turns its own every refresh; this pair is then only its fallback, parallel).
+        const bool correction_requested = TurnEyes(tag.record);
+        const bool correction_delegated = late_enabled.load() && eyes.late.valid;
+        bool turn = correction_requested && !correction_delegated;
+        if (turn && !eye_cant.Ready() && !eye_cant_tried) {
+            eye_cant_tried = true;
+            eye_cant.Init(instance.GetDevice(), instance.GetAllocator());
+        }
+        turn = turn && eye_cant.Ready();
         for (u32 i = 0; i < 2; ++i) {
             // The eye images are the crops, or (eye_upscale) larger, never with depth.
             const vk::Extent2D crop = eyes.crop[i].rect.extent;
@@ -17273,7 +20833,7 @@ struct OpenXRPresenter::Impl {
             }
             // The depth, when the warp wrote it and the pair has depth swapchains (a refused
             // image sends this frame without depth; it stays acquired for the next one).
-            with_depth = eyes.depth_buffer && DepthWanted();
+            with_depth = eyes.depth_buffer && DepthWanted() && !turn;
             for (u32 i = 0; i < 2 && with_depth; ++i) {
                 auto& depth = depth_swapchains[2 * pair + i];
                 with_depth = depth.handle != XR_NULL_HANDLE && AcquireAndWait(depth);
@@ -17341,23 +20901,45 @@ struct OpenXRPresenter::Impl {
         frame.source = {};
         frame.source.serial = publish_serial.fetch_add(1) + 1;
         std::array<EyeProjection, 2> render_crops{};
+        std::array<bool, 2> turned{};
         for (u32 i = 0; i < 2; ++i) {
             const vk::Rect2D& rect = eyes.crop[i].rect;
-            const vk::ImageCopy region{
-                .srcSubresource = layers,
-                .srcOffset = {0, 0, 0},
-                .dstSubresource = layers,
-                .dstOffset = {0, 0, 0},
-                .extent = {eyes.extent[i].width, eyes.extent[i].height, 1},
-            };
-            cmdbuf.copyImage(eyes.image[i], vk::ImageLayout::eTransferSrcOptimal, xr_images[i],
-                             vk::ImageLayout::eTransferDstOptimal, region);
             const XrFovf fov{eyes.crop[i].fov.angle_left, eyes.crop[i].fov.angle_right,
                              eyes.crop[i].fov.angle_up, eyes.crop[i].fov.angle_down};
-            frame.projections[i] = {fov,
-                                    {{0, 0},
-                                     {static_cast<s32>(eyes.extent[i].width),
-                                      static_cast<s32>(eyes.extent[i].height)}}};
+            if (turn) {
+                // The eye's own view at its parallel image's density (it fits that image's
+                // swapchain: a turned eye's located FOV spans less than its cover).
+                const VR::Fov& lf = record.eye_located_fov[i];
+                const XrFovf located{lf.angle_left, lf.angle_right, lf.angle_up, lf.angle_down};
+                const vk::Extent2D size = VrEyeCant::Extent(located, fov, eyes.extent[i]);
+                const vk::Extent2D out{std::min(size.width, eyes.extent[i].width),
+                                       std::min(size.height, eyes.extent[i].height)};
+                const VR::Quat& q = record.eye_cant[i];
+                turned[i] = eye_cant.TurnCopy(cmdbuf, i, eyes.image[i], eyes.view[i],
+                                              eyes.extent[i], fov, xr_images[i], out, located,
+                                              {q.x, q.y, q.z, q.w});
+                if (turned[i]) {
+                    frame.projections[i] = {located,
+                                            {{0, 0},
+                                             {static_cast<s32>(out.width),
+                                              static_cast<s32>(out.height)}}};
+                }
+            }
+            if (!turned[i]) {
+                const vk::ImageCopy region{
+                    .srcSubresource = layers,
+                    .srcOffset = {0, 0, 0},
+                    .dstSubresource = layers,
+                    .dstOffset = {0, 0, 0},
+                    .extent = {eyes.extent[i].width, eyes.extent[i].height, 1},
+                };
+                cmdbuf.copyImage(eyes.image[i], vk::ImageLayout::eTransferSrcOptimal,
+                                 xr_images[i], vk::ImageLayout::eTransferDstOptimal, region);
+                frame.projections[i] = {fov,
+                                        {{0, 0},
+                                         {static_cast<s32>(eyes.extent[i].width),
+                                          static_cast<s32>(eyes.extent[i].height)}}};
+            }
             render_crops[i] = {fov,
                                {{rect.offset.x, rect.offset.y},
                                 {static_cast<s32>(rect.extent.width),
@@ -17394,7 +20976,10 @@ struct OpenXRPresenter::Impl {
             const VR::Vec3 eye = head.valid ? head.eye_pose[i].position : VR::Vec3{side, 0.0f, 0.0f};
             const VR::Vec3 offset = VR::Rotate(orientation, eye);
             const auto& p = record.head_position;
-            frame.eye_poses[i] = ToXr(orientation, {p.x + offset.x, p.y + offset.y, p.z + offset.z});
+            // A turned eye (canted display): the parallel eye's orientation turned by its cant.
+            frame.eye_poses[i] =
+                ToXr(turned[i] ? Multiply(orientation, record.eye_cant[i]) : orientation,
+                     {p.x + offset.x, p.y + offset.y, p.z + offset.z});
         }
         static const bool pose_debug = std::getenv("VR_POSE_DEBUG") != nullptr;
         if (pose_debug) {
@@ -17405,12 +20990,29 @@ struct OpenXRPresenter::Impl {
                      record.head_position.z, record.render_position.x, record.render_position.y,
                      record.render_position.z, record.base_yaw, record.head_yaw);
         }
+        // These are recorded correction commands, not proof of headset display success.
+        // At most three records per process, including a later success after a fallback.
+        if (turned[0] && turned[1]) {
+            RENDER_DIAGNOSTIC_ONCE("angled-screen correction: path=stereo-copy recorded_L=true recorded_R=true");
+        } else if (correction_requested && !correction_delegated) {
+            RENDER_DIAGNOSTIC_ONCE("angled-screen correction: path=stereo-copy incomplete "
+                                   "ready={} recorded_L={} recorded_R={}",
+                                   eye_cant.Ready(), turned[0], turned[1]);
+        } else {
+            RENDER_DIAGNOSTIC_ONCE("angled-screen correction: path=stereo-copy recorded_L={} "
+                                   "recorded_R={} delegated_to_late_warp={}",
+                                   turned[0], turned[1], correction_requested && correction_delegated);
+        }
         frame.late = eyes.late;
         frame.record = record;
         frame.render_crops = render_crops;
         frame.flip_record = tag.flip_record;
         frame.aux_record = tag.aux_record;
         frame.source.record = record.id;
+        frame.source.monocular_eye = record.monocular_eye;
+        frame.source.monocular_zoom = record.monocular_zoom;
+        frame.source.monocular_shift = record.monocular_shift;
+        frame.source.monocular_strength = record.monocular_strength;
         frame.source.space = record.space_serial;
         frame.source.tick_ns = record.tick_ns;
         frame.source.base_yaw = record.base_yaw;
@@ -17688,8 +21290,10 @@ struct OpenXRPresenter::Impl {
         const UiContent previous_ui = ui_shown;
         const bool previous_ui_composed = shown_ui_composed;
         const bool previous_overlay_composed = shown_overlay_composed;
+        const bool previous_page_composed = shown_page_composed;
         if (adopted.ui_set) ui_shown = adopted.ui;
         shown_overlay_composed = false;
+        shown_page_composed = false;
         shown_ui_composed = adopted.compose && ComposeAdoptedUi(adopted);
         bool released = true;
         if (xrq.Own()) {
@@ -17719,6 +21323,7 @@ struct OpenXRPresenter::Impl {
             ui_shown = previous_ui;
             shown_ui_composed = previous_ui_composed;
             shown_overlay_composed = previous_overlay_composed;
+            shown_page_composed = previous_page_composed;
             UpdateLateBusy();
             return;
         }
@@ -17916,7 +21521,7 @@ struct OpenXRPresenter::Impl {
         if (XR_FAILED(xrLocateSpace(view_space, local_space, fs.predictedDisplayTime, &head)) ||
             (head.locationFlags & needed) != needed) {
             ++st.no_head;
-            return late.Reuse(views);
+            return late.Reuse(views, recenter_serial);
         }
         const VR::CameraRecord& rec = late_shown_record;
         VR::Quat q_s = VR::QuatFromYawPitchRoll(rec.head_yaw, rec.head_pitch, rec.head_roll);
@@ -17993,7 +21598,7 @@ struct OpenXRPresenter::Impl {
         const bool render_taa = late_shown.render_taa;
         const bool native_stereo = std::getenv("VR_NATIVE_STEREO") != nullptr;
         src.taa = VR::EyeHistory::Weight(native_stereo, render_taa, vrs.eye_taa,
-                                         vrs.taa_eye_taa, vrs.dibr_eye_taa);
+                                         vrs.taa_eye_taa, vrs.dibr_eye_taa, late_shown.upscaled);
         if (render_taa && VR::Tune::Active() && (native_stereo || vrs.dibr_eye_taa < 0.0f)) {
             // VR_TUNE_FILE taa.eye_taa (tests; < 0 = keep).
             const float t = VR::Tune::Get("taa.eye_taa", -1.0f);
@@ -18075,6 +21680,10 @@ struct OpenXRPresenter::Impl {
                     src.sharpen = std::min(es, 1.0f);
                 }
             }
+            // DIBR reconstructed by DLSS / FSR: dibr_upscale_sharpen (>= 0) in its place.
+            if (late_shown.upscaled && vrs.dibr_upscale_sharpen >= 0.0f) {
+                src.sharpen = std::min(vrs.dibr_upscale_sharpen, 1.0f);
+            }
         }
         // vr.ini eye_taa: the eyes keep part of the last warp's (VrLateWarp: VrEyeTaa::Choose
         // against the last rendered warp's frame). eye_taa_follow: moved by the displayed eyes in
@@ -18089,7 +21698,7 @@ struct OpenXRPresenter::Impl {
                              !game_arm,
                          src.motion,
                          rec.turn_serial,
-                         rec.space_serial,
+                         recenter_serial, // warped poses use current LOCAL, even for an old capture
                          rec.tick_ns,
                          fs.predictedDisplayTime,
                          rec.base_yaw,
@@ -18108,6 +21717,18 @@ struct OpenXRPresenter::Impl {
         const VR::Vec3& p = v.position;
         src.eye_poses[0] = ToXr(v.orientation, {p.x - right.x, p.y - right.y, p.z - right.z});
         src.eye_poses[1] = ToXr(v.orientation, {p.x + right.x, p.y + right.y, p.z + right.z});
+        // A canted display (core/vr/eye_cant.h, TurnEyes): the parallel eyes cover each eye's
+        // turned view; the warp turns them into those views and submits them with the eyes' own
+        // orientation and located FOV, what the runtime expects.
+        if (TurnEyes(rec)) {
+            src.canted = true;
+            for (u32 e = 0; e < 2; ++e) {
+                const VR::Quat& q = rec.eye_cant[e];
+                const VR::Fov& f = rec.eye_located_fov[e];
+                src.cant[e] = {q.x, q.y, q.z, q.w};
+                src.cant_fovs[e] = {f.angle_left, f.angle_right, f.angle_up, f.angle_down};
+            }
+        }
         src.gpu = late_shown_gpu != nullptr ? late_shown_gpu->Handle() : vk::Semaphore{};
         src.gpu_tick = late_shown_tick;
         src.stamp = {rec.id, late_shown_rows[0], ++late_serial, late_shown_rows[1]};
@@ -18254,6 +21875,11 @@ struct OpenXRPresenter::Impl {
             LOG_INFO(Render_Vulkan,
                      "VR late warp: {} warps with the fetch-once eye pass (late_warp_fetch_once)",
                      t.fetch_once);
+        }
+        if (t.canted > 0) {
+            LOG_INFO(Render_Vulkan,
+                     "VR late warp: {} warps turned each eye into a canted display's own view",
+                     t.canted);
         }
         const double n = std::max<double>(st.measured, 1.0);
         const VR::Settings& vrs = VR::GetSettings();
@@ -18749,8 +22375,8 @@ struct OpenXRPresenter::Impl {
     // Composition layers built per XR frame (Submit's stack storage): the rest quad, the HUD
     // band's pieces and the canvas, each with its own colour scale (fades).
     // The rest quad (two with a banner's rows cut out), the title, the band, the canvas and the
-    // menu's HUD.
-    static constexpr u32 UiMaxLayers = 3 + VR::Ui::MaxSegments + 2 + 1; // + the build-up meter
+    // menu's HUD, the build-up meter, and the area name's own piece (ui_hud_slots).
+    static constexpr u32 UiMaxLayers = 3 + VR::Ui::MaxSegments + 2 + 1 + 1;
     struct UiLayerStorage {
         std::array<XrCompositionLayerQuad, UiMaxLayers> quads{};
         std::array<XrCompositionLayerCylinderKHR, UiMaxLayers> cylinders{};
@@ -18819,13 +22445,16 @@ struct OpenXRPresenter::Impl {
         c.hud_right = ui.hud_right;
         c.area_name = ui.area_name;
         c.menu_hud = ui.menu_hud && c.cls == VR::UiClass::Full;
+        // In the strip its rows start at the strip's first row; in the slot sheet at their own.
+        const s32 cond_bottom = ui.slots ? ui.conditions_rect[3]
+                                         : ui.conditions_rect[3] - ui.conditions_rect[1];
         c.conditions = ui.conditions && ui.conditions_rect[2] > ui.conditions_rect[0] &&
                        ui.conditions_rect[3] > ui.conditions_rect[1] &&
-                       ui.strip_top + static_cast<u32>(ui.conditions_rect[3] -
-                                                       ui.conditions_rect[1]) <=
-                           ui.extent.height;
+                       ui.strip_top + static_cast<u32>(cond_bottom) <= ui.extent.height;
         c.conditions_rect = ui.conditions_rect;
         c.strip_top = ui.strip_top;
+        c.slots = ui.slots;
+        c.slot_banner = ui.slot_banner;
         return c;
     }
 
@@ -18839,6 +22468,11 @@ struct OpenXRPresenter::Impl {
             band_h = static_cast<u32>(std::lround(source.width * 9.0f / 16.0f));
         }
         const auto& s = VR::GetSettings();
+        // The HUD widgets' slots (ui_hud_slots): the meter has its own, no strip; the slot sheet
+        // takes rows of a half each frame does not show (vk_presenter_vr.cpp RecordVrUi).
+        if (VR::Ui::Slots::Active() != nullptr && source.height > band_h) {
+            return {source.width, 2 * band_h};
+        }
         return {source.width,
                 VR::Ui::Conditions::AtlasHeight(
                     source.width, band_h,
@@ -20231,7 +23865,12 @@ struct OpenXRPresenter::Impl {
                                             static_cast<VR::Ui::HudAnchor>(s.ui_hud_anchor),
                                             s.ui_hud_corner_yaw_deg, s.ui_hud_corner_pitch_deg);
         const auto pos = static_cast<VR::Ui::CountersPos>(s.ui_counters_pos);
-        if (pos == VR::Ui::CountersPos::LowerMiddle && UiHudOnView()) {
+        if (pos == VR::Ui::CountersPos::UnderStatus) {
+            VR::Ui::PlaceCountersUnderStatus(hud, s.ui_counters_under_scale,
+                                             s.ui_counters_under_gap_deg,
+                                             s.ui_counters_under_centre,
+                                             s.ui_counters_under_x_deg);
+        } else if (pos == VR::Ui::CountersPos::LowerMiddle && UiHudOnView()) {
             VR::Ui::TrayConfig tray{};
             tray.top_deg = VR::Tune::Get("ui.tray_top_deg", s.ui_counters_tray_top_deg);
             tray.scale = VR::Tune::Get("ui.tray_scale", s.ui_counters_scale);
@@ -20244,7 +23883,9 @@ struct OpenXRPresenter::Impl {
             hud.segment[VR::Ui::CountersSegment].row_pitch_deg += s.ui_counters_raise_deg;
         }
         VR::Ui::FitDialogue(hud, c.dialogue);
-        if (ui_area_on && !c.dialogue) {
+        // In its slot (ui_hud_slots) the name has a piece of its own (UiAreaSegment): the lower
+        // piece stays where it is.
+        if (ui_area_on && !ui_area_slot && !c.dialogue) {
             VR::Ui::CentreAreaName(hud, VR::Tune::Get("ui.area_center_x", VR::Ui::AreaNameCenterX),
                                    VR::Tune::Get("ui.area_drop_deg", VR::Ui::AreaNameDropDeg));
         }
@@ -20255,7 +23896,32 @@ struct OpenXRPresenter::Impl {
     float UiLowerDistance() const {
         const auto& s = VR::GetSettings();
         const float d = s.ui_hud_distance_m + s.ui_lower_push_m;
-        return ui_area_on ? std::max(d, VR::Ui::AreaNameDistanceM) : d;
+        return ui_area_on && !ui_area_slot ? std::max(d, VR::Ui::AreaNameDistanceM) : d;
+    }
+
+    // A slotted widget's piece in the atlas's slot sheet (ui_hud_slots, VR::Ui::Slots): `home`
+    // (stage px, where the game lays the widget out) moved into the layout's `slot`, from the
+    // sheet's first row (strip_top). None: not in a slot in this frame (the band's own rect).
+    std::optional<XrRect2Di> UiSheetRect(const UiContent& c, const VR::Ui::StageRect& home,
+                                         VR::Ui::Slots::Slot VR::Ui::Slots::Layout::*slot) const {
+        namespace Slots = VR::Ui::Slots;
+        const Slots::Layout* layout = Slots::Active();
+        if (!c.slots || layout == nullptr || !(layout->*slot).on || c.band.width == 0 ||
+            c.render.height <= c.band.height) {
+            return std::nullopt;
+        }
+        const float k = VR::Ui::BandScale(static_cast<float>(c.band.width));
+        const auto blocks = Slots::BlocksOf(*layout);
+        const auto sheet = Slots::SheetOf(blocks, k,
+                                          static_cast<s32>((c.render.height - c.band.height) / 2),
+                                          static_cast<s32>(c.render.height));
+        const auto r = Slots::SheetRect(sheet, blocks, (layout->*slot).Moved(home), k);
+        const s32 x0 = std::clamp(r[0], 0, static_cast<s32>(c.band.width) - 1);
+        const s32 x1 = std::clamp(r[2], x0 + 1, static_cast<s32>(c.band.width));
+        if (r[3] <= r[1]) {
+            return std::nullopt;
+        }
+        return XrRect2Di{{x0, static_cast<s32>(c.strip_top) + r[1]}, {x1 - x0, r[3] - r[1]}};
     }
 
     // The status build-up meter's piece for the shown frame's rows (ui_conditions=view,
@@ -20932,8 +24598,20 @@ struct OpenXRPresenter::Impl {
             // One of unknown type waits for a banner's screen-wide dim (VR::Ui::UnknownBannerGate);
             // while dead it is the death screen at once, as before. A known one supersedes it.
             const bool unknown = played && banner.type == 0 && !dead;
+            // With the banners in their slot (ui_hud_slots) the words drawn there are a banner,
+            // whatever the sampled text effect said: one played between two samples has type 0,
+            // and a banner's dim need not reach the screen's edges (BLOOD ECHOES RETRIEVED's did
+            // not, 2026-10-26: no title). Their first frame also starts a title of their own when
+            // no event came with them.
+            constexpr u32 BannerSlotMinPx = 256;
+            const bool slot_words = ui_shown.valid && ui_shown.slots &&
+                                    ui_shown.cls == VR::UiClass::None &&
+                                    ui_shown.slot_banner >= BannerSlotMinPx;
+            const bool slot_rise = slot_words && !ui_title.slot_words;
+            ui_title.slot_words = slot_words;
             bool dropped = false;
-            const bool confirmed = ui_title.unknown.Step(unknown, screen, now, dropped);
+            const bool confirmed =
+                ui_title.unknown.Step(unknown, screen || slot_words, now, dropped);
             if (played && !unknown) {
                 ui_title.unknown = {};
             }
@@ -20941,7 +24619,13 @@ struct OpenXRPresenter::Impl {
                 LOG_INFO(Render_Vulkan, "VR ui: a text effect of unknown type without a banner's "
                                         "screen-wide dim: no title");
             }
-            const bool new_banner = (played && !unknown) || confirmed;
+            const bool slot_only = slot_rise && !played && !confirmed && !ui_title.state.on;
+            if (slot_only) {
+                LOG_INFO(Render_Vulkan, "VR ui: a banner's words in their slot ({} px) with no "
+                                        "text effect seen: a title",
+                         ui_shown.slot_banner);
+            }
+            const bool new_banner = (played && !unknown) || confirmed || slot_only;
             const bool was_on = ui_title.state.on;
             if (VR::Ui::StepDeathTitle(ui_title.state, s.ui_death_distance_m > 0.0f, screen, dead,
                                        head.valid, new_banner, dt)) {
@@ -20956,8 +24640,10 @@ struct OpenXRPresenter::Impl {
                 }
                 // YOU DIED's cut-out and size, or every other banner's (a banner whose type was
                 // not seen: YOU DIED while the hunter is dead).
-                ui_title.death = !new_banner || banner.type == 2 || (banner.type == 0 && dead);
-                ui_title.type = new_banner ? banner.type : 2;
+                // A title from the slot alone: the widest cut-out (its type is not known).
+                const u32 type = slot_only ? 0u : banner.type;
+                ui_title.death = !new_banner || type == 2 || (type == 0 && dead);
+                ui_title.type = new_banner ? type : 2;
                 const auto q =
                     VR::Ui::TitleQuad(ui_title.death, ui_title.type, s.ui_death_distance_m,
                                       s.ui_death_text_deg, s.ui_banner_text_deg);
@@ -20994,11 +24680,17 @@ struct OpenXRPresenter::Impl {
                                   c.band.width != 0 && UiBelt(c);
             const bool was_on = ui_area_on;
             ui_area_on = gameplay && c.area_name && !c.dialogue;
+            const auto* layout = VR::Ui::Slots::Active();
+            ui_area_slot = ui_area_on && c.slots && layout != nullptr && layout->area.on;
             if (ui_area_on != was_on) {
                 LOG_INFO(Render_Vulkan, "VR ui: area name {}",
-                         ui_area_on ? fmt::format("on the lower piece: straight ahead, {:.1f} m away",
-                                                  UiLowerDistance())
-                                    : std::string{"gone: the lower group back in place"});
+                         !ui_area_on ? std::string{"gone: the lower group back in place"}
+                         : ui_area_slot
+                             ? fmt::format("from its slot: its own piece under the prompts, {:.1f} m "
+                                           "away",
+                                           VR::Ui::AreaNameDistanceM)
+                             : fmt::format("on the lower piece: straight ahead, {:.1f} m away",
+                                           UiLowerDistance()));
             }
         }
         // The HUD band (ui_hud_anchor=band): follows the head lazily (LOCAL space: snap and
@@ -21042,12 +24734,17 @@ struct OpenXRPresenter::Impl {
                 ? 1.0f
                 : 0.0f,
         };
-        const bool fade = Runtime().has_color_scale && s.ui_fade_ms > 0.0f;
-        // The hands' check on the HUD pieces (below): with the fade as before, and without the
-        // colour scale extension always, a piece then cut instead of faded (its alpha jumps;
-        // BuildUiLayers leaves out what is below half: VrXrLayers::UiHandCheck, UiCut).
-        const bool cut = !Runtime().has_color_scale;
-        const bool hand_check = VrXrLayers::UiHandCheck(fade, Runtime().has_color_scale);
+        // Partial alphas show where the runtime has the colour scale extension or the UI is drawn
+        // into the eye images (ui_compose=eyes, the last shown frame: the compositor applies them
+        // itself; SteamVR before 2026-10-23 cut a hand-faded item pickup out whole). A frame that
+        // falls back to layers without the extension still cuts below half (UiCut).
+        const bool can_fade = Runtime().has_color_scale || shown_ui_composed;
+        const bool fade = can_fade && s.ui_fade_ms > 0.0f;
+        // The hands' check on the HUD pieces (below): with the fade as before, and without a way
+        // to fade always, a piece then cut instead of faded (its alpha jumps; BuildUiLayers
+        // leaves out what is below half: VrXrLayers::UiHandCheck, UiCut).
+        const bool cut = !can_fade;
+        const bool hand_check = VrXrLayers::UiHandCheck(fade, can_fade);
         const float step = fade ? dt / (s.ui_fade_ms * 1e-3f) : 1.0f;
         for (u32 i = 0; i < ui_alpha.size(); ++i) {
             // Full menus pop in once their content is settled; no VR fade or slide.
@@ -21092,6 +24789,7 @@ struct OpenXRPresenter::Impl {
             u32 parts = 0; // VR::Ui::HudInFront*
             const char* why = "";
             const bool lower = i < hud.count && hud.segment[i].dynamic;
+            const bool counters = i == VR::Ui::CountersSegment; // covered: gone (HudFadeFloor)
             // The counters (and the HP cluster) while hidden: nothing to fade (nor to log).
             const bool counters_off =
                 (i == VR::Ui::CountersSegment && !ui_counters_want && ui_counters_alpha <= 0.0f) ||
@@ -21104,7 +24802,7 @@ struct OpenXRPresenter::Impl {
                                         &parts);
                 const auto floor_of = [&](u32 of) {
                     return VR::Ui::HudFadeFloor(level, of, lower, talking, reading,
-                                                s.ui_hud_blade_alpha, lower_alpha);
+                                                s.ui_hud_blade_alpha, lower_alpha, counters);
                 };
                 // The lower group fades for a weapon while your hand in front would not: name it.
                 constexpr u32 Weapons = VR::Ui::HudInFrontBlade | VR::Ui::HudInFrontGun;
@@ -21144,13 +24842,13 @@ struct OpenXRPresenter::Impl {
             }
             const float floor =
                 VR::Ui::HudFadeFloor(ui_piece_level[i], ui_piece_parts[i], lower, talking, reading,
-                                     s.ui_hud_blade_alpha, lower_alpha);
+                                     s.ui_hud_blade_alpha, lower_alpha, counters);
             if (lower && reading && floor >= 0.999f) {
                 // A prompt (or text) came up while the boss bar's piece was faded for your hands,
                 // arms or body: whole at once, never a prompt fading in.
                 ui_piece_alpha[i] = 1.0f;
             } else if (cut) {
-                ui_piece_alpha[i] = hidden ? floor : 1.0f; // no fade without the colour scale
+                ui_piece_alpha[i] = hidden ? floor : 1.0f; // no way to fade (can_fade)
             } else {
                 ui_piece_alpha[i] = hidden ? Approach(ui_piece_alpha[i], floor, dt / 0.08f)
                                            : Approach(ui_piece_alpha[i], 1.0f, dt / 0.25f);
@@ -21396,10 +25094,12 @@ struct OpenXRPresenter::Impl {
     }
 
     // Frame thread (xr_mutex held): the UI layers of this XR frame, appended to `layers` (rest
-    // quad, HUD band pieces, canvas). Returns how many.
+    // quad, HUD band pieces, canvas). Returns how many. `into_eyes`: for the eye compositor
+    // (ComposeAdoptedUi), which draws a group's colour scale itself (VrUiGeometry's tint), so a
+    // piece fades partly there on every runtime (SteamVR too) instead of being cut below half.
     u32 BuildUiLayers(UiLayerStorage& st, float brightness,
                       std::array<const XrCompositionLayerBaseHeader*, 12>& layers,
-                      u32& layer_count) {
+                      u32& layer_count, bool into_eyes = false) {
         const UiContent& c = ui_shown;
         if (!c.valid || c.empty || c.chain < 0 || ui_disabled.load() || ui_probe ||
             ui_chains[c.chain].handle == XR_NULL_HANDLE || c.band.width == 0 ||
@@ -21407,7 +25107,7 @@ struct OpenXRPresenter::Impl {
             return 0;
         }
         const auto& s = VR::GetSettings();
-        const bool scale_ext = Runtime().has_color_scale;
+        const bool scale_ext = Runtime().has_color_scale || into_eyes;
         if (!scale_ext && brightness < 0.5f) {
             return 0;
         }
@@ -21445,7 +25145,8 @@ struct OpenXRPresenter::Impl {
         const auto arc = [&](float alpha, const XrRect2Di& rect, float yaw, float pitch,
                              const VR::Vec3& origin, float distance, float width_deg,
                              XrSpace space) {
-            if (VrXrLayers::UiCut(scale_ext, alpha)) {
+            // Faded right out (the covered counters): no layer at all.
+            if (alpha <= 0.004f || VrXrLayers::UiCut(scale_ext, alpha)) {
                 return;
             }
             const void* next = group(alpha);
@@ -21569,7 +25270,11 @@ struct OpenXRPresenter::Impl {
                 t.space = local_space;
                 t.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
                 t.subImage.swapchain = swapchain;
-                t.subImage.imageRect = stage_rect(title_rect, 0);
+                // In its slot (ui_hud_slots) the banner's words alone, never the boss bar or the
+                // HUD under them.
+                t.subImage.imageRect =
+                    UiSheetRect(c, title_rect, &VR::Ui::Slots::Layout::banner)
+                        .value_or(stage_rect(title_rect, 0));
                 t.pose = ToXr(facing, {og.x + at.x, og.y + at.y, og.z + at.z});
                 t.size = {size.width_m, size.height_m};
                 add(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&t));
@@ -21602,11 +25307,33 @@ struct OpenXRPresenter::Impl {
                     continue;
                 }
                 const UiPiece piece = UiPieceAt(seg, i, c);
-                arc(ui_alpha[1] * ui_piece_alpha[i] * counters_alpha, stage_rect(seg.rect, 0),
+                // The clusters from their slot (ui_hud_slots): only HP, stamina, the items, the
+                // echoes and insight, whatever else the game draws in their rows of the band.
+                const XrRect2Di rect =
+                    seg.dynamic ? stage_rect(seg.rect, 0)
+                                : UiSheetRect(c, seg.rect, &VR::Ui::Slots::Layout::status)
+                                      .value_or(stage_rect(seg.rect, 0));
+                arc(ui_alpha[1] * ui_piece_alpha[i] * counters_alpha, rect,
                     on_view ? piece.yaw : hud_anchor.yaw + piece.yaw,
                     on_view ? piece.pitch : hud_anchor.pitch + piece.pitch, origin,
                     seg.dynamic ? UiLowerDistance() : s.ui_hud_distance_m, seg.WidthDeg(),
                     on_view ? view_space : local_space);
+            }
+            // The area name from its slot (ui_hud_slots): its own piece under the lower group's
+            // prompts, the words straight ahead, never sharing a prompt's rows.
+            if (ui_area_slot && c.area_name && hud.count > 2) {
+                const auto area = VR::Ui::Slots::AreaSegment(
+                    hud.segment[2], VR::Tune::Get("ui.area_center_x", VR::Ui::AreaNameCenterX),
+                    VR::Tune::Get("ui.area_gap_deg", 0.5f));
+                if (const auto rect =
+                        UiSheetRect(c, VR::Ui::Slots::AreaHome, &VR::Ui::Slots::Layout::area)) {
+                    const UiPiece piece = UiPieceAt(area, VR::Ui::MaxSegments + 1, c);
+                    arc(ui_alpha[1] * ui_piece_alpha[2], *rect,
+                        on_view ? piece.yaw : hud_anchor.yaw + piece.yaw,
+                        on_view ? piece.pitch : hud_anchor.pitch + piece.pitch, origin,
+                        VR::Ui::AreaNameDistanceM, area.WidthDeg(),
+                        on_view ? view_space : local_space);
+                }
             }
             // The status build-up meter (ui_conditions=view): the game's rows from the atlas's
             // strip, its own piece under the view's centre (VR::Ui::Conditions), only while the
@@ -21615,7 +25342,10 @@ struct OpenXRPresenter::Impl {
                 (scale_ext || ui_cond_alpha * ui_cond_piece_alpha >= 0.5f)) {
                 const auto seg = UiConditionsSegment(c);
                 const auto& r = c.conditions_rect;
-                const XrRect2Di rect{{0, static_cast<s32>(c.strip_top)}, {r[2] - r[0], r[3] - r[1]}};
+                // The strip holds the rows at its top-left; the slot sheet where they are.
+                const XrRect2Di rect{{c.slots ? r[0] : 0,
+                                      static_cast<s32>(c.strip_top) + (c.slots ? r[1] : 0)},
+                                     {r[2] - r[0], r[3] - r[1]}};
                 const UiPiece piece = UiPieceAt(seg, 3, c);
                 arc(ui_alpha[1] * ui_cond_alpha * ui_cond_piece_alpha, rect,
                     on_view ? piece.yaw : hud_anchor.yaw + piece.yaw,
@@ -21681,7 +25411,11 @@ struct OpenXRPresenter::Impl {
                 s.ui_hud_corner_pitch_deg + s.ui_hud_pitch_deg, s.ui_menu_corner_yaw_deg);
             for (u32 i = 0; i < hud.count; ++i) {
                 const auto& seg = hud.segment[i];
-                arc(ui_alpha[3] * PageCanvasDim(), stage_rect(seg.rect, bh),
+                // From the clusters' slot (ui_hud_slots): the menu never draws over it there.
+                const XrRect2Di rect =
+                    UiSheetRect(c, seg.rect, &VR::Ui::Slots::Layout::status)
+                        .value_or(stage_rect(seg.rect, bh));
+                arc(ui_alpha[3] * PageCanvasDim(), rect,
                     ui_canvas.now.yaw - seg.yaw_deg / RadToDeg,
                     ui_canvas.now.pitch + seg.row_pitch_deg / RadToDeg, ui_canvas.now.origin,
                     s.ui_menu_distance_m, seg.WidthDeg(), local_space);
@@ -21713,9 +25447,22 @@ struct OpenXRPresenter::Impl {
         if (compose_failed || frame.record.space_serial != recenter_serial) return false;
         const bool want_ui = VR::GetSettings().ui_compose_eyes && ui_compose_sampled && frame.ui_set &&
                              frame.ui.valid && frame.ui.chain >= 0;
+        // A VR page (settings, lamp rest / travel) baked too, over the game's UI and under the
+        // overlay: one projection layer and one pose for the whole frame. As layers (the page's,
+        // and the overlay pulled out over it) they cost Link frames, and Virtual Desktop tilted
+        // and swayed the world with the head (2026-11-07). Its pieces are the page as last placed.
+        const bool page_up = VR::Page::Runtime::Get().Visible();
+        // Never bake a paused choice (or its closing fade) into a guest frame: that
+        // frame may be the last one until the user chooses, freezing its image/revision.
+        const s32 page_image = page_up && !VR::Page::Runtime::Get().RequiresLivePresentation() &&
+                                       VR::GetSettings().ui_compose_eyes &&
+                                       page_piece_count > 0 && !VR::MenuPanelActive()
+                                   ? page_layer.BakeCurrent()
+                                   : -1;
+        const bool bake_page = page_image >= 0;
         const OverlaySnapshot* snapshot = nullptr;
         if (VR::GetSettings().overlay_compose_eyes && overlay_in_eye.IsActive() &&
-            !VR::Page::Runtime::Get().Visible()) {
+            (!page_up || bake_page)) {
             for (const auto& candidate : overlay_history) {
                 if (candidate.head_time != 0 && candidate.head_time == frame.record.head_time &&
                     candidate.space == frame.record.space_serial) {
@@ -21724,7 +25471,7 @@ struct OpenXRPresenter::Impl {
                 }
             }
         }
-        if (!want_ui && !snapshot) return false;
+        if (!want_ui && !snapshot && !bake_page) return false;
         EyeSwapchain* atlas = want_ui ? &ui_chains[frame.ui.chain] : nullptr;
         if (atlas && (!atlas->acquired || !atlas->waited)) return false;
         std::unique_lock game_lock{Scheduler::submit_mutex, std::defer_lock};
@@ -21749,7 +25496,7 @@ struct OpenXRPresenter::Impl {
         std::array<const XrCompositionLayerBaseHeader*, 12> layers{};
         u32 count = 0;
         // The projection layer applies the cinematic brightness once, after compositing.
-        if (want_ui) BuildUiLayers(storage, 1.0f, layers, count);
+        if (want_ui) BuildUiLayers(storage, 1.0f, layers, count, true);
         std::array<VrUiGeometry::Piece, 12> pieces{};
         u32 piece_count = 0;
         for (u32 i = 0; i < count; ++i) {
@@ -21757,7 +25504,7 @@ struct OpenXRPresenter::Impl {
             if (!piece) return false;
             pieces[piece_count++] = *piece;
         }
-        if (piece_count == 0 && (!snapshot || snapshot->items.empty())) {
+        if (piece_count == 0 && !bake_page && (!snapshot || snapshot->items.empty())) {
             shown_overlay_composed = snapshot != nullptr;
             return want_ui;
         }
@@ -21792,6 +25539,11 @@ struct OpenXRPresenter::Impl {
             ui_compose.Draw(cmd, targets[i], {u32(rect.extent.width),u32(rect.extent.height)},
                             atlas_view, ui_chain_extent, {pieces.data(),piece_count},
                             frame.eye_poses[i],frame.projections[i].fov,frame.ui.frame_pose);
+            if (bake_page) // its bake image is left in shader-read layout by its copy
+                ui_compose.Draw(cmd, targets[i], {u32(rect.extent.width),u32(rect.extent.height)},
+                                page_layer.BakeView(u32(page_image)), page_layer.BakeExtent(),
+                                {page_pieces.data(), page_piece_count}, frame.eye_poses[i],
+                                frame.projections[i].fov, frame.ui.frame_pose);
         }
         auto restore = read;
         restore.srcStageMask=vk::PipelineStageFlagBits2::eFragmentShader;
@@ -21844,12 +25596,16 @@ struct OpenXRPresenter::Impl {
             }
         }
         const auto sync = xrq.PlanGameBatch(0); // acquire was already waited by the game's copy
+        // The bake image this slot samples: never written again until the slot is done.
+        page_bake_reads[ui_compose.SlotIndex() & 1] = bake_page ? page_image : -1;
         if (!ui_compose.Submit(instance.GetGraphicsQueue(),sync.signal,sync.signal_value)) return false;
         xrq.GameBatchSubmitted(sync);
-        Common::SyncLog::Line("compose rec=%llu head_t=%lld ui=%u pieces=%u overlay=%u gpu_ms=%.4f",
+        Common::SyncLog::Line("compose rec=%llu head_t=%lld ui=%u pieces=%u overlay=%u page=%d gpu_ms=%.4f",
             static_cast<unsigned long long>(frame.record.id),static_cast<long long>(frame.record.head_time),
-            want_ui ? 1u : 0u,piece_count,snapshot ? 1u : 0u,ui_compose.LastGpuMs());
+            want_ui ? 1u : 0u,piece_count,snapshot ? 1u : 0u,page_image,ui_compose.LastGpuMs());
         shown_overlay_composed = snapshot != nullptr;
+        shown_page_composed = bake_page;
+        shown_page_revision = page_layer.BakeRevision();
         return want_ui;
     }
 
@@ -21873,6 +25629,7 @@ struct OpenXRPresenter::Impl {
     void ShowMono(const Pending& frame) {
         shown_ui_composed = false;
         shown_overlay_composed = false;
+        shown_page_composed = false;
         for (u32 i = 0; i < 2; ++i) {
             content[i] = {true, frame.eye_poses[i], frame.projections[i], frame.swapchain,
                           frame.source};
@@ -22198,6 +25955,7 @@ struct OpenXRPresenter::Impl {
     VR::Space::Shift app_space{};
     VR::Space::Fade recenter_fade{}; // frame thread
     VR::QuickTurn::Gesture quick_turn_gesture{};
+    VR::QuickTurn::Gesture pad_quick_turn{}; // the gamepad's right stick (first person)
     VR::Space::Fade quick_turn_fade{};
     bool quick_turn_input{};
     float quick_turn_dt{};
@@ -22217,6 +25975,11 @@ struct OpenXRPresenter::Impl {
     // created the first time As the player (or a seated eye height) wants it (never otherwise),
     // located in local_space every XR frame while it does (UpdateHead). Frame thread.
     XrSpace floor_space{XR_NULL_HANDLE};
+    // STAGE as well when LOCAL_FLOOR is the floor space: Meta Link's own recenter moves LOCAL to
+    // the head's height but its LOCAL_FLOOR stays the old distance below it (the eye read 0.82 m
+    // over the floor, 2026-10-24); STAGE stays on the room's floor (LocateFloor).
+    XrSpace stage_space{XR_NULL_HANDLE};
+    bool floor_from_stage{false}; // the last located floor was STAGE's (they disagreed)
     bool floor_tried{false};
     const char* floor_kind{"none"};
     bool floor_located{false}; // the last locate gave a valid floor
@@ -22269,6 +26032,7 @@ struct OpenXRPresenter::Impl {
     // never waits for xrEndFrame. Else everything runs as before.
     VrXrQueue xrq;
     VrXrQueuePolicy::Runtime xr_runtime{VrXrQueuePolicy::Runtime::Other};
+    bool runtime_y_menu{};
     bool swapchain_mips{true}; // the UI and page swapchains may have mips (SwapchainMips)
     u64 late_acquire_value{0}; // own queue: the late warp's acquired image (VrXrQueue)
     // The black base layer (vr_xr_layers_policy.h; VR_XR_BASE_LAYER): chosen with the session (on
@@ -22516,6 +26280,8 @@ struct OpenXRPresenter::Impl {
     XrSessionState watchdog_logged{XR_SESSION_STATE_UNKNOWN};
     std::chrono::steady_clock::time_point state_since{};
     VR::SessionPausePolicy pause_policy;
+    bool soft_save_choice_pause{}, soft_save_choice_boundary{};
+    u64 soft_save_choice_clock{};
     VR::SessionExitGate exit_gate; // core/vr/session_exit.h: only EXITING closes
     bool exit_requested{false};
     std::atomic_bool torn_down{false}; // TeardownForExit ran: the process is ending
@@ -22548,6 +26314,7 @@ struct OpenXRPresenter::Impl {
     VR::Melee::Classifier melee{};        // motion weapon: swing commit gate + big-swing heavies
     VR::Melee::Classifier melee_shadow{}; // ... the same with swings on (the deny tick, SwingGate)
     std::array<HandHaptics, 2> haptics{}; // 0 = left (gun), 1 = right (weapon)
+    std::array<u32, 4> respec_feel_seen{}; // VR::Respec::Feel's counters played (UpdateRespecFeel)
     // Vibration diagnostics (UpdateHaptics, frame thread): per hand since the last 5 s line.
     struct HapticStats {
         u32 calls{};
@@ -22564,6 +26331,10 @@ struct OpenXRPresenter::Impl {
     std::chrono::steady_clock::time_point haptic_stats_since{};
     std::array<bool, 2> haptic_first_logged{};
     u32 haptic_failures_logged{};
+    // The vibrations carry their frequency (RefreshHapticHz: the PS VR2 Sense controllers only),
+    // and whether the runtime refused one with it this session (then none does).
+    bool haptic_hz{false};
+    bool haptic_hz_refused{false};
     bool haptic_bindings_dirty{true};
     std::string haptic_bindings_text;
     std::chrono::steady_clock::time_point haptic_bindings_checked{};
@@ -22578,6 +26349,9 @@ struct OpenXRPresenter::Impl {
     };
     std::array<HapticTestHand, 2> haptic_test_hands{};
     XrDuration display_period{11'111'111};
+    float session_refresh_hz{0.0f}; // SessionRefreshHz: the rate the session chose (0: unknown)
+    XrDuration shortest_period{0};  // ... else the shortest period reported this session
+    s64 refresh_read_ns{0};         // ... the chosen rate last read
     PhysicalState blocked{};
     // Move with the right stick (swap_sticks; core/vr/thumb_layout.h): the controls are read into
     // their logical slots (UpdateInput), `blocked` with them; the layout last logged.
@@ -22618,6 +26392,9 @@ struct OpenXRPresenter::Impl {
     // cannot answer (third person, body=0, quick_arc=0, no quick-item state): Y's tap is the
     // menu there, so this is that state's only Square (UpdateGameplay).
     bool y_x_combo{false};
+    // left_scheme=2: this X press is the quick-item fan's (decided at the press, where the arc
+    // could answer; kept until X is let go): no vial, no Triangle (UpdateGameplay).
+    bool x_fan{false};
     // The quick-item arc could answer a tap or a grip in the last UpdateQuickItems (gameplay, the
     // arc on, the hunter's hand and the slots).
     bool quick_arc_ready{false};
@@ -22638,6 +26415,7 @@ struct OpenXRPresenter::Impl {
     float quick_since_attack{10.0f}; // since_attack at the last UpdateQuickItems (a new swing)
     bool r3_down{false};
     bool r3_to_game{true};
+    bool r3_immediate_transform{false}; // immediate bow/whip click cannot also switch a weapon / fire on release
     float r3_time{0.0f}; // the right stick click held this long (motion)
     bool r3_used{false}; // ... with the stick pushed or a weapon switched: no lock-on on release
     bool r3_switched{false}; // ... a weapon switched (no deny tick on release)
@@ -22648,6 +26426,22 @@ struct OpenXRPresenter::Impl {
     float b_time{0.0f};
     float touch_left{0.0f};
     float touch_x{0.25f};
+    // In a game menu (the menu branch): a stick click held this long is L2 / R2 (a tap: L3 / R3),
+    // X held this long the touchpad's right half (a tap: its left half).
+    static constexpr float MenuClickHoldS = 0.5f;
+    static constexpr float MenuTouchHoldS = 0.6f;
+    std::array<float, 2> menu_click_s{}; // each stick's click held this long (0: up)
+    float menu_x_s{0.0f};                // X held this long
+    bool menu_x_fired{false};            // ... and its hold already tapped the right half
+    // Forgets the clicks and X held in a menu (a context switch, outside a game menu), so a
+    // release later is no tap. `clicks` false: X only.
+    void ResetMenuThumbs(bool clicks = true) {
+        if (clicks) {
+            menu_click_s = {};
+        }
+        menu_x_s = 0.0f;
+        menu_x_fired = false;
+    }
     VR::Gun::WristReload wrist_reload;
     VR::Gun::WristReloadMode reload_mode;
     VR::Gun::NearBody reload_near; // the gun hand near the body: the stricter flick
@@ -22681,9 +26475,31 @@ struct OpenXRPresenter::Impl {
     VR::Body::Quat grip_head_q{};
     u32 grip_located_space{0};
     s64 grip_located_ns{0}; // when they were published (the injection's freeze counts from it)
+    s32 monocular_log_eye{-1};
+    // The stabilized aim (core/vr/monocular.h Stabilizer): its state, the head sample it last
+    // took, its last aim and the head forward that aim was taken at.
+    VR::Monocular::Stabilizer monocular_stabilizer{};
+    s64 monocular_stab_ns{0};
+    std::array<float, 3> monocular_aim{0.0f, 0.0f, -1.0f};
+    std::array<float, 3> monocular_aim_head{0.0f, 0.0f, -1.0f};
+    bool monocular_aim_valid{false};
+    s32 monocular_tick_eye{-1};  // the eye the lens ticks counted at last frame
+    float monocular_tick_zoom{0.0f}; // the zoom at the last tick (or the arrival)
+    s64 monocular_tick_ns{0};
+    s32 monocular_roll_eye{-1};
+    s32 monocular_render_eye{-1};
+    u32 monocular_space_serial{0};
+    VR::Body::Quat monocular_previous_orientation{0.0f, 0.0f, 0.0f, 1.0f};
+    float monocular_wrist_turn{0.0f};
+    float monocular_target_zoom{2.5f};
+    float monocular_zoom_smoothed{1.0f};
+    float monocular_strength{0.0f};
     bool grip_l_down{false};
     bool was_locked{false};
     bool stick_armed{true};
+    // This XR frame's smooth turn speed (radians a second; 0: none), published once as UpdateInput
+    // ends (VR::SetSmoothTurnRate), whatever path the frame's input took.
+    float smooth_turn_rate{0.0f};
     float up_hold{0.0f};
     // Virtual-screen menu stick (left stick as D-pad while the game shows menus).
     bool menu_stick_active{false};
@@ -22710,6 +26526,12 @@ struct OpenXRPresenter::Impl {
     // VR body hands channel (frame thread): triggers and grips of the last input sync (left
     // trigger, right trigger, left grip, right grip), publications.
     std::array<float, 4> body_analog{};
+    // The bare hands' fingers (ApplyFingerRig): each hand's followed curls, its blend, the sensors
+    // it has shown, and the XR time they were last followed for.
+    std::array<VR::Body::Rig::Curl, 2> finger_curl{};
+    std::array<float, 2> finger_weight{};
+    std::array<VR::Body::Rig::Senses, 2> finger_senses{};
+    XrTime finger_time{0};
     u64 hands_published{0};
     bool hands_logged{false};
     // VR body feedback (frame thread): the live weapon grip adjust (hold A+B; while it is frozen
@@ -22760,16 +26582,19 @@ struct OpenXRPresenter::Impl {
     bool grip_r_native{false};         // ... it went to the weapon-only transform (no L1)
     u32 transform_serial{0};           // native transform squeezes sent
     float grip_press_time{0.0f};
-    bool talk_paused{false}; // talk_guard holds swings back (an NPC is talking)
     bool trigger_r_down{false};
     Route trigger_route{Route::R1};
     Heavy heavy{Heavy::Idle};
     float heavy_time{0.0f};
     bool heavy_tap_suppressed{false};
     float since_attack{10.0f};
+    // ... a committed swing only (an aborted onset leaves it): the empty syringe's draw gate.
+    float since_committed_attack{10.0f};
     bool arc_sustain{false}; // the pending big-swing buzz owns the weapon hand's sustain
     bool quick_wipe_sustain{false}; // quick_use_wipe: the rasp owns both hands' hum
     s64 quick_wipe_cue_ns{0};       // ... and the find cue's next tick (0: none due)
+    s64 quick_tool_feel_ns{0};      // a charging tool's next pulse (QuickToolFeel; 0: none due)
+    u32 quick_tool_feel_seed{0x9E3779B9u}; // ... Tonitrus' crackle spacing
     bool quick_hold_sustain{false}; // quick_hold_use: the ring's rising hum owns the left hand's
     bool melee_logged{false};
     // melee=physical (UpdatePhysicalMelee): the swing windows, the route (logged on change), the
@@ -22779,6 +26604,7 @@ struct OpenXRPresenter::Impl {
     const char* melee_route_why{""};
     float melee_clock{0.0f};
     s64 melee_step_ns{0}; // the last WindowTracker::Step (the budget's real-time gap, Advance)
+    s64 melee_left_step_ns{0}; // ... the left hand's (its own budget's gap, split blades)
     std::array<std::pair<float, float>, 16> melee_tip_history{};
     u32 melee_tip_next{0};
     unsigned melee_recovery_logged{0}; // VR_SWING_LOG: the last recovery stroke logged
@@ -22787,10 +26613,16 @@ struct OpenXRPresenter::Impl {
     u32 melee_prev_serial{0};
     bool melee_prev_aborted{false};
     u32 melee_hit_serial{0};
+    // The last few Hit events' serials (M::TrackerInput::recent_hits: a late hit of a window
+    // given back as a miss), and where the next goes.
+    std::array<u32, VR::Melee::MissPending> melee_recent_hits{};
+    u32 melee_recent_hit_next{0};
+    u32 melee_ended_serial{0}; // the newest contact-held attack the game ended (Ended events)
     u32 melee_impact_serial{0}; // the swing whose impact played last (HandleMeleeEvents) ...
     s64 melee_impact_ns{0};     // ... when, and how heavy
     float melee_impact_weight{0.0f};
     bool melee_charge_sustain{false}; // the trigger charge's buzz owns the weapon hand's sustain
+    float melee_charge_full_s{0.0f};  // ... held at full this long (SettledChargeHum)
     bool melee_whip_sustain{false};   // the physical whip's hum owns it
     VR::Whip::SpinCounter melee_spin{}; // a spun whip's revolutions (UpdatePhysicalMelee)
     VR::Whip::CrackGate melee_crack{};  // ... and its cracks (the wrist alone lashing it)
@@ -22815,6 +26647,7 @@ struct OpenXRPresenter::Impl {
     VR::Bow::Bow bow{};
     VR::Bow::NockedTracking bow_tracking{};
     bool bow_up{false};
+    bool arrow_swing_was{false}; // the arrow in the right hand swung as a melee attack (last frame)
     int bow_hand_i{0}; // the hand the bow hangs on (0 left, 1 right) as last seen
     u32 bow_shots{0};
     bool bow_sustain{false};
@@ -22846,6 +26679,17 @@ struct OpenXRPresenter::Impl {
     // hand (0: none); form B kept while both hands hold the handle (HoldForm, UpdateTwoHand); the
     // blast's charge and its level (UpdateBladeShots).
     VR::Tricks::RightGrip right_grip{};
+    bool furnace_seeded{false}; // RightGrip::Seed once (the Boom Hammer's catches)
+    float furnace_beat_s{0.0f}; // the idling furnace's putter (UpdateRightGrip)
+    // The lit Boom Hammer's hits (boom_fire_hits; HandleMeleeEvents counts, UpdateRightGrip
+    // resets when lit afresh): the last swing counted, the fire-out asked (0: none), its serial.
+    bool boom_was_lit{false};
+    s64 boom_lit_ns{0}; // when it was lit (BoomRelitGraceNs)
+    int boom_lit_hits{0};
+    u32 boom_hit_serial{0};
+    s64 boom_quench_ns{0};
+    const char* boom_quench_why{""}; // "the hit" / "the squeeze" (logs)
+    u32 boom_quench_serial{0};
     bool right_grip_ready{false};
     float grip_sustain_r{0.0f};
     VR::Tricks::HoldForm hold_form{};
@@ -22864,8 +26708,21 @@ struct OpenXRPresenter::Impl {
     VR::Tricks::Blast blast{};
     float blast_sustain{0.0f};
     int blast_quarter{0}; // ... the build's detents passed
+    float blast_full_s{0.0f}; // ... held at full this long (SettledChargeHum)
+    // The split blades (core/vr/dual_blades.h; UpdateSharpen): the rubs, each hand's hone (0 left,
+    // 1 right: until when; spent by the first hit that carried it, NoteDualHit).
+    VR::DualBlades::Sharpener dual_sharpener{};
+    u32 dual_strokes_seen{0};
+    std::array<s64, 2> dual_honed_until_ns{};
+    std::array<s64, 2> dual_honed_at_ns{}; // the ring that honed each (its shine: PublishShine)
+    std::array<s64, 2> dual_spent_ns{};    // its honed hit landed
     int split_quarter{0}; // UpdateHandTransform: the split's pull, its detents passed
     bool l2_trigger_prev{false}; // UpdateGun: the left trigger last frame (its silent special)
+    VR::WheelRev::Rev wheel_rev{}; // Logarius' Wheel's left-trigger spin steps (UpdateGun)
+    s64 wheel_rev_ns{0};
+    u32 wheel_spin_serial{0};
+    bool arm_lash{false}; // the Amygdalan Arm's lash: its right trigger held in form B // the newest WheelSpin published
+    static constexpr s32 WheelFamily = 120;
     bool freed_trigger_down{false}; // ... pulled while the left hand was free (no gun)
     bool gun_trigger_wait{false};   // ... held from while the hand had no gun: none until let go
     VR::Tricks::SawSpin saw_spin{}; // UpdateSawSpin: the Whirligig's spin, the levels it wrote,
@@ -22880,6 +26737,13 @@ struct OpenXRPresenter::Impl {
     // UpdateBladeShots: the trigger's last state, the shots sent, the swing that sent one.
     bool blade_trigger_down{false};
     u32 blade_shots{0};
+    struct KosSpitInput {
+        bool down{false};
+        bool ritual{false}; // this hold is the ritual (form B)
+        s64 press_ns{0};
+    } kos_spit{};
+    s64 kos_feedback_ns{0};
+    std::size_t kos_feedback_beat{0};
     u32 blade_shot_window{0};
     s64 blade_fired_ns{0}; // the gun-blade's last shot (its cadence for the kick at the pull) ...
     s64 blade_dry_ns{0};   // ... its last empty click
@@ -22894,8 +26758,10 @@ struct OpenXRPresenter::Impl {
     VR::Sparks::Field wall_sparks{};
     std::array<float, 3> wall_spark_carry{}; // ... the sparks each contact's scrape owes
     bool wall_on{false}; // weapon_wall on last frame (off: let go once, then nothing runs)
-    u32 wave_window{0};     // moon_wave: the swing window its sweep is of ...
-    VR::Tricks::WaveSweep wave_sweep{}; // ... through your line of sight, or its fastest line
+    u32 wave_window{0};     // moon_wave: the swing window its slash is of ...
+    VR::Tricks::ViewCrossing wave_cross{}; // ... and its blade crossing where you face
+    VR::Tricks::WaveSlash wave_slash{}; // its plane, independent of the flight direction
+    u32 wave_slash_space{0}; // never infer a slash across a recenter
     float hum_level{0.0f}; // UpdateWeaponHum: the hum level written to the sword hand (0: none)
     bool plunge_down_armed{true}; // UpdatePhysicalMelee: this fall may still open a blade-down plunge
     // UpdateLeftMelee (melee_left): the left hand's stroke classifier and window tracker, its
@@ -22908,6 +26774,8 @@ struct OpenXRPresenter::Impl {
     u32 melee_left_prev_serial{0};       // the window the newest one replaced ...
     bool melee_left_prev_aborted{false}; // ... and whether it was no swing
     u32 melee_left_hit_serial{0};
+    std::array<u32, VR::Melee::MissPending> melee_left_recent_hits{}; // (melee_recent_hits)
+    u32 melee_left_recent_hit_next{0};
     bool melee_left_on{false};
     unsigned left_dropped_stroke{0};
     bool left_single{false}; // ... a left-hand weapon of its own (not the dual blades' part)
@@ -22950,6 +26818,29 @@ struct OpenXRPresenter::Impl {
     // the right grip's latch on it, the hunter's hand eased onto the knob (music_box_snap toward
     // music_box_knob, LOCAL), a play for the next quick-item input and the last play's time.
     bool music_box_free{false};
+    // The right hand's empty syringe (UpdateBloodDraw, core/vr/blood_draw.h).
+    VR::BloodDraw::Machine blood_draw{};
+    VR::BloodDraw::Output blood_draw_out{};
+    VR::VialContact::LeftArmGate blood_draw_gate{};
+    VR::VialZones::Result blood_draw_hit{}; // the gate's report this frame
+    bool blood_draw_zone{false};  // the right hand at the left shoulder, a draw available
+    s64 blood_draw_pulse_ns{0};   // the blood bullets' arrival (the white edge pulse)
+    u64 tonitrus_serial{0};       // UpdateTonitrusCharge: the last charge seen
+    u32 blood_draw_ask{0};        // the stab's ask for the game's blood bullets (its serial)
+    bool blood_draw_pad_up{false}; // the ask's D-pad up fallback pressed
+    float blood_draw_pulse_test{0.0f}; // VR_TUNE bd.pulse_test's last value
+    VR::StatusCorners::Tracker status_corners{}; // the status build-ups at the corners
+    int status_corners_logged{-1};
+    double status_beats{0.0}; // their veins' beat clock (StatusCorners::AdvanceBeats)
+    s64 status_beat_ns{0};    // its last advance (0: none showing)
+    // What each eye's lens shows (QueryVisibleAreas; empty: unknown) and how far out it shows the
+    // corners' diagonals (StatusLensDiagonal: the field and the areas it was measured for).
+    std::array<std::vector<VR::StatusCorners::MaskPoint>, 2> visible_vertices{};
+    std::array<std::vector<u32>, 2> visible_indices{};
+    u32 visible_areas_serial{0};
+    std::array<float, 4> status_fit_field{};
+    u32 status_fit_serial{~0u};
+    float status_fit{VR::StatusCorners::LensDiagonalDefault};
     VR::MusicBox::Crank music_box_crank{};
     bool music_box_grip{false};
     bool music_box_knocked{false}; // knocked off the knob with the grip still squeezed
@@ -22971,6 +26862,8 @@ struct OpenXRPresenter::Impl {
     XrTime quick_fresh_time{0};
     VR::Quick::V3 quick_fresh_wv{};
     bool quick_inframe_warned{false};
+    bool quick_inframe_shown{true}; // (the log of its comings and goings, at most 200 lines)
+    u32 quick_inframe_flips{0};
     double quick_mark_t{0.0}; // VR_THROW_MARK: the grab's second body-log mark is due then
     // quick_use_stab (UpdateQuickStab): the stab gate of the blood in the hand (started again at
     // every take, Q::Output::grabs) and a stab for the next UpdateQuickItems (nullptr: none).
@@ -22985,9 +26878,20 @@ struct OpenXRPresenter::Impl {
     // zones'), where the left hand is against the hip's box this frame, and a draw for UpdateVial
     // (the grip at the hip, Output::draw_vial).
     VR::Holsters::Tracker holster_tracker{};
+    VR::Holsters::Moving hunter_moving{}; // the waist pocket's touch tick waits for him to stand
+    VR::Holsters::VialPoseGrace vial_pose_grace{};
+    bool vial_pose_ok{false};
     VR::Belt::Torso belt_torso{};
     VR::Belt::Place belt_place{};
     bool vial_belt_draw{false};
+    // The shoulder vial's squeeze log (UpdateQuickItems, headset tuning: compiled out with the
+    // logs): the raw left grip, a squeeze near the right shoulder waiting for its vial (until
+    // shoulder_log_until, -1 none) and what the frame of the squeeze said, the left controller's
+    // last tracked time.
+    bool shoulder_log_grip{false};
+    double shoulder_log_until{-1.0};
+    std::string shoulder_log_what;
+    s64 shoulder_log_tracked_ns{0};
     float vial_grip_release{-1.0f};
     VR::Body::VialGripHold vial_grip_hold{};
     bool vial_belt{false};
@@ -23004,6 +26908,10 @@ struct OpenXRPresenter::Impl {
     // Blood Vial self-injection.
     bool vial_armed{false};
     VR::Body::VialButton vial_button{}; // X: a press arms / disarms, holding it does nothing more
+    // After a heal X arms the next vial only VialRearmS later (a press in between waits for it).
+    static constexpr float VialRearmS = 0.15f;
+    float vial_rearm_wait{0.0f};
+    bool vial_rearm_pending{false};
     float vial_time{0.0f};
     s64 vial_contact_log_ns{0};
     VR::VialContact::Gate vial_gate{}; // syringe hub against posed anatomy
@@ -23014,13 +26922,15 @@ struct OpenXRPresenter::Impl {
     bool inject_logged{false};
     // A healed stab's hands freeze (vial_inject_hold_ms; StartInjectHold, ApplyInjectHold):
     // [0] the left (the vial), [1] the right (the weapon; vial_inject_hold_hands=both), counted
-    // in monotonic time by inject_freeze.
+    // in monotonic time by inject_freeze; for the empty syringe, [1] the syringe and [0] the arm
+    // it went into (inject_right_stab).
     std::array<VR::Body::InjectHold, 2> inject_hands{};
     VR::Body::FreezeTime inject_freeze{};
     // The healed stab's drain (vial_inject_drain; StartInjectDrain, UpdateHeldRequest).
     VR::Held::VialDrain inject_drain{};
     std::array<VR::Body::InjectHold::Phase, 2> inject_hand_phase{}; // last logged (Off)
     std::array<const char*, 2> inject_let_go{}; // why each hand let go (the log)
+    bool inject_right_stab{false}; // the hold is the syringe's (the right hand went in)
     float inject_swing_speed{0.0f};             // the weapon hand's speed when a swing broke it
     // Two-handed grip (core/vr/two_hand_grip.h; UpdateTwoHand on the input, ApplyTwoHand on the
     // published hands, both on the frame thread): the grab, the game's status as last read, the
@@ -23029,6 +26939,7 @@ struct OpenXRPresenter::Impl {
     VR::Lever::Tracker physical_lever;
     VR::Lever::Output physical_lever_out{};
     VR::Lever::Acquisition physical_lever_acquisition{};
+    VR::Lever::ApproachGrip physical_lever_approach{};
     VR::Lever::Rig physical_lever_rig{};
     u32 physical_lever_space{};
     s64 physical_lever_update_ns{};
@@ -23044,8 +26955,21 @@ struct OpenXRPresenter::Impl {
     bool physical_lever_armed_near{};           // this frame: the armed lever is near
     std::array<bool, 2> physical_lever_reaching{}; // this frame: each hand reaching for it
     bool physical_lever_ready{};                // a hand could pull a lever (the game's word)
+    VR::Lever::ReachTracker physical_lever_reach; // how high a hand reaches (lever_channel reach_top)
     VR::TwoHand::Output two_hand_out{};
     VR::TwoHand::SupportGrip two_hand_support{};
+    VR::TwoHand::TriggerAttachment optimized_attachment{};
+    VR::TwoHand::SpecialTrigger optimized_special_trigger{};
+    bool optimized_mode_was{}, optimized_trigger_owned{}, optimized_special_wait{}, optimized_grip_wait{};
+    bool optimized_item_y_wait{}; // a Y used while supporting stays unavailable until released
+    VR::TwoHand::RepositionButton two_hand_reposition{};
+    VR::TwoHand::RepositionButton::Out two_hand_reposition_out{};
+    VR::TwoHand::PushButton two_hand_push{}; // Y: the rear hand grips, the lead slides
+    VR::TwoHand::PushButton::Out two_hand_push_out{};
+    std::array<float, 2> two_hand_push_from{}; // both hands' places on the weapon at Y's press
+    bool two_hand_push_y_was{}, two_hand_push_logged{}; // the push log's Y edge
+    bool two_hand_push_chord{}; // left_scheme=2: this Y press became the modifier's (a chord)
+    bool shoulder_y_near_miss{}; // the latest left Y press was a near miss of the left shoulder
     VR::TwoHand::BladeMotion two_hand_blade_motion{}, two_hand_physical_motion{};
     VR::TwoHand::BladeSample two_hand_intent_blade{};
     VR::TwoHand::BladeSample two_hand_blade{};
@@ -23055,6 +26979,10 @@ struct OpenXRPresenter::Impl {
     bool two_hand_tip_known{};
     VR::TwoHand::BladeClearCache two_hand_blade_clear{};
     XrTime two_hand_apply_time{}; // ApplyTracked's last published-pose time (its dt)
+    float two_hand_apply_dt{}; // ... and that dt
+    // After a carried transform's seat: the hand blends from where it was held onto the handle.
+    static constexpr float CarryOutS = 0.10f;
+    float two_hand_carry_out_s{1.0f};
     VR::TwoHand::SwingHum two_hand_hum{};
     float two_hand_hum_level{};
     bool two_hand_combat{};
@@ -23085,6 +27013,7 @@ struct OpenXRPresenter::Impl {
     VrOverlayRenderer overlay_in_eye;
     bool shown_overlay_composed{false};
     bool overlay_deferred{false};
+    bool dibr_optical_overlay_pending{false};
     struct OverlaySnapshot {
         s64 head_time{};
         u32 space{};
@@ -23107,6 +27036,15 @@ struct OpenXRPresenter::Impl {
     VR::Vec3 page_origin{0.0f, 0.0f, 0.0f};
     VR::Page::Surface page_surface{};
     bool page_surface_valid{false};
+    // The page baked into the eye images (ui_compose=eyes): its two pieces as BuildPageLayers last
+    // placed them (the page and its glow, their opacity in the tint), the bake image each bake
+    // slot samples (VrPageLayer may write an image only when no unfinished bake samples it), and
+    // whether the pair shown now carries the page (then no page layer goes up) and its revision.
+    std::array<VrUiGeometry::Piece, 2> page_pieces{};
+    u32 page_piece_count{0};
+    std::array<s32, 2> page_bake_reads{-1, -1};
+    bool shown_page_composed{false};
+    u64 shown_page_revision{0};
     s32 page_dir{-1}; // the held D-pad direction: 0 up, 1 down, 2 left, 3 right
     bool page_armed{false};
     float page_hold{0.0f};
@@ -23119,6 +27057,22 @@ struct OpenXRPresenter::Impl {
     VR::Page::PressRepeat page_other_pace{};
     VR::Page::PressRepeat page_grip_l_pace{};
     VR::Page::PressRepeat page_grip_r_pace{};
+    // A gamepad on the page (core/vr/page_pad.h): its buttons last frame (edges), L2 / R2's value
+    // steps, and whether its button names show (the last input came from it).
+    u32 page_pad_prev{0};
+    u32 page_pad_blocked{0}; // held as the page opened: ignored until let go
+    VR::PadMenu::Hold pad_menu_hold{}; // the gamepad's Options (core/vr/pad_menu.h)
+    // Since the VR controllers were last used (UpdateInput; from the start: unused). A gamepad
+    // style vibrates them only within PadStyleHapticIdleS of it (ApplyHaptic).
+    float vr_idle_s{60.0f};
+    static constexpr float PadStyleHapticIdleS = 10.0f;
+    bool pad_play_style{false}; // a gamepad play style (UpdateInput, every frame)
+    // The gamepad's (and keyboard's) own buttons and sticks this input frame (UpdateInput's one
+    // read of the emulated pad's physical layer; the page, Options, the turnaround read it).
+    Input::PadLayers::Physical pad_phys{};
+    VR::Page::PressRepeat page_pad_l2_pace{};
+    VR::Page::PressRepeat page_pad_r2_pace{};
+    bool page_pad_names{false};
     bool page_trigger_r{false};
     VR::Page::Hover page_logged_hover{};
     u32 page_logs{0};
@@ -23160,6 +27114,9 @@ struct OpenXRPresenter::Impl {
         float opacity{0.0f};
     } page_diag;
     bool page_input_owned{false}; // the open page has had its context switch
+    bool page_close_all{false};   // the page closed with Event::CloseAll: Options after release
+    bool page_test_opened{false}; // VR_PAGE_TEST_OPEN has opened the page
+    VR::FreeCamera::YButton free_camera_y; // Y in the free camera: a tap back, y_menu's hold
     VrOverlay::VialAnimator vial_anim{};
     VrOverlay::VialAttach vial_attach{};
     u32 vial_events{0}; // VrOverlay::VialEvent bits set by the input code this frame
@@ -23233,6 +27190,10 @@ struct OpenXRPresenter::Impl {
     // Lean to dodge.
     VR::Lean::Detector lean{};
     VR::Lean::Detector lean_iframes{}; // lean_iframes: the same lean, i-frames only
+    VR::Lean::DuckDetector duck_iframes{}; // duck_iframes_ms: a quick duck, i-frames only
+    u32 duck_space{0};                     // the recenter_serial its history is in
+    double iframes_granted_t{-1e9};        // the last lean or duck grant (s): their cooldown
+    bool iframes_granted_duck{false};      // ... it was a duck's (a lean may still top it up)
     XrVector2f lean_stick{0.0f, 0.0f}; // the dodge direction (+y = view forward)
     float lean_stick_left{0.0f};       // the left stick is held in it this much longer
     float lean_circle_in{0.0f};        // Circle is pressed in this long
@@ -23337,10 +27298,12 @@ struct OpenXRPresenter::Impl {
         VR::Vec3 origin{};
         u64 banner_serial{0}; // the last banner (VR::LatestBanner) taken (ui_banner_title)
         VR::Ui::UnknownBannerGate unknown{}; // one of unknown type waiting for a banner's dim
+        bool slot_words{false}; // the banners' slot held words in the last shown frame
         bool death{true};     // YOU DIED's cut-out and size, else every other banner's
         u32 type{2};          // the banner's text-effect type (its cut-out)
     } ui_title{};
     bool ui_area_on{false}; // an area's name up in the lower group (frame thread)
+    bool ui_area_slot{false}; // ... in its own slot: its own piece (ui_hud_slots)
     std::array<float, 4> ui_alpha{}; // rest, band, canvas, the HUD under a menu canvas
     // Each band piece's hand fade (1 = none) and when a hand was last in front of it.
     std::array<float, VR::Ui::MaxSegments> ui_piece_alpha{1.0f, 1.0f, 1.0f};
@@ -23383,6 +27346,10 @@ struct OpenXRPresenter::Impl {
     u64 ui_layers_submitted{0};
     // ---- The late warp (vr.ini late_warp): frame thread, the shown pair's source under xr_mutex.
     VrLateWarp late;
+    // Canted displays: the game-rate pair's eyes turned into their own views (RecordStereoCopy;
+    // initialized at the first canted pair, once).
+    VrEyeCant eye_cant;
+    bool eye_cant_tried{false};
     // vr.ini vignette_in_warp: this frame's vignettes for the late warp (DrawOverlay ->
     // LateWarp), whether the last frame's warp could take them (Submit / LateWarp), and
     // DrawOverlay's choice for this frame.
@@ -23524,33 +27491,120 @@ bool OpenXRPresenter::ProbeHeadset(HeadsetInfo& info) {
     return valid && info.width[0] && info.width[1] && info.height[0] && info.height[1];
 }
 
-bool OpenXRPresenter::IsHeadsetConnected() {
-    XrInstanceCreateInfo create_info{XR_TYPE_INSTANCE_CREATE_INFO};
-    std::strncpy(create_info.applicationInfo.applicationName, "shadPS4 Bloodborne VR",
-                 XR_MAX_APPLICATION_NAME_SIZE - 1);
-    create_info.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-    XrInstance instance{XR_NULL_HANDLE};
-    if (XR_FAILED(xrCreateInstance(&create_info, &instance))) {
-        return false;
+static XrResult ReadBootHeadsetSystem(XrInstance instance, XrSystemId& system) {
+    XrSystemGetInfo get{XR_TYPE_SYSTEM_GET_INFO};
+    get.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    XrResult result = xrGetSystem(instance, &get, &system);
+    if (XR_FAILED(result)) {
+        return result;
     }
-    XrSystemGetInfo system_info{XR_TYPE_SYSTEM_GET_INFO};
-    system_info.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
-    XrSystemId system_id{XR_NULL_SYSTEM_ID};
-    std::array<XrViewConfigurationView, 2> views{};
-    for (auto& view : views) {
-        view.type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
+    std::array<XrViewConfigurationView, 2> views{{{XR_TYPE_VIEW_CONFIGURATION_VIEW},
+                                                 {XR_TYPE_VIEW_CONFIGURATION_VIEW}}};
+    u32 count{};
+    result = xrEnumerateViewConfigurationViews(instance, system,
+        XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2, &count, views.data());
+    if (XR_FAILED(result)) {
+        return result;
     }
-    u32 count = 0;
-    const bool connected =
-        XR_SUCCEEDED(xrGetSystem(instance, &system_info, &system_id)) &&
-        XR_SUCCEEDED(xrEnumerateViewConfigurationViews(instance, system_id,
-                                                       XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
-                                                       2, &count, views.data())) &&
-        count == 2 && views[0].recommendedImageRectWidth != 0 &&
-        views[0].recommendedImageRectHeight != 0 && views[1].recommendedImageRectWidth != 0 &&
-        views[1].recommendedImageRectHeight != 0;
-    xrDestroyInstance(instance);
-    return connected;
+    return count == 2 && views[0].recommendedImageRectWidth && views[0].recommendedImageRectHeight &&
+           views[1].recommendedImageRectWidth && views[1].recommendedImageRectHeight
+               ? XR_SUCCESS : XR_ERROR_FORM_FACTOR_UNAVAILABLE;
+}
+
+OpenXRPresenter::BootHeadset OpenXRPresenter::PollBootHeadset(bool settle_meta) {
+    // The startup thread, then the wait window's worker, owns the probe until boot.
+    auto& rt = Runtime();
+    bool meta = rt.instance != XR_NULL_HANDLE;
+    XrSystemId system{XR_NULL_SYSTEM_ID};
+    if (!meta) {
+        // Identify the active runtime through the loader. Other runtimes keep their ordinary
+        // extension-free probe and initialize Vulkan on the renderer's thread as before.
+        XrInstanceCreateInfo create{XR_TYPE_INSTANCE_CREATE_INFO};
+        std::strncpy(create.applicationInfo.applicationName, Common::g_application_name,
+                     XR_MAX_APPLICATION_NAME_SIZE - 1);
+        create.applicationInfo.apiVersion = XR_API_VERSION_1_0;
+        XrInstance probe{XR_NULL_HANDLE};
+        if (XR_FAILED(xrCreateInstance(&create, &probe))) {
+            return BootHeadset::Waiting;
+        }
+        static const bool force_other = [] {
+            const char* env = std::getenv("VR_TEST_HEADSET_OTHER");
+            return env && env[0] == '1';
+        }();
+        const bool ready = XR_SUCCEEDED(ReadBootHeadsetSystem(probe, system));
+        XrInstanceProperties properties{XR_TYPE_INSTANCE_PROPERTIES};
+        meta = ready && settle_meta && !force_other &&
+               XR_SUCCEEDED(xrGetInstanceProperties(probe, &properties)) &&
+               VrXrQueuePolicy::Classify(properties.runtimeName) == VrXrQueuePolicy::Runtime::Meta;
+        xrDestroyInstance(probe);
+        if (!ready) {
+            return BootHeadset::Waiting;
+        }
+    }
+    const auto failed = [&](XrResult result) {
+        rt.system_id = XR_NULL_SYSTEM_ID;
+        if (result == XR_ERROR_SIZE_INSUFFICIENT) return BootHeadset::Waiting;
+        const bool absent = result == XR_ERROR_FORM_FACTOR_UNAVAILABLE;
+        if (absent && rt.instance != XR_NULL_HANDLE) {
+            // Keep the confirmed client through a brief Link dropout. If it stays absent,
+            // release it so the loader can discover a different active runtime next poll.
+            const auto now = std::chrono::steady_clock::now();
+            if (rt.boot_missing_since == std::chrono::steady_clock::time_point{})
+                rt.boot_missing_since = now;
+            if (now - rt.boot_missing_since < std::chrono::seconds(3)) return BootHeadset::Waiting;
+        }
+        if (absent || result == XR_ERROR_INSTANCE_LOST || result == XR_ERROR_RUNTIME_UNAVAILABLE ||
+            result == XR_ERROR_RUNTIME_FAILURE || result == XR_ERROR_SYSTEM_INVALID) {
+            rt.boot_missing_since = {};
+            if (rt.instance != XR_NULL_HANDLE) {
+                xrDestroyInstance(rt.instance);
+                rt.instance = XR_NULL_HANDLE;
+                rt.runtime_name.clear();
+            }
+            return BootHeadset::Waiting;
+        }
+        LOG_ERROR(Render_Vulkan, "OpenXR headset startup failed ({})", static_cast<s32>(result));
+        return BootHeadset::Failed;
+    };
+    if (meta && rt.instance == XR_NULL_HANDLE) {
+        const XrResult result = rt.CreateInstance();
+        if (XR_FAILED(result)) {
+            return failed(result);
+        }
+        if (VrXrQueuePolicy::Classify(rt.runtime_name) != VrXrQueuePolicy::Runtime::Meta) {
+            // The active runtime changed between the two creates. Rediscover it normally.
+            xrDestroyInstance(rt.instance);
+            rt.instance = XR_NULL_HANDLE;
+            rt.runtime_name.clear();
+            return BootHeadset::Waiting;
+        }
+    }
+    if (meta) {
+        const XrResult result = ReadBootHeadsetSystem(rt.instance, system);
+        if (XR_FAILED(result)) {
+            return failed(result);
+        }
+        rt.boot_missing_since = {};
+    }
+    // (Tests: the first VR_TEST_HEADSET_WAIT probes say no, to walk the wait window's path with a
+    // headset that is there: emulator.cpp WaitForHeadset. VR_TEST_HEADSET_OTHER=1: the runtime
+    // counts as not Meta's there, the mock's too.)
+    static std::atomic<int> test_left{[] {
+        const char* const env = std::getenv("VR_TEST_HEADSET_WAIT");
+        return env != nullptr ? std::atoi(env) : 0;
+    }()};
+    if (test_left.load(std::memory_order_relaxed) > 0 && test_left.fetch_sub(1, std::memory_order_relaxed) > 0) {
+        return BootHeadset::Waiting;
+    }
+    if (!meta) {
+        return BootHeadset::Ready;
+    }
+    if (settle_meta) {
+        return BootHeadset::SettleMeta;
+    }
+    rt.system_id = system;
+    const XrResult result = rt.FinishInitialization(true);
+    return XR_SUCCEEDED(result) ? BootHeadset::Ready : failed(result);
 }
 
 const std::vector<std::string>& OpenXRPresenter::RequiredVulkanInstanceExtensions() {
@@ -23652,6 +27706,14 @@ bool OpenXRPresenter::DibrEyesFit(const std::array<vk::Extent2D, 2>& eyes) const
     return impl && impl->ready && impl->DibrEyesFit(eyes);
 }
 
+vk::Extent2D OpenXRPresenter::NativeEyeLimit() const {
+    if (!impl || !impl->ready) {
+        return {};
+    }
+    const VrXrSize::Size limit = impl->NativeEyeLimitNow();
+    return {limit.width, limit.height};
+}
+
 bool OpenXRPresenter::CopyStereoFrame(vk::CommandBuffer command_buffer, const StereoEyes& eyes,
                                       vk::Image source_image, vk::Extent2D source_extent,
                                       const VR::FrameTag& tag) {
@@ -23716,8 +27778,8 @@ bool OpenXRPresenter::ProbeHeadset(HeadsetInfo& info) {
     info = {};
     return false;
 }
-bool OpenXRPresenter::IsHeadsetConnected() {
-    return false;
+OpenXRPresenter::BootHeadset OpenXRPresenter::PollBootHeadset(bool) {
+    return BootHeadset::Failed;
 }
 const std::vector<std::string>& OpenXRPresenter::RequiredVulkanInstanceExtensions() {
     static const std::vector<std::string> empty;
@@ -23760,6 +27822,9 @@ std::array<vk::Extent2D, 2> OpenXRPresenter::EyeOutputExtents(
 }
 bool OpenXRPresenter::DibrEyesFit(const std::array<vk::Extent2D, 2>&) const {
     return false;
+}
+vk::Extent2D OpenXRPresenter::NativeEyeLimit() const {
+    return {};
 }
 bool OpenXRPresenter::CopyStereoFrame(vk::CommandBuffer, const StereoEyes&, vk::Image,
                                       vk::Extent2D, const VR::FrameTag&) {

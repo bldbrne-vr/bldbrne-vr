@@ -4,6 +4,8 @@
 
 #include "video_core/native_stereo/lighting_reconstruction.h"
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
@@ -12,19 +14,8 @@
 
 namespace Shader::Backend::SPIRV {
 
-// VR body cutaway (FragmentRuntimeInfo::vr_cut): a fragment of the hunter's own body nearer to the
-// first-person camera than `near` is discarded; between `near` and `far` it is kept with the
-// probability smoothstep(near, far, depth) against interleaved gradient noise on the pixel grid
-// (a stable dither, no hard edge). The view depth is 1 / gl_FragCoord.w (w_clip of a perspective
-// projection); an orthographic pass (w = 1, shadow maps) reads as 1 unit and so is never cut.
-// A cut fragment gets SampleMask 0 (no colour, no depth written), so no control flow is added to
-// the entry block; the rest of the shader runs as before. Bit 31 of the code: back-facing
-// fragments are cut too, at any depth (the inside of the body never shows through the opening).
-// VrPushData: near and the fade's scale are the draw's (vr_cut is only this permutation's flag),
-// a negative scale cuts the back faces; the same arithmetic as with the code's baked constants.
-void EmitVrCutaway(EmitContext& ctx) {
-    const bool pushed = ctx.UsesVrPushData();
-    const VrCut baked = VrCut::Decode(ctx.runtime_info.fs_info.vr_cut);
+// The body cut's test (true: drop the fragment), pushed or baked (EmitVrCutaway).
+static Id CutawayCut(EmitContext& ctx, bool pushed, const VrCut& baked) {
     const bool cull_back = (pushed || baked.back) && Sirit::ValidId(ctx.front_facing);
     const Id type{ctx.F32[1]};
     const Id coord{ctx.OpLoad(ctx.F32[4], ctx.frag_coord)};
@@ -62,6 +53,44 @@ void EmitVrCutaway(EmitContext& ctx) {
         }
         cut = ctx.OpLogicalOr(ctx.U1[1], cut, back_face);
     }
+    return cut;
+}
+
+// VR body cutaway (FragmentRuntimeInfo::vr_cut): a fragment of the hunter's own body nearer to the
+// first-person camera than `near` is discarded; between `near` and `far` it is kept with the
+// probability smoothstep(near, far, depth) against interleaved gradient noise on the pixel grid
+// (a stable dither, no hard edge). The view depth is 1 / gl_FragCoord.w (w_clip of a perspective
+// projection); an orthographic pass (w = 1, shadow maps) reads as 1 unit and so is never cut.
+// A cut fragment gets SampleMask 0 (no colour, no depth written), so no control flow is added to
+// the entry block; the rest of the shader runs as before. Bit 31 of the code: back-facing
+// fragments are cut too, at any depth (the inside of the body never shows through the opening).
+// VrPushData: near and the fade's scale are the draw's (vr_cut is only this permutation's flag),
+// a negative scale cuts the back faces; the same arithmetic as with the code's baked constants.
+void EmitVrCutaway(EmitContext& ctx) {
+    if (const s32 eye = VrCut::MonocularEye(ctx.runtime_info.fs_info.vr_cut); eye >= 0) {
+        if (!ctx.runtime_info.native_stereo) {
+            // DIBR reconstructs both eyes from this one source. Clear the foreground for
+            // either optical eye; NativeEyeIndex() is always zero in this path.
+            ctx.OpStore(ctx.OpAccessChain(ctx.output_u32, ctx.sample_mask, ctx.u32_zero_value),
+                        ctx.u32_zero_value);
+            return;
+        }
+        // A magnified eye must see through the hunter's hand and held tube. Keep the same
+        // draw in the other eye; SampleMask also prevents the hidden eye writing depth.
+        Id cut{ctx.OpIEqual(ctx.U1[1], ctx.NativeEyeIndex(),
+                            eye == 0 ? ctx.ConstU32(0u) : ctx.ConstU32(1u))};
+        if (ctx.UsesVrPushData()) {
+            // The free eye keeps the body's cutaway near the camera: the draw pushes it
+            // (VrPushData::SetCut's free cut; with none, a cut that keeps every fragment).
+            cut = ctx.OpLogicalOr(ctx.U1[1], cut, CutawayCut(ctx, true, VrCut{}));
+        }
+        const Id mask{ctx.OpSelect(ctx.U32[1], cut, ctx.u32_zero_value,
+                                   ctx.ConstU32(0xFFFFFFFFu))};
+        ctx.OpStore(ctx.OpAccessChain(ctx.output_u32, ctx.sample_mask, ctx.u32_zero_value), mask);
+        return;
+    }
+    const bool pushed = ctx.UsesVrPushData();
+    const Id cut{CutawayCut(ctx, pushed, VrCut::Decode(ctx.runtime_info.fs_info.vr_cut))};
     const Id mask{ctx.OpSelect(ctx.U32[1], cut, ctx.u32_zero_value, ctx.ConstU32(0xFFFFFFFFu))};
     ctx.OpStore(ctx.OpAccessChain(ctx.output_u32, ctx.sample_mask, ctx.u32_zero_value), mask);
 }
@@ -175,7 +204,7 @@ void ApplyStereoShift(EmitContext& ctx) {
     const Id hud{push_float(PushData::VrHudIndex)};
     if (ctx.runtime_info.native_stereo) {
         if (!ctx.runtime_info.native_multiview) return;
-        const Id flags=ctx.OpConvertFToU(ctx.U32[1],hud);
+        const Id flags=ctx.OpConvertFToU(ctx.U32[1],ctx.NativeHud(hud));
         const auto flag=[&](u32 mask) {
             return ctx.OpINotEqual(bool_type,ctx.OpBitwiseAnd(ctx.U32[1],flags,ctx.ConstU32(mask)),ctx.ConstU32(0u));
         };
@@ -227,17 +256,41 @@ void ApplyStereoShift(EmitContext& ctx) {
         // matcher cannot infer their relationship to Position. Move those UVs with
         // the rectangle so depth/G-buffer samples still address the rasterized pixel.
         if (light_rectangle && remap) {
-            const auto& uv=ctx.output_params[uv_param];
-            const Id moved=remapped(world);
-            for (u32 axis=0;axis<2;++axis) {
-                const Id ptr=ctx.OpAccessChain(uv.pointer_type,uv.id,ctx.ConstU32(axis));
-                const Id before=ctx.OpLoad(type,ptr);
-                const Id half=ctx.Constant(type,.5f);
-                const Id centered=ctx.OpFMul(type,ctx.OpFSub(type,before,half),component(axis));
-                const Id bias=ctx.OpFMul(type,ctx.Constant(type,axis==0?.5f:-.5f),component(axis+2));
-                const Id after=ctx.OpFAdd(type,ctx.OpFAdd(type,centered,half),bias);
-                ctx.OpStore(ptr,ctx.OpSelect(type,moved,after,before));
+            const Id half=ctx.Constant(type,.5f);
+            const auto move_uv=[&](const auto& uv, Id moved) {
+                for (u32 axis=0;axis<2;++axis) {
+                    const Id ptr=ctx.OpAccessChain(uv.pointer_type,uv.id,ctx.ConstU32(axis));
+                    const Id before=ctx.OpLoad(type,ptr);
+                    const Id centered=ctx.OpFMul(type,ctx.OpFSub(type,before,half),component(axis));
+                    const Id bias=ctx.OpFMul(type,ctx.Constant(type,axis==0?.5f:-.5f),component(axis+2));
+                    const Id after=ctx.OpFAdd(type,ctx.OpFAdd(type,centered,half),bias);
+                    ctx.OpStore(ptr,ctx.OpSelect(type,moved,after,before));
+                }
+            };
+            // The glow's full-screen passes (its blur and its composite) read the glow at their
+            // screen UV in param 1; their param 0 is the light quad's frame. That param 1 moves
+            // too, at the vertices where it is the vertex's own screen position (the light quad's
+            // param 1 is its local 0..1 and stays). Without it each eye read its glow where the
+            // flat game's screen has it, a second remap away from the light.
+            Id screen_uv1{};
+            if (uv_param==0) {
+                const auto& other=ctx.output_params[1];
+                if (Sirit::ValidId(other.id) && !other.is_integer && other.num_components>=2) {
+                    const auto load=[&](u32 axis) {
+                        return ctx.OpLoad(type,ctx.OpAccessChain(other.pointer_type,other.id,ctx.ConstU32(axis)));
+                    };
+                    const Id su=ctx.OpFAdd(type,ctx.OpFMul(type,half,ctx.OpFDiv(type,x,w)),half);
+                    const Id sv=ctx.OpFSub(type,half,ctx.OpFMul(type,half,ctx.OpFDiv(type,y,w)));
+                    const Id eps=ctx.Constant(type,1e-3f);
+                    const auto near=[&](Id a,Id b) {
+                        return ctx.OpFOrdLessThan(bool_type,ctx.OpFAbs(type,ctx.OpFSub(type,a,b)),eps);
+                    };
+                    screen_uv1=ctx.OpLogicalAnd(bool_type,remapped(world),
+                        ctx.OpLogicalAnd(bool_type,near(load(0u),su),near(load(1u),sv)));
+                }
             }
+            move_uv(ctx.output_params[uv_param],remapped(world));
+            if (Sirit::ValidId(screen_uv1)) move_uv(ctx.output_params[1],screen_uv1);
         }
         ctx.OpStore(ctx.output_position,result);
         // Apply precisely the same position correction to recognized screen exports.
@@ -252,6 +305,22 @@ void ApplyStereoShift(EmitContext& ctx) {
             if (!e.dynamic_scale.IsEmpty()) delta=ctx.OpFMul(type,delta,ctx.Def(e.dynamic_scale));
             const Id value=ctx.OpFAdd(type,ctx.OpLoad(type,ptr),ctx.OpFMul(type,ctx.Constant(type,e.slope),delta));
             ctx.OpStore(ptr,ctx.OpSelect(type,world,value,ctx.OpLoad(type,ptr)));
+        }
+        // VR_EXP_CULL=1 (GPU timing experiment only, never a default): a world draw's vertices all
+        // moved to one point (x, y, z times a factor the driver cannot fold: vr_hud's sign bit, 0
+        // outside TAA jitter), so its vertex work stays and no triangle is rasterized.
+        static const bool exp_cull = [] {
+            const char* v = std::getenv("VR_EXP_CULL");
+            return v && v[0] == '1';
+        }();
+        if (exp_cull) {
+            const Id sign=ctx.OpShiftRightLogical(ctx.U32[1],ctx.OpBitcast(ctx.U32[1],hud),ctx.ConstU32(31u));
+            const Id factor=ctx.OpConvertUToF(type,sign);
+            const Id final_position=ctx.OpLoad(ctx.F32[4],ctx.output_position);
+            Id collapsed=ctx.OpVectorTimesScalar(ctx.F32[4],final_position,factor);
+            collapsed=ctx.OpCompositeInsert(ctx.F32[4],ctx.OpCompositeExtract(type,final_position,3u),collapsed,3u);
+            const Id worlds=ctx.OpCompositeConstruct(ctx.U1[4],std::array<Id,4>{world,world,world,world});
+            ctx.OpStore(ctx.output_position,ctx.OpSelect(ctx.F32[4],worlds,collapsed,final_position));
         }
         return;
     }
@@ -316,6 +385,11 @@ void EmitEpilogue(EmitContext& ctx) {
     if (ctx.stage == Stage::Vertex && !ctx.runtime_info.vs_info.clip_disable) {
         ApplyStereoShift(ctx);
     }
+    // Layer draws: every both-eye vertex stage that ends before the rasterizer, screen-space ones
+    // too, sends its primitives to its eye's layer.
+    if (ctx.stage == Stage::Vertex && ctx.NativeLayerOutput()) {
+        ctx.OpStore(ctx.output_layer, ctx.NativeEyeIndex());
+    }
     // Store the final per-eye position, after the native stereo/asymmetric remap.
     if (Sirit::ValidId(ctx.motion_out_cur)) {
         EmitVertexMotion(ctx);
@@ -352,6 +426,9 @@ void EmitEmitVertex(EmitContext& ctx) {
             exports.emplace_back(ptr,ctx.OpLoad(ctx.F32[1],ptr));
         }
         ApplyStereoShift(ctx);
+        if (ctx.NativeLayerOutput()) {
+            ctx.OpStore(ctx.output_layer, ctx.NativeEyeIndex());
+        }
         ctx.OpEmitVertex();
         ctx.OpStore(ctx.output_position,original);
         for (const auto& [ptr,value]:exports) ctx.OpStore(ptr,value);

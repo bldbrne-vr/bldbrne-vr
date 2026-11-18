@@ -38,8 +38,11 @@ struct VectorIds {
 
 class EmitContext final : public Sirit::Module {
 public:
+    // `merged_eyes` (native stereo compute only, vr_merged_eyes.h): both eyes in one launch of
+    // twice the groups in z; the eye is the group's z (vr_hud is not read), the game's z is 0.
+    // Never part of a cached shader: the variant is built in memory.
     explicit EmitContext(const Profile& profile, const RuntimeInfo& runtime_info, Info& info,
-                         Bindings& binding);
+                         Bindings& binding, bool merged_eyes = false);
     ~EmitContext();
 
     Id Def(const IR::Value& value);
@@ -201,6 +204,106 @@ public:
     LogicalStage l_stage{};
 
     Id last_label{};
+    // VR light shadows (emit_spirv_light_shadow.cpp): the shader's one-time setup, made at its
+    // first VrLightVisibility (all of them are in the entry block).
+    struct VrLightShadowState {
+        bool ready{};
+        std::array<Id, 4> rows{}; // the ndc-to-view matrix's rows
+        bool rows_given{};        // ... set by the caller (the air pass: its own camera), not read
+                                  // from Info::vr_light_shadow's matrix buffer
+        std::array<Id, 4> inv{};  // its inverse's rows (view to clip)
+        bool has_inv{};           // inv is made (Setup's inverse, or the shadowed air's)
+        Id a{}, b{};              // coordinates = a * ndc + b
+        Id ok{};                  // a and b are defined
+        Id p{};                   // the pixel's view position
+        Id normal{};              // its surface's normal (depth neighbours, facing the eye)
+        Id normal_ok{};           // ... trusted: no depth edge across the pixel
+        Id seed{};                // per-pixel, per-frame jitter in [0, 1)
+        Id seed_still{};          // the pixel's noise without the frame's turn (the AO's)
+        Id frame_turn{};          // per-frame only, in [0, 1) (the golden ratio's steps; 0 with white noise)
+        Id ball{};                // a per-pixel, per-frame point of the unit cube [-1, 1]^3
+        Id pixel{};               // a pixel's size in coordinates (vec2)
+        Id vis{}, occl{}, step{}; // Private variables of the branch and the march
+        Id mask{};                // the AO's sector bits (u32)
+        Id gi{};                  // the bounce light's sum (vec3)
+        // The other eye (light_shadow.h CrossEye): made once, with Setup.
+        bool other_ready{};
+        Id this_eye{}, other_eye{};      // eye indices (u32)
+        std::array<Id, 4> other_inv{};   // its view-to-clip rows
+        Id other_row2{}, other_row3{};   // its ndc-to-view matrix's z and w rows
+        Id other_differs{};              // its matrix is not this eye's (bool)
+        // The blocker grid (light_shadow.h Grid): made once with the setup.
+        bool grid_ready{};
+        u32 grid_buffer{~0u};            // ctx.buffers index (~0u: none)
+        Id grid_on{};                    // bool
+        Id grid_stamp{}, grid_life{};    // u32
+        Id grid_inv_voxel{};             // 1 / the voxel's side (game units)
+        Id grid_shift{};                 // this eye's view to the flat view (vec3)
+        std::array<Id, 3> grid_rows{};   // the flat view to the world (vec4 rows)
+        Id grid_hit{};                   // Private float: the march's grid hit
+        Id grid_near{};                  // the eye distance it holds from (view units)
+        Id grid_reach{};                 // ... and to
+        Id grid_thick{};                 // the blockers' thickness (view units; 0: ThickM)
+        // The lights the game keeps on the camera (light_shadow.h AttachedFromM).
+        bool attached_ready{};
+        Id attached_count{};             // u32
+        Id attached_shift{};             // this eye's view to the flat view (vec3)
+        std::array<Id, 4> attached{};    // their places and reach (flat view; vec4: x y z k)
+        Id attached_remove{};            // they light nothing (bool)
+        Id probe_mask{};                 // tests: the light classes casting nothing (u32)
+        Id probe_sel{};                  // tests: the light classes moved for their shadows (u32)
+        Id probe_nudge{};                // tests: that move, in the eye's view (vec3)
+        // The scene maps (light_shadow.h SceneMaps): slots used, each slot's lamp (flat view x y
+        // z, reach k), this eye's shift to the flat view (vec3), the maps' buffer.
+        bool loop_ready{};               // the lights' loop emitted (light_shadow.h LoopLights)
+        Id loop_vis{};                   // its results: a private array, one per light
+        Id loop_vis_ptr{};               // a pointer to one of them
+        u32 loop_stride{};
+        bool scene_ready{};
+        u32 scene_buffer{};
+        Id scene_count{};
+        u32 scene_body{};                // the body buffer (the slots: read one at a time)
+        Id scene_half{};                 // this frame's half of the cubes (u32 0 or 1)
+        Id scene_capacity{};             // the mask's pixels (u32)
+        std::array<Id, 3> scene_rot{};   // the flat view's rows into the world's axes (f32x3)
+        bool mask_ready{};
+        bool hero_ready{};               // High's setups made (light_shadow.h High: HeroSetup)
+        bool hero_loop_ready{};          // High's heroes' loop emitted (HeroLoop)
+        Id hero_vis{};                   // its results: a light's march, or -1 (no hero)
+        Id hero_vis_ptr{};
+        u32 hero_count{};                // its lights (at most SceneMaps::DrawLights)
+        u32 mask_buffer{};
+        u32 pyr_buffer{~0u};             // the depth pyramid (the AO pass's march; ~0u: none)
+        Id pyr_scale{};                  // its step scale this pixel (1 without a pyramid)
+        std::array<Id, 3> mask_word{};   // this pixel's mask (the lamp shaders)
+        std::array<std::array<Id, 3>, 4> mask_corner{}; // the 4 half-res neighbours' words
+        Id mask_fx{}, mask_fy{};         // their bilinear weights
+        std::array<Id, 4> mask_w{};      // ... times their depth's nearness to this pixel's (normalized)
+        Id mask_min{};                   // tests (MaskShow): the darkest slot here, the AO pass
+        // The mask's edges marched again (light_shadow.h SceneMaps::Edges): what the lamp read's
+        // one-time part leaves for each light's march (all unset with the edges off).
+        Id edge_pv{};                    // the pixel's view place (vec3)
+        Id edge_own{};                   // ... and its distance
+        Id edge_w{};                     // the matrix's w there
+        Id edge_ndc{};                   // the pixel's ndc (vec2)
+        std::array<Id, 4> edge_rows{};   // the ndc-to-view matrix's rows (vec4)
+        Id edge_a{}, edge_b{};           // coordinates = a * ndc + b (vec2)
+        Id edge_pixel{};                 // a pixel's size in coordinates (vec2)
+        Id edge_ok{};                    // a and b are defined (bool)
+        Id edge_budget{};                // Private u32: the marches this pixel may still take
+        Id mask_unsure{};                // the blend had little to go by (bool; unset: never)
+        Id scene_shift{};
+        Id scene_voxel{};                // the grid's voxel (its entries' bias), f32
+        // This shader's earlier lights, for grouping small ones (light_shadow.h GroupM): place
+        // (this eye's view), small, marched (bools), visibility after the march.
+        struct Grouped {
+            Id centre;
+            Id small;
+            Id marched;
+            Id vis;
+        };
+        std::vector<Grouped> grouped;
+    } vr_light_shadow{};
 
     Id void_id{};
     Id U8{};
@@ -256,16 +359,21 @@ public:
     Id motion_out_cur{}, motion_out_prev{}, motion_in_cur{}, motion_in_prev{}, motion_frag_out{};
     // The motion buffers' addresses: pushed per draw with VrPushData (vr_motion is only its
     // flag), otherwise both baked into this permutation.
+    // Native stereo's multiview passes, or the DIBR centre's single view (its upscaler,
+    // renderer_vulkan/vr_dibr_upscale.h: baked addresses, no VrPushData).
     bool VertexMotion() const {
+        // A body-map capture (VrMotion::Capture) is the moon's single-view shadow pass's.
         return stage == Stage::Vertex && l_stage == LogicalStage::Vertex &&
-               runtime_info.native_stereo && runtime_info.native_multiview &&
+               (!runtime_info.native_stereo || runtime_info.native_multiview ||
+                runtime_info.vr_motion.Capture()) &&
                !runtime_info.vs_info.clip_disable && runtime_info.vr_motion.enabled &&
                (UsesVrPushData() ||
                 (runtime_info.vr_motion.params_address && runtime_info.vr_motion.positions_address));
     }
     bool FragmentMotion() const {
-        return l_stage == LogicalStage::Fragment && runtime_info.native_stereo &&
-               runtime_info.native_multiview && runtime_info.vr_motion.enabled;
+        return l_stage == LogicalStage::Fragment &&
+               (!runtime_info.native_stereo || runtime_info.native_multiview) &&
+               runtime_info.vr_motion.enabled && !runtime_info.vr_motion.Capture();
     }
     struct NativeScreenExport {
         u32 param{}, component{}, axis{};
@@ -277,9 +385,31 @@ public:
     bool native_camera_position = false;
     bool native_projection_position = false;
     Id NativeEyeIndex();
+    // While valid, NativeEyeIndex (and so every per-eye buffer and image access) is this u32
+    // instead of the stage's own eye: the light shadows read the other eye's depth and matrices
+    // (emit_spirv_light_shadow.cpp, light_shadow.h CrossEye). Set and cleared around those reads.
+    Id eye_override{};
+    // Layer draws (Profile::native_layer_draws): a both-eye graphics stage takes its eye from
+    // vr_hud's sign bit (multiview: ViewIndex).
+    bool NativeLayerDraws() const {
+        return runtime_info.native_multiview && profile.native_layer_draws;
+    }
+    // ...and the last vertex stage (the hardware VS stage: the vertex or evaluation program, or
+    // the geometry program) writes gl_Layer, the eye's layer of the two-layer attachments.
+    bool NativeLayerOutput() const {
+        return NativeLayerDraws() && (stage == Stage::Vertex || l_stage == LogicalStage::Geometry);
+    }
+    // vr_hud as a graphics stage reads its flags: without a layer draw's eye bit.
+    Id NativeHud(Id hud);
     Id NativeBufferPointer(Id type, Id buffer, Id member, Id index);
     Id NativeImagePointer(Id type, Id image, Id lod = {});
     Id NativeNonUniform(Id resource);
+    // VR_EXP_EYE_INDEX (timing experiment): the descriptor eye index of a graphics stage.
+    bool ExpEyeGraphics() const;
+    Id DescriptorEyeIndex();
+    // VR_EYE_SPEC: the descriptor (`eye`, or 0 where the pipeline is specialized with the binding
+    // shared) and the element index (`index`, moved by the eye's stride where it has one).
+    std::pair<Id, Id> EyeSpecAccess(Id buffer, Id eye, Id index);
     // VrPushData (Profile::SupportsVrPushData): a native stereo graphics stage declares the whole
     // push block and reads the draw's projection, light tiles, cut and motion buffers from it at
     // run time.
@@ -298,6 +428,7 @@ public:
     Id push_data_block{};
     Id base_vertex{};
     Id frag_coord{};
+    Id shading_rate{}; // ShadingRateKHR (the lamp shadows' AO pass, with attachment rates)
     Id front_facing{};
     Id frag_depth{};
     Id stencil_ref{};
@@ -313,6 +444,7 @@ public:
     std::array<Id, 30> patches{};
 
     Id workgroup_id{};
+    bool merged_eyes{};
     Id num_workgroups_id{};
     Id workgroup_index_id{};
     Id local_invocation_id{};
@@ -390,6 +522,26 @@ public:
     Bindings& binding;
     boost::container::small_vector<Id, 16> buf_type_ids;
     boost::container::small_vector<BufferDefinition, 16> buffers;
+    // VR_EXP_EYE_INDEX=c (timing experiment): the variables of buffers of a size the eyes pair.
+    boost::container::small_vector<Id, 8> exp_pair_buffers;
+    // VR_EYE_SPEC (shader_recompiler/eye_spec.h): a graphics stage's buffer bindings' markers,
+    // how many compares read each, and the variables of each binding's aliases (by id).
+    struct EyeSpecMarker {
+        u32 binding;
+        Id marker;
+        u32 uses;
+        Id delta{}; // read-only bindings: the stride and size markers (else invalid)
+        Id size{};
+        u32 delta_uses{};
+        u32 size_uses{};
+    };
+    struct EyeSpecVar {
+        u32 var;          // an alias variable's id
+        u32 marker_index; // in eye_spec_markers
+        u32 shift;        // its element size, log2 bytes
+    };
+    boost::container::small_vector<EyeSpecMarker, 16> eye_spec_markers;
+    boost::container::small_vector<EyeSpecVar, 32> eye_spec_vars;
     boost::container::small_vector<TextureDefinition, 8> images;
     boost::container::small_vector<Id, 4> samplers;
     std::unordered_map<u32, Id> first_to_last_label_map;

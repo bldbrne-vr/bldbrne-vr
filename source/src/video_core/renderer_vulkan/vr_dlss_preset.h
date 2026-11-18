@@ -70,7 +70,12 @@ inline u32 DlssPresetForFrame(const VR::Graphics::Config& accepted, u64 frame) {
     const u32 ini = VR::Graphics::dlss_model.load(std::memory_order_relaxed);
     const auto env = DlssPresetEnv();
     const bool on = FastRender::On(DlssPreset);
-    const u32 selected = on && env ? *env : ini;
+    // vr.ini dlss_model wins when set; otherwise the preset decides (K, or M for Ultra Quality:
+    // graphics_settings.h DlssModelForProfile). DLSS 5 keeps its own chain's model.
+    const u32 preset_model =
+        accepted.dlss5 ? VR::Graphics::DlssModelBuiltIn
+                       : VR::Graphics::DlssModelForProfile(VR::Graphics::EffectiveProfile(accepted));
+    const u32 selected = on && env ? *env : ini != VR::Graphics::DlssModelBuiltIn ? ini : preset_model;
     static u64 last_frame{};
     if (frame - last_frame >= 300) {
         last_frame = frame;

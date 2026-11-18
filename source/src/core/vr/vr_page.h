@@ -17,6 +17,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "core/vr/card_tier.h"
+#include "core/vr/play_style.h"
 #include "core/vr/graphics_settings.h"
 
 #include "core/vr/thumb_layout.h"
@@ -73,7 +75,7 @@ struct Row {
     bool signed_value{false};
 };
 
-enum class ButtonAction : unsigned char { None, ShowControls, Defaults, AcceptGraphics, RestartGraphics };
+enum class ButtonAction : unsigned char { None, ShowControls, Defaults, AcceptGraphics, RestartGraphics, SoftSave, ClearSoftSave, FreeCamera };
 
 struct Button {
     const char* label{nullptr}; // nullptr = no button there
@@ -84,13 +86,57 @@ struct Button {
 inline constexpr int Slots = 5;             // rows per tab (the Environment page's)
 inline constexpr int FocusLeftButton = 5;   // focus index of the left button
 inline constexpr int FocusRightButton = 6;  // ... the right one
+inline constexpr int FocusStrip = 7;        // the sub-tab strip of a tab with pages
+
+// A tab's further page: its own two group headers and five rows (2026-10-30, the user: a tab longer
+// than five rows pages by five, each page keeping the game's two groups and their headers).
+struct TabPage {
+    std::array<const char*, 2> headers;
+    std::array<int, Slots> rows;
+};
 
 struct Tab {
     const char* name;
-    std::array<const char*, 2> headers; // above slots 0 and 2
-    std::array<int, Slots> rows;        // index into Rows(), -1 = empty slot
+    std::array<const char*, 2> headers; // page 1: above slots 0 and 2
+    std::array<int, Slots> rows;        // page 1: index into Rows(), -1 = empty slot
     Button left;
     Button right;
+    std::vector<TabPage> more{}; // pages 2.. (the sub-tab strip picks the page)
+    std::vector<const char*> page_names{}; // the strip's names, one a page (else its first header)
+
+    int Pages() const {
+        return 1 + static_cast<int>(more.size());
+    }
+    const std::array<const char*, 2>& HeadersOf(int page) const {
+        return page <= 0 || page > static_cast<int>(more.size())
+                   ? headers
+                   : more[static_cast<size_t>(page - 1)].headers;
+    }
+    const std::array<int, Slots>& RowsOf(int page) const {
+        return page <= 0 || page > static_cast<int>(more.size())
+                   ? rows
+                   : more[static_cast<size_t>(page - 1)].rows;
+    }
+    const char* PageName(int page) const {
+        if (page >= 0 && page < static_cast<int>(page_names.size()) &&
+            page_names[static_cast<size_t>(page)] != nullptr) {
+            return page_names[static_cast<size_t>(page)];
+        }
+        const char* header = HeadersOf(page)[0];
+        return header != nullptr ? header : "";
+    }
+    // Every row of every page, in order (Defaults, the launcher's list).
+    std::vector<int> AllRows() const {
+        std::vector<int> all;
+        for (int p = 0; p < Pages(); ++p) {
+            for (const int r : RowsOf(p)) {
+                if (r >= 0) {
+                    all.push_back(r);
+                }
+            }
+        }
+        return all;
+    }
 };
 
 // ---- The rows (design.md section 3, with the design choices of 2026-10-05) ----------------------
@@ -134,7 +180,8 @@ inline const std::vector<Row>& Rows() {
                       {"Snap 90°", {"90", nullptr}},
                       {"Smooth, slow", {"0", "90"}},
                       {"Smooth", {"0", "120"}},
-                      {"Smooth, fast", {"0", "180"}}}});
+                      {"Smooth, fast", {"0", "180"}},
+                      {"Smooth, very fast", {"0", "240"}}}});
         r.push_back({"vibration", "Vibration", "Strength of every vibration. 0 turns it off.",
                      Widget::Slider, {"haptic_gain", nullptr}, {}, 0, 10, 1, nullptr, "", 0,
                      1.0f / 7.0f});
@@ -145,8 +192,28 @@ inline const std::vector<Row>& Rows() {
                      {"lamp_travel", nullptr},
                      {{"Off", {"0", nullptr}}, {"On", {"1", nullptr}}}});
         r.push_back({"physical_summon_bell", "Physical summon bell",
-                     "First person: B draws the bell; shake to summon. B again cancels.",
+                     "First person: {B} draws the bell; shake to summon. {B} again cancels.",
                      Widget::Choice, {"physical_summon_bell", nullptr},
+                     {{"On", {"1", nullptr}}, {"Off", {"0", nullptr}}}});
+        // cinematic_ladder_skip (core/vr/cinematic_state.h LadderSkipOf; the tester, 2026-11-06:
+        // "does it have an option in the launcher and in the in-game VR settings (skip ladder
+        // animation)?").
+        r.push_back({"ladder_skip", "Skip ladder climbs",
+                     "Long ladders: the screen goes dark while he climbs to the end.",
+                     Widget::Choice, {"cinematic_ladder_skip", nullptr},
+                     {{"On", {"1", nullptr}}, {"Off", {"0", nullptr}}}});
+        // vr_interactions, one setting for doors, chests and lamps (2026-11-06: "There
+        // should be a single setting in settings to control all flat vs immersive vr interactions
+        // (doors, lamps, chests)"): live for doors and chests, lamps from the next start.
+        r.push_back({"vr_interactions", "VR interactions",
+                     "Immersive: doors and chests open, lamps light, knocks answer, as you move. "
+                     "Lamps and knocks after a restart.",
+                     Widget::Choice, {"vr_interactions", nullptr},
+                     {{"Immersive", {"1", nullptr}}, {"Flat", {"0", nullptr}}}});
+        // The Doll's respec (core/vr/doll_respec.h; the tester, 2026-11-06).
+        r.push_back({"doll_respec", "Doll respec",
+                     "Redistribute at the same level. Minimums: 7/8/9/9/5/6. Origin unchanged.",
+                     Widget::Choice, {"doll_respec", nullptr},
                      {{"On", {"1", nullptr}}, {"Off", {"0", nullptr}}}});
         r.push_back({"physical_levers", "Physical levers",
                      "Grip a lever with either hand and pull. Off: original interaction.",
@@ -164,12 +231,20 @@ inline const std::vector<Row>& Rows() {
                      "Stab the vial into your wrist, or use a button. Restart after picking Stab.",
                      Widget::Choice, {"inject", nullptr},
                      {{"Stab to inject", {"1", nullptr}}, {"Button", {"0", nullptr}}}});
+        // X opens the quick-item fan (the default since 2026-11-01) or readies a Blood Vial as
+        // before (2026-11-03: "X button -- Fan menu // Vial (default Fan Menu)"). Only
+        // with the stab and the default left hand (the presenter's x_fan).
+        r.push_back({"x_button", "{X} button",
+                     "Fan menu: opens and closes your quick items. Vial: readies a Blood Vial to "
+                     "stab.",
+                     Widget::Choice, {"x_button", nullptr},
+                     {{"Fan menu", {"fan", nullptr}}, {"Vial", {"vial", nullptr}}}});
         r.push_back({"laser", "Gun laser", "A thin line from the gun's barrel.", Widget::Choice,
                      {"laser", nullptr}, {{"Off", {"0", nullptr}}, {"On", {"1", nullptr}}}});
         // {entry:grip_adjust}: the controls the scheme table binds to it (RowLabel).
         r.push_back({"grip_adjust", "Grip adjust ({entry:grip_adjust})",
-                     "Press {entry:grip_adjust} twice and hold to set how the weapon sits in your "
-                     "hand.",
+                     "Hold {entry:grip_adjust} 1.2 s standing still to set how the weapon sits in "
+                     "your hand.",
                      Widget::Choice, {"grip_adjust", nullptr},
                      {{"On", {"1", nullptr}}, {"Off", {"0", nullptr}}}});
         r.push_back({"vr_grab_attacks", "VR Grab attacks",
@@ -223,11 +298,33 @@ inline const std::vector<Row>& Rows() {
                      Widget::Choice, {"melee_stamina_pct", nullptr},
                      {{"Original", {"100", nullptr}}, {"80%", {"80", nullptr}},
                       {"50%", {"50", nullptr}}, {"10%", {"10", nullptr}}}});
+        // Third person (core/vr/bloodborne_camera.cpp; after ID-Gamer's patch): how far the camera
+        // sits from the hunter, as a share of the game's own distance, and how much the view tilts
+        // as a gamepad's right stick raises or lowers the camera. Both apply at once.
+        r.push_back({"camera_distance", "Camera distance",
+                     "Third person: how far the camera sits from the hunter. 100% is the game's. "
+                     "Gamepad: hold the left stick click and push the right stick.",
+                     Widget::Number, {"tp_distance_pct", nullptr}, {}, 50, 100, 5, nullptr, "%"});
+        r.push_back({"camera_tilt", "Camera tilt",
+                     "Third person: the view tilts as the gamepad's right stick raises the camera.",
+                     Widget::Choice, {"tp_view_follows_pitch", nullptr},
+                     {{"Off", {"0", nullptr}},
+                      {"Quarter", {"0.25", nullptr}},
+                      {"Half", {"0.5", nullptr}},
+                      {"Three quarters", {"0.75", nullptr}},
+                      {"Full", {"1", nullptr}}}});
         r.push_back({"outgoing_damage", "Damage dealt",
-                     "Your attack damage: -30% to +30%. 0% is normal. Applies immediately.",
+                     "Your attack damage: -60% to +30%. 0% is normal. Applies immediately.",
                      Widget::Number, {"outgoing_damage_pct", nullptr}, {},
-                     -30, 30, 5, nullptr, "%"});
+                     -60, 30, 5, nullptr, "%"});
         r.back().signed_value = true;
+        r.push_back({"riposte_style",
+                     "Riposte burst",
+                     "Visceral attacks briefly turn the scene black, red and white with ink outlines. "
+                     "Beast Roar briefly turns the scene deep crimson.",
+                     Widget::Choice,
+                     {"riposte_style", nullptr},
+                     {{"Off", {"0", nullptr}}, {"On", {"1", nullptr}}}});
         r.push_back({"hp_bonus", "Extra health",
                      "More maximum health for the hunter. Applies while playing.",
                      Widget::Choice, {"player_hp_bonus_pct", nullptr},
@@ -249,7 +346,7 @@ inline const std::vector<Row>& Rows() {
         // Blade kills (core/vr/bloodborne_ragdoll.h, 2026-10-08): the instant ragdoll on a
         // right-hand melee kill and its push, live: the damage detour reads melee_kill_ragdoll at
         // every hit and the push reads melee_ragdoll_impulse when it is applied. On, a kill still
-        // keeps the game's own death with vr.ini melee_ragdoll_vanilla_pct's chance (22%; no row).
+        // keeps the game's own death with vr.ini melee_ragdoll_vanilla_pct's chance (18%; no row).
         r.push_back({"kill_ragdoll", "Instant ragdoll",
                      // 70 characters (69 measured 844 of the line's 900 stage px).
                      "An enemy your blade kills goes limp at once. Off: its death animation.",
@@ -278,7 +375,7 @@ inline const std::vector<Row>& Rows() {
         r.push_back({"aa", "Anti-aliasing",
                      // About 870 of the frame's 900 stage px at 24 px (the menu font; a line of
                      // 69 characters measured 844). A wider line shrinks to fit.
-                     "Game FXAA, dual-eye SMAA, or None. Bypassed while DLSS or FSR is on.",
+                     "Game FXAA, dual-eye SMAA, or None. Off while DLSS, DLSS 5 or FSR is on.",
                      Widget::Choice, {"aa_mode", nullptr},
                      {{"Game FXAA", {"fxaa", nullptr}},
                       {"SMAA", {"smaa", nullptr}},
@@ -328,6 +425,164 @@ inline const std::vector<Row>& Rows() {
                      Widget::Choice,
                      {"graphics_dlss"},
                      {{"Off", {"0"}}, {"On", {"1"}}}});
+        // Graphics (video_core/renderer_vulkan/vr_foveation.h, 2026-10-22): fixed foveated
+        // rendering, live since 2026-11-01 (Picture > Performance; Light the user's). Auto: on
+        // where the card supports it (measured at 2000x2160 per eye on an RTX 5080: +25% FPS
+        // without upscaling, +8-9% with DLSS/FSR 4).
+        r.push_back({"foveation",
+                     "Foveated rendering",
+                     "Less detail toward the lens edges for more FPS. Light: a little less.",
+                     Widget::Choice,
+                     {"foveation", nullptr},
+                     {{"Auto", {"-1", nullptr}},
+                      {"Off", {"0", nullptr}},
+                      {"Light", {"3", nullptr}},
+                      {"On", {"1", nullptr}},
+                      {"Performance", {"2", nullptr}}}});
+        // Graphics (2026-10-24): the shadow atlas's farthest cascade, live (shadows_far).
+        r.push_back({"shadows_far",
+                     "Far shadows",
+                     "Reduced skips the farthest shadows for more FPS in big areas.",
+                     Widget::Choice,
+                     {"shadows_far", nullptr},
+                     {{"Reduced", {"reduced", nullptr}}, {"Full", {"full", nullptr}}}});
+        // Picture > New graphics (2026-11-11, the user: water reflections off by default, "the
+        // wetness should be a flag in settings, and reflections in the new graphics (OFF by
+        // default)"): the game's planar water reflection (water_reflections, live; was Picture >
+        // Performance's Water reflections since 2026-11-01) and the game's unused screen-space
+        // reflections on wet streets (wet_streets, from the next start; core/vr/game_reflections.h;
+        // off by default again since 2026-11-11 until they are made cheaper).
+        // (0.9.6, the user: "wetness : off / water / wet streets & water": wet streets alone is no
+        // choice of the row any more; a vr.ini that has it shows as Custom and keeps it.)
+        r.push_back({"reflections",
+                     "Wetness",
+                     "Water reflections change at once. Street and puddle reflections change after restart.",
+                     Widget::Choice,
+                     {"water_reflections", "wet_streets"},
+                     {{"Off", {"0", "0"}}, {"Water", {"1", "0"}}, {"Wet streets and water", {"1", "1"}}}});
+        // Graphics (2026-10-24): the game prepares its next frame early (frame_overlap).
+        r.push_back({"frame_overlap",
+                     "Frame overlap",
+                     "Starts the next frame early: smoother in busy areas. Applies at the next start.",
+                     Widget::Choice,
+                     {"frame_overlap", nullptr},
+                     {{"On", {"1", nullptr}}, {"Off", {"0", nullptr}}}});
+        // Graphics (2026-11-01): turn each eye to an angled screen's own view (canted_eyes).
+        r.push_back({"canted_eyes",
+                     "Angled screens",
+                     "Pimax: turns each eye to its screen. Straight-screen headsets: no change.",
+                     Widget::Choice,
+                     {"canted_eyes", nullptr},
+                     {{"Off", {"0", nullptr}}, {"On", {"1", nullptr}}}});
+        // Graphics (2026-10-24): the next cascade too while frames are busy (shadows_busy).
+        r.push_back({"shadows_busy",
+                     "Fewer shadows when busy",
+                     "In very busy views also skips the next-farthest shadows, then brings them back.",
+                     Widget::Choice,
+                     {"shadows_busy", nullptr},
+                     {{"On", {"1", nullptr}}, {"Off", {"0", nullptr}}}});
+        // Picture > Performance > Shadows (2026-11-17, the user: "I want to add a high setting
+        // available in settings"): the lamp shadows' detail (light_shadow.h High), in the light
+        // shaders: at the next start.
+        // New graphics (2026-11-10: "a new tab in in game vr settings called 'new
+        // graphics' under picture"): the lighting this mod adds to the game's, each with DLSS or
+        // FSR only. The shader rows build the game's shaders anew: they apply at the next start.
+        {
+            // (0.9.6, the tester, 2026-11-17: the rows regrouped: "Dynamic shadows: game's / low /
+            // high; fog: game's / on; Moon glow: off / on (has moon glow/haze/godrays); Lighting:
+            // game's / AO / AO & bounce; wetness: off / water / wet streets & water", and on the
+            // other page "tone mapping: value; parallax: on / off (remove filmic, it's on for
+            // everyone)". The moon's shadows, the lamps' glow in the air and the filmic highlights
+            // have no row: vr.ini's moon_shadows, fog_light and filmic_highlights. A row not set is
+            // by the graphics card's memory: core/vr/card_tier.h.)
+            Row shadows{"new_shadows",
+                        "Lamp & torch shadows",
+                        "Your lantern, torches and lamps cast shadows. High: sharp near you. Costs FPS.",
+                        Widget::Choice,
+                        {"light_shadows", "light_shadow_detail"},
+                        {{"Game's", {"0", "low"}}, {"Low", {"1", "low"}}, {"High", {"1", "high"}}}};
+            shadows.restart = true;
+            r.push_back(shadows);
+            Row fog{"new_fog",
+                    "Fog",
+                    "On: the mod's own fog banks and ground mist, lit by lamps and the moon. Costs FPS.",
+                    Widget::Choice,
+                    {"fog_banks", nullptr},
+                    {{"Game's", {"0", nullptr}}, {"On", {"1", nullptr}}}};
+            fog.restart = true;
+            r.push_back(fog);
+            Row glow{"moon_glow",
+                     "Moon glow",
+                     "The moon's glow, haze and rays in the air. Always on while Fog is on.",
+                     Widget::Choice,
+                     {"moon_shafts", nullptr},
+                     {{"Off", {"0", nullptr}}, {"On", {"1", nullptr}}}};
+            glow.restart = true;
+            r.push_back(glow);
+            Row ambient{"new_ambient",
+                        "Lighting",
+                        "AO: deep corners, wet blood, less shimmer. Bounce: light off walls. Costs FPS.",
+                        Widget::Choice,
+                        {"ambient_occlusion", "bounce_light"},
+                        {{"Game's", {"0", "0"}}, {"AO", {"1", "0"}}, {"AO and bounce", {"1", "1"}}}};
+            ambient.restart = true;
+            r.push_back(ambient);
+            // Parallax (parallax.h BumpGaps; its own setting since 2026-11-12, the user: parallax
+            // "is changing how textures are applied and looks wrong": now only on the textures
+            // that carry a real height map).
+            Row bricks{"raised_bricks",
+                       "Parallax",
+                       "Brick walls, stone blocks and roof tiles get real depth in their joints.",
+                       Widget::Choice,
+                       {"raised_bricks", nullptr},
+                       {{"Off", {"0", nullptr}}, {"On", {"1", nullptr}}}};
+            bricks.restart = true;
+            r.push_back(bricks);
+        }
+        r.push_back({"cinematic_look", "Tone mapping",
+                     "Deeper blacks and a film curve on the game's colors. 0 is the game's look.",
+                     Widget::Number, {"cinematic_look"}, {}, 0, 100, 5, nullptr, "%"});
+        // Eye adaptation (cinematic_look.h; the tester, 2026-11-11: "add adaptive eyes control in
+        // settings ... where it says filmic"). Live: the tone map's strength (a new tone map
+        // permutation the first time it is turned on in a session).
+        r.push_back({"eye_adaptation",
+                     "Eye adaptation",
+                     "On: step from light into a dark place and it starts darker, then your eyes adjust in a couple of seconds (and the other way round).",
+                     Widget::Choice,
+                     {"eye_adaptation", nullptr},
+                     {{"Off", {"0", nullptr}}, {"On", {"1", nullptr}}}});
+        r.push_back({"graphics_upscaler",
+                     "Upscaler",
+                     "Render smaller, then reconstruct both eyes. FSR 4.1.2: AMD's own, RX 6000 and newer. DLSS 5: experimental (RTX 50, your own file).",
+                     Widget::Choice,
+                     {"graphics_upscaler"},
+                     // FSR 4.1 (2026-10-31): 5, after DLSS 5's 4; offered on AMD cards only
+                     // (graphics_fsr41_available, UpscalerChoiceMissing).
+                     {{"Off", {"0"}},
+                      {"DLSS", {"1"}},
+                      {"FSR 4", {"2"}},
+                      {"FSR 4.1.2", {"5"}},
+                      {"FSR 3.1.5", {"3"}},
+                      {"DLSS 5", {"4"}}}});
+        // upscale_focus (renderer_vulkan/vr_dlss_focus.h; the tester, 2026-11-06: "apply dlss/fsr
+        // only in the foveated area ... and do strong TAA in the rest"): read at start, so with
+        // this tab's SAVE AND RESTART. Marked restart (the first headset check, 11-06: switched
+        // Off and back as if live, it showed no change and said nothing). Medium by default
+        // (2026-11-07).
+        {
+            Row focus{"upscale_focus",
+                      "Foveated upscale",
+                      "DLSS or FSR on the middle of each eye only; a TAA smooths the rest. "
+                      "Performance: fastest.",
+                      Widget::Choice,
+                      {"upscale_focus", nullptr},
+                      {{"Off", {"0", nullptr}},
+                       {"Quality", {"1", nullptr}},
+                       {"Medium", {"2", nullptr}},
+                       {"Performance", {"3", nullptr}}}};
+            focus.restart = true;
+            r.push_back(focus);
+        }
         r.push_back({"graphics_fsr4",
                      "FSR",
                      "Choose FSR 4 or FSR 3.1.5 to reconstruct both eyes. Turns DLSS off.",
@@ -335,19 +590,35 @@ inline const std::vector<Row>& Rows() {
                      {"graphics_fsr4"},
                      {{"Off", {"0"}}, {"FSR 4", {"1"}}, {"FSR 3.1.5", {"2"}}}});
         const std::vector<Option> profiles{
-            {"Performance", {"0"}}, {"Balanced", {"1"}}, {"Quality", {"2"}}};
+            {"Ultra Performance", {"3"}}, {"Performance", {"0"}}, {"Balanced", {"1"}},
+            {"Balanced Plus", {"5"}}, {"Quality", {"2"}}, {"Ultra Quality", {"4"}}};
         r.push_back({"graphics_mode",
                      "Profile",
-                     "Requires DLSS or FSR. DLSS and FSR remember their profiles.",
+                     "Render size before upscaling: Ultra Performance 40%, Performance 50%, "
+                     "Balanced 58%, Balanced Plus 58% (62% with FSR), Quality 67%, Ultra Quality "
+                     "67% (75% with FSR). Balanced Plus and Ultra Quality use DLSS's best model. "
+                     "Requires DLSS or FSR; each remembers its profile.",
                      Widget::Choice,
                      {"graphics_mode"},
                      profiles});
-        r.push_back({"graphics_neural",
-                     "DLSS 5",
-                     "Neural lighting and detail. Turns regular DLSS and FSR off; ACCEPT applies.",
-                     Widget::Choice,
-                     {"graphics_neural"},
-                     {{"Off", {"0"}}, {"On", {"1"}}}});
+        // DLSS 5 (2026-10-27): one setting. On runs the model at full strength on the
+        // centre of each eye, then DLSS Super Resolution (dlss5_bridge's default chain); its
+        // strengths and profile are fixed (Set below, VrDlssRuntime::Activate).
+        {
+            Row neural{"graphics_neural",
+                       "DLSS 5",
+                       "Experimental neural rendering at full strength, then DLSS upscaling. Turns DLSS and FSR off.",
+                       Widget::Choice,
+                       {"graphics_neural"},
+                       {{"Off", {"0"}}, {"On", {"1"}}}};
+            neural.restart = true;
+            r.push_back(neural);
+        }
+        r.push_back({"graphics_neural_note",
+                     "Status",
+                     "An experiment. Needs an RTX 50 GPU and your own NVIDIA DLSS 5 file, added in the launcher.",
+                     Widget::ReadOnly,
+                     {"graphics_neural_note"}});
         r.push_back({"graphics_neural_mode",
                      "Profile",
                      "Controls render and neural resolution together. Balanced is the default.",
@@ -425,21 +696,35 @@ inline const std::vector<Row>& Rows() {
                      {{"Off", {"0", nullptr}}, {"On", {"1", nullptr}}}});
         r.push_back(
             {"holster_mode",
-             "Item access",
-             "Left grip takes and holds items. Release returns an unused vial, or throws a "
-             "throwable. Vials stay right; pocket/chest follow equipped quick slots 1/2.",
+             "Item Access",
+             "No Grip disables grip-to-open-menu only; grabbing and holding still work. "
+             "No Body disables body slots. Menu button shortcuts remain available.",
              Widget::Choice,
              {"holster_mode", nullptr},
-             {{"Menu", {"0", nullptr}}, {"Body slots", {"1", nullptr}}, {"Both", {"2", nullptr}}}});
+             {{"Grip + Body", {"2", nullptr}}, {"No Grip", {"1", nullptr}}, {"No Body", {"0", nullptr}}}});
         r.push_back({"holster_haptics",
                      "Pouch touch feedback",
                      "A small vibration when your hand finds a pouch.",
                      Widget::Choice,
                      {"holster_haptics", nullptr},
                      {{"On", {"1", nullptr}}, {"Off", {"0", nullptr}}}});
+        r.push_back({"shoulder_vial",
+                     "Shoulder vial",
+                     "Reach over your right shoulder with the left hand and squeeze the grip to draw a vial.",
+                     Widget::Choice,
+                     {"shoulder_vial", nullptr},
+                     {{"On", {"1", nullptr}}, {"Off", {"0", nullptr}}}});
+        r.push_back({"quick_arc_pick",
+                     "Quick item menu",
+                     "Fan A (gothic panes) or B (brass): reach toward an item from where the menu opened; pull away to close. Boxes: your fist on an item picks it.",
+                     Widget::Choice,
+                     {"quick_arc_pick", "quick_fan_style"},
+                     {{"Fan A", {"fan", "lancet"}},
+                      {"Fan B", {"fan", "brass"}},
+                      {"Boxes", {"hover", nullptr}}}});
         r.push_back({"shoulder_switch",
                      "Shoulder weapon switch",
-                     "B at right shoulder / Y at left: tap to switch, hold about 0.7 seconds for unarmed. Tap unarmed to restore the remembered weapon.",
+                     "{B} at right shoulder / {Y} at left: tap to switch, hold about 0.4 seconds for unarmed. Tap unarmed to restore the remembered weapon.",
                      Widget::Choice,
                      {"shoulder_switch", nullptr},
                      {{"Off", {"0", nullptr}}, {"On", {"1", nullptr}}}});
@@ -483,8 +768,46 @@ inline const std::vector<Row>& Rows() {
                      "%",
                      0,
                      .01f});
+        // Merged rows (2026-10-30, the user: fewer, clearer rows): each sets the two vr.ini keys of
+        // the rows it replaces, which stay defined for vr.ini (and Custom shows any other pair).
+        r.push_back({"low_hp_edges", "Low-health edges",
+                     "A red edge below 30% health; it takes priority over the exhaustion color.",
+                     Widget::Choice, {"health_color", "health_color_strength"},
+                     {{"Off", {"0", nullptr}},
+                      {"Low", {"1", "0.3"}},
+                      {"Medium", {"1", "0.5"}}, // the default
+                      {"High", {"1", "0.8"}}}});
+        r.push_back({"exhaustion_color", "Exhaustion color",
+                     "Colors soften briefly at exhausted stamina, then fade back.",
+                     Widget::Choice, {"stamina_color", "stamina_color_strength"},
+                     {{"Off", {"0", nullptr}},
+                      {"Low", {"1", "0.4"}},
+                      {"Medium", {"1", "0.7"}}, // the default
+                      {"High", {"1", "1"}}}});
+        r.push_back({"health_bars", "Health bars",
+                     "Bosses only: the boss's bar near the top. All: also over enemies you hit.",
+                     Widget::Choice, {"ui_enemy_hp_bars", "ui_boss_bar"},
+                     {{"Off", {"0", "0"}},
+                      {"Bosses only", {"0", "1"}}, // the default
+                      {"All", {"1", "1"}},
+                      {"Enemies only", {"1", "0"}, true}}});
+        r.push_back({"ragdoll", "Ragdoll",
+                     "An enemy your blade kills goes limp at once, thrown by your swing.",
+                     Widget::Choice, {"melee_kill_ragdoll", "melee_ragdoll_impulse"},
+                     {{"Off", {"0", nullptr}},
+                      {"Limp", {"1", "0"}},
+                      {"Light push", {"1", "0.5"}},
+                      {"Normal", {"1", "1"}}, // the default
+                      {"Strong", {"1", "2"}},
+                      {"Strongest", {"1", "3"}}}});
+        r.push_back({"two_handed", "Two-handed controls",
+                     "Optimized: the stick transforms, the left trigger grabs (hold, or toggle).",
+                     Widget::Choice, {"two_hand_optimized_controls", "two_hand_trigger_hold"},
+                     {{"Original", {"0", nullptr}}, // the default
+                      {"Optimized, hold", {"1", "1"}},
+                      {"Optimized, toggle", {"1", "0"}}}});
         r.push_back({"gun_wrist_reload", "Flick to reload",
-                     "Wrist flick: release the trigger and flick firmly after each shot. Off/Original: fire again without a flick.",
+                     "Wrist flick: release the trigger and snap the muzzle up (or flick it down sharply), then lower it a little. Off/Original: fire again without a flick.",
                      Widget::Choice, {"gun_wrist_reload", nullptr},
                      {{"Wrist flick", {"1", nullptr}}, {"Off/Original", {"0", nullptr}}}});
         r.push_back({"weighted_weapons", "Weighted weapons",
@@ -492,8 +815,8 @@ inline const std::vector<Row>& Rows() {
                      Widget::Choice, {"weighted_weapons", nullptr},
                      {{"Off", {"0", nullptr}}, {"On (Light)", {"2", nullptr}},
                       {"On (Regular)", {"1", nullptr}}}}); // regular by default
-        // vr.ini weapon_wall: defaults to 2, weapons solid against each other but
-        // passing through walls. 0 disables solid weapons; 1 also enables walls.
+        // vr.ini weapon_wall: defaults to 1 (0.7.0), weapons stopping at the walls and at
+        // each other. 2: only at each other, through walls; 0 disables solid weapons.
         r.push_back({"weapon_wall", "Solid weapons",
                      "Stop at walls and each other. Weapons only: just each other.",
                      Widget::Choice, {"weapon_wall", nullptr},
@@ -509,6 +832,14 @@ inline const std::vector<Row>& Rows() {
                      "Hold the right grip to show where your left hand can grab.",
                      Widget::Choice, {"two_hand_guide", nullptr},
                      {{"On", {"1", nullptr}}, {"Off", {"0", nullptr}}}});
+        r.push_back({"two_hand_optimized_controls", "Two-handed optimized controls",
+                     "Off (default): existing {button:B}/{button:Y} controls. On: stick transforms; left trigger grabs (Hold or Toggle); each grip slides its own hand, including past the other; release to catch. The front hand after a slide leads, as with {button:B}. Right trigger handles specials. Unsupported two-handed swings deal half damage. Bow controls stay unchanged.",
+                     Widget::Choice, {"two_hand_optimized_controls", nullptr},
+                     {{"Off", {"0", nullptr}}, {"On", {"1", nullptr}}}});
+        r.push_back({"two_hand_trigger_hold", "Two-hand attachment",
+                     "Optimized controls only. Hold (default): squeeze left trigger near the handle to grab, release to let go. Toggle: press to grab, again to release. Your own weapons do not clash while attached. Bow controls are unchanged.",
+                     Widget::Choice, {"two_hand_trigger_hold", nullptr},
+                     {{"Hold", {"1", nullptr}}, {"Toggle", {"0", nullptr}}}});
         r.push_back({"two_hand_swing_hum", "Swing feel",
                      "Faint feedback during fast swings with both hands on one weapon.",
                      Widget::Slider, {"two_hand_swing_hum", nullptr}, {},
@@ -535,100 +866,112 @@ inline const std::vector<Tab>& Tabs() {
         const Button defaults{"Defaults", "Return this page to its defaults.",
                               ButtonAction::Defaults};
         std::vector<Tab> t;
-        // Body: Height and Adjust height (2026-10-09); Stance is on Controls (it sizes the swings,
-        // throws and the vial's lap).
-        t.push_back({"General",
-                     {"Body", "Controllers"},
-                     {RowIndex("height"), RowIndex("height_adjust"), RowIndex("move_with"),
-                      RowIndex("turning"), RowIndex("vibration")},
-                     controls,
-                     defaults});
-        t.push_back({"Controls",
-                     {"Style", "Aids"},
-                     {RowIndex("controls"), RowIndex("inject"), RowIndex("laser"),
-                      RowIndex("grip_adjust"), RowIndex("stance")},
-                     controls,
-                     defaults});
-        t.push_back({"Comfort",
-                     {"View", "Body"},
-                     {RowIndex("smooth_motion"), -1, RowIndex("cutaway"),
-                      RowIndex("body_mode"), RowIndex("ipd")},
-                     {},
-                     defaults});
-        t.push_back({"HUD",
-                     {"Vitals", "Display"},
-                     {RowIndex("hud_vitals"), RowIndex("low_hp"), RowIndex("counters"),
-                      RowIndex("hit_flash"), RowIndex("hud_size")},
-                     {},
-                     defaults});
-        t.push_back({"Assists",
-                     {"Combat", "Attacks"},
-                     {RowIndex("hp_bonus"), RowIndex("iframes"), RowIndex("kill_ragdoll"),
-                      RowIndex("ragdoll_push"), RowIndex("attack_stamina")},
-                     {},
-                     defaults});
-        // Existing display controls keep their immediate-apply behavior.
-        t.push_back({"Display",
-                     {"Image", "Display"},
-                     {RowIndex("aa"), RowIndex("lod"), RowIndex("enemy_bars"), RowIndex("boss_bar"),
-                      -1},
-                     {},
-                     defaults});
         const Button accept{"ACCEPT", "Save all pending Graphics and DLSS 5 choices together.",
                             ButtonAction::AcceptGraphics};
         const Button restart{"SAVE AND RESTART", "Save graphics settings and restart. Progress since the last autosave may be lost.",
                              ButtonAction::RestartGraphics};
-        t.push_back(
-            {"Graphics",
-             {"Headset", "Upscaling"},
-             {RowIndex("graphics_resolution"), RowIndex("graphics_scale"),
-              RowIndex("graphics_dlss"), RowIndex("graphics_fsr4"), RowIndex("graphics_mode")},
-             restart,
-             accept});
-        t.push_back({"DLSS 5",
-                     {"Neural rendering", "Appearance"},
-                     {RowIndex("graphics_neural"), RowIndex("graphics_neural_mode"),
-                      RowIndex("graphics_intensity"), RowIndex("graphics_detail"),
-                      RowIndex("graphics_lighting")},
+        // The tabs (2026-10-30, the user: the menus had become long and confusing): 9 themes
+        // instead of 17; a tab longer than five rows pages by five (Tab::more). Upscaling holds
+        // only what needs ACCEPT / SAVE AND RESTART, in one page. Not on the page (vr.ini and the
+        // launcher): the posture tuning (side lean, posture smoothing, clipping protection), the
+        // pouch and two-handed swing vibrations, and the rows merged into Low-health edges,
+        // Exhaustion color, Health bars, Ragdoll, Two-handed controls and Upscaler.
+        t.push_back({"You",
+                     {"Body", "View"},
+                     {RowIndex("height"), RowIndex("height_adjust"), RowIndex("ipd"),
+                      RowIndex("body_mode"), RowIndex("cutaway")},
+                     // Free camera (core/vr/free_camera.h): the view flies, the hunter stays and
+                     // enemies ignore him; Y brings you back (2026-10-30, the user).
+                     {"Free camera",
+                      "Fly the view; the hunter stays and enemies ignore him. Off: here again, or Y.",
+                      ButtonAction::FreeCamera},
+                     defaults,
+                     // Skip ladder climbs: a comfort choice (2026-11-06).
+                     {{{"Comfort", nullptr},
+                       {RowIndex("smooth_motion"), RowIndex("body_follow"),
+                        RowIndex("ladder_skip"), RowIndex("camera_distance"),
+                        RowIndex("camera_tilt")}}},
+                     {"Body & view", "Comfort"}});
+        t.push_back({"Controls",
+                     {"Movement", "Style"},
+                     {RowIndex("move_with"), RowIndex("turning"), RowIndex("controls"),
+                      RowIndex("stance"), RowIndex("vibration")},
+                     controls,
+                     defaults,
+                     {{{"Aids", "Hands"},
+                       {RowIndex("inject"), RowIndex("x_button"), RowIndex("laser"),
+                        RowIndex("grip_adjust"), -1}}},
+                     {"Movement & style", "Aids & hands"}});
+        t.push_back({"Combat",
+                     {"Weapons", "Feel"},
+                     {RowIndex("weighted_weapons"), RowIndex("weapon_wall"),
+                      RowIndex("blade_sounds"), RowIndex("riposte_style"), RowIndex("ragdoll")},
+                     {},
+                     defaults,
+                     {{{"Two hands", "Guns & enemies"},
+                       {RowIndex("two_handed"), RowIndex("two_hand_guide"),
+                        RowIndex("gun_wrist_reload"), RowIndex("vr_grab_attacks"), -1}}},
+                     {"Weapons & feel", "Two hands & guns"}});
+        t.push_back({"Items & world",
+                     {"Items", "Quick draws"},
+                     {RowIndex("holster_mode"), RowIndex("quick_arc_pick"),
+                      RowIndex("shoulder_vial"), RowIndex("shoulder_switch"), -1},
+                     {},
+                     defaults,
+                     {{{"World", "Summons"},
+                       {RowIndex("vr_interactions"), RowIndex("physical_levers"),
+                        RowIndex("lamp_travel"), RowIndex("physical_summon_bell"),
+                        RowIndex("doll_respec")}}},
+                     {"Items & quick draws", "World & summons"}});
+        t.push_back({"HUD & feedback",
+                     {"Vitals", "Display"},
+                     {RowIndex("hud_vitals"), RowIndex("low_hp"), RowIndex("counters"),
+                      RowIndex("hit_flash"), RowIndex("hud_size")},
+                     {},
+                     defaults,
+                     {{{"Color feedback", "Bars"},
+                       {RowIndex("low_hp_edges"), RowIndex("exhaustion_color"),
+                        RowIndex("health_bars"), -1, -1}}},
+                     {"Vitals & display", "Colors & bars"}});
+        // Frame overlap needs a restart and stays in vr.ini and the launcher.
+        t.push_back({"Picture",
+                     {"Image", "Color"},
+                     {RowIndex("aa"), RowIndex("lod"), RowIndex("color_contrast"),
+                      RowIndex("color_saturation"), RowIndex("color_gamma")},
+                     {},
+                     defaults,
+                     {{{"Rendering", "Shadows"},
+                       {RowIndex("foveation"), -1, RowIndex("shadows_far"),
+                        RowIndex("shadows_busy"), -1}},
+                      // New graphics (2026-11-10, the user): the lighting this mod adds; since
+                      // 2026-11-11 the reflections too (water and wet streets off by default).
+                      // (0.9.6: the user's five rows, in his order.)
+                      {{"Shadows & fog", "Light & water"},
+                       {RowIndex("new_shadows"), RowIndex("new_fog"), RowIndex("moon_glow"),
+                        RowIndex("new_ambient"), RowIndex("reflections")}},
+                      // Film look (2026-11-11, the user's polish list): the grade and the tone
+                      // map's highlights, both live.
+                      {{"Tone", "Depth & eyes"},
+                       {RowIndex("cinematic_look"), -1, RowIndex("raised_bricks"),
+                        RowIndex("eye_adaptation"), -1}}},
+                     {"Image & color", "Performance", "New graphics", "Film look"}});
+        // Upscaling: pending until ACCEPT, applied by SAVE AND RESTART; one page, never more.
+        t.push_back({"Upscaling",
+                     {"Headset", "Upscaling"},
+                     {RowIndex("graphics_resolution"), RowIndex("graphics_scale"),
+                      RowIndex("graphics_upscaler"), RowIndex("graphics_mode"),
+                      RowIndex("upscale_focus")},
                      restart,
                      accept});
-        t.push_back({"Body",
-                     {"Posture", "Protection"},
-                     {RowIndex("body_follow"), RowIndex("lean_side"), RowIndex("body_comfort"),
-                      RowIndex("lean_response"), -1},
+        t.push_back({"Difficulty",
+                     {"Survival", "Attacks"},
+                     {RowIndex("hp_bonus"), RowIndex("iframes"), RowIndex("attack_stamina"),
+                      RowIndex("outgoing_damage"), -1},
                      {},
                      defaults});
-        t.push_back(
-            {"Inventory",
-             {"Access", nullptr},
-             {RowIndex("holster_mode"), RowIndex("holster_haptics"), -1, -1, -1},
-             {},
-             defaults});
-        t.push_back({"Feedback",
-                     {"Health", "Stamina"},
-                     {RowIndex("health_color"), RowIndex("health_color_strength"),
-                      RowIndex("stamina_color"), RowIndex("stamina_color_strength"),
-                      RowIndex("shoulder_switch")},
-                     {},
-                     defaults});
-        t.push_back({"Weapons", {"Handling", nullptr},
-                     {RowIndex("weapon_wall"), RowIndex("two_hand_guide"),
-                      RowIndex("two_hand_swing_hum"), RowIndex("gun_wrist_reload"),
-                      RowIndex("blade_sounds")}, {},
-                     defaults});
-        t.push_back({"Interactions",
-                     {"Hands", "Enemy attacks"},
-                     {RowIndex("physical_levers"), RowIndex("lamp_travel"),
-                      RowIndex("vr_grab_attacks"), RowIndex("physical_summon_bell"), -1},
-                     {},
-                     defaults});
-        t.push_back({"Color", {"Color", "Brightness"},
-                     {RowIndex("color_contrast"), RowIndex("color_saturation"),
-                      RowIndex("color_gamma"), -1, -1}, {}, defaults});
-        t.push_back({"Weapon weight", {"Handling", nullptr},
-                     {RowIndex("weighted_weapons"), -1, -1, -1, -1}, {}, defaults});
-        t.push_back({"Damage", {"Attacks", nullptr},
-                     {RowIndex("outgoing_damage"), -1, -1, -1, -1}, {}, defaults});
+        t.push_back({"Save", {"Soft save", nullptr}, {-1, -1, -1, -1, -1},
+                     {"Soft save", "Save this moment, replacing your previous soft save. Using a lantern clears it.", ButtonAction::SoftSave},
+                     {"Clear soft save", "Forget this soft save. Your next death returns to the lantern.", ButtonAction::ClearSoftSave}});
         return t;
     }();
     return tabs;
@@ -682,8 +1025,9 @@ public:
     std::string Get(const std::string& key) override {
         if (!key.starts_with("graphics_") || key == "graphics_resolution" ||
             key == "graphics_config" || key == "graphics_status" ||
-            key == "graphics_fsr4_available" || key == "graphics_fsr31_available" || key == "graphics_neural_available" ||
-            key == "graphics_native_stereo")
+            key == "graphics_fsr4_available" || key == "graphics_fsr31_available" ||
+            key == "graphics_fsr41_available" || key == "graphics_neural_available" ||
+            key == "graphics_native_stereo" || key == "graphics_dibr_upscale")
             return source.Get(key);
         const auto c = Current();
         if (key == "graphics_scale")
@@ -699,6 +1043,18 @@ public:
             return std::to_string(int(Graphics::IsFsr(c.upscaler) ? c.fsr4 : c.dlss));
         if (key == "graphics_neural")
             return c.upscaler == Graphics::Upscaler::Dlss && c.dlss5 ? "1" : "0";
+        if (key == "graphics_upscaler")
+            return c.upscaler == Graphics::Upscaler::Dlss    ? (c.dlss5 ? "4" : "1")
+                   : c.upscaler == Graphics::Upscaler::Fsr4  ? "2"
+                   : c.upscaler == Graphics::Upscaler::Fsr31 ? "3"
+                   : c.upscaler == Graphics::Upscaler::Fsr41 ? "5"
+                                                             : "0";
+        if (key == "graphics_neural_note") {
+            // The runtime says why DLSS 5 is greyed (vr_page_runtime.cpp); a store that does not
+            // know shows the experiment note.
+            const auto note = source.Get(key);
+            return note.empty() ? "Experimental" : note;
+        }
         if (key == "graphics_neural_mode")
             return std::to_string(int(c.neural));
         if (key == "graphics_intensity")
@@ -742,13 +1098,44 @@ public:
             if (c.upscaler == Graphics::Upscaler::Off || c.dlss5)
                 return;
             (c.upscaler == Graphics::Upscaler::Dlss ? c.dlss : c.fsr4) =
-                Graphics::Profile(std::clamp(n, 0, 2));
+                Graphics::Profile(std::clamp(n, 0, Graphics::ProfileCount - 1));
         } else if (key == "graphics_neural") {
             // DLSS 5 owns its reconstruction internally; the three menu choices are exclusive.
-            if (n) c.upscaler = Graphics::Upscaler::Dlss;
-            else if (c.dlss5 && c.upscaler == Graphics::Upscaler::Dlss)
+            if (n) {
+                // One setting: the Balanced size the chain was measured at, full strength.
+                c.upscaler = Graphics::Upscaler::Dlss;
+                Graphics::SetNeuralProfile(c, Graphics::Profile::Balanced);
+                c.intensity = c.detail = c.lighting = 100;
+            } else if (c.dlss5 && c.upscaler == Graphics::Upscaler::Dlss)
                 c.upscaler = Graphics::Upscaler::Off;
             c.dlss5 = n != 0;
+        } else if (key == "graphics_upscaler") {
+            // The Upscaler row: the DLSS, FSR and DLSS 5 rows' exclusive choices as one.
+            switch (n) {
+            case 1:
+                Set("graphics_dlss", "1");
+                return;
+            case 2:
+                Set("graphics_fsr4", "1");
+                return;
+            case 3:
+                Set("graphics_fsr4", "2");
+                return;
+            case 4:
+                Set("graphics_neural", "1");
+                return;
+            case 5:
+                // AMD cards only: a store that does not say it is available never sets it.
+                if (source.Get("graphics_fsr41_available") != "1")
+                    return;
+                c.upscaler = Graphics::Upscaler::Fsr41;
+                c.dlss5 = false;
+                break;
+            default:
+                c.upscaler = Graphics::Upscaler::Off;
+                c.dlss5 = false;
+                break;
+            }
         } else if (key == "graphics_neural_mode")
             Graphics::SetNeuralProfile(c, Graphics::Profile(std::clamp(n, 0, 2)));
         else if (key == "graphics_intensity")
@@ -784,15 +1171,37 @@ public:
             Set(key, "0");
     }
 };
+inline bool FogRequiresMoonGlow(const Row& row, Store& store) {
+    return std::string_view(row.id) == "moon_glow" && store.Get("fog_banks") == "1";
+}
+
 inline bool Enabled(const Row& row, Store& store) {
     const std::string_view id = row.id;
-    if (row.widget == Widget::ReadOnly)
+    if (row.widget == Widget::ReadOnly || FogRequiresMoonGlow(row, store))
         return false;
-    // The current reconstruction path needs native stereo's paired images and motion.
-    // Preserve the saved preference, but keep DIBR's working spatial AA accessible.
+    // A gamepad play style sets it (core/vr/play_style.h): shown, locked.
+    if (const auto style = PlayStyle::Parse(store.Get("play_style"))) {
+        for (const char* key : row.keys) {
+            if (key != nullptr && PlayStyle::IsForced(*style, key))
+                return false;
+        }
+    }
+    // DIBR: DLSS, FSR 4 and FSR 3.1.5 reconstruct its centre view (graphics_dibr_upscale "1",
+    // renderer_vulkan/vr_dibr_upscale.h); DLSS 5 needs native stereo's paired images. Without
+    // the DIBR upscaler (VR_DIBR_UPSCALE=0) the saved preference is preserved and DIBR's
+    // spatial AA stays accessible.
     if (store.Get("graphics_native_stereo") == "0") {
-        if (id == "aa" || id == "graphics_scale") return true;
-        if (id.starts_with("graphics_")) return false;
+        if (id == "graphics_scale") return true;
+        if (id == "upscale_focus") return false; // native stereo's upscaler only
+        const bool upscale = store.Get("graphics_dibr_upscale") == "1";
+        if (id == "aa") {
+            const auto accepted = Graphics::Parse(store.Get("graphics_config"));
+            return !upscale || !accepted || !Graphics::DibrUpscaleSupports(*accepted);
+        }
+        if (!upscale && id.starts_with("graphics_")) return false;
+        if (id == "graphics_neural" || id == "graphics_neural_mode" || id == "graphics_intensity" ||
+            id == "graphics_detail" || id == "graphics_lighting")
+            return false;
     }
     if (id == "aa") {
         const auto accepted = Graphics::Parse(store.Get("graphics_config"));
@@ -806,8 +1215,11 @@ inline bool Enabled(const Row& row, Store& store) {
         return store.Get("graphics_fsr4_available") != "0" || store.Get("graphics_fsr31_available") == "1";
     if (id == "graphics_neural")
         return store.Get("graphics_neural_available") != "0";
-    if (id == "graphics_mode")
-        return store.Get("graphics_dlss") == "1" || store.Get("graphics_fsr4") == "1" || store.Get("graphics_fsr31") == "1";
+    // (graphics_upscaler: its unavailable choices are skipped by Step, UpscalerChoiceMissing.)
+    // Foveated upscale as Profile: with DLSS (not DLSS 5) or FSR.
+    if (id == "graphics_mode" || id == "upscale_focus")
+        return store.Get("graphics_dlss") == "1" || store.Get("graphics_fsr4") == "1" ||
+               store.Get("graphics_fsr31") == "1" || store.Get("graphics_upscaler") == "5";
     if (id == "graphics_neural_mode" || id == "graphics_intensity" || id == "graphics_detail" ||
         id == "graphics_lighting")
         return store.Get("graphics_neural") == "1";
@@ -877,8 +1289,8 @@ inline std::string ExpandEntries(std::string text, Store& store) {
             what = store.ControlName(b.first);
             if (b.second != VR::Thumbs::Control::None) {
                 const bool chord = b.entry.how == VR::Thumbs::How::Chord;
-                what = std::string{chord ? "" : "hold "} + what + (chord ? "+" : " + ") +
-                       store.ControlName(b.second);
+                what = chord ? VR::Thumbs::Chord(what, store.ControlName(b.second))
+                             : "hold " + what + " + " + store.ControlName(b.second);
             }
         }
         text.replace(at, close + 1 - at, what);
@@ -962,6 +1374,8 @@ inline std::string NumberText(const Row& row, int n) {
 }
 
 inline std::string ValueText(const Row& row, Store& store) {
+    if (FogRequiresMoonGlow(row, store))
+        return CardTier::MoonGlowRequired;
     switch (row.widget) {
     case Widget::Action:
         return {};
@@ -993,6 +1407,20 @@ struct Change {
 // Slider / Number: by `step`, clamped; a Number with a `zero_text` starts at `first` from 0 and
 // goes back to 0 below its range). Applies through the store. A Choice steps through its offered
 // options only: an ini_only one is skipped.
+// The Upscaler row's choices this release or mode cannot run: FSR 4 / FSR 3.1.5 without their
+// files, DLSS 5 without its file or in DIBR (it needs native stereo's paired images), FSR 4.1
+// unless the store says it is available (its files and an AMD card).
+inline bool UpscalerChoiceMissing(const Row& row, const Option& option, Store& store) {
+    if (std::string_view(row.id) != "graphics_upscaler" || option.values[0] == nullptr)
+        return false;
+    const std::string_view v = option.values[0];
+    return (v == "2" && store.Get("graphics_fsr4_available") == "0") ||
+           (v == "3" && store.Get("graphics_fsr31_available") == "0") ||
+           (v == "4" && (store.Get("graphics_neural_available") == "0" ||
+                         store.Get("graphics_native_stereo") == "0")) ||
+           (v == "5" && store.Get("graphics_fsr41_available") != "1");
+}
+
 inline Change Step(const Row& row, Store& store, int delta) {
     Change c{row.id, {}, {}, {}, row.restart, row.placeholder};
     if (delta == 0 || !Enabled(row, store)) {
@@ -1007,9 +1435,10 @@ inline Change Step(const Row& row, Store& store, int delta) {
         std::vector<int> offered;
         for (size_t i = 0; i < row.options.size(); ++i) {
             const auto& option = row.options[i];
-            const bool missing_fsr = std::string_view(row.id) == "graphics_fsr4" &&
+            const bool missing_fsr = (std::string_view(row.id) == "graphics_fsr4" &&
                 ((SameValue("1", option.values[0]) && store.Get("graphics_fsr4_available") == "0") ||
-                 (SameValue("2", option.values[0]) && store.Get("graphics_fsr31_available") == "0"));
+                 (SameValue("2", option.values[0]) && store.Get("graphics_fsr31_available") == "0"))) ||
+                UpscalerChoiceMissing(row, option, store);
             if (!option.ini_only && !missing_fsr) {
                 offered.push_back(static_cast<int>(i));
             }
@@ -1028,6 +1457,9 @@ inline Change Step(const Row& row, Store& store, int delta) {
         }
         p = p < 0 ? (delta > 0 ? 0 : count - 1) : ((p + delta) % count + count) % count;
         const Option& opt = row.options[static_cast<size_t>(offered[static_cast<size_t>(p)])];
+        // Water applies live. Only changing the wet-streets half of Wetness needs a restart.
+        if (std::string_view(row.id) == "reflections")
+            c.restart = !SameValue(store.Get("wet_streets"), opt.values[1]);
         for (int k = 0; k < 2; ++k) {
             if (row.keys[k] != nullptr && opt.values[k] != nullptr) {
                 store.Set(row.keys[k], opt.values[k]);
@@ -1093,8 +1525,10 @@ inline Change Defaults(const Tab& tab, Store& store) {
     // Snapshot enabled rows first: resetting a provider changes the enabled state
     // of dependent profile rows. Defaults must not depend on row order.
     std::vector<int> enabled;
-    for (const int r : tab.rows) {
-        if (r >= 0 && Enabled(Rows()[static_cast<size_t>(r)], store)) enabled.push_back(r);
+    for (const int r : tab.AllRows()) { // every page's
+        const Row& row = Rows()[static_cast<size_t>(r)];
+        // A full Picture reset also restores the Moon glow preference hidden by Fog.
+        if (std::string_view(row.id) == "moon_glow" || Enabled(row, store)) enabled.push_back(r);
     }
     for (const int r : enabled) {
         const Row& row = Rows()[static_cast<size_t>(r)];
@@ -1172,6 +1606,7 @@ enum class Target : unsigned char {
     SliderBar,  // index = slot
     ButtonLeft,
     ButtonRight,
+    PageTab,    // index = a page in the tab's sub-tab strip
 };
 
 struct Hover {
@@ -1181,11 +1616,13 @@ struct Hover {
 };
 
 // What the page asks of its owner.
-enum class Action : unsigned char { None, Close, ShowControls, RestartGraphics };
+enum class Action : unsigned char { None, Close, ShowControls, RestartGraphics, SoftSave, ClearSoftSave, FreeCamera };
 
 struct State {
     int tab{0};
-    int focus{0};            // 0..4 a row slot, FocusLeftButton / FocusRightButton
+    int page{0};             // the tab's page shown (Tab::Pages(); its sub-tab strip picks it)
+    int focus{0};            // 0..4 a row slot of that page, FocusLeftButton / FocusRightButton,
+                             // FocusStrip
     bool confirm{false};     // the Defaults question is up (the buttons read YES / NO)
     bool confirm_restart{false};
     int confirm_yes{0};      // 1 = YES selected (NO is preselected, as in the game)
@@ -1207,12 +1644,15 @@ public:
     const Tab& CurrentTab() const {
         return Tabs()[static_cast<size_t>(state.tab)];
     }
-    // The row in a slot of the current tab (nullptr when empty).
+    // The row in a slot of the current tab's page shown (nullptr when empty).
     const Row* RowAt(int slot) const {
-        if (slot < 0 || slot >= Slots) {
+        return RowAtPage(state.page, slot);
+    }
+    const Row* RowAtPage(int page, int slot) const {
+        if (slot < 0 || slot >= Slots || page < 0 || page >= CurrentTab().Pages()) {
             return nullptr;
         }
-        const int r = CurrentTab().rows[static_cast<size_t>(slot)];
+        const int r = CurrentTab().RowsOf(page)[static_cast<size_t>(slot)];
         return r >= 0 ? &Rows()[static_cast<size_t>(r)] : nullptr;
     }
     bool HasButton(int focus) const {
@@ -1225,11 +1665,18 @@ public:
                                            : false;
     }
     bool Focusable(int focus) const {
-        return focus < Slots ? RowAt(focus) != nullptr && Enabled(*RowAt(focus), store)
-                             : HasButton(focus);
+        if (focus == FocusStrip) {
+            return CurrentTab().Pages() > 1 && !state.confirm;
+        }
+        return focus < Slots ? FocusableAt(state.page, focus) : HasButton(focus);
+    }
+    bool FocusableAt(int page, int slot) const {
+        const Row* row = RowAtPage(page, slot);
+        return row != nullptr && Enabled(*row, store);
     }
 
-    // Opening: the General tab's first row (as the game's pages open on their first row).
+    // Opening: the first tab, its sub-tab strip when it has pages, else its first row (as the
+    // game's pages open on their first row).
     void Reset() {
         store.Discard();
         state = State{};
@@ -1272,14 +1719,19 @@ public:
         }
         if (dir == Dir::Up || dir == Dir::Down) {
             const int step = dir == Dir::Down ? 1 : -1;
-            // The order: slots 0..4, then the button row (left, else right).
+            // The order: the sub-tab strip (a tab with pages), the page's slots 0..4, then the
+            // button row (left, else right); it wraps. Pages change only on the strip (2026-10-30,
+            // the user: a strip, flicked left / right, not down past the last row).
             std::vector<int> order;
+            if (Focusable(FocusStrip)) {
+                order.push_back(FocusStrip);
+            }
             for (int s = 0; s < Slots; ++s) {
                 if (Focusable(s)) {
                     order.push_back(s);
                 }
             }
-            const bool on_buttons = state.focus >= FocusLeftButton;
+            const bool on_buttons = state.focus == FocusLeftButton || state.focus == FocusRightButton;
             const int button = Focusable(FocusLeftButton) ? FocusLeftButton : FocusRightButton;
             if (Focusable(button)) {
                 order.push_back(on_buttons ? state.focus : button);
@@ -1297,8 +1749,13 @@ public:
             }
             return Action::None;
         }
+        // On the strip: left / right (and the triggers) pick the page.
+        if (state.focus == FocusStrip) {
+            PageTo(state.page + (dir == Dir::Right ? 1 : -1));
+            return Action::None;
+        }
         const int delta = dir == Dir::Right ? 1 : -1;
-        if (state.focus >= FocusLeftButton) {
+        if (state.focus == FocusLeftButton || state.focus == FocusRightButton) {
             const int other = state.focus == FocusLeftButton ? FocusRightButton : FocusLeftButton;
             if (Focusable(other) && ((delta > 0) == (other == FocusRightButton))) {
                 state.focus = other;
@@ -1341,9 +1798,23 @@ public:
             }
             return Action::None;
         }
-        if (state.focus >= FocusLeftButton) {
+        if (state.focus == FocusLeftButton || state.focus == FocusRightButton) {
             const Button& b = state.focus == FocusLeftButton ? CurrentTab().left : CurrentTab().right;
             switch (b.action) {
+            case ButtonAction::SoftSave:
+                return Action::SoftSave;
+            case ButtonAction::ClearSoftSave:
+                return Action::ClearSoftSave;
+            case ButtonAction::FreeCamera:
+                // It flies with the VR controllers' sticks and Y brings you back: not in a gamepad
+                // play style (core/vr/play_style.h), where nothing would steer it or end it.
+                if (const auto style = PlayStyle::Parse(store.Get("play_style"));
+                    style && *style != PlayStyle::Style::Motion) {
+                    SetNotice("The free camera flies with the motion controllers: not in a "
+                              "gamepad play style.");
+                    return Action::None;
+                }
+                return Action::FreeCamera;
             case ButtonAction::ShowControls:
                 return Action::ShowControls;
             case ButtonAction::RestartGraphics:
@@ -1362,7 +1833,7 @@ public:
                 if (store.Accept()) {
                     if (log)
                         log("VR page: graphics preferences accepted.");
-                    SetNotice("Graphics saved. Resolution changes take effect after SAVE AND RESTART.");
+                    SetNotice("Graphics saved. Upscaler and resolution changes take effect after SAVE AND RESTART.");
                 } else
                     SetNotice("No pending graphics changes.");
                 return Action::None;
@@ -1385,6 +1856,28 @@ public:
         return Action::Close;
     }
 
+    // The tab's page `page` (wrapping; the sub-tab strip). The strip keeps the selection while it
+    // has it; else the new page's first row is selected.
+    void PageTo(int page) {
+        const int pages = CurrentTab().Pages();
+        if (pages <= 1 || state.confirm) {
+            return;
+        }
+        page = ((page % pages) + pages) % pages;
+        if (page == state.page) {
+            return;
+        }
+        state.page = page;
+        state.dragging = -1;
+        if (state.focus != FocusStrip) {
+            state.focus = FirstRowFocus();
+        }
+        dirty = true;
+    }
+    void PageStep(int delta) {
+        PageTo(state.page + delta);
+    }
+
     void TabStep(int delta) {
         const int count = static_cast<int>(Tabs().size());
         SetTab(((state.tab + delta) % count + count) % count);
@@ -1395,6 +1888,7 @@ public:
             return;
         }
         state.tab = tab;
+        state.page = 0;
         state.notice.clear();
         state.confirm = false;
         state.focus = FirstFocus();
@@ -1412,6 +1906,8 @@ public:
                 if (Focusable(h.index) && !state.confirm) {
                     state.focus = h.index;
                 }
+            } else if (h.target == Target::PageTab && Focusable(FocusStrip)) {
+                state.focus = FocusStrip;
             } else if (h.target == Target::ButtonLeft && Focusable(FocusLeftButton)) {
                 state.focus = FocusLeftButton;
                 state.confirm_yes = 1;
@@ -1438,6 +1934,13 @@ public:
             return Action::None;
         case Target::TabNext:
             TabStep(1);
+            return Action::None;
+        case Target::PageTab:
+            if (!state.confirm) {
+                state.focus = FocusStrip;
+                PageTo(h.index);
+                dirty = true;
+            }
             return Action::None;
         case Target::RowLeft:
         case Target::RowRight:
@@ -1502,7 +2005,12 @@ public:
     }
 
 private:
+    // Opening the page and changing tab: a tab with pages selects its sub-tab strip, so left /
+    // right pick the page at once (2026-10-30, the user); else the first row.
     int FirstFocus() const {
+        return Focusable(FocusStrip) ? FocusStrip : FirstRowFocus();
+    }
+    int FirstRowFocus() const {
         for (int s = 0; s < Slots; ++s) {
             if (Focusable(s)) {
                 return s;

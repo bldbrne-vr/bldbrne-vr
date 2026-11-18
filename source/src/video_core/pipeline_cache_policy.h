@@ -18,9 +18,13 @@
 // with a version word and a meta also carries the version of its binary; an entry whose word is not
 // this build's is never used: its pipeline is compiled again during play and the entry rewritten.
 //
-// The word: upstream's own number in bits 0..3, the fork's SCOPED revision in bits 4..7, the fork's
-// revision in bits 8..15 and the tag 'VR' (0x5652) above. Each field only ever grows, so two
-// different (upstream, scoped, revision) triples never give the same word.
+// The word: upstream's own number in bits 0..3, the fork's SCOPED revision in bits 4..19, the
+// fork's revision in bits 20..27 and the tag 0xA above. Each field only ever grows and every number
+// is checked to fit its field (a compile error, never a wrap), so two different (upstream, scoped,
+// revision) triples never give the same word. (Until 2026-11-16 the scoped field had 4 bits and the
+// tag 'VR' (0x5652) bits 16..31: fragment revision 162 wrote 146's word, and a cache 16 bumps old
+// could be read as current (a code review). Those words' top four bits are 5, never 0xA: every
+// entry they wrote is stale once, its pipeline compiled again on first use.)
 //
 // Which number to bump (a stale entry must never be used, and only stale entries should go):
 //  - the LAYOUT of what is serialized changes (GraphicsPipelineKey, ComputePipelineKey,
@@ -32,12 +36,13 @@
 //    scale, the TAA jitter; the geometry stage runs it before every EmitVertex and has the same
 //    scope since the asymmetric geometry-stage remap): VrVertexRevision - the fragment and compute
 //    shaders and the other stages stay cached;
-//  - only the game's own fragment programs change (FragmentRuntimeInfo::vr_cut == 0):
-//    VrFragmentRevision - the other stages stay cached; a change to every fragment permutation
-//    bumps VrCutRevision too;
-//  - only the body-cutaway permutations change (FragmentRuntimeInfo::vr_cut != 0, the VR-owned
-//    variants of the hunter's own fragment programs): VrCutRevision - the game's own fragment
-//    programs stay cached;
+//  - the fragment programs change: VrFragmentRevision - the other stages stay cached. The
+//    body-cutaway permutations (FragmentRuntimeInfo::vr_cut != 0) are fragment programs too: their
+//    word carries VrFragmentRevision with VrCutRevision, so they follow every fragment change (until
+//    2026-11-16 a change to every fragment permutation had to bump VrCutRevision by hand, and 160's
+//    and 162's did not: a code review);
+//  - only the body-cutaway permutations change (the VR-owned variants of the hunter's own fragment
+//    programs): VrCutRevision - the game's own fragment programs stay cached;
 //  - the object-motion permutations (RuntimeInfo::vr_motion, cached since VrRevision 8): the
 //    vertex side (EmitVertexMotion) is the hardware vertex stage's epilogue, VrVertexRevision; the
 //    fragment side (EmitFragmentMotion, with or without a cut) VrFragmentRevision + VrCutRevision.
@@ -84,19 +89,23 @@ namespace Vulkan::PipelineCachePolicy {
 
 using Word = std::uint32_t;
 
-constexpr Word Tag = 0x5652u;
+constexpr Word Tag = 0xAu; // (the words before 2026-11-16: 0x5652 in bits 16..31)
+constexpr Word UpstreamBits = 4u, ScopedBits = 16u, RevisionBits = 8u;
+constexpr bool Fits(Word value, Word bits) {
+    return value < (Word{1} << bits);
+}
 constexpr Word UpstreamShaderVersion = 3u; // upstream's ShaderBinary / ShaderMeta number
 constexpr Word UpstreamKeyVersion = 4u;    // upstream's PipelineKey number
 
 constexpr Word VrKeyLayoutRevision = 10u;  // the stage hashes are permutation ids
-constexpr Word VrMetaLayoutRevision = 20u; // RuntimeInfo::billboard_face_eye
+constexpr Word VrMetaLayoutRevision = 23u; // a permutation's own draw-time VR fields too (vr_bump_image: flat parallax) (22: its own resources; 21: vr_bump_image)
 // FAST_CPU_PERM_IDS off (the default): the indexed naming's words, the caches' before the ids.
 constexpr Word VrKeyLayoutRevisionIndexed = 9u;
-constexpr Word VrMetaLayoutRevisionIndexed = 19u; // RuntimeInfo::billboard_face_eye
+constexpr Word VrMetaLayoutRevisionIndexed = 22u; // a permutation's own draw-time VR fields too (21: its own resources; 20: vr_bump_image)
 constexpr Word VrRevision = 9u;           // NonUniform on final per-eye image/atomic operands
-constexpr Word VrVertexRevision = 6u;     // geometry-stage sprites face the eye (RewriteGeometrySprites)
-constexpr Word VrFragmentRevision = 1u;   // only what the SPIR-V reads of the written colour targets
-constexpr Word VrCutRevision = 1u;        // the vr_cut permutations: the same colour-target change
+constexpr Word VrVertexRevision = 8u;     // object motion stores its position with one plain store
+constexpr Word VrFragmentRevision = 164u;  // the lamp shadows' mask on by default (Low, its march noise 2) and High's hero lamps marching in the lamp programs (light_shadow.h High), which declare his body maps and the grid at both; 163: the fixture clearance 46 cm at a reach of 5 m, was 45 (light_shadow.h ClearFireM); 162: the bounce's 2x2 parity from the unscaled FragCoord; fragment shaders that can discard keep exact math; 161: the bounce's 2x2 split whenever it is on, each pixel's own normal, soft neighbour weights (bounce_light.h QuadGather); 160: the game's fragment math may fuse multiply-add where no depth is written (emit_spirv_floating_point.cpp); 159: a spawned grey or blue light's shadows in full from 0.5 (the cane men's lanterns); 158: the lamp glow's normal and inverse only where a light reaches, the scene copy's setup inside its branch, the block blend's ramp (157) (the lamp read blends between the mask's blocks (their size in its last word, the facing 6 bits a component) (156) (the fog grid branch joined with the flame vote within 0.18 m (155; 154 was the flame vote alone) (the fog grid holds the moonlit air too: no cells' march, no tent in the scene copy, with VR_FOG_GRID=1 only (153; without the switch every program is still byte for byte 151's) (the air pass's programs keyed for the fog grid, VR_FOG_GRID=1 (152; without the switch every program is byte for byte 151's) (the moon glow a bit more than a quarter outside the woods (151; 150 was a test) (the glow's knee, the moon glow's far keep 0.75 (149) (the lamps' plane test by the angle (148) (the mist brought to each pixel's distance, the haze in the apply (147) (the haze's own brightness, the ambient level (146) (the distance haze (145) (the moon glow LanternEngine's way: far surfaces keep 0.8, no dimming (144) (the mist high haze, coarse blocks take the mean jitter (143) (the glow's loop ends after the lights with a glow, votes in blocks (142) (thick mist, small lights' glow, the moon's rays behind VR_AIR_RAYS (141) (the air pass in the reflections pass (its half-size host), the mist, the moon aim (140) (the air pass: moon beams in half-size cells, the halos and their source votes in the scene copy, the colour probe, lit smoke by core (139) (foveated march steps (138) (near pixels march more steps; the GPU step dial (137) (raised bricks on the map's G-buffer programs only (136) (raised bricks: no parallax where a branch some pixels skip holds its reads (135) (close lamps (the held torch) march more steps (134) (the grid's block stamps off by default (133) (the grid's block stamps (VR_MARCH_OPT 128) (132) (the depth pyramid in the mask march (131) (the mask pass's exact speed-ups (VR_MARCH_OPT) (130) (the world-tied noise off again (129) (the mask march with the world-tied noise by default (128) (tests: the mask march smart steps (VR_SCENE_MARCH_SMART), world-tied noise (VR_SCENE_MARCH_NOISE) (127) (the mask word: half-float distance + octahedral facing, the lamp read weighs facing (126) (the mask march at half the steps, the grid cell halfway back read only behind a solid one (125) (the old march in the mask (MarchSteps shared), the grid fallback careful (own surface skipped, edge blend, two cells for a full hit) (124) (the screen splats back, each cube shadow checked against the view (a ghost in empty air left out) (123) (trace-first: the smart trace (growing steps, a crossing refined, no half hits), world-tied offsets, the outer view traced, no screen splats (122) (each slot's trace reach (the dial), the mask read's nearest-depth fallback, the grid splat counts this frame's stamps, no strongest-lamp tracking beside the full trace, tests VR_SCENE_EARLY (121) (120: the trace lift taken back (119: lifted; 118:  // the trace's blockers 30 cm thick (118) (117:  // every slot lamp traced by default, fresh ones too (117) (116:  // the mask read depth-aware (116) (115:  // the trace a function: per lamp (tests) or the top one; its footprint outside branches (115) (114:  // the mask with our AO off (114) (113:  // contact shadows on (113) (112:  // contact shadows hold still (112) (111:  // contact shadows at full rate, within 12 m (111) (110:  // contact shadows behind VR_SCENE_CONTACT (110) (109:  // uncapped slope bias, edge-on fade only at the end (109) (108:  // 16 cubes of 192, the mask bilinear (107:  // the AO pass foveated again, the shadow work over coarse blocks (106:  // edge-on light and the rim fade the mask's shadows (105:  // seamless cubes (105) (104:  // the cubes' normal offset (no acne) (103:  // splats that hold still: footprints, the grid's in-view test by depth, previous places (102:  // the shadow pass at full rate, grid out of view only, a smooth lookup (101:  // the mask's size written every frame (100:  // tests: the mask shown, the slope's share (99:  // enemies never in the grid; valid branches (98:  // loops' conditions before their merge (valid SPIR-V) (97:  // the GPU's slot match where the CPU saw no list (96:  // slope bias for the screen's entries too (95:  // enemies and NPCs out of view as capsules (94: held lights in the slots, lamp programs bind less (93: the lamp's slot from the CPU, a byte; 92: the shadow mask, world-axis cubes two deep (91: 24 map slots read in loops; 90: 16 slots; 89: maps only; 88: the grid into the scene maps, live keys (87: the grid into the scene maps (86: his shadow from up to three lamps; 85: one loop over a lamp shader's lights (84: scene shadow maps (VR_SCENE_MAPS) (83: merge: the lamp work (82: grouping off by default (81: the game's shadow lookups lit without an Identity (80: small lights within 20 cm grouped for shadows (79: blockers 40 cm thick (78: the game's shadowed lamps: ours for each, its maps lit; more steps at medium distance (77: the grid looked up only within its reach, the march ending beyond it (76: single lights cast nothing (light_shadow.h NoCastLights); tests behind VR_LIGHT_PROBE (75: tests; 74: bounce light: a sample at most luminance 2 (73: camera lights by place and reach; 72: matched in either view; 71: the camera fill light removable; 70: lights kept on the camera cast none; 69: live grid and thickness keys; 68: the blocker grid; 67: fixture clearance 12 to 72 cm, the air back to the old one; 66: both eyes' pictures; 65: fixture clearance 6 to 32 cm; 64: small lights all steps; 63: no flicker, full reach, more steps (62: a strength, a held torch casts, edge fade)) and the moon (81 on the other branch: the moon 1.8x the real one (was 3.6x; 77..80 left to the graphics folder's unpushed work) (76: single lights cast nothing (light_shadow.h NoCastLights); tests behind VR_LIGHT_PROBE (75: tests; 74: bounce light: a sample at most luminance 2 (73: camera lights by place and reach; 72: matched in either view; 71: the camera fill light removable; 70: lights kept on the camera cast none; 69: live grid and thickness keys; 68: the blocker grid; 67: fixture clearance 12 to 72 cm, the air back to the old one; 66: both eyes' pictures; 65: fixture clearance 6 to 32 cm; 64: small lights all steps; 63: no flicker, full reach, more steps (62: a strength, a held torch casts, edge fade)))))))))))))))))
+constexpr Word VrCutRevision = 3u;        // Monocular variant: the free eye keeps the pushed body cut
 
 // How a permutation is named on disk (the keys' stage hashes, the metas' and binaries' names):
 // HashCombine(program, its index), or its id (FAST_CPU_PERM_IDS=1).
@@ -111,8 +120,22 @@ enum class Scope : Word {
 };
 
 constexpr Word Encode(Word upstream, Word scoped, Word revision) {
-    return (upstream & 0xFu) | ((scoped & 0xFu) << 4) | ((revision & 0xFFu) << 8) | (Tag << 16);
+    return (upstream & 0xFu) | ((scoped & 0xFFFFu) << 4) | ((revision & 0xFFu) << 20) | (Tag << 28);
 }
+
+// The body-cutaway permutations' scoped revision: the fragment programs' (theirs too) in its low 12
+// bits, the cut's own above (never 0: never the game's own fragment programs' word).
+constexpr Word CutScopedRevision() {
+    return (VrCutRevision << 12) | VrFragmentRevision;
+}
+static_assert(Fits(UpstreamShaderVersion, UpstreamBits) && Fits(UpstreamKeyVersion, UpstreamBits));
+static_assert(Fits(VrKeyLayoutRevision, RevisionBits) && Fits(VrMetaLayoutRevision, RevisionBits) &&
+              Fits(VrKeyLayoutRevisionIndexed, RevisionBits) &&
+              Fits(VrMetaLayoutRevisionIndexed, RevisionBits) && Fits(VrRevision, RevisionBits),
+              "a revision past its field: widen the word (and retire the old one), never wrap");
+static_assert(Fits(VrVertexRevision, ScopedBits) && Fits(VrFragmentRevision, 12u) &&
+                  VrCutRevision > 0 && Fits(VrCutRevision, ScopedBits - 12u),
+              "a scoped revision past its field: widen the word (and retire the old one), never wrap");
 
 // `hw_vertex`: the program runs as the hardware vertex stage (RuntimeInfo::stage ==
 // Shader::Stage::Vertex, also when it is the logical tessellation-evaluation stage) or as the
@@ -133,7 +156,7 @@ constexpr Word ScopedRevision(Scope scope) {
     case Scope::VertexEpilogue:
         return VrVertexRevision;
     case Scope::FragmentCut:
-        return VrCutRevision;
+        return CutScopedRevision();
     case Scope::Fragment:
         return VrFragmentRevision;
     case Scope::Common:
@@ -181,6 +204,8 @@ enum class Reject : Word {
     OtherMode,    // the other mode's (flat vs native stereo): kept for it, never used in this one
     MotionIdle,   // an object-motion variant, the session started without an upscaler: kept
     OtherNaming,  // the other permutation naming's key (FAST_CPU_PERM_IDS): kept, never read here
+    Misaligned,   // a stage's bindings start where the stages before it do not end (BindingsLineUp):
+                  // its descriptors would be read as another stage's; never built
     Count,
 };
 
@@ -206,6 +231,8 @@ constexpr const char* RejectName(Reject r) {
         return "object motion, no upscaler";
     case Reject::OtherNaming:
         return "the other permutation naming's";
+    case Reject::Misaligned:
+        return "stages' bindings not lined up";
     default:
         return "?";
     }

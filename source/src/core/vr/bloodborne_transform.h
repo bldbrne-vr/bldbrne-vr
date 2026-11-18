@@ -51,6 +51,10 @@ void InstallTransform(VAddr base, u64 size);
 // same right-arm state): starts, runs and ends a transform, publishes the status.
 void TransformPoseTick(u8* chr, const MeleeBody& body);
 
+// Powered Stake Driver: arm recovery on accepted discharge (pose thread), hit or miss.
+// Recovery waits for the contact window to finish and uses the weapon-only retract.
+void ArmStakeReturn(u8* chr, s64 attack_ns);
+
 // The saw uses only the weapon-part animation hook. Cleared on every blocked/stale tick.
 // Returns false if the verified native hook is unavailable (never falls back to a player clip).
 bool SetSawWeaponPose(u8* chr, float time, bool active);

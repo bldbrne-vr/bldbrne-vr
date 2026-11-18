@@ -25,7 +25,13 @@ struct ThrustState {
     std::uint32_t verdict_window{0}; // the newest window judged
     std::uint8_t verdict{0};         // its VR::Melee::Thrust::Verdict
     const char* why{""};             // ... and what decided it (a string literal)
-    bool enabled{false};             // visceral_thrust on, physical melee, swings judged
+    bool enabled{false};             // visceral_thrust on, physical melee
+    std::uint32_t motion{};          // live detector motion, separate from the attack window
+    std::uint8_t motion_verdict{};   // live verdict; a finished thrust must not keep retrying
+    bool forward{};                 // tracked hand still moving toward the facing, head-relative
+    float motion_age{};             // seconds since this motion began
+    std::uint32_t opportunity{};    // the opening observed by this hand sample
+    const void* target{};           // compared only; never dereferenced by the presenter
     float peak{0.0f};                // the newest thrust: m/s along the blade (logs)
     float travel{0.0f};              // ... m along the blade (logs)
     std::int64_t ns{0};              // published at (steady clock)

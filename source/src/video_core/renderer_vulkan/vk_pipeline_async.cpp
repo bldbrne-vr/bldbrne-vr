@@ -501,16 +501,45 @@ struct PipelineCache::AsyncPipelines {
     /// bbport AsyncSkippable (BBV vk_pipeline_cache.cpp:643-693): only a pass drawn every frame
     /// (its target drawn to in each of the last 8 frames), never a full-screen pass (12 indices
     /// or fewer: going without one greys whole frames), an indirect draw (only Stage A's direct
-    /// draw asks), a loading-screen frame (fewer than 300 draws) or a VR variant.
+    /// draw asks), a loading-screen frame (fewer than 300 draws) or a VR variant. An effect draw
+    /// (PipelineSkip::EffectDraw: a particle, a spark, a blood sprite) needs neither the size
+    /// nor the every-frame target.
     bool Skippable(const PipelineSelection& selection) const {
         if (selection.vr_probe_mode || selection.vr_fs_cut || selection.vr_motion.enabled ||
-            !selection.regs || last_frame_draws < 300 || selection.regs->num_indices <= 12) {
+            !selection.regs || last_frame_draws < 300) {
             return false;
         }
         const u64 target = AsyncDetail::DrawTarget(*selection.regs);
+        if (target == 0) {
+            return false;
+        }
+        if (IsEffectDraw(selection)) {
+            effect_candidates.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        if (selection.regs->num_indices <= 12) {
+            return false;
+        }
         const auto streak = target_streaks.find(target);
-        return target != 0 && streak != target_streaks.end() && streak->second.frames >= 8;
+        return streak != target_streaks.end() && streak->second.frames >= 8;
     }
+
+    static bool IsEffectDraw(const PipelineSelection& selection) {
+        static const bool on = PipelineSkip::EffectSkipOn(std::getenv("FAST_ASYNC_EFFECT_SKIP"));
+        if (!on) {
+            return false;
+        }
+        const auto& regs = *selection.regs;
+        const auto& key = selection.graphics_key;
+        bool any_blend = false;
+        for (u32 cb = 0; cb < key.num_color_attachments && cb < key.blend_controls.size(); ++cb) {
+            any_blend |= key.blend_controls[cb].enable != 0;
+        }
+        return PipelineSkip::EffectDraw(key.num_color_attachments != 0, any_blend,
+                                        regs.depth_control.depth_enable != 0,
+                                        regs.depth_control.depth_write_enable != 0);
+    }
+    mutable std::atomic<u64> effect_candidates{};
 
     /// Native stereo, a draw the skip rule would leave out (its key has no finished job): its
     /// VR vetoes, then the age cap. True: leave it out; false: drawn after all, compiled here or
@@ -695,7 +724,7 @@ struct PipelineCache::AsyncPipelines {
                  "veto_player={} veto_ui={} veto_mono={} veto_stencil={} veto_frame={} aged={} "
                  "aged_held={} promoted={} cut_deferred={} motion_deferred={} variant_jobs={} "
                  "aged_ms={:.2f} veto_ms={:.2f} stall_max_ms={:.2f} skip_keys={} "
-                 "skip_max_ms={:.2f}",
+                 "skip_max_ms={:.2f} effects={}",
                  n(ready) + n(waited), n(ready), n(waited), ms(wait_ns), ms(saved_ns), n(sync_a),
                  n(sync_b), ms(sync_ns), n(taken_back), n(skipped), n(owner_jobs), n(prebuilds),
                  n(offered), n(offer_full), n(accepted), n(duplicates), n(expired), n(compiled),
@@ -705,7 +734,7 @@ struct PipelineCache::AsyncPipelines {
                  n(vetoes[Veto::Mono]), n(vetoes[Veto::Stencil]), n(vetoes[Veto::Frame]), n(aged),
                  n(aged_held), n(promoted), n(cut_deferred), n(motion_deferred), n(variant_jobs),
                  ms(aged_ns), ms(veto_ns), max_ms(stall_max_ns), n(skip_keys),
-                 max_ms(skip_max_ns));
+                 max_ms(skip_max_ns), effect_candidates.load(std::memory_order_relaxed));
         // Why the shaders and pipelines compiled (vk_compile_reason.h), when any did since.
         if constexpr (Common::Log::Enabled) {
             if (const auto reasons = cache.compile_reasons.Report(); !reasons.empty()) {

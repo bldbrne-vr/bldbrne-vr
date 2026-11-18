@@ -18,11 +18,14 @@
 // set's two angles and turn it with the camera's world matrix. On a flat screen the camera turns
 // with the hunter; in VR the camera is your head, so every glance swung those highlights across
 // the surfaces (2026-10-20, Bloodstarved Beast's entrance and elsewhere). With
-// body_fill_lights=1 (off by default: it lost too much atmosphere, the tester kept the original
-// look) the builders get the camera's
+// body_fill_lights=1 (not the default: it lost too much atmosphere) the builders get the camera's
 // matrix without your head's look: levelled, and turned back by the head's yaw, so the hunter's
 // heading (stick turns) still turns them as in the flat game while looking around leaves them in
-// place. Nothing else reads that matrix there, so world lights, lamps and the moon are untouched.
+// place. With body_fill_lights=2, the default, they follow a lazy camera (the tester 2026-10-29,
+// as the flat game's trailing camera): a share of each head turn at once, the rest over a catch-up
+// time, sideways and up/down each with their own (fill_light_yaw_* / fill_light_pitch_*), so a
+// glance barely moves them and a held look settles to exactly the game's matrix. Nothing else
+// reads that matrix there, so world lights, lamps and the moon are untouched.
 namespace VR::Bloodborne {
 
 // OnEbootLoaded (VR enabled): checks both builders' prologues and hooks them. Logs one line.

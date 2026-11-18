@@ -50,6 +50,8 @@ public:
     }
 
     void Stat(FileStat& out) override;
+    /// The times Stat reports, read from the path alone (no handle is opened).
+    static void StatTimes(const std::filesystem::path& path, FileStat& out);
 
 private:
     std::filesystem::path m_path;

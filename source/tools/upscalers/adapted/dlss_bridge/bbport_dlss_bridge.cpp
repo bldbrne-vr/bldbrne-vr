@@ -273,6 +273,37 @@ bool ValidImage(const BbDlssImage& image, uint32_t width, uint32_t height) {
            image.range.layerCount == 1 && image.range.aspectMask != 0;
 }
 
+// One eye's Super Resolution from `input` (the host's colour, or the neural chain's).
+bool Upscale(uint32_t view, VkCommandBuffer command, const BbDlssEvaluate& evaluate,
+             const BbDlssImage& input) {
+    auto& eye = state.views[view];
+    auto color = Wrap(input, false);
+    auto depth = Wrap(evaluate.depth, false);
+    auto motion = Wrap(evaluate.motion, false);
+#ifdef VR_DLSSNR_CHAIN
+    auto output = Wrap(view < 2 ? VrNeural::Output(view, command, evaluate.output)
+                                : evaluate.output, true);
+#else
+    auto output = Wrap(evaluate.output, true);
+#endif
+    NVSDK_NGX_VK_DLSS_Eval_Params parameters{};
+    parameters.Feature.pInColor = &color;
+    parameters.Feature.pInOutput = &output;
+    parameters.Feature.InSharpness = evaluate.sharpness;
+    parameters.pInDepth = &depth;
+    parameters.pInMotionVectors = &motion;
+    parameters.InRenderSubrectDimensions = {eye.feature_desc.input_width,
+                                            eye.feature_desc.input_height};
+    parameters.InJitterOffsetX = evaluate.jitter_x;
+    parameters.InJitterOffsetY = evaluate.jitter_y;
+    parameters.InReset = evaluate.reset;
+    parameters.InMVScaleX = parameters.InMVScaleY = 1.0f;
+    parameters.InPreExposure = parameters.InExposureScale = 1.0f;
+    parameters.InFrameTimeDeltaInMsec = evaluate.frame_ms;
+    return Check("DLSS evaluation", NGX_VULKAN_EVALUATE_DLSS_EXT(command, eye.feature,
+                                                                eye.parameters, &parameters));
+}
+
 int32_t Evaluate(uint32_t view, VkCommandBuffer command, const BbDlssEvaluate* evaluate) {
     if (view >= state.views.size()) return 0;
     auto& eye = state.views[view];
@@ -287,33 +318,29 @@ int32_t Evaluate(uint32_t view, VkCommandBuffer command, const BbDlssEvaluate* e
         !std::isfinite(evaluate->frame_ms) || evaluate->frame_ms < 0 ||
         !std::isfinite(evaluate->sharpness) || evaluate->sharpness < 0 || evaluate->sharpness > 1)
         return 0;
-    auto color = Wrap(evaluate->color, false);
-    auto depth = Wrap(evaluate->depth, false);
-    auto motion = Wrap(evaluate->motion, false);
 #ifdef VR_DLSSNR_CHAIN
-    auto output = Wrap(view < 2 ? VrNeural::Output(view, command, evaluate->output)
-                                : evaluate->output, true);
+    const bool neural = view < 2 && VrNeural::Enabled();
+    BbDlssImage input = evaluate->color;
+    if (neural) {
+        VrNeural::Stamp(view, command, 0);
+        // nr_first/overlay: the model's output becomes SR's colour.
+        if (!VrNeural::Before(view, command, *evaluate, input)) return 0;
+        if (!input.image) return 1; // VR_DLSS5_SHARED: the left eye's SR waits for the right
+        if (VrNeural::NeuralFirst())
+            VrNeural::Stamp(view, command, 1);
+        BbDlssEvaluate left{};
+        if (VrNeural::HasDeferredLeft(left) && !Upscale(0, command, left, VrNeural::Input(0)))
+            return 0;
+    }
+    if (!Upscale(view, command, *evaluate, input)) return 0;
+    if (neural) {
+        if (!VrNeural::NeuralFirst())
+            VrNeural::Stamp(view, command, 1);
+        if (!VrNeural::Evaluate(view, command, *evaluate)) return 0;
+        VrNeural::Stamp(view, command, 2);
+    }
 #else
-    auto output = Wrap(evaluate->output, true);
-#endif
-    NVSDK_NGX_VK_DLSS_Eval_Params parameters{};
-    parameters.Feature.pInColor = &color;
-    parameters.Feature.pInOutput = &output;
-    parameters.Feature.InSharpness = evaluate->sharpness;
-    parameters.pInDepth = &depth;
-    parameters.pInMotionVectors = &motion;
-    parameters.InRenderSubrectDimensions = {eye.feature_desc.input_width,
-                                            eye.feature_desc.input_height};
-    parameters.InJitterOffsetX = evaluate->jitter_x;
-    parameters.InJitterOffsetY = evaluate->jitter_y;
-    parameters.InReset = evaluate->reset;
-    parameters.InMVScaleX = parameters.InMVScaleY = 1.0f;
-    parameters.InPreExposure = parameters.InExposureScale = 1.0f;
-    parameters.InFrameTimeDeltaInMsec = evaluate->frame_ms;
-    if (!Check("DLSS evaluation", NGX_VULKAN_EVALUATE_DLSS_EXT(command, eye.feature,
-                                                              eye.parameters, &parameters))) return 0;
-#ifdef VR_DLSSNR_CHAIN
-    if (view < 2 && !VrNeural::Evaluate(view, command, *evaluate)) return 0;
+    if (!Upscale(view, command, *evaluate, evaluate->color)) return 0;
 #endif
     return 1;
 }

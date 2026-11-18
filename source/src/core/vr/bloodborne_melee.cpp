@@ -6,6 +6,8 @@
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
+#include "core/vr/shaman_blade.h"
+#include "core/vr/bloodborne_evasion.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -15,43 +17,60 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <xbyak/xbyak.h>
 
 #include "common/logging/log.h"
 #include "common/thread.h"
+#include "core/vr/amygdalan_arm.h"
+#include "core/vr/amygdalan_hook.h"
+#include "core/vr/beast_claw_hand.h"
+#include "core/vr/bloodborne_deflect.h"
 #include "core/vr/bloodborne_gun.h"
 #include "core/vr/bloodborne_held.h"
-#include "core/vr/bow.h"
-#include "core/vr/bow_pose.h"
-#include "core/vr/bow_channel.h"
 #include "core/vr/bloodborne_iframes.h"
 #include "core/vr/bloodborne_layout.h"
 #include "core/vr/bloodborne_melee.h"
 #include "core/vr/bloodborne_motion.h"
+#include "core/vr/bloodborne_ragdoll.h"
+#include "core/vr/bloodborne_sever.h"
 #include "core/vr/bloodborne_transform.h"
 #include "core/vr/bloodborne_tuning.h"
+#include "core/vr/bloodborne_visceral_stage.h"
+#include "core/vr/bloodborne_weapon_shape.h"
 #include "core/vr/bloodborne_whip.h"
-#include "core/vr/whip_spin.h"
-#include "core/vr/whip_damage.h"
-#include "core/vr/whip_moves.h"
-#include "core/vr/whip_settings.h"
 #include "core/vr/body_channel.h"
+#include "core/vr/bow.h"
+#include "core/vr/bow_channel.h"
+#include "core/vr/bow_pose.h"
+#include "core/vr/boom_blast.h"
 #include "core/vr/combat_channel.h"
+#include "core/vr/dual_blades.h"
+#include "core/vr/ragdoll_kill.h"
 #include "core/vr/feature_cost.h"
 #include "core/vr/hook_util.h"
-#include "core/vr/bloodborne_visceral_stage.h"
-#include "core/vr/melee_settings.h"
 #include "core/vr/left_attack.h"
+#include "core/vr/kos_punch.h"
+#include "core/vr/kos_attack.h"
+#include "core/vr/bowblade_moves.h"
+#include "core/vr/melee_settings.h"
 #include "core/vr/melee_window.h"
+#include "core/vr/object_break_haptics.h"
+#include "core/vr/object_break_hook.h"
 #include "core/vr/plunge.h"
 #include "core/vr/solid_weapon.h"
+#include "core/vr/stake_driver.h"
 #include "core/vr/transform_settings.h"
 #include "core/vr/trick_weapons.h"
 #include "core/vr/two_hand_grip.h"
-#include "core/vr/stake_driver.h"
 #include "core/vr/visceral_channel.h"
+#include "core/vr/visceral_intent.h"
 #include "core/vr/visceral_thrust.h"
 #include "core/vr/vr_session.h"
+#include "core/vr/whip_damage.h"
+#include "core/vr/whip_moves.h"
+#include "core/vr/whip_settings.h"
+#include "core/vr/whip_spin.h"
 
 namespace VR::Bloodborne {
 
@@ -100,6 +119,18 @@ constexpr std::array<u8, 32> HandCodeSig = {
 constexpr u32 OffsetEquip = 0x4B8; // -> +0x08 the weapon style (1 = form A one-handed, 2 = the
                                    // left weapon two-handed, 3 / 5 = form B)
 constexpr u32 OffsetEquipStyle = 0x08;
+constexpr u32 OffsetEquipRightSlot = 0x10; // ... +0x10 the active right slot (0..2)
+constexpr u32 OffsetEquipIds = 0x64;       // ... +0x64 + 4 (slot * 2 + 1): its weapon id
+// WeaponParamRow, `void(Out{s32 id; u32; u8* row; ...}*, s32 weapon)` (the shop's and the test
+// kit's lookup, bloodborne_givekit.cpp): the weapon's EquipParamWeapon row (upgrade level
+// stripped), whose u16 at +0xB8 is its equipModelId: the parts/wp_a_XXXX file of its model
+// (weapon_wall_shape, bloodborne_weapon_shape.h).
+constexpr u64 WeaponRowRva = 0x1F29AA0;
+constexpr std::array<u8, 32> WeaponRowSig = {
+    0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50, 0x41, 0x89,
+    0xF4, 0x49, 0x89, 0xFE, 0x45, 0x31, 0xC9, 0x41, 0xBF, 0xFF, 0xFF, 0xFF, 0xFF, 0x41, 0xBA, 0xFF,
+};
+constexpr u32 ParamModelId = 0xB8;
 constexpr u32 OffsetInputBits = 0x5C;   // HKS action state (ChrCtrl +0x38): u16
 constexpr u32 OffsetAttackType = 0x1C4; // PlayerIns: s32, -1 idle (4, and 11 in style 1: left)
 // ChrThrowModule::TryThrowAll, `s32(ChrThrowModule* = [[chr+0x3B0]+0x88], s32 padType, s32
@@ -335,6 +366,18 @@ using PlaySoundFn = void(PS4_SYSV_ABI*)(u64* handle, const float* pos, s32 type,
 using BladeFfxFn = void(PS4_SYSV_ABI*)(void* ctl, s32 slot, s32 ffx, const s32* base,
                                        const s32* tip);
 using DmyPolyFn = s32(PS4_SYSV_ABI*)(void* chr, void* out, const s32* ids, u32 max);
+struct WeaponRowOut {
+    s32 id{-1};
+    u32 pad0{0};
+    u8* row{nullptr};
+    s32 base{-1};
+    u32 pad1{0};
+    s32 reinforce_id{-1};
+    u32 pad2{0};
+    u8* reinforce{nullptr};
+};
+static_assert(sizeof(WeaponRowOut) == 0x28);
+using WeaponRowFn = void(PS4_SYSV_ABI*)(WeaponRowOut* out, s32 weapon);
 using NotifyAttackFn = void(PS4_SYSV_ABI*)(void* chr, s32 attack_type);
 using ParryTimingFn = void(PS4_SYSV_ABI*)(void* chr);
 using AiChrFn = u8*(PS4_SYSV_ABI*)(void* accessor);
@@ -382,6 +425,7 @@ TryThrowAllFn g_try_throw = nullptr;
 PlaySoundFn g_play_sound = nullptr;
 BladeFfxFn g_blade_ffx = nullptr;
 DmyPolyFn g_dmy_poly = nullptr;
+WeaponRowFn g_weapon_row = nullptr; // weapon_wall_shape: the weapons' models (WeaponRowRva)
 const u8* g_sound_table = nullptr;
 std::unique_ptr<Xbyak::CodeGenerator> g_code;
 // VR_MELEE_LOG: 1 = + the capsule's first frames of each window, 2 = + every frame of it.
@@ -516,13 +560,14 @@ u8* HitEntry(u32 handle, s32 bid) {
     return entry;
 }
 
-u64 Sound(s32 id, B::Vec3 pos) {
+u64 Sound(s32 id, B::Vec3 pos, s32 sound_type = -1) {
     if (!g_sound || id < 0 || g_dry_run) {
         return 0;
     }
     alignas(16) std::array<float, 4> p{pos.x, pos.y, pos.z, 1.0f};
     u64 handle = 0;
-    const s32 type = g_sound_table != nullptr && Read<u8>(g_sound_table + 3) != 0 ? 0xA : 1;
+    const s32 type = sound_type >= 0 ? sound_type
+                     : g_sound_table != nullptr && Read<u8>(g_sound_table + 3) != 0 ? 0xA : 1;
     g_play_sound(&handle, p.data(), type, id);
     return handle;
 }
@@ -532,6 +577,7 @@ u64 Sound(s32 id, B::Vec3 pos) {
 struct Attack {
     s32 weapon_variation{-1};
     bool form_b{false};
+    bool arm_hook{false}; // a trigger-held Arm stroke: flexible sections catch, club still hurts
     u32 serial{0};
     s32 bid{-1};
     u32 handle{0xFFFFFFFFu};
@@ -550,11 +596,20 @@ struct Attack {
     s64 last_wall_ns{0};
     float damage{0.0f}; // dealt so far
     float tip{0.0f};    // the blade tip's speed the pose tick last saw (m/s)
+    float hand_peak{-1.0f}; // its window's peak hand speed (m/s; -1 unknown): the bonus's arm
+    float tip_peak{0.0f};   // its window's peak blade-tip speed (m/s; 0 unknown)
+    float arc_peak{0.0f};   // rad: the widest its stroke swept (0 unknown)
     bool transform{false}; // the game's transform attack of a flick (core/vr/melee_moves.h)
     bool saw{false};       // native grinding attack: no swing-speed or cadence scaling
     bool powered{false};   // released Stake Driver charge: no swing-speed scaling
     bool flick{false};     // opened by a flick (FlickOpen): outside the combo budget
-    float two_hand{1.0f};  // a two-handed swing's bonus (MeleeWindow::two_hand, the largest seen)
+    float two_hand{1.0f};  // a two-handed swing's factor (MeleeWindow::two_hand; 1 = one-handed)
+    bool two_handed{false}; // latched for the attack, even when the bonus is disabled
+    float support_damage{1.0f}; // frozen when the attack starts; all its hits use the same penalty
+    float damage_scale{1.0f};   // ... the window's (split blades, honed: MeleeWindow::damage_scale)
+    // A row of ours over the game's row it opens (core/vr/bowblade_moves.h DamageScale: the
+    // Bowblade's charged swing 170 / 130, its arrow 60 / 100); 1 for the game's own rows.
+    float row_scale{1.0f};
     // Opened while the hunter fell (melee_plunge, core/vr/plunge.h): held to the landing; its
     // fall's depth so far (the pose tick raises it) sets the plunge's damage.
     bool plunge{false};
@@ -567,9 +622,27 @@ struct Attack {
     // that dealt damage (< 0: none yet; vr.ini whip_pace, core/vr/whip_damage.h).
     s32 whip_variation{-1};
     float pace{-1.0f};
+    bool contact_hold{false};
 };
 
 std::mutex g_attack_mutex;
+
+// The lit Boom Hammer's explosion (core/vr/boom_blast.h): armed by the first thing a lit heavy or
+// charged swing hits (the damage and map hooks), let off by the next pose tick (the clips' FFX
+// and sounds; the charged blast row kept alive on BoomBlastSlot for BlastNs). One per swing.
+constexpr u32 BoomBlastSlot = 3; // the game's TAE uses 0-2, the left hand 4-5, the right 6-7
+struct BoomBlastState {
+    u32 serial{0};       // the swing that exploded
+    bool pending{false}; // to let off at the next pose tick
+    VR::BoomBlast::Blast blast{};
+    s32 blast_bid{-1};
+    B::Vec3 at{};       // the hit's contact (the sounds)
+    const char* what{""};
+    s64 hit_ns{0};
+    s64 until_ns{0};    // the blast row kept alive until then (0: none)
+};
+BoomBlastState g_boom; // (g_attack_mutex)
+
 std::array<Attack, 4> g_attacks{}; // the newest four (a ring)
 u32 g_attack_next = 0;
 // The whip forms' damage pace (vr.ini whip_pace): one meter, every whip window that hurt.
@@ -593,6 +666,39 @@ Attack* FindAttack(s32 bid, u32 handle, s64 now) {
     return best;
 }
 
+// The first contact of a lit Boom Hammer heavy or charged swing (`a`, a copy; an enemy, or a wall
+// or the ground: `what`) arms its explosion (core/vr/boom_blast.h); any other swing, or a swing
+// that already exploded, nothing. Takes g_attack_mutex.
+void ArmBoomBlast(const Attack& a, B::Vec3 at, const char* what, s64 now) {
+    if (a.row == nullptr) {
+        return;
+    }
+    const VR::BoomBlast::Blast blast = VR::BoomBlast::Of(
+        a.weapon_variation, a.form_b, a.row->judge, a.verdict_light, a.transform);
+    if (!blast.Valid()) {
+        return;
+    }
+    std::scoped_lock lock{g_attack_mutex};
+    if (g_boom.serial == a.serial) {
+        return;
+    }
+    g_boom = {};
+    g_boom.serial = a.serial;
+    g_boom.pending = true;
+    g_boom.blast = blast;
+    g_boom.blast_bid = VR::BoomBlast::BlastBid(a.bid, a.row->judge, blast.blast_judge);
+    g_boom.at = at;
+    g_boom.what = what;
+    g_boom.hit_ns = now;
+}
+
+// The charged blast row's (BoomBlastSlot): its hits and wall touches, while it lives and shortly
+// after (the game's hit step runs after the pose tick that refreshed it). Holding g_attack_mutex.
+bool BoomBlastBidLocked(s32 bid, s64 now) {
+    return bid >= 0 && bid == g_boom.blast_bid && g_boom.until_ns != 0 &&
+           now <= g_boom.until_ns + 250'000'000;
+}
+
 // The blade's bite (the damage / map hooks write, SolveBody reads).
 std::atomic<s64> g_bite_ns{0};
 std::atomic<float> g_bite_hold{0.0f};
@@ -605,6 +711,8 @@ std::atomic<u32> g_visceral_checked{0};
 // thrust verdict before its attack is created (site A writes, the pose tick reads).
 std::atomic<bool> g_thrust_wait{false};
 constexpr u32 ThrustWaitFrames = 8;
+// Published by site A for the pose tick: bounded native retries still own this attack.
+VR::SeqLock<M::Thrust::RetryHold> g_thrust_retry_hold;
 
 // Statistics (the 10 s line).
 struct Stats {
@@ -662,6 +770,7 @@ struct TickState {
     const char* weapon_why{"not read yet"};
     // The window being served.
     M::LatchState latch{};
+    u32 visceral_held_serial{0};
     Attack cur{};         // its attack (a copy of the ring's)
     bool cur_live{false}; // created and not finalized
     // The combo budget could not pay the window (Combat::MeleeWindow::unpaid): no attack, its
@@ -855,21 +964,20 @@ s8 BowHandOf(u8* chr, TickState& t) {
 const M::WeaponMoves* StakeMovesFor(s32 variation, const M::WeaponMoves* moves) {
     namespace T = VR::Tricks;
     static M::WeaponMoves stake{};
-    static s32 judge = 0; // 0 not looked up yet, -1 none
+    static T::StakeAttackLookup lookup;
+    static s32 cached_judge = 0;
     if (variation != StakeDriverVariation || moves == nullptr || moves->rows[5].Valid() ||
         !moves->rows[4].Valid() || !T::GetTrickSettings().stake_blast || !g_stake_geometry) {
         return moves;
     }
+    const s32 judge = lookup.Resolve([&](s32 j) {
+        return GunBehaviorRefType(100000000 + variation * 1000 + j);
+    });
     if (judge == 0) {
-        judge = -1;
-        std::string kinds;
-        for (const s32 j : T::ChargedJudgesB) {
-            const s32 kind = GunBehaviorRefType(100000000 + variation * 1000 + j);
-            kinds += fmt::format(" {}: {}", j, kind < 0 ? "no row" : kind == 0 ? "an attack" : "a bullet");
-            if (kind == 0 && judge < 0) {
-                judge = j;
-            }
-        }
+        return moves; // Live params unavailable: retry later, without log spam.
+    }
+    if (cached_judge != judge) {
+        cached_judge = judge;
         if (judge > 0) {
             stake = *moves;
             stake.rows[5] = moves->rows[4];
@@ -885,7 +993,7 @@ const M::WeaponMoves* StakeMovesFor(s32 variation, const M::WeaponMoves* moves) 
                 stake.rows[5].dmy2 = -1;
             }
         }
-        LOG_INFO(Core, "VR melee: the Stake Driver's transformed charged R2 rows:{} -> {}", kinds,
+        LOG_INFO(Core, "VR melee: the Stake Driver's transformed charged R2: {}",
                  judge > 0 ? fmt::format("the charged swing opens judge {}", judge)
                            : std::string{"no attack row (a bullet is the gun module's)"});
     }
@@ -940,6 +1048,12 @@ const M::WeaponMoves* FistMovesFor(s32 variation, const M::WeaponMoves* moves) {
     return checked > 0 ? &fists : moves;
 }
 
+// A dismembering right-hand weapon (either form) as last told to dismemberment
+// (SeverWeaponEquipped). Kept apart from the tick's own weapon: a new hunter object resets that,
+// and the change must still be told (the review, 2026-11-13: it stayed "on" after a load into
+// another weapon). Game thread only.
+bool g_sever_weapon_signalled = false;
+
 void ReadWeapon(u8* chr, TickState& t) {
     const s32 bid0 = BehaviorId(chr, 0);
     const s32 variation_before = t.variation;
@@ -950,6 +1064,17 @@ void ReadWeapon(u8* chr, TickState& t) {
     t.moves = WhipMovesFor(t.variation, t.moves);
     t.moves = StakeMovesFor(t.variation, t.moves);
     t.moves = FistMovesFor(t.variation, t.moves);
+    if (t.variation == 101 && t.moves != nullptr && g_stake_geometry) {
+        static const M::WeaponMoves punches = M::WithKosPunchRows(*t.moves);
+        t.moves = &punches;
+    }
+    if (t.variation == BowbladeVariation && t.moves != nullptr) {
+        // Simon's Bowblade's own moves (core/vr/bowblade_moves.h): the sword's charged swing, and
+        // with the physical bow the arrow's stab (its hit moved onto the arrow per attack).
+        static const M::WeaponMoves with_arrow = M::Bowblade::WithOwnMoves(*t.moves, true);
+        static const M::WeaponMoves sword_only = M::Bowblade::WithOwnMoves(*t.moves, false);
+        t.moves = g_stake_geometry && VR::Bow::GetBowSettings().enabled ? &with_arrow : &sword_only;
+    }
     t.style = WeaponStyle(chr);
     if (t.style == t.style_prev && t.variation == variation_before) {
         ++t.style_stable;
@@ -958,6 +1083,12 @@ void ReadWeapon(u8* chr, TickState& t) {
         t.style_prev = t.style;
     }
     t.form_b = VR::Tricks::PhysicalMeleeFormB(t.variation, t.style);
+    // Awake with the claw or the Burial Blade in the hand, in either form (sever_policy.h CanWake).
+    if (const bool eligible = VR::Sever::CanWake(t.variation);
+        eligible != g_sever_weapon_signalled) {
+        g_sever_weapon_signalled = eligible;
+        VR::Bloodborne::SeverWeaponEquipped(eligible);
+    }
     // Simon's Bowblade's bow form (vr.ini bow, core/vr/bow.h): the hand its bow hangs on.
     t.bow_hand = t.variation == BowbladeVariation && t.form_b ? BowHandOf(chr, t) : -1;
     if (t.bow_hand < 0) {
@@ -1102,6 +1233,153 @@ void LogBladeGeometry(u8* chr, const TickState& t) {
              t.form_b ? "B" : "A", t.style, rows, gun, parts);
 }
 
+// A weapon part's skeleton as posed now (the layout MeleeBowGeometry reads): each bone's name,
+// parent and model-space transform. False (and `why`) when the part has no readable pose.
+bool ReadPartPose(const u8* part, std::vector<VR::WeaponMesh::LiveBone>& out,
+                  std::vector<s16>* parents_out, const char*& why) {
+    out.clear();
+    if (!Plausible(part) || Read<const u8*>(part) != g_base + WeaponPartVtableRva) {
+        why = "no part";
+        return false;
+    }
+    const auto* anim = Read<const u8*>(part + 0x158);
+    const auto* state = Plausible(anim) ? Read<const u8*>(anim) : nullptr;
+    const auto* player = Plausible(state) ? Read<const u8*>(state) : nullptr;
+    const auto* node = Plausible(player) ? Read<const u8*>(player + 0x20) : nullptr;
+    if (!Plausible(node)) {
+        why = "no pose";
+        return false;
+    }
+    const auto* pose = node + 0x38;
+    const auto* skel = Read<const u8*>(pose);
+    if (!Plausible(skel)) {
+        why = "no skeleton";
+        return false;
+    }
+    const int count = Read<s32>(skel + 0x30);
+    const auto* names = Read<const u8*>(skel + 0x28);
+    const auto* parents = Read<const s16*>(skel + 0x18);
+    const auto* locals = Read<const B::HkQsTransform*>(pose + 0x08);
+    if (count < 1 || count > 256 || Read<s32>(pose + 0x10) != count ||
+        Read<s32>(skel + 0x20) != count || !Plausible(names) ||
+        !Plausible(reinterpret_cast<const u8*>(parents), 2) ||
+        !Plausible(reinterpret_cast<const u8*>(locals), 16)) {
+        why = "bad pose";
+        return false;
+    }
+    std::vector<B::QsTransform> model(static_cast<size_t>(count));
+    out.resize(static_cast<size_t>(count));
+    if (parents_out != nullptr) {
+        parents_out->resize(static_cast<size_t>(count));
+    }
+    for (int i = 0; i < count; ++i) {
+        const int parent = parents[i];
+        if (parent < -1 || parent >= i) {
+            why = "bad parents";
+            out.clear();
+            return false;
+        }
+        const auto local = B::FromHavok(locals[i]);
+        model[i] = parent >= 0 ? B::Compose(model[parent], local) : local;
+        const auto raw = Read<uintptr_t>(names + 16 * i) & ~uintptr_t{1};
+        const auto* name = reinterpret_cast<const char*>(raw);
+        std::string label;
+        if (Plausible(reinterpret_cast<const u8*>(name), 1)) {
+            std::size_t len = 0;
+            while (len < 48 && name[len] != 0) {
+                ++len;
+            }
+            label.assign(name, len);
+        }
+        out[static_cast<size_t>(i)] = {std::move(label), model[i].t, model[i].q};
+        if (parents_out != nullptr) {
+            (*parents_out)[static_cast<size_t>(i)] = static_cast<s16>(parent);
+        }
+    }
+    return true;
+}
+
+// VR_SOLID_SHAPE_LOG: a part's skeleton as posed now, as text (name:parent:(mm)q(x,y,z,w)).
+std::string PartBones(const u8* part) {
+    std::vector<VR::WeaponMesh::LiveBone> bones;
+    std::vector<s16> parents;
+    const char* why = nullptr;
+    if (!ReadPartPose(part, bones, &parents, why)) {
+        return fmt::format(" {}", why);
+    }
+    std::string out;
+    for (size_t i = 0; i < bones.size(); ++i) {
+        std::string label = bones[i].name.empty() ? std::string{"?"} : bones[i].name;
+        for (char& c : label) {
+            if (static_cast<unsigned char>(c) < 0x21 || static_cast<unsigned char>(c) > 0x7E ||
+                c == ':' || c == '|') {
+                c = '_';
+            }
+        }
+        const auto& b = bones[i];
+        out += fmt::format(" {}:{}:({:.1f},{:.1f},{:.1f})q({:.4f},{:.4f},{:.4f},{:.4f})", label,
+                           parents[i], b.t.x * 1000.0f, b.t.y * 1000.0f, b.t.z * 1000.0f, b.q.x,
+                           b.q.y, b.q.z, b.q.w);
+    }
+    return out;
+}
+
+// VR_SOLID_SHAPE_LOG=1 (tests; the solid weapons' shapes): once per weapon and form, as the blade
+// line, every dummy of the right weapon's parts (groups 10-13, ids 0-999 of each, every copy of
+// an id) within GeometryFarM of the grip, in the grip's frame (mm, R_Weapon 300's axes) with its
+// own Y and Z axes in that frame, and each part's attach dummy (-1 not attached, -2 no part).
+void LogWeaponDummies(u8* chr, const TickState& t) {
+    std::array<float, 12> g{};
+    if (g_dmy_poly == nullptr || !DummyMtx(chr, RightWeaponDummy, g)) {
+        return;
+    }
+    const B::Vec3 grip{g[3], g[7], g[11]};
+    const auto axis = [&](B::Vec3 d) {
+        return B::Vec3{g[0] * d.x + g[4] * d.y + g[8] * d.z, g[1] * d.x + g[5] * d.y + g[9] * d.z,
+                       g[2] * d.x + g[6] * d.y + g[10] * d.z};
+    };
+    u8* const parts = Read<u8*>(chr + OffsetChrAsm);
+    std::string out;
+    for (s32 i = 0; i < 4; ++i) {
+        s32 attach = -2;
+        if (Plausible(parts)) {
+            u8* const part = Read<u8*>(parts + OffsetAsmParts + 8 * (RightPartSlot + i));
+            if (Plausible(part) && Read<u8*>(part) == g_base + WeaponPartVtableRva) {
+                attach = Read<s32>(part + OffsetPartMode) == 2 ? Read<s32>(part + OffsetPartDummy)
+                                                               : -1;
+            }
+        }
+        std::string list;
+        for (s32 s = 0; s < 1000; ++s) {
+            s32 id = (10 + i) * 1000 + s;
+            alignas(16) std::array<float, 8 * 12> m{};
+            const s32 n = std::min(g_dmy_poly(chr, m.data(), &id, 8), 8);
+            for (s32 k = 0; k < n; ++k) {
+                const float* r = m.data() + 12 * k;
+                const B::Vec3 p{r[3], r[7], r[11]};
+                if (!B::IsFinite(p) || B::Length(p - grip) > GeometryFarM) {
+                    continue;
+                }
+                const B::Vec3 l = InFrameCm(g, p) * 10.0f;
+                const B::Vec3 y = axis({r[1], r[5], r[9]});
+                const B::Vec3 z = axis({r[2], r[6], r[10]});
+                list += fmt::format(" {}:({:.0f},{:.0f},{:.0f})y({:.2f},{:.2f},{:.2f})z({:.2f},"
+                                    "{:.2f},{:.2f})",
+                                    id, l.x, l.y, l.z, y.x, y.y, y.z, z.x, z.y, z.z);
+            }
+        }
+        out += fmt::format(" | part {} attach {}:{}", 10 + i, attach,
+                           list.empty() ? std::string{" none"} : list);
+        if (attach >= 300 && attach <= 339) {
+            LOG_INFO(Core, "VR solid dump: {} form {} part {} bones:{}", t.moves->name,
+                     t.form_b ? "B" : "A", 10 + i,
+                     PartBones(Read<u8*>(parts + OffsetAsmParts + 8 * (RightPartSlot + i))));
+        }
+    }
+    LOG_INFO(Core, "VR solid dump: {} (variation {}) form {} (style {}){}", t.moves->name,
+             t.variation, t.form_b ? "B" : "A", t.style, out);
+}
+
 // The one refusal a new swing waits out (swing_buffer_ms, M::SwingBuffer): compared by pointer.
 constexpr const char* AttackWaitWhy = "the game takes no attack yet";
 
@@ -1203,9 +1481,23 @@ void Refund(u8* chr, s32 amount, u32 serial, const char* why) {
 }
 
 // What a physical swing does with the game's stamina (melee_stamina_pct, melee_regen_pause).
-M::SwingStamina SwingRule(M::MoveKind kind = M::MoveKind::Light) {
+// `full`: the game's whole cost and its regen pause for a light too (the Amygdalan Arm's whip form:
+// ArmWhipForm), unless swings are free.
+M::SwingStamina SwingRule(M::MoveKind kind = M::MoveKind::Light, bool full = false) {
     const auto& ms = VR::Melee::GetMeleeSettings();
-    return M::AttackStaminaOf(kind, ms.stamina_pct, ms.regen_pause);
+    return M::AttackStaminaOf(kind, full && ms.stamina_pct > 0 ? 100 : ms.stamina_pct,
+                              ms.regen_pause);
+}
+
+// The Amygdalan Arm's whip form, its tentacle ours (whip=physical), weakened so that it is not
+// spammed (2026-11-07: "weaken the amygdala arm whip form so that users don't just spam
+// it non stop and just kill everything"; in the headset its light lashes cost 20 of 170 and the
+// stamina was full again by the next: it never fell under 116 in 67 swings): each lash pays the
+// game's full stamina and pauses the regen as the game's own attacks do, the regen stays paused
+// while the tentacle is out on a lash or a jab (ArmLashNow; holding an enemy is not), and its hits
+// fall off with distance from the hand (core/vr/whip_damage.h ContactDamageFactor).
+bool ArmWhipForm(s32 variation, bool form_b) {
+    return variation == 2500 && form_b && VR::Whip::GetWhipSettings().physical;
 }
 
 // " (row 30, 10% of 30)" / " (row 30)" / " (row 30, free: melee_stamina_pct=0)" for the open line.
@@ -1402,6 +1694,11 @@ Attack Finalize(u8* chr, TickState& t, const Combat::MeleeWindow* w, const char*
         return {};
     }
     t.cur_live = false;
+    if (t.cur.contact_hold && !replaced) {
+        // Its window closes with it (melee_window.h TrackerInput::ended_serial): a dodge or a kept
+        // hit ends it here while the chain flies on, and the window would turn down new lashes.
+        Combat::PushMeleeEvent({Combat::MeleeEventKind::Ended, t.cur.serial, 0.0f, 0.0f, now, why});
+    }
     Attack a{};
     {
         std::scoped_lock lock{g_attack_mutex};
@@ -1439,9 +1736,36 @@ Attack Finalize(u8* chr, TickState& t, const Combat::MeleeWindow* w, const char*
     return a;
 }
 
-// The weapon's own swing sound and trail of `row` (its clip's), else the Saw Cleaver's.
+// The first move of the form in the hand, whose hit capsule is the weapon's blade (the solid
+// weapon, the blade sounds, the kill ragdoll's push, the paper wipe, the blade trail). Never the
+// Bowblade's arrow stab: the arrow is no blade (solid, it would knock on the bow as it is nocked).
+const M::MoveRow* FormBladeRow(const TickState& t) {
+    if (t.moves == nullptr) {
+        return nullptr;
+    }
+    const std::size_t first = t.form_b ? 3 : 0;
+    for (std::size_t k = first; k < first + 3; ++k) {
+        const M::MoveRow& r = t.moves->rows[k];
+        if (r.Valid()) {
+            return M::Bowblade::IsArrowAttack(t.variation, t.form_b, r.judge) ? nullptr : &r;
+        }
+    }
+    return nullptr;
+}
+
+// The weapon's own swing sound and trail of `row` (its clip's), else the Saw Cleaver's. The
+// Bowblade's arrow: its light slash's sound, heard from the arrow, and no trail (Refresh).
 void SetSwingFx(TickState& t, const M::MoveRow& r) {
     t.whoosh = r.whoosh > 0 ? r.whoosh : t.form_b ? 611 : 610;
+    // (The lit Boom Hammer's charged booms at its blast, not as it swings: core/vr/boom_blast.h.)
+    t.whoosh = VR::BoomBlast::SwingSound(t.variation, t.form_b, r.judge, t.whoosh);
+    t.trail_checked = false;
+    if (M::Bowblade::IsArrowAttack(t.variation, t.form_b, r.judge)) {
+        t.trail_ffx = 0;
+        t.trail_base = r.dmy1;
+        t.trail_tip = r.dmy2;
+        return;
+    }
     if (r.trail_ffx > 0 && r.trail_base > 0 && r.trail_tip > 0) {
         t.trail_ffx = r.trail_ffx;
         t.trail_base = r.trail_base;
@@ -1480,11 +1804,17 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
                 const M::MoveRow* row, M::MoveKind kind, M::MoveKind want, bool lighter,
                 const M::MoveRow* light, bool transform, float since_s,
                 float near_m = DummyNearM, bool soft = false) {
+    near_m = AmygdalanArm::MarkerLimit(t.variation, t.form_b,
+                                      M::Kos::MarkerLimit(t.variation, near_m));
     u8* const module = Module(chr, OffsetAttackModule);
     u8* const data = Module(chr, L::OffsetDataModule);
+    // A mechanical discharge keeps its charged row and pays the game's full cost.
+    // Ordinary swings may downgrade, but a charged stake must never silently become a tap.
+    const bool powered_stake = w.powered && !transform && t.variation == StakeDriverVariation &&
+                               t.form_b && kind == M::MoveKind::Charged;
     const auto affordable = M::AffordableMove({row, kind, lighter}, light ? light :
         (t.moves ? M::ChooseMove(*t.moves, t.form_b, M::MoveKind::Light).row : nullptr),
-        data ? Read<s32>(data + OffsetStamina) : 0);
+        data ? Read<s32>(data + OffsetStamina) : 0, powered_stake);
     if (affordable.kind != kind) {
         LOG_INFO(Core, "VR melee: #{} {} -> light (stamina {} < strong cost {})",
                  w.serial, M::MoveKindName(kind), data ? Read<s32>(data + OffsetStamina) : 0,
@@ -1500,7 +1830,8 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
     B::Vec3 dmy{}, grip{};
     const bool have_dmy = row != nullptr && DummyAt(chr, row->dmy1, dmy);
     const bool have_grip = DummyAt(chr, RightWeaponDummy, grip);
-    const M::SwingStamina stamina_rule = SwingRule(kind);
+    const M::SwingStamina stamina_rule =
+        SwingRule(kind, !transform && ArmWhipForm(t.variation, t.form_b));
     const char* refuse = nullptr;
     if (module == nullptr || data == nullptr) {
         refuse = "no behaviour module";
@@ -1536,9 +1867,28 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
     if (!g_dry_run) {
         ok = Invoke(chr, module, bid, slot, row->stamina, stamina_rule, &full_cost);
     }
-    const s32 stamina_after = Read<s32>(data + OffsetStamina);
     const u32 handle = Read<u32>(module + OffsetAttackSlots + slot * 8);
-    u8* const entry = ok != 0 ? HitEntry(handle, bid) : nullptr;
+    u8* entry = ok != 0 ? HitEntry(handle, bid) : nullptr;
+    // A hit moved onto another part for this attack: the Kos Parasite's punch onto its fist,
+    // Simon's Bowblade's arrow stab (core/vr/bowblade_moves.h) onto the arrow.
+    const bool kos_punch = M::KosPunchInFormB(t.variation, t.form_b, judge);
+    const bool arrow = M::Bowblade::IsArrowAttack(t.variation, t.form_b, judge);
+    if (ok != 0 && (kos_punch || arrow) &&
+        (!g_stake_geometry || entry == nullptr ||
+         !(kos_punch ? M::RelocateKosPunch({entry, EntrySize})
+                     : M::Bowblade::RelocateArrow({entry, EntrySize})))) {
+        // InvokeAttack with a missing row retires the old slot before its failed
+        // creation (retail 1.09: 1A294FC -> 1866400, then 1A2976F -> 1863970).
+        // Do not leave a punch following a hidden part if the layout differs.
+        g_invoke(module, -1, 0, slot, 1);
+        Refund(chr, std::max(stamina_before - Read<s32>(data + OffsetStamina), 0),
+               w.serial,
+               kos_punch ? "Parasite punch attachment unavailable"
+                         : "the arrow's hit could not be moved onto it");
+        ok = 0;
+        entry = nullptr;
+    }
+    const s32 stamina_after = Read<s32>(data + OffsetStamina);
     const bool stake_native = t.variation == StakeDriverVariation && t.form_b &&
                               kind == M::MoveKind::Charged && judge == 930;
     if (stake_native && entry != nullptr && g_stake_geometry) {
@@ -1564,6 +1914,10 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
             if (t.variation == BeastCutterVariation) {
                 want = !IsWhipRow(row) ? 0.22f : row->radius >= 0.3f ? 0.45f : 0.31f;
             }
+            // The Bowblade's arrow: round the arrow, not the sword's 35 cm.
+            if (arrow) {
+                want = M::Bowblade::ArrowRadiusM;
+            }
             if (std::abs(want - radius_before) > 0.002f) {
                 radius_after = want;
                 std::memcpy(entry + OffsetEntryRadius, &radius_after, sizeof(radius_after));
@@ -1577,6 +1931,8 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
     Attack a{};
     a.weapon_variation = t.variation;
     a.form_b = t.form_b;
+    a.arm_hook = t.variation == 2500 && t.form_b &&
+                 VR::Whip::LatestSwingInput(now, AmygdalanHook::MaxAgeNs).arm_lash;
     a.serial = w.serial;
     a.bid = bid;
     a.handle = handle;
@@ -1584,8 +1940,7 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
     a.row = row;
     a.light = light;
     a.transform = transform;
-    a.powered = w.powered && !transform && t.variation == StakeDriverVariation &&
-                t.form_b && kind == M::MoveKind::Charged;
+    a.powered = powered_stake;
     a.cost = std::max(stamina_before - stamina_after, 0);
     a.stamina_rule = stamina_rule;
     a.light_stamina_pct = VR::Melee::GetMeleeSettings().stamina_pct;
@@ -1597,7 +1952,15 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
                                VR::Whip::WhipRecover(t.variation, static_cast<std::size_t>(kind)) > 0.0f
                            ? t.variation
                            : -1;
-    a.two_hand = std::clamp(w.two_hand, 1.0f, 2.0f);
+    a.two_hand = std::clamp(w.two_hand, 0.5f, 2.0f);
+    a.contact_hold = w.contact_hold && VR::Whip::ContactHeldWhip(a.whip_variation);
+    a.two_handed = w.two_handed;
+    a.support_damage = VR::TwoHand::UnsupportedDamage(
+        w.unsupported_family, t.variation / 10, t.form_b, transform);
+    a.damage_scale = transform ? 1.0f : std::clamp(w.damage_scale, 0.25f, 3.0f);
+    a.row_scale = !transform && row != nullptr && t.variation == M::Bowblade::Variation
+                      ? M::Bowblade::DamageScale(t.variation, *row, M::FindMoves(t.variation))
+                      : 1.0f;
     a.verdict_light =
         !transform && w.verdict_known && w.verdict == 0 && kind != M::MoveKind::Light;
     // Opened while the hunter falls (or just landed from a deep fall): a plunge, held to the
@@ -1634,12 +1997,13 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
          w.serial, static_cast<float>(a.cost), static_cast<float>(static_cast<u8>(kind)), now,
          ok != 0 || g_dry_run ? "" : "the game made no attack"});
     if (a.powered && ok != 0) {
+        ArmStakeReturn(chr, now);
         StakeDischarge(chr, now);
         Combat::PushMeleeEvent({Combat::MeleeEventKind::Shot, w.serial,
                                static_cast<float>(VR::Tricks::Shot::StakeBlast), 1.0f,
                                now, "charged melee discharge"});
     }
-    LOG_INFO(Core,
+    LOG_BENCHMARK_INFO(Core,
              "VR melee: #{} {} {}{}{} open ({}, window {:.0f} ms old) bid={} judge={} slot {} "
              "ok={} handle={:#x} stamina {}->{}{} mv {} radius {:.2f}->{:.2f} variation "
              "{} {} form {} style {} armR={:.2f} tip {:.1f} m/s since {:.2f} s dmy {} {:.0f} mm "
@@ -1716,9 +2080,7 @@ void Create(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, s64 
     const bool made =
         OpenAttack(chr, t, w, arm, now, choice.row, choice.kind, want, choice.lighter, light, false,
                    w.since_counted_s,
-                   IsWhipRow(choice.row) ? WhipNearM
-                   : flick               ? FlickNearM
-                                         : DummyNearM,
+                   IsWhipRow(choice.row) ? WhipNearM : flick ? FlickNearM : DummyNearM,
                    flick);
     if (flick && !made && t.latch.active) {
         t.flick.phase = FlickPhase::Gap; // the transform attack serves the whole stroke
@@ -1727,7 +2089,9 @@ void Create(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, s64 
 
 // ---- A flick mid-swing (core/vr/melee_window.h FlickJoins) --------------------------------------
 
-constexpr u32 FlickPartWaitUpdates = 8; // the new form's hit dummy must reach the hand by then
+// The new form's hit dummy must reach the hand by then (updates at 60 fps; the transform's own
+// clock: VR::GameFramesAt60).
+constexpr u32 FlickPartWaitUpdates = 8;
 
 const char* FlickPhaseName(FlickPhase p) {
     switch (p) {
@@ -1896,8 +2260,9 @@ void FlickOpen(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, s
     const bool whip = IsWhipRow(row) && row->Group() == WhipHandleDummy / 1000;
     B::Vec3 dmy{}, grip{};
     if (!DummyAt(chr, whip ? WhipHandleDummy : row->dmy1, dmy) ||
-        !DummyAt(chr, RightWeaponDummy, grip) || B::Length(dmy - grip) > FlickNearM) {
-        if (++f.waited > FlickPartWaitUpdates) {
+        !DummyAt(chr, RightWeaponDummy, grip) ||
+        B::Length(dmy - grip) > AmygdalanArm::MarkerLimit(t.variation, t.form_b, FlickNearM)) {
+        if (++f.waited > VR::GameFramesAt60(FlickPartWaitUpdates)) {
             FlickDone(t, "the new form's hit dummy never came to the hand");
         }
         return;
@@ -1939,6 +2304,65 @@ void FlickOpen(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, s
     }
 }
 
+// The lit Boom Hammer's explosion armed by a hit (ArmBoomBlast): its clip's FFX on the head and
+// its sounds at the contact, once; the charged blast row refreshed on BoomBlastSlot for BlastNs
+// (each pose tick; the game ends it the first update it is not), while the lit hammer is in hand.
+void BoomBlastTick(u8* chr, const TickState& t, s64 now) {
+    bool let_off = false;
+    BoomBlastState b{};
+    {
+        std::scoped_lock lock{g_attack_mutex};
+        if (g_boom.pending) {
+            g_boom.pending = false;
+            g_boom.until_ns = g_boom.blast_bid >= 0 ? now + VR::BoomBlast::BlastNs : 0;
+            let_off = true;
+        } else if (g_boom.until_ns == 0 || now > g_boom.until_ns) {
+            return;
+        }
+        b = g_boom;
+    }
+    // Only with the lit hammer still in hand, and never a stale one (a load, a long stall).
+    const bool lit = t.variation == VR::BoomBlast::Variation && t.form_b;
+    if (!lit || now - b.hit_ns > 250'000'000 || g_dry_run) {
+        if (let_off) {
+            LOG_INFO(Core, "VR melee: #{} Boom Hammer explosion not let off ({})", b.serial,
+                     g_dry_run ? "dry run" : !lit ? "the lit hammer is no longer in hand"
+                                                  : "too late after the hit");
+        }
+        return;
+    }
+    if (let_off) {
+        int effects = 0;
+        for (const s32 ffx : b.blast.ffx) {
+            if (ffx >= 0 && SpawnClipEffect(chr, ffx, VR::BoomBlast::HeadDummy)) {
+                ++effects;
+            }
+        }
+        std::array<u64, 3> sounds{};
+        for (size_t i = 0; i < b.blast.sounds.size(); ++i) {
+            sounds[i] = Sound(b.blast.sounds[i], b.at);
+        }
+        // The blast spends the fire, whatever it hit (the presenter puts it out).
+        Combat::PushMeleeEvent({Combat::MeleeEventKind::Blast, b.serial,
+                                b.blast_bid >= 0 ? 1.0f : 0.0f, 0.0f, now, "explosion"});
+        LOG_INFO(Core,
+                 "VR melee: #{} Boom Hammer EXPLOSION on {} at {}: {} of FFX {} / {} on {}, sounds "
+                 "{} {} {} (h={:#x} {:#x} {:#x}){}, {:.0f} ms after the hit",
+                 b.serial, b.what, V3(b.at), effects, b.blast.ffx[0], b.blast.ffx[1],
+                 VR::BoomBlast::HeadDummy, b.blast.sounds[0], b.blast.sounds[1], b.blast.sounds[2],
+                 sounds[0], sounds[1], sounds[2],
+                 b.blast_bid >= 0 ? fmt::format(", the blast {} for {} ms", b.blast_bid,
+                                                VR::BoomBlast::BlastNs / 1'000'000)
+                                  : std::string{},
+                 static_cast<double>(now - b.hit_ns) * 1e-6);
+    }
+    if (b.blast_bid >= 0 && now <= b.until_ns) {
+        if (u8* const module = Module(chr, OffsetAttackModule); module != nullptr) {
+            g_invoke(module, b.blast_bid, 0, BoomBlastSlot, 1);
+        }
+    }
+}
+
 void Refresh(u8* chr, TickState& t, const Combat::MeleeWindow& w, s64 now) {
     u8* const module = Module(chr, OffsetAttackModule);
     if (module == nullptr || (!t.cur_live && !t.unpaid_live) || t.cur.row == nullptr) {
@@ -1948,6 +2372,20 @@ void Refresh(u8* chr, TickState& t, const Combat::MeleeWindow& w, s64 now) {
     const u32 slot = FirstSlot + (t.cur.serial & 1);
     u8 ok = 1;
     if (!g_dry_run && !unpaid) {
+        // Never recreate a contact sweep, a Kos attack or the Bowblade's arrow here: it would
+        // spend stamina again and reset the hit list (and a punch's or the arrow's moved hit:
+        // the arrow would hit with the sword's dummies again).
+        const bool pinned_attack = t.cur.weapon_variation == VR::Tricks::KosRuneVariation ||
+            M::KosPunchInFormB(t.cur.weapon_variation, t.cur.form_b, t.cur.row->judge) ||
+            M::Bowblade::IsArrowAttack(t.cur.weapon_variation, t.cur.form_b, t.cur.row->judge);
+        if ((t.cur.contact_hold || pinned_attack) &&
+            (Read<u32>(module + OffsetAttackSlots + slot * 8) != t.cur.handle ||
+             HitEntry(t.cur.handle, t.cur.bid) == nullptr)) {
+            Finalize(chr, t, &w, "physical attack lost its native attack", now);
+            t.latch.active = false;
+            t.latch.done = true;
+            return;
+        }
         // (A new attack here would cost the swing's share again: it must not happen, logged.)
         ok = Invoke(chr, module, t.cur.bid, slot, t.cur.row->stamina, t.cur.stamina_rule);
         const u32 handle = Read<u32>(module + OffsetAttackSlots + slot * 8);
@@ -1978,8 +2416,13 @@ void Refresh(u8* chr, TickState& t, const Combat::MeleeWindow& w, s64 now) {
                 r.verdict_light = r.verdict_light || judged_light;
                 if (w.serial == t.cur.serial) {
                     r.tip = w.tip_speed;
+                    r.hand_peak = w.hand_peak; // a hit after the next window opened keeps it
+                    r.tip_peak = w.tip_peak;
+                    r.arc_peak = w.arc_peak;
                     // Two-handed (both hands moved): known once the left hand has moved.
-                    r.two_hand = std::max(r.two_hand, std::clamp(w.two_hand, 1.0f, 2.0f));
+                    r.two_hand = VR::TwoHand::CombineSwingFactor(
+                        r.two_hand, std::clamp(w.two_hand, 0.5f, 2.0f));
+                    r.two_handed = r.two_handed || w.two_handed;
                 }
                 if (r.plunge) {
                     r.drop_m = std::max(r.drop_m, t.air.Drop(now, PlungeConfig()));
@@ -1996,7 +2439,8 @@ void Refresh(u8* chr, TickState& t, const Combat::MeleeWindow& w, s64 now) {
         t.trail_checked = true;
         B::Vec3 grip{};
         const bool have_grip = DummyAt(chr, RightWeaponDummy, grip);
-        const float near_m = IsWhipRow(t.cur.row) ? WhipNearM : DummyNearM;
+        const float near_m = AmygdalanArm::MarkerLimit(t.variation, t.form_b,
+            M::Kos::MarkerLimit(t.variation, IsWhipRow(t.cur.row) ? WhipNearM : DummyNearM));
         const auto on_part = [&](bool have, B::Vec3 p) {
             return have && (!have_grip || B::Length(p - grip) <= near_m);
         };
@@ -2042,7 +2486,10 @@ void Refresh(u8* chr, TickState& t, const Combat::MeleeWindow& w, s64 now) {
                      have_base && have_tip ? "" : " (no dummies: no trail)");
         }
     }
-    if (ms.trail && g_trail && have_base && have_tip && !g_dry_run) {
+    // (The Bowblade's arrow draws none: SetSwingFx; its dummies only place the whoosh.)
+    const bool arrow_stab =
+        M::Bowblade::IsArrowAttack(t.cur.weapon_variation, t.cur.form_b, t.cur.row->judge);
+    if (ms.trail && g_trail && have_base && have_tip && !arrow_stab && !g_dry_run) {
         u8* const ctl = chr + OffsetSfxCtl;
         if (Read<u8*>(ctl) == g_base + SfxCtlVtableRva) {
             g_blade_ffx(ctl, TrailSlot, t.trail_ffx, &t.trail_base, &t.trail_tip);
@@ -2110,26 +2557,54 @@ u32 PS4_SYSV_ABI MeleeMapHit(u8* module, u8* /*map*/, u8* res, u32 /*soft*/) {
     u32 serial = 0;
     bool report = false;
     bool whip = false;
+    Attack claimed{};
     {
         std::scoped_lock lock{g_attack_mutex};
         Attack* a = FindAttack(bid, handle, now);
         if (a == nullptr) {
             // A whip's capsules 1-3 down the chain come with other handles (as in MeleeDamage).
             a = FindAttack(bid, 0, now);
-            if (a != nullptr && !IsWhipRow(a->row)) {
+            if (a != nullptr && !IsWhipRow(a->row) &&
+                !(a->weapon_variation == 2500 && a->form_b)) {
                 a = nullptr;
             }
         }
+        if (a == nullptr && BoomBlastBidLocked(bid, now)) {
+            // The lit Boom Hammer's charged blast on the ground or a wall: an explosion, never
+            // the canned bounce (its swing reported the clank already).
+            return 1;
+        }
         if (a == nullptr) {
+            // No swing claims it (its window and grace are over, the chain still on the floor):
+            // while we drive the Beast Cutter's or the Threaded Cane's chain it is that chain's,
+            // and the game's canned bounce took both arms (the 2026-11-08 Cutter runs; the Cane's
+            // "hit a wall" on every touch of geometry, 2026-11-09): the chain never staggers the
+            // hunter; nor does the Kos Parasite's tendril (101). Otherwise (the cane's own form,
+            // every other weapon) the game's own.
+            if (const WhipChainState chain = WhipChainNow(now);
+                chain.applies &&
+                (chain.variation == 2400 || chain.variation == 2200 || chain.variation == 101)) {
+                static s64 logged_ns = 0;
+                if (now - logged_ns > 500 * Ms) {
+                    logged_ns = now;
+                    LOG_INFO(Core, "VR melee: a wall touch of the whip's chain after its swing (bid {} "
+                                   "handle {:#x}): the game's bounce suppressed", bid, handle);
+                }
+                return 1;
+            }
             return 0;
         }
         serial = a->serial;
-        whip = IsWhipRow(a->row);
+        whip = IsWhipRow(a->row) || (a->weapon_variation == 2500 && a->form_b);
         // The first contact only: a blade dragged along a wall touches it every frame.
         report = ++a->walls == 1;
         a->last_wall_ns = now;
+        claimed = *a;
     }
     if (report) {
+        const B::Vec3 at{Read<float>(res + ResPosition), Read<float>(res + ResPosition + 4),
+                         Read<float>(res + ResPosition + 8)};
+        ArmBoomBlast(claimed, at, "the ground or a wall", now); // (a lit heavy or charged)
         g_stats.walls.fetch_add(1, std::memory_order_relaxed);
         if (!whip) {
             // (A whip's chain metres out on the floor does not catch the hand: the clank only.)
@@ -2138,8 +2613,6 @@ u32 PS4_SYSV_ABI MeleeMapHit(u8* module, u8* /*map*/, u8* res, u32 /*soft*/) {
             g_bite_ns.store(now, std::memory_order_release);
         }
         Combat::PushMeleeEvent({Combat::MeleeEventKind::Wall, serial, 1.0f, 0.0f, now, ""});
-        const B::Vec3 at{Read<float>(res + ResPosition), Read<float>(res + ResPosition + 4),
-                         Read<float>(res + ResPosition + 8)};
         LOG_INFO(Core,
                  "VR melee: #{} WALL at {} (bid {} atk {}): the game's bounce suppressed, t={:.3f}",
                  serial, V3(at), bid, Read<s32>(res + ResAtkParam),
@@ -2497,7 +2970,9 @@ constexpr s32 LeftDefaultCost = 20;
 constexpr float LeftApartM = 0.30f;    // do not learn a side with the fists together
 constexpr float GunPunchReachM = 0.5f; // a gun punch's hitbox this close to the left fist ...
 constexpr float KnownRowReachM = 1.0f; // ... a known row's (the Torch's burning head) this close
-constexpr u32 GunPunchFrames = 6;      // ... seen within this many updates of its attack
+// ... seen within this many updates of its attack, at 60 fps (VR::GameFramesAt60: the hitbox
+// comes on the attack's own clock, so as long in time at any game frame rate).
+constexpr u32 GunPunchFrames = 6;
 
 // A left attack not seen in the game before (the fist's punch with a gun or a shield in the hand,
 // a known row: Tricks::KnownLeftRow): unknown until its first attack shows where it hits. Each
@@ -2531,6 +3006,7 @@ struct LeftTick {
     s32 variation{-1};
     bool gun{false}; // a handgun's punch: the fist's rows (variation 100), the gun in the hand
     s32 check{0};    // its first hit checked at the left fist for this (HitCheckOf; 0: none)
+    M::Kos::LeftCheck kos_check{}; // Milkweed: each swing checked against its own tentacle
     s32 punch{0};    // the gun's variation, minus the shield's family (0: no punch)
     std::array<s32, 24> judges{};
     u32 count{0};
@@ -2545,6 +3021,7 @@ struct LeftTick {
     s32 cost{LeftDefaultCost};
     s32 whoosh{-1}; // the dual blades' left swing sound (the right weapon's light row's; -1: none)
     M::LatchState latch{};
+    u32 visceral_held_serial{0}; // only a deferred stroke loses the closed-window grace
     // The live attack (its identity also under g_attack_mutex: the damage step reads it).
     bool live{false};
     u32 serial{0};
@@ -2552,8 +3029,15 @@ struct LeftTick {
     u32 slot{0};
     u32 handle{0};
     u32 frames{0};
+    float damage_scale{1.0f}; // its window's (split blades, honed: MeleeWindow::damage_scale)
     s32 paid{0}; // the stamina it took
     u32 hits{0}; // (under g_attack_mutex: the damage step counts them)
+    // As the damage step sees it (MeleeLeftHitInfoOf: the left claw's cut), synced each update
+    // under g_attack_mutex: its swing's fastest tip and widest sweep (rad) so far, and whether its
+    // row is the left part's for sure (learned: one still being tried may hit on the right side).
+    float tip_peak{0.0f};
+    float arc_peak{0.0f};
+    bool sure{false};
     s64 created_ns{0};
     s64 ended_ns{0};
     const char* logged_why{nullptr};
@@ -2573,20 +3057,24 @@ std::string& LearnedLeftRows() {
 // transforms (a split, a join) and from session to session.
 void RestoreLeftRow(LeftTick& l) {
     const s32 learned = VR::Tricks::LeftRowOf(LearnedLeftRows(), l.key);
-    const s32 judge = learned >= 0 ? learned : VR::Tricks::KnownLeftRow(l.key);
+    const bool kos = l.key == M::Kos::LeftKey;
+    const s32 judge = M::Kos::PreferredLeftJudge(l.key, learned, VR::Tricks::KnownLeftRow(l.key));
     for (u32 i = 0; judge >= 0 && i < l.count; ++i) {
         if (l.judges[i] == judge) {
             l.next = i;
             l.verified = true;
-            if (learned < 0 && l.check == 0) {
+            if (kos) {
+                l.check = 0; // no session-wide fist/side check for a moving tentacle
+            } else if (learned < 0 && l.check == 0) {
                 l.check = l.key; // known, never seen: its first hit is checked
             }
             LOG_INFO(Core, "VR melee left: judge {} {}", judge,
-                     learned >= 0 ? "remembered (melee_left_rows)"
+                     learned >= 0 && !kos ? "remembered (melee_left_rows)"
                                   : "known: the game's own left-hand attack");
             return;
         }
     }
+    if (kos) l.count = 0; // missing native row: never probe unrelated right-hand attacks
 }
 
 // The weapon's attack rows (refType 0) its left hand may use: the right weapon's transformed
@@ -2690,6 +3178,14 @@ void LeftOpen(u8* chr, LeftTick& l, const Combat::MeleeWindow& w, s64 now) {
         return;
     }
     const u32 slot = LeftFirstSlot + (w.serial & 1);
+    if (l.key == M::Kos::LeftKey) {
+        l.kos_check.Begin(now);
+        B::Vec3 marker{}, grip{};
+        const bool seen = DummyAt(chr, M::Kos::LeftTip, marker) &&
+                          DummyAt(chr, LeftWeaponDummy, grip);
+        // Seed the preceding endpoint before Invoke creates the collision entry.
+        l.kos_check.Step(now, false, {}, seen, marker, grip);
+    }
     l.probing = probe;
     l.reprobe = false;
     const s32 before = Read<s32>(data + OffsetStamina);
@@ -2704,12 +3200,16 @@ void LeftOpen(u8* chr, LeftTick& l, const Combat::MeleeWindow& w, s64 now) {
         std::scoped_lock lock{g_attack_mutex};
         l.live = ok != 0;
         l.serial = w.serial;
+        l.damage_scale = std::clamp(w.damage_scale, 0.25f, 3.0f);
         l.bid = bid;
         l.slot = slot;
         l.handle = handle;
         l.frames = 0;
         l.paid = ok != 0 ? std::max(before - after, 0) : 0;
         l.hits = 0;
+        l.tip_peak = 0.0f;
+        l.arc_peak = 0.0f;
+        l.sure = l.verified && !l.probing;
         l.created_ns = now;
         l.ended_ns = 0;
     }
@@ -2734,6 +3234,25 @@ void LeftOpen(u8* chr, LeftTick& l, const Combat::MeleeWindow& w, s64 now) {
     }
 }
 
+// Milkweed's left hit follows its left-part dummy even when crossing the right
+// hand. A missing/stale pose rejects this swing only; the next swing checks anew.
+void CheckKosLeft(u8* chr, LeftTick& l, const u8* entry, s64 now) {
+    B::Vec3 hit{}, marker{}, grip{};
+    const bool attached = g_stake_geometry && entry != nullptr &&
+                          M::Kos::LeftAttachment({entry, EntrySize});
+    if (attached) {
+        hit = {Read<float>(entry + OffsetEntryA), Read<float>(entry + OffsetEntryA + 4),
+               Read<float>(entry + OffsetEntryA + 8)};
+    }
+    const bool seen = DummyAt(chr, M::Kos::LeftTip, marker) &&
+                      DummyAt(chr, LeftWeaponDummy, grip);
+    if (l.kos_check.Step(now, attached, hit, seen, marker, grip) != M::Kos::Check::Reject)
+        return;
+    LeftFinalize(chr, l, true, "Milkweed left tentacle attachment not ready", now);
+    l.latch.active = false;
+    l.latch.done = true; // do not retry this window or disable later swings
+}
+
 // The first punch with a gun in the hand: the fist's row with another weapon in that hand is
 // untested, so its hitbox must show up at the left fist. Else it ends now (its stamina back unless
 // it hit) and gun punches stay off (logged); with the fists together, the hitbox between them or
@@ -2755,7 +3274,7 @@ void CheckGunPunch(u8* chr, LeftTick& l, s64 now) {
     }
     if (entry == nullptr || !B::IsFinite(a) || B::LengthSq(a) == 0.0f ||
         !DummyAt(chr, LeftWeaponDummy, left) || !DummyAt(chr, RightWeaponDummy, right)) {
-        if (l.frames >= GunPunchFrames) {
+        if (l.frames >= VR::GameFramesAt60(GunPunchFrames)) {
             LOG_INFO(Core, "VR melee left: #{} a punch with the gun in the hand: no hitbox seen in "
                            "{} updates: gun punches off for this session", l.serial, l.frames);
             off("the gun punch showed no hitbox");
@@ -2767,7 +3286,8 @@ void CheckGunPunch(u8* chr, LeftTick& l, s64 now) {
         // maps it to the left weapon (20100), not the body or right weapon.
         B::Vec3 weapon{};
         if (!DummyAt(chr, 20100, weapon)) {
-            if (l.frames >= GunPunchFrames) off("left weapon dummy unavailable");
+            if (l.frames >= VR::GameFramesAt60(GunPunchFrames))
+                off("left weapon dummy unavailable");
             return;
         }
         const float error = B::Length(a - weapon);
@@ -2823,7 +3343,8 @@ void CheckLeftProbe(u8* chr, LeftTick& l, s64 now) {
     const float to_left = seen ? B::Length(a - left) : 0.0f;
     const float to_right = seen ? B::Length(a - right) : 0.0f;
     const s32 judge = l.judges[l.next];
-    switch (Tr::ProbeStep(seen, to_left, to_right, l.frames)) {
+    switch (Tr::ProbeStep(seen, to_left, to_right, l.frames,
+                          VR::GameFramesAt60(Tr::ProbeFrames))) {
     case Tr::Probe::Wait:
         return;
     case Tr::Probe::Learned:
@@ -2868,13 +3389,27 @@ void LeftRefresh(u8* chr, LeftTick& l, s64 now) {
         LeftEnd(l, "no verified attack", now);
         return;
     }
+    const bool kos = l.key == M::Kos::LeftKey;
+    const u8* const kos_entry = kos ? HitEntry(l.handle, l.bid) : nullptr;
+    if (kos && (Read<u32>(module + OffsetAttackSlots + l.slot * 8) != l.handle ||
+                kos_entry == nullptr)) {
+        // Invoke can create a replacement if the old attack was retired. This
+        // swing has already paid; never give it another charge or fresh hit list.
+        LeftFinalize(chr, l, false, "Milkweed left attack ended natively", now);
+        l.latch.active = false;
+        l.latch.done = true;
+        return;
+    }
     if (l.probing) {
         CheckLeftProbe(chr, l, now);
         if (!l.live) {
             return; // not refreshed: the game ends it this update
         }
     }
-    if (l.check != 0 && HitCheckOf(l.check) == GunPunch::Unknown) {
+    if (kos && !l.kos_check.Accepted()) {
+        CheckKosLeft(chr, l, kos_entry, now);
+        if (!l.live) return;
+    } else if (l.check != 0 && HitCheckOf(l.check) == GunPunch::Unknown) {
         CheckGunPunch(chr, l, now);
         if (!l.live) {
             return; // not refreshed: the game ends it this update
@@ -2981,7 +3516,9 @@ void LeftMeleeTick(u8* chr, const TickState& t, const MeleeBody& body, s64 now,
             ScanLeftRows(l, hand == HandRight ? t.moves : nullptr);
             RestoreLeftRow(l);
             l.whoosh = hand == HandRight ? 611 : -1; // (the form-B default, as the right's)
-            if (hand == HandRight && t.moves != nullptr) {
+            if (hand == HandRight && t.moves != nullptr && t.variation != 101) {
+                // Kos 101's new right-hand form-B rows are punches, not the
+                // left part's rows. Preserve that part's existing cost and sound.
                 if (const M::MoveRow* light = M::ChooseMove(*t.moves, true, M::MoveKind::Light).row;
                     light != nullptr) {
                     l.cost = light->stamina; // the right hand's light: the same weapon's pace
@@ -3067,7 +3604,17 @@ void LeftMeleeTick(u8* chr, const TickState& t, const MeleeBody& body, s64 now,
         // refreshing it): finished here, its stamina back when it was no swing.
         LeftFinalize(chr, l, w.prev_serial == l.serial && w.prev_aborted, "a new swing", now);
     }
-    switch (M::StepLatch(l.latch, li)) {
+    // Do not let a new off-hand attack spoil a right-hand stab while its verdict/native
+    // check is pending. Existing left attacks are not restarted or charged twice.
+    Combat::ThrustState thrust{};
+    Combat::VisceralOpen opening{};
+    const auto& ms = M::GetMeleeSettings();
+    const bool reserve = (!l.latch.active || l.latch.serial != w.serial) && have && w.open &&
+                         g_visceral && ms.visceral && ms.visceral_thrust && !ms.visceral_swing &&
+                         Combat::ThrustChannel().Load(thrust) &&
+                         Combat::VisceralOpenChannel().Load(opening) &&
+                         M::Thrust::ForwardIntent(thrust, opening, now);
+    switch (M::Thrust::StepOffhand(l.latch, li, l.visceral_held_serial, reserve)) {
     case M::LatchStep::Create:
         LeftOpen(chr, l, w, now);
         break;
@@ -3097,6 +3644,22 @@ void LeftMeleeTick(u8* chr, const TickState& t, const MeleeBody& body, s64 now,
         }
         break;
     }
+    // The live attack's swing for the damage step (MeleeLeftHitInfoOf): its own window's tip speed
+    // and sweep, kept for the attack (a newer window replaces the latest one), and whether its row
+    // is learned by now (a probe may learn it mid-swing).
+    const bool sure = l.verified && !l.probing;
+    // (Its swing's peaks: only the Beast Claw's left claw cuts.)
+    const bool swing = have && l.live && w.serial == l.serial &&
+                       l.variation == VR::Sever::BeastClawVariation;
+    if (sure != l.sure || (swing && (w.tip_peak > l.tip_peak || w.tip_speed > l.tip_peak ||
+                                     w.arc_peak > l.arc_peak))) {
+        std::scoped_lock lock{g_attack_mutex};
+        l.sure = sure;
+        if (swing) {
+            l.tip_peak = std::max({l.tip_peak, w.tip_peak, w.tip_speed});
+            l.arc_peak = std::max(l.arc_peak, w.arc_peak);
+        }
+    }
     status.left_ok = why == nullptr;
     status.left_why = why != nullptr ? why : "";
     status.left_learning = variation >= 0 && g_physical && Tr::GetTrickSettings().melee_left &&
@@ -3108,11 +3671,12 @@ void LeftMeleeTick(u8* chr, const TickState& t, const MeleeBody& body, s64 now,
 }
 
 // The damage step: a hit of the left swing's attack (its row and capsule): the left hand's impact.
-bool LeftMeleeHit(u8* res, float damage, s64 now) {
+bool LeftMeleeHit(u8* res, float& damage, s64 now) {
     const s32 bid = Read<s32>(res + ResBid);
     const u32 handle = Read<u32>(res + ResHandle);
     u32 serial = 0;
     bool gun = false;
+    float scale = 1.0f;
     {
         std::scoped_lock lock{g_attack_mutex};
         LeftTick& l = g_left;
@@ -3122,12 +3686,122 @@ bool LeftMeleeHit(u8* res, float damage, s64 now) {
         }
         serial = l.serial;
         gun = l.gun;
+        scale = l.damage_scale;
         ++l.hits;
     }
-    Combat::PushMeleeEvent({Combat::MeleeEventKind::LeftHit, serial, damage, 0.09f, now, ""});
+    // The split blades' (a honed one's: core/vr/dual_blades.h); else its damage is the game's.
+    const float before = damage;
+    if (scale != 1.0f && std::isfinite(damage) && damage > 0.0f) {
+        damage *= scale;
+    }
+    Combat::PushMeleeEvent(
+        {Combat::MeleeEventKind::LeftHit, serial, damage, 0.09f, now, "", scale});
     // A gun's punch: whose attack rating it hits with (the gun's, or the right weapon's?).
-    LOG_INFO(Core, "VR melee left: #{} HIT dmg {:.1f}{}", serial, damage,
-             gun ? " (a punch with the gun in the hand)" : "");
+    LOG_INFO(Core, "VR melee left: #{} HIT dmg {:.1f}{}{}", serial, damage,
+             gun ? " (a punch with the gun in the hand)" : "",
+             scale != 1.0f ? fmt::format(" ({:.1f} x{:.2f}: split blades)", before, scale)
+                           : std::string{});
+    return true;
+}
+
+// ---- Confirmed object destruction (feedback only) --------------------------------------------
+// 1.09: 0x18B8430 processes an attack on a MapObj. At 0x18B8507 it calls
+// 0x15A50B0(object=r12, result=rbx, ...). That function subtracts object HP (+0x1FA)
+// and, only when it reaches zero, calls the break action (0x17ED4C0) and returns 1.
+// Observe its return at 0x18B850C: eax is the break result, r14 the attacker, rbx the
+// hit result. Do not call the native function again, change its return, or retain the object.
+constexpr std::array<u8, 28> ObjectBreakCallSig = {
+    0x49, 0x8B, 0x06, 0x4C, 0x89, 0xF7, 0xFF, 0x90, 0xA8, 0x01, 0x00, 0x00,
+    0x34, 0x01, 0x0F, 0xB6, 0xD0, 0x4C, 0x89, 0xE7, 0x48, 0x89, 0xDE,
+    0xE8, 0xA4, 0xCB, 0xCE, 0xFF,
+};
+constexpr std::array<u8, 65> ObjectBreakResultSig = {
+    0x29, 0xC8, 0x31, 0xC9, 0x66, 0x85, 0xC0, 0x66, 0x0F, 0x4F, 0xC8,
+    0x66, 0x89, 0x8B, 0xFA, 0x01, 0x00, 0x00, 0x0F, 0x8F, 0x12, 0xFA, 0xFF, 0xFF,
+    0x48, 0x8D, 0xBB, 0x10, 0x02, 0x00, 0x00, 0x49, 0x8D, 0xB4, 0x24, 0x80, 0x01,
+    0x00, 0x00, 0xBA, 0x01, 0x00, 0x00, 0x00, 0xE8, 0xAD, 0x7B, 0x24, 0x00,
+    0x49, 0x8B, 0xB4, 0x24, 0xE0, 0x01, 0x00, 0x00, 0xB0, 0x01, 0x89, 0x85,
+    0xC0, 0xFB, 0xFF, 0xFF,
+};
+constexpr std::array<u8, 9> ObjectBreakReturnSig = {
+    0x8B, 0x85, 0xC0, 0xFB, 0xFF, 0xFF, 0x0F, 0xB6, 0xC0,
+};
+std::unique_ptr<Xbyak::CodeGenerator> g_object_break_code;
+VR::Haptics::ObjectBreak::Gate g_object_break_gate; // g_attack_mutex
+
+void PS4_SYSV_ABI MeleeObjectBroken(u8* res, u8* attacker) {
+    if (!g_physical || res == nullptr || attacker == nullptr || attacker != MainPlayer() ||
+        Read<s32>(res + ResBullet) != -1) {
+        return; // enemy, bullet, explosion or scripted destruction: no held-weapon impact
+    }
+    const s64 now = NowNs();
+    const s32 bid = Read<s32>(res + ResBid);
+    const u32 handle = Read<u32>(res + ResHandle);
+    u32 serial = 0;
+    unsigned hand = 1;
+    bool both = false;
+    {
+        std::scoped_lock lock{g_attack_mutex};
+        s64 created = 0;
+        const LeftTick& l = g_left;
+        if (l.bid >= 0 && bid == l.bid && handle == l.handle &&
+            (l.live || (now >= l.ended_ns && now - l.ended_ns <= HitGraceNs))) {
+            if (!l.sure) {
+                return; // an unverified left-row probe must not fall through to a right whip
+            }
+            hand = 0;
+            serial = l.serial;
+            created = l.created_ns;
+        } else {
+            Attack* a = FindAttack(bid, handle, now);
+            if (a == nullptr) {
+                // The same checked extra-capsule allowance as the native map-hit path.
+                a = FindAttack(bid, 0, now);
+                if (a != nullptr && !IsWhipRow(a->row) &&
+                    !(a->weapon_variation == 2500 && a->form_b)) {
+                    a = nullptr;
+                }
+            }
+            if (a == nullptr) {
+                return;
+            }
+            serial = a->serial;
+            created = a->created_ns;
+            both = a->two_handed;
+        }
+        if (!g_object_break_gate.Admit(hand, serial, created)) {
+            return;
+        }
+    }
+    Combat::PushMeleeEvent({Combat::MeleeEventKind::ObjectBreak, serial,
+                          static_cast<float>(hand), both ? 1.0f : 0.0f, now, ""});
+    // No enemy-hit counters, stamina refunds, hone consumption or combat state changes.
+}
+
+bool InstallObjectBreak(u8* module) {
+    namespace Native = VR::Haptics::ObjectBreak::Native;
+    if (std::memcmp(module + Native::SiteRva, Native::SiteSig.data(),
+                    Native::SiteSig.size()) != 0 ||
+        std::memcmp(module + 0x18B84F0, ObjectBreakCallSig.data(), ObjectBreakCallSig.size()) != 0 ||
+        std::memcmp(module + 0x15A58E2, ObjectBreakResultSig.data(), ObjectBreakResultSig.size()) != 0 ||
+        std::memcmp(module + 0x15A58A9, ObjectBreakReturnSig.data(), ObjectBreakReturnSig.size()) != 0) {
+        LOG_WARNING(Core, "VR melee: object-break feedback unavailable (1.09 signature differs)");
+        return false;
+    }
+    auto code = std::make_unique<Xbyak::CodeGenerator>(4096);
+    // Non-breaking contacts never enter host code or save vector registers. Preserve flags
+    // on both paths; the original eax (used later by the game) is also preserved by the helper.
+    const u64 resume = reinterpret_cast<u64>(module + Native::SiteRva + Native::SiteSig.size());
+    void* const entry = Native::Emit(*code, reinterpret_cast<void*>(&MeleeObjectBroken), resume);
+    code->ready();
+    u8* const site = module + Native::SiteRva;
+    if (!Hook::MakeWritable(site, Native::SiteSig.size())) {
+        LOG_WARNING(Core, "VR melee: could not install object-break feedback");
+        return false;
+    }
+    // Keep the executable storage alive before publishing its address to the guest.
+    g_object_break_code = std::move(code);
+    Hook::WriteJump(site, Native::SiteSig.size(), entry);
     return true;
 }
 
@@ -3216,6 +3890,12 @@ void InstallMelee(VAddr base, u64 size) {
         std::memcmp(module + StakeDummyStoreRva, StakeDummyStoreSig.data(), StakeDummyStoreSig.size()) == 0;
     g_invoke = reinterpret_cast<InvokeAttackFn>(module + InvokeAttackRva);
     g_dmy_poly = reinterpret_cast<DmyPolyFn>(module + DmyPolyRva);
+    if (std::memcmp(module + WeaponRowRva, WeaponRowSig.data(), WeaponRowSig.size()) == 0) {
+        g_weapon_row = reinterpret_cast<WeaponRowFn>(module + WeaponRowRva);
+    } else {
+        LOG_WARNING(Core, "VR melee: WeaponParamRow does not match: no fitted solid shapes (the "
+                          "weapons' lines as before)");
+    }
     g_play_sound = reinterpret_cast<PlaySoundFn>(module + PlaySoundRva);
     {
         s32 disp{};
@@ -3254,6 +3934,13 @@ void InstallMelee(VAddr base, u64 size) {
     }
     LOG_INFO(Core, "VR melee left: scoped native weapon hand selection {}",
              g_left_hand_hook ? "ready" : "unavailable (torch/Gratia swings disabled)");
+    try {
+        const bool object_break_ready = InstallObjectBreak(module);
+        LOG_INFO(Core, "VR melee: confirmed object-break feedback {}",
+                 object_break_ready ? "ready" : "unavailable");
+    } catch (const Xbyak::Error& error) {
+        LOG_WARNING(Core, "VR melee: object-break feedback unavailable ({})", error.what());
+    }
     g_installed = true;
     g_physical = true;
     LOG_INFO(Core,
@@ -3274,8 +3961,662 @@ void InstallMelee(VAddr base, u64 size) {
              g_dry_run ? " DRY RUN (no attack)" : "");
 }
 
+namespace {
+// Same generation-checked WorldChrMan lookup used by bloodborne_deflect.cpp. Only
+// the integer handle crosses frames; the resolved pointer is borrowed for this call.
+u8* ItemBladeTarget(u32 handle) {
+    if (!g_base || !VR::ShamanBlade::CharacterHandle(handle)) return nullptr;
+    u8* const mgr = Read<u8*>(g_base + WorldChrManRva);
+    u8* const blocks = Plausible(mgr) ? Read<u8*>(mgr + 0x08) : nullptr;
+    if (!Plausible(blocks)) return nullptr;
+    const s32 block_count = Read<s32>(blocks + 0x18);
+    const u32 block = (handle >> 14) & 0x3f, slot = handle & 0x3fff;
+    if (block_count < 0 || block_count > 64 || block >= static_cast<u32>(block_count+2))
+        return nullptr;
+    u8* const set = Read<u8*>(mgr + 0x850 + 8*block);
+    if (!Plausible(set)) return nullptr;
+    const s32 count = Read<s32>(set);
+    if (count <= 0 || count > 0x4000 || slot >= static_cast<u32>(count)) return nullptr;
+    u8* const entries = Read<u8*>(set + 0x08);
+    u8* const chr = Plausible(entries) ? Read<u8*>(entries + 0x38*slot) : nullptr;
+    if (!Plausible(chr) || Read<u32>(chr+0x08) != handle) return nullptr;
+    const u8* const vtable = Read<u8*>(chr);
+    return vtable == g_base+ChrInsVtableRva || vtable == g_base+EnemyInsVtableRva ? chr : nullptr;
+}
+
+bool ItemBladePath(u8* player, B::Vec3 base, B::Vec3 point, float scale) {
+    // Check that the hand has not been carried through scenery before checking the
+    // blade. A ray starting at an already-clipped hand alone could miss that wall.
+    const B::Vec3 chest = ChrPos(player) + B::Vec3{0,1.2f*scale,0};
+    const float radius=VR::ShamanBlade::ContactRadius(scale);
+    if (!MapSpherePathClear(chest,base,radius)) return false;
+    return B::LengthSq(point-base) <= 1e-10f ||
+           MapSpherePathClear(base,point,radius);
+}
+} // namespace
+
+bool ItemBladeContactStillValid(u32 target, B::Vec3 base, B::Vec3 point, float scale) {
+    namespace S = VR::ShamanBlade;
+    if (!g_installed || !g_physical || !S::ValidScale(scale) ||
+        !S::Finite(base) || !S::Finite(point)) return false;
+    u8* const player = MainPlayer();
+    u8* const chr = ItemBladeTarget(target);
+    if (!player || !chr || chr==player || !B::IsFinite(ChrPos(player)) ||
+        B::Length(point-ChrPos(player)) > 3.0f*scale ||
+        B::Length(base-point) > .5f*scale || !ItemBladePath(player,base,point,scale)) return false;
+    u8* const data = Module(chr,L::OffsetDataModule);
+    if (!data || Read<s32>(data+L::OffsetHp)<=0) return false;
+    std::array<VR::GrabCamera::CollisionCapsule,64> capsules{};
+    const size_t n=VictimCapsules(chr,ChrPos(chr),scale,capsules);
+    for (size_t i=0; i<n; ++i) {
+        B::Vec3 ignored{};
+        if (S::Touch(point,point,point,point,scale,capsules[i],ignored)) return true;
+    }
+    return false;
+}
+
+bool ItemBladeContact(B::Vec3 a0, B::Vec3 b0, B::Vec3 a1, B::Vec3 b1,
+                      float scale, B::Vec3& contact, u32& target) {
+    namespace S = VR::ShamanBlade;
+    if (!g_installed || !g_physical || !S::Finite(a0) || !S::Finite(b0) ||
+        !S::Finite(a1) || !S::Finite(b1) || !S::ValidScale(scale) ||
+        B::Length(a1-a0) > .35f*scale || B::Length(b1-b0) > .35f*scale) return false;
+    u8* const player = MainPlayer();
+    if (!player || !B::IsFinite(ChrPos(player)) ||
+        B::Length(b1-ChrPos(player)) > 3.0f*scale) return false;
+    u8* const managers = Read<u8*>(g_base+AiManagersRva);
+    if (!Plausible(managers)) return false;
+    const s32 count = Read<s32>(managers+OffsetAiManagerCount);
+    u8* const array = Read<u8*>(managers+OffsetAiManagerArray);
+    if (count <= 0 || count > 8 || !Plausible(array)) return false;
+    std::array<VR::GrabCamera::CollisionCapsule, 64> capsules{};
+    for (s32 m=0; m<count; ++m) {
+        u8* const manager = array+static_cast<size_t>(m)*AiManagerSize;
+        u8* entry = Read<u8*>(manager+OffsetAiListBegin);
+        u8* const end = Read<u8*>(manager+OffsetAiListEnd);
+        for (int k=0; k<256 && Plausible(entry) && entry<end; ++k, entry+=8) {
+            u8* const node = Read<u8*>(entry);
+            u8* const think = Plausible(node) ? Read<u8*>(node+OffsetAiEntryThink) : nullptr;
+            u8* const ai = Plausible(think) ? Read<u8*>(think) : nullptr;
+            u8* const chr = Plausible(ai) ? AiChr(ai) : nullptr;
+            if (!chr || chr==player || !B::IsFinite(ChrPos(chr)) ||
+                B::LengthSq(ChrPos(chr)-b1)>36.0f*scale*scale) continue;
+            const u32 handle=Read<u32>(chr+0x08);
+            if (!S::CharacterHandle(handle)) continue;
+            u8* const data = Module(chr,L::OffsetDataModule);
+            if (!data || Read<s32>(data+L::OffsetHp)<=0) continue;
+            const size_t n = VictimCapsules(chr,ChrPos(chr),scale,capsules);
+            for (size_t c=0; c<n; ++c) {
+                B::Vec3 point{};
+                if (!S::Touch(a0,b0,a1,b1,scale,capsules[c],point)) continue;
+                if (!ItemBladePath(player,a1,point,scale)) continue;
+                contact=point;
+                target=handle;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+size_t GatherEnemyCapsules(B::Vec3 centre, float reach, float scale, EnemyCapsules& out) {
+    namespace S = VR::ShamanBlade;
+    out.count = 0;
+    if (!g_installed || !S::Finite(centre) || !S::ValidScale(scale) || !std::isfinite(reach) ||
+        reach <= 0) return 0;
+    u8* const player = MainPlayer();
+    u8* const managers = player ? Read<u8*>(g_base+AiManagersRva) : nullptr;
+    if (!Plausible(managers)) return 0;
+    const s32 count = Read<s32>(managers+OffsetAiManagerCount);
+    u8* const array = Read<u8*>(managers+OffsetAiManagerArray);
+    // Central Yharnam reports 17 managers in the native runtime. Eight was a
+    // sampling limit in the old AI observer, not the maximum valid native count.
+    // Keep the walk bounded; each list and the resulting capsule store are capped too.
+    if (count <= 0 || count > 64 || !Plausible(array))
+        return 0;
+    // The live enemies near it (their root within `reach` plus a tall one's 6 m), nearest first,
+    // so a full store keeps the ones that matter.
+    struct Near { u8* chr; B::Vec3 root; float d2; };
+    std::array<Near, 64> near_list;
+    size_t found = 0;
+    const float r = reach+6.0f*scale;
+    for (s32 m=0; m<count; ++m) {
+        u8* const manager = array+static_cast<size_t>(m)*AiManagerSize;
+        u8* entry = Read<u8*>(manager+OffsetAiListBegin);
+        u8* const end = Read<u8*>(manager+OffsetAiListEnd);
+        for (int k=0; k<256 && Plausible(entry) && entry<end; ++k, entry+=8) {
+            u8* const node = Read<u8*>(entry);
+            u8* const think = Plausible(node) ? Read<u8*>(node+OffsetAiEntryThink) : nullptr;
+            u8* const ai = Plausible(think) ? Read<u8*>(think) : nullptr;
+            u8* const chr = Plausible(ai) ? AiChr(ai) : nullptr;
+            if (!chr || chr==player) continue;
+            const B::Vec3 root = ChrPos(chr);
+            const float d2 = B::IsFinite(root) ? B::LengthSq(root-centre) : -1.0f;
+            if (!(d2 >= 0.0f) || d2 > r*r || !S::CharacterHandle(Read<u32>(chr+0x08))) continue;
+            u8* const data = Module(chr,L::OffsetDataModule);
+            if (!data || Read<s32>(data+L::OffsetHp)<=0) continue;
+            if (found < near_list.size()) {
+                near_list[found++] = {chr, root, d2};
+            } else {
+                // Full: replace the farthest if this one is nearer.
+                size_t farthest = 0;
+                for (size_t i=1; i<found; ++i)
+                    if (near_list[i].d2 > near_list[farthest].d2) farthest = i;
+                if (d2 < near_list[farthest].d2) near_list[farthest] = {chr, root, d2};
+            }
+        }
+    }
+    std::sort(near_list.begin(), near_list.begin()+static_cast<std::ptrdiff_t>(found),
+              [](const Near& a, const Near& b) { return a.d2 < b.d2; });
+    static std::array<VR::GrabCamera::CollisionCapsule, 64> scratch; // Game:Main only
+    for (size_t i=0; i<found && out.count<EnemyCapsules::Max; ++i) {
+        const size_t n = VictimCapsules(near_list[i].chr,near_list[i].root,scale,scratch);
+        const u32 handle = Read<u32>(near_list[i].chr+0x08);
+        for (size_t c=0; c<n && c<scratch.size() && out.count<EnemyCapsules::Max; ++c) {
+            const auto& cap = scratch[c];
+            if (!S::Finite(cap.a) || !S::Finite(cap.b) || !std::isfinite(cap.radius) ||
+                cap.radius <= 0 || cap.radius > 2.0f*scale) continue;
+            out.capsules[out.count] = cap;
+            out.handle[out.count++] = handle;
+        }
+    }
+    return out.count;
+}
+
+bool SphereHitsCapsules(B::Vec3 from, B::Vec3 to, float radius, float scale,
+                        const EnemyCapsules& caps, float& fraction, B::Vec3& away, u32* target) {
+    namespace S = VR::ShamanBlade;
+    if (!S::Finite(from) || !S::Finite(to) || !S::ValidScale(scale) || !std::isfinite(radius) ||
+        radius <= 0 || radius > scale) return false;
+    const float length = B::Length(to-from);
+    if (!(length >= 0.0f) || length > 2.0f*scale) return false; // (0: a still item, a touch)
+    const auto e = [](B::Vec3 p) { return Evade::Vec3{p.x,p.y,p.z}; };
+    float best = 2.0f;
+    for (size_t c=0; c<caps.count && c<EnemyCapsules::Max; ++c) {
+        const auto& cap = caps.capsules[c];
+        Evade::Vec3 p{}, q{};
+        const float d2 = Evade::SegSegClosest(e(from),e(to),e(cap.a),e(cap.b),p,q);
+        const float r = radius+cap.radius;
+        if (!(d2 <= r*r)) continue;
+        // The first touch: back from the closest point along the path by what the spheres
+        // overlap there.
+        const B::Vec3 at{p.x,p.y,p.z};
+        const float t = length > 1e-6f
+            ? std::clamp((B::Length(at-from)-std::sqrt(r*r-d2))/length, 0.0f, 1.0f)
+            : 0.0f;
+        if (t < best) {
+            best = t;
+            away = B::Vec3{p.x-q.x, 0.0f, p.z-q.z};
+            if (target) *target = caps.handle[c];
+        }
+    }
+    if (best > 1.0f) return false;
+    fraction = best;
+    return true;
+}
+
+bool ItemSphereEnemyHit(B::Vec3 from, B::Vec3 to, float radius, float scale, float& fraction,
+                        B::Vec3& away, u32* target) {
+    static EnemyCapsules caps; // Game:Main only (the render tick): 16 KB once, off the stack
+    if (!B::IsFinite(from) || !B::IsFinite(to)) return false;
+    const B::Vec3 mid = from+(to-from)*.5f;
+    if (GatherEnemyCapsules(mid, .5f*B::Length(to-from)+radius, scale, caps) == 0) return false;
+    return SphereHitsCapsules(from, to, radius, scale, caps, fraction, away, target);
+}
+
 bool MeleePhysicalWanted() {
     return g_installed && g_physical;
+}
+
+// A character's world frame: ChrCtrl's matrix (three float4 rows {R, t}); `axes`: R's columns.
+static bool ChrFrame(const u8* chr, B::Vec3& pos, std::array<B::Vec3, 3>& axes) {
+    u8* const ctrl = Read<u8*>(chr + L::OffsetChrCtrl);
+    if (!Plausible(ctrl)) return false;
+    const u8* w = ctrl + OffsetCtrlWorld;
+    std::array<float, 12> m{};
+    for (int i = 0; i < 12; ++i) m[i] = Read<float>(w + 4 * i);
+    pos = {m[3], m[7], m[11]};
+    axes = {B::Vec3{m[0], m[4], m[8]}, B::Vec3{m[1], m[5], m[9]}, B::Vec3{m[2], m[6], m[10]}};
+    for (const auto& a : axes)
+        if (!B::IsFinite(a) || std::abs(B::Length(a) - 1.f) > .1f) return false;
+    return B::IsFinite(pos);
+}
+
+// An enemy's weight from its hit capsules near `at` (their volume as flesh, world scale removed):
+// a living ragdoll's bodies have no mass of their own until it goes limp.
+static float CapsuleKg(u32 handle, B::Vec3 at, float scale) {
+    static EnemyCapsules caps; // Game:Main only (the render tick), as ItemSphereEnemyHit's
+    if (GatherEnemyCapsules(at, 8.f * scale, scale, caps) == 0) return 0.f;
+    float volume = 0.f;
+    for (size_t i = 0; i < caps.count; ++i) {
+        if (caps.handle[i] != handle) continue;
+        const auto& c = caps.capsules[i];
+        const float r = c.radius / scale, l = B::Length(c.b - c.a) / scale;
+        volume += 3.14159265f * r * r * l + 4.f / 3.f * 3.14159265f * r * r * r;
+    }
+    return std::isfinite(volume) ? volume * VR::AmygdalanHook::FleshKgPerM3 : 0.f;
+}
+
+// Main-player adapter: physical tip contacts and static-map checks here; native
+// ragdoll forces execute on the selected enemy's own update in bloodborne_ragdoll.
+static void AmygdalanHookProbe(u8* chr, const TickState& t, const MeleeBody& body, s64 now) {
+    namespace H = VR::AmygdalanHook;
+    // Explicit test mode only, in a copied-save fixture. No weapon/input needed:
+    // exercise the native recovery before allowing a player's hook to request it.
+    static const bool recovery_test = [] {
+        const char* value = std::getenv("VR_AMYGDALA_HOOK_TEST");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    static const bool trial = [] {
+        const char* value = std::getenv("VR_AMYGDALA_HOOK_TRIAL");
+        return value && std::strcmp(value, "1") == 0 && H::Enabled();
+    }();
+    if (recovery_test || trial) {
+        static s64 first{}, next{};
+        static bool sent{};
+        static ArmHookInput simulated{};
+        static B::Vec3 start_grip{}, start_root{};
+        static s64 caught{}, report{};
+        static float max_moved{};
+        static int round{};
+        static bool cancellation_sent{};
+        if (trial && caught) {
+            const float elapsed = static_cast<float>(now - caught) * 1e-9f;
+            const auto state = ArmHookNow();
+            const float speed = round == 3 ? 1.6f : .6f;
+            const float travel = std::clamp((elapsed - .3f) * speed, 0.f, 1.2f);
+            simulated.grip = start_grip + B::Vec3{0, 0, -travel};
+            simulated.velocity = {0, 0, elapsed > .3f && travel < 1.2f ? -speed : 0.f};
+            if (round == 3) {
+                simulated.grip.y += travel * .5f;
+                simulated.velocity.y = -simulated.velocity.z * .5f;
+            }
+            simulated.ns = now;
+            simulated.held = elapsed < (round == 3 ? 1.f : 3.f);
+            simulated.clear =
+                state.attached && MapSpherePathClear(simulated.grip, state.point, .04f);
+            if (round == 1 && elapsed > 1.5f)
+                simulated.clear = false;
+            if (round == 4 && elapsed > 1.5f && !cancellation_sent) {
+                // A producer can publish a bad context and recover before the
+                // enemy's next callback. The second update must not revive it.
+                auto invalid = simulated;
+                ++invalid.space;
+                UpdateArmHook(invalid);
+                cancellation_sent = true;
+            }
+            if (!(round == 2 && elapsed > 1.5f))
+                UpdateArmHook(simulated);
+            if (state.ns > 0)
+                max_moved = std::max(max_moved, B::Length(state.root - start_root));
+            if (now >= report) {
+                LOG_INFO(Core,
+                         "VR Arm hook TRIAL: round {} t {:.2f} attached={} root moved {:.3f}m",
+                         round, elapsed, state.attached, max_moved);
+                report = now + 250'000'000;
+            }
+            if (elapsed > 7.f) {
+                u8* target = ItemBladeTarget(simulated.target);
+                u8* data = target ? Module(target, L::OffsetDataModule) : nullptr;
+                u8* ctrl = target ? Read<u8*>(target + 0x58) : nullptr;
+                u8* rag = Plausible(ctrl) ? Read<u8*>(ctrl + 0x20) : nullptr;
+                LOG_INFO(Core,
+                         "VR Arm hook TRIAL: COMPLETE round {} released={} state={} hp={} max "
+                         "moved {:.3f}m",
+                         round, state.target == H::NoTarget,
+                         Plausible(rag) ? Read<s32>(rag + 0xC0) : -1,
+                         data ? Read<s32>(data + L::OffsetHp) : -1, max_moved);
+                ++round;
+                caught = 0;
+                sent = round >= 5 || state.target != H::NoTarget;
+            }
+            return;
+        }
+        if (!first)
+            first = now;
+        if (!sent && now - first > 20'000'000'000 && now >= next) {
+            next = now + 1'000'000'000;
+            static EnemyCapsules candidates;
+            GatherEnemyCapsules(ChrPos(chr), 50.f, 1.f, candidates);
+            LOG_INFO(Core, "VR Arm recovery TEST: looking for a target, {} capsules",
+                     candidates.count);
+            for (size_t i = 0; i < candidates.count; ++i) {
+                u8* target = ItemBladeTarget(candidates.handle[i]);
+                if (trial && target) {
+                    if (Read<s32>(target + 0x74) != 2630)
+                        continue;
+                    const auto cap = candidates.capsules[i];
+                    const B::Vec3 point = (cap.a + cap.b) * .5f;
+                    ArmHookInput in{};
+                    in.ns = now;
+                    in.player = reinterpret_cast<u64>(chr);
+                    in.target = candidates.handle[i];
+                    in.grip = point + B::Vec3{0, 0, -1.2f};
+                    in.strength = 30;
+                    in.held = true;
+                    in.clear = MapSpherePathClear(in.grip, point, .04f);
+                    if (BeginArmHook(target, in, point)) {
+                        simulated = in;
+                        start_grip = in.grip;
+                        start_root = ChrPos(target);
+                        caught = now;
+                        max_moved = 0;
+                        cancellation_sent = false;
+                        sent = true;
+                        break;
+                    }
+                } else if (target && AmygdalanRecoveryTest(target)) {
+                    sent = true;
+                    break;
+                }
+            }
+            if (!sent && !trial) {
+                u8* managers = Read<u8*>(g_base + AiManagersRva);
+                const s32 count =
+                    Plausible(managers) ? Read<s32>(managers + OffsetAiManagerCount) : 0;
+                u8* array =
+                    count > 0 && count <= 64 ? Read<u8*>(managers + OffsetAiManagerArray) : nullptr;
+                int alive = 0;
+                for (s32 m = 0; m < count && Plausible(array) && !sent; ++m) {
+                    u8* manager = array + static_cast<size_t>(m) * AiManagerSize;
+                    u8* entry = Read<u8*>(manager + OffsetAiListBegin);
+                    u8* end = Read<u8*>(manager + OffsetAiListEnd);
+                    for (int n = 0; n < 256 && Plausible(entry) && entry < end; ++n, entry += 8) {
+                        u8* node = Read<u8*>(entry);
+                        u8* think =
+                            Plausible(node) ? Read<u8*>(node + OffsetAiEntryThink) : nullptr;
+                        u8* ai = Plausible(think) ? Read<u8*>(think) : nullptr;
+                        u8* target = Plausible(ai) ? AiChr(ai) : nullptr;
+                        u8* data =
+                            target && target != chr ? Module(target, L::OffsetDataModule) : nullptr;
+                        if (!data || Read<s32>(data + L::OffsetHp) <= 0)
+                            continue;
+                        ++alive;
+                        const float distance = B::Length(ChrPos(target) - ChrPos(chr));
+                        LOG_INFO(Core, "VR Arm recovery TEST: c{} {:.1f}m hp {}",
+                                 Read<s32>(target + 0x74), distance, Read<s32>(data + L::OffsetHp));
+                        if (distance < 60.f && AmygdalanRecoveryTest(target)) {
+                            sent = true;
+                            break;
+                        }
+                    }
+                }
+                LOG_INFO(Core, "VR Arm recovery TEST: {} managers, {} living targets", count,
+                         alive);
+            }
+        }
+        if (trial)
+            return; // scripted input owns this isolated fixture, never live controller input
+    }
+    if (!H::ProbeEnabled() && !H::Active())
+        return;
+    static H::Catch probe;
+    static float yaw{};
+    static bool had_yaw{};
+    static B::Vec3 last_grip{}, velocity{};
+    static s64 last_grip_ns{};
+    // The latch (every hit, the enemy still on its feet): its handle, the contact point in its own
+    // frame, the rope's length, when it took hold and the last strain tick; whether a yank may
+    // pull it (light enough, a ragdoll), the throw's swing is over, a yank was refused (logged).
+    struct Latch {
+        u32 handle{H::NoTarget};
+        B::Vec3 local{};
+        float rope{};
+        s64 start{}, strain{};
+        bool movable{}, settled{}, refused{};
+    };
+    static Latch latch{};
+    B::HandsSample hands{};
+    B::Anchor anchor{};
+    B::Vec3 tip{}, grip{};
+    const bool have_hands = B::LatestHands(hands);
+    const bool have_anchor = B::LatestAnchor(anchor) && anchor.valid && anchor.steady_ns > 0 &&
+                             now >= anchor.steady_ns && now - anchor.steady_ns <= H::MaxAgeNs &&
+                             VR::ShamanBlade::ValidScale(anchor.world_scale);
+    const float scale = have_anchor ? anchor.world_scale : 1.f;
+    H::Input input{};
+    input.now = now;
+    input.sample = hands.steady_ns;
+    input.player = reinterpret_cast<u64>(chr);
+    input.space = hands.space_serial;
+    input.variation = t.variation;
+    input.transformed = t.form_b;
+    input.tracked = have_hands && B::IsTracked(hands.hand[1]);
+    input.trigger = hands.hand[1].trigger;
+    input.ready = g_physical && body.body && body.driven && body.right_ik && !body.held &&
+                  have_anchor && VR::IsImmersive() && !VR::IsGameMenuOpen() &&
+                  !VR::MenuPanelActive() && !TransformRun().active &&
+                  TransformSwingBlock() == nullptr && VR::Whip::GetWhipSettings().physical &&
+                  t.variation == 2500 && t.form_b && DummyAt(chr, RightWeaponDummy, grip) &&
+                  DummyAt(chr, 12100, tip) && B::IsFinite(grip) && B::IsFinite(tip) &&
+                  B::Length(tip - grip) <= H::MaxTetherM * scale;
+    input.tip = tip * (1.f / scale);
+    const u32 before = probe.Target();
+    if (!std::isfinite(body.base_yaw) ||
+        (had_yaw &&
+         std::abs(std::remainder(body.base_yaw - yaw, 2.f * 3.14159265f)) > BladeTurnRad)) {
+        input.ready = false; // a snap turn cannot sweep through an enemy
+    }
+    yaw = body.base_yaw;
+    had_yaw = input.ready;
+    const bool search = probe.Step(input);
+    if (before != H::NoTarget && probe.Target() == H::NoTarget && !H::Enabled())
+        LOG_INFO(Core, "VR Arm hook PROBE: released candidate {:#x}; no enemy state changed",
+                 before);
+    ArmHookInput native{};
+    native.ns = input.sample;
+    native.player = input.player;
+    native.space = input.space;
+    native.target = probe.Target();
+    native.scale = scale;
+    native.grip = grip;
+    if (input.sample != last_grip_ns) {
+        const float dt = last_grip_ns && input.sample > last_grip_ns
+                             ? static_cast<float>(input.sample - last_grip_ns) * 1e-9f
+                             : 0.f;
+        velocity = input.ready && dt > 0 && dt <= .1f ? (grip - last_grip) * (1.f / dt) : B::Vec3{};
+        if (!B::IsFinite(velocity) || B::Length(velocity) > 12.f * scale)
+            velocity = {};
+        last_grip = grip;
+        last_grip_ns = input.sample;
+    }
+    native.velocity = velocity;
+    const auto* player_data = Read<const u8*>(chr + 0x3C0);
+    if (Plausible(player_data))
+        native.strength = Read<s32>(player_data + 0x58);
+    if (H::Enabled()) {
+        const auto status = ArmHookNow();
+        const bool fresh = status.ns > 0 && now >= status.ns && now - status.ns <= H::MaxAgeNs &&
+                           status.player == input.player;
+        // The latch: the contact point carried with the enemy as it moves and turns; it lets go
+        // with the trigger, a blocked line, a tether stretched past the lash's reach, or after 10 s.
+        bool latched = false, yank = false;
+        u8* held = nullptr;
+        B::Vec3 point{};
+        if (latch.handle != H::NoTarget) {
+            held = probe.Target() == latch.handle ? ItemBladeTarget(latch.handle) : nullptr;
+            u8* const held_data = held ? Module(held, L::OffsetDataModule) : nullptr;
+            B::Vec3 pos{};
+            std::array<B::Vec3, 3> axes{};
+            if (held_data && Read<s32>(held_data + L::OffsetHp) > 0 && ChrFrame(held, pos, axes)) {
+                point = pos + axes[0] * latch.local.x + axes[1] * latch.local.y +
+                        axes[2] * latch.local.z;
+                const B::Vec3 chest = ChrPos(chr) + B::Vec3{0, 1.2f * scale, 0};
+                const float stretch = B::Length(point - grip);
+                latched = input.ready && now - latch.start < 10'000'000'000 &&
+                          B::IsFinite(point) &&
+                          stretch <= std::min(latch.rope + 1.2f * scale, H::MaxTetherM * scale) &&
+                          MapSpherePathClear(chest, grip, .04f * scale) &&
+                          MapSpherePathClear(grip, point, .04f * scale);
+                if (latched) {
+                    // The yank (H::Yanked): pulled or swung away once the throw's own swing has
+                    // slowed, or a step back stretching the tether.
+                    yank = H::Yanked({velocity * (1.f / scale), (point - grip) * (1.f / scale),
+                                      latch.rope / scale,
+                                      static_cast<float>(now - latch.start) * 1e-9f, latch.movable},
+                                     latch.settled);
+                }
+                if (latched && stretch > latch.rope + .05f * scale &&
+                    now - latch.strain > 250'000'000) {
+                    // Straining against it: the rope taut, a tick now and then.
+                    Combat::PushMeleeEvent(
+                        {Combat::MeleeEventKind::Corpse, 1, .45f, 0.f, now, "Arm hook strain"});
+                    latch.strain = now;
+                }
+            }
+            if (!latched) {
+                LOG_INFO(Core, "VR Arm hook: latch on {:#x} let go after {:.1f} s", latch.handle,
+                         static_cast<float>(now - latch.start) * 1e-9f);
+                latch = {};
+            }
+            H::latch_status.Store({now, input.player, point, latched});
+        }
+        if (probe.Target() != H::NoTarget && (!fresh || !status.attached) && !latched)
+            probe.Cancel();
+        native.target = probe.Target();
+        native.held = input.ready && native.target != H::NoTarget;
+        // The caught enemy's lever (H::LeverWay): the hand's turn at the yank and the way out to
+        // the enemy then; the native pull goes for the lever's tip.
+        static B::Quat lever_q0{};
+        static B::Vec3 lever_way0{};
+        const auto turn = H::HandTurnNow();
+        const bool turn_fresh = turn.ns > 0 && now >= turn.ns && now - turn.ns <= H::MaxAgeNs &&
+                                turn.player == input.player;
+        bool yanked = false;
+        if (yank && native.held && native.target == latch.handle) {
+            // Limp now, pulled by the latch's own rope (the step back stretched it past that).
+            ArmHookInput in = native;
+            in.clear = true; // the latch checked both lines this update
+            lever_way0 = turn_fresh ? B::Normalize(point - grip, B::Vec3{}) : B::Vec3{};
+            lever_q0 = turn.q;
+            in.lever = lever_way0;
+            yanked = BeginArmHook(held, in, point, latch.rope / scale);
+            if (yanked) {
+                LOG_INFO(Core, "VR Arm hook: yanked {:#x} after {:.1f} s: limp, pulled{}",
+                         latch.handle, static_cast<float>(now - latch.start) * 1e-9f,
+                         turn_fresh ? ", swung by the hand's turn" : "");
+                latch = {};
+                H::latch_status.Store({now, input.player, point, false});
+            } else if (!latch.refused) {
+                LOG_INFO(Core, "VR Arm hook: yanked {:#x}, but it could not go limp now: still "
+                               "latched", latch.handle);
+                latch.refused = true;
+            }
+        }
+        native.lever = turn_fresh && (yanked || (fresh && status.attached))
+                           ? H::LeverWay(lever_q0, turn.q, lever_way0)
+                           : B::Vec3{};
+        const B::Vec3 chest = ChrPos(chr) + B::Vec3{0, 1.2f * scale, 0};
+        native.clear = native.held &&
+                       (yanked || (fresh && MapSpherePathClear(chest, grip, .04f * scale) &&
+                                   MapSpherePathClear(grip, status.point, .04f * scale)));
+        UpdateArmHook(native);
+        if (status.target != H::NoTarget && !ItemBladeTarget(status.target))
+            ForgetArmHook(status.target);
+    }
+    // The tentacle's outer half sweeps too, not only its tip: swung out, the tip runs a 3 m circle
+    // round the hand and passes behind an enemy nearer than that while the tentacle goes through
+    // it (the mock, 2026-11-06: whipped back and forth across a Scourge Beast 2 m off, nothing
+    // caught). The part's dummy 130 (on the middle joint's link) and the point halfway from it to
+    // the tip, each from where it was last update.
+    static B::Vec3 last_mid{}, last_half{};
+    static s64 last_mid_ns{};
+    B::Vec3 mid{};
+    const bool have_mid = DummyAt(chr, 12130, mid) && B::IsFinite(mid) &&
+                          B::Length(mid - grip) <= H::MaxTetherM * scale;
+    const bool mid_fresh = have_mid && last_mid_ns > 0 && input.sample > last_mid_ns &&
+                           input.sample - last_mid_ns <= H::MaxAgeNs;
+    const B::Vec3 half = (mid + tip) * .5f, was_mid = last_mid, was_half = last_half;
+    if (have_mid && !body.hands_reused) {
+        last_mid = mid;
+        last_half = half;
+        last_mid_ns = input.sample;
+    }
+    if (!search || body.hands_reused)
+        return;
+    const B::Vec3 from = probe.PreviousTip() * scale;
+    constexpr float TipRadius = .04f;
+    const float radius = TipRadius * scale;
+    const B::Vec3 chest = ChrPos(chr) + B::Vec3{0, 1.2f * scale, 0};
+    if (!MapSpherePathClear(chest, grip, radius))
+        return;
+    // Also test the actual outer capsule (the native row uses 12130 -> 12100).
+    // Three moving points alone leave gaps along it when the jab stops on an enemy.
+    const std::array<std::pair<B::Vec3, B::Vec3>, 4> sweeps{
+        {{from, tip}, {was_half, half}, {was_mid, mid}, {mid, tip}}};
+    float fraction{};
+    B::Vec3 away{}, swept_from{}, swept_to{};
+    u32 handle = H::NoTarget;
+    bool hit = false;
+    for (std::size_t s = 0; s < sweeps.size() && !hit; ++s) {
+        if ((s == 1 || s == 2) && !mid_fresh) continue;
+        if (s == 3 && !have_mid) continue;
+        const auto& [a, b] = sweeps[s];
+        if ((s == 1 || s == 2) && B::Length(b - a) > 1.5f * scale)
+            continue; // a jump (a load, a recentre), not a sweep through the world between
+        hit = ItemSphereEnemyHit(a, b, radius, scale, fraction, away, &handle);
+        if (hit) {
+            const B::Vec3 contact = a + (b - a) * fraction;
+            // Occlusion is needed up to the contact, not beyond the enemy to the missed tip.
+            hit = MapSpherePathClear(grip, contact, radius) &&
+                  (B::LengthSq(contact - a) <= 1e-10f || MapSpherePathClear(a, contact, radius));
+        }
+        swept_from = a;
+        swept_to = b;
+    }
+    if (!hit)
+        return;
+    u8* const target = ItemBladeTarget(handle);
+    u8* const data = target ? Module(target, L::OffsetDataModule) : nullptr;
+    if (!data || Read<s32>(data + L::OffsetHp) <= 0)
+        return;
+    if (H::Enabled()) {
+        // Every hit latches: the tip holds on and follows it, the enemy stays on
+        // its feet. A yank (above) makes one light enough with a ragdoll go limp and be pulled
+        // (core/vr/bloodborne_ragdoll.cpp); anything heavier, or with no ragdoll (bosses too),
+        // never moves.
+        const B::Vec3 contact = swept_from + (swept_to - swept_from) * fraction;
+        const s32 model = Read<s32>(target + 0x74);
+        const float kg = CapsuleKg(handle, contact, scale);
+        const bool ragdoll = VR::Ragdoll::ChrCanRagdoll(model);
+        B::Vec3 pos{};
+        std::array<B::Vec3, 3> axes{};
+        if (!ChrFrame(target, pos, axes))
+            return;
+        // Commit the catch before feedback: overlapping capsules and later held frames
+        // cannot repeat either the puncture or its sound.
+        if (!probe.Contact(handle, true, true))
+            return;
+        const B::Vec3 d = contact - pos;
+        latch = {};
+        latch.handle = handle;
+        latch.local = {B::Dot(d, axes[0]), B::Dot(d, axes[1]), B::Dot(d, axes[2])};
+        latch.rope = B::Length(contact - grip);
+        latch.start = latch.strain = now;
+        latch.movable = ragdoll && kg > 0.f && kg <= H::AnchoredKg;
+        H::latch_status.Store({now, input.player, contact, true});
+        if (!g_dry_run) {
+            const s32 hp = Read<s32>(data + L::OffsetHp);
+            const s32 remaining = H::CatchHp(hp);
+            if (remaining != hp)
+                std::memcpy(data + L::OffsetHp, &remaining, sizeof(remaining));
+            // Existing native blood-impact event (s820); no extra mixer or decoded buffer.
+            Sound(820, contact, 5);
+        }
+        Combat::PushMeleeEvent({Combat::MeleeEventKind::Corpse, 1, 1.f, 0.f, now, "Arm hook"});
+        LOG_INFO(Core, "VR Arm hook: the lash hit c{} {:#x} hp {}, about {:.0f} kg by its capsules: {}",
+                 model, handle, Read<s32>(data + L::OffsetHp), kg,
+                 latch.movable ? "latched, a yank pulls it"
+                 : ragdoll     ? "too heavy: latched, never moved"
+                               : "no ragdoll: latched, never moved");
+    }
+    if (probe.Contact(handle, true, true)) {
+        if (!H::Enabled())
+            LOG_INFO(Core,
+                     "VR Arm hook PROBE: tip touched living c{} handle {:#x}, hp {}; "
+                     "candidate only, living ragdoll recovery NOT enabled",
+                     Read<s32>(target + 0x74), handle, Read<s32>(data + L::OffsetHp));
+    }
 }
 
 // The right weapon's blade (MeleeBladeSegment: its hit capsule, base -> tip) this update and its
@@ -3369,15 +4710,218 @@ void TrackPartBlades(u8* chr, const TickState& t) {
     }
 }
 
+// weapon_wall_shape (bloodborne_weapon_shape.h): each hand's fitted shape, what the other
+// weapon meets (the walls meet the line). Once its weapon, form and the parts in that hand
+// have stayed the same SettleState::DelayNs (a transform's clip has ended), each part's live
+// skeleton and its frame on the grip are captured and the fit is asked for (once per weapon, form
+// and parts for the session); g_shape_key is the key the body looks up (0: none, the line as
+// before: until it has settled, the whips, a weapon without parts in that hand, the setting
+// off). weapon_wall=2 (weapons solid against each other only) has it too.
+std::array<WeaponShape::SettleState, 2> g_shape_track{};
+std::array<std::atomic<u64>, 2> g_shape_key{};
+// The split blades' shine (core/vr/dual_blades.h): the same key, for its model (Request::shine),
+// whatever the solid weapons' settings (the hone works without them). Game:Main only.
+std::array<u64, 2> g_shine_key{};
+
+void ClearWeaponShape() {
+    for (std::size_t hand = 0; hand < g_shape_track.size(); ++hand) {
+        g_shape_track[hand].Reset();
+        g_shape_key[hand].store(0, std::memory_order_relaxed);
+        g_shine_key[hand] = 0;
+    }
+}
+
+void WeaponShapeTick(u8* chr, const TickState& t, s64 now, bool left = false) {
+    const std::size_t hand = left ? 0 : 1;
+    const auto clear = [&] {
+        g_shape_track[hand].Reset();
+        g_shape_key[hand].store(0, std::memory_order_relaxed);
+        g_shine_key[hand] = 0;
+    };
+    // Only the two reviewed paired blades use a second fitted shape.
+    if (left && (!t.form_b || (t.variation != 400 && t.variation != 2700))) {
+        clear();
+        return;
+    }
+    const auto& ts = VR::Tricks::GetTrickSettings();
+    const M::MoveRow* row = FormBladeRow(t);
+    u8* const equip = Read<u8*>(chr + OffsetEquip);
+    u8* const parts = Read<u8*>(chr + OffsetChrAsm);
+    // The solid weapons' shape (its settings), and the split blades' shine model (always: the hone
+    // works with the solid weapons off): either asks for the fit.
+    const bool shape = ts.weapon_wall && ts.weapon_wall_shape &&
+                       // A cached rigid fit cannot follow the moving tentacle's pose.
+                       !(t.variation == 2500 && t.form_b && VR::Whip::GetWhipSettings().physical);
+    const bool shine = t.form_b && VR::DualBlades::IsDualBlades(t.variation);
+    if ((!shape && !shine) || g_weapon_row == nullptr || row == nullptr || IsWhipRow(row) ||
+        !Plausible(equip, 4) || !Plausible(parts)) {
+        clear();
+        return;
+    }
+    const s32 slot = Read<s32>(equip + OffsetEquipRightSlot);
+    const s32 weapon = slot >= 0 && slot <= 2 ? Read<s32>(equip + OffsetEquipIds + 4 * (slot * 2 + 1))
+                                              : -1;
+    u64 key = 0xcbf29ce484222325ull;
+    const auto mix = [&](s64 v) {
+        for (int b = 0; b < 8; ++b) {
+            key = (key ^ static_cast<u64>((v >> (8 * b)) & 0xFF)) * 0x100000001b3ull;
+        }
+    };
+    mix(weapon);
+    mix(t.style);
+    mix(t.form_b);
+    mix(left);
+    std::array<u8*, 4> held_parts{};
+    std::array<s32, 4> attach{};
+    int count = 0;
+    for (s32 i = 0; i < 4; ++i) {
+        u8* const part = Read<u8*>(parts + OffsetAsmParts + 8 * (RightPartSlot + i));
+        if (!Plausible(part) || Read<u8*>(part) != g_base + WeaponPartVtableRva ||
+            Read<s32>(part + OffsetPartMode) != 2) {
+            continue;
+        }
+        const s32 dummy = Read<s32>(part + OffsetPartDummy);
+        if (dummy < (left ? 340 : 300) || dummy > (left ? 379 : 339)) {
+            continue;
+        }
+        held_parts[static_cast<size_t>(i)] = part;
+        attach[static_cast<size_t>(i)] = dummy;
+        mix(i * 1000 + dummy);
+        ++count;
+    }
+    if (weapon <= 0 || count == 0) {
+        clear();
+        return;
+    }
+    // Not before it has settled, fitted before or not: a form fitted earlier applied at the flip
+    // would meet the other weapon where the transform's clip has not yet put the blade.
+    const bool settled = g_shape_track[hand].Ready(key, now);
+    g_shape_key[hand].store(settled && shape ? key : 0, std::memory_order_relaxed);
+    g_shine_key[hand] = settled && shine ? key : 0;
+    if (!settled || WeaponShape::Asked(key)) {
+        return;
+    }
+    WeaponShape::Request r{};
+    r.key = key;
+    r.weapon = weapon;
+    r.style = t.style;
+    r.form_b = t.form_b;
+    r.left = left;
+    r.shine = shine; // the split blades' hone
+    WeaponRowOut param{};
+    g_weapon_row(&param, weapon);
+    if (Plausible(param.row, 2)) {
+        r.model = Read<u16>(param.row + ParamModelId);
+    }
+    std::array<float, 12> grip{};
+    const bool have_grip = DummyMtx(chr, left ? LeftWeaponDummy : RightWeaponDummy, grip);
+    std::string why;
+    for (s32 i = 0; i < 4 && have_grip; ++i) {
+        if (held_parts[static_cast<size_t>(i)] == nullptr) {
+            continue;
+        }
+        WeaponShape::Part part{};
+        part.index = i;
+        std::array<float, 12> at{};
+        if (!DummyMtx(chr, attach[static_cast<size_t>(i)], at)) {
+            why = fmt::format("no dummy {}", attach[static_cast<size_t>(i)]);
+            break;
+        }
+        part.to_grip = VR::WeaponMesh::Mul(VR::WeaponMesh::Inverse(grip), at);
+        const char* pose_why = nullptr;
+        if (!ReadPartPose(held_parts[static_cast<size_t>(i)], part.bones, nullptr, pose_why)) {
+            // No animation of its own (the Blade of Mercy, the Kirkhammer's sword): its bind
+            // pose, checked against its dummies like any other.
+            part.bones.clear();
+            if (std::string_view{pose_why} != "no pose") {
+                why = fmt::format("part {}: {}", i, pose_why);
+                break;
+            }
+        }
+        // Its dummies where the game has them, to check the posed model against (and to lay a
+        // bone the skeleton poses otherwise on them).
+        static constexpr std::array<s32, 44> MarkerIds = {
+            100, 101, 102, 103, 104, 105, 106, 110, 111, 112, 113, 120, 121, 122, 123,
+            130, 131, 132, 133, 140, 141, 142, 143, 200, 201, 202, 203, 204, 205, 206,
+            207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220};
+        alignas(16) std::array<float, 32 * 12> m{};
+        for (const s32 suffix : MarkerIds) {
+            s32 id = (10 + i) * 1000 + suffix;
+            const s32 n = std::min(g_dmy_poly(chr, m.data(), &id, 32), 32);
+            for (s32 k = 0; k < n; ++k) {
+                const float* row = m.data() + 12 * k;
+                const B::Vec3 world{row[3], row[7], row[11]};
+                const B::Vec3 local = InFrameCm(grip, world) * 0.01f;
+                if (B::IsFinite(local) && B::Length(local) <= GeometryFarM) {
+                    part.markers.push_back({suffix, local});
+                }
+            }
+        }
+        r.parts.push_back(std::move(part));
+    }
+    if (!have_grip) {
+        why = "no grip dummy";
+    }
+    if (!why.empty() || r.model < 0 || static_cast<int>(r.parts.size()) != count) {
+        LOG_WARNING(Core, "VR solid: weapon {} style {}: not fitted ({}); its line as before",
+                    weapon, t.style, why.empty() ? "no model in its param row" : why);
+        r.parts.clear();
+        r.model = -1;
+    }
+    WeaponShape::Ask(std::move(r));
+}
+
+// The split blades' shine (core/vr/dual_blades.h): each blade's model and line
+// (WeaponShape::GetShine), for the in-frame list on another thread. Every update, but the worker
+// is asked only when a hand's key changes or its model is not done yet, and the channel written
+// only when what it holds changes. Game:Main only.
+void PublishDualBlades() {
+    static VR::DualBlades::Lines lines{};
+    static std::array<u64, 2> known{}; // the key each hand's entry is done for (0: none)
+    static bool published = false;
+    bool changed = !published;
+    for (std::size_t hand = 0; hand < 2; ++hand) {
+        const u64 key = g_shine_key[hand];
+        if (key == known[hand]) {
+            continue;
+        }
+        WeaponShape::Shine s{};
+        if (key != 0 && !WeaponShape::GetShine(key, s)) {
+            s = {}; // not done yet: none until it is (asked again next update)
+        } else {
+            known[hand] = key;
+        }
+        if (lines.model[hand] != s.model || lines.base[hand] != s.base || lines.tip[hand] != s.tip) {
+            lines.model[hand] = s.model;
+            lines.base[hand] = s.base;
+            lines.tip[hand] = s.tip;
+            changed = true;
+        }
+    }
+    if (changed) {
+        VR::DualBlades::LinesChannel().Store(lines);
+        published = true;
+    }
+}
+
 void MeleePoseTick(u8* chr, const MeleeBody& body) {
     // The weapon-only transform shares this tick and its right-arm state (and goes first: its
     // gate holds swings back while the form changes).
     TransformPoseTick(chr, body);
     // ... and the physical whip (whip=physical: the chain of a whip form on the hand).
     WhipPoseTick(chr, body);
+    // Refresh at the same pose-update point as attack regen pauses, even without physical
+    // attack rows installed.
+    DeflectRegenTick(chr);
     if (!g_installed || chr == nullptr) {
+        ClearWeaponShape();
         SetSawWeaponPose(nullptr, 0.0f, false);
         g_part_blade = {};
+        if (g_sever_weapon_signalled) {
+            // Melee not running (or no hunter): no eligible weapon is being swung.
+            g_sever_weapon_signalled = false;
+            VR::Bloodborne::SeverWeaponEquipped(false);
+        }
         return;
     }
     auto& t = g_tick;
@@ -3385,6 +4929,7 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
     const float dt = StepSeconds(t, now);
     if (chr != t.chr) {
         // A new character object (a load): nothing of the old one carries over.
+        ClearWeaponShape();
         const M::LatchState latch = t.latch;
         t = {};
         t.chr = chr;
@@ -3432,7 +4977,11 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
                  body.right_ik ? "yours" : "game's", body.right_weight);
     }
     t.regen_left = std::max(t.regen_left - dt, 0.0f);
-    if (t.regen_left > 0.0f) {
+    // The Arm's whip form: no regen while its tentacle lashes (ArmWhipForm).
+    const bool arm_lashing = ArmWhipForm(t.variation, t.form_b) &&
+                             SwingRule(M::MoveKind::Light, true).regen_pause &&
+                             ArmLashNow(now).lashing;
+    if (t.regen_left > 0.0f || arm_lashing) {
         PauseRegen(chr);
     }
     Combat::MeleeWindow w{};
@@ -3454,6 +5003,8 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
                  t.weapon_why == nullptr ? "physical swings"
                                          : fmt::format("R1 / R2 ({})", t.weapon_why));
     }
+    // The lit Boom Hammer's explosion of a hit since the last update (core/vr/boom_blast.h).
+    BoomBlastTick(chr, t, now);
     // Hide only an empty hand. Keep the remembered slot while hidden: the game's hide
     // override destroys the part, and rediscovering it every tick caused the blinking.
     Combat::BowVisual bow_visual{};
@@ -3468,12 +5019,22 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
         TrackBlade(chr, t, body, now);
     }
     TrackPartBlades(chr, t);
+    AmygdalanHookProbe(chr, t, body, now);
+    WeaponShapeTick(chr, t, now);
+    WeaponShapeTick(chr, t, now, true);
+    PublishDualBlades();
     // (After a transform: once its clip has settled, about 1.5 s after the switch.)
-    if (g_log >= 1 && t.moves != nullptr && t.style_stable >= 12 &&
+    static const bool dump_dummies = std::getenv("VR_SOLID_SHAPE_LOG") != nullptr;
+    if ((g_log >= 1 || dump_dummies) && t.moves != nullptr && t.style_stable >= 12 &&
         (t.variation != t.geo_variation || t.style != t.geo_style)) {
         t.geo_variation = t.variation;
         t.geo_style = t.style;
-        LogBladeGeometry(chr, t);
+        if (g_log >= 1) {
+            LogBladeGeometry(chr, t);
+        }
+        if (dump_dummies) {
+            LogWeaponDummies(chr, t);
+        }
     }
     // A flick mid-swing: the window joins the transform; its old-form attack ends as the switch
     // is handed over, the transform attack opens once the new form is in the hand.
@@ -3488,6 +5049,16 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
         gate = "the saw's grinding attack"; // never create an ordinary swing alongside the spin
     }
     g_gate_block.store(gate, std::memory_order_relaxed); // (a telegraph needs a swing possible)
+    {
+        // Which clip takes the right arm (2026-11-08: "the game's R1 seeps in").
+        static const char* last_gate = nullptr;
+        static constexpr const char* GameArm = "the game has the right arm";
+        if (gate != last_gate && gate != nullptr && std::strcmp(gate, GameArm) == 0) {
+            LOG_INFO(Core, "VR melee: the game took the right arm: clip {} (held {}, the gate {})",
+                     body.owner_id, body.held, static_cast<int>(body.reason));
+        }
+        last_gate = gate;
+    }
     // A new window replaces the one served: that one is over.
     if (new_window && t.cur_live) {
         Finalize(chr, t, &w, "a new window", now);
@@ -3535,7 +5106,18 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
         }
     }
     if (g_thrust_wait.load(std::memory_order_relaxed)) {
-        li.max_wait = std::max(li.max_wait, ThrustWaitFrames); // the thrust verdict first
+        // The thrust verdict first (as long in time at any game frame rate).
+        li.max_wait = std::max(li.max_wait, VR::GameFramesAt60(ThrustWaitFrames));
+    }
+    M::Thrust::RetryHold retry{};
+    const bool new_attack = !t.latch.active || t.latch.serial != w.serial;
+    if (new_attack && g_thrust_retry_hold.Load(retry) && retry.Holds(w.serial, now)) {
+        t.visceral_held_serial = w.serial;
+        li.ready = false;
+        li.max_wait = 1u << 30; // released by site A or the absolute deadline above
+    }
+    if (new_attack && w.serial != 0 && w.serial == t.visceral_held_serial) {
+        li.gates = li.gates && w.open; // no deferred hit after this stroke ended
     }
     if (whip_slow && !t.latch.active) {
         li.ready = false;
@@ -3680,6 +5262,7 @@ struct VisceralWatch {
 };
 VisceralWatch g_vwatch{};
 u32 g_thrust_handled = 0;
+M::Thrust::ReachRetry g_thrust_retry;
 
 bool IsChr(const u8* chr) {
     if (!Plausible(chr)) {
@@ -3840,16 +5423,301 @@ void SpfxWatchTick(u8* player, s64 now) {
     }
 }
 
+// VR_VISCERAL_TEST=1 (tests: the mock cannot stagger anyone): the AI character with the most HP
+// within VisceralTestM (a boss: Father Gascoigne) is the target. VR_VISCERAL_TEST_HP=<0..1> sets
+// its HP to that share of its maximum once (Gascoigne turns into the beast at half). Within
+// VisceralTestReachM it gets the visceral stagger's SpEffects (52, 53: the gun parry's), and while
+// the visceral is open the game's R1 visceral check runs as a thrust would; VR_VISCERAL_TEST_COUNT
+// viscerals (2 by default), VisceralTestGapNs apart. Logs `VR visceral test:`.
+constexpr float VisceralTestM = 80.0f;
+constexpr float VisceralTestReachM = 2.5f;
+constexpr float VisceralTestPlaceM = 1.0f; // where the target is put: this far ahead
+constexpr float VisceralTestCloseM = 1.2f; // ... and once staggered, for the visceral
+constexpr s64 VisceralTestGapNs = 8'000'000'000;
+constexpr u64 VisceralTestAddSpEffectRva = 0x18C6DB0; // ChrIns::AddSpEffect (bloodborne_pose.cpp)
+constexpr u32 VisceralTestOffsetMaxHp = 0xFC;          // ChrDataModule (bloodborne_tuning.cpp)
+using VisceralTestAddFn = u8(PS4_SYSV_ABI*)(void* chr, s32 id, void* source, u32 a3,
+                                            u32 local_only, s32 a5, float f0, float f1, float f2,
+                                            float f3, float f4, s32 stack0);
+struct VisceralTest {
+    bool on{false};
+    float hp_share{-1.0f};
+    int count{2};
+    s32 min_hp{1000};   // VR_VISCERAL_TEST_MINHP: a target needs this much max HP (a boss)
+    s32 max_hp{1 << 30}; // VR_VISCERAL_TEST_MAXHP: ... and at most this (a big non-boss enemy)
+    bool spfx{false};   // VR_VISCERAL_TEST_SPFX=1: the stagger SpEffects added (else a real
+                        // stagger: VR_GUN_PARRY_PROBE's shot into its attack)
+    s64 placed_ns{0};
+    u8* target{nullptr};
+    bool hp_set{false};
+    bool placed{false}; // put in front for this visceral
+    bool closed{false}; // put near again for this stagger
+    float place_m{VisceralTestPlaceM};
+    int done{0};
+    s64 next_ns{0};      // no stagger before this
+    s64 staggered_ns{0}; // the SpEffects added (0: not yet for this visceral)
+    s64 tried_ns{0};
+    s64 angle_log_ns{0};
+    s64 log_ns{0};
+};
+VisceralTest g_vtest = [] {
+    VisceralTest t{};
+    const char* on = std::getenv("VR_VISCERAL_TEST");
+    t.on = on != nullptr && on[0] == '1';
+    if (const char* hp = std::getenv("VR_VISCERAL_TEST_HP"); hp != nullptr && *hp) {
+        t.hp_share = std::clamp(std::strtof(hp, nullptr), 0.01f, 1.0f);
+    }
+    if (const char* n = std::getenv("VR_VISCERAL_TEST_COUNT"); n != nullptr && *n) {
+        t.count = std::clamp(std::atoi(n), 1, 20);
+    }
+    if (const char* n = std::getenv("VR_VISCERAL_TEST_MINHP"); n != nullptr && *n) {
+        t.min_hp = std::max(std::atoi(n), 1);
+    }
+    if (const char* n = std::getenv("VR_VISCERAL_TEST_MAXHP"); n != nullptr && *n) {
+        t.max_hp = std::max(std::atoi(n), 1);
+    }
+    const char* spfx = std::getenv("VR_VISCERAL_TEST_SPFX");
+    t.spfx = spfx != nullptr && spfx[0] == '1';
+    return t;
+}();
+
+s32 TryVisceralNow(u8* player, bool fresh, const char*& skipped);
+void ReportVisceral(u8* player, u32 serial, bool thrust, s32 result, const char* skipped,
+                    s64 now);
+
+void VisceralTestTick(u8* player, bool open, s64 now) {
+    auto& t = g_vtest;
+    if (!t.on || t.done >= t.count) {
+        return;
+    }
+    const B::Vec3 me = ChrPos(player);
+    const auto data_of = [](u8* chr) { return Module(chr, L::OffsetDataModule); };
+    // The target: the most HP within VisceralTestM, chosen afresh while none is alive.
+    u8* const old_data = t.target != nullptr ? data_of(t.target) : nullptr;
+    if (t.target == nullptr || !IsChr(t.target) || old_data == nullptr ||
+        Read<s32>(old_data + L::OffsetHp) <= 0) {
+        t.target = nullptr;
+        u8* const mgrs = Read<u8*>(g_base + AiManagersRva);
+        const s32 count = Plausible(mgrs) ? std::min(Read<s32>(mgrs + OffsetAiManagerCount), 8) : 0;
+        u8* const array = count > 0 ? Read<u8*>(mgrs + OffsetAiManagerArray) : nullptr;
+        s32 best_max = 0;
+        std::string seen; // every 5 s without a target: the AI characters and their distance
+        int seen_count = 0;
+        const bool report = now - t.log_ns > 5'000'000'000;
+        for (s32 m = 0; m < count && Plausible(array); ++m) {
+            u8* const mgr = array + static_cast<size_t>(m) * AiManagerSize;
+            u8* p = Read<u8*>(mgr + OffsetAiListBegin);
+            u8* const end = Read<u8*>(mgr + OffsetAiListEnd);
+            for (int k = 0; k < 256 && Plausible(p) && p < end; ++k, p += 8) {
+                u8* const entry = Read<u8*>(p);
+                u8* const think = Plausible(entry) ? Read<u8*>(entry + OffsetAiEntryThink) : nullptr;
+                u8* const ai = Plausible(think) ? Read<u8*>(think) : nullptr;
+                u8* const chr = Plausible(ai) ? AiChr(ai) : nullptr;
+                u8* const data = chr != nullptr && chr != player ? data_of(chr) : nullptr;
+                if (report && data != nullptr && seen_count++ < 12) {
+                    seen += fmt::format(" [{:.0f} m, HP {}/{}]", B::Length(ChrPos(chr) - me),
+                                        Read<s32>(data + L::OffsetHp),
+                                        Read<s32>(data + VisceralTestOffsetMaxHp));
+                }
+                if (data == nullptr || Read<s32>(data + L::OffsetHp) <= 0 ||
+                    B::Length(ChrPos(chr) - me) > VisceralTestM) {
+                    continue;
+                }
+                const s32 max_hp = Read<s32>(data + VisceralTestOffsetMaxHp);
+                if (max_hp >= t.min_hp && max_hp <= t.max_hp && max_hp > best_max) {
+                    best_max = max_hp;
+                    t.target = chr;
+                }
+            }
+        }
+        if (t.target != nullptr) {
+            t.hp_set = false;
+            LOG_INFO(Core, "VR visceral test: target {} (max HP {}) {:.1f} m away",
+                     fmt::ptr(t.target), best_max, B::Length(ChrPos(t.target) - me));
+        } else if (report) {
+            t.log_ns = now;
+            LOG_INFO(Core, "VR visceral test: no target within {:.0f} m; {} AI managers, AI "
+                           "characters:{}",
+                     VisceralTestM, count, seen.empty() ? " none" : seen);
+        }
+    }
+    if (t.target == nullptr) {
+        return;
+    }
+    u8* const data = data_of(t.target);
+    const s32 hp = Read<s32>(data + L::OffsetHp);
+    const s32 max_hp = Read<s32>(data + VisceralTestOffsetMaxHp);
+    if (t.hp_share > 0.0f && !t.hp_set && max_hp > 0) {
+        const s32 set = std::max(1, static_cast<s32>(max_hp * t.hp_share));
+        std::memcpy(data + L::OffsetHp, &set, sizeof(set));
+        t.hp_set = true;
+        LOG_INFO(Core, "VR visceral test: target HP {} -> {} of {}", hp, set, max_hp);
+    }
+    // Placed in front of the hunter, the game's own in-map warp (bbport's join teleport:
+    // chr->vtable[0x5F8](chr, &position, &rotation, 1), then chr+0x1E1 |= 2), its rotation kept;
+    // VisceralTestPlaceM ahead along the hunter's yaw (his physics rotation at +0x1D0).
+    if (t.placed && !open && now - t.placed_ns > 6'000'000'000 &&
+        B::Length(ChrPos(t.target) - me) > 3.0f) {
+        t.placed = false; // it wandered off: put it back
+    }
+    using WarpFn = void(PS4_SYSV_ABI*)(u8* chr, float* position, float* rotation, u32);
+    const auto warp_of = [](u8* chr) -> WarpFn {
+        u8* const vtable = Read<u8*>(chr);
+        u8* const warp = Plausible(vtable) ? Read<u8*>(vtable + 0x5F8) : nullptr;
+        return Plausible(warp) && warp > g_base && warp < g_base + ChrInsVtableRva
+                   ? reinterpret_cast<WarpFn>(warp)
+                   : nullptr;
+    };
+    // A real stagger knocks it back (1.9 - 2.9 m): the visceral wants it near. Once per stagger
+    // the hunter steps in to VisceralTestCloseM, facing it, as you would (a warped victim is no
+    // longer one the game's check takes).
+    // VR_VISCERAL_TEST_STEP=1 only: across the mock runs of 2026-10-27 the game took a visceral
+    // only in staggers where neither was warped.
+    static const bool step = std::getenv("VR_VISCERAL_TEST_STEP") != nullptr;
+    if (step && open && !t.spfx && !t.closed && t.staggered_ns != 0 &&
+        now - t.staggered_ns > 400'000'000) { // after the knock-back
+        t.closed = true;
+        const B::Vec3 at = ChrPos(t.target);
+        const float gap = std::hypot(at.x - me.x, at.z - me.z);
+        u8* const own_physics = Module(player, 0x68);
+        if (const WarpFn warp = warp_of(player);
+            warp && Plausible(own_physics) && gap > VisceralTestCloseM + 0.2f) {
+            // Straight in along the line to it, turned to face it (yaw atan2(dx, dz) + pi).
+            const float dx = (at.x - me.x) / gap, dz = (at.z - me.z) / gap;
+            const float a = std::atan2(dx, dz) + 3.14159265f;
+            alignas(16) std::array<float, 4> position{at.x - dx * VisceralTestCloseM, me.y,
+                                                      at.z - dz * VisceralTestCloseM, 1.0f};
+            alignas(16) std::array<float, 4> rotation{};
+            std::memcpy(rotation.data(), own_physics + 0x1D0, sizeof(rotation));
+            warp(player, position.data(), rotation.data(), 1);
+            player[0x1E1] = static_cast<u8>(player[0x1E1] | 0x02);
+            std::memcpy(own_physics + 0x1D4, &a, sizeof(a));
+            LOG_INFO(Core, "VR visceral test: the hunter stepped in from {:.2f} to {:.1f} m",
+                     gap, VisceralTestCloseM);
+        }
+    }
+    if (!open) {
+        t.closed = false;
+    }
+    if (t.staggered_ns == 0 && now >= t.next_ns && !t.placed) {
+        u8* const own_physics = Module(player, 0x68);
+        u8* const physics = Module(t.target, 0x68);
+        if (const WarpFn warp = warp_of(t.target); Plausible(own_physics) && Plausible(physics) && warp) {
+            // Physics +0x1D0 holds Euler angles; facing (dx, dz) is a yaw (+0x1D4) of
+            // atan2(dx, dz) + pi (the game's own turn, 0x1526D08; bloodborne_facing.cpp).
+            const float yaw = Read<float>(own_physics + 0x1D4);
+            alignas(16) std::array<float, 4> position{me.x - std::sin(yaw) * t.place_m,
+                                                      me.y,
+                                                      me.z - std::cos(yaw) * t.place_m,
+                                                      1.0f};
+            // Facing the hunter (a front visceral wants the victim to face him): his yaw + 180.
+            alignas(16) std::array<float, 4> rotation{};
+            std::memcpy(rotation.data(), physics + 0x1D0, sizeof(rotation));
+            warp(t.target, position.data(), rotation.data(), 1);
+            t.target[0x1E1] = static_cast<u8>(t.target[0x1E1] | 0x02);
+            const float facing = yaw + 3.14159265f;
+            std::memcpy(physics + 0x1D4, &facing, sizeof(facing));
+            t.placed = true;
+            t.placed_ns = now;
+            LOG_INFO(Core, "VR visceral test: target placed {:.1f} m in front (yaw {:.0f} deg) at "
+                           "({:.2f}, {:.2f}, {:.2f})",
+                     t.place_m, yaw * 57.29578f, position[0], position[1], position[2]);
+        }
+    }
+    const B::Vec3 at = ChrPos(t.target);
+    const float distance = std::hypot(at.x - me.x, at.z - me.z);
+    if (now - t.log_ns > 2'000'000'000) {
+        t.log_ns = now;
+        LOG_INFO(Core, "VR visceral test: target {:.2f} m away, HP {} of {}, visceral {}open",
+                 distance, hp, max_hp, open ? "" : "not ");
+    }
+    if (open && t.staggered_ns == 0 && !t.spfx) {
+        t.staggered_ns = now; // a real stagger opened it
+        LOG_INFO(Core, "VR visceral test: the target is staggered at {:.2f} m", distance);
+    }
+    if (t.spfx && t.staggered_ns == 0 && now >= t.next_ns && distance <= VisceralTestReachM) {
+        const auto add = reinterpret_cast<VisceralTestAddFn>(g_base + VisceralTestAddSpEffectRva);
+        const u8 a = add(t.target, 52, player, 0, 1, 0, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0);
+        const u8 b = add(t.target, 53, player, 0, 1, 0, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0);
+        t.staggered_ns = now;
+        LOG_INFO(Core, "VR visceral test: stagger SpEffects 52 / 53 added ({} / {}) at {:.2f} m",
+                 a, b, distance);
+    }
+    if (t.staggered_ns != 0 && open && now - t.tried_ns > 100'000'000) {
+        t.tried_ns = now;
+        // VR_VISCERAL_TEST_FACE=1: the hunter turned to face it first (his yaw and W only).
+        static const bool face = std::getenv("VR_VISCERAL_TEST_FACE") != nullptr;
+        u8* const own_physics = Module(player, 0x68);
+        u8* const physics = Module(t.target, 0x68);
+        if (Plausible(own_physics) && Plausible(physics)) {
+            const float to = std::atan2(at.x - me.x, at.z - me.z);
+            u8* const ctrl = Read<u8*>(player + L::OffsetChrCtrl);
+            if (face && Plausible(ctrl)) {
+                // His yaw (+0x1D4, Euler: atan2(dx, dz) + pi faces (dx, dz)) and his W, which the
+                // game's check may read before it is rebuilt: rows (cos s, 0, sin s), (0, 1, 0),
+                // (-sin s, 0, cos s) (as the game builds it, 2026-10-27 log).
+                auto* const w = reinterpret_cast<float*>(ctrl + 0x90);
+                const float old = Read<float>(own_physics + 0x1D4);
+                if (now - t.angle_log_ns > 500'000'000)
+                    LOG_INFO(Core, "VR visceral test: his W rows 0/2 ({:.2f} {:.2f}) ({:.2f} "
+                                   "{:.2f}); from his yaw ({:.2f} {:.2f}) ({:.2f} {:.2f})",
+                             w[0], w[2], w[8], w[10], std::cos(old), std::sin(old),
+                             -std::sin(old), std::cos(old));
+                const float y = to + 3.14159265f;
+                std::memcpy(own_physics + 0x1D4, &y, sizeof(y));
+                w[0] = std::cos(y); w[1] = 0.0f; w[2] = std::sin(y);
+                w[4] = 0.0f; w[5] = 1.0f; w[6] = 0.0f;
+                w[8] = -std::sin(y); w[9] = 0.0f; w[10] = std::cos(y);
+            }
+            const float mine = Read<float>(own_physics + 0x1D4) - 3.14159265f;
+            const float its = Read<float>(physics + 0x1D4) - 3.14159265f;
+            const auto wrap = [](float a) { return std::remainder(a, 6.2831853f) * 57.29578f; };
+            if (now - t.angle_log_ns > 500'000'000) {
+                t.angle_log_ns = now;
+                LOG_INFO(Core, "VR visceral test: try at {:.2f} m, it is {:.0f} deg off his "
+                               "facing, it faces {:.0f} deg off him",
+                         distance, wrap(to - mine), wrap(its - (to + 3.14159265f)));
+            }
+        }
+        const char* skipped = nullptr;
+        const s32 result = TryVisceralNow(player, true, skipped);
+        ReportVisceral(player, 9000 + static_cast<u32>(t.done), true, result, skipped, now);
+        if (result >= 0) {
+            ++t.done;
+            t.staggered_ns = 0;
+            t.placed = false;
+            t.next_ns = now + VisceralTestGapNs;
+            LOG_INFO(Core, "VR visceral test: visceral {} of {} started (throw {})", t.done,
+                     t.count, result);
+        }
+    } else if (t.spfx && t.staggered_ns != 0 && now - t.staggered_ns > 4'000'000'000) {
+        t.staggered_ns = 0; // the stagger ran out without a visceral: placed and again
+        t.placed = false;
+        LOG_INFO(Core, "VR visceral test: no visceral within 4 s of the stagger; again");
+    }
+    if (!t.spfx && !open && t.staggered_ns != 0) {
+        t.staggered_ns = 0; // the real stagger ended without a visceral: in front again, facing
+        t.placed = false;   // him, before its next attack (it parried at an angle)
+    }
+}
+
+u8* VisceralTestTarget() {
+    return g_vtest.on ? g_vtest.target : nullptr;
+}
+
 // Whether a visceral is open: the character the hunter last hit (within VisceralTargetNs; the
 // gun's parry shot or a charged swing) is alive within VisceralOpenM and carries a visceral
 // SpEffect, the hunter not in a throw himself. Published for the presenter's heartbeat cue.
+// VR_VISCERAL_TEST follows its target instead.
 bool VisceralOpenTick(u8* player, s64 now) {
     VR::FeatureCost::Scope cost{VR::FeatureCost::VisceralOpen};
     auto& v = g_vwatch;
     s64 hit_ns = 0;
     u8* const target = LastPlayerHitTarget(hit_ns);
     // (Never the hunter himself: his own Molotov's blast is a hit of his on him.)
-    u8* const followed = target != nullptr && target != player &&
+    u8* const followed = g_vtest.on && g_vtest.target != nullptr && IsChr(g_vtest.target)
+                             ? g_vtest.target
+                         : target != nullptr && target != player &&
                                  now - hit_ns < VisceralTargetNs && IsChr(target)
                              ? target
                              : nullptr;
@@ -3872,13 +5740,14 @@ bool VisceralOpenTick(u8* player, s64 now) {
                      fmt::ptr(followed), hp, distance, ids.empty() ? " none" : ids);
         }
     }
+    const bool changed_target = followed != v.target;
     v.target = followed;
     u8* const throws = Module(player, L::OffsetThrowModule);
     u8* const node = throws != nullptr ? Read<u8*>(throws + L::OffsetThrowNode) : nullptr;
     const bool in_throw = Plausible(node) && Read<u8>(node + L::OffsetThrowState) != 0;
     const bool open = followed != nullptr && effect >= 0 && hp > 0 &&
                       distance <= VisceralOpenM && !in_throw;
-    if (open && !v.open) {
+    if (open && (!v.open || changed_target)) {
         ++v.serial;
         v.open_ns = now;
         v.effect = effect;
@@ -3967,19 +5836,65 @@ void MeleeSiteA(u8* player) {
     }
     if (!g_installed || !g_visceral) {
         g_thrust_wait.store(false, std::memory_order_relaxed);
+        g_thrust_retry.Reset();
+        g_thrust_retry_hold.Store({});
         return;
     }
     const auto& ms = VR::Melee::GetMeleeSettings();
     // Physical viscerals: the presenter's thrusts (visceral_thrust=1). A swing never starts one
     // then (visceral_swing=0): a new window waits for its verdict while a visceral is open.
     const bool open = ms.visceral_thrust && VisceralOpenTick(player, now);
+    VisceralTestTick(player, open, now); // VR_VISCERAL_TEST (tests)
     Combat::ThrustState th{};
     const bool thrust_mode = ms.visceral_thrust && Combat::ThrustChannel().Load(th) &&
-                             th.enabled && now - th.ns < ThrustStateMaxAgeNs;
+                             th.enabled && th.ns > 0 && now >= th.ns &&
+                             now - th.ns < ThrustStateMaxAgeNs;
     const bool swing_only_thrust = thrust_mode && !ms.visceral_swing;
     g_thrust_wait.store(swing_only_thrust && open, std::memory_order_relaxed);
     Combat::MeleeWindow w{};
     const bool have_w = Combat::LatestMeleeWindow(w) && w.serial != 0;
+    namespace T = M::Thrust;
+    const bool fresh = have_w && now >= w.ns && now - w.ns < WindowMaxAgeNs &&
+                       (w.open || (w.close_ns != 0 && now - w.close_ns <= StaleCloseNs));
+    const bool this_thrust =
+        have_w && (th.thrust_window == w.serial ||
+                   (w.open && th.verdict_window == w.serial &&
+                    th.verdict == static_cast<u8>(T::Verdict::Thrust)));
+    Combat::VisceralOpen opening{};
+    opening.serial = g_vwatch.serial;
+    opening.open = open;
+    opening.target = open ? g_vwatch.target : nullptr;
+    opening.ns = now;
+    const auto finish_retry = [&] {
+        if (g_thrust_retry.hold.window != 0) {
+            g_visceral_checked.store(g_thrust_retry.hold.window, std::memory_order_release);
+        }
+        g_thrust_retry.Reset();
+        g_thrust_retry_hold.Store({});
+    };
+    if (g_thrust_retry.Active()) {
+        // A thrust can precede its ordinary melee window. Bind only that thrust's window;
+        // a replacement/closed window cancels the retry instead of delaying another attack.
+        const bool window_ok = g_thrust_retry.AcceptWindow(
+            w.serial, fresh && w.open && !w.aborted, this_thrust);
+        if (!swing_only_thrust || !ms.visceral || !window_ok ||
+            !g_thrust_retry.Keep(player, th, opening, now)) {
+            finish_retry();
+        } else {
+            if (g_thrust_retry.Due(now)) {
+                const char* skipped = nullptr;
+                const s32 result = TryVisceralNow(player, true, skipped);
+                if (result >= 0 || skipped != nullptr || g_dry_run) {
+                    ReportVisceral(player, g_thrust_retry.hold.window, true, result, skipped, now);
+                    finish_retry();
+                }
+            }
+            if (g_thrust_retry.Active()) {
+                g_thrust_retry_hold.Store(g_thrust_retry.hold);
+                return;
+            }
+        }
+    }
     if (thrust_mode && th.thrust_serial != g_thrust_handled) {
         const bool first = g_thrust_handled == 0 && now - th.thrust_ns >= ThrustMaxAgeNs;
         g_thrust_handled = th.thrust_serial;
@@ -3992,7 +5907,19 @@ void MeleeSiteA(u8* player) {
                      "visceral {}open): {}",
                      th.thrust_serial, th.peak, th.travel * 100.0f, th.thrust_window,
                      open ? "" : "not ", result >= 0 ? "the visceral" : "none");
-            if (have_w && th.thrust_window == w.serial) {
+            // A failed *native* check may simply have been early. Keep it bounded and
+            // tied to this forward motion/opening; do not reopen a window already checked.
+            if (result < 0 && skipped == nullptr && !g_dry_run && swing_only_thrust &&
+                T::ForwardIntent(th, opening, now) &&
+                th.motion_verdict == static_cast<u8>(T::Verdict::Thrust) &&
+                ((!this_thrust && (!have_w || !w.open)) ||
+                 (this_thrust && fresh && w.open && !w.aborted &&
+                  w.serial != g_visceral_checked.load(std::memory_order_relaxed)))) {
+                g_thrust_retry.Begin(player, th, opening, this_thrust ? w.serial : 0, now);
+                g_thrust_retry_hold.Store(g_thrust_retry.hold);
+                return;
+            }
+            if (this_thrust) {
                 g_visceral_checked.store(w.serial, std::memory_order_release); // checked now
             }
         }
@@ -4000,10 +5927,7 @@ void MeleeSiteA(u8* player) {
     if (!have_w || w.serial == g_visceral_checked.load(std::memory_order_relaxed)) {
         return;
     }
-    const bool fresh = now - w.ns < WindowMaxAgeNs &&
-                       (w.open || (w.close_ns != 0 && now - w.close_ns <= StaleCloseNs));
     if (swing_only_thrust) {
-        namespace T = VR::Melee::Thrust;
         const T::Verdict verdict = th.verdict_window == w.serial
                                        ? static_cast<T::Verdict>(th.verdict)
                                        : T::Verdict::Pending;
@@ -4021,6 +5945,12 @@ void MeleeSiteA(u8* player) {
             }
             return;
         }
+        if (th.thrust_serial != 0 && th.thrust_serial == g_thrust_handled) {
+            // The event (including its bounded retry) owns this thrust. A window published
+            // after the event must not start a second, unbounded native attempt.
+            g_visceral_checked.store(w.serial, std::memory_order_release);
+            return;
+        }
     }
     const char* skipped = nullptr;
     const s32 result = TryVisceralNow(player, fresh, skipped);
@@ -4033,7 +5963,7 @@ bool MeleeDamage(u8* res, u8* target, float* damage) {
         return false;
     }
     if (Read<s32>(res + ResBullet) == -1 && LeftMeleeHit(res, *damage, NowNs())) {
-        return true; // a left swing's hit (reported; its damage the game's)
+        return true; // a left swing's hit (reported; its damage the game's, x a split blade's)
     }
     if (Read<s32>(res + ResHand) != HandRight || Read<s32>(res + ResBullet) != -1) {
         return false;
@@ -4049,11 +5979,21 @@ bool MeleeDamage(u8* res, u8* target, float* damage) {
             // A whip's row has four capsules down its chain (core/vr/whip_moves.h); a hit by one
             // after the first comes with another handle: the attack is matched by its row.
             found = FindAttack(bid, 0, now);
-            if (found != nullptr && !IsWhipRow(found->row)) {
+            if (found != nullptr && !IsWhipRow(found->row) &&
+                !(found->weapon_variation == 2500 && found->form_b)) {
                 found = nullptr;
             }
         }
         if (found == nullptr) {
+            if (BoomBlastBidLocked(bid, now)) {
+                // The lit Boom Hammer's charged blast (core/vr/boom_blast.h): the game's damage.
+                const u8* data = Plausible(target) ? Module(target, L::OffsetDataModule) : nullptr;
+                LOG_INFO(Core, "VR melee: #{} Boom Hammer blast HIT tgt={} tgtHp={} dmg {:.2f} "
+                               "(the game's), {:.0f} ms after the explosion",
+                         g_boom.serial, fmt::ptr(target),
+                         data != nullptr ? Read<s32>(data + OffsetHp) : -1, *damage,
+                         static_cast<double>(now - g_boom.hit_ns) * 1e-6);
+            }
             return false;
         }
         // A whip form's move (whip_pace, core/vr/whip_damage.h PaceMeter): the window's share of a
@@ -4063,11 +6003,16 @@ bool MeleeDamage(u8* res, u8* target, float* damage) {
             std::isfinite(*damage) && *damage > 0.0f) {
             const M::MoveKind kind = found->verdict_light ? M::MoveKind::Light : found->kind;
             found->pace = g_whip_pace.Pay(
-                found->created_ns,
+                VR::Whip::PaceTime(found->contact_hold, found->created_ns, now),
                 VR::Whip::WhipPaceRecover(found->whip_variation, static_cast<std::size_t>(kind)));
         }
         a = *found;
     }
+    // The first enemy a lit heavy or charged swing hits arms its explosion (core/vr/boom_blast.h).
+    ArmBoomBlast(a,
+                 {Read<float>(res + ResPosition), Read<float>(res + ResPosition + 4),
+                  Read<float>(res + ResPosition + 8)},
+                 "an enemy", now);
     const auto& ms = VR::Melee::GetMeleeSettings();
     Combat::MeleeWindow w{};
     const bool have_w = Combat::LatestMeleeWindow(w) && w.serial == a.serial;
@@ -4080,7 +6025,12 @@ bool MeleeDamage(u8* res, u8* target, float* damage) {
                                                             : w.tip_speed)
                                         : 0.0f,
                                  a.tip);
-    M::DamageConfig cfg{};
+    // The two-handed grip's swing (core/vr/two_hand_grip.h): in the HIT line's factor.
+    const float two_hand = VR::TwoHand::CombineSwingFactor(
+        a.two_hand, have_w ? std::clamp(w.two_hand, 0.5f, 2.0f) : 1.0f);
+    // The speed scale of this kind of swing (melee_window.h SwingDamageConfig).
+    const bool two_handed = a.two_handed || (have_w && w.two_handed);
+    M::DamageConfig cfg = M::SwingDamageConfig(IsWhipRow(a.row), two_handed);
     cfg.speed =
         !a.saw && !a.powered && ms.speed_damage &&
         (have_w || a.tip > 0.0f || (chain.applies && chain.tip > 0.0f));
@@ -4088,11 +6038,10 @@ bool MeleeDamage(u8* res, u8* target, float* damage) {
     const bool whip_paced = a.pace >= 0.0f;
     const float whip_pace = whip_paced ? a.pace : 1.0f;
     cfg.cadence = !a.saw && !whip_paced && (!ms.budget || a.flick);
-    float factor = M::DamageFactor(tip, a.since_counted_s, a.kind, cfg);
-    // The two-handed grip's swing (core/vr/two_hand_grip.h): in the HIT line's factor.
-    const float two_hand =
-        std::max(a.two_hand, have_w ? std::clamp(w.two_hand, 1.0f, 2.0f) : 1.0f);
-    if (two_hand > 1.0f) {
+    // The bonus's arm: the swing's peak hand speed (no window: the blade's alone).
+    const float hand_peak = have_w ? w.hand_peak : a.hand_peak;
+    float factor = M::DamageFactor(tip, a.since_counted_s, a.kind, cfg, hand_peak);
+    if (two_hand != 1.0f && a.support_damage == 1.0f) {
         factor *= two_hand;
         LOG_INFO(Core, "VR melee: #{} two-handed swing: x{:.2f} (in the HIT line's factor)",
                  a.serial, two_hand);
@@ -4124,8 +6073,38 @@ bool MeleeDamage(u8* res, u8* target, float* damage) {
             contact_distance = B::Length(contact - chain.grip);
             range_factor = VR::Whip::ContactDamageFactor(attack_variation, true, contact_distance);
         }
+    } else if (!a.transform && ArmWhipForm(attack_variation, a.form_b)) {
+        // The Arm's whip form: the same falloff, from its hand (ArmWhipForm).
+        const ArmLashState arm = ArmLashNow(now);
+        const B::Vec3 contact{Read<float>(res + ResPosition), Read<float>(res + ResPosition + 4),
+                              Read<float>(res + ResPosition + 8)};
+        if (arm.valid && B::IsFinite(contact)) {
+            contact_distance = B::Length(contact - arm.grip);
+            range_factor = VR::Whip::ContactDamageFactor(attack_variation, true, contact_distance);
+        }
+    }
+    // Holding the hook trigger reserves the flexible sections for catching. A real controller
+    // swing still opens an attack and the rigid club keeps its damage. Read the per-instance
+    // capsule only with the same verified layout used for Stake Driver; never edit shared params.
+    if (a.weapon_variation == 2500 && a.form_b && !a.transform &&
+        (a.arm_hook || VR::Whip::LatestSwingInput(now, AmygdalanHook::MaxAgeNs).arm_lash)) {
+        const u8* const entry = g_stake_geometry ? HitEntry(handle, bid) : nullptr;
+        const bool club = entry && AmygdalanHook::ClubHit(Read<s32>(entry + 0x188),
+                                                        Read<s32>(entry + 0x18C));
+        if (g_log >= 1)
+            LOG_INFO(Core, "VR Arm hook impact: {} (native dummies {} / {})",
+                     club ? "club damage" : "catch only", entry ? Read<s32>(entry + 0x188) : -1,
+                     entry ? Read<s32>(entry + 0x18C) : -1);
+        if (!club) {
+            *damage = 0.0f;
+            return true; // no ordinary impact/hitstop from a catch-only section
+        }
     }
     const float before = *damage;
+    // Apply after plunge minimums. A late grab cannot upgrade an attack begun unsupported.
+    factor *= a.support_damage;
+    factor *= a.damage_scale; // the split blades' (a honed one's: core/vr/dual_blades.h)
+    factor *= a.row_scale;    // a row of ours (the Bowblade's charged swing, its arrow)
     float after = before;
     // The hit's feel (the presenter's impact: its strength from the damage, a knock under 1): the
     // damage before a whip's pace, so every lash that lands feels as it did before whip_pace (the
@@ -4150,17 +6129,19 @@ bool MeleeDamage(u8* res, u8* target, float* damage) {
     g_bite_wall.store(false, std::memory_order_relaxed);
     g_bite_hold.store(std::clamp(hitstop * 0.8f, 0.05f, 0.1f), std::memory_order_relaxed);
     g_bite_ns.store(now, std::memory_order_release);
-    Combat::PushMeleeEvent({Combat::MeleeEventKind::Hit, a.serial, felt, hitstop, now, ""});
+    Combat::PushMeleeEvent(
+        {Combat::MeleeEventKind::Hit, a.serial, felt, hitstop, now, "", a.damage_scale});
     const u8* data = Plausible(target) ? Module(target, L::OffsetDataModule) : nullptr;
     LOG_INFO(Core,
              "VR melee: #{} HIT {}{} bid={} atk={} tgt={} tgtHp={} dmg {:.2f}->{:.2f} x{:.3f} (tip "
-             "{:.1f} m/s -> speed x{:.2f}, cadence {:.2f} s -> x{:.2f}{}) {:.0f} ms after the "
-             "open, t={:.3f}",
+             "{:.1f} m/s, hand {:.1f} -> speed x{:.2f}, cadence {:.2f} s -> x{:.2f}{}) {:.0f} ms "
+             "after the open, t={:.3f}",
              a.serial, a.transform ? "TRANSFORM ATTACK " : "", M::MoveKindName(a.kind), bid,
              Read<s32>(res + ResAtkParam), fmt::ptr(target),
              data != nullptr ? Read<s32>(data + OffsetHp) : -1, before, after,
              factor * row_factor * range_factor * whip_pace,
-             tip, cfg.speed ? M::SpeedFactor(tip, cfg) : 1.0f, a.since_counted_s,
+             tip, hand_peak, cfg.speed ? M::SpeedFactor(tip, cfg, hand_peak) : 1.0f,
+             a.since_counted_s,
              cfg.speed && cfg.cadence
                  ? M::CadenceFactor(a.since_counted_s, M::RecoverSeconds(a.kind))
                  : 1.0f,
@@ -4172,9 +6153,79 @@ bool MeleeDamage(u8* res, u8* target, float* damage) {
                  (contact_distance >= 0.0f
                       ? fmt::format(", contact {:.2f} m -> range x{:.2f}", contact_distance, range_factor)
                       : std::string{}) +
-                 (whip_paced ? fmt::format(", whip pace x{:.2f}", whip_pace) : std::string{}),
+                 (whip_paced ? fmt::format(", whip pace x{:.2f}", whip_pace) : std::string{}) +
+                 (a.damage_scale != 1.0f
+                      ? fmt::format(", split blades x{:.2f}", a.damage_scale)
+                      : std::string{}) +
+                 (a.row_scale != 1.0f
+                      ? fmt::format(", {} x{:.2f}",
+                                    M::Bowblade::IsArrowAttack(a.weapon_variation, a.form_b,
+                                                               a.row ? a.row->judge : -1)
+                                        ? "the Bowblade's arrow"
+                                        : "the Bowblade's charged swing",
+                                    a.row_scale)
+                      : std::string{}),
              static_cast<double>(now - a.created_ns) * 1e-6, static_cast<double>(now) * 1e-9);
     return true;
+}
+
+bool MeleeLeftHitInfoOf(u8* res, MeleeHitInfo& out) {
+    out = {};
+    if (res == nullptr || Read<s32>(res + ResBullet) != -1) {
+        return false;
+    }
+    const s32 bid = Read<s32>(res + ResBid);
+    const u32 handle = Read<u32>(res + ResHandle);
+    const s64 now = NowNs();
+    u32 serial = 0;
+    s32 key = -1, hand = 0, variation = -1;
+    bool gun = false;
+    float tip_peak = 0.0f, arc_peak = 0.0f;
+    {
+        std::scoped_lock lock{g_attack_mutex};
+        const LeftTick& l = g_left;
+        if (l.bid < 0 || bid != l.bid || handle != l.handle ||
+            (!l.live && now - l.ended_ns > HitGraceNs) || !l.sure) {
+            return false; // (a row still being tried: maybe the right claw's side)
+        }
+        serial = l.serial;
+        key = l.key;
+        hand = l.hand;
+        variation = l.variation;
+        gun = l.gun;
+        tip_peak = l.tip_peak;
+        arc_peak = l.arc_peak;
+    }
+    if (gun || hand != HandRight || variation < 0) {
+        return false; // a left-hand weapon's, or a gun punch: not the right weapon's part
+    }
+    out.weapon_variation = variation;
+    out.form_b = key >= 0 && key % 10 == 1;
+    out.swing = true;
+    out.serial = serial;
+    out.kind = "light"; // (the left hand's swings are lights)
+    out.left = true;
+    // Its own swing's (kept for the attack), with its window's latest (a hit before an update
+    // synced them).
+    out.tip_peak = tip_peak;
+    out.arc_deg = arc_peak / M::Deg;
+    Combat::MeleeWindow w{};
+    if (Combat::LatestMeleeWindowLeft(w) && w.serial == serial) {
+        out.tip_speed = w.tip_speed;
+        out.tip_peak = std::max({out.tip_peak, w.tip_peak, w.tip_speed});
+        out.arc_deg = std::max(out.arc_deg, w.arc_peak / M::Deg);
+    }
+    return true;
+}
+
+void MeleeBiteAtLeast(float seconds) {
+    if (!std::isfinite(seconds) || seconds <= 0.0f) {
+        return;
+    }
+    float now = g_bite_hold.load(std::memory_order_relaxed);
+    while (now < seconds &&
+           !g_bite_hold.compare_exchange_weak(now, seconds, std::memory_order_relaxed)) {
+    }
 }
 
 bool MeleeHitInfoOf(u8* res, MeleeHitInfo& out) {
@@ -4208,7 +6259,8 @@ bool MeleeHitInfoOf(u8* res, MeleeHitInfo& out) {
         Attack* found = FindAttack(bid, handle, now);
         if (found == nullptr) {
             found = FindAttack(bid, 0, now); // a whip's capsules down the chain (as MeleeDamage)
-            if (found != nullptr && !IsWhipRow(found->row)) {
+            if (found != nullptr && !IsWhipRow(found->row) &&
+                !(found->weapon_variation == 2500 && found->form_b)) {
                 found = nullptr;
             }
         }
@@ -4221,12 +6273,18 @@ bool MeleeHitInfoOf(u8* res, MeleeHitInfo& out) {
     const bool have_w = Combat::LatestMeleeWindow(w) && w.serial == a.serial;
     out.weapon_variation = a.weapon_variation;
     out.form_b = a.form_b;
-    out.two_handed = std::max(a.two_hand, have_w ? w.two_hand : 1.0f) > 1.0f;
+    out.two_handed = a.two_handed || (have_w && w.two_handed);
     out.swing = true;
     out.serial = a.serial;
     out.kind = M::MoveKindName(a.kind);
     out.transform = a.transform;
+    // (A charged window the classifier judged light deals the light row: no charged kill.)
+    out.charged = a.kind == M::MoveKind::Charged && !a.transform && !a.verdict_light;
+    out.heavy = a.kind == M::MoveKind::Heavy || a.kind == M::MoveKind::Charged;
+    out.judged_light = a.verdict_light;
     out.tip_speed = std::max(have_w ? w.tip_speed : 0.0f, a.tip);
+    out.tip_peak = std::max({out.tip_speed, have_w ? w.tip_peak : 0.0f, a.tip_peak});
+    out.arc_deg = std::max(have_w ? w.arc_peak : 0.0f, a.arc_peak) / M::Deg;
     return true;
 }
 
@@ -4262,19 +6320,13 @@ void MeleeBite(VR::Body::ModelTarget& right_target, s64 now_ns) {
 // why) when the weapon or its dummies are not known. Game:Main, as the pose tick that reads it.
 bool MeleeBladeSegment(u8* chr, B::Vec3& base, B::Vec3& tip, const char*& how,
                        B::Vec3* grip_out, float* strike_near) {
-    constexpr float BladeNearM = 2.0f;
     const TickState& t = g_tick;
+    const float BladeNearM = AmygdalanArm::MarkerLimit(t.variation, t.form_b, 2.0f);
     if (!g_installed || chr == nullptr || chr != t.chr || t.moves == nullptr) {
         how = "the right weapon not read";
         return false;
     }
-    const M::MoveRow* row = nullptr;
-    const std::size_t first = t.form_b ? 3 : 0;
-    for (std::size_t k = first; k < first + 3 && row == nullptr; ++k) {
-        if (t.moves->rows[k].Valid()) {
-            row = &t.moves->rows[k];
-        }
-    }
+    const M::MoveRow* row = FormBladeRow(t);
     if (row == nullptr) {
         how = t.form_b ? "no hit capsule in form B" : "no hit capsule in form A";
         return false;
@@ -4345,6 +6397,11 @@ bool MeleeBladeSegment(u8* chr, B::Vec3& base, B::Vec3& tip, const char*& how,
                                 0.0f);
     }
     return true;
+}
+
+bool MeleeFittedShape(VR::WeaponFit::Fit& out, bool left) {
+    const u64 key = g_shape_key[left ? 0 : 1].load(std::memory_order_relaxed);
+    return key != 0 && WeaponShape::Get(key, out) && out.count > 0;
 }
 
 bool MeleeBladeReach(float& base, float& tip) {
@@ -4467,6 +6524,97 @@ void MeleeBowPartPose(u8* node) {
     std::memcpy(pose + 0x38, &dirty, sizeof(dirty));
 }
 
+bool MeleeLeftClawShape(u8* chr, float scale, VR::Solid::Shape& out) {
+    namespace C = VR::BeastClawHand;
+    namespace W = VR::WeaponMesh;
+    if (!g_installed || !Plausible(chr) || HeldLeftHidden() ||
+        !VR::Tricks::PhysicalMeleeFormB(900, WeaponStyle(chr))) return false;
+    const auto* equip = Read<const u8*>(chr + OffsetEquip);
+    if (!Plausible(equip, 4)) return false;
+    const int slot = Read<s32>(equip + OffsetEquipRightSlot);
+    if (slot < 0 || slot > 2 ||
+        Read<s32>(equip + OffsetEquipIds + 4*(slot*2+1)) / 100000 != 90) return false;
+    // Only wp_a_1001_2, visibly attached to the left hand. Reacquire all native
+    // objects on the game thread; the cache keeps only identities and indices,
+    // never a pose to dereference on a later update.
+    const auto* parts = Read<const u8*>(chr + OffsetChrAsm);
+    const auto* part = Plausible(parts)
+        ? Read<const u8*>(parts + OffsetAsmParts + 8*(RightPartSlot+2)) : nullptr;
+    if (!Plausible(part) || Read<const u8*>(part) != g_base + WeaponPartVtableRva ||
+        Read<s32>(part + OffsetPartMode) != 2) return false;
+    const int attach = Read<s32>(part + OffsetPartDummy);
+    if (attach < 340 || attach > 359) return false;
+    const auto* anim = Read<const u8*>(part + 0x158);
+    const auto* state = Plausible(anim) ? Read<const u8*>(anim) : nullptr;
+    const auto* player = Plausible(state) ? Read<const u8*>(state) : nullptr;
+    const auto* node = Plausible(player) ? Read<const u8*>(player + 0x20) : nullptr;
+    if (!Plausible(node)) return false;
+    const auto* pose = node + 0x38;
+    const auto* skel = Read<const u8*>(pose);
+    if (!Plausible(skel)) return false;
+    const int count = Read<s32>(skel + 0x30);
+    const auto* names = Read<const u8*>(skel + 0x28);
+    if (count < static_cast<int>(C::Names.size()) || count > C::MaxBones ||
+        !Plausible(names)) return false;
+    struct Binding {
+        const u8 *chr{}, *part{}, *node{}, *skel{}, *names{};
+        int count{};
+        C::Indices indices{};
+        bool valid{};
+    };
+    static Binding binding; // identities + indices only, never dereference stored pointers
+    if (binding.chr != chr || binding.part != part || binding.node != node ||
+        binding.skel != skel || binding.names != names || binding.count != count) {
+        binding = {chr, part, node, skel, names, count};
+        binding.indices.fill(-1);
+        for (int i = 0; i < count; ++i) {
+            const auto raw = Read<uintptr_t>(names + 16*i) & ~uintptr_t{1};
+            const auto* name = reinterpret_cast<const char*>(raw);
+            if (!Plausible(reinterpret_cast<const u8*>(name), 1)) return false;
+            size_t len = 0;
+            while (len < 32 && name[len] != 0) ++len;
+            const std::string_view label{name, len};
+            for (size_t k = 0; k < C::Names.size(); ++k) {
+                if (label != C::Names[k]) continue;
+                if (binding.indices[k] >= 0) return false;
+                binding.indices[k] = i;
+            }
+        }
+        binding.valid = std::all_of(binding.indices.begin(), binding.indices.end(),
+                                    [](int i) { return i >= 0; });
+    }
+    if (!binding.valid) return false;
+    std::array<B::QsTransform, C::MaxBones> model{};
+    auto model_span = std::span{model}.first(static_cast<size_t>(count));
+    // Prefer synchronized model transforms. If the animation just dirtied model
+    // space, compose its authoritative locals on our stack; never synchronize or
+    // write the game's pose merely for collision.
+    if (Read<u8>(pose + 0x39) == 0) {
+        const auto* native = Read<const B::HkQsTransform*>(pose + 0x18);
+        if (Read<s32>(pose + 0x20) != count ||
+            !Plausible(reinterpret_cast<const u8*>(native),16)) return false;
+        for (int i = 0; i < count; ++i) model[i] = B::FromHavok(native[i]);
+    } else {
+        const auto* native = Read<const B::HkQsTransform*>(pose + 0x08);
+        const auto* parents = Read<const s16*>(skel + 0x18);
+        if (Read<u8>(pose + 0x38) != 0 || Read<s32>(pose + 0x10) != count ||
+            Read<s32>(skel + 0x20) != count ||
+            !Plausible(reinterpret_cast<const u8*>(native),16) ||
+            !Plausible(reinterpret_cast<const u8*>(parents),2) ||
+            !C::ModelPose({native,static_cast<size_t>(count)},
+                          {parents,static_cast<size_t>(count)},model_span)) return false;
+    }
+    W::Mat34 grip{}, marker{};
+    B::Vec3 check{};
+    if (!DummyMtx(chr, LeftWeaponDummy, grip) || !DummyMtx(chr, 12110, marker) ||
+        !DummyAt(chr, 12100, check)) return false;
+    W::Mat34 master_to_grip{};
+    // Independent root marker rejects a different asset/layout rather than
+    // putting finger capsules somewhere the rendered hand isn't.
+    if (!C::RootFrame(grip,marker,check,scale,master_to_grip)) return false;
+    return C::Build(model_span,binding.indices,master_to_grip,scale,out);
+}
+
 s32 MeleePartLine(int hand, B::Vec3& base, B::Vec3& tip, bool& seen) {
     seen = false;
     if (hand < 0 || hand > 1) {
@@ -4483,18 +6631,12 @@ s32 MeleePartLine(int hand, B::Vec3& base, B::Vec3& tip, bool& seen) {
 // SpawnFFX_Blade dummies: the game draws the swing's trail between them, along the blade you
 // see), both on the weapon in the hand. False when the row has none or they are not shown.
 bool MeleeBladeTrail(u8* chr, B::Vec3& a, B::Vec3& b, s32& id_a, s32& id_b) {
-    constexpr float BladeNearM = 2.0f;
     const TickState& t = g_tick;
+    const float BladeNearM = AmygdalanArm::MarkerLimit(t.variation, t.form_b, 2.0f);
     if (!g_installed || chr == nullptr || chr != t.chr || t.moves == nullptr) {
         return false;
     }
-    const M::MoveRow* row = nullptr;
-    const std::size_t first = t.form_b ? 3 : 0;
-    for (std::size_t k = first; k < first + 3 && row == nullptr; ++k) {
-        if (t.moves->rows[k].Valid()) {
-            row = &t.moves->rows[k];
-        }
-    }
+    const M::MoveRow* row = FormBladeRow(t);
     B::Vec3 grip{};
     if (row == nullptr || row->trail_base < 0 || row->trail_tip < 0 ||
         !DummyAt(chr, RightWeaponDummy, grip)) {

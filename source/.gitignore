@@ -426,6 +426,8 @@ result
 
 # Local game dumps, extracted ROM and tools (never commit game files)
 /ROM/
+# Local extracted game assets used by the Amygdalan motion probes.
+/scratchpad/amygdala-hook/*.bnd
 
 # Bloodborne VR: per-user caches and debug outputs (never commit)
 vr_cache/

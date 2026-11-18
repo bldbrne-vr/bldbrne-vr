@@ -30,8 +30,13 @@
 #include "core/emulator_settings.h"
 #include "core/file_sys/fs.h"
 #include "core/vr/bloodborne_assets.h"
+#include "core/vr/beast_roar_asset.h"
+#include "core/vr/call_beyond_asset.h"
+#include "core/vr/executioner_glove_asset.h"
+#include "core/vr/augur_creature_asset.h"
 #include "core/vr/music_box_mesh.h"
 #include "core/vr/music_box_texture.h"
+#include "core/vr/poison_knife_texture.h"
 #include "core/vr/bc7_decode.h"
 #include "core/vr/game_font.h"
 #include "core/vr/vr_session.h"
@@ -347,7 +352,7 @@ std::shared_ptr<Icon> DecodeIcon(const std::vector<u8>& tpf, std::string& why) {
 
 // The models of the held-item table (core/vr/bloodborne_quickitems.cpp HeldModelOf): all read in
 // one pass over the archive (87 MB unpacked, dropped again once they are out).
-constexpr std::array<s32, 29> HeldModelIds = {
+constexpr std::array<s32, 32> HeldModelIds = {
     10002, // Blood Vial
     10004, // Shining Coins
     10005, // a bell
@@ -357,7 +362,8 @@ constexpr std::array<s32, 29> HeldModelIds = {
     10013, // Pungent Blood Cocktail's parts
     10014, // Oil Urn
     10015, // Pungent Blood Cocktail
-    10016, // Throwing Knife / Poison Knife
+    10016, // Throwing Knife
+    VR::PoisonKnife::Model, // same native mesh, separate authored material
     10017, // Blue Elixir
     10019, // a blood bottle
     10021, // a small lamp
@@ -366,6 +372,7 @@ constexpr std::array<s32, 29> HeldModelIds = {
     10024, // Monocular
     10020, 10051, 10070, // bone blade, delayed Molotov, Vermin
     11010, 11012, 11013, 11014, 11015, 11016, // Hunter tools and music box
+    ExecutionerGlove::Model, AugurCreature::Model,
     11050, 11051, 11052, 11401, // DLC tools and Silencing Blank
 };
 constexpr const char* SfxArchive = "/app0/dvdroot_ps4/sfx/frpg_sfxbnd_commoneffects.ffxbnd.dcx";
@@ -425,8 +432,9 @@ bool DetileLevel(const u8* src, size_t size, u32 bw, u32 bh, u32 block_bytes,
     return true;
 }
 
-// A PS4 TPF's first texture with its whole mip chain.
-bool DecodeTexture(const std::vector<u8>& tpf, ModelTexture& out, std::string& why) {
+// A PS4 TPF's first texture with its whole mip chain (`entry`: another texture's table entry).
+bool DecodeTexture(const std::vector<u8>& tpf, ModelTexture& out, std::string& why,
+                   size_t entry = 0x10) {
     s32 count{};
     if (tpf.size() < 0x40 || std::memcmp(tpf.data(), "TPF\0", 4) != 0 || !ReadAt(tpf, 8, count) ||
         count < 1 || tpf[0x0C] != 4) {
@@ -436,13 +444,17 @@ bool DecodeTexture(const std::vector<u8>& tpf, ModelTexture& out, std::string& w
     u32 offset{}, tile_mode{};
     s32 size{};
     u16 w{}, h{};
-    ReadAt(tpf, 0x10, offset);
-    ReadAt(tpf, 0x14, size);
-    ReadAt(tpf, 0x1C, w);
-    ReadAt(tpf, 0x1E, h);
-    ReadAt(tpf, 0x24, tile_mode);
-    const u8 format = tpf[0x18];
-    const u32 mips = std::max<u32>(tpf[0x1A], 1);
+    if (entry + 0x24 > tpf.size()) {
+        why = "its table entry";
+        return false;
+    }
+    ReadAt(tpf, entry, offset);
+    ReadAt(tpf, entry + 0x04, size);
+    ReadAt(tpf, entry + 0x0C, w);
+    ReadAt(tpf, entry + 0x0E, h);
+    ReadAt(tpf, entry + 0x14, tile_mode);
+    const u8 format = tpf[entry + 0x08];
+    const u32 mips = std::max<u32>(tpf[entry + 0x0A], 1);
     u32 block_bytes = 0;
     out.format = TpfFormat(format, block_bytes);
     if (out.format == ModelTexture::Format::None) {
@@ -992,6 +1004,47 @@ bool RegalMusicBox(Model& model) {
     return true;
 }
 
+// Project the authored bands along s10020's hooked blade, collar and wrapped grip.
+bool ShamanBladeUVs(Model& model) {
+    constexpr std::array<float,3> lo{-.00926f,-.02872f,-.16590f}, hi{-.00064f,.04364f,.04590f};
+    for (int i=0;i<3;++i)
+        if (!(std::abs(model.min[i]-lo[i])<.002f && std::abs(model.max[i]-hi[i])<.002f))
+            return false;
+    for (auto& vertex : model.vertices) {
+        const float y=vertex.position[1], z=vertex.position[2];
+        const float hook=std::clamp((-.110f-z)/.056f,0.f,1.f);
+        const float centre=.006f+.038f*hook*hook;
+        const float width=z<-.062f ? .036f : z<-.038f ? .075f : .035f;
+        vertex.uv[0]=std::clamp(.5f+(y-centre)/width,.002f,.998f);
+        const float v=z<-.062f ? .65f*(z-lo[2])/(-.062f-lo[2]) :
+                      z<-.038f ? .65f+.11f*(z+.062f)/.024f :
+                                 .76f+.24f*(z+.038f)/(hi[2]+.038f);
+        vertex.uv[1]=std::clamp(v,.002f,.998f);
+    }
+    return true;
+}
+
+bool KnifeMaterial(Model& model, bool shaman) {
+    namespace PK = VR::PoisonKnife;
+    const auto file = cmrc::res::get_filesystem().open(shaman ? "src/resources/vr/shaman_blade.dds"
+                                                              : "src/resources/vr/poison_knife.dds");
+    if (!PK::DdsValid({file.begin(), file.size()})) return false;
+    ModelTexture texture{};
+    texture.format = ModelTexture::Format::Bc1;
+    texture.width = texture.height = PK::Size;
+    texture.levels = PK::Levels;
+    u32 offset = 0;
+    for (u32 level = 0; level < texture.levels; ++level) {
+        texture.level_offset.push_back(offset);
+        const u32 blocks = std::max(1u, (PK::Size >> level) / 4);
+        offset += blocks * blocks * 8;
+    }
+    texture.blocks.assign(file.begin()+128, file.end());
+    if (!(shaman ? ShamanBladeUVs(model) : PK::ApplyUVs(model.vertices))) return false;
+    model.diffuse = std::move(texture);
+    return true;
+}
+
 // Every model of the held-item table plus `wanted`, from one read of the sfx archive.
 void LoadModels(Loader& l, s32 wanted) {
     const auto start = std::chrono::steady_clock::now();
@@ -1006,6 +1059,32 @@ void LoadModels(Loader& l, s32 wanted) {
         });
     }
     std::unordered_map<s32, std::shared_ptr<Model>> loaded;
+    const auto embedded = [&](s32 id, const char* path, u32 limit, auto decode) {
+        if (std::find(ids.begin(), ids.end(), id) == ids.end()) return;
+        const auto file = cmrc::res::get_filesystem().open(path);
+        u32 size = 0;
+        if (file.size() >= 8 && std::memcmp(file.begin(), "BRZ1", 4) == 0) {
+            std::memcpy(&size, file.begin() + 4, 4);
+            if (size > 0 && size <= limit) {
+                std::vector<u8> raw(size);
+                mz_ulong actual = size;
+                if (mz_uncompress(raw.data(), &actual,
+                                  reinterpret_cast<const unsigned char*>(file.begin() + 8),
+                                  file.size() - 8) == MZ_OK && actual == size)
+                    if (auto model = decode(raw)) loaded.emplace(id, std::move(model));
+            }
+        }
+        if (!loaded.contains(id))
+            LOG_WARNING(Core, "VR animated item {}: embedded model invalid; using game fallback", id);
+    };
+    embedded(BeastRoar::Model, "src/resources/vr/beast_roar.brb", BeastRoar::MaxDecodedBytes,
+             BeastRoar::Decode);
+    embedded(CallBeyond::Model, "src/resources/vr/call_beyond.brb", CallBeyond::MaxDecodedBytes,
+             CallBeyond::Decode);
+    embedded(AugurCreature::Model, "src/resources/vr/augur_creature.brb",
+             AugurCreature::MaxDecodedBytes, AugurCreature::Decode);
+    embedded(ExecutionerGlove::Model, "src/resources/vr/executioner_glove.brb",
+             ExecutionerGlove::MaxDecodedBytes, ExecutionerGlove::Decode);
     std::string why = "the archive is missing";
     for (const char* archive : {SfxArchive, "/app0/dvdroot_ps4/sfx/frpg_sfxbnd_dlceffects.ffxbnd.dcx"}) {
     if (auto file = ReadGameFile(archive)) {
@@ -1014,13 +1093,13 @@ void LoadModels(Loader& l, s32 wanted) {
             std::vector<std::string> names;
             for (const s32 id : ids) {
                 if (loaded.contains(id)) continue;
-                names.push_back(fmt::format("s{:05}.flver", id));
+                names.push_back(fmt::format("s{:05}.flver", VR::PoisonKnife::SourceModel(id)));
             }
             auto flvers = Bnd4FilesNamed(*bnd, names);
             std::vector<std::string> texture_names;
             std::unordered_map<s32, std::string> texture_of;
             for (const s32 id : ids) {
-                const auto it = flvers.find(fmt::format("s{:05}.flver", id));
+                const auto it = flvers.find(fmt::format("s{:05}.flver", VR::PoisonKnife::SourceModel(id)));
                 if (it == flvers.end()) {
                     continue;
                 }
@@ -1043,6 +1122,8 @@ void LoadModels(Loader& l, s32 wanted) {
             }
             const auto tpfs = Bnd4FilesNamed(*bnd, texture_names);
             for (auto& [id, model] : loaded) {
+                if (!model->animation.empty())
+                    continue;
                 if (!texture_of.contains(id)) continue;
                 Model* const m = model.get();
                 const auto name = texture_of.find(id);
@@ -1064,6 +1145,14 @@ void LoadModels(Loader& l, s32 wanted) {
     if (const auto it=loaded.find(11012); it!=loaded.end()) {
         if (!RegalMusicBox(*it->second))
             LOG_WARNING(Core, "VR assets: music box regal atlas invalid; keeping native material");
+    }
+    if (const auto it = loaded.find(VR::PoisonKnife::Model); it != loaded.end()) {
+        if (!KnifeMaterial(*it->second, false))
+            LOG_WARNING(Core, "VR assets: poison knife atlas/layout invalid; keeping native material");
+    }
+    if (const auto it = loaded.find(10020); it != loaded.end()) {
+        if (!KnifeMaterial(*it->second, true))
+            LOG_WARNING(Core, "VR assets: shaman blade atlas/layout invalid; keeping native material");
     }
     const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
                             std::chrono::steady_clock::now() - start)
@@ -1281,6 +1370,10 @@ void Start() {
     std::thread(Run).detach();
 }
 
+std::optional<std::vector<u8>> DecompressDcx(const std::vector<u8>& file) {
+    return Dcx(file);
+}
+
 std::string GoodsName(s32 goods) {
     auto& l = L();
     if (!l.names_ready.load(std::memory_order_acquire)) {
@@ -1324,6 +1417,9 @@ std::shared_ptr<const Model> GetModel(s32 model_id) {
         if (const auto it = l.models.find(model_id); it != l.models.end()) {
             return it->second;
         }
+        if (model_id >= RuntimeModelBase) {
+            return nullptr; // a runtime model not put (or dropped): nothing to load
+        }
         if (l.model_failed.contains(model_id) ||
             std::find(l.model_queue.begin(), l.model_queue.end(), model_id) !=
                 l.model_queue.end()) {
@@ -1333,6 +1429,96 @@ std::shared_ptr<const Model> GetModel(s32 model_id) {
     }
     l.cv.notify_one();
     return nullptr;
+}
+
+void PutModel(s32 model_id, std::shared_ptr<const Model> model) {
+    if (model_id < RuntimeModelBase || !model) {
+        return;
+    }
+    Start();
+    auto& l = L();
+    std::scoped_lock lock{l.mutex};
+    l.models[model_id] = std::move(model);
+}
+
+namespace {
+std::atomic<u32> g_dropped_models{0}; // DroppedModels
+} // namespace
+
+void DropModel(s32 model_id) {
+    if (model_id < RuntimeModelBase) {
+        return;
+    }
+    auto& l = L();
+    std::shared_ptr<const Model> gone; // freed after the lock
+    {
+        std::scoped_lock lock{l.mutex};
+        if (const auto it = l.models.find(model_id); it != l.models.end()) {
+            gone = std::move(it->second);
+            l.models.erase(it);
+        }
+    }
+    g_dropped_models.fetch_add(1, std::memory_order_release);
+}
+
+u32 DroppedModels() {
+    return g_dropped_models.load(std::memory_order_acquire);
+}
+
+void KeepDroppedModels(std::vector<s32>& ids) {
+    auto& l = L();
+    std::scoped_lock lock{l.mutex};
+    std::erase_if(ids, [&](s32 id) { return id < RuntimeModelBase || l.models.contains(id); });
+}
+
+bool DecodeTpfTexture(const std::vector<u8>& tpf, std::string_view name, ModelTexture& out,
+                      std::string& why) {
+    // Entries of 0x24 bytes from 0x10: {u32 offset, s32 size, u8 format, type, mips, flags, u16
+    // width, height, u32, u32 tile mode, u32 name offset, ..}; names UTF-16 when +0x0E is 1.
+    s32 count{};
+    if (tpf.size() < 0x40 || std::memcmp(tpf.data(), "TPF\0", 4) != 0 || tpf[0x0C] != 4) {
+        why = "not a PS4 TPF";
+        return false;
+    }
+    std::memcpy(&count, tpf.data() + 8, sizeof(count));
+    if (count < 1 || count > 4096 || 0x10 + 0x24ull * static_cast<u64>(count) > tpf.size()) {
+        why = "its texture table";
+        return false;
+    }
+    const bool utf16 = tpf[0x0E] == 1;
+    const auto lower = [](char c) {
+        return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    };
+    for (s32 k = 0; k < count; ++k) {
+        const size_t e = 0x10 + 0x24 * static_cast<size_t>(k);
+        u32 at{};
+        std::memcpy(&at, tpf.data() + e + 0x18, sizeof(at));
+        // The name, compared as it is read.
+        size_t i = 0;
+        bool same = true;
+        for (;; ++i) {
+            const size_t p = at + (utf16 ? 2 * i : i);
+            if (p + (utf16 ? 1 : 0) >= tpf.size() || i > 255) {
+                same = false;
+                break;
+            }
+            const u16 c = utf16 ? static_cast<u16>(tpf[p] | (tpf[p + 1] << 8)) : tpf[p];
+            if (c == 0) {
+                same = same && i == name.size();
+                break;
+            }
+            if (i >= name.size() || c > 127 || lower(static_cast<char>(c)) != lower(name[i])) {
+                same = false;
+                break;
+            }
+        }
+        if (!same) {
+            continue;
+        }
+        return DecodeTexture(tpf, out, why, e);
+    }
+    why = fmt::format("no texture '{}'", name);
+    return false;
 }
 
 void RequestMenuTextures(const std::vector<std::string>& names) {

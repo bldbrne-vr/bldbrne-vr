@@ -1,4 +1,6 @@
+#include "common/frame_timeline.h"
 #include "common/render_diagnostic.h"
+#include "common/scm_rev.h"
 #include "video_core/native_stereo/asymmetric_projection.h"
 #include "video_core/native_stereo/capture_marker.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
@@ -7,7 +9,6 @@
 
 #include "video_core/native_stereo/native_stereo.h"
 #include "common/debug.h"
-#include "video_core/vma_fallback.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -16,10 +17,16 @@
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/system/systemservice.h"
+#include "core/vr/bloodborne_quickitems.h"
 #include "core/vr/desktop_mirror.h"
 #include "core/vr/graphics_settings.h"
 #include "core/vr/graphics_status.h"
 #include "core/vr/live_tune.h"
+#include "core/vr/riposte_style.h"
+#include "core/vr/trick_weapons.h"
+#include "core/vr/body_channel.h"
+#include "core/vr/vr_page_runtime.h"
+#include "core/vr/vr_session.h"
 #include "imgui/friends_layer.h"
 #include "imgui/invitation_prompt_layer.h"
 #include "imgui/notifications_layer.h"
@@ -33,11 +40,14 @@
 #include "video_core/renderer_vulkan/vk_gpu_frame_timer.h"
 #include "video_core/renderer_vulkan/vk_gpu_pass_profiler.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
-#include "core/vr/vr_page_runtime.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_gpu_crash.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_submit_lock_trace.h"
+#include "video_core/renderer_vulkan/vr_inframe.h"
+#include "video_core/renderer_vulkan/vr_xr_size.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/vma_fallback.h"
 
 #include <algorithm>
 #include <array>
@@ -492,8 +502,22 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       swapchain{instance, window},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
-    const u32 num_images = swapchain.GetImageCount();
+    // VR_OUTPUT_FRAME_EXTRA=1..2 (tests only, VR): output frames beyond the desktop swapchain's
+    // images. Stage A needs a free output frame before it prepares (and publishes) a frame, and the
+    // present thread frees one per vblank, so a fast stage A waits up to a vblank (2026-11-05 frame
+    // timeline, PGO at 120 Hz: 509 of 553 frames over 12 ms waited 7.4 ms on average). One more
+    // frame cut late frames ~80% but queued deeper: camera -> display 50 -> 78 ms. Off.
+    const u32 extra_frames = [] {
+        const char* value = std::getenv("VR_OUTPUT_FRAME_EXTRA");
+        if (value == nullptr || !OpenXRPresenter::IsRequested()) {
+            return 0u;
+        }
+        return static_cast<u32>(std::clamp(std::atoi(value), 0, 2));
+    }();
+    const u32 num_images = swapchain.GetImageCount() + extra_frames;
     const vk::Device device = instance.GetDevice();
+    LOG_INFO(Render_Vulkan, "Output frames: {} ({} desktop swapchain images + {} for VR)",
+             num_images, swapchain.GetImageCount(), extra_frames);
 
     // Create presentation frames.
     present_frames.resize(num_images);
@@ -522,6 +546,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
                 LOG_ERROR(Render_Vulkan, "OpenXR presenter could not start; VR is off");
                 openxr_presenter.reset();
             } else {
+                VR::SetXrPresenterActive(true); // a VR run (gnmdriver.cpp: frame overlap)
                 // DIBR stereo (stereo_mode 2): captured in the draw stream, warped at the flip.
                 vr_warp = std::make_unique<VrStereoWarp>(instance, draw_scheduler);
                 if (std::getenv("VR_DIBR_TIMING") != nullptr) {
@@ -535,6 +560,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
                                             openxr_presenter->LateSlotsWanted());
                 }
                 rasterizer->SetVrStereoWarp(vr_warp.get());
+                // The held items' meshes, built in the background while the game loads.
+                VrInFrame::PrewarmMeshes();
                 LOG_INFO(Render_Vulkan, "VR dibr: warp pipelines created");
                 // The game's UI on its own layer: shadowed in the draw stream, resolved at the
                 // flip.
@@ -673,6 +700,7 @@ Frame* Presenter::PrepareLastFrame() {
         if (result == vk::Result::eTimeout) {
             continue;
         }
+        GpuCrash::Report(result, "the desktop present's wait for a frame");
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
     }
@@ -738,7 +766,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
 
-    Frame* frame = GetRenderFrame();
+    Frame* frame = TakeRenderFrame();
     frame->vr_tag = vr_tag;
     frame->vr_stereo = false;
     frame->vr_published = false;
@@ -936,6 +964,51 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         rasterizer->VrEndFrame();
     }
 
+    // No allocations/formatting on unchanged frames; settings are sampled every
+    // 120 immersive flips and changes must survive two polls (at most eight lines).
+    static Common::RenderDiagnostic::SettingsSnapshot<std::array<int, 14>> settings_snapshot;
+    if (settings_snapshot.Poll(vr_tag.immersive)) {
+        const auto& settings = VR::GetSettings();
+        const auto graphics = VR::Graphics::Accepted();
+        const auto stereo = VR::GetStereo();
+        const int ffr = VR::Graphics::foveation.load(std::memory_order_relaxed);
+        const bool restart_needed = VR::Graphics::ResolutionRestartRequired();
+        const std::array<int, 14> values{
+            settings.lod_bias, settings.water_reflections, settings.shadows_far_reduced,
+            settings.shadows_busy, ffr, graphics.scale_percent, int(graphics.upscaler),
+            int(VR::Graphics::EffectiveProfile(graphics)), graphics.dlss5,
+            stereo.stereo ? stereo.mode : -1, NativeStereo::Enabled(),
+            NativeStereo::LayerDrawsMode(), restart_needed, settings.canted_eyes};
+        if (settings_snapshot.Observe(values)) {
+            try {
+                const char* detail = settings.lod_bias == 0 ? "Performance" :
+                    settings.lod_bias == -1 ? "Balanced" :
+                    settings.lod_bias == -2 ? "Quality" : "Custom";
+                constexpr std::array profiles{"Performance", "Balanced", "Quality",
+                    "UltraPerformance", "UltraQuality", "BalancedPlus"};
+                const auto profile = static_cast<unsigned>(VR::Graphics::EffectiveProfile(graphics));
+                Common::RenderDiagnostic::Write(fmt::format(
+                    "VR settings release={} distant_detail_config={}({}) water_reflections={} "
+                    "far_shadows_reduced={} busy_shadows={} ffr_config={} ffr_available={} "
+                    "ffr_env_override={} scale_accepted={}% upscaler_accepted={} preset={} neural={} "
+                    "resolution_restart_needed={} stereo_mode={} native={} native_views={} angled_screens={}",
+                    Common::g_scm_desc[0] ? Common::g_scm_desc : "unknown",
+                    detail, settings.lod_bias, settings.water_reflections,
+                    settings.shadows_far_reduced, settings.shadows_busy,
+                    ffr < 0 ? "Auto" : ffr == 0 ? "Off" : ffr == 1 ? "On" :
+                        ffr == 2 ? "Performance" : ffr == 3 ? "Light" : "Unknown",
+                    instance.IsFoveationEnabled(), instance.IsFoveationFixed(),
+                    graphics.scale_percent, VR::Graphics::UpscalerName(graphics.upscaler),
+                    profile < profiles.size() ? profiles[profile] : "Unknown", graphics.dlss5,
+                    restart_needed,
+                    !stereo.stereo ? "Mono" : stereo.mode == 2 ? "DIBR" :
+                        stereo.mode == 1 ? "PerEye" : "ClipShift",
+                    NativeStereo::Enabled(), NativeStereo::LayerDrawsMode() ? "Layers" : "Multiview",
+                    settings.canted_eyes));
+            } catch (...) { /* Diagnostics must not interrupt rendering. */ }
+        }
+    }
+
     // One diagnostic window per process; loading/flat flips cannot consume it.
     // Eye allocations persist across Frame reuse; only count them as current when
     // this flip actually produced stereo. Recording a copy does not validate pixels.
@@ -988,8 +1061,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
 Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     rasterizer->DrainDrawPipe();
-    // Request a free presentation frame.
-    Frame* frame = GetRenderFrame();
+    // Request a free presentation frame (the present thread's own; the GPU thread's reserved one).
+    Frame* frame = present_thread ? GetRenderFrame() : TakeRenderFrame();
     frame->vr_stereo = false;
     frame->vr_published = false;
     frame->vr_ui = {};
@@ -1109,7 +1182,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
                      "(desktop_mirror {}), {} shown as an eye",
                      mirror_published, mirror_skipped, every, mirror_eye_shown);
         }
-        if (!VR::DesktopMirror::Presents(every, mirror_published) &&
+        const s64 mirror_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch())
+                                      .count();
+        if (!VR::DesktopMirror::PresentsAt(every, mirror_now_ns, mirror_last_shown_ns) &&
             VideoCore::PeekWithOverlaysScreenshotRequests() == 0) {
             const auto reset = instance.GetDevice().resetFences(frame->present_done);
             ASSERT_MSG(reset == vk::Result::eSuccess,
@@ -1143,6 +1219,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
             DebugState.IncFlipFrameNum();
             return;
         }
+        mirror_last_shown_ns = mirror_now_ns; // this one is shown: the next waits its interval
     }
 
     // Recreate the swapchain if the window was resized.
@@ -1520,8 +1597,10 @@ void Presenter::RecordMirrorEye(vk::CommandBuffer cmdbuf, const Frame& frame, vk
     const bool window_bgra = format == vk::Format::eB8G8R8A8Unorm;
     const bool window_rgba = format == vk::Format::eR8G8B8A8Unorm;
     const u32 e = std::min<u32>(frame.vr_desktop_eye_index, 1u);
-    const bool typed_srgb = frame.native_eyes[e] &&
-                            frame.vr_eye_image[e] == frame.native_eyes[e]->image;
+    const bool typed_srgb = (frame.native_eyes[e] &&
+                             frame.vr_eye_image[e] == frame.native_eyes[e]->image) ||
+                            (frame.native_fit_eyes[e] &&
+                             frame.vr_eye_image[e] == frame.native_fit_eyes[e]->image);
     // Native eyes are typed sRGB images, unlike DIBR's RGBA_UNORM byte containers.
     // Blitting them decodes sRGB and already understands their channel order. Use an
     // sRGB intermediate in the window's order to encode again before the raw copy.
@@ -1602,6 +1681,7 @@ void Presenter::RecordMirrorEye(vk::CommandBuffer cmdbuf, const Frame& frame, vk
 Frame* Presenter::GetRenderFrame() {
     // Wait for free presentation frames
     Frame* frame;
+    Common::FrameTimeline::FrameWaitStart();
     {
         std::unique_lock lock{free_mutex};
         free_cv.wait(lock, [this] { return !free_queue.empty(); });
@@ -1622,6 +1702,7 @@ Frame* Presenter::GetRenderFrame() {
 
     // Wait for the presentation to be finished so all frame resources are free
     while (wait() != vk::Result::eSuccess) {
+        GpuCrash::Report(result, "the desktop present's wait for its frame's presentation");
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
         // Retry if the waiting times out
@@ -1629,12 +1710,41 @@ Frame* Presenter::GetRenderFrame() {
             continue;
         }
     }
+    Common::FrameTimeline::FrameWaitEnd();
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {
         RecreateFrame(frame, expected_frame_width, expected_frame_height);
     }
 
+    return frame;
+}
+
+// VR (2026-11-05): the wait for a free output frame is the pipeline's latency cap (one frame
+// being prepared, one waiting for its vblank, one in flight), but it sat between a finished
+// frame and its publication to the headset (PrepareFrame: the frame first, the eyes published at
+// its end), holding that frame back up to a vblank (frame timeline, PGO at 120 Hz: 509 of 553
+// frames over 12 ms). Taken right after a flip is handed over instead, the same wait comes before
+// the next frame's commands: the same cap and game timing, the finished frame published at once.
+void Presenter::ReserveRenderFrame() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("VR_FRAME_PREACQUIRE");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (enabled && openxr_presenter && reserved_frame == nullptr) {
+        reserved_frame = GetRenderFrame();
+    }
+}
+
+Frame* Presenter::TakeRenderFrame() {
+    Frame* frame = std::exchange(reserved_frame, nullptr);
+    if (frame == nullptr) {
+        return GetRenderFrame();
+    }
+    if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
+        frame->is_hdr != swapchain.GetHDR()) {
+        RecreateFrame(frame, expected_frame_width, expected_frame_height);
+    }
     return frame;
 }
 

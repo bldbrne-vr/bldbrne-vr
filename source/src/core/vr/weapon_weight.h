@@ -54,14 +54,40 @@ inline Profile AuthoredWeapon(int family, bool form_b) {
     case 220: return form_b ? Profile{} : Profile{.8f, .8f, .28f};
     case 230: return form_b ? Profile{1.3f, .6f, .28f} : Profile{1.3f, .95f, .48f};
     case 240: return form_b ? Profile{} : Profile{2.8f, .9f, .55f, .95f, .16f, .05f, .120f}; // Beast Cutter; B uses its chain solver
-    case 250: return form_b ? Profile{} : Profile{3.5f, 1.0f, .65f};
+    // The Amygdalan Arm: 5.0 kg (3.5 until 2026-11-09, the user: "very light given how massive
+    // it is"); its form B is the lash's (core/vr/amygdalan_arm.h).
+    case 250: return form_b ? Profile{} : Profile{5.0f, 1.0f, .65f};
     case 260: return form_b ? Profile{3.0f, 1.4f, .65f} : Profile{2.0f, 1.1f, .45f};
     case 280: return {3.5f, .9f, .65f};
-    case 290: return form_b ? Profile{3.5f, 1.25f, .80f} : Profile{1.6f, .65f, .43f};
+    // The Bloodletter: its transformed flail 4.0 kg (3.5 until 2026-11-09, the user: heavier, "a bit
+    // more sway").
+    case 290: return form_b ? Profile{4.0f, 1.25f, .80f} : Profile{1.6f, .65f, .43f};
     case 300: return form_b ? Profile{2.0f, 1.25f, .65f} : Profile{1.2f, .85f, .32f};
     case 310: return form_b ? Profile{4.0f, 1.35f, .85f} : Profile{1.8f, .7f, .43f};
     case 320: return form_b ? Profile{} : Profile{1.1f, .85f, .30f};
     default: return {};
+    }
+}
+
+// Heft (2026-10-28: "heavy and strong", per weapon): how much a swing carries, on top of
+// the profile's inertia, by what the weapon is (a hammer head or a saw on a pole carries more than
+// a balanced greatsword; a scythe's long sweep stays fluid). It scales the swing lag and its
+// deflection limit only: slow aim stays exact and the sag is gravity's alone.
+inline float Heft(int family, bool form_b) {
+    switch (family) {
+    case 80: return form_b ? 1.35f : 1.0f;  // Kirkhammer: the stone hammer
+    case 120: return 1.30f;                 // Logarius' Wheel
+    case 310: return form_b ? 1.28f : 1.08f; // Whirligig Saw: the saw on its pole
+    case 280: return 1.25f;                 // Boom Hammer
+    case 250: return form_b ? 1.0f : 1.32f; // Amygdalan Arm (1.25 until 2026-11-09)
+    case 290: return form_b ? 1.28f : 1.0f; // Bloodletter (its form B 1.18 until 2026-11-09)
+    case 81: return form_b ? 1.15f : 1.0f;  // Ludwig's Holy Blade: the greatsword
+    case 50: return form_b ? 1.15f : 1.0f;  // Hunter Axe: the long axe
+    case 260: return form_b ? 1.12f : 1.0f; // Holy Moonlight Sword
+    case 240: return form_b ? 1.0f : 1.12f; // Beast Cutter
+    case 51: return form_b ? 1.05f : 1.0f;  // Burial Blade: the scythe sweeps
+    case 300: return form_b ? 1.05f : 1.0f; // Church Pick
+    default: return 1.0f;
     }
 }
 
@@ -110,6 +136,8 @@ struct Input {
     float load_response{}; // experimental 0..1 compliance, independently opt-in
     float lift_response{}; // experimental acceleration load, requires load_response
     Vec3 gravity_arm{}; // optional grip-to-centroid vector in tracking space, incl. grip trims
+    float sliding{}; // 0..1 slide mode (two_hand_grip.h SupportGrip::SlideMode): adjusting the
+                     // hands, the weight mostly steps aside (SlideDamp) and nothing carries through
 };
 
 class Filter {
@@ -123,6 +151,7 @@ public:
             native_center_ = profile_.measured ? ForWeapon(in.family,in.form_b,true).center : Vec3{};
             inertia_ = profile_.Inertia();
             profile_twist_ = profile_.TwistRatio();
+            heft_ = Heft(in.family, in.form_b);
             profile_family_ = in.family; profile_form_ = in.form_b;
             profile_mesh_ = in.measured_shape; profile_scale_ = in.model_to_metres;
             profile_valid_ = true;
@@ -143,20 +172,29 @@ public:
         const auto& profile = ProfileFor(in);
         if (profile.mass == 0) { Clear(); return false; }
         const Quat target = Normalize(hand.q);
-        const float strength = std::clamp(in.strength, 0.0f, 1.0f);
+        // Slide mode (2026-10-28): adjusting the hands, a big weapon must not flap
+        // about as the hands come together; the weight is full again once the grip is fixed.
+        const float sliding = std::isfinite(in.sliding) ? std::clamp(in.sliding, 0.0f, 1.0f) : 0.0f;
+        const float strength = std::clamp(in.strength, 0.0f, 1.0f) * (1.0f - SlideDamp * sliding);
+        const float desired_carry = strength * (1.0f - sliding);
         const float support = std::clamp(in.support, 0.0f, 1.0f);
-        const float leverage = Smoothstep(.06f, .45f, in.separation);
+        // Leverage (2026-10-28): hands wide apart steady the weapon, but its mass still
+        // has to get moving ("heavy and strong", not light): at most ~1.8x quicker, the deflection
+        // ~60% of one hand's. Sag stays the two-handed gravity's own (strong, never floaty).
+        const float leverage = Smoothstep(.08f, .50f, in.separation);
         const float inertia = inertia_;
-        const float control = 1.0f + support * (.35f + 1.25f * leverage);
-        const float desired_tau = strength * (.008f + .020f * inertia / (inertia + .6f)) / control;
+        const float control = 1.0f + support * (.25f + .55f * leverage);
+        const float heft = heft_; // Heft: per weapon, swing lag and its limit only
+        const float desired_tau =
+            strength * heft * (.008f + .020f * inertia / (inertia + .6f)) / control;
         // Drag torque depends on exposed area AND its lever from the grip. Keep
         // extension separate from mass (e.g. both axe forms have the same mass).
         const float desired_air = strength * profile.air * (profile.Area()/.05f) *
                                   (profile.balance/.45f) / control;
         const float desired_lever = profile.balance;
         const float desired_twist = profile_twist_;
-        const float desired_limit = strength * (3.0f + 7.0f * inertia / (inertia + .8f)) *
-                                    (1.0f - support * (.20f + .40f * leverage)) * Deg;
+        const float desired_limit = strength * heft * (3.0f + 7.0f * inertia / (inertia + .8f)) *
+                                    (1.0f - support * (.15f + .25f * leverage)) * Deg;
         const bool gravity_enabled = std::isfinite(in.gravity) && in.gravity > 0 &&
                                      IsFinite(in.gravity_down) && LengthSq(in.gravity_down) > .5f;
         const Vec3 desired_arm = in.measured_shape && profile.measured && IsFinite(in.gravity_arm) &&
@@ -177,16 +215,28 @@ public:
         // The reset guard and angular velocity use the same shortest-arc rotation.
         // Calculate its normalized quaternion/log once, retaining the exact guard.
         const Vec3 delta = have_ ? RotationVector(target * Conjugate(raw_)) : Vec3{};
+        // A sample at or within MinStepS of the last (a second publish for one frame) is no new step:
+        // its rotation over that sliver of time would be a turn rate no blade has (the headset
+        // log, 2026-10-28: one-handed tips of 10^8 m/s). Repeat the last output instead.
+        if (have_ && elapsed >= 0 && elapsed < MinStepS && in.measured_shape == measured_shape_ &&
+            space == space_ && in.family == family_) {
+            hand.q = q_;
+            hand.p += load_offset_;
+            hand.w = last_w_;
+            hand.angular_valid = true;
+            return true;
+        }
         if (!have_ || in.measured_shape != measured_shape_ || space != space_ || in.family != family_ || elapsed <= 0 ||
             elapsed > .05 || Length(hand.p - position_) > .25f ||
             Length(delta) > 45.0f * Deg) {
             have_ = true; time_ = time; space_ = space; family_ = in.family;
             raw_ = q_ = target; position_ = hand.p;
-            tau_ = desired_tau; air_ = desired_air; limit_ = desired_limit;
+            tau_ = desired_tau; air_ = desired_air; limit_ = desired_limit; last_w_ = {};
             lever_ = desired_lever; twist_ = desired_twist;
             gravity_limit_ = desired_gravity; gravity_state_ = {}; gravity_sag_ = 0;
             local_arm_ = local_arm; measured_shape_ = in.measured_shape;
             relative_ = relative; relative_valid_ = relative_valid; linear_ = {}; turning_ = {};
+            momentum_ = {}; carry_scale_ = desired_carry;
             load_offset_ = {}; lift_velocity_ = {}; lift_acceleration_ = {}; lift_scale_ = 1; force_drag_ = {};
             hand.q = target;
             return false;
@@ -194,6 +244,7 @@ public:
         const float dt = static_cast<float>(elapsed);
         // Form and grip changes blend their parameters, never the tracked input or clock.
         const float blend = 1.0f - std::exp(-dt / .24f);
+        carry_scale_ += (desired_carry - carry_scale_) * blend;
         tau_ += (desired_tau - tau_) * blend;
         air_ += (desired_air - air_) * blend;
         limit_ += (desired_limit - limit_) * blend;
@@ -209,6 +260,8 @@ public:
         // Differentiate already stabilized poses. Runtime/raw angular velocity must not
         // reopen this response with tracking noise after the hand has actually settled.
         turning_ = turning_ + (target_velocity-turning_) * (1.0f-std::exp(-dt/.05f));
+        // The head's momentum: the turn, remembered a little longer (MomentumTauS).
+        momentum_ = momentum_ + (turning_-momentum_) * (1.0f-std::exp(-dt/MomentumTauS));
         const float speed = Length(turning_);
         // Saturating quadratic drag: nearly absent for precise aiming, substantial for a
         // deliberate swing. The signed turn estimate suppresses rapid alternating noise;
@@ -263,6 +316,24 @@ public:
         // Axial rotation has less inertia than swinging the blade across its length.
         Vec3 next_error = (Perp(turning_,axis) + axis*Dot(turning_,axis)*twist_) *
                           (-response) + drag;
+        // Carry-through (2026-10-28): a heavy weapon's head runs on a little past a
+        // fast swing's stop, then settles. Only while the hand slows (the remembered momentum
+        // ahead of the turn, along it), only a fast swing, scaled by the weapon's heft (light
+        // weapons none); one damped pass, no ringing: both memories decay to rest.
+        carry_ = {};
+        const float carry_gain = carry_scale_ * std::clamp((heft_ - 1.0f) / .35f, 0.0f, 1.0f);
+        const float momentum_speed = Length(momentum_);
+        if (carry_gain > 0 && momentum_speed > 1e-4f) {
+            const Vec3 along = Perp(momentum_ * (1.0f/momentum_speed), axis);
+            const float slowing = Dot(momentum_ - turning_, along);
+            if (slowing > 0) {
+                const float fast = Smoothstep(CarryFromDps*Deg, CarryFullDps*Deg, momentum_speed);
+                float amount = carry_gain * fast * CarryS * slowing;
+                amount = std::min(amount, carry_gain * CarryMaxDeg * Deg);
+                carry_ = along * amount;
+                next_error += carry_;
+            }
+        }
         if (gravity_enabled) {
             // Gravitational torque is proportional to the horizontal moment arm.
             // Smooth the load, then project it onto the CURRENT downward torque direction:
@@ -311,6 +382,7 @@ public:
         }
         hand.q = q_;
         hand.w = RotationVector(q_ * Conjugate(previous)) * (1.0f/dt);
+        last_w_ = hand.w;
         hand.angular_valid = true;
         return true;
     }
@@ -318,8 +390,18 @@ public:
         have_ = false;
         load_offset_ = {}; lift_velocity_ = {}; lift_acceleration_ = {}; lift_scale_ = 1;
         gravity_sag_ = gravity_limit_ = 0;
-        drag_cue_ = {};
+        drag_cue_ = {}; momentum_ = {}; carry_ = {};
     }
+    // Carry-through: momentum's memory, its gain (s), the swing speeds it needs and its cap.
+    static constexpr float MomentumTauS = .12f;
+    static constexpr float CarryS = .03f;
+    static constexpr float CarryFromDps = 100.0f, CarryFullDps = 250.0f;
+    static constexpr float CarryMaxDeg = 3.5f;
+    // Slide mode keeps this little of the weight (1 - SlideDamp), and no carry-through.
+    static constexpr float SlideDamp = .75f;
+    // Samples closer than this (s) are one sample (Step).
+    static constexpr double MinStepS = .001;
+    Vec3 CarryCue() const { return carry_; }
     Vec3 DragCue() const { return drag_cue_; }
     float LiftScale() const { return lift_scale_; }
     Vec3 PositionOffset() const { return load_offset_; }
@@ -328,7 +410,7 @@ public:
 private:
     Profile profile_{};
     Vec3 native_center_{};
-    float inertia_{}, profile_twist_{}, profile_scale_{};
+    float inertia_{}, profile_twist_{}, profile_scale_{}, heft_{1.0f};
     int profile_family_{};
     bool profile_valid_{}, profile_form_{}, profile_mesh_{};
     bool have_{};
@@ -336,7 +418,9 @@ private:
     std::uint32_t space_{};
     int family_{-1};
     Quat raw_{}, q_{};
-    Vec3 position_{}, relative_{}, linear_{}, turning_{};
+    Vec3 position_{}, relative_{}, linear_{}, turning_{}, momentum_{}, carry_{};
+    float carry_scale_{};
+    Vec3 last_w_{};
     bool relative_valid_{};
     float tau_{}, air_{}, limit_{}, lever_{}, twist_{};
     float gravity_limit_{}, gravity_sag_{}, lift_scale_{1};
@@ -346,14 +430,27 @@ private:
 };
 
 // Preserve the attached off-hand's grip relationship when the shared weapon rotates.
+// `position_shift`: the weight's own move of the right hand (Filter::PositionOffset).
 inline void CarrySupport(HandsSample& sample, Quat previous_right, Vec3 position_shift = {}) {
     if (sample.two_hand <= 0 || !IsTracked(sample.hand[0])) return;
-    const auto& r = sample.hand[1];
+    auto& r = sample.hand[1];
     auto& l = sample.hand[0];
-    const Quat turn = ScaleRotation(Normalize(r.q * Conjugate(previous_right)),
-                                    std::clamp(sample.two_hand, 0.0f, 1.0f));
-    l.p = r.p + Rotate(turn, l.p-r.p+position_shift) -
-        position_shift*(1.0f-std::clamp(sample.two_hand,0.0f,1.0f));
+    const float w = std::clamp(sample.two_hand, 0.0f, 1.0f);
+    const Quat turn = ScaleRotation(Normalize(r.q * Conjugate(previous_right)), w);
+    // About the right fist, where the weight turned the weapon: the support hand goes round it.
+    const Vec3 right_was = r.p - position_shift;
+    const Vec3 round_right = right_was + Rotate(turn, l.p - right_was) + position_shift * w;
+    // A leading left hand is the weapon's pivot (two_hand_left_lead): the weapon and the right
+    // fist go round it instead (2026-10-28: with the left leading, the weight swung the
+    // weapon about the right fist and dragged the dominant left off its controller).
+    const float m = std::clamp(sample.two_hand_left_lead, 0.0f, 1.0f) * w;
+    if (m > 0.0f) {
+        const Vec3 round_left = l.p + Rotate(turn, right_was - l.p) + position_shift;
+        r.p = Lerp(r.p, round_left, m);
+        l.p = Lerp(round_right, l.p + position_shift * w, m);
+    } else {
+        l.p = round_right;
+    }
     l.q = Normalize(turn*l.q);
     // The adjusted linear velocity is not the controller's; shared combat differentiates
     // the final poses in BladeMotion after this operation.

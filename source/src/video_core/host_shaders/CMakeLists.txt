@@ -17,15 +17,26 @@ set(SHADER_FILES
     fault_buffer_process.comp
     fs_tri.vert
     fsr.comp
+    vr_hle_multi_copy.comp
     post_process.frag
     tiling.comp
+    vr_depth_copy.frag
+    vr_depth_copy.vert
+    vr_depth_rescale.comp
+    vr_body_maps.comp
+    vr_depth_pyramid.comp
+    vr_fog_grid.comp
+    vr_stencil_copy.frag
     vr_dibr_prep.comp
     vr_dibr_warp.comp
+    vr_dlss_focus.comp
+    vr_dlss_focus_crop.comp
     vr_eye_taa.comp
     vr_eye_upscale.comp
     vr_inframe.frag
     vr_inframe.vert
     vr_late_classify.comp
+    vr_eye_cant.comp
     vr_late_reproject.comp
     vr_overlay.frag
     vr_overlay.vert
@@ -33,7 +44,10 @@ set(SHADER_FILES
     vr_temporal_motion.comp
     vr_temporal_merge.comp
     vr_temporal_prepare.comp
+    vr_temporal_prepare8.comp
     vr_render_taa.comp
+    vr_riposte_meter.comp
+    vr_sky_encode.comp
     vr_ui_compose.vert
     vr_ui_compose.frag
     vr_ui_resolve.comp
@@ -54,6 +68,15 @@ foreach(FILENAME IN ITEMS ${SHADER_FILES})
     if(FILENAME STREQUAL "post_process.frag" OR FILENAME STREQUAL "vr_eye_upscale.comp"
        OR FILENAME STREQUAL "vr_dibr_warp.comp")
         set(COLOR_DEPENDENCY ${CMAKE_CURRENT_SOURCE_DIR}/vr_color.glsl)
+    endif()
+    if(FILENAME STREQUAL "post_process.frag" OR FILENAME STREQUAL "vr_eye_upscale.comp")
+        list(APPEND COLOR_DEPENDENCY ${CMAKE_CURRENT_SOURCE_DIR}/vr_riposte.glsl)
+    endif()
+    if(FILENAME STREQUAL "vr_eye_upscale.comp" OR FILENAME STREQUAL "post_process.frag")
+        list(APPEND COLOR_DEPENDENCY ${CMAKE_CURRENT_SOURCE_DIR}/vr_kos_ritual.glsl)
+    endif()
+    if(FILENAME STREQUAL "vr_overlay.frag" OR FILENAME STREQUAL "vr_eye_upscale.comp")
+        list(APPEND COLOR_DEPENDENCY ${CMAKE_CURRENT_SOURCE_DIR}/vr_status_veins.glsl)
     endif()
     add_custom_command(
         OUTPUT

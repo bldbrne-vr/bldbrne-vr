@@ -6,6 +6,7 @@
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
+#include "core/vr/messenger_gift.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -21,8 +22,12 @@
 #include "core/vr/bloodborne_body.h"
 #include "core/vr/bloodborne_gun.h"
 #include "core/vr/body_channel.h"
+#include "core/vr/boom_light.h"
 #include "core/vr/bloodborne_heal.h"
 #include "core/vr/bloodborne_held.h"
+#include "core/vr/blood_draw_channel.h"
+#include "core/vr/bloodborne_quickitems.h"
+#include "core/vr/hand_lantern.h"
 #include "core/vr/held_item.h"
 #include "core/vr/inframe.h"
 #include "core/vr/music_box.h"
@@ -31,6 +36,8 @@
 #include "core/vr/quick_channel.h"
 #include "core/vr/quick_items.h"
 #include "core/vr/quick_settings.h"
+#include "core/vr/tonitrus_charge.h"
+#include "core/vr/torch_glow.h"
 #include "core/vr/torch_lift.h"
 #include "core/vr/vial_drain.h"
 #include "core/vr/vr_session.h"
@@ -175,6 +182,10 @@ using SfxSlotRequestFn = void(PS4_SYSV_ABI*)(void* ctl, s32 slot, s32 ffx, const
 u8* g_base = nullptr;
 bool g_ready = false; // installed: the sites matched and vial_in_hand=game
 SfxSlotRequestFn g_sfx_slot = nullptr;
+// The effect sites alone (InstallTorch: the vial's checks without its settings and hide sites),
+// for the torch, the Boom Hammer and the Tonitrus.
+u8* g_torch_base = nullptr;
+SfxSlotRequestFn g_torch_sfx = nullptr;
 DmyPolyFn g_dmy_poly = nullptr; // the depth proxy (nullptr: GetDmyPolyMtx did not match)
 // The character whose vial the render-camera hook places the depth proxy for (nullptr: none this
 // update). Written by the tick (the loop thread, or site A's job thread), read by the hook.
@@ -357,6 +368,155 @@ void EndOurs(Side& s, const char* why) {
     }
 }
 
+// The Hand Lantern's light in the hand (core/vr/hand_lantern.h; LanternLightInHand: carried lit,
+// the hip's lantern out meanwhile): its light effect on the palm's dummy, asked every update
+// (repeat 0: it ends when no longer asked). VR_LANTERN_FFX / VR_LANTERN_DUMMY override the effect
+// and the dummy (the headset and mock checks).
+constexpr s32 LanternLightSlot = 30030; // private (the vial's 30000.., the torch's 30020..30029)
+bool g_lantern_shown = false;
+
+void LanternLight(u8* chr, s32 goods) {
+    const bool want = goods == VR::HandLantern::Goods && LanternLightInHand();
+    static const s32 ffx = [] {
+        const char* const env = std::getenv("VR_LANTERN_FFX");
+        return env != nullptr ? std::atoi(env) : VR::HandLantern::HandLightFfx;
+    }();
+    static const s32 dummy = [] {
+        const char* const env = std::getenv("VR_LANTERN_DUMMY");
+        return env != nullptr ? std::atoi(env) : VR::HandLantern::HandLightDummy;
+    }();
+    if (want != g_lantern_shown) {
+        g_lantern_shown = want;
+        LOG_INFO(Core, "VR lantern: {} (effect {} on dummy {})",
+                 want ? "the light in the hand" : "no light in the hand", ffx, dummy);
+    }
+    u8* const ctl = chr + OffsetSfxCtl;
+    if (!want || g_sfx_slot == nullptr || ffx <= 0 || Read<u8*>(ctl) != g_base + SfxCtlVtableRva) {
+        return;
+    }
+    const s32 at = dummy;
+    g_sfx_slot(ctl, LanternLightSlot, ffx, &at, 0);
+}
+
+// The hunter's SpEffect list (as bloodborne_quickitems.cpp HasEffect walks it; its nodes are
+// not the effect slots' above).
+constexpr u32 OffsetSpEffects = 0x1C8;
+constexpr u32 OffsetEffectHead = 0x08;
+constexpr u32 OffsetEffectFlags = 0x1C;
+constexpr u32 OffsetEffectId = 0x40;
+constexpr u32 OffsetEffectNext = 0x58;
+constexpr u32 EffectSkipMask = 0x800C0003;
+
+bool HasEffect(const u8* chr, s32 id) {
+    u8* const list = Read<u8*>(chr + OffsetSpEffects);
+    if (!Plausible(list)) {
+        return false;
+    }
+    u8* node = Read<u8*>(list + OffsetEffectHead);
+    for (u32 i = 0; i < 512 && Plausible(node); ++i) {
+        if ((Read<u32>(node + OffsetEffectFlags) & EffectSkipMask) == 0 &&
+            Read<s32>(node + OffsetEffectId) == id) {
+            return true;
+        }
+        node = Read<u8*>(node + OffsetEffectNext);
+    }
+    return false;
+}
+
+// Tonitrus' charge (core/vr/tonitrus_charge.h): the game's SpEffect 6032 on the hunter, however it
+// began. Published every update that changes it (its start: the bolt, the world's flash, the
+// thunder); while it holds, the light on the mace's head and, for the strike, a burst of the game's
+// lightning, asked every update like the lantern's (they end with the charge). VR_TONITRUS_FFX /
+// VR_TONITRUS_DUMMY override the light and where it sits. It needs the effect sites alone (the
+// torch's), whatever the vial's settings, and ticks from both of the hunter's update sites.
+VR::TonitrusCharge::Tracker g_tonitrus{};
+
+// The charge's own crackle once it is over. With the idle crackle blanked (core/vr/
+// tonitrus_charge.h: SpEffectVfxParam row 33), the game's state node for the Tonitrus asks for no
+// effect after a charge (-1, where it asked for the idle 7211) and never replaces the charge's
+// 7210, which then crackles on for good. Such a node (flags 0x4011: the effect asked at +0x24, the
+// one running at +0x40, that effect at +0x50) has its effect stopped (as the game stops one: the
+// stop bit) and is set back to running nothing, so the next charge spawns its own afresh. The
+// effect stays alive meanwhile: the node holds a counted reference to it (+0x08, released by the
+// game's own stop of a node's effect, 0x18B55B2, which flags it, drops the reference and clears
+// +0x50), and the node's next change of effect, or its end, releases it the game's way.
+constexpr u16 StateNodeFlags = 0x4011;
+constexpr u32 OffsetStateAsked = 0x24;
+constexpr u32 OffsetStateRunning = 0x40;
+constexpr u32 OffsetStateSfx = 0x50;
+constexpr s32 ChargedCrackleFfx = 7210;
+
+void EndChargedCrackle(u8* chr) {
+    u8* const ctl = chr + OffsetSfxCtl;
+    if (Read<u8*>(ctl) != g_torch_base + SfxCtlVtableRva) {
+        return;
+    }
+    u8* node = Read<u8*>(ctl + OffsetCtlHead);
+    for (u32 hops = 0; node != nullptr && hops < MaxHops && Plausible(node); ++hops) {
+        if ((Read<u16>(node + OffsetNodeFlags) & 0x7FFF) == StateNodeFlags &&
+            Read<s32>(node + OffsetStateAsked) == -1 &&
+            Read<s32>(node + OffsetStateRunning) == ChargedCrackleFfx) {
+            if (u8* const sfx = Read<u8*>(node + OffsetStateSfx); Plausible(sfx)) {
+                const u8 stop = Read<u8>(sfx + OffsetSfxStop) | 1;
+                std::memcpy(sfx + OffsetSfxStop, &stop, sizeof(stop));
+            }
+            constexpr s32 none = -1;
+            std::memcpy(node + OffsetStateRunning, &none, sizeof(none));
+            LOG_INFO(Core, "VR Tonitrus: the charge's crackle (effect {}) ended with it",
+                     ChargedCrackleFfx);
+        }
+        node = Read<u8*>(node + OffsetNodeNext);
+    }
+}
+
+void TonitrusTick(u8* chr, s64 now) {
+    namespace T = VR::TonitrusCharge;
+    if (g_torch_sfx == nullptr || !Plausible(chr)) {
+        return; // the effect sites did not match (and the idle crackle is kept: PrepareHeldEffects)
+    }
+    const bool charged = HasEffect(chr, T::ChargeEffect);
+    const bool was = g_tonitrus.state.active;
+    if (g_tonitrus.Step(charged, now)) {
+        LOG_INFO(Core, "VR Tonitrus: charged (effect {}): the strike, then its light",
+                 T::ChargeEffect);
+    } else if (was && !charged) {
+        LOG_INFO(Core, "VR Tonitrus: the charge is over after {:.1f} s",
+                 static_cast<double>(now - g_tonitrus.state.start_ns) * 1e-9);
+    }
+    if (charged != was) {
+        T::Publish(g_tonitrus.state);
+    }
+    if (!charged) {
+        EndChargedCrackle(chr); // a walk of a few nodes; only a match ever writes
+    }
+    static const s32 ffx = [] {
+        const char* const env = std::getenv("VR_TONITRUS_FFX");
+        return env != nullptr ? std::atoi(env) : T::LightFfx;
+    }();
+    static const s32 dummy = [] {
+        const char* const env = std::getenv("VR_TONITRUS_DUMMY");
+        return env != nullptr ? std::atoi(env) : T::HeadDummy;
+    }();
+    u8* const ctl = chr + OffsetSfxCtl;
+    if (!charged || Read<u8*>(ctl) != g_torch_base + SfxCtlVtableRva) {
+        return;
+    }
+    const s32 at = dummy;
+    if (ffx > 0) {
+        g_torch_sfx(ctl, T::LightSlot, ffx, &at, 0);
+    }
+    // The strike's burst: its own light and arcs for the first FlashNs (VR_TONITRUS_FLASH=0, tests:
+    // none).
+    static const bool burst = [] {
+        const char* const env = std::getenv("VR_TONITRUS_FLASH");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    if (burst &&
+        T::StrikeAgeS(now, g_tonitrus.state.start_ns) < static_cast<float>(T::FlashNs) * 1e-9f) {
+        g_torch_sfx(ctl, T::FlashSlot, T::FlashFfx, &at, 0);
+    }
+}
+
 void Tick(u8* chr, const HeldGate& gate, const char* site) {
     auto& s = g_side;
     const s64 now = SteadyNs();
@@ -386,11 +546,13 @@ void Tick(u8* chr, const HeldGate& gate, const char* site) {
     in.request = request;
     in.age_ms = H::RequestAgeMs(request, now / Ms);
     in.cinematic = VR::CinematicActive();
-    in.menu = VR::IsGameMenuOpen();
+    // Use the existing hide/restore path for our held effects while the game disguises us.
+    in.menu = VR::IsGameMenuOpen() || VR::MessengerGift::Hidden(now);
     in.gate_valid = gate.valid;
     in.reason = gate.reason;
     in.owner = gate.owner;
     in.held = gate.held;
+    in.blood_bullet_vial = gate.blood_bullet_vial;
     const u8* const module = DataModule(chr);
     in.hp = module != nullptr ? Read<s32>(module + OffsetHp) : 1; // unknown: not a reason
     in.item_use_state = Read<s32>(chr + OffsetItemUseState);
@@ -507,7 +669,8 @@ void Tick(u8* chr, const HeldGate& gate, const char* site) {
         s.reason = "";
         // Armed with no Blood Vials left: an empty vial (a stab is refused, nothing drains).
         bool fresh = false;
-        const u64 word = s.ours_look.Word(drain_word, CarriedBloodVials(), fresh);
+        const u64 word = s.ours_look.Word(drain_word, CarriedBloodVials(),
+                                         (request.flags & H::FlagArmed) != 0, fresh);
         if (fresh && s.ours_look.Empty()) {
             LOG_INFO(Core, "VR held: drain: no Blood Vials left: the vial in the hand is empty");
         }
@@ -548,6 +711,7 @@ void Tick(u8* chr, const HeldGate& gate, const char* site) {
         s.state = H::State::Shown;
         s.reason = "";
         g_proxy_chr.store(nullptr, std::memory_order_relaxed);
+        LanternLight(chr, item_goods);
         Publish(s, hidden, now);
         return;
     }
@@ -711,8 +875,12 @@ void MusicBoxHideTick(u8* chr) {
         VR::MusicBox::HideReady().store(true, std::memory_order_relaxed);
     }
     VR::MusicBox::Scene mb{};
+    VR::BloodDraw::Scene syringe{};
     const s64 now = SteadyNs();
-    const bool hide = VR::MusicBox::LatestScene(mb) && VR::MusicBox::ActiveAt(mb, now);
+    const bool box = VR::MusicBox::LatestScene(mb) && VR::MusicBox::ActiveAt(mb, now);
+    // The right hand's empty syringe (core/vr/blood_draw.h) frees it the same way.
+    const bool drawing = VR::BloodDraw::LatestActive(now, syringe);
+    const bool hide = box || drawing;
     if (hide) {
         u8* const chr_asm = Read<u8*>(chr + OffsetChrAsm);
         if (Plausible(chr_asm)) {
@@ -725,8 +893,10 @@ void MusicBoxHideTick(u8* chr) {
     }
     if (hide != g_right_hidden) {
         g_right_hidden = hide;
-        LOG_INFO(Core, "VR held: MUSIC BOX {} ({} updates hidden)",
-                 hide ? "in the left hand: the right weapon put away (its parts 0-3 hidden)"
+        LOG_INFO(Core, "VR held: {} {} ({} updates hidden)",
+                 box ? "MUSIC BOX" : drawing ? "EMPTY SYRINGE" : "right hand",
+                 hide ? box ? "in the left hand: the right weapon put away (its parts 0-3 hidden)"
+                            : "in the right hand: the right weapon put away (its parts 0-3 hidden)"
                       : "gone: the right weapon back in the hand",
                  g_right_hides);
         if (!hide) {
@@ -754,8 +924,6 @@ constexpr s32 LeftFistDummy = 340;              // L_Weapon's attach (the torch'
 constexpr s64 TorchScanNs = 1000 * Ms;          // the flame looked for again this often
 constexpr u32 TorchParamDumpBytes = 0x1C0;      // its EquipParamWeapon row, logged once
 
-u8* g_torch_base = nullptr;
-SfxSlotRequestFn g_torch_sfx = nullptr;
 DmyPolyFn g_torch_dmy = nullptr;
 
 struct TorchState {
@@ -876,6 +1044,7 @@ void TorchTick(u8* chr) {
     if (g_torch_sfx == nullptr || chr == nullptr || !ts.enabled) {
         return;
     }
+    if (VR::MessengerGift::Hidden(SteadyNs())) return; // private flames expire when not requested
     auto& t = g_torch;
     const s32 weapon = LeftWeaponId(chr);
     if (weapon != t.weapon) {
@@ -962,6 +1131,9 @@ void TorchTick(u8* chr) {
     const s64 sample_ns = valid ? std::min(body.steady_ns, hands.steady_ns) : 0;
     const int level = t.lift.Step(sample_now, allowed, sample_ns,
                                   valid ? hands.hand[0].p.y - hands.head_p.y : 0.0f, ts);
+    if (valid && level > 0) {
+        VR::TorchGlow::Publish(flame_at, level); // the glow at the flame (torch_glow.h)
+    }
     const int copies = t.ffx > 0 && t.dummy > 0 ? VR::Torch::Copies(level, ts) : 0;
     if (copies != t.copies) {
         LOG_INFO(Core, "VR torch: {} ({} more flame{}, effect {} on dummy {}, {})",
@@ -990,12 +1162,66 @@ void TorchTick(u8* chr) {
     }
 }
 
-// The effect sites alone (the vial's checks without its settings and hide sites).
-void InstallTorch(u8* module, u64 size) {
-    if (!VR::Torch::GetTorchSettings().enabled) {
-        LOG_INFO(Core, "VR torch: torch_lift=0 (the game's torch)");
+// One modest native flickering light on the lit Boom Hammer's furnace. No requests when
+// cold, holstered, hidden, dead or missing its actual part dummy; the slot expires.
+void BoomLightTick(u8* chr) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("VR_BOOM_LIGHT");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    if (!enabled || g_torch_sfx == nullptr || g_torch_dmy == nullptr || !Plausible(chr))
         return;
+    const u8* equip = Read<const u8*>(chr + OffsetChrEquip);
+    if (!Plausible(equip))
+        return;
+    const s32 slot = Read<s32>(equip + 0x10);
+    if (slot < 0 || slot > 2)
+        return;
+    const s32 weapon = Read<s32>(equip + OffsetEquipIds + 4 * (slot * 2 + 1));
+    if (!VR::BoomLight::Lit(weapon, Read<s32>(equip + 8)))
+        return;
+    const u8* data = DataModule(chr);
+    if (!data || Read<s32>(data + OffsetHp) <= 0 || VR::MessengerGift::Hidden(SteadyNs()))
+        return;
+    const u8* assembly = Read<const u8*>(chr + OffsetChrAsm);
+    const u8* part = Plausible(assembly)
+                         ? Read<const u8*>(assembly + OffsetAsmParts + 13 * 8)
+                         : nullptr; // right-hand part 2, the lit furnace
+    if (!Plausible(part) || Read<s32>(part + 0x138) != 2 || Read<s32>(part + 0x13C) != 300)
+        return;
+    u8* const ctl = chr + OffsetSfxCtl;
+    std::array<float, 3> furnace{};
+    if (Read<u8*>(ctl) != g_torch_base + SfxCtlVtableRva ||
+        !TorchDummyAt(chr, VR::BoomLight::Dummy, furnace))
+        return;
+    const s32 dummy = VR::BoomLight::Dummy;
+    g_torch_sfx(ctl, VR::BoomLight::Slot, VR::BoomLight::Ffx, &dummy, 0);
+    static const bool log = std::getenv("VR_BOOM_LIGHT_LOG") != nullptr;
+    if (log) {
+        static s64 last{};
+        const s64 now = SteadyNs();
+        if (now - last > 1'000'000'000) {
+            last = now;
+            bool alive = false;
+            u8* node = Read<u8*>(ctl + OffsetCtlHead);
+            for (u32 n = 0; Plausible(node) && n < MaxHops; ++n) {
+                if (Read<u8*>(node) == g_torch_base + NodeVtableRva &&
+                    Read<s32>(node + OffsetNodeSlot) == VR::BoomLight::Slot &&
+                    Read<s32>(node + OffsetNodeCur) == VR::BoomLight::Ffx && Alive(node)) {
+                    alive = true;
+                    break;
+                }
+                node = Read<u8*>(node + OffsetNodeNext);
+            }
+            LOG_INFO(Core, "VR Boom light: effect {} dummy {} alive={} at ({:.2f},{:.2f},{:.2f})",
+                     VR::BoomLight::Ffx, dummy, alive, furnace[0], furnace[1], furnace[2]);
+        }
     }
+}
+
+// The effect sites alone (the vial's checks without its settings and hide sites).
+// Also used by the Boom Hammer, independently of the torch-lift setting.
+void InstallTorch(u8* module, u64 size) {
     if (size < SfxCtlVtableRva + sizeof(u64)) {
         return;
     }
@@ -1015,6 +1241,10 @@ void InstallTorch(u8* module, u64 size) {
         g_torch_dmy = reinterpret_cast<DmyPolyFn>(module + DmyPolyRva);
     }
     const auto& ts = VR::Torch::GetTorchSettings();
+    if (!ts.enabled) {
+        LOG_INFO(Core, "VR weapon lights: native effects ready; torch_lift=0");
+        return;
+    }
     LOG_INFO(Core,
              "VR torch: ready (raised from {:.0f} cm, high from {:.0f} cm against the eyes, up to "
              "{} more flame{}; the flame: {})",
@@ -1140,20 +1370,36 @@ void InstallHeld(VAddr base, u64 size) {
 
 void HeldPoseTick(u8* chr, const HeldGate& gate) {
     MusicBoxHideTick(chr);
+    TonitrusTick(chr, SteadyNs()); // whatever the vial's settings (not under its g_ready gate)
     if (g_ready && chr != nullptr) {
         Tick(chr, gate, "pose copy");
     }
     LeverHideTick(chr);
     TorchTick(chr); // after the vial's tick: its hide of the left weapon is known
+    BoomLightTick(chr);
 }
 
 void HeldSiteATick(u8* player) {
+    if (player != nullptr && !PoseHookInstalled()) {
+        TonitrusTick(player, SteadyNs());
+    }
     if (g_ready && player != nullptr && !PoseHookInstalled()) {
         Tick(player, HeldGate{}, "player update");
     }
     if (player != nullptr && !PoseHookInstalled()) {
         TorchTick(player);
+        BoomLightTick(player);
     }
+}
+
+void PrepareHeldEffects(VAddr base, u64 size) {
+    if (g_torch_sfx == nullptr && VR::IsEnabled()) {
+        InstallTorch(reinterpret_cast<u8*>(base), size);
+    }
+}
+
+bool TonitrusEffectsReady() {
+    return g_torch_sfx != nullptr;
 }
 
 void HeldRenderTick(u64 record_id, const float* rows, const float* position) {
@@ -1162,6 +1408,7 @@ void HeldRenderTick(u64 record_id, const float* rows, const float* position) {
         !VR::GetSettings().vial_dibr_proxy) {
         return;
     }
+    if (VR::MessengerGift::Hidden(SteadyNs())) return;
     u8* const world = Read<u8*>(g_base + WorldChrManRva);
     if (!Plausible(world) || Read<u8*>(world + OffsetMainPlayer) != chr) {
         return;

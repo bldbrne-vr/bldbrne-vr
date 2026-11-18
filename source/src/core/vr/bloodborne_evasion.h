@@ -57,6 +57,21 @@ void EvasionRenderTick(const VR::CameraOverride* result, bool fp_follow);
 bool CastMapSphere(const float from[3], const float to[3], float radius, float hit[3],
                    float normal[3], float& fraction);
 
+// A strict visibility test for consumable physical hits. True only after a valid native
+// cast reports no obstruction. Missing world/hook, invalid input or a start in scenery deny.
+// Unlike CastMapSphere, callers cannot mistake unavailable geometry for a clear path.
+bool MapSpherePathClear(Body::Vec3 from, Body::Vec3 to, float radius);
+// Strict three-state sweep for a precomputed item flight. A start overlap is a hit,
+// and unavailable physics must not be treated as an unobstructed segment.
+enum class MapSweep { Unavailable, Clear, Hit };
+MapSweep SweepMapSphere(Body::Vec3 from, Body::Vec3 to, float radius,
+                       Body::Vec3& normal, float& fraction);
+
+// This character's live collision body (its ragdoll's capsules, world), those within 6 m x scale
+// of `root`; the count written (0: none readable).
+size_t VictimCapsules(const u8* victim, Body::Vec3 root, float scale,
+                      std::span<GrabCamera::CollisionCapsule> out);
+
 // Horizontal eye-level ray against only this character's live collision body.
 // Eye-level misses use its horizontal silhouette; missing/unsupported bodies return no hit.
 GrabCamera::SurfaceRay CastVisceralSurface(const u8* victim, Body::Vec3 eye,

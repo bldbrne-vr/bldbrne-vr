@@ -19,6 +19,7 @@
 #include "core/vr/bloodborne_cinematic.h"
 #include "core/vr/bloodborne_layout.h"
 #include "core/vr/cinematic_state.h"
+#include "core/vr/door_knock.h"
 #include "core/vr/hook_util.h"
 #include "core/vr/quick_channel.h"
 #include "core/vr/vr_session.h"
@@ -653,16 +654,19 @@ bool InitCinematic(VAddr base, u64 size, bool site_ok, bool main_ok) {
                            matches(JumpTable4Rva, JumpTable4Sig) &&
                            matches(JumpTable11Rva, JumpTable11Sig);
     const auto& settings = VR::GetSettings();
-    const bool ladder_setting = settings.cinematic_ladder;
+    // Scenes on a screen off (cinematic=0): only the lamps' scenes go flat (Cine::Flat), so only
+    // the event animations are read; throws, ladders and canned items are left alone.
+    const bool scenes = settings.cinematic;
+    const bool ladder_setting = scenes && settings.cinematic_ladder;
     const bool hook_ok = site_ok && main_ok;
     g_event = hook_ok && event_anim_ok && act8_ok;
-    g_throw = hook_ok && throw_env_ok && in_throw_ok;
+    g_throw = scenes && hook_ok && throw_env_ok && in_throw_ok;
     g_request_ids = set_event_ok;
     g_ring_ids = push_ok;
     g_ladder = hook_ok && act26_ok && ladder_setting;
     g_ladder_predict = g_ladder && env99_ok;
     g_cancel = hook_ok && cancel_ok;
-    g_item = hook_ok;
+    g_item = scenes && hook_ok;
     if (const char* value = std::getenv("VR_CINE_LOG"); value != nullptr) {
         g_log = std::max(std::atoi(value), 1);
     }
@@ -685,12 +689,15 @@ bool InitCinematic(VAddr base, u64 size, bool site_ok, bool main_ok) {
              "VR cine: ladder act26@1A11A67={} env99@1A14D9C={} env100@1A14DF1={} -> ladder={} "
              "predict={}{}",
              verdict(act26_ok), verdict(env99_ok), verdict(env100_ok), on(g_ladder),
-             on(g_ladder_predict), ladder_setting ? "" : " (cinematic_ladder=0)");
+             on(g_ladder_predict),
+             ladder_setting ? "" : scenes ? " (cinematic_ladder=0)" : " (cinematic=0)");
     LOG_INFO(Core,
              "VR cine: canned item uses (the Shaman Bone Blade's stab from the arc): our Square's "
              "arm + the item-use bit {:#04x} -> item={}{}",
              static_cast<u32>(FlagItemUse), on(g_item),
-             settings.cinematic_item ? "" : " (cinematic_item=0: shown in VR)");
+             !scenes                  ? " (cinematic=0: shown in VR)"
+             : settings.cinematic_item ? ""
+                                       : " (cinematic_item=0: shown in VR)");
     const auto dump = [module](const char* name, u64 rva, size_t length) {
         LOG_WARNING(Core, "VR cine: {} live bytes at {:#x}: {}", name, rva,
                     Hook::HexBytes(module + rva, length));
@@ -784,6 +791,13 @@ void CinematicUpdate(u8* player) {
             static_cast<double>(SteadyNs())*1e-9, signals.event_id)) {
         signals.event=false;
         signals.event_id=-1;
+    }
+    // Knocking on a resident's door in third person (vr_interactions): the hunter's knock plays
+    // in VR, never on the screen (in first person its events were rewritten at boot, no clip).
+    if (VR::DoorKnock::KeepInVr(VR::GetSettings().vr_interactions, VR::IsFirstPerson(),
+                                signals.event_id)) {
+        signals.event = false;
+        signals.event_id = -1;
     }
     signals.hp_valid = s.hp_valid;
     signals.hp = s.hp;

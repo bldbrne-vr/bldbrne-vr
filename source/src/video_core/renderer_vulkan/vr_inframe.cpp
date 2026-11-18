@@ -8,13 +8,18 @@
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <future>
+#include <memory>
 #include <cmath>
 #include <cstring>
 #include <limits>
 
 #include "common/logging/log.h"
+#include "common/thread.h"
 #include "core/vr/bloodborne_assets.h"
+#include "core/vr/sever_reveal.h"
 #include "video_core/host_shaders/vr_inframe_frag.h"
 #include "video_core/host_shaders/vr_inframe_vert.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -27,6 +32,8 @@
 #include "video_core/renderer_vulkan/vr_molotov_mesh.h"
 #include "video_core/renderer_vulkan/vr_apothecary_mesh.h"
 #include "video_core/renderer_vulkan/vr_goods_meshes.h"
+#include "video_core/renderer_vulkan/vr_hunter_relic_meshes.h"
+#include "video_core/renderer_vulkan/vr_augur_spray.h"
 
 #include <vk_mem_alloc.h>
 #include <cmrc/cmrc.hpp>
@@ -55,11 +62,17 @@ constexpr u32 AtlasWidth = 2048;
 constexpr u32 AtlasHeight = 1024;
 constexpr u32 AtlasRow = 64;
 constexpr u32 MaxIcons = 16;
-constexpr u32 MaxModels = 8;
+// (kept severed pieces: eight cuts of a piece (a few models: a texture of its own each, the
+// flesh's) and a stump each: bloodborne_sever.cpp MaxPieces, MaxPieceModels; freed as dropped)
+constexpr u32 MaxModels = 96;
+// New models uploaded a frame (a cut brings up to eleven at once: spread over a few frames).
+constexpr u32 MaxModelUploadsPerFrame = 4;
 constexpr u32 MaxUploadsPerFrame = 4;
 // vr_inframe.frag: shade + these flags (the cards' analytic edges).
 constexpr u32 EdgeDisc = 16;
 constexpr u32 EdgeRing = 32;
+// ... both (never a card's edge): Item::candle.
+constexpr u32 Candle = EdgeDisc | EdgeRing;
 
 constexpr vk::ImageSubresourceRange ColorRange{
     .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -289,6 +302,22 @@ O::MeshData BuildMesh(F::MeshId id) {
         const auto file = cmrc::res::get_filesystem().open("src/resources/vr/sangiran17.bin");
         return O::SkullMeshFrom({reinterpret_cast<const u8*>(file.begin()), file.size()});
     }
+    case F::MeshId::MessengerSkull: {
+        const auto file=cmrc::res::get_filesystem().open("src/resources/vr/messenger_skull.bin");
+        return O::SkullMeshFrom({reinterpret_cast<const u8*>(file.begin()),file.size()});
+    }
+    case F::MeshId::TinyTonitrus: return O::HunterRelic::Tonitrus();
+    case F::MeshId::ExecutionerGloves: return O::HunterRelic::Gloves();
+    case F::MeshId::Cigarette: return O::CigaretteMesh(false);
+    case F::MeshId::CigarettePacket: return O::CigaretteMesh(true);
+    case F::MeshId::BlackskyEye: return O::HunterRelic::BlackskyEye();
+    case F::MeshId::BlackskyCornea: return O::HunterRelic::BlackskyCornea();
+    case F::MeshId::TonitrusBridge: return O::HunterRelic::TonitrusBridge();
+    case F::MeshId::AugurSpray: return O::AugurSprayMesh();
+    case F::MeshId::MessengerChunks: {
+        const auto file=cmrc::res::get_filesystem().open("src/resources/vr/messenger_chunks.bin");
+        return O::MessengerChunksFrom({reinterpret_cast<const u8*>(file.begin()),file.size()});
+    }
     case F::MeshId::BloodClothVelvet:
     case F::MeshId::BloodClothLinen:
     case F::MeshId::ResonantBell:
@@ -318,6 +347,8 @@ O::MeshData BuildMesh(F::MeshId id) {
                         {0.50f, 0.0f, true},
                         {0.0f, 0.0f}},
                        12, 0.0f);
+    case F::MeshId::Cylinder:
+        return O::Puck(1.0f, 1.0f, 0.001f, 24);
     case F::MeshId::Model: // drawn from its own buffers (VrInFrame::ModelOf)
     case F::MeshId::Count:
         break;
@@ -330,7 +361,7 @@ O::MeshData BuildMesh(F::MeshId id) {
 VrInFrame::VrInFrame(const Instance& instance_, Scheduler& scheduler_)
     : instance{instance_}, scheduler{scheduler_}, device{instance_.GetDevice()} {
     // 0: the item's texture, 1: the scene light probe.
-    const std::array<vk::DescriptorSetLayoutBinding, 2> bindings{{
+    const std::array<vk::DescriptorSetLayoutBinding, 4> bindings{{
         {
             .binding = 0,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -343,6 +374,14 @@ VrInFrame::VrInFrame(const Instance& instance_, Scheduler& scheduler_)
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eFragment,
         },
+        {.binding = 2,
+         .descriptorType = vk::DescriptorType::eStorageBuffer,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eVertex},
+        {.binding = 3,
+         .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eFragment},
     }};
     auto layout = device.createDescriptorSetLayoutUnique({
         .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
@@ -478,6 +517,9 @@ VrInFrame::VrInFrame(const Instance& instance_, Scheduler& scheduler_)
 }
 
 VrInFrame::~VrInFrame() {
+    if (pending_translucent && pending_translucent->result.valid()) {
+        pending_translucent->result.wait(); // its worker uses the shader modules below
+    }
     for (const vk::ShaderModule module : {vert, frag}) {
         if (module) {
             device.destroyShaderModule(module);
@@ -490,7 +532,7 @@ VrInFrame::~VrInFrame() {
         }
     }
     for (auto& [id, model] : models) {
-        for (Buffer* b : {&model.vertices, &model.indices}) {
+        for (Buffer* b : {&model.vertices, &model.indices, &model.animation}) {
             if (b->buffer) {
                 vmaDestroyBuffer(instance.GetAllocator(), static_cast<VkBuffer>(b->buffer),
                                  b->allocation);
@@ -541,18 +583,55 @@ void VrInFrame::DestroyBufferLater(Buffer& b) {
     b = {};
 }
 
-bool VrInFrame::BuildMeshes() {
+namespace {
+// The item library (BuildMesh for every id): the same for every VrInFrame and session. Its
+// occlusion bakes took ~1-2 s of stage B at the first world frame, once for each eye's VrInFrame
+// (2026-11-07 stall sampler); now built once, on a thread of its own from the first ask.
+struct MeshLibrary {
     std::vector<O::Vertex> verts;
     std::vector<u32> idx;
+    std::array<std::array<u32, 3>, static_cast<size_t>(F::MeshId::Count)> ranges{};
+};
+std::shared_future<std::shared_ptr<const MeshLibrary>> MeshLibraryFuture() {
+    static const std::shared_future<std::shared_ptr<const MeshLibrary>> library =
+        std::async(std::launch::async, [] {
+            Common::SetCurrentThreadName("VrInFrameMeshes");
+            auto lib = std::make_shared<MeshLibrary>();
+            for (u32 i = 0; i < static_cast<u32>(F::MeshId::Count); ++i) {
+                const O::MeshData mesh = BuildMesh(static_cast<F::MeshId>(i));
+                lib->ranges[i] = {static_cast<u32>(lib->idx.size()),
+                                  static_cast<u32>(mesh.indices.size()),
+                                  static_cast<u32>(lib->verts.size())};
+                lib->verts.insert(lib->verts.end(), mesh.vertices.begin(), mesh.vertices.end());
+                lib->idx.insert(lib->idx.end(), mesh.indices.begin(), mesh.indices.end());
+            }
+            return std::shared_ptr<const MeshLibrary>(std::move(lib));
+        }).share();
+    return library;
+}
+} // Anonymous namespace
+
+void VrInFrame::PrewarmMeshes() {
+    (void)MeshLibraryFuture();
+}
+
+bool VrInFrame::BuildMeshes() {
+    const auto wait_start = std::chrono::steady_clock::now();
+    const auto library = MeshLibraryFuture().get();
+    LOG_INFO(Render_Vulkan, "VR inframe: item meshes ready ({} vertices; waited {:.1f} ms)",
+             library->verts.size(),
+             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                       wait_start)
+                 .count());
+    const auto& verts = library->verts;
+    const auto& idx = library->idx;
     for (u32 i = 0; i < static_cast<u32>(F::MeshId::Count); ++i) {
-        const O::MeshData mesh = BuildMesh(static_cast<F::MeshId>(i));
-        ranges[i] = {static_cast<u32>(idx.size()), static_cast<u32>(mesh.indices.size()),
-                     static_cast<s32>(verts.size())};
-        verts.insert(verts.end(), mesh.vertices.begin(), mesh.vertices.end());
-        idx.insert(idx.end(), mesh.indices.begin(), mesh.indices.end());
+        const auto& r = library->ranges[i];
+        ranges[i] = {r[0], r[1], static_cast<s32>(r[2])};
     }
     if (!CreateBuffer(vertices, verts.size() * sizeof(O::Vertex),
-                      vk::BufferUsageFlagBits::eVertexBuffer) ||
+                      vk::BufferUsageFlagBits::eVertexBuffer |
+                          vk::BufferUsageFlagBits::eStorageBuffer) ||
         !CreateBuffer(indices, idx.size() * sizeof(u32), vk::BufferUsageFlagBits::eIndexBuffer)) {
         return Fail("mesh buffers");
     }
@@ -564,21 +643,96 @@ bool VrInFrame::BuildMeshes() {
 }
 
 vk::Pipeline VrInFrame::PipelineFor(vk::Format color_format, vk::Format depth_fmt, bool xray,
-                                      const std::array<float, 4>& clip) {
+                                      const std::array<float, 2>& depth, bool translucent) {
     for (const auto& p : pipelines) {
-        if (p.color == color_format && p.depth == depth_fmt && p.xray == xray && p.clip == clip) {
+        if (p.color == color_format && p.depth == depth_fmt && p.xray == xray &&
+            p.depth_terms == depth && p.translucent == translucent) {
             return *p.pipeline;
         }
     }
-    // Projection is stable for a headset configuration. Specialization keeps the existing
-    // 128-byte item push constants and preserves view-space lighting and physical dimensions.
-    const std::array<vk::SpecializationMapEntry, 4> entries{{
+    // Only the depth mapping is specialized: the near and far planes stay put for a session. The
+    // eye's projection is pushed (proj, Record), so the Monocular's zoomed eye, whose window
+    // slides every frame, costs no pipeline (until 2026-11-03 a new one each frame: the in-frame
+    // pass compiled ~30 ms of pipelines a frame while looking around through it).
+    if (pipelines.size() == 16) {
+        LOG_WARNING(Render_Vulkan, "VR in-frame: 16 pipelines built: a key that changes every "
+                                   "frame? (formats, x-ray and the depth mapping only)");
+    }
+    const auto start = NowNs();
+    auto created = CreatePipeline(color_format, depth_fmt, xray, depth, translucent);
+    if (!created) {
+        Fail(fmt::format("pipeline for {} / {}", vk::to_string(color_format),
+                         vk::to_string(depth_fmt)));
+        return {};
+    }
+    pipelines.push_back({color_format, depth_fmt, xray, translucent, depth, std::move(created)});
+    LOG_INFO(Render_Vulkan, "VR inframe: {}pipeline for {} + {} ({:.1f} ms)", xray ? "x-ray " : "",
+             vk::to_string(color_format), vk::to_string(depth_fmt),
+             static_cast<double>(NowNs() - start) * 1e-6);
+    return *pipelines.back().pipeline;
+}
+
+vk::Pipeline VrInFrame::TranslucentFor(vk::Format color_format, vk::Format depth_fmt,
+                                       const std::array<float, 2>& depth) {
+    for (const auto& p : pipelines) {
+        if (p.color == color_format && p.depth == depth_fmt && !p.xray && p.depth_terms == depth &&
+            p.translucent) {
+            return *p.pipeline;
+        }
+    }
+    if (failed || translucent_failed) {
+        return {};
+    }
+    if (!pending_translucent) {
+        try {
+            pending_translucent.emplace(PendingPipeline{
+                color_format, depth_fmt, depth, NowNs(),
+                std::async(std::launch::async, [this, color_format, depth_fmt, depth] {
+                    return CreatePipeline(color_format, depth_fmt, false, depth, true);
+                })});
+        } catch (const std::exception& e) { // no thread for it (std::system_error)
+            translucent_failed = true;
+            LOG_WARNING(Render_Vulkan,
+                        "VR inframe: no worker for the translucent pipeline ({}): what needs it "
+                        "stays hidden",
+                        e.what());
+        }
+        return {};
+    }
+    auto& p = *pending_translucent;
+    if (p.result.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        return {};
+    }
+    auto created = p.result.get();
+    const bool same = p.color == color_format && p.depth == depth_fmt && p.depth_terms == depth;
+    const bool built = static_cast<bool>(created);
+    if (built) {
+        LOG_INFO(Render_Vulkan,
+                 "VR inframe: translucent pipeline for {} + {} ({:.1f} ms, on a "
+                 "worker)",
+                 vk::to_string(p.color), vk::to_string(p.depth),
+                 static_cast<double>(NowNs() - p.start_ns) * 1e-6);
+        pipelines.push_back({p.color, p.depth, false, true, p.depth_terms, std::move(created)});
+    } else {
+        // Not asked again every frame (a thread and a build each): what needs it (translucent
+        // items, the gray world, the Tonitrus' flash) stays hidden, the rest draws on.
+        translucent_failed = true;
+        LOG_WARNING(Render_Vulkan, "VR inframe: the translucent pipeline failed on its worker; "
+                                   "what needs it stays hidden");
+    }
+    pending_translucent.reset(); // a different key: the next ask builds that one
+    return same && built ? *pipelines.back().pipeline : vk::Pipeline{};
+}
+
+vk::UniquePipeline VrInFrame::CreatePipeline(vk::Format color_format, vk::Format depth_fmt,
+                                             bool xray, const std::array<float, 2>& depth,
+                                             bool translucent) const {
+    const std::array<vk::SpecializationMapEntry, 2> entries{{
         {0, 0, sizeof(float)}, {1, 4, sizeof(float)},
-        {2, 8, sizeof(float)}, {3, 12, sizeof(float)},
     }};
     const vk::SpecializationInfo specialization{
         .mapEntryCount = static_cast<u32>(entries.size()), .pMapEntries = entries.data(),
-        .dataSize = sizeof(clip), .pData = clip.data(),
+        .dataSize = sizeof(depth), .pData = depth.data(),
     };
     const std::array<vk::PipelineShaderStageCreateInfo, 2> stages{{
         {.stage = vk::ShaderStageFlagBits::eVertex, .module = vert, .pName = "main",
@@ -619,7 +773,7 @@ vk::Pipeline VrInFrame::PipelineFor(vk::Format color_format, vk::Format depth_fm
     // in front) and leave the depth alone.
     const vk::PipelineDepthStencilStateCreateInfo depth_state{
         .depthTestEnable = true,
-        .depthWriteEnable = !xray,
+        .depthWriteEnable = !xray && !translucent,
         .depthCompareOp = xray ? vk::CompareOp::eGreater : vk::CompareOp::eLessOrEqual,
     };
     const std::array<vk::PipelineColorBlendAttachmentState, 2> blend_attachments{{
@@ -678,160 +832,190 @@ vk::Pipeline VrInFrame::PipelineFor(vk::Format color_format, vk::Format depth_fm
         .pDynamicState = &dynamic,
         .layout = *pipeline_layout,
     };
-    const auto start = NowNs();
     auto result = device.createGraphicsPipelineUnique({}, ci);
     if (result.result != vk::Result::eSuccess) {
-        Fail(fmt::format("pipeline for {} / {}", vk::to_string(color_format),
-                         vk::to_string(depth_fmt)));
         return {};
     }
-    pipelines.push_back({color_format, depth_fmt, xray, clip, std::move(result.value)});
-    LOG_INFO(Render_Vulkan, "VR inframe: {}pipeline for {} + {} ({:.1f} ms)", xray ? "x-ray " : "",
-             vk::to_string(color_format), vk::to_string(depth_fmt),
-             static_cast<double>(NowNs() - start) * 1e-6);
-    return *pipelines.back().pipeline;
+    return std::move(result.value);
 }
 
-bool VrInFrame::ProbeScene(const RecorderProxy& cmdbuf, vk::Image src, vk::Format src_format,
-                           vk::Extent2D extent, u32 source_layer) {
+bool VrInFrame::PrepareProbe(vk::Format src_format, vk::Extent2D extent) {
     probe_valid = false;
     if (failed || extent.width < 128 || extent.height < 128) {
         return false;
     }
     const vk::Extent2D size{extent.width / 2, extent.height / 2};
-    if (!probe || probe_extent != size || probe_format != src_format) {
-        if (probe) {
-            scheduler.DeferOperation([image = std::move(probe),
-                                      view = std::move(probe_view)]() mutable {
-                view.reset();
-                image.Destroy();
-            });
-        }
-        probe = VideoCore::UniqueImage(device, instance.GetAllocator());
-        probe.Create(vk::ImageCreateInfo{
-            .imageType = vk::ImageType::e2D,
-            .format = src_format,
-            .extent = {size.width, size.height, 1},
-            .mipLevels = ProbeLevels,
-            .arrayLayers = 1,
-            .samples = vk::SampleCountFlagBits::e1,
-            .tiling = vk::ImageTiling::eOptimal,
-            .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc |
-                     vk::ImageUsageFlagBits::eTransferDst,
-            .initialLayout = vk::ImageLayout::eUndefined,
-        });
-        auto view = device.createImageViewUnique({
-            .image = probe,
-            .viewType = vk::ImageViewType::e2D,
-            .format = src_format,
-            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, ProbeLevels, 0, 1},
-        });
-        if (view.result != vk::Result::eSuccess) {
-            return Fail("probe view");
-        }
-        probe_view = std::move(view.value);
-        probe_extent = size;
-        probe_format = src_format;
+    if (probe && probe_extent == size && probe_format == src_format) {
+        return true;
     }
-    const auto level_barrier = [&](u32 level, vk::ImageLayout from, vk::ImageLayout to,
-                                   vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
-                                   vk::PipelineStageFlags2 dst_stage,
-                                   vk::AccessFlags2 dst_access) {
-        const vk::ImageMemoryBarrier2 b{
-            .srcStageMask = src_stage,
-            .srcAccessMask = src_access,
-            .dstStageMask = dst_stage,
-            .dstAccessMask = dst_access,
-            .oldLayout = from,
-            .newLayout = to,
-            .image = probe,
-            .subresourceRange = {vk::ImageAspectFlagBits::eColor, level,
-                                 level == ~0u ? ProbeLevels : 1, 0, 1},
-        };
+    if (probe) {
+        scheduler.DeferOperation([image = std::move(probe),
+                                  view = std::move(probe_view)]() mutable {
+            view.reset();
+            image.Destroy();
+        });
+    }
+    probe = VideoCore::UniqueImage(device, instance.GetAllocator());
+    probe.Create(vk::ImageCreateInfo{
+        .imageType = vk::ImageType::e2D,
+        .format = src_format,
+        .extent = {size.width, size.height, 1},
+        .mipLevels = ProbeLevels,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc |
+                 vk::ImageUsageFlagBits::eTransferDst,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    });
+    auto view = device.createImageViewUnique({
+        .image = probe,
+        .viewType = vk::ImageViewType::e2D,
+        .format = src_format,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, ProbeLevels, 0, 1},
+    });
+    if (view.result != vk::Result::eSuccess) {
+        return Fail("probe view");
+    }
+    probe_view = std::move(view.value);
+    probe_extent = size;
+    probe_format = src_format;
+    return true;
+}
+
+void VrInFrame::ProbeScenes(const RecorderProxy& cmdbuf, std::span<const ProbeSource> eyes,
+                            vk::Image src, vk::Format src_format, vk::Extent2D extent) {
+    std::array<VrInFrame*, 2> probes{};
+    std::array<u32, 2> layers{};
+    u32 count = 0;
+    for (const ProbeSource& eye : eyes) {
+        if (count < probes.size() && eye.renderer != nullptr &&
+            eye.renderer->PrepareProbe(src_format, extent)) {
+            probes[count] = eye.renderer;
+            layers[count++] = eye.source_layer;
+        }
+    }
+    if (count == 0) {
+        return;
+    }
+    // One barrier call for every eye's probe (the same step of each chain).
+    std::array<vk::ImageMemoryBarrier2, 2> barriers{};
+    const auto barrier = [&](const vk::ImageMemoryBarrier2& step, u32 level, u32 levels) {
+        for (u32 i = 0; i < count; ++i) {
+            barriers[i] = step;
+            barriers[i].image = probes[i]->probe;
+            barriers[i].subresourceRange = {vk::ImageAspectFlagBits::eColor, level, levels, 0, 1};
+        }
         cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .imageMemoryBarrierCount = 1,
-            .pImageMemoryBarriers = &b,
+            .imageMemoryBarrierCount = count,
+            .pImageMemoryBarriers = barriers.data(),
         });
     };
     // Every level to TransferDst (the last frame's reads are done before: an execution dependency).
-    const vk::ImageMemoryBarrier2 all_dst{
-        .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
-        .srcAccessMask = vk::AccessFlagBits2::eNone,
-        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .oldLayout = vk::ImageLayout::eUndefined,
-        .newLayout = vk::ImageLayout::eTransferDstOptimal,
-        .image = probe,
-        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, ProbeLevels, 0, 1},
-    };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers = &all_dst,
-    });
+    barrier(vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+                .srcAccessMask = vk::AccessFlagBits2::eNone,
+                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            },
+            0, ProbeLevels);
     // Halving blits with a linear filter: each level averages 2 x 2 texels of the one above.
     s32 w = static_cast<s32>(extent.width), h = static_cast<s32>(extent.height);
     for (u32 level = 0; level < ProbeLevels; ++level) {
         const s32 nw = std::max(w / 2, 1), nh = std::max(h / 2, 1);
-        const vk::ImageBlit blit{
-            .srcSubresource = {vk::ImageAspectFlagBits::eColor, level == 0 ? 0u : level - 1,
-                               level == 0 ? source_layer : 0u, 1},
-            .srcOffsets = std::array<vk::Offset3D, 2>{vk::Offset3D{0, 0, 0}, vk::Offset3D{w, h, 1}},
-            .dstSubresource = {vk::ImageAspectFlagBits::eColor, level, 0, 1},
-            .dstOffsets =
-                std::array<vk::Offset3D, 2>{vk::Offset3D{0, 0, 0}, vk::Offset3D{nw, nh, 1}},
-        };
-        if (level == 0) {
-            cmdbuf.blitImage(src, vk::ImageLayout::eTransferSrcOptimal, probe,
-                             vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
-        } else {
-            cmdbuf.blitImage(probe, vk::ImageLayout::eTransferSrcOptimal, probe,
+        for (u32 i = 0; i < count; ++i) {
+            const vk::ImageBlit blit{
+                .srcSubresource = {vk::ImageAspectFlagBits::eColor, level == 0 ? 0u : level - 1,
+                                   level == 0 ? layers[i] : 0u, 1},
+                .srcOffsets =
+                    std::array<vk::Offset3D, 2>{vk::Offset3D{0, 0, 0}, vk::Offset3D{w, h, 1}},
+                .dstSubresource = {vk::ImageAspectFlagBits::eColor, level, 0, 1},
+                .dstOffsets =
+                    std::array<vk::Offset3D, 2>{vk::Offset3D{0, 0, 0}, vk::Offset3D{nw, nh, 1}},
+            };
+            const vk::Image probe = probes[i]->probe;
+            cmdbuf.blitImage(level == 0 ? src : probe, vk::ImageLayout::eTransferSrcOptimal, probe,
                              vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
         }
         // This level becomes the next one's source.
-        level_barrier(level, vk::ImageLayout::eTransferDstOptimal,
-                      vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eTransfer,
-                      vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer,
-                      vk::AccessFlagBits2::eTransferRead);
+        barrier(vk::ImageMemoryBarrier2{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                    .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                    .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                    .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                },
+                level, 1);
         w = nw;
         h = nh;
     }
-    const vk::ImageMemoryBarrier2 all_read{
-        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eTransferRead,
-        .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
-        .dstAccessMask = vk::AccessFlagBits2::eShaderSampledRead,
-        .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
-        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-        .image = probe,
-        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, ProbeLevels, 0, 1},
-    };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers = &all_read,
-    });
-    probe_valid = true;
-    return true;
+    barrier(vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask =
+                    vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eTransferRead,
+                .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderSampledRead,
+                .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            },
+            0, ProbeLevels);
+    for (u32 i = 0; i < count; ++i) {
+        probes[i]->probe_valid = true;
+    }
 }
 
-void VrInFrame::Warm(vk::Format color_format, vk::Format depth_fmt) {
+// The shader's specialized depth mapping (A z + B) for a camera's near and far planes: the one
+// pipeline key that follows the camera.
+static std::array<float, 2> DepthTerms(const VrInFrame::Camera& camera) {
+    const float n = camera.near_z;
+    const float f = camera.far_z;
+    return {f / (f - n), -n * f / (f - n)};
+}
+
+void VrInFrame::Warm(vk::Format color_format, vk::Format depth_fmt, float near_z, float far_z) {
     if (!failed) {
-        PipelineFor(color_format, depth_fmt);
-        PipelineFor(color_format, depth_fmt, true);
+        Camera camera{}; // the usual planes, else this camera's
+        if (near_z > 0.0f && far_z > near_z) {
+            camera.near_z = near_z;
+            camera.far_z = far_z;
+        }
+        const auto depth = DepthTerms(camera);
+        PipelineFor(color_format, depth_fmt, false, depth);
+        PipelineFor(color_format, depth_fmt, true, depth);
+        TranslucentFor(color_format, depth_fmt, depth); // on a worker
     }
 }
 
 bool VrInFrame::EnsureDepth(const Target& t) {
-    if (depth && depth_format == t.depth_format && depth_extent == t.depth_extent) {
-        return true;
-    }
-    if (depth) {
+    const auto retire_depth = [&] {
         scheduler.DeferOperation([image = std::move(depth),
                                   a = std::move(depth_attachment_view),
                                   s = std::move(depth_sampled_view)]() mutable {
             s.reset();
             a.reset();
             image.Destroy();
-        });
+        }); // leaves `depth` empty
+        depth_format = vk::Format::eUndefined;
+        depth_extent = {};
+    };
+    if (t.depth_in_place) {
+        // A copy left from frames before S1 goes once S1 has drawn in place for a second (a
+        // frame that falls back now and then does not make it again each time).
+        if (depth && ++in_place_lists >= 90) {
+            retire_depth();
+            LOG_INFO(Render_Vulkan, "VR inframe: in place in S1's depth; private depth copy freed");
+        }
+        return EnsureCover(t.depth_extent);
+    }
+    in_place_lists = 0;
+    if (depth && depth_format == t.depth_format && depth_extent == t.depth_extent) {
+        return EnsureCover(t.depth_extent);
+    }
+    if (depth) {
+        retire_depth();
     }
     depth = VideoCore::UniqueImage(device, instance.GetAllocator());
     depth.Create(vk::ImageCreateInfo{
@@ -869,6 +1053,15 @@ bool VrInFrame::EnsureDepth(const Target& t) {
     depth_sampled_view = std::move(sampled.value);
     depth_format = t.depth_format;
     depth_extent = t.depth_extent;
+    LOG_INFO(Render_Vulkan, "VR inframe: private depth copy {}x{} {}", depth_extent.width,
+             depth_extent.height, vk::to_string(depth_format));
+    return EnsureCover(t.depth_extent);
+}
+
+bool VrInFrame::EnsureCover(vk::Extent2D extent) {
+    if (cover && cover_extent == extent) {
+        return true;
+    }
     if (cover) {
         scheduler.DeferOperation(
             [image = std::move(cover), view = std::move(cover_view)]() mutable {
@@ -880,7 +1073,7 @@ bool VrInFrame::EnsureDepth(const Target& t) {
     cover.Create(vk::ImageCreateInfo{
         .imageType = vk::ImageType::e2D,
         .format = CoverFormat,
-        .extent = {t.depth_extent.width, t.depth_extent.height, 1},
+        .extent = {extent.width, extent.height, 1},
         .mipLevels = 1,
         .arrayLayers = 1,
         .samples = vk::SampleCountFlagBits::e1,
@@ -895,11 +1088,11 @@ bool VrInFrame::EnsureDepth(const Target& t) {
         .subresourceRange = ColorRange,
     });
     if (cv.result != vk::Result::eSuccess) {
+        cover_extent = {};
         return Fail("coverage view");
     }
     cover_view = std::move(cv.value);
-    LOG_INFO(Render_Vulkan, "VR inframe: private depth copy {}x{} {}", depth_extent.width,
-             depth_extent.height, vk::to_string(depth_format));
+    cover_extent = extent;
     return true;
 }
 
@@ -1015,6 +1208,26 @@ vk::ImageView VrInFrame::IconView(const RecorderProxy& cmdbuf, u32 icon_id) {
 void VrInFrame::DestroyModelLater(GpuModel& model) {
     DestroyBufferLater(model.vertices);
     DestroyBufferLater(model.indices);
+    DestroyBufferLater(model.animation);
+    if (model.shared_key != 0) {
+        const auto it = shared_images.find(model.shared_key);
+        if (it != shared_images.end() && --it->second.users == 0) {
+            scheduler.DeferOperation([image = std::move(it->second.image),
+                                      view = std::move(it->second.view)]() mutable {
+                view.reset();
+                image.Destroy();
+            });
+            shared_images.erase(it);
+        }
+        model.shared_key = 0;
+        model.shared_view = vk::ImageView{};
+    }
+    if (model.surface)
+        scheduler.DeferOperation(
+            [image = std::move(model.surface), view = std::move(model.surface_view)]() mutable {
+                view.reset();
+                image.Destroy();
+            });
     if (model.image) {
         scheduler.DeferOperation([image = std::move(model.image),
                                   view = std::move(model.view)]() mutable {
@@ -1024,9 +1237,11 @@ void VrInFrame::DestroyModelLater(GpuModel& model) {
     }
 }
 
-const VrInFrame::GpuModel* VrInFrame::ModelOf(const RecorderProxy& cmdbuf, s32 model_id) {
+const VrInFrame::GpuModel* VrInFrame::ModelOf(const RecorderProxy& cmdbuf, s32 model_id,
+                                            u32 reveal_token) {
     if (const auto it = models.find(model_id); it != models.end()) {
         it->second.last_used = frame;
+        it->second.reveal_token = reveal_token;
         return &it->second;
     }
     if (model_missing.contains(model_id)) {
@@ -1036,19 +1251,34 @@ const VrInFrame::GpuModel* VrInFrame::ModelOf(const RecorderProxy& cmdbuf, s32 m
     if (!model) {
         return nullptr; // loading (the first call asked for it), or missing
     }
+    if (model_uploads >= MaxModelUploadsPerFrame) {
+        return nullptr; // the next frame's
+    }
+    // A runtime model (a severed piece): this eye looks for dropped ones from now on.
+    runtime_held = runtime_held || model_id >= VR::Assets::RuntimeModelBase;
     if (models.size() >= MaxModels) {
-        auto oldest = std::ranges::min_element(models, {}, [](const auto& e) {
-            return e.second.last_used;
-        });
-        if (oldest->second.last_used == frame) {
+        auto oldest = models.end();
+        for (auto it = models.begin(); it != models.end(); ++it) {
+            const auto& cached = it->second;
+            if (cached.last_used == frame ||
+                (cached.reveal_token != 0 && VR::Sever::g_reveals.Pinned(cached.reveal_token)))
+                continue;
+            if (oldest == models.end() || cached.last_used < oldest->second.last_used) oldest = it;
+        }
+        if (oldest == models.end()) {
             return nullptr;
         }
         DestroyModelLater(oldest->second);
         models.erase(oldest);
     }
+    ++model_uploads; // a full/pinned cache must not spend the budget without an upload
     GpuModel g;
+    g.reveal_token = reveal_token;
+    g.single_surface = model->single_surface;
+    g.animation_bones = model->animation_bones;
     const size_t vbytes = model->vertices.size() * sizeof(VR::Assets::ModelVertex);
-    const size_t ibytes = model->indices.size() * sizeof(u32);
+    const bool compact_indices = !model->animation.empty() && model->vertices.size() <= 65536;
+    const size_t ibytes = model->indices.size() * (compact_indices ? sizeof(u16) : sizeof(u32));
     static_assert(sizeof(VR::Assets::ModelVertex) == sizeof(O::Vertex));
     if (!CreateBuffer(g.vertices, vbytes, vk::BufferUsageFlagBits::eVertexBuffer) ||
         !CreateBuffer(g.indices, ibytes, vk::BufferUsageFlagBits::eIndexBuffer)) {
@@ -1058,34 +1288,59 @@ const VrInFrame::GpuModel* VrInFrame::ModelOf(const RecorderProxy& cmdbuf, s32 m
         return nullptr;
     }
     std::memcpy(g.vertices.mapped, model->vertices.data(), vbytes);
-    std::memcpy(g.indices.mapped, model->indices.data(), ibytes);
+    if (compact_indices) {
+        g.index_type = vk::IndexType::eUint16;
+        auto* dst = static_cast<u16*>(g.indices.mapped);
+        for (size_t i = 0; i < model->indices.size(); ++i)
+            dst[i] = static_cast<u16>(model->indices[i]);
+    } else {
+        std::memcpy(g.indices.mapped, model->indices.data(), ibytes);
+    }
     vmaFlushAllocation(instance.GetAllocator(), g.vertices.allocation, 0, VK_WHOLE_SIZE);
     vmaFlushAllocation(instance.GetAllocator(), g.indices.allocation, 0, VK_WHOLE_SIZE);
     g.index_count = static_cast<u32>(model->indices.size());
-    // The diffuse texture with the game's mip chain.
+    g.vertex_count = static_cast<u32>(model->vertices.size());
+    // The diffuse texture with the game's mip chain (a shared one: already up, its user).
     const auto& t = model->diffuse;
+    bool shared_hit = false; // (its texture already up: shared, not uploaded again)
+    if (t.share_key != 0) {
+        if (const auto it = shared_images.find(t.share_key); it != shared_images.end()) {
+            shared_hit = true;
+            ++it->second.users;
+            g.shared_key = t.share_key;
+            g.shared_view = *it->second.view;
+            g.textured = true;
+        }
+    }
     using TF = VR::Assets::ModelTexture::Format;
-    const vk::Format format = t.format == TF::Bc1   ? vk::Format::eBc1RgbaSrgbBlock
-                              : t.format == TF::Bc3 ? vk::Format::eBc3SrgbBlock
-                              : t.format == TF::Bc7 ? vk::Format::eBc7SrgbBlock
-                                                    : vk::Format::eUndefined;
+    const vk::Format format = t.format == TF::Bc1     ? vk::Format::eBc1RgbaSrgbBlock
+                              : t.format == TF::Bc3   ? vk::Format::eBc3SrgbBlock
+                              : t.format == TF::Bc7   ? vk::Format::eBc7SrgbBlock
+                              : t.format == TF::Rgba8 ? vk::Format::eR8G8B8A8Srgb
+                                                      : vk::Format::eUndefined;
     const bool sampled =
         format != vk::Format::eUndefined &&
         (instance.GetPhysicalDevice().getFormatProperties(format).optimalTilingFeatures &
          vk::FormatFeatureFlagBits::eSampledImage) != vk::FormatFeatureFlags{};
-    if (sampled && t.levels > 0) {
+    if (!g.textured && sampled && t.levels > 0) {
         g.image = VideoCore::UniqueImage(device, instance.GetAllocator());
-        g.image.Create(vk::ImageCreateInfo{
-            .imageType = vk::ImageType::e2D,
-            .format = format,
-            .extent = {t.width, t.height, 1},
-            .mipLevels = t.levels,
-            .arrayLayers = 1,
-            .samples = vk::SampleCountFlagBits::e1,
-            .tiling = vk::ImageTiling::eOptimal,
-            .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
-            .initialLayout = vk::ImageLayout::eUndefined,
-        });
+        if (!g.image.TryCreate(vk::ImageCreateInfo{
+                .imageType = vk::ImageType::e2D,
+                .format = format,
+                .extent = {t.width, t.height, 1},
+                .mipLevels = t.levels,
+                .arrayLayers = 1,
+                .samples = vk::SampleCountFlagBits::e1,
+                .tiling = vk::ImageTiling::eOptimal,
+                .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
+                .initialLayout = vk::ImageLayout::eUndefined,
+            })) {
+            DestroyModelLater(g);
+            model_missing[model_id] = true;
+            LOG_WARNING(Render_Vulkan, "VR inframe: model s{:05}: texture allocation failed",
+                        model_id);
+            return nullptr;
+        }
         auto view = device.createImageViewUnique({
             .image = g.image,
             .viewType = vk::ImageViewType::e2D,
@@ -1099,11 +1354,13 @@ const VrInFrame::GpuModel* VrInFrame::ModelOf(const RecorderProxy& cmdbuf, s32 m
         }
         g.view = std::move(view.value);
         Buffer staging{};
-        if (!CreateBuffer(staging, t.blocks.size(), vk::BufferUsageFlagBits::eTransferSrc)) {
+        const std::vector<u8>& bytes = t.Bytes();
+        if (!CreateBuffer(staging, bytes.size(), vk::BufferUsageFlagBits::eTransferSrc)) {
             DestroyModelLater(g);
+            model_missing[model_id] = true;
             return nullptr;
         }
-        std::memcpy(staging.mapped, t.blocks.data(), t.blocks.size());
+        std::memcpy(staging.mapped, bytes.data(), bytes.size());
         vmaFlushAllocation(instance.GetAllocator(), staging.allocation, 0, VK_WHOLE_SIZE);
         std::vector<vk::BufferImageCopy> regions;
         for (u32 level = 0; level < t.levels; ++level) {
@@ -1150,12 +1407,99 @@ const VrInFrame::GpuModel* VrInFrame::ModelOf(const RecorderProxy& cmdbuf, s32 m
         DestroyBufferLater(staging);
         g.textured = true;
         ++stats_uploads;
+        if (t.share_key != 0) {
+            // Shared from now on: the next model with this texture uses this image.
+            SharedImage& s = shared_images[t.share_key];
+            s.image = std::move(g.image);
+            s.view = std::move(g.view);
+            s.users = 1;
+            g.shared_key = t.share_key;
+            g.shared_view = *s.view;
+        }
+    }
+    if (!model->animation.empty()) {
+        const size_t bytes = model->animation.size() * sizeof(float);
+        if (!CreateBuffer(g.animation, bytes, vk::BufferUsageFlagBits::eStorageBuffer)) {
+            DestroyModelLater(g);
+            model_missing[model_id] = true; // Do not retry a failed upload every frame.
+            return nullptr;
+        }
+        std::memcpy(g.animation.mapped, model->animation.data(), bytes);
+        vmaFlushAllocation(instance.GetAllocator(), g.animation.allocation, 0, VK_WHOLE_SIZE);
+        const auto& surface = model->surface;
+        g.surface = VideoCore::UniqueImage(device, instance.GetAllocator());
+        if (!g.surface.TryCreate(vk::ImageCreateInfo{
+                .imageType = vk::ImageType::e2D,
+                .format = vk::Format::eBc3UnormBlock,
+                .extent = {surface.width, surface.height, 1},
+                .mipLevels = surface.levels,
+                .arrayLayers = 1,
+                .samples = vk::SampleCountFlagBits::e1,
+                .tiling = vk::ImageTiling::eOptimal,
+                .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
+                .initialLayout = vk::ImageLayout::eUndefined})) {
+            DestroyModelLater(g);
+            model_missing[model_id] = true;
+            LOG_WARNING(Render_Vulkan, "VR inframe: model s{:05}: surface allocation failed",
+                        model_id);
+            return nullptr;
+        }
+        auto surface_view = device.createImageViewUnique(
+            {.image = g.surface,
+             .viewType = vk::ImageViewType::e2D,
+             .format = vk::Format::eBc3UnormBlock,
+             .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, surface.levels, 0, 1}});
+        if (surface_view.result != vk::Result::eSuccess) {
+            DestroyModelLater(g);
+            model_missing[model_id] = true;
+            return nullptr;
+        }
+        g.surface_view = std::move(surface_view.value);
+        Buffer staging{};
+        const std::vector<u8>& surface_bytes = surface.Bytes();
+        if (!CreateBuffer(staging, surface_bytes.size(), vk::BufferUsageFlagBits::eTransferSrc)) {
+            DestroyModelLater(g);
+            model_missing[model_id] = true;
+            return nullptr;
+        }
+        std::memcpy(staging.mapped, surface_bytes.data(), surface_bytes.size());
+        vmaFlushAllocation(instance.GetAllocator(), staging.allocation, 0, VK_WHOLE_SIZE);
+        std::vector<vk::BufferImageCopy> regions;
+        for (u32 l = 0; l < surface.levels; l++)
+            regions.push_back({.bufferOffset = surface.level_offset[l],
+                               .imageSubresource = {vk::ImageAspectFlagBits::eColor, l, 0, 1},
+                               .imageExtent = {surface.width >> l, surface.height >> l, 1}});
+        const vk::ImageSubresourceRange all{vk::ImageAspectFlagBits::eColor, 0, surface.levels, 0,
+                                            1};
+        const vk::ImageMemoryBarrier2 dst{.srcStageMask = vk::PipelineStageFlagBits2::eNone,
+                                          .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                          .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                                          .oldLayout = vk::ImageLayout::eUndefined,
+                                          .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                                          .image = g.surface,
+                                          .subresourceRange = all};
+        cmdbuf.pipelineBarrier2(
+            vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &dst});
+        cmdbuf.copyBufferToImage(staging.buffer, g.surface, vk::ImageLayout::eTransferDstOptimal,
+                                 regions);
+        const vk::ImageMemoryBarrier2 read{.srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                           .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                                           .dstStageMask =
+                                               vk::PipelineStageFlagBits2::eFragmentShader,
+                                           .dstAccessMask = vk::AccessFlagBits2::eShaderSampledRead,
+                                           .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                                           .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                                           .image = g.surface,
+                                           .subresourceRange = all};
+        cmdbuf.pipelineBarrier2(
+            vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &read});
+        DestroyBufferLater(staging);
     }
     g.last_used = frame;
     LOG_INFO(Render_Vulkan,
              "VR inframe: model s{:05} uploaded ({} triangles, texture {}x{} {} levels{})",
              model_id, g.index_count / 3, t.width, t.height, t.levels,
-             g.textured ? "" : ", NOT textured");
+             !g.textured ? ", NOT textured" : shared_hit ? ", shared" : "");
     return &models.emplace(model_id, std::move(g)).first->second;
 }
 
@@ -1246,13 +1590,52 @@ void VrInFrame::CollectTimes() {
 }
 
 bool VrInFrame::Record(const RecorderProxy& cmdbuf, const Target& t, const Camera& camera,
-                       const F::List& list) {
+                       const F::RenderList& list) {
     ++frame;
-    if (failed || list.count == 0) {
+    model_uploads = 0;
+    // (Dropped pieces are swept at the frame's end, never here: a piece retired between the two
+    // eyes' draws would go from one eye a frame before the other.)
+    if (failed || (list.count == 0 && list.world_gray <= 0.0f && list.world_storm <= 0.0f)) {
         return false;
     }
+    return RecordList(cmdbuf, t, camera, list);
+}
+
+void VrInFrame::SweepDropped() {
+    // Runtime models dropped (a severed piece gone): their GPU copies freed now, not when the
+    // cache next fills (their ids are never put again).
+    if (runtime_held && VR::Assets::DroppedModels() != dropped_models) {
+        const u32 dropped = VR::Assets::DroppedModels();
+        dropped_models = dropped;
+        std::vector<s32> gone;
+        for (const auto& [id, model] : models) {
+            if (id >= VR::Assets::RuntimeModelBase) {
+                gone.push_back(id);
+            }
+        }
+        for (const auto& [id, missing] : model_missing) {
+            if (id >= VR::Assets::RuntimeModelBase) {
+                gone.push_back(id);
+            }
+        }
+        const std::size_t held = gone.size();
+        VR::Assets::KeepDroppedModels(gone);
+        for (const s32 id : gone) {
+            if (const auto it = models.find(id); it != models.end()) {
+                DestroyModelLater(it->second);
+                models.erase(it);
+            }
+            model_missing.erase(id);
+        }
+        runtime_held = held > gone.size(); // (some still put)
+    }
+}
+
+bool VrInFrame::RecordList(const RecorderProxy& cmdbuf, const Target& t, const Camera& camera,
+                           const F::RenderList& list) {
     const s64 start = NowNs();
-    const vk::Pipeline pipeline = PipelineFor(t.color_format, t.depth_format, false, camera.clip);
+    const auto depth_terms = DepthTerms(camera);
+    const vk::Pipeline pipeline = PipelineFor(t.color_format, t.depth_format, false, depth_terms);
     if (!pipeline || !EnsureDepth(t)) {
         return false;
     }
@@ -1263,7 +1646,10 @@ bool VrInFrame::Record(const RecorderProxy& cmdbuf, const Target& t, const Camer
         any_xray = any_xray || list.items[i].xray;
     }
     const vk::Pipeline xray_pipeline =
-        any_xray ? PipelineFor(t.color_format, t.depth_format, true, camera.clip) : vk::Pipeline{};
+        any_xray ? PipelineFor(t.color_format, t.depth_format, true, depth_terms) : vk::Pipeline{};
+    // Asked every frame (built on a worker the first time): ready before a flash needs it.
+    const vk::Pipeline translucent_pipeline =
+        TranslucentFor(t.color_format, t.depth_format, depth_terms);
     if (!label_atlas_ready) {
         // Undefined -> cleared -> sampled, once.
         const vk::ImageMemoryBarrier2 to_dst{
@@ -1341,7 +1727,7 @@ bool VrInFrame::Record(const RecorderProxy& cmdbuf, const Target& t, const Camer
         const GpuModel* model{nullptr}; // MeshId::Model: its own buffers
         bool skip{false};
     };
-    std::array<Prepared, F::MaxItems> prepared{};
+    std::array<Prepared, F::MaxRenderItems> prepared{};
     std::array<int, F::MaxLabels> label_row{};
     label_row.fill(-2);
     const auto row_of = [&](int label) {
@@ -1356,15 +1742,90 @@ bool VrInFrame::Record(const RecorderProxy& cmdbuf, const Target& t, const Camer
     };
     const float tan_half = std::tan(0.5f * camera.vfov);
     const float p11 = tan_half > 1e-4f ? 1.0f / tan_half : 1.0f;
-    const float n = camera.near_z;
-    const float f = camera.far_z;
-    const std::array<float, 4> proj{p11 / std::max(camera.aspect, 1e-3f), p11, f / (f - n),
-                                    -n * f / (f - n)};
+    // The eye's projection, pushed (the shader's proj): the game's P00 / P11 times the eye's
+    // clip scale, and the clip offset. The depth mapping is the pipeline's (DepthTerms).
+    const std::array<float, 4> proj{p11 / std::max(camera.aspect, 1e-3f) * camera.clip[0],
+                                    p11 * camera.clip[1], camera.clip[2], camera.clip[3]};
     const float exposure = list.exposure;
     u32 drawn = 0;
+    u32 optical_hidden = 0;
+    std::array<u32, 16> waiting_groups{}; // a group with a model not up yet: none of it drawn
+    std::size_t waiting = 0;
+    const auto group_waits = [&](u32 group) {
+        return std::find(waiting_groups.begin(), waiting_groups.begin() + waiting, group) !=
+               waiting_groups.begin() + waiting;
+    };
+    // Held/body-slot models get the upload budget before severed pieces. Keep their result
+    // for preparation below (including a miss), so each is requested only once. ModelOf marks
+    // cached entries used this frame: the later piece uploads cannot evict these pointers.
+    for (u32 i = 0; i < list.count; ++i) {
+        const F::Item& item = list.items[i];
+        if (item.mesh == F::MeshId::Model && item.group == 0 &&
+            !(item.hide_from_monocular_eye &&
+              camera.monocular_eye == static_cast<s32>(t.depth_layer))) {
+            prepared[i].model = ModelOf(cmdbuf, static_cast<s32>(item.tex_key));
+        }
+    }
+    // Pending cuts are upload-only, including outside the frustum. Count every model of
+    // each cut; a truncated list must never acknowledge a partial piece/stump. Commands
+    // are recorded before the later frame that hides the limb, on the same scheduler.
+    // No GPU fence wait: pinned models and queue ordering keep the handoff non-blocking.
+    struct UploadGroup { u32 token{}, count{}; bool preload{}; };
+    std::array<UploadGroup, VR::Sever::RevealMailbox::Slots> uploading{};
+    std::size_t uploading_count = 0;
+    for (u32 i = 0; i < list.count; ++i) {
+        const auto& item = list.items[i];
+        if (item.mesh != F::MeshId::Model || item.group == 0) continue;
+        // A first draw is acknowledged only while its cut still holds its reveal slot: the slot
+        // goes back once the cut is drawn (bloodborne_sever.cpp RevealDone), and a list built
+        // before that but drawn after it (the game runs a frame ahead) is an ordinary group,
+        // never one waiting on a slot that is gone (a piece blinking out for a frame).
+        const bool tracked = item.upload_only ||
+                             (item.reveal_first && VR::Sever::g_reveals.Live(item.group));
+        if (!group_waits(item.group) &&
+            ModelOf(cmdbuf, static_cast<s32>(item.tex_key), tracked ? item.group : 0) == nullptr &&
+            waiting < waiting_groups.size()) waiting_groups[waiting++] = item.group;
+        // Fold tracking into the existing group-upload pass. Settled/ordinary items
+        // neither access the mailbox nor acquire another lock.
+        if (!tracked) continue;
+        auto end = uploading.begin() + uploading_count;
+        auto it = std::find_if(uploading.begin(), end,
+                               [&](const auto& g) { return g.token == item.group; });
+        if (it == end) {
+            if (uploading_count == uploading.size()) continue;
+            it = uploading.begin() + uploading_count++;
+            it->token = item.group;
+            it->preload = item.upload_only;
+        }
+        ++it->count;
+    }
+    for (std::size_t i = 0; i < uploading_count; ++i) {
+        const auto& g = uploading[i];
+        if (VR::Sever::g_reveals.Waiting(g.token, g.count) && !group_waits(g.token) &&
+            waiting < waiting_groups.size()) waiting_groups[waiting++] = g.token;
+        // Refresh readiness during the first draw too: switching mono/native stereo
+        // after hiding must not leave the reveal waiting forever on the old eye mask.
+        // Both the replacement meshes and AddGush use the regular pipeline, already
+        // checked at entry. Unrelated translucent-effect compilation must not block a cut.
+        if (!group_waits(g.token))
+            VR::Sever::g_reveals.Uploaded(g.token, g.count, t.depth_layer, camera.model_eye_mask);
+    }
     for (u32 i = 0; i < list.count; ++i) {
         const F::Item& item = list.items[i];
         Prepared& p = prepared[i];
+        if (item.upload_only) {
+            p.skip = true;
+            continue;
+        }
+        if (item.group != 0 && group_waits(item.group)) {
+            p.skip = true;
+            continue;
+        }
+        if (item.hide_from_monocular_eye && camera.monocular_eye == static_cast<s32>(t.depth_layer)) {
+            p.skip = true;
+            ++optical_hidden;
+            continue;
+        }
         p.push.mv = item.mv;
         p.push.mv[3] -= camera.eye_x;
         p.push.color = item.color;
@@ -1376,9 +1837,10 @@ bool VrInFrame::Record(const RecorderProxy& cmdbuf, const Target& t, const Camer
         const float inv_w = probe_valid ? 1.0f / static_cast<float>(t.extent.width) : 0.0f;
         const float inv_h = probe_valid ? 1.0f / static_cast<float>(t.extent.height) : 0.0f;
         // The cards' round silhouettes are anti-aliased in the shader (EdgeDisc / EdgeRing).
-        const u32 edge = item.mesh == F::MeshId::Plate  ? EdgeDisc
-                         : item.mesh == F::MeshId::Ring ? EdgeRing
-                                                        : 0u;
+        const u32 edge = item.candle                    ? Candle
+                         : item.mesh == F::MeshId::Plate ? EdgeDisc
+                         : item.mesh == F::MeshId::Ring  ? EdgeRing
+                                                         : 0u;
         // Bits 6 and up: Item::depth_pull in 1e-4 game units (vr_inframe.vert).
         const u32 pull = static_cast<u32>(std::clamp(item.depth_pull * 1e4f, 0.0f, 200000.0f));
         p.push.extra = {static_cast<float>(static_cast<u32>(item.shade) + edge + (pull << 6)),
@@ -1390,13 +1852,33 @@ bool VrInFrame::Record(const RecorderProxy& cmdbuf, const Target& t, const Camer
         p.view = *label_view;
         p.sampler = *sampler;
         if (item.mesh == F::MeshId::Model) {
-            p.model = ModelOf(cmdbuf, static_cast<s32>(item.tex_key));
+            if (item.group != 0) {
+                // The same pin as the upload pass (a first draw keeps it until it is visible).
+                p.model = ModelOf(cmdbuf, static_cast<s32>(item.tex_key),
+                                  item.reveal_first ? item.group : 0);
+            }
             if (p.model == nullptr) {
                 p.skip = true;
                 continue;
             }
+            if (p.model->animation.buffer) {
+                p.push.uv = {std::isfinite(item.model_frame)
+                                 ? std::clamp(item.model_frame, 0.0f, 254.0f)
+                                 : 0.0f,
+                             static_cast<float>(p.model->vertex_count),
+                             item.soft_glove ? -3.0f : p.model->single_surface ? -2.0f : -1.0f,
+                             static_cast<float>(3 * p.model->animation_bones)};
+                if (p.model->single_surface && !item.soft_glove &&
+                    std::isfinite(item.model_blend_frame) && item.model_blend_frame >= 0.0f) {
+                    // Keep the 128-byte push layout: z selects scaled-bone skinning and
+                    // second frame; fractional w carries half the crossfade weight.
+                    p.push.uv[2] = -4.0f - std::clamp(item.model_blend_frame, 0.0f, 254.0f);
+                    p.push.uv[3] += std::isfinite(item.model_blend_weight)
+                        ? .5f * std::clamp(item.model_blend_weight, 0.0f, 1.0f) : 0.0f;
+                }
+            }
             if (item.tex == F::Tex::Model) {
-                p.view = p.model->textured ? *p.model->view : *white_view;
+                p.view = p.model->textured ? p.model->View() : *white_view;
                 p.sampler = *model_sampler;
             }
         }
@@ -1437,7 +1919,10 @@ bool VrInFrame::Record(const RecorderProxy& cmdbuf, const Target& t, const Camer
         }
         ++drawn;
     }
-    if (drawn == 0) {
+    // The backdrop: A Call Beyond's gray world, or Tonitrus' strike's flash (which grays no item).
+    const bool gray_world = (list.world_gray > 0.0f || list.world_storm > 0.0f) &&
+                            translucent_pipeline && probe_valid;
+    if (drawn == 0 && optical_hidden == 0 && !gray_world) {
         return false;
     }
 
@@ -1448,46 +1933,62 @@ bool VrInFrame::Record(const RecorderProxy& cmdbuf, const Target& t, const Camer
         cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *query_pool,
                                timing_slot * 2);
     }
-    // The scene depth into the private copy (depth only; the game's image is only read).
-    const vk::ImageMemoryBarrier2 copy_in{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eNone,
-        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .oldLayout = vk::ImageLayout::eUndefined,
-        .newLayout = vk::ImageLayout::eTransferDstOptimal,
+    // The scene depth into the private copy (depth only; the game's image is only read). In place
+    // (S1's own depth): no copy, its layer becomes the attachment after the probe's read.
+    const vk::ImageAspectFlags depth_aspects =
+        HasStencil(t.depth_format) ? vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil
+                                   : vk::ImageAspectFlags{vk::ImageAspectFlagBits::eDepth};
+    vk::ImageMemoryBarrier2 to_attachment{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                        vk::PipelineStageFlagBits2::eLateFragmentTests,
+        .dstAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+        .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+        .newLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
         .image = depth,
-        .subresourceRange = {HasStencil(depth_format)
-                                 ? vk::ImageAspectFlagBits::eDepth |
-                                       vk::ImageAspectFlagBits::eStencil
-                                 : vk::ImageAspectFlags{vk::ImageAspectFlagBits::eDepth},
-                             0, 1, 0, 1},
+        .subresourceRange = {depth_aspects, 0, 1, 0, 1},
     };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers = &copy_in,
-    });
-    const vk::ImageCopy copy{
-        .srcSubresource = {vk::ImageAspectFlagBits::eDepth, 0, t.depth_layer, 1},
-        .srcOffset = {0, 0, 0},
-        .dstSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
-        .dstOffset = {0, 0, 0},
-        .extent = {t.depth_extent.width, t.depth_extent.height, 1},
-    };
-    cmdbuf.copyImage(t.depth_image, vk::ImageLayout::eTransferSrcOptimal, depth,
-                     vk::ImageLayout::eTransferDstOptimal, copy);
-    if (camera.collect_probe) {
-        RecordProbe(cmdbuf, t, camera, list);
+    depth_copied = !t.depth_in_place;
+    if (t.depth_in_place) {
+        if (camera.collect_probe) {
+            RecordProbe(cmdbuf, t, camera, list);
+        }
+        // From the scale's layout (its writes were made visible to transfer reads, and this
+        // chains on them); the probe's read is the only access since.
+        to_attachment.srcAccessMask = vk::AccessFlagBits2::eNone;
+        to_attachment.oldLayout = vk::ImageLayout::eTransferSrcOptimal;
+        to_attachment.image = t.depth_image;
+        to_attachment.subresourceRange = {depth_aspects, 0, 1, t.depth_layer, 1};
+    } else {
+        const vk::ImageMemoryBarrier2 copy_in{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eNone,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .image = depth,
+            .subresourceRange = {depth_aspects, 0, 1, 0, 1},
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &copy_in,
+        });
+        const vk::ImageCopy copy{
+            .srcSubresource = {vk::ImageAspectFlagBits::eDepth, 0, t.depth_layer, 1},
+            .srcOffset = {0, 0, 0},
+            .dstSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
+            .dstOffset = {0, 0, 0},
+            .extent = {t.depth_extent.width, t.depth_extent.height, 1},
+        };
+        cmdbuf.copyImage(t.depth_image, vk::ImageLayout::eTransferSrcOptimal, depth,
+                         vk::ImageLayout::eTransferDstOptimal, copy);
+        if (camera.collect_probe) {
+            RecordProbe(cmdbuf, t, camera, list);
+        }
     }
-    vk::ImageMemoryBarrier2 to_attachment = copy_in;
-    to_attachment.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
-    to_attachment.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
-    to_attachment.dstStageMask = vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                                 vk::PipelineStageFlagBits2::eLateFragmentTests;
-    to_attachment.dstAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-                                  vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
-    to_attachment.oldLayout = vk::ImageLayout::eTransferDstOptimal;
-    to_attachment.newLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = 1,
         .pImageMemoryBarriers = &to_attachment,
@@ -1525,7 +2026,7 @@ bool VrInFrame::Record(const RecorderProxy& cmdbuf, const Target& t, const Camer
         },
     }};
     const vk::RenderingAttachmentInfo depth_attachment{
-        .imageView = *depth_attachment_view,
+        .imageView = t.depth_in_place ? t.depth_in_place : *depth_attachment_view,
         .imageLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
         .loadOp = vk::AttachmentLoadOp::eLoad,
         .storeOp = vk::AttachmentStoreOp::eStore,
@@ -1551,24 +2052,51 @@ bool VrInFrame::Record(const RecorderProxy& cmdbuf, const Target& t, const Camer
     const vk::DeviceSize zero = 0;
     const GpuModel* bound = nullptr; // the buffers bound: a model's, or (nullptr) the library's
     bool library_bound = false;
+    const GpuModel* animation_bound = nullptr;
+    bool animation_descriptors_ready = false;
     // Two passes: the items, then the x-ray copies (their own pipeline; the viewport and the
     // scissor are dynamic state and stay set).
-    for (u32 n = 0; n < 2 * list.count; ++n) {
-        const u32 i = n % list.count;
-        const bool xray_pass = n >= list.count;
+    vk::Pipeline bound_pipeline = pipeline;
+    Prepared backdrop{};
+    if (gray_world) {
+        backdrop.view = *probe_view;
+        backdrop.sampler = *sampler;
+        backdrop.push.color[3] = list.world_gray;
+        backdrop.push.color[0] = list.world_bright; // its lift (the frag's gray backdrop)
+        backdrop.push.color[1] = list.world_flash;  // its flare once raised
+        backdrop.push.color[2] = list.world_storm;  // Tonitrus' strike: lightning's flash
+        // Reuse this eye's scene-light probe. Hardware blending preserves the original
+        // full-resolution scene in proportion to the color still left during the fade.
+        const bool linear = probe_format == vk::Format::eR8G8B8A8Srgb ||
+                            probe_format == vk::Format::eB8G8R8A8Srgb;
+        backdrop.push.extra = {linear ? 1.0f : 0.0f, t.swapped ? 1.0f : 0.0f,
+                               1.0f / t.extent.width, 1.0f / t.extent.height};
+    }
+    for (int n = gray_world ? -1 : 0; n < static_cast<int>(2 * list.count); ++n) {
+        const bool background = n < 0;
+        const u32 i = background ? 0 : static_cast<u32>(n) % list.count;
+        const bool xray_pass = !background && static_cast<u32>(n) >= list.count;
         if (xray_pass && n == list.count) {
             if (!xray_pipeline) {
                 break; // none (or no pipeline for them): one pass
             }
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, xray_pipeline);
+            bound_pipeline = xray_pipeline;
         }
-        const Prepared& p = prepared[i];
-        if (p.skip || list.items[i].xray != xray_pass) {
+        const Prepared& p = background ? backdrop : prepared[i];
+        if (p.skip || (!background && list.items[i].xray != xray_pass)) {
             continue;
+        }
+        const auto wanted_pipeline = background ? translucent_pipeline : xray_pass ? xray_pipeline
+            : list.items[i].translucent ? translucent_pipeline : pipeline;
+        if (!wanted_pipeline) continue;
+        if (wanted_pipeline != bound_pipeline) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, wanted_pipeline);
+            bound_pipeline = wanted_pipeline;
         }
         if (p.model != nullptr && p.model != bound) {
             cmdbuf.bindVertexBuffers(0, p.model->vertices.buffer, zero);
-            cmdbuf.bindIndexBuffer(p.model->indices.buffer, 0, vk::IndexType::eUint32);
+            cmdbuf.bindIndexBuffer(p.model->indices.buffer, 0, p.model->index_type);
             bound = p.model;
             library_bound = false;
         } else if (p.model == nullptr && !library_bound) {
@@ -1587,7 +2115,7 @@ bool VrInFrame::Record(const RecorderProxy& cmdbuf, const Target& t, const Camer
             .imageView = probe_valid ? *probe_view : *label_view,
             .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
         };
-        const std::array<vk::WriteDescriptorSet, 2> writes{{
+        std::array<vk::WriteDescriptorSet, 4> writes{{
             {
                 .dstBinding = 0,
                 .descriptorCount = 1,
@@ -1601,17 +2129,50 @@ bool VrInFrame::Record(const RecorderProxy& cmdbuf, const Target& t, const Camer
                 .pImageInfo = &probe_info,
             },
         }};
-        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, writes);
+        const GpuModel* animated = p.model && p.model->animation.buffer ? p.model : nullptr;
+        vk::DescriptorBufferInfo animation_info{};
+        vk::DescriptorImageInfo surface_info{};
+        u32 write_count = 2;
+        if (!animation_descriptors_ready || animated != animation_bound) {
+            animation_info = vk::DescriptorBufferInfo{
+                .buffer = animated ? animated->animation.buffer : vertices.buffer,
+                .offset = 0,
+                .range = animated ? VK_WHOLE_SIZE : 16};
+            surface_info = vk::DescriptorImageInfo{
+                .sampler = *model_sampler,
+                .imageView = animated ? *animated->surface_view : *white_view,
+                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
+            writes[2] = vk::WriteDescriptorSet{.dstBinding = 2,
+                                               .descriptorCount = 1,
+                                               .descriptorType = vk::DescriptorType::eStorageBuffer,
+                                               .pBufferInfo = &animation_info};
+            writes[3] =
+                vk::WriteDescriptorSet{.dstBinding = 3,
+                                       .descriptorCount = 1,
+                                       .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                                       .pImageInfo = &surface_info};
+            write_count = 4;
+            animation_bound = animated;
+            animation_descriptors_ready = true;
+        }
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0,
+                                    {write_count, writes.data()});
         ScratchPush::Invalidate();
         cmdbuf.pushConstants(*pipeline_layout,
                              vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
                              0, sizeof(DrawConstants), &p.push);
+        if (background) {
+            cmdbuf.draw(3, 1, 0, 256); // fullscreen at near depth, no depth or coverage write
+            continue;
+        }
+        const u32 gray = gray_world && !list.items[i].keep_charge_color
+                             ? static_cast<u32>(std::lround(255 * list.world_gray)) : 0;
         if (p.model != nullptr) {
-            cmdbuf.drawIndexed(p.model->index_count, 1, 0, 0, 0);
+            cmdbuf.drawIndexed(p.model->index_count, 1, 0, 0, gray);
             continue;
         }
         const MeshRange& r = ranges[static_cast<size_t>(list.items[i].mesh)];
-        cmdbuf.drawIndexed(r.index_count, 1, r.first_index, r.vertex_offset, 0);
+        cmdbuf.drawIndexed(r.index_count, 1, r.first_index, r.vertex_offset, gray);
     }
     cmdbuf.endRendering();
     if (query_pool) {
@@ -1640,13 +2201,20 @@ bool VrInFrame::Record(const RecorderProxy& cmdbuf, const Target& t, const Camer
         .image = cover,
         .subresourceRange = ColorRange,
     };
-    const std::array<vk::ImageMemoryBarrier2, 2> after{to_read, cover_out};
+    // In place: S1's depth stays an attachment (nothing reads it after; the next frame's scale
+    // starts it from Undefined).
+    const std::array<vk::ImageMemoryBarrier2, 2> after{cover_out, to_read};
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .imageMemoryBarrierCount = static_cast<u32>(after.size()),
+        .imageMemoryBarrierCount = t.depth_in_place ? 1u : static_cast<u32>(after.size()),
         .pImageMemoryBarriers = after.data(),
     });
     ++stats_lists;
     stats_items += drawn;
+    for (std::size_t i = 0; i < uploading_count; ++i) {
+        const auto& g = uploading[i];
+        if (!g.preload && !group_waits(g.token))
+            VR::Sever::g_reveals.Drawn(g.token, g.count, t.depth_layer, camera.model_eye_mask);
+    }
     const double cpu = static_cast<double>(NowNs() - start) * 1e-3;
     stats_cpu_us += cpu;
     stats_cpu_max_us = std::max(stats_cpu_max_us, cpu);
@@ -1659,7 +2227,7 @@ bool VrInFrame::Record(const RecorderProxy& cmdbuf, const Target& t, const Camer
 // copies cost the pass about 60 us), published once the GPU is past it (CollectProbes). Only a
 // 32-bit float depth (the game's D32 S8) is read.
 void VrInFrame::RecordProbe(const RecorderProxy& cmdbuf, const Target& t, const Camera& camera,
-                            const F::List& list) {
+                            const F::RenderList& list) {
     CollectProbes();
     const F::Probe& probe = list.probe;
     if (probe.id == 0 || probe.count == 0 ||

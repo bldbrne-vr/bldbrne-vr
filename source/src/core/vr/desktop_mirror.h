@@ -65,6 +65,26 @@ enum class View : u8 {
     return n % static_cast<u64>(every) == 0;
 }
 
+// The same by time (2026-11-06; Presenter::Present): with N >= 2 the window shows at most 60 / N
+// images a second (2 = 30 Hz), whatever the game's frame rate. Counting frames, every 2nd frame of
+// a game running 110 fps in VR was 55 window presents a second, and the window's blit, present
+// and compositing cost ~0.24 ms of GPU per frame (2.9% fps in the mock, 2026-11-06). A frame is
+// shown once 90% of the interval has passed since the last one shown (frame-time jitter must not
+// skip a whole interval at exactly 60 fps). 1 = every frame, 0 (or less) = none, as Presents.
+[[nodiscard]] constexpr bool PresentsAt(s32 every, s64 now_ns, s64 last_shown_ns) {
+    if (every == 1) {
+        return true;
+    }
+    if (every <= 0) {
+        return false;
+    }
+    if (last_shown_ns <= 0 || now_ns < last_shown_ns) {
+        return true; // the first, or a clock that went back: show it and start counting again
+    }
+    const s64 interval_ns = static_cast<s64>(every) * 1'000'000'000LL / 60;
+    return now_ns - last_shown_ns >= interval_ns * 9 / 10;
+}
+
 // The present queue's priority hint (Instance: {graphics, present}). Anything but the window of
 // before 2026-10-09 (every frame, the game view) gives the desktop present the lowest priority.
 [[nodiscard]] constexpr bool LowPresentPriority(s32 every, View view) {

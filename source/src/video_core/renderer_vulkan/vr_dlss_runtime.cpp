@@ -5,11 +5,14 @@
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #include <algorithm>
-#include "video_core/renderer_vulkan/vr_dibr_dlss.h"
+#include "video_core/renderer_vulkan/vr_dibr_upscale.h"
 #include <cstdlib>
 #include <cstring>
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "core/vr/dlss5_file.h"
+#include "core/vr/graphics_settings.h"
+#include <mutex>
 #include "video_core/renderer_vulkan/vr_dlss_preset.h"
 #include "video_core/renderer_vulkan/vr_dlss_runtime.h"
 #ifdef _WIN32
@@ -31,6 +34,18 @@ std::filesystem::path RuntimeDirectory() {
 #else
     return {};
 #endif
+}
+// The player's DLSS 5 file: VR_DLSS5_FILE (tests), else user/dlss5 (the launcher copies it there),
+// else an older setup's copy beside the DLSS bridge.
+std::filesystem::path NeuralCandidate() {
+    if (const char* path = std::getenv("VR_DLSS5_FILE"); path && *path)
+        return std::filesystem::absolute(path);
+    std::error_code error;
+    const auto user = VR::Dlss5File::InUser(Common::FS::GetUserPath(Common::FS::PathType::UserDir));
+    if (std::filesystem::is_regular_file(user, error))
+        return user;
+    const auto beside = RuntimeDirectory();
+    return beside.empty() ? user : beside / VR::Dlss5File::Name;
 }
 void Remember(std::vector<std::string>& stored, const std::vector<const char*>& enabled) {
     stored.clear();
@@ -72,6 +87,22 @@ bool Requirements(const VkExtensionProperties* required, uint32_t count,
     return true;
 }
 } // namespace
+std::filesystem::path VerifiedNeuralFile() {
+    static std::once_flag once;
+    static std::filesystem::path verified;
+    std::call_once(once, [] {
+        const auto file = NeuralCandidate();
+        const auto check = VR::Dlss5File::Verify(file);
+        if (check.ok) {
+            verified = file;
+            LOG_INFO(Render_Vulkan, "VR DLSS 5: {} {} (NVIDIA-signed)", file.string(), check.version);
+        } else {
+            LOG_INFO(Render_Vulkan, "VR DLSS 5 unavailable: {} {}", file.string(), check.problem);
+        }
+        VR::Graphics::neural_file.store(check.ok ? 1 : 0);
+    });
+    return verified;
+}
 VrDlssRuntime& VrDlssRuntime::Get() {
     // Deliberate process lifetime: the bridge must outlive NGX/driver callbacks.
     static auto* runtime = new VrDlssRuntime;
@@ -79,10 +110,11 @@ VrDlssRuntime& VrDlssRuntime::Get() {
 }
 void VrDlssRuntime::PrepareDriverAddressSpace() {
 #ifdef _WIN32
-    if (!std::getenv("VR_NATIVE_STEREO") && !DibrDlss::Requested()) return;
+    if (!std::getenv("VR_NATIVE_STEREO") && !DibrUpscale::Requested()) return;
     if (early_attempted || VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Dlss)
         return;
     early_attempted = true;
+    VR::Graphics::dlss_early.store(0, std::memory_order_relaxed); // until it succeeds below
     if (!Load()) return;
     // Keep an unused device alive until the real one exists. NVIDIA reserves its
     // binary-import VA here, and the guest memory map then skips those host ranges.
@@ -145,6 +177,7 @@ void VrDlssRuntime::PrepareDriverAddressSpace() {
         }
     }
     early_ready=!early_devices.empty();
+    VR::Graphics::dlss_early.store(early_ready ? 1 : 0, std::memory_order_relaxed);
     if (!early_ready) {
         ReleaseDriverReservation(); Fail("early DLSS driver address reservation failed");
     } else LOG_INFO(Render_Vulkan,"VR DLSS: driver address space prepared before guest reservation");
@@ -168,9 +201,10 @@ void VrDlssRuntime::Fail(const char* reason) {
     problem = reason;
 }
 bool VrDlssRuntime::Load() {
-    // A saved native-upscaler preference must not load NGX or reserve its memory in DIBR.
-    if (!std::getenv("VR_NATIVE_STEREO") && !DibrDlss::Requested()) {
-        problem = "Disabled in DIBR mode; native-stereo preference preserved";
+    // DIBR loads NGX only for its centre reconstruction (vr_dibr_upscale.h; VR_DIBR_UPSCALE=0
+    // never does).
+    if (!std::getenv("VR_NATIVE_STEREO") && !DibrUpscale::Requested()) {
+        problem = "Disabled in DIBR mode (VR_DIBR_UPSCALE=0)";
         return false;
     }
     if (attempted)
@@ -291,8 +325,30 @@ VrDlssSession* VrDlssRuntime::Activate(const VR::Graphics::Config& accepted,
     using SetNeural = int (*)(int, unsigned, unsigned, unsigned, unsigned);
     const auto neural = reinterpret_cast<SetNeural>(GetProcAddress(
         static_cast<HMODULE>(module), "VrDlssSetNeuralConfig"));
+    // DLSS 5 only on an RTX 50 card (the VR page offers it nowhere else; an older vr.ini could).
+    if (accepted.dlss5 && VR::Graphics::neural_gpu.load(std::memory_order_relaxed) != 1) {
+        Fail("DLSS 5 needs a GeForce RTX 50-series GPU; choose DLSS or FSR");
+        return nullptr;
+    }
+    // The player's own NVIDIA file (never shipped): the bridge loads it from where it was found.
+    if (accepted.dlss5) {
+        using SetRuntime = int (*)(const wchar_t*);
+        const auto set_runtime = reinterpret_cast<SetRuntime>(GetProcAddress(
+            static_cast<HMODULE>(module), "VrDlssSetNeuralRuntime"));
+        const auto file = VerifiedNeuralFile();
+        if (file.empty()) {
+            Fail("DLSS 5 needs NVIDIA's signed nvngx_dlssnr.dll (add it in the launcher's DLSS 5 tab)");
+            return nullptr;
+        }
+        if (!set_runtime || !set_runtime(file.c_str())) {
+            Fail("DLSS 5 bridge cannot take the player's DLSS 5 file");
+            return nullptr;
+        }
+    }
+    // DLSS 5 runs at full strength whatever an older vr.ini kept (the VR page has one DLSS 5
+    // setting, on or off; the tester, 2026-10-27).
     if ((accepted.dlss5 && !neural) || (neural && !neural(accepted.dlss5,
-            unsigned(accepted.neural), accepted.intensity, accepted.detail, accepted.lighting))) {
+            unsigned(accepted.neural), 100u, 100u, 100u))) {
         Fail("DLSS5 bridge unavailable or previous eye features have not retired");
         return nullptr;
     }

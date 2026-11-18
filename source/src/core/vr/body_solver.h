@@ -343,8 +343,25 @@ struct BodyInput {
     std::array<std::optional<ModelTarget>, 2> target{}; // C0000::Left, C0000::Right
     std::array<float, 2> arm_weight{};
     float two_hand{0.0f}; // left target follows the actually solved right weapon
+    std::optional<QsTransform> right_weapon_local{}; // visual hand contact; weapon target unchanged
     bool hide{false};
+    // The camera's own smoothing of his root's height (model units, + = the camera above where
+    // his root puts it: stairs, slopes; StairRide): with the torso hidden his upper body rides
+    // it after the posture (which works on `eye_m` without it).
+    float stair_dy{0.0f};
 };
+
+// The camera's smoothing of the root's height (`dip`, game units) the upper body rides: all of it
+// up to 15 cm (a stair's lag and more), then a soft knee to at most 25 cm (a drop's or a fall's
+// view held high never lifts his shoulders off him).
+inline float StairRide(float dip, float scale) {
+    if (!std::isfinite(dip)) {
+        return 0.0f;
+    }
+    const float lin = 0.15f * scale, knee = 0.10f * scale;
+    const float a = std::abs(dip);
+    return a <= lin ? dip : std::copysign(lin + knee * std::tanh((a - lin) / knee), dip);
+}
 
 struct BodyOutput {
     bool ok{true};             // false: nothing may be written (see `fail`)
@@ -468,6 +485,20 @@ public:
         };
         const float smooth =
             dt > 0.0f && p.align_tau > 0.0f ? 1.0f - std::exp(-dt / p.align_tau) : 1.0f;
+        // The camera's own smoothing of his root's height (stairs, slopes: in.stair_dy) on his upper
+        // body as it is on the view, with no filter of its own: the one offset the view and the
+        // view model share in Quake and Source, and FRIK's on the body (the research, 2026-11-04).
+        // His shoulders ride with the camera while his legs stay on the step, so arms held still
+        // against the view keep their shape (the mock's stairs: the shoulders 21 cm up and down
+        // against the eye and the elbows bending with each step). The posture works on his root's
+        // eye (the walk's bob and its deadband as they were); the ride goes into its shift, one
+        // move of the upper body, and the camera it is measured against moves with it. Only with
+        // the torso hidden (a drawn one would stretch at the waist) and the body's weight (none on
+        // a ladder, in an event, a throw).
+        const Vec3 ride{0.0f,
+                        p.align && in.hide && std::isfinite(in.stair_dy) ? in.stair_dy * body_w
+                                                                         : 0.0f,
+                        0.0f};
         if (p.posture == PostureMode::Shift) {
             Vec3 raw = goal - out.eye;
             const float horizontal = std::sqrt(raw.x * raw.x + raw.z * raw.z);
@@ -490,13 +521,13 @@ public:
                 shift = shift + (raw - shift) * smooth;
             }
             if (p.align && body_w > 0.0f) {
-                out.shift = shift * body_w;
+                out.shift = shift * body_w + ride;
                 if (LengthSq(out.shift) > 0.0f) {
                     move_upper(out.shift);
                 }
             }
-            out.eye_residual = Length(out.eye + out.shift - goal);
-            const Vec3 cam = in.eye_m - (out.eye + out.shift);
+            out.eye_residual = Length(out.eye + out.shift - (goal + ride));
+            const Vec3 cam = in.eye_m + ride - (out.eye + out.shift);
             out.cam_ahead = Dot(cam, forward);
             out.cam_above = cam.y;
             out.cam_side = Dot(cam, Cross(up, forward));
@@ -588,12 +619,12 @@ public:
             } else {
                 vertical += (vy_goal - vertical) * (1.0f - std::exp(-dt / p.vertical_tau));
             }
-            if (p.align && body_w > 0.0f && vertical != 0.0f) {
-                out.shift = Vec3{0.0f, vertical * body_w, 0.0f};
+            if (p.align && body_w > 0.0f && (vertical != 0.0f || ride.y != 0.0f)) {
+                out.shift = Vec3{0.0f, vertical * body_w, 0.0f} + ride;
                 move_upper(out.shift);
             }
-            out.eye_residual = Length(leaned + out.shift - goal);
-            const Vec3 cam = in.eye_m - (leaned + out.shift);
+            out.eye_residual = Length(leaned + out.shift - (goal + ride));
+            const Vec3 cam = in.eye_m + ride - (leaned + out.shift);
             out.cam_ahead = Dot(cam, forward);
             out.cam_above = cam.y;
             out.cam_side = Dot(cam, Cross(up, forward));
@@ -669,9 +700,16 @@ public:
                 params.limits.maxStretch += p.rise_stretch;
             }
             params.clavicleCatchUp = std::max(p.shoulder_reach, 0.0f);
+            const auto native_effector = pose[rig.effector];
+            const bool contact_override = side == C::Right && in.right_weapon_local.has_value();
+            if (contact_override) pose[rig.effector] = *in.right_weapon_local;
             out.arm[i] = SolveArm(pose, parents, C::BoneCount, rig, {target.p, target.q, 1.0f},
                                   params, arms[i], dt);
             const ArmResult& r = out.arm[i];
+            if (contact_override) {
+                if (r.status == ArmStatus::Solved) out.written.set(rig.effector);
+                else pose[rig.effector] = native_effector;
+            }
             for (int k = 0; k < r.writtenCount; ++k) {
                 out.written.set(static_cast<std::size_t>(r.written[static_cast<std::size_t>(k)]));
             }

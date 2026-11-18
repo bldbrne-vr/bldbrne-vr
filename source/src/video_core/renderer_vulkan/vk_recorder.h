@@ -20,6 +20,7 @@
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_push_split.h"
+#include "video_core/renderer_vulkan/vk_stereo_set_codec.h"
 
 #ifdef MemoryBarrier
 #undef MemoryBarrier
@@ -96,6 +97,9 @@ public:
     RecorderProxy(CommandRecorder& recorder, std::source_location site)
         : recorder{recorder}, site{site} {}
     vk::CommandBuffer Raw(std::string_view reason = "raw_api") const;
+    /// Packets are being encoded (not recorded on this thread): VR_COMPACT_SETS decides with it
+    /// before it records anything.
+    bool Encoding() const;
     operator vk::CommandBuffer() const {
         return Raw();
     }
@@ -138,6 +142,15 @@ public:
     void writeDescriptorSet(DescriptorHeap& heap, vk::DescriptorSetLayout set_layout,
                             vk::PipelineBindPoint bind_point, vk::PipelineLayout layout, u32 set,
                             std::span<vk::WriteDescriptorSet> writes) const;
+    // VR_COMPACT_SETS (vk_stereo_set_codec.h): writeDescriptorSet of the writes NativeStereo's
+    // pairing would make from `writes` and `rights`, the replay expanding them. False, having
+    // recorded nothing, when the recorder is off or a write cannot be carried: the caller pairs
+    // and writes as before. `check` (VR_COMPACT_SETS=v): StereoSetCodec::FieldHash of the
+    // pairing's writes, compared by the replay with the expanded ones' (0: no check).
+    bool writeDescriptorSetCompact(DescriptorHeap& heap, vk::DescriptorSetLayout set_layout,
+                                   vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
+                                   u32 set, std::span<const vk::WriteDescriptorSet> writes,
+                                   const StereoSetCodec::Rights& rights, u64 check) const;
     void pipelineBarrier2(const vk::DependencyInfo& info) const;
     void pipelineBarrier(vk::PipelineStageFlags src, vk::PipelineStageFlags dst,
                          vk::DependencyFlags flags,
@@ -170,6 +183,16 @@ private:
 class CommandRecorder {
 public:
     explicit CommandRecorder(vk::CommandBuffer& command, bool allowed);
+    // FAST_CPU_STAGEB_SPLIT: a blob recorder only
+    // collects packets, linearly from position 0, for another recorder's AppendBlob. It never
+    // replays or publishes, and its bind filter and push split are off. A Raw(), a Drain() or a
+    // full blob calls `flush` (the scheduler appends the blob to the ring first; for a Raw() it
+    // returns the ring recorder's raw handle).
+    struct Blob {};
+    // `mode`: 0 append only (the blob is full), 1 append then drain, 2 append then a raw borrow.
+    using BlobFlush = vk::CommandBuffer (*)(void* context, std::string_view reason,
+                                            std::source_location site, u32 mode);
+    CommandRecorder(vk::CommandBuffer& command, Blob, void* flush_context, BlobFlush flush);
     ~CommandRecorder();
     CommandRecorder(const CommandRecorder&) = delete;
     CommandRecorder& operator=(const CommandRecorder&) = delete;
@@ -205,9 +228,27 @@ public:
     }
     void Drain(std::string_view reason,
                std::source_location site = std::source_location::current());
+    bool IsBlob() const noexcept {
+        return blob;
+    }
+    bool BlobEmpty() const noexcept {
+        return write_position == 0;
+    }
+    // FAST_CPU_STAGEB_SPLIT: `from`'s packets (a blob), in order, then `from` is empty. While this
+    // recorder records inline (off, or a raw borrow) they are replayed here at once. Any packet
+    // that may bind, push or end a render pass makes bit 35 and the push split forget what this
+    // recorder tracked. Producer only.
+    /// Returns the control packets it appended (their publish is the caller's).
+    u64 AppendBlob(CommandRecorder& from);
     std::byte* Allocate(RecorderOpcode opcode, u32 bytes);
     void Commit();
     void Abandon(); // drops the reservation of the last Allocate; nothing is published
+    // VR_FRAME_MATCH (diagnostic, vr_frame_match.h): the producer's ring position, and a copy of
+    // the committed bytes between two positions. Producer thread only.
+    u64 WritePosition() const noexcept {
+        return write_position;
+    }
+    void CopyOut(u64 from, u64 to, std::vector<std::byte>& out) const;
 
     // FAST bit 56 (SkipEmptyFinish, vk_scheduler.cpp). Producer: monotonic counts of the encoded
     // Vulkan command packets (control packets excluded) and of the Raw() borrows; while neither
@@ -281,10 +322,17 @@ public:
     void WriteDescriptorSet(DescriptorHeap& heap, vk::DescriptorSetLayout set_layout,
                             vk::PipelineBindPoint bind_point, vk::PipelineLayout layout, u32 set,
                             std::span<vk::WriteDescriptorSet> writes, std::source_location site);
+    // VR_COMPACT_SETS (RecorderProxy::writeDescriptorSetCompact).
+    bool WriteDescriptorSetCompact(DescriptorHeap& heap, vk::DescriptorSetLayout set_layout,
+                                   vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
+                                   u32 set, std::span<const vk::WriteDescriptorSet> writes,
+                                   const StereoSetCodec::Rights& rights, u64 check);
 
 private:
     // FAST_CPU_DRIVER_CALLS: the replay of WriteDescriptorSet's packet.
     void ReplaySetWrite(const std::byte* data);
+    // VR_COMPACT_SETS: the replay of WriteDescriptorSetCompact's packet (the pairs expanded).
+    void ReplaySetWriteCompact(const std::byte* data);
     void ReportSetWrites();
     // FAST_CPU_PUSH_SPLIT_VERIFY, before PushSplit decides: checks the held block's leave-out
     // against the ring, and counts the forgets the shadow block finds needed or spare.
@@ -306,6 +354,11 @@ private:
     void Run();
     void PublishStats();
     static constexpr u32 Capacity = 8 * 1024 * 1024;
+    // FAST_CPU_STAGEB_SPLIT: a blob recorder (constant after construction).
+    bool blob{};
+    void* blob_context{};
+    BlobFlush blob_flush{};
+    u64 blob_appends{}, blob_packets{}, blob_bytes{}, blob_resets{}, blob_inline{};
     // Cache lines by writer, as bbport keeps its pipe's cursors (vk_draw_pipe.h:255-258). The
     // first line is read by the producer and the replay alike and written only while the replay is
     // idle or not yet started (construction, Configure's mode change after its drain, Stop).
@@ -321,6 +374,7 @@ private:
     // Written together by the producer's Publish; read by the replay when it runs dry.
     alignas(64) std::atomic<u64> published{};
     std::atomic<u32> wake_sequence{};
+    std::atomic<bool> replay_waiting{}; // the replay sleeps or is about to (Publish wakes it)
     // Written by the replay once per batch; read by the producer's Allocate and Drain.
     alignas(64) std::atomic<u64> completed{};
     alignas(64) ReplayCensus replay_census{}; // FAST bit 56, replay owner
@@ -328,6 +382,9 @@ private:
     // packet) and, with _VERIFY, the packets compared and those that differed.
     std::vector<vk::WriteDescriptorSet> replay_writes;
     u64 set_write_verified{}, set_write_mismatches{};
+    // VR_COMPACT_SETS: the replay's expansion scratch; packets, checks and mismatches.
+    std::unique_ptr<StereoSetCodec::Expanded> compact_expanded;
+    u64 compact_replayed{}, compact_checked{}, compact_mismatches{}, compact_bad{};
     // Producer only from here: Allocate and Commit write these for every command, on lines the
     // replay neither reads nor spins on.
     // A raw handle may remain in a caller local until submit. Keep intervening

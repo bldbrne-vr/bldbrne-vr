@@ -37,6 +37,28 @@ static_assert(offsetof(PromptVerdict, row) == 0x00 && offsetof(PromptVerdict, ha
               offsetof(PromptVerdict, fallback) == 0x10 && offsetof(PromptVerdict, serial) == 0x18 &&
               sizeof(PromptVerdict) == 0x20);
 
+// The scripted lever (lever_models.h `button`: no ObjActParam row; its map's event script waits on
+// an action button at it) whose prompt the game offered last, for the script-prompt gate
+// (bloodborne_levers.cpp): read and written by generated code at these offsets. The gate keeps
+// the game's prompt and button unless `bound`, asks the host on a new object or button, a prompt
+// change (`serial`) or a due recheck, bumps `seen` each pass the game offers it (the hunter in
+// its zone), and answers its button once for the object in `fire` (a completed hand pull).
+// `seen` and `fire` are shared with the scheduler thread (std::atomic_ref there).
+struct ScriptVerdict {
+    std::uint64_t object{};  // +0x00 the map object (guest address) this verdict is for
+    std::uint32_t button{};  // +0x08 the ActionButtonParam row the condition asks (its +0x28)
+    std::uint16_t recheck{}; // +0x0C passes left before the host classifies again
+    std::uint8_t bound{};    // +0x0E 1: a hand pulls it (prompt and button hidden)
+    std::uint8_t reserved{}; // +0x0F
+    std::uint64_t serial{};  // +0x10 the prompt-change serial this verdict has seen
+    std::uint64_t seen{};    // +0x18 passes the game offered its prompt
+    std::uint64_t fire{};    // +0x20 the object whose button the next pass answers (0: none)
+};
+static_assert(offsetof(ScriptVerdict, object) == 0x00 && offsetof(ScriptVerdict, button) == 0x08 &&
+              offsetof(ScriptVerdict, recheck) == 0x0C && offsetof(ScriptVerdict, bound) == 0x0E &&
+              offsetof(ScriptVerdict, serial) == 0x10 && offsetof(ScriptVerdict, seen) == 0x18 &&
+              offsetof(ScriptVerdict, fire) == 0x20 && sizeof(ScriptVerdict) == 0x28);
+
 // About one second (bound) / half a second (not bound) of selection passes at 90 game frames
 // per second: a lever that comes to rest after an animation gets its rig soon, and a bound one
 // is re-validated so a changed object restores its prompt.

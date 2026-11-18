@@ -72,6 +72,25 @@ inline constexpr std::array<Capsule, 23> Capsules{{
     {27,28,.08f,VialZones::Zone::Lap,"seated left thigh / knee"},
     {29,30,.08f,VialZones::Zone::Lap,"seated right thigh / knee"},
 }};
+// The right hand's empty syringe (core/vr/blood_draw.h): the same stabs into the other arm, the
+// body and the legs; never the head, never the right arm that holds it.
+inline constexpr std::array<Capsule, 15> LeftArmCapsules{{
+    {0,1,.10f,VialZones::Zone::Body,"hips",.16f,.10f},
+    {1,2,.10f,VialZones::Zone::Body,"belly",.15f,.10f},
+    {2,3,.11f,VialZones::Zone::Body,"chest",.17f,.11f},
+    {3,4,.095f,VialZones::Zone::Body,"collar"},
+    {10,11,.055f,VialZones::Zone::UpperArm,"left upper arm",0,0,.03f},
+    {11,19,.045f,VialZones::Zone::Forearm,"left forearm",0,0,.03f},
+    {19,26,.035f,VialZones::Zone::Wrist,"left hand / wrist",0,0,.05f},
+    {12,13,.075f,VialZones::Zone::LeftLeg,"left thigh"},
+    {13,14,.055f,VialZones::Zone::LeftLeg,"left shin"},
+    {16,17,.075f,VialZones::Zone::RightLeg,"right thigh"},
+    {17,18,.055f,VialZones::Zone::RightLeg,"right shin"},
+    {12,16,.10f,VialZones::Zone::Body,"hips"},
+    {3,10,.065f,VialZones::Zone::UpperArm,"left shoulder / clavicle",0,0,.03f},
+    {27,28,.08f,VialZones::Zone::Lap,"seated left thigh / knee"},
+    {29,30,.08f,VialZones::Zone::Lap,"seated right thigh / knee"},
+}};
 inline Vec3 Nearest(Vec3 p, Vec3 a, Vec3 b) {
     const Vec3 d=b-a;
     return a+d*std::clamp(Body::Dot(p-a,d)/std::max(Body::Dot(d,d),1e-9f),0.f,1.f);
@@ -116,6 +135,20 @@ inline TorsoAxes GetTorsoAxes(const Anatomy& body) {
     const Vec3 y=Body::Normalize(Body::Perp(body.p[3]-body.p[1],x),{0,1,0});
     return {x,y,Body::Normalize(Body::Cross(x,y),{0,0,1})};
 }
+// The left hand on the live left controller (the right syringe's target), as AtRightGrip.
+inline void AtLeftGrip(Anatomy& body, Vec3 p, Body::Quat q, std::int64_t now) {
+    if(!body.grip_valid || !Body::IsFinite(p) || !Body::IsFinite(q)) return;
+    body.torso_axes=GetTorsoAxes(body);
+    body.torso_axes_valid=true;
+    const Vec3 old_wrist=body.p[19];
+    const auto rotation=Body::Normalize(q)*Body::Conjugate(Body::Normalize(body.grip_q));
+    for(int i:{19,26}) {
+        body.p[i]=p+Body::Rotate(rotation,body.p[i]-body.grip_p);
+        body.point_ns[i]=now;
+    }
+    body.p[11]=body.p[11]+(body.p[19]-old_wrist)*.5f;
+    body.point_ns[11]=now;
+}
 // Use the adjusted grip published to the body, not the raw controller. Keep the
 // shoulder on the game-pose torso; wrist twist must never rotate chest geometry.
 inline void AtRightGrip(Anatomy& body, Vec3 p, Body::Quat q, std::int64_t now) {
@@ -159,7 +192,10 @@ private:
     std::array<Vec3,Bones.size()+4> p_{},v_{};
     std::array<std::int64_t,Bones.size()+4> ns_{};
 };
-class Gate {
+// The stab gate over one capsule table (Capsules: the left hand's Blood Vial; LeftArmCapsules:
+// the right hand's empty syringe).
+template <const auto& Table>
+class GateFor {
 public:
     void Reset() { const auto until=cooldown_until_; *this={}; cooldown_until_=until; }
     void StartMoved(Vec3) { Reset(); }
@@ -191,8 +227,8 @@ public:
         std::array<bool,VialZones::ZoneCount> outside_zone{};
         outside_zone.fill(true);
         margin_scale=std::clamp(margin_scale,.5f,2.f);
-        for(std::size_t i=0;i<Capsules.size();++i) {
-            const auto& c=Capsules[i];
+        for(std::size_t i=0;i<Table.size();++i) {
+            const auto& c=Table[i];
             if(c.zone==VialZones::Zone::Lap && !s.body.seated) continue;
             const float margin=c.margin*margin_scale;
             // Skin padding and the headset/lap envelope are measured in room metres.
@@ -270,9 +306,11 @@ private:
     bool fired_{}; // one request until the next explicit draw/reset
     std::array<bool,VialZones::ZoneCount> needs_exit_{};
     std::int64_t cooldown_until_{};
-    std::array<std::int64_t,Capsules.size()> outside_{};
-    std::array<Vec3,Capsules.size()> origin_{};
-    std::array<std::int64_t,Capsules.size()> approach_ns_{};
-    std::array<float,Capsules.size()> approach_speed_{};
+    std::array<std::int64_t,Table.size()> outside_{};
+    std::array<Vec3,Table.size()> origin_{};
+    std::array<std::int64_t,Table.size()> approach_ns_{};
+    std::array<float,Table.size()> approach_speed_{};
 };
+using Gate = GateFor<Capsules>;
+using LeftArmGate = GateFor<LeftArmCapsules>;
 } // namespace VR::VialContact

@@ -10,7 +10,9 @@
 
 #include "video_core/fast_render.h"
 
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
@@ -187,7 +189,27 @@ void Run(std::stop_token stop, std::string file) {
                 const u64 old = g_mask.exchange(mask, std::memory_order_relaxed);
                 if (old != mask) {
                     mixed = true;
-                    LOG_INFO(Render_Vulkan, "FAST toggles: {:#x} -> {:#x}", old, mask);
+                    LOG_BENCHMARK_INFO(Render_Vulkan, "FAST toggles: {:#x} -> {:#x}", old, mask);
+                }
+                // The optional second word: the A/B switches (all on when it is absent).
+                u64 ab = ~u64{0};
+                const size_t first = text.find_first_not_of(" \t\r\n");
+                const size_t gap = text.find_first_of(" \t\r\n,", first);
+                if (gap != std::string::npos) {
+                    u64 parsed = 0;
+                    if (ParseMask(text.substr(text.find_first_not_of(" \t\r\n,", gap) ==
+                                                      std::string::npos
+                                                  ? text.size()
+                                                  : text.find_first_not_of(" \t\r\n,", gap)),
+                                  parsed)) {
+                        ab = parsed;
+                    }
+                }
+                const u64 old_ab = g_ab_mask.exchange(ab, std::memory_order_relaxed);
+                if (old_ab != ab) {
+                    mixed = true;
+                    LOG_BENCHMARK_INFO(Render_Vulkan, "FAST ab switches: {:#x} -> {:#x}", old_ab,
+                                       ab);
                 }
             }
         }
@@ -316,13 +338,14 @@ void Run(std::stop_token stop, std::string file) {
         packets_start = packets;
         LOG_INFO(Render_Vulkan,
                  "FAST stats: mask={:#x} mixed={} fps={:.2f} draws/f={:.0f} disp/f={:.0f}{} "
-                 "faults/s={:.0f} elapsed_s={:.3f} window_s={:.3f} gameplay_compiles={}",
+                 "faults/s={:.0f} elapsed_s={:.3f} window_s={:.3f} gameplay_compiles={} ab={:#x}",
                  mask, (mixed || mask != mask_start) ? 1 : 0, frame_count / seconds,
                  frame_count > 0 ? draw_count / frame_count : 0.0,
                  frame_count > 0 ? (dispatches - dispatches_start) / frame_count : 0.0, threads,
                  (faults - faults_start) / seconds,
                  std::chrono::duration<double>(now - reporting_start).count(), seconds,
-                 g_counters.gameplay_compiles.load(std::memory_order_relaxed));
+                 g_counters.gameplay_compiles.load(std::memory_order_relaxed),
+                 g_ab_mask.load(std::memory_order_relaxed));
         ReportRecorderFlushes(frame_count);
         if (CacheStatsEnabled()) {
             const auto take = [](std::atomic<u64>& value) {
@@ -362,6 +385,13 @@ void Start() {
         std::string file;
         if (const char* env = std::getenv("FAST_TOGGLE_FILE")) {
             file = env;
+        }
+        // Without log output or a live toggle file, the reporting thread has no consumer.
+        // Apply the startup mask above even when no background polling is needed.
+        if constexpr (!Common::Log::Enabled) {
+            if (file.empty()) {
+                return;
+            }
         }
         LOG_INFO(Render_Vulkan, "FAST toggles: start mask {:#x}, file '{}'",
                  g_mask.load(std::memory_order_relaxed), file);
@@ -406,6 +436,11 @@ void NoteRecorderSpin(u64 ns, bool on_stage_b) {
 }
 
 void NoteRecorderFlush(std::string_view reason, std::source_location site, bool pending) {
+    // This map only feeds LOG_INFO in ReportRecorderFlushes. Release builds with logging
+    // compiled out need neither the string construction nor the cross-thread statistics lock.
+    if constexpr (!Common::Log::Enabled) {
+        return;
+    }
     std::string key{reason};
     if (reason.starts_with("raw")) {
         std::string_view file{site.file_name()};
@@ -418,7 +453,23 @@ void NoteRecorderFlush(std::string_view reason, std::source_location site, bool 
     count.drains += pending;
 }
 
+unsigned ProcessCpus() {
+    static const unsigned cpus = [] {
+#ifdef _WIN32
+        DWORD_PTR process = 0, system = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) && process != 0)
+            return static_cast<unsigned>(std::popcount(static_cast<u64>(process)));
+#endif
+        return std::max(1u, std::thread::hardware_concurrency());
+    }();
+    return cpus;
+}
+
 void RegisterThread(Role role) {
+    // These handles are only sampled for the statistics log, never for scheduling.
+    if constexpr (!Common::Log::Enabled) {
+        return;
+    }
 #ifdef _WIN32
     HANDLE handle = nullptr;
     if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle,

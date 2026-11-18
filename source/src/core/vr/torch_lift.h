@@ -34,7 +34,10 @@ struct Settings {
     float raised_m{-0.30f};    // the hand this far below the eyes or higher: raised (1 copy)
     float high_m{0.0f};        // ... at or above the eyes: held high (2 copies)
     float hysteresis_m{0.10f}; // a level is left this much below its threshold (for Lift::DropS)
-    int copies{2};             // at most this many added flames
+    // 0 since 2026-11-12 (the user: lifted, "only slightly bump the intensity up ... but increase
+    // its light range a tiny bit"): each copy was a whole extra light of the same reach; the
+    // glow (torch_glow.h) does it now.
+    int copies{0};             // at most this many added flames
     std::int32_t ffx{0};       // the flame's effect id (0: the torch's own, found at runtime)
     std::int32_t dummy{0};     // its dummy (0: the torch's own)
 };

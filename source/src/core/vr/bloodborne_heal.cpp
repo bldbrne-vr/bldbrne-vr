@@ -6,6 +6,7 @@
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
+#include "core/vr/messenger_gift.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -27,6 +28,7 @@
 #include "core/vr/bloodborne_melee.h"
 #include "core/vr/bloodborne_menu.h"
 #include "core/vr/bloodborne_lamps.h"
+#include "core/vr/bloodborne_respec.h"
 #include "core/vr/bloodborne_motion.h"
 #include "core/vr/bloodborne_pose.h"
 #include "core/vr/bloodborne_quickitems.h"
@@ -517,6 +519,7 @@ void HitSignalUpdate(s32 before, s32 max_before, s32 hp, s32 max_hp,
 void HealSignalUpdate(const u8* player) {
     const u8* const module = DataModule(player);
     if (module == nullptr) {
+        VR::MessengerGift::Publish(false, 0);
         return;
     }
     auto& h = g_signal;
@@ -534,12 +537,18 @@ void HealSignalUpdate(const u8* player) {
     bool item_anim = false;
     bool vial_effect = false;
     bool warp_effect = false;
+    bool messenger = false;
     ForEachEffect(player, [&](u8* node, u8*) {
         const s32 id = Read<s32>(node + OffsetNodeId);
         item_anim = item_anim || id == ItemAnimEffectId;
         vial_effect = vial_effect || id == VialEffectId;
         warp_effect = warp_effect || id == 2101; // native lamp travel / rest
+        messenger = messenger || id == VR::MessengerGift::DisguiseEffect;
     });
+    const auto now = std::chrono::steady_clock::now();
+    VR::MessengerGift::Publish(messenger && hp > 0,
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now.time_since_epoch()).count());
     const bool died = h.hp > 0 && hp == 0 && max_hp > 0;
     if (died || (warp_effect && !h.warp_effect)) {
         VR::RequestTransitionTextureCleanup();
@@ -550,7 +559,6 @@ void HealSignalUpdate(const u8* player) {
     const s32 use_state = Read<s32>(player + OffsetItemUseState);
     const s32 goods = Read<s32>(player + OffsetItemAnimGoods);
     const bool context = use_state != 0 || item_anim || vial_effect;
-    const auto now = std::chrono::steady_clock::now();
     if (context) {
         h.item_seen = true;
         h.item_at = now;
@@ -745,10 +753,12 @@ void OnMainPlayerUpdate(u8* player) {
     IframesSiteA(player);     // the dodge i-frame log's view of the game (VR_IFRAMES_LOG only)
     MenuUpdate(player);       // in-game menu state for the presenter
     LampsSiteA(player);       // lamp requests: native game calls on the player update thread
+    RespecSiteA(player);      // the Doll's respec: its menu closed, a crash's Blood Echoes back
     EnemyBarsUpdate();        // the enemy HP bars switch's log (ui_enemy_hp_bars)
     TestHurt(player);         // VR_HEAL_TEST_HURT only
     HealSignalUpdate(player); // the heal vignette's item heals
     VitalsSiteA(g_base, player); // HP, rally, stamina, bullets for the wrist gauge (hud_vitals)
+    BloodBulletsSiteA(g_base, player); // the empty syringe's stab: the game's blood bullets
     StatusSiteA(player);         // build-ups drain a little faster (status_drain_pct)
     // The Blood Vials carried (vial_inject_drain: a vial armed with none left is an empty one,
     // bloodborne_held.cpp): one inventory lookup per update, as the game's own HUD count. Read
@@ -818,7 +828,8 @@ void InstallPlayerHook(VAddr base, u64 size) {
         LOG_INFO(Core, "VR heal: inject=0, instant Blood Vial injection not installed");
     }
     if (!settings.cinematic) {
-        LOG_INFO(Core, "VR cine: cinematic=0, scripted animations stay in VR");
+        LOG_INFO(Core, "VR cine: cinematic=0, scripted animations stay in VR{}",
+                 settings.cinematic_lamps ? " (lamps' rest, travel and arrivals stay flat)" : "");
     }
     // Motion signals also time the ladder coat fade when the dodge comfort camera is off.
     // Keep sampling when the cutaway is hidden: its in-game switch can enable it live.
@@ -876,7 +887,9 @@ void InstallPlayerHook(VAddr base, u64 size) {
     if (!main_ok) {
         dump("IsMainPlayer", IsMainPlayerRva, IsMainPlayerSig.size());
     }
-    const bool cinematic_ok = settings.cinematic && InitCinematic(base, size, site_ok, main_ok);
+    // With cinematic=0 too while cinematic_lamps holds the lamps' scenes flat.
+    const bool cinematic_ok = (settings.cinematic || settings.cinematic_lamps) &&
+                              InitCinematic(base, size, site_ok, main_ok);
     const bool motion_ok = motion && InitMotion(base, size, site_ok, main_ok);
     const bool menu_ok = menu && hook_ok;
     if (!hook_ok) {
@@ -935,6 +948,10 @@ void InstallPlayerHook(VAddr base, u64 size) {
 
 bool IsHealInstalled() {
     return g_heal;
+}
+
+bool ItemUseForbidden(const u8* player) {
+    return player != nullptr && HasStateInfo(player, StateInfoNoVial);
 }
 
 bool IsPlayerHookInstalled() {

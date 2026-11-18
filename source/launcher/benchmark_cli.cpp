@@ -39,6 +39,7 @@ int wmain(int argc, wchar_t **argv) {
                                  item.at("dlss_model"),
                                  item.at("quality_rank")};
                 }
+                candidate.upscale_focus = item.value("upscale_focus", 0);
                 std::vector<Benchmark::Sample> samples;
                 unsigned repeat = 0;
                 for (const auto &original : item.at("repeats")) {
@@ -66,7 +67,7 @@ int wmain(int argc, wchar_t **argv) {
         }
     }
     if (argc < 5) {
-        std::cerr << "runtime game fixture output [candidate-id|--cases=a,b] [--size=WxH] [cancel] "
+        std::cerr << "runtime game fixture output [candidate-id|--cases=a,b] [--size=WxH] [--target-hz=N] [cancel] "
                      "OR --analyze report-folder\n";
         return 2;
     }
@@ -95,6 +96,12 @@ int wmain(int argc, wchar_t **argv) {
                 q.display_hz = std::stoul(value, &consumed);
                 if (consumed != value.size() || q.display_hz < 30 || q.display_hz > 360)
                     throw std::runtime_error("Invalid display cadence.");
+            } else if (option.starts_with("--target-hz=")) {
+                const auto value=option.substr(12);
+                size_t consumed{};
+                q.target_hz=std::stoi(value,&consumed);
+                if(consumed!=value.size() || !ValidGameRefreshHz(q.target_hz))
+                    throw std::runtime_error("Invalid target refresh rate.");
             } else if (option.starts_with("--size=")) {
                 std::istringstream input(option.substr(7));
                 unsigned w{}, h{};

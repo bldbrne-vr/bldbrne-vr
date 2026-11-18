@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "common/types.h"
+#include "core/vr/headset_panels.h"
 
 namespace Vulkan::VrEyeScale {
 
@@ -54,67 +55,16 @@ inline Size Scaled(Size in, float scale) {
 }
 
 // A headset's panel: its pixels per eye and its model, from the runtime's system name
-// (xrGetSystemProperties::systemName, e.g. "Meta Quest 3" or "Oculus Quest2"). The name is read
-// as words split at anything but letters and digits and between letters and digits ("Quest3S" =
-// quest 3 s), case ignored. size {0, 0}: not a headset we know (eye_size=panel then follows the
+// (core/vr/headset_panels.h). size {0, 0}: not a headset we know (eye_size=panel then follows the
 // runtime's recommended size).
 struct Panel {
     Size size{};
     std::string_view model{};
 };
 
-inline std::vector<std::string> NameWords(std::string_view name) {
-    std::vector<std::string> words;
-    std::string word;
-    int kind = 0; // 1 letter, 2 digit
-    for (const char ch : name) {
-        const unsigned char u = static_cast<unsigned char>(ch);
-        const int k = (u >= '0' && u <= '9') ? 2 : ((u | 0x20) >= 'a' && (u | 0x20) <= 'z') ? 1 : 0;
-        if (k == 0 || (k != kind && !word.empty())) {
-            if (!word.empty()) {
-                words.push_back(word);
-                word.clear();
-            }
-        }
-        if (k != 0) {
-            word += static_cast<char>(k == 1 ? (u | 0x20) : u);
-        }
-        kind = k;
-    }
-    if (!word.empty()) {
-        words.push_back(word);
-    }
-    return words;
-}
-
 inline Panel KnownPanel(std::string_view system_name) {
-    const std::vector<std::string> w = NameWords(system_name);
-    const auto next = [&w](size_t i, size_t n) -> std::string_view {
-        return i + n < w.size() ? std::string_view{w[i + n]} : std::string_view{};
-    };
-    for (size_t i = 0; i < w.size(); ++i) {
-        if (w[i] == "quest") {
-            const std::string_view a = next(i, 1);
-            if (a == "3") {
-                return next(i, 2) == "s" ? Panel{{1832, 1920}, "Quest 3S"}
-                                         : Panel{{2064, 2208}, "Quest 3"};
-            }
-            if (a == "2") {
-                return {{1832, 1920}, "Quest 2"};
-            }
-            if (a == "pro") {
-                return {{1800, 1920}, "Quest Pro"};
-            }
-            if (a.empty() || a == "1") {
-                return {{1440, 1600}, "Quest"};
-            }
-            return {}; // a later Quest: not known yet
-        }
-        if (w[i] == "rift") {
-            return next(i, 1) == "s" ? Panel{{1280, 1440}, "Rift S"} : Panel{{1080, 1200}, "Rift"};
-        }
-    }
-    return {};
+    const ::VR::Headsets::Headset* h = ::VR::Headsets::FromSystemName(system_name);
+    return h ? Panel{{h->width, h->height}, h->model} : Panel{};
 }
 
 // What capped the factor (for the log).

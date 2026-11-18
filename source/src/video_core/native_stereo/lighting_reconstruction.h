@@ -11,13 +11,14 @@
 #include <span>
 
 namespace NativeProjection {
-enum class LightingLayout { None, Light, Occlusion, Cascades, Decal };
+enum class LightingLayout { None, Light, Occlusion, Cascades, Decal, Reflection };
 inline const char* Name(LightingLayout layout) {
     switch (layout) {
     case LightingLayout::Light: return "light208";
     case LightingLayout::Occlusion: return "ssao272";
     case LightingLayout::Cascades: return "cascades336";
     case LightingLayout::Decal: return "decal416";
+    case LightingLayout::Reflection: return "ssr320";
     default: return "unrecognized";
     }
 }
@@ -50,10 +51,24 @@ inline bool AffineView(const float* f) {
     return ViewRotation(f) && std::abs(f[12])<1e-5f && std::abs(f[13])<1e-5f &&
         std::abs(f[14])<1e-5f && std::abs(f[15]-1)<1e-5f;
 }
+// The game's screen-space reflections (FS 0x6c2323c2, core/vr/game_reflections.h), ssr320: inverse
+// P at 0..15 (ndc x, y, raw depth -> view), P at 16..31 (view -> clip, its w row 0 0 1 0), the
+// view rotation for the G-buffer's normals at 32..47, the reprojection at 48..63 (this frame's
+// ndc x, y, raw depth, 1 -> the last frame's clip, for the colour the ray finds), then the trace's
+// parameters (64 facing, 68..69 depth, 72..75 the half-size target, 76..79 thickness, reach).
+// Only that program's 320-byte buffers are looked at (2026-11-11: other programs' buffers of that
+// size are many; capturing and testing each per draw cost CPU for nothing).
+inline constexpr std::uint64_t ReflectionProgram = 0x6c2323c2;
+inline bool ReflectionLayout(std::span<const float> f) {
+    return f.size()==80 && InversePerspective(f.data()) && Finite(f.data()+16,64) &&
+        f[16]>0 && f[21]>0 && f[28]==0 && f[29]==0 && f[30]==1 && f[31]==0 &&
+        AffineView(f.data()+32) && f[72]>100 && f[73]>100;
+}
 inline LightingLayout RecognizeLighting(std::span<const float> f) {
     if (f.size()==104 && InversePerspective(f.data()+16) &&
         Finite(f.data(),16) && AffineView(f.data()+32) && Viewport(f.data()+48))
         return LightingLayout::Decal;
+    if (ReflectionLayout(f)) return LightingLayout::Reflection;
     if (f.size()!=52 && f.size()!=68 && f.size()!=84) return LightingLayout::None;
     if (!InversePerspective(f.data())) return LightingLayout::None;
     if (f.size()==52 && ViewRotation(f.data()+16) && Viewport(f.data()+28) &&
@@ -164,6 +179,13 @@ inline void RemapLighting(float* values, const float* source, LightingLayout lay
     } else if (layout==LightingLayout::Cascades) {
         for (unsigned block=16;block<80;block+=16)
             EyeReconstruction(values+block,source,eye,transform);
+    } else if (layout==LightingLayout::Reflection) {
+        // All in the eye's own view (its depth, its normals): P and the reprojection follow its
+        // frustum, x' = sx x + ox w on both sides (the eye's shift within a frame's head move is
+        // well under a millimetre of the reprojection, left out).
+        Forward(values+16,transform);
+        Forward(values+48,transform);
+        Inverse(values+48,transform);
     } else return;
     Inverse(values,transform);
 }
@@ -198,6 +220,12 @@ inline int ScreenPointDword(std::uint64_t hash) {
     return hash==0xd506a1 ? 28 : hash==0xe55e45eb ? 68 : -1;
 }
 inline bool ScreenPointShader(std::uint64_t hash) { return ScreenPointDword(hash) >= 0; }
+// The light glow's god rays drawn by VS 0x637500e0's quad with FS 0xe55e45eb: its blur into a
+// small target of its own and its composite over the scene (Rasterizer::VrGlowDepthCut tells them
+// apart by the target).
+inline bool GlowRaysComposite(std::uint64_t vs, std::uint64_t fs) {
+    return ScreenQuadUvParam(vs) == 0 && fs == 0xe55e45eb;
+}
 // A point on the flat game's screen (UV: u right, v down; a direction, the light at infinity: no
 // eye shift) where one eye sees it: NDC x' = sx x + ox, y' = sy y + oy.
 inline std::array<float,2> RemapScreenPoint(float u, float v, const Transform& t) {

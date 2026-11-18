@@ -6,6 +6,10 @@
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
+#include "core/vr/messenger_gift.h"
+#include "core/vr/blacksky_eye.h"
+#include "core/vr/blood_draw_channel.h"
+#include "core/vr/bloodborne_evasion.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -23,12 +27,15 @@
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "core/vr/bloodborne_assets.h"
+#include "core/vr/bloodborne_deflect.h"
 #include "core/vr/body_channel.h"
 #include "core/vr/body_frame.h"
+#include "core/vr/feature_cost.h"
 #include "core/vr/bloodborne_gun.h"
 #include "core/vr/bloodborne_held.h"
 #include "core/vr/bloodborne_heal.h"
 #include "core/vr/bloodborne_melee.h"
+#include "core/vr/dual_blades.h"
 #include "core/vr/bloodborne_quickitems.h"
 #include "core/vr/bloodborne_whip.h"
 #include "core/vr/hook_util.h"
@@ -36,14 +43,28 @@
 #include "core/vr/inframe.h"
 #include "core/vr/live_tune.h"
 #include "core/vr/grip_preview.h"
+#include "core/vr/hand_lantern.h"
 #include "core/vr/quick_channel.h"
 #include "core/vr/music_box.h"
 #include "core/vr/quick_items.h"
+#include "core/vr/beast_roar.h"
+#include "core/vr/call_beyond.h"
+#include "core/vr/call_beyond_sky.h"
+#include "core/vr/executioner_glove.h"
+#include "core/vr/old_hunter_bone.h"
+#include "core/vr/augur.h"
+#include "core/vr/deferred_tool.h"
+#include "core/vr/augur_creature.h"
+#include "core/vr/game_sounds.h"
+#include "core/vr/item_audio.h"
+#include "core/vr/vitals_channel.h"
 #include "core/vr/grip_lab_pose.h"
 #include "core/vr/item_attachment.h"
 #include "core/vr/quick_settings.h"
 #include "core/vr/player_body.h"
 #include "core/vr/seqlock.h"
+#include "core/vr/tonitrus_charge.h"
+#include "core/vr/weapon_wall.h"
 #include "core/vr/vial_drain.h"
 #include "core/vr/vial_liquid.h"
 #include "core/vr/vial_needle.h"
@@ -162,6 +183,7 @@ constexpr u16 FlagNoGoodsConsume = 0x200;
 // PlayerGameData: EquipGameData at +0x1D0, its quick-item ring at +0x3D0 (= egd + 0x200).
 constexpr u32 OffsetEgd = 0x1D0;
 constexpr u32 OffsetChestArmor = 0xD4 + 4 * 9;
+constexpr u32 OffsetArmArmor = 0xD4 + 4 * 10;
 constexpr u32 OffsetQuickRing = 0x3D0;
 constexpr u32 OffsetRingEgd = 0x10;      // ring -> egd (sanity)
 constexpr u32 OffsetRingSelected = 0x48; // ring: selected inventory index (-1 none)
@@ -187,6 +209,7 @@ constexpr u32 RowVariation = 0x04;
 constexpr u32 RowIcon = 0x2C;
 constexpr u32 RowUseAnim = 0x3E;
 constexpr u32 RowConsumeByte = 0x44; // bit 7: isConsume
+constexpr u32 RowBulletCost = 0x60;  // u8: the bullets a use takes (Blood Bullets first)
 // Projectile P.
 constexpr u32 OffsetPQuat = 0x30;
 constexpr u32 OffsetPVel = 0x40;
@@ -271,6 +294,8 @@ constexpr s32 PalmDummy = 3;         // L_Hand, the palm (FFX 173's dummy)
 // L_Weapon's dummy: the centre of the hunter's fist, which the left arm's IK puts on your
 // controller's grip (the arc's hover point; the palm is 3.1 cm toward the wrist and the palm).
 constexpr s32 GripDummy = 340;
+// R_Weapon's dummy: the centre of the right fist (the weapon's grip): the empty syringe's seat.
+constexpr s32 RightGripDummy = 300;
 
 struct GoodsRowOut {
     s32 id{-1};
@@ -335,7 +360,8 @@ std::unique_ptr<Xbyak::CodeGenerator> g_code;
 int g_log = 0;          // VR_QUICK_LOG: 1 = STATE every 10 s, 2 = every 2 s and more
 bool g_dry_run = false; // VR_QUICK_DRYRUN: every gate, no store and no UseGoods
 bool g_markers = false; // VR_QUICK_MARKERS: axes at the palm dummy and the arc's pivot (in-frame)
-std::string g_autotest; // VR_QUICK_AUTOTEST=select:<k>|use:<k>|throw:<k>[,...]
+int g_solid_shapes = 0; // VR_SOLID_SHAPES: 1 both, 2 weapon-clash shapes (=new), 3 walls (=old)
+std::string g_autotest; // VR_QUICK_AUTOTEST=select:<k>|use:<k>|throw:<k>|tool:<k>[:<dmy>][,...]
 std::string g_test_give; // VR_QUICK_TEST_GIVE=<goods>:<count>[,...] (isolated test saves only)
 AddItemFn g_add_item = nullptr;
 
@@ -355,6 +381,7 @@ struct GoodsInfo {
     s32 ffx{-1};
     s32 ref{-1}; // refId_default (a paper's buff SpEffect)
     s32 use_anim{-1}; // goodsUseAnim (quick_use_sounds: Q::UseSoundsOf)
+    s32 cost{0};      // the Quicksilver Bullets a use takes (the Augur 1, A Call Beyond 7, ...)
     bool consume{true};
 };
 std::array<GoodsInfo, 32> g_goods_cache{};
@@ -395,10 +422,20 @@ void LogUseTable() {
         const std::string gesture = gk == Q::GestureKind::Crush && qs.use_crush   ? "+crush"
                                     : gk == Q::GestureKind::Shake && qs.use_shake ? "+shake"
                                                                                   : "";
+        // quick_tool_gestures / quick_tool_keep: a hunter tool's act, and whether it stays.
+        const Q::ToolGesture tg = qs.tool_gestures ? Q::ToolGestureOf(goods) : Q::ToolGesture::None;
+        const std::string tool =
+            (tg != Q::ToolGesture::None ? std::string{"+"} + Q::ToolGestureName(tg) : "") +
+            (qs.tool_keep && Q::ToolKeepOf(goods) && !Q::CannedOf(goods) ? "+stays" : "") +
+            (qs.tool_direct && Q::ToolUseOf(goods).clip >= 0
+                 ? fmt::format("+direct(dmy {})", Q::ToolUseOf(goods).dmy)
+                 : std::string{});
         if (goods == 1000) {
             continue; // the Blood Vial: the belt / X, never the ring
         }
-        if (Q::MouthOf(goods) != Q::MouthKind::None) {
+        if (goods == VR::ShamanBlade::Goods) {
+            stab += tag + "+enemy-contact";
+        } else if (Q::MouthOf(goods) != Q::MouthKind::None) {
             mouth += tag;
         } else if (Q::WipeOf(goods) && qs.use_wipe) {
             wipe += tag;
@@ -411,20 +448,25 @@ void LogUseTable() {
         } else if (hk == Q::HoldKind::Rite) {
             rite += tag + gesture + (Q::CannedOf(goods) ? "+flat" : "");
         } else if (goods == Q::ChoirBell && qs.hold_use && qs.use_shake && qs.shake_choir_bell) {
-            rite += tag + gesture;
+            rite += tag + gesture + tool;
         } else {
-            pull += tag;
+            pull += tag + tool;
         }
     }
-    LOG_INFO(Core,
-             "VR quick: use table (quick_hold_use={}, {:.2f} s; quick_use_mouth={}; "
-             "quick_use_wipe={}; quick_use_crush={} shake={} (choir bell {}) stab={}): hold "
-             "(consume, the game's use at once):{} | hold (rite, the game's own act):{} | mouth:{} "
-             "| wipe:{} | stab:{} | throw:{} | vial: 1000 | at the pull:{} | params disagreeing:{}",
-             qs.hold_use ? 1 : 0, qs.hold_use_s, qs.use_mouth ? 1 : 0, qs.use_wipe ? 1 : 0,
-             qs.use_crush ? 1 : 0, qs.use_shake ? 1 : 0, qs.shake_choir_bell ? 1 : 0,
-             qs.use_stab ? 1 : 0, hold, rite, mouth, wipe.empty() ? " none" : wipe,
-             stab.empty() ? " none" : stab, thrown, pull, odd.empty() ? " none" : odd);
+    LOG_INFO(
+        Core,
+        "VR quick: use table (quick_hold_use={}, {:.2f} s; quick_use_mouth={}; "
+        "quick_use_wipe={}; quick_use_crush={} shake={} (choir bell {}) stab={}; quick_tap_pick={} "
+        "({:.0f} ms) tool_keep={} tool_gestures={} tool_direct={}): hold "
+        "(consume, the game's use at once):{} | hold (rite, the game's own act):{} | mouth:{} "
+        "| wipe:{} | stab:{} | throw:{} | vial: 1000 | {}:{} | params disagreeing:{}",
+        qs.hold_use ? 1 : 0, qs.hold_use_s, qs.use_mouth ? 1 : 0, qs.use_wipe ? 1 : 0,
+        qs.use_crush ? 1 : 0, qs.use_shake ? 1 : 0, qs.shake_choir_bell ? 1 : 0,
+        qs.use_stab ? 1 : 0, qs.tap_pick ? 1 : 0, qs.tap_use_ms, qs.tool_keep ? 1 : 0,
+        qs.tool_gestures ? 1 : 0, qs.tool_direct ? 1 : 0, hold, rite, mouth,
+        wipe.empty() ? " none" : wipe, stab.empty() ? " none" : stab, thrown,
+        qs.tap_pick ? "picked, then the trigger" : "at the pull", pull,
+        odd.empty() ? " none" : odd);
 }
 
 GoodsInfo LookupGoods(s32 goods) {
@@ -451,6 +493,7 @@ GoodsInfo LookupGoods(s32 goods) {
         info.consume = (Read<u8>(out.row + RowConsumeByte) & 0x80) != 0;
         info.ref = Read<s32>(out.row + RowRefId);
         info.use_anim = use_anim;
+        info.cost = Read<u8>(out.row + RowBulletCost);
         // quick_use_wipe's table (Q::WipeOf, by goods id) against the goods' own use clip (anim
         // 1: the blade wipe), logged when either says so.
         if (Q::WipeOf(goods) || Q::WipeOfAnim(use_anim)) {
@@ -673,6 +716,34 @@ struct HeldPlace {
     float carried_m{0.0f}; // inframe_hand_sync: how far the hand sync carried it (metres)
 };
 SeqLock<HeldPlace> g_held_place;
+struct MonocularLens {
+    s64 ns{0};
+    u32 space_serial{0};
+    std::array<float, 3> tracking{};
+};
+SeqLock<MonocularLens> g_monocular_lens;
+// The held item's drawn centre (any goods, tracking space): the Blacksky Eye's distance to your
+// eyes (HeldItemPoint), as the Monocular's eyepiece.
+struct HeldPoint {
+    s64 ns{0};
+    u32 space_serial{0};
+    s32 goods{-1};
+    std::array<float, 3> tracking{};
+};
+SeqLock<HeldPoint> g_held_point;
+struct BladeSample {
+    s64 ns{}, session{};
+    u32 space{};
+    VR::Body::Vec3 a{}, b{};
+};
+BladeSample g_blade_sample{}; // render hook only; no retained guest pointers
+VR::ShamanBlade::Contact g_blade_last_contact{}; // render hook only; one contact per stroke
+u32 g_blade_logged_stroke{0}; // render hook only: the stroke whose outcome is logged next
+bool g_blade_touched{false};
+struct BladeCast { s64 ns{}; u32 owner{}; };
+SeqLock<BladeCast> g_blade_cast;
+std::atomic<s64> g_blade_launch_ns{};
+
 std::atomic<u32> g_armed_serial{0};
 std::atomic<u32> g_consumed_serial{0};
 std::atomic<u32> g_launches{0};
@@ -711,6 +782,32 @@ struct UseCue {
     s32 use_anim{-1};
 };
 SeqLock<UseCue> g_use_cue;
+SeqLock<VR::BeastRoar::Use> g_beast_roar_use;
+SeqLock<VR::CallBeyond::Answer> g_call_beyond_answer;
+VR::CallBeyond::GrayFade g_call_beyond_gray; // the held one's gray world (render tick only)
+VR::CallBeyond::Sky::Fade g_call_beyond_sky; // same render-thread ownership; no game pointers
+SeqLock<VR::OldHunterBone::Use> g_old_bone_use;
+SeqLock<VR::MessengerGift::Use> g_messenger_use;
+SeqLock<VR::Augur::Use> g_augur_use;
+// The squeezed Augur (ToolAimBy::Hand): the splash first, the tentacles AugurBurstDelayNs later
+// (the tester's 2026-11-03 "fire the tentacles a tiny bit after it gets splashed/squeeze"). Act
+// answers the use at once (the crush, the spray, the crunch: the reply's cues);
+// DeferredCastTick makes the game's UseGoods at its time. Site A's thread only.
+struct DeferredCast {
+    Q::Request r{};
+    s32 dmy{-1};
+    VR::DeferredTool::Ticket ticket{};
+};
+DeferredCast g_deferred_cast;
+constexpr s64 AugurBurstDelayNs = VR::DeferredTool::DelayNs;
+struct RelicUse {
+    s64 ns{},held_since{};
+    s32 goods{-1};
+    bool used{};
+    std::array<float, 3> shot_ray{};
+};
+SeqLock<RelicUse> g_relic_use;
+u32 g_beast_roar_count = 0; // SiteA is the single successful-use producer.
 std::atomic<u32> g_use_cue_serial{0};
 // The render tick's: the cue being played (its sounds go out at their offsets).
 struct UsePlaying {
@@ -726,14 +823,18 @@ struct UsePlaying {
 };
 UsePlaying g_use_playing{};
 
-void QueueUseCue(s32 goods, s32 use_anim) {
+void QueueUseCue(s32 goods, s32 use_anim, s64 stamp = 0) {
+    // Augur's added crunch is published only by its confirmed direct-use reply.
+    if (goods == VR::Augur::Goods && stamp <= 0)
+        return;
     // (quick_music_box_crank: the music box's tune is its own cue, core/vr/music_box.h TuneCue.)
     const s32 count = use_anim == VR::MusicBox::TuneCue ? VR::MusicBox::Tune().count
                                                         : Q::UseSoundsForGoods(goods, use_anim).count;
     if (count == 0) {
         return;
     }
-    g_use_cue.Store({g_use_cue_serial.load(std::memory_order_relaxed) + 1, Q::NowNs(), goods,
+    g_use_cue.Store({g_use_cue_serial.load(std::memory_order_relaxed) + 1,
+                     stamp > 0 ? stamp : Q::NowNs(), goods,
                      use_anim});
     g_use_cue_serial.fetch_add(1, std::memory_order_release);
 }
@@ -907,7 +1008,30 @@ float g_burst_radius_to = -1.0f;
 // Molotov this long after its launch.
 s64 g_burst_test_ms = 0;
 
+// molotov_fire_scale: the impact children (the burst and fire where they land or hit) of the
+// hunter's Molotovs, as their rows name them (plain, rope and delayed differ); -1 unused.
+std::array<std::atomic<s32>, 4> g_fire_children{-1, -1, -1, -1};
+// ... and the children of those (a lingering fire), widened only within FireChainNs of one of them
+// (other uses of the same bullet by the hunter stay as they are).
+std::array<std::atomic<s32>, 4> g_fire_chain{-1, -1, -1, -1};
+std::atomic<s64> g_fire_ns{0};
+constexpr s64 FireChainNs = 2000 * Ms;
+u32 g_fire_logs = 0;
+
 void RegisterMolotov(u8* p, s32 bullet, s64 now) {
+    const u8* const row = Read<u8*>(p + OffsetPMode2 + OffsetModeRow);
+    if (const s32 child = Plausible(row, 4) ? Read<s32>(row + RowHitBullet) : -1; child > 0) {
+        bool known = false;
+        for (const auto& c : g_fire_children) {
+            known = known || c.load(std::memory_order_relaxed) == child;
+        }
+        for (auto& c : g_fire_children) {
+            s32 empty = -1;
+            if (known || c.compare_exchange_strong(empty, child, std::memory_order_relaxed)) {
+                break;
+            }
+        }
+    }
     std::scoped_lock lock{g_flying_mutex};
     g_flying[g_flying_next++ % g_flying.size()] = {p, Read<u32>(p + OffsetPHandle), bullet, now,
                                                    Read3(p + OffsetPPos)};
@@ -1073,6 +1197,70 @@ void WidenBurst(u8* p, s32 bullet) {
     g_burst_radius_to = Read<float>(copy + RowHitRadius);
 }
 
+// molotov_fire_scale (the launch hook): the impact child of a Molotov of the hunter's gets a private
+// copy of its BulletParam row with its hit radius (and a growing one's maximum) that many times its
+// own. Only for the bullets RegisterMolotov saw as a Molotov's child, launched by the hunter.
+bool IsFireChild(s32 bullet) {
+    for (const auto& c : g_fire_children) {
+        if (c.load(std::memory_order_relaxed) == bullet) {
+            return true;
+        }
+    }
+    if (NowNs() - g_fire_ns.load(std::memory_order_relaxed) > FireChainNs) {
+        return false;
+    }
+    for (const auto& c : g_fire_chain) {
+        if (c.load(std::memory_order_relaxed) == bullet) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void WidenFire(u8* p, s32 bullet) {
+    const float scale = Q::GetQuickSettings().molotov_fire_scale;
+    const s32 mode = Read<s32>(p + OffsetPMode);
+    if (!(scale > 1.001f) || mode < 1 || mode > 3) {
+        return;
+    }
+    u8* const object = p + OffsetPModes[static_cast<size_t>(mode - 1)];
+    u8* const row = Read<u8*>(object + OffsetModeRow);
+    if (!Plausible(row, 4) || Read<s32>(object + OffsetModeId) != bullet ||
+        !(Read<float>(row + RowHitRadius) > 0.0f)) {
+        return;
+    }
+    u8* const copy = g_rows[g_row_next.fetch_add(1) % g_rows.size()].data();
+    std::memcpy(copy, row, BulletRowSize);
+    for (const u32 offset : {RowHitRadius, RowHitRadiusMax}) {
+        const float radius = Read<float>(row + offset);
+        if (radius > 0.0f) {
+            const float wider = radius * scale;
+            std::memcpy(copy + offset, &wider, sizeof(wider));
+        }
+    }
+    std::memcpy(object + OffsetModeRow, &copy, sizeof(copy));
+    // Its own impact child, if any (a lingering fire left by the burst), is the Molotov's too,
+    // for FireChainNs from now.
+    g_fire_ns.store(NowNs(), std::memory_order_relaxed);
+    if (const s32 next = Read<s32>(row + RowHitBullet); next > 0 && next != bullet) {
+        bool known = false;
+        for (const auto& c : g_fire_chain) {
+            known = known || c.load(std::memory_order_relaxed) == next;
+        }
+        for (auto& c : g_fire_chain) {
+            s32 empty = -1;
+            if (known || c.compare_exchange_strong(empty, next, std::memory_order_relaxed)) {
+                break;
+            }
+        }
+    }
+    if (g_fire_logs < 8) {
+        ++g_fire_logs;
+        LOG_INFO(Core, "VR quick: Molotov fire bullet {} (mode {}): hit radius {:.2f} -> {:.2f} m",
+                 bullet, mode, Read<float>(row + RowHitRadius), Read<float>(copy + RowHitRadius));
+    }
+}
+
 // VR_THROW_TRACE: follow projectile `p` (its impact child from `row`).
 void StartTrace(u8* p, const u8* row, s32 bullet, s32 goods, bool vanilla, s64 now) {
     Trace t{};
@@ -1097,8 +1285,42 @@ void StartTrace(u8* p, const u8* row, s32 bullet, s32 goods, bool vanilla, s64 n
              t.v0[0], t.v0[1], t.v0[2], std::hypot(t.v0[0], t.v0[1], t.v0[2]), t.impact);
 }
 
+// The native stab's 80 cm sphere compensates for its canned animation. A physical
+// blade already confirmed contact; keep its native effect, with a small contact volume.
+// One immutable row lives for the process, so no projectile can outlive/reuse its storage.
+void NarrowBladeContact(u8* p) {
+    if (!p || Read<s32>(p+OffsetPBullet)!=310) return;
+    BladeCast cast{};
+    const s64 now=NowNs();
+    if (!g_blade_cast.Load(cast) || cast.ns<=0 || now<cast.ns ||
+        now-cast.ns>VR::ShamanBlade::MaxAgeNs || Read<u32>(p+OffsetPOwner)!=cast.owner) return;
+    const s32 mode=Read<s32>(p+OffsetPMode);
+    if (mode<1 || mode>3) return;
+    u8* const object=p+OffsetPModes[static_cast<size_t>(mode-1)];
+    const u8* const row=Read<u8*>(object+OffsetModeRow);
+    if (!Plausible(row,4) || Read<s32>(object+OffsetModeId)!=310) return;
+    s64 taken=g_blade_launch_ns.load(std::memory_order_relaxed);
+    if (taken>=cast.ns || !g_blade_launch_ns.compare_exchange_strong(taken,cast.ns)) return;
+    alignas(16) static const std::array<u8,BulletRowSize> narrow=[row] {
+        std::array<u8,BulletRowSize> copy{};
+        std::memcpy(copy.data(),row,copy.size());
+        const float radius=.04f;
+        std::memcpy(copy.data()+RowHitRadius,&radius,sizeof(radius));
+        std::memcpy(copy.data()+RowHitRadiusMax,&radius,sizeof(radius));
+        return copy;
+    }();
+    const u8* const copy=narrow.data();
+    std::memcpy(object+OffsetModeRow,&copy,sizeof(copy));
+    LOG_INFO(Core,"VR Shaman: native bullet 310 at confirmed blade contact (4 cm radius)");
+}
+
 void PS4_SYSV_ABI LaunchHook(u8* p, u8* /*saved_ymm*/) {
+    NarrowBladeContact(p);
     GunLaunchTail(p); // VR_GUN_LOG: the gun shot's readback (core/vr/bloodborne_gun.h)
+    DeflectLaunch(p); // melee_deflect: an enemy's bullet (core/vr/bloodborne_deflect.h)
+    if (!g_ready) {
+        return; // installed for melee_deflect alone (quick items off or not installed)
+    }
     if (g_end_flight != nullptr && p != nullptr && IsMolotov(Read<s32>(p + OffsetPBullet)) &&
         Read<s32>(p + OffsetPMode) == 2 &&
         Read<u32>(p + OffsetPOwner) == g_player_handle.load(std::memory_order_relaxed)) {
@@ -1107,6 +1329,9 @@ void PS4_SYSV_ABI LaunchHook(u8* p, u8* /*saved_ymm*/) {
     if (const s32 burst = g_burst_spawning.load(std::memory_order_relaxed);
         burst >= 0 && p != nullptr && Read<s32>(p + OffsetPBullet) == burst) {
         WidenBurst(p, burst); // molotov_burst_radius_m
+    } else if (p != nullptr && IsFireChild(Read<s32>(p + OffsetPBullet)) &&
+               Read<u32>(p + OffsetPOwner) == g_player_handle.load(std::memory_order_relaxed)) {
+        WidenFire(p, Read<s32>(p + OffsetPBullet)); // molotov_fire_scale
     }
     const u32 armed_serial = g_armed_serial.load(std::memory_order_acquire);
     const bool ours_pending = armed_serial != g_consumed_serial.load(std::memory_order_relaxed);
@@ -1133,6 +1358,9 @@ void PS4_SYSV_ABI LaunchHook(u8* p, u8* /*saved_ymm*/) {
             } else if (IsFlyingThrowable(bullet) && Read<s32>(p + OffsetPMode) == 2) {
                 u8* const row = Read<u8*>(p + OffsetPMode2 + OffsetModeRow);
                 StartTrace(p, Plausible(row, 4) ? row : nullptr, bullet, -1, true, now);
+            } else if (bullet == 350) {
+                // An Executioner's Gloves spirit (tests): where it starts and how long it lives.
+                StartTrace(p, nullptr, bullet, VR::HunterRelics::Gloves, true, now);
             }
         }
         return;
@@ -1395,6 +1623,56 @@ void PlayWhoosh(s64 now) {
     }
 }
 
+// The Shaman Bone Blade swung (the render tick, Game:Main; the tester's 2026-11-04 "when we swing the
+// shaman blade can we have a swing sound play? be careful as we don't want random sounds leaking
+// in again"): its own use clip's whoosh (a00 100370's c750 at 1.10 s: sude0-2, a bare-handed
+// swing, one layer, no voice; always type 1, never the table's flip), once per stroke the
+// controller armed (ShamanBlade::Stroke: 6 cm of a deliberate stroke, the blade in the hand, the
+// arm yours), at the blade, at most every BladeSwingGapNs. A stroke seen in that gap is spent
+// silently: nothing plays late.
+constexpr s32 BladeSwingSound = 750;
+constexpr s64 BladeSwingGapNs = 300 * Ms;
+struct BladeSwing {
+    s64 session{0};
+    u32 stroke{0};
+    s64 ns{0};
+    bool ended{true}; // a stroke ended since (its serial restarts after a recenter)
+};
+BladeSwing g_blade_swing{}; // the render tick's
+void PlayBladeSwing(s64 now, const float* cam, const Q::Scene* frame) {
+    auto& s = g_blade_swing;
+    if (frame == nullptr || frame->held_goods != VR::ShamanBlade::Goods || frame->blade_stroke == 0) {
+        s.ended = true;
+        return;
+    }
+    const Q::Scene& scene = *frame;
+    if (g_play_sound == nullptr || !Q::GetQuickSettings().use_sounds ||
+        scene.held_session_ns <= 0 || scene.blade_active_ns <= 0 || now < scene.blade_active_ns ||
+        now - scene.blade_active_ns > VR::ShamanBlade::MaxAgeNs) {
+        return;
+    }
+    if (!s.ended && s.session == scene.held_session_ns && s.stroke == scene.blade_stroke) {
+        return; // this stroke's whoosh went out (or was spent in the gap)
+    }
+    s.session = scene.held_session_ns;
+    s.stroke = scene.blade_stroke;
+    s.ended = false;
+    if (s.ns > 0 && now >= s.ns && now - s.ns < BladeSwingGapNs) {
+        return;
+    }
+    s.ns = now;
+    HeldPlace held{};
+    const bool at_hand = g_held_place.Load(held) && held.goods == VR::ShamanBlade::Goods &&
+                         now >= held.ns && now - held.ns < 300 * Ms;
+    alignas(16) std::array<float, 4> pos{at_hand ? held.centre[0] : cam[0],
+                                         at_hand ? held.centre[1] : cam[1],
+                                         at_hand ? held.centre[2] : cam[2], 1.0f};
+    u64 handle = 0;
+    g_play_sound(&handle, pos.data(), 1, BladeSwingSound);
+    LOG_INFO(Core, "VR quick: Bone Blade swing c{} (type 1), stroke #{}, at the {} h={:#x}",
+             BladeSwingSound, scene.blade_stroke, at_hand ? "blade" : "camera", handle);
+}
+
 // quick_use_sounds (the render tick, Game:Main): the queued use's sounds (SoundType 1), each at
 // its offset after the first, where the held item was drawn in the last 300 ms (its model's
 // centre) or else at the game camera `cam`; a cue queued more than 300 ms ago is dropped (a
@@ -1406,7 +1684,7 @@ void PlayUseSounds(s64 now, const float* cam) {
         if (g_use_cue.Load(c) && c.serial != p.taken) {
             p.taken = c.serial;
             if (now - c.ns <= 300 * Ms) {
-                p.ns = now;
+                p.ns = c.goods == VR::Augur::Goods ? c.ns : now;
                 p.use_ns = c.ns;
                 p.goods = c.goods;
                 p.use_anim = c.use_anim;
@@ -1426,18 +1704,59 @@ void PlayUseSounds(s64 now, const float* cam) {
     }
     while (p.next < p.sounds.count &&
            now - p.ns >= static_cast<s64>(p.sounds.sound[p.next].after_ms) * Ms) {
-        const Q::UseSound sound = p.sounds.sound[p.next++];
+        Q::UseSound sound = p.sounds.sound[p.next++];
+        if (p.goods == VR::Augur::Goods) {
+            Q::Scene scene{};
+            VR::Augur::Use use{};
+            g_augur_use.Load(use);
+            // A put-away item, replaced take or resumed stall cannot produce a late crunch. (The
+            // eaten one's gulp may come after it is gone from the hand: only the use and the
+            // stall are checked for it.)
+            const bool in_hand = !(sound.type == Q::OwnSoundType && sound.id == Q::OwnGulp);
+            if (use.ns != p.use_ns ||
+                now - p.use_ns > (sound.after_ms + 150) * Ms ||
+                !Q::GetQuickSettings().use_sounds ||
+                (in_hand && (!Q::LatestScene(scene) || scene.held_goods != VR::Augur::Goods ||
+                             scene.held_session_ns <= 0 ||
+                             scene.held_session_ns != use.held_since)))
+                continue;
+            HeldPlace held{};
+            if (g_held_place.Load(held) && held.goods == p.goods && now >= held.ns &&
+                now - held.ns < 300 * Ms) {
+                p.position = held.centre;
+                p.at_hand = true;
+            }
+        }
+        if (sound.type == Q::OwnSoundType) {
+            if (sound.id == Q::OwnGulp && VR::GameSounds::Gulp().empty()) {
+                // No gulp cut (not decoded yet, or a dump without it): the game's own swallow,
+                // as before 2026-11-04 (the 2026-11-04 review).
+                sound = {Q::SwallowSound, sound.after_ms, 1};
+            } else {
+                // Ours (core/vr/item_audio.h): the short splash, the gulp; centred, no position.
+                VR::ItemAudio::Play(static_cast<VR::ItemAudio::Clip>(sound.id), now);
+                LOG_INFO(Core,
+                         "VR quick: use sound ours {} for goods {} (anim {}) {:.0f} ms after the use",
+                         sound.id == Q::OwnSplash ? "splash" : "gulp", p.goods, p.use_anim,
+                         static_cast<float>(now - p.use_ns) * 1e-6f);
+                continue;
+            }
+        }
         if (g_play_sound == nullptr) {
             continue;
         }
         alignas(16) std::array<float, 4> pos{p.position[0], p.position[1], p.position[2], 1.0f};
         u64 handle = 0;
-        const s32 type = g_sound_table != nullptr && Read<u8>(g_sound_table + 3) != 0 ? 0xA : 1;
+        // SoundType 1 as event 128 maps it; another (quick_tool_direct: the DLC tools' 's'
+        // sounds, 5) as the TAE names it.
+        const s32 type = sound.type != 1                                                ? sound.type
+                         : g_sound_table != nullptr && Read<u8>(g_sound_table + 3) != 0 ? 0xA
+                                                                                        : 1;
         g_play_sound(&handle, pos.data(), type, sound.id);
         LOG_INFO(Core,
-                 "VR quick: use sound c{} (type {}) for goods {} (anim {}, clip {}, {}) at the {} "
+                 "VR quick: use sound {}{} (type {}) for goods {} (anim {}, clip {}, {}) at the {} "
                  "({:.3f},{:.3f},{:.3f}) {:.0f} ms after the use, h={:#x}",
-                 sound.id, type, p.goods, p.use_anim, p.sounds.clip,
+                 sound.type == 5 ? 's' : 'c', sound.id, type, p.goods, p.use_anim, p.sounds.clip,
                  p.sounds.own ? "its own" : "the closest", p.at_hand ? "hand" : "camera", pos[0],
                  pos[1], pos[2], static_cast<float>(now - p.use_ns) * 1e-6f, handle);
     }
@@ -1583,6 +1902,12 @@ struct SiteState {
     s32 wipe_ref{-1};
     s32 wipe_goods{-1};
     s64 wipe_ns{0};
+    // quick_tool_direct: a tool used directly; the Quicksilver and Blood Bullets before it (the
+    // log of what it cost, ToolSpendTick: the game spends the Blood Bullets first).
+    s32 tool_goods{-1};
+    s32 tool_qs{-1};
+    s32 tool_blood{-1};
+    s64 tool_ns{0};
 };
 SiteState g_site{};
 
@@ -1649,6 +1974,48 @@ const char* UiGate() {
 
 void Answer(const Q::Request& r, Q::Outcome outcome, const char* reason, s32 before = 0,
             s32 after = 0) {
+    if((r.goods==VR::HunterRelics::Tonitrus || r.goods==VR::HunterRelics::Gloves ||
+        r.goods==VR::BlackskyEye::Goods) && r.tool && r.action==Q::Action::Use) {
+        Q::Scene scene{};const s64 stamp=NowNs();
+        if(Q::LatestScene(scene) && scene.held_goods==r.goods) {
+            const auto valid=VR::MessengerGift::Confirm(stamp,r.steady_ms,scene.held_session_ns);
+            if(valid.ns)g_relic_use.Store({stamp,scene.held_session_ns,r.goods,outcome==Q::Outcome::Used,
+                                          r.tool_direction});
+        }
+    }
+    if (r.goods==VR::MessengerGift::Goods && r.tool!=0 && r.action==Q::Action::Use &&
+        outcome==Q::Outcome::Used) {
+        Q::Scene scene{};
+        if(Q::LatestScene(scene) && scene.held_goods==VR::MessengerGift::Goods)
+            g_messenger_use.Store(VR::MessengerGift::Confirm(NowNs(),r.steady_ms,scene.held_session_ns));
+    }
+    if (r.goods == VR::Augur::Goods && r.tool != 0 && r.action == Q::Action::Use &&
+        outcome == Q::Outcome::Used) {
+        const s64 stamp = NowNs();
+        Q::Scene scene{};
+        if (Q::LatestScene(scene) && scene.held_goods == VR::Augur::Goods) {
+            const auto use = VR::Augur::Confirm(stamp, r.steady_ms, scene.held_session_ns,
+                r.mouth == static_cast<u8>(Q::MouthKind::Eat));
+            g_augur_use.Store(use);
+            // Same clock origin as the fist closure; eaten (anim 0): the crunch, then a swallow.
+            // (Its splash and gulp are ours: no need of the game's PlaySound to queue them.)
+            if (use.ns != 0 && Q::GetQuickSettings().use_sounds)
+                QueueUseCue(r.goods, use.eaten ? 0 : 21, stamp);
+        }
+    }
+    if (r.goods == VR::OldHunterBone::Goods && r.action == Q::Action::Use &&
+        outcome == Q::Outcome::Used)
+        g_old_bone_use.Store({NowNs()});
+    if (r.goods == VR::CallBeyond::Goods && r.action == Q::Action::Use &&
+        outcome != Q::Outcome::None && outcome != Q::Outcome::Selected) {
+        g_call_beyond_answer.Store({NowNs(), r.serial, outcome == Q::Outcome::Used});
+    }
+    if (r.goods == VR::BeastRoar::Goods && outcome == Q::Outcome::Used) {
+        ++g_beast_roar_count;
+        if (!g_beast_roar_count)
+            g_beast_roar_count = 1;
+        g_beast_roar_use.Store({NowNs(), g_beast_roar_count});
+    }
     Q::Result result{};
     result.serial = r.serial;
     result.outcome = outcome;
@@ -1719,39 +2086,141 @@ s32 QtyOf(const Pointers& p, s32 goods, s32 slot_hint) {
     return 0;
 }
 
+// The Hand Lantern carried (core/vr/hand_lantern.h; LanternTick, Act): lit, the hunter has
+// SpEffect 2010 (the lit lantern at the hip); in the hand the light follows the hand.
+VR::HandLantern::Carry g_lantern{};
+VR::HandLantern::Owed g_lantern_owe{}; // a change owed to the game's lantern (LanternTick)
+std::atomic<bool> g_lantern_light{false};
+// The game's lantern model on the palm stays hidden while it is lit in the hand and a second
+// after (its effect fading out): set once per update here, one atomic read per draw in the
+// renderer (LanternModelHidden). Site A's thread only, but for the flag.
+s64 g_lantern_lit_ns = 0;
+std::atomic<bool> g_lantern_hide{false};
+// When the light in the hand last went out (steady ns; LanternJustPutOut).
+std::atomic<s64> g_lantern_out_ns{0};
+
+void PublishLanternLight() {
+    const bool lit = g_lantern.Light();
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    if (g_lantern_light.exchange(lit, std::memory_order_relaxed) && !lit) {
+        g_lantern_out_ns.store(now, std::memory_order_relaxed);
+    }
+    if (lit) {
+        g_lantern_lit_ns = now;
+    }
+    g_lantern_hide.store(lit || (g_lantern_lit_ns != 0 && now - g_lantern_lit_ns < 1'000'000'000LL),
+                         std::memory_order_relaxed);
+}
+
+// The game's lantern lit or put out, without the item's animation: lit by the item's own UseGoods
+// (it adds 2010; it never takes it away: the mock, 2026-10-30), put out by SpEffect 2011 (0.5 s,
+// 2010's own category: it replaces it and runs out) through the player's AddSpEffect (vt+0x3F0,
+// 0x18C6DB0, as core/vr/bloodborne_pose.cpp; checked before the call), local only.
+constexpr u64 AddSpEffectRva = 0x18C6DB0;
+constexpr u32 OffsetVtableAddSpEffect = 0x3F0;
+constexpr std::array<u8, 16> AddSpEffectHead = {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56,
+                                                0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xEC};
+using AddSpEffectFn = u8(PS4_SYSV_ABI*)(void* chr, s32 id, void* source, u32 a3, u32 local_only,
+                                       s32 a5, float f0, float f1, float f2, float f3, float f4,
+                                       s32 stack0);
+
+bool LanternSet(u8* player, bool lit) {
+    if (lit) {
+        return g_use_goods != nullptr && g_use_goods(player, VR::HandLantern::Goods, -1) != 0;
+    }
+    u8* const vtable = Read<u8*>(player);
+    u8* const add = Plausible(vtable) ? Read<u8*>(vtable + OffsetVtableAddSpEffect) : nullptr;
+    if (add == nullptr || add != g_base + AddSpEffectRva ||
+        std::memcmp(add, AddSpEffectHead.data(), AddSpEffectHead.size()) != 0) {
+        return false;
+    }
+    return reinterpret_cast<AddSpEffectFn>(add)(player, VR::HandLantern::OffEffect, player, 0, 1,
+                                               0, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0) != 0;
+}
+
+// Shared by immediate uses and the delayed Augur: a passed gate is valid only this update.
+const char* UseBlocked(u8* player, const Pointers& p) {
+    if (const char* ui = UiGate(); ui != nullptr) return ui;
+    const u8* const module = DataModule(player);
+    if (module == nullptr || Read<s32>(module + OffsetHp) <= 0) return "dead";
+    if (Read<s32>(player + OffsetItemUseState) != 0) return "a menu item is being used";
+    if (HasEffect(player, ItemAnimEffect)) return "an item animation is playing";
+    if (MenuMulti()) return "an inventory multi-use is pending";
+    if (Read<s32>(p.egd + OffsetOverride) >= 0) return "an inventory item is pending";
+    return nullptr;
+}
+
 // Use or throw `r.goods` now (the gates of quickitems_design.md 5.1).
 void Act(u8* player, const Pointers& p, const Q::Request& r) {
+    if (r.goods == VR::Cigarette::Goods)
+        return Answer(r, Q::Outcome::Denied, "cigarettes are cosmetic: bring to mouth");
     const Q::GoodsClass cls = Q::Classify(r.goods);
     const bool throwing = r.action == Q::Action::Throw;
-    if (const char* ui = UiGate(); ui != nullptr) {
-        return Answer(r, Q::Outcome::Denied, ui);
-    }
+    if (const char* why = UseBlocked(player, p); why != nullptr)
+        return Answer(r, Q::Outcome::Denied, why);
     const u8* const module = DataModule(player);
-    if (module == nullptr || Read<s32>(module + OffsetHp) <= 0) {
-        return Answer(r, Q::Outcome::Denied, "dead");
-    }
-    if (Read<s32>(player + OffsetItemUseState) != 0) {
-        return Answer(r, Q::Outcome::Denied, "a menu item is being used");
-    }
-    if (HasEffect(player, ItemAnimEffect)) {
-        return Answer(r, Q::Outcome::Denied, "an item animation is playing");
-    }
-    if (MenuMulti()) {
-        return Answer(r, Q::Outcome::Denied, "an inventory multi-use is pending");
-    }
-    if (Read<s32>(p.egd + OffsetOverride) >= 0) {
-        return Answer(r, Q::Outcome::Denied, "an inventory item is pending");
-    }
     // quick_music_box_crank: the Tiny Music Box played by its crank (core/vr/music_box.h) is
     // used through UseGoods like an instant item (its clip, a00 100170, is skipped: no animation).
     const bool crank = r.crank != 0 && !throwing && r.goods == VR::MusicBox::Goods;
-    if (!crank && (throwing ? cls.use != Q::UseKind::Throw
-                            : (cls.use != Q::UseKind::Instant && cls.use != Q::UseKind::Bullet))) {
+    // quick_tool_direct: a hunter tool used by its act, with no animation: UseGoods with its
+    // clip's event 65 dummy (Q::ToolUseOf), as the clip would call it.
+    const bool tool = r.tool != 0 && !throwing && Q::ToolUseOf(r.goods).clip >= 0;
+    const bool blade = !throwing && r.goods == VR::ShamanBlade::Goods && r.blade_contact.ns > 0;
+    if (r.goods == VR::ShamanBlade::Goods) {
+        Q::Scene scene{};
+        VR::ShamanBlade::Contact latest{};
+        VR::Body::BodyStatus body{};
+        VR::Body::HandsSample hands{};
+        VR::Body::Anchor anchor{};
+        const s64 now=NowNs();
+        if (!blade || !g_launch_hook || !Q::LatestScene(scene) || scene.held_goods != r.goods ||
+            scene.held_slot != r.slot || !Q::LatestBladeContact(latest) ||
+            latest.session != r.blade_contact.session || latest.stroke != r.blade_contact.stroke ||
+            latest.target != r.blade_contact.target || latest.space != r.blade_contact.space ||
+            latest.ns < r.blade_contact.ns || !VR::Body::LatestHands(hands) ||
+            !VR::ShamanBlade::Fresh(r.blade_contact,now,scene.held_session_ns,
+                                    r.blade_contact.stroke,hands.space_serial) ||
+            !VR::Body::LatestAnchor(anchor) || !anchor.valid ||
+            now < anchor.steady_ns || now-anchor.steady_ns > VR::ShamanBlade::MaxAgeNs ||
+            !VR::Body::LatestBodyStatus(body) || !body.driven || !body.items_ok ||
+            !(body.arm_weight[0]>=.9f) || now<body.steady_ns ||
+            now-body.steady_ns>VR::ShamanBlade::MaxAgeNs)
+            return Answer(r,Q::Outcome::Denied,"blade contact expired or item window closed");
+        if (!ItemBladeContactStillValid(r.blade_contact.target,r.blade_contact.blade_base,
+                                       r.blade_contact.point,anchor.world_scale))
+            return Answer(r,Q::Outcome::Denied,"target left the blade");
+    }
+
+    if (!crank && !tool && !blade &&
+        (throwing ? cls.use != Q::UseKind::Throw
+                  : (cls.use != Q::UseKind::Instant && cls.use != Q::UseKind::Bullet))) {
         return Answer(r, Q::Outcome::Denied, "not that kind of item");
     }
     const s32 before = QtyOf(p, r.goods, r.slot);
     if (before <= 0) {
         return Answer(r, Q::Outcome::Denied, "none left");
+    }
+    if (r.goods == VR::HandLantern::Goods && !throwing) {
+        if (g_lantern.active) {
+            // Carried: the trigger or a shake flips the light in the hand. The hip's lantern is
+            // out meanwhile and is set as carried when it goes back (LanternTick).
+            g_lantern.Flip();
+            PublishLanternLight();
+            LOG_INFO(Core, "VR lantern: {} in the hand", g_lantern.lit ? "lit" : "put out");
+        } else {
+            // Used straight from the arc: the game's lantern toggled, both ways, no animation.
+            const bool lit = !HasEffect(player, VR::HandLantern::LitEffect);
+            const bool ran = LanternSet(player, lit);
+            LOG_INFO(Core, "VR lantern: the hip's lantern {} ({})", lit ? "lit" : "put out",
+                     ran ? "ran" : "REFUSED");
+            if (!ran) {
+                return Answer(r, Q::Outcome::Denied, "the lantern did not change", before, before);
+            }
+        }
+        ++g_site.uses;
+        return Answer(r, Q::Outcome::Used, "", before, before);
     }
     if (!CanUse(player, r.goods)) {
         return Answer(r, Q::Outcome::Denied, "the game says no (CanUseGoods)", before, before);
@@ -1774,6 +2243,8 @@ void Act(u8* player, const Pointers& p, const Q::Request& r) {
         return Answer(r, Q::Outcome::Denied, "dry run", before, before);
     }
     const GoodsInfo info = LookupGoods(r.goods);
+    if (blade && (info.ref != 310 || info.use_anim != 25))
+        return Answer(r,Q::Outcome::Denied,"native blade parameters differ",before,before);
     if (!throwing) {
         PgdDiffArm(p.pgd, r.goods); // VR_QUICK_PGD_DIFF (tests)
     }
@@ -1854,13 +2325,38 @@ void Act(u8* player, const Pointers& p, const Q::Request& r) {
     // (The music box: its clip's event 65 dummy, 17, where its bullet 400 starts.)
     const s32 dmy = throwing ? PalmDummy
                     : crank  ? (r.dmy >= 0 ? r.dmy : 17)
-                    : (cls.use == Q::UseKind::Bullet ? cls.dmy : -1);
+                    : blade  ? PalmDummy
+                    : tool   ? (r.dmy >= 0 ? r.dmy : Q::ToolUseOf(r.goods).dmy)
+                             : (cls.use == Q::UseKind::Bullet ? cls.dmy : -1);
     const auto start = std::chrono::steady_clock::now();
     // Items that are never used up (the Infinite Items cheat, the game's no-consume debug flag,
     // a non-consumed goods): the count cannot tell whether the use went out.
     const bool frozen = InfiniteItems() || !info.consume ||
                         (Read<u16>(module + OffsetDebugFlags) & FlagNoGoodsConsume) != 0;
+    if (tool && r.goods == VR::Augur::Goods && r.mouth == 0 &&
+        r.aim == static_cast<u8>(Q::ToolAimBy::Hand)) {
+        // The squeezed Augur: the splash first, the tentacles a beat later (DeferredCast). Its
+        // gates passed above; the reply (the crush, the spray, the crunch) goes now.
+        g_deferred_cast = {r, dmy, {NowNs(), reinterpret_cast<std::uintptr_t>(player),
+                                          Read<u32>(player + OffsetHandle)}};
+        LOG_INFO(Core, "VR quick: TOOL goods {}: squeezed, its UseGoods (dmy {}) in {} ms",
+                 r.goods, dmy, AugurBurstDelayNs / Ms);
+        ++g_site.uses;
+        return Answer(r, Q::Outcome::Used, "", before, before);
+    }
+    if (tool) {
+        // tool_aim: its first launch is aimed (during the call, or after): where you look for
+        // the Blacksky Eye held to your eye.
+        if(!NoteDirectTool(r.goods,r.aim,r.tool_direction,r.tool_origin))
+            return Answer(r,Q::Outcome::Denied,"tool launch placement unavailable",before,before);
+    }
+    if (blade && !NoteDirectTool(r.goods,static_cast<u8>(Q::ToolAimBy::BladeContact),{},
+            {r.blade_contact.point.x,r.blade_contact.point.y,r.blade_contact.point.z}))
+        return Answer(r,Q::Outcome::Denied,"blade contact placement unavailable",before,before);
+    if (blade) g_blade_cast.Store({NowNs(),Read<u32>(player+OffsetHandle)});
     const bool ran = g_use_goods(player, r.goods, dmy) != 0;
+    if (blade && !ran) { CancelDirectTool(); g_blade_cast.Store({}); }
+    if(tool && !ran)CancelDirectTool();
     s32 after = QtyOf(p, r.goods, r.slot);
     s32 used_dmy = dmy;
     const bool launched =
@@ -1880,6 +2376,34 @@ void Act(u8* player, const Pointers& p, const Q::Request& r) {
     }
     LOG_INFO(Core, "VR quick: UseGoods({}, dmy {}) count {} -> {} ({} us){}", r.goods, used_dmy,
              before, after, micros, frozen && after == before ? " (not consumed: no-consume)" : "");
+    if (tool) {
+        // Never consumed: UseGoods ran is the use. Its clip's own sounds (the whistle, ...) play
+        // whatever quick_use_sounds says (the clip that would have played them was skipped),
+        // unless we played it already (the whistle's call while it was blown: r.voiced); the
+        // Quicksilver Bullets it costs are looked at from now (ToolSpendTick: the log).
+        if (g_play_sound != nullptr && r.voiced == 0 && r.goods != VR::Augur::Goods) {
+            QueueUseCue(r.goods, info.use_anim);
+        }
+        // The clip's effect that is the use itself (Beast Roar's roar: ToolUse::ffx).
+        if (const Q::ToolUse u = Q::ToolUseOf(r.goods); u.ffx >= 0) {
+            const bool spawned = SpawnClipEffect(player, u.ffx, u.ffx_dmy);
+            LOG_INFO(Core, "VR quick: TOOL goods {}: its clip's effect {} at dummy {} {}", r.goods,
+                     u.ffx, u.ffx_dmy, spawned ? "spawned" : "NOT spawned (no effect call)");
+        }
+        VR::Vitals::Status vitals{};
+        g_site.tool_goods = r.goods;
+        const bool have_vitals = VR::Vitals::LatestStatus(vitals);
+        g_site.tool_qs = have_vitals ? vitals.qs_bullets : -1;
+        g_site.tool_blood = have_vitals ? vitals.blood_bullets : -1;
+        g_site.tool_ns = NowNs();
+        LOG_INFO(Core,
+                 "VR quick: TOOL used directly: UseGoods({}, dmy {}) ran, no animation (use "
+                 "anim {}, clip {}), Quicksilver Bullets {} + Blood Bullets {}{}",
+                 r.goods, used_dmy, info.use_anim, Q::ToolUseOf(r.goods).clip, g_site.tool_qs,
+                 g_site.tool_blood, r.voiced != 0 ? " (its sound: ours, already played)" : "");
+        ++g_site.uses;
+        return Answer(r, Q::Outcome::Used, "", before, after);
+    }
     if (crank) {
         // Never consumed: UseGoods ran is the play. Its tune (the clip's c100171, c100170) plays
         // whatever quick_use_sounds says: the tune is what the crank is for.
@@ -1899,7 +2423,7 @@ void Act(u8* player, const Pointers& p, const Q::Request& r) {
         // quick_use_sounds: the use clip's own sound (the clip was skipped); 0: only a drink at
         // the mouth (quick_mouth_sound), as before.
         const auto& qs = Q::GetQuickSettings();
-        if (!throwing && g_play_sound != nullptr) {
+        if (!throwing) { // (a gulp is ours: PlayUseSounds skips the game's without PlaySound)
             if (qs.use_sounds) {
                 QueueUseCue(r.goods, info.use_anim);
             } else if (r.mouth == static_cast<u8>(Q::MouthKind::Drink) && qs.mouth_sound) {
@@ -1921,6 +2445,10 @@ void Act(u8* player, const Pointers& p, const Q::Request& r) {
     }
     if (armed != 0) {
         g_consumed_serial.store(armed, std::memory_order_release); // no launch to wait for
+    }
+    if (blade) {
+        CancelDirectTool();
+        return Answer(r,Q::Outcome::Denied,"blade was not consumed",before,after);
     }
     Answer(r, Q::Outcome::Latched, "nothing was consumed: the game's own use from now on", before,
            after);
@@ -1947,7 +2475,7 @@ void Handle(u8* player, const Pointers& p, const Q::Request& r, bool may_use) {
         return Answer(r, Q::Outcome::Selected, "");
     }
     if (!may_use) {
-        return Answer(r, Q::Outcome::Denied, "the vial was injected this update");
+        return Answer(r, Q::Outcome::Denied, "another item reserved this update");
     }
     Act(player, p, r);
 }
@@ -1975,9 +2503,19 @@ void Publish(u8* player, const Pointers* p) {
                 const GoodsInfo info = LookupGoods(slot.goods);
                 slot.icon = info.icon;
                 slot.ffx = info.ffx;
+                slot.cost = info.cost;
                 if (recheck || g_site.usable_goods[static_cast<size_t>(k)] != slot.goods) {
                     g_site.usable_goods[static_cast<size_t>(k)] = slot.goods;
-                    g_site.usable[static_cast<size_t>(k)] = CanUse(player, slot.goods);
+                    // Cosmetic mouth interaction has no native UseGoods animation/reference.
+                    // Keep the normal alive/menu/tracking gates; recognize only our data row.
+                    // (Its icon: 343 from the runtime build, 9000 from the old patch scripts; the
+                    // check wanted 9000 alone and the packet would not leave the slot, the headset
+                    // run 10, 2026-11-04.)
+                    g_site.usable[static_cast<size_t>(k)] = slot.goods == VR::Cigarette::Goods
+                        ? (info.icon == VR::Cigarette::Icon ||
+                           info.icon == VR::Cigarette::LegacyIcon) && info.ref == -1 &&
+                          info.cost == 0 && !info.consume
+                        : CanUse(player, slot.goods);
                 }
                 slot.usable = g_site.usable[static_cast<size_t>(k)];
                 if (slot.qty > 0 && slot.inv_idx == selected && s.selected < 0) {
@@ -1988,6 +2526,14 @@ void Publish(u8* player, const Pointers* p) {
         const u8* const module = DataModule(player);
         s.alive = module == nullptr || Read<s32>(module + OffsetHp) > 0;
         s.busy = Read<s32>(player + OffsetItemUseState) != 0;
+        // What a hunter tool's cost is paid from (Q::ShortOfBullets): the Blood Bullets, taken
+        // first, and the Quicksilver Bullets; only from a fresh, whole read of the vitals (an old
+        // one never refuses a tool: unknown).
+        if (VR::Vitals::Status vitals{};
+            VR::Vitals::LatestStatus(vitals) && vitals.ok && vitals.qs_bullets >= 0 &&
+            std::abs(s.steady_ns - vitals.steady_ns) < 1'000'000'000) {
+            s.bullets = vitals.qs_bullets + std::max(vitals.blood_bullets, 0);
+        }
     }
     Q::PublishSnapshot(s);
     const s64 now = s.steady_ns;
@@ -2085,17 +2631,17 @@ void Publish(u8* player, const Pointers* p) {
                                  a.usable ? "" : "(no)", k == s.selected ? "*" : "");
         }
         LOG_INFO(Core,
-                 "VR quick: STATE {} [{}] override {} busy {} | selects {} uses {} throws {} "
-                 "denies {} launches {}",
-                 s.valid ? "ok" : "no data", slots, s.override_idx, s.busy ? 1 : 0,
+                 "VR quick: STATE {} [{}] override {} busy {} bullets {} | selects {} uses {} "
+                 "throws {} denies {} launches {}",
+                 s.valid ? "ok" : "no data", slots, s.override_idx, s.busy ? 1 : 0, s.bullets,
                  g_site.selects, g_site.uses, g_site.throws, g_site.denies,
                  g_launches.load(std::memory_order_relaxed));
     }
     g_site.last = s;
 }
 
-// VR_QUICK_AUTOTEST=select:<k>|use:<k>|throw:<k>[,...]: one step every 3 s from 3 s after the
-// first valid snapshot (no controller needed). Throws go forward and up at 7 m/s (LOCAL).
+// VR_QUICK_AUTOTEST=select:<k>|use:<k>|throw:<k>|tool:<k>[:<dmy>][,...]: one step every 3 s from
+// 3 s after the first valid snapshot (no controller needed). Throws go forward and up at 7 m/s (LOCAL).
 bool AutotestRequest(const Q::Snapshot& s, Q::Request& r) {
     auto& st = g_site;
     if (g_autotest.empty() || !s.valid || st.first_valid_ns == 0) {
@@ -2134,6 +2680,19 @@ bool AutotestRequest(const Q::Snapshot& s, Q::Request& r) {
     } else if (verb == "throw") {
         r.action = Q::Action::Throw;
         r.v_world = {0.0f, 3.5f, -6.0f}; // LOCAL: forward (-Z) and up
+    } else if (verb == "tool") {
+        // tool:<k>[:<dmy>]: a hunter tool used directly (quick_tool_direct's UseGoods), at its
+        // clip's dummy or the one given.
+        r.action = Q::Action::Use;
+        r.tool = 1;
+        if (const auto second = step.find(':', colon + 1); second != std::string::npos) {
+            r.dmy = static_cast<s8>(std::atoi(step.c_str() + second + 1));
+        }
+        // The Blacksky Eye as held to your eye (its clip's dummy), or pointed as a gun (another
+        // dummy given: the hand's 17, the controller's own choice).
+        if (r.goods == 2120 && (r.dmy < 0 || r.dmy == Q::ToolUseOf(r.goods).dmy)) {
+            r.aim = static_cast<u8>(Q::ToolAimBy::Gaze);
+        }
     } else {
         LOG_WARNING(Core, "VR quick: AUTOTEST unknown step '{}'", step);
         return false;
@@ -2207,8 +2766,11 @@ struct RenderState {
     std::array<float, Q::SlotCount> lift{}; // eased hover lift per layout index
     s64 last_ns{0};
     bool placed_logged{false};
+    bool fan{false}; // the layout is a fan's (quick_arc_pick=fan: PlaceFan, Scene::fan_*) ...
+    Q::FanDirections fan_dirs{}; // ... with its cards' directions (their segments of the fan)
 };
 RenderState g_render{};
+VR::MessengerGift::ReleasePose g_messenger_release{}; // same camera-hook owner as g_render
 
 // An item: `centre` (view), the axes (view, unit), sizes in metres (times the world scale).
 F::Item MakeItem(F::MeshId mesh, Q::V3 centre, Q::V3 x, Q::V3 y, Q::V3 z, float sx, float sy,
@@ -2218,6 +2780,42 @@ F::Item MakeItem(F::MeshId mesh, Q::V3 centre, Q::V3 x, Q::V3 y, Q::V3 z, float 
     item.mv = {x.x * sx, y.x * sy, z.x * sz, centre.x, x.y * sx, y.y * sy, z.y * sz, centre.y,
                x.z * sx, y.z * sy, z.z * sz, centre.z};
     return item;
+}
+
+void AddCallBeyondSky(F::List& list, const Mapping& map, s64 now, float sky_alpha) {
+    // (2026-11-18, the user: "a little easier to notice. But not by super much. Maybe 28% str and
+    // a chance to be a bit higher": two of the four 8 and 7 degrees higher, 38 and 50 over the
+    // horizon; the other two where they were, 25 and 34.)
+    // World directions, independent of the hand and head rotation. Distant geometry is
+    // only a projection scaffold: the vertex shader tests at the distant-sky cutoff, in front
+    // of the game's depth-writing sky dome. Nearer geometry occludes it; no depth/coverage writes.
+    constexpr std::array<Q::V3, VR::CallBeyond::Sky::EyeCount> directions{{
+        {0.0f, .62f, .7846018f}, {-.60f, .77f, .2181742f},
+        {.78f, .42f, .4634652f}, {-.28f, .56f, -.7797435f}}};
+    constexpr float distance = 10000.0f;
+    const double seconds = double(now) * 1e-9;
+    for (int e = 0; e < VR::CallBeyond::Sky::EyeCount; ++e) {
+        const auto d = Q::Normalize(directions[e]);
+        const auto view = map.DirToView({d.x, d.y, d.z});
+        // Same conservative near-side bound as CullInvisible below; keep a crossing
+        // quad for normal per-eye clipping. Native stereo shifts X only, not this Z.
+        if (view.z < -.18f) continue;
+        const float openness = VR::CallBeyond::Sky::Openness(seconds, e);
+        if (openness <= 0.0f) continue; // a completely closed eye needs no draw
+        const Q::V3 side = Q::Normalize(Q::V3{d.z, 0.0f, -d.x});
+        const Q::V3 up = Q::Cross(d, side);
+        auto eye = MakeItem(F::MeshId::Quad, view * distance,
+            map.DirToView({side.x, side.y, side.z}), map.DirToView({up.x, up.y, up.z}),
+            view, distance * .32f, distance * .13f, 1.0f);
+        eye.translucent = true;
+        eye.keep_charge_color = true;
+        eye.color = {.27f, .30f, .34f, sky_alpha * .28f};
+        eye.uv = {VR::CallBeyond::Sky::ShaderTag, openness, float(e),
+                  1.0f / VR::CallBeyond::Sky::SkyDepthM}; // constant inverse depth
+        eye.cull_sphere = {view.x * distance, view.y * distance, view.z * distance,
+                           distance * .18f};
+        list.Add(eye); // bounded by MaxItems; never a hand item or an x-ray copy
+    }
 }
 
 constexpr std::array<float, 4> Linear(float r, float g, float b, float a = 1.0f) {
@@ -2240,6 +2838,7 @@ struct ArcStyle {
     std::array<float, 4> frame_deny{0.42f, 0.12f, 0.07f, 0.95f};
     std::array<float, 3> bone{0.80f, 0.765f, 0.69f}; // the game's text white
     std::array<float, 3> ochre{0.70f, 0.48f, 0.22f}; // the last one left
+    std::array<float, 3> blood{0.80f, 0.17f, 0.11f}; // a hunter tool short of bullets: its cost
     float icon_scale{0.80f};                         // of the card
     float fade_in_s{0.16f};
     float fade_out_s{0.14f};
@@ -2250,6 +2849,14 @@ struct ArcStyle {
     // The hovered card where the hunter's own fist hides it (it reaches into the card): shown
     // through the fingers at this opacity, faded in with the hover (quick_arc_hover_xray).
     float xray_alpha{0.85f};
+    // quick_arc_pick=fan: no cards, a segment of the fan per item, the icons straight on it (the
+    // user, 2026-10-26: no outline or background round the icons). Its look is the shader's
+    // (vr_inframe.frag ShadeFanFn, quick_fan_style): Fan A gothic panes, Fan B engraved brass (the
+    // user's picks of 2026-10-27: the first flat slate fan looked "very modern").
+    int fan_style{0};
+    float fan_inner_m{0.025f}; // the segments start this far past where a pick starts (FanEnterM)
+    float fan_reach{0.75f};    // and end this many cards past the icons
+    float fan_icon{0.92f};     // of the card
 };
 
 // A copy of `item` drawn only where the scene hides it (F::Item::xray) at `alpha` of its opacity.
@@ -2270,6 +2877,67 @@ float EaseOut(float t) {
     return 1.0f - u * u * u;
 }
 
+// quick_arc_pick=fan: how far out the fan reaches past its icons (local metres), for the segments
+// and the name above them.
+float FanOuter(const RenderState& rs, const ArcStyle& st, float card) {
+    return Q::Length(rs.layout.card[0] - rs.layout.pivot) + st.fan_reach * card;
+}
+
+// quick_arc_pick=fan: layout index i's segment of the fan (Shade::Fan), from just past where a
+// pick starts out past its icon, between the middles to its neighbours' directions (where they
+// pick it, Q::FanCovers; the end ones just as wide, not out to their pick's edges, so the fan
+// keeps its shape with fewer items). The shader draws the style's pane, rim and ornaments and the
+// lit glow (eased with the hover; a grab flashes it, a deny flashes it rust), the game's selected
+// item's rim a little brighter; used up since the fan opened, fainter; pulled out of the fan
+// (about to close), all dim. Each segment draws its half of the mullion or division it shares
+// with a neighbour; an end segment's quad reaches FanEndMargin past the fan's end for the whole
+// of the end's. Through the hunter's arm wherever it hides it only faintly (a third of the icons'
+// x-ray): the fan is the backdrop, the icons on it are what must stay in sight.
+constexpr float FanEndMargin = 0.035f; // of the outer radius
+void AddFanSegment(F::List& list, const Mapping& map, const RenderState& rs, const ArcStyle& st,
+                   int i, float card, Q::V3 fan_n, float fade, float ease, float flash, bool deny,
+                   bool selected, bool empty, bool out, float hidden_xray) {
+    const Q::Layout& l = rs.layout;
+    const float a = rs.fan_dirs.angle[static_cast<size_t>(i)];
+    const float half =
+        rs.fan_dirs.n > 1 ? 0.5f * rs.fan_dirs.step : 30.0f * (3.14159265f / 180.0f);
+    const float r_icon = Q::Length(l.card[static_cast<size_t>(i)] - l.pivot);
+    const float outer = FanOuter(rs, st, card);
+    const float inner = std::min(Q::FanEnterM + st.fan_inner_m, 0.8f * r_icon);
+    const Q::V3 dir = l.right * std::sin(a) + l.up * std::cos(a);
+    const Q::V3 pivot = map.WorldToView(map.ToWorld(l.pivot));
+    const Q::V3 rim = map.WorldToView(map.ToWorld(l.pivot + dir * outer));
+    const float length = Q::Length(rim - pivot);
+    if (length < 1e-5f || outer <= inner) {
+        return;
+    }
+    const Q::V3 y = (rim - pivot) * (1.0f / length);
+    const Q::V3 x = Q::Normalize(Q::Cross(fan_n, y), {1.0f, 0.0f, 0.0f});
+    const float k = inner / outer;
+    const float lo = k * std::cos(half); // the quad's near edge (the segment's corners)
+    // The fan's ends on this quad's sides (bit 1: its -x side, 2: its +x side) and bit 4 when its
+    // +x is the viewer's right (Fan B's ticks run round the whole fan).
+    const Q::V3 right_view = map.WorldToView(map.ToWorld(l.pivot + l.right)) - pivot;
+    const bool x_right = Q::Dot(x, right_view) > 0.0f;
+    const bool left_end = i == 0;
+    const bool right_end = i == rs.fan_dirs.n - 1;
+    const int end_bits =
+        ((x_right ? left_end : right_end) ? 1 : 0) | ((x_right ? right_end : left_end) ? 2 : 0);
+    const int ends = end_bits | (x_right ? 4 : 0);
+    const float margin = end_bits != 0 ? FanEndMargin : 0.0f;
+    F::Item seg = MakeItem(F::MeshId::Quad, pivot + y * (0.5f * (lo + 1.0f) * length), x, y, fan_n,
+                           2.0f * (std::sin(half) + margin) * length, (1.0f - lo) * length, 1.0f);
+    // (Both sides widen; the shader draws past a side only where it is the fan's end.)
+    seg.shade = F::Shade::Fan;
+    const float glow = std::max(ease, deny ? 0.0f : flash);
+    const float dim = (empty && !deny ? 0.45f : 1.0f) * (out ? 0.35f : 1.0f);
+    seg.color = {glow, deny ? flash : 0.0f, selected ? 1.0f : 0.0f, fade * dim};
+    seg.emissive = {static_cast<float>(st.fan_style), static_cast<float>(ends), margin, 0.0f};
+    seg.uv = {half, k, a, r_icon / outer};
+    list.Add(seg);
+    AddXray(list, seg, hidden_xray * 0.35f);
+}
+
 void BuildArc(F::List& list, const Mapping& map, const Q::Scene& scene, const Q::Snapshot& snap,
               s64 now, float scale_m) {
     auto& rs = g_render;
@@ -2278,6 +2946,9 @@ void BuildArc(F::List& list, const Mapping& map, const Q::Scene& scene, const Q:
     st.slate[3] = VR::Tune::Get("arc.slate_a", st.slate[3]);
     st.frame[3] = VR::Tune::Get("arc.frame_a", st.frame[3]);
     st.icon_scale = VR::Tune::Get("arc.icon", st.icon_scale);
+    st.fan_style = qs.fan_style;
+    st.fan_reach = VR::Tune::Get("fan.reach", st.fan_reach);
+    st.fan_icon = VR::Tune::Get("fan.icon", st.fan_icon);
     const bool open = scene.state == Q::SceneState::Open;
     // An arc open again at its placement (left_scheme=2: an item put back, the next throw) fades
     // in from that open, not from its placement.
@@ -2286,8 +2957,23 @@ void BuildArc(F::List& list, const Mapping& map, const Q::Scene& scene, const Q:
     const float since = static_cast<float>(now - scene.state_ns) * 1e-9f;
     const float dt = std::clamp(static_cast<float>(now - rs.last_ns) * 1e-9f, 0.0f, 0.1f);
     rs.last_ns = now;
-    const Q::V3 eye_view{0.0f, 0.0f, 0.0f};
+    // The cards and the name face where the eyes were when the arc opened, upright in the room,
+    // fixed like real cards. Facing the eyes every frame, upright in the view (before 2026-10-24),
+    // turned and rolled them as the head moved (the eyes swing round the neck): they rotated
+    // looking around (the user).
+    const Q::V3 eye_view = map.WorldToView(map.ToWorld(rs.layout.eye));
+    const Q::V3 world_up = Q::Normalize(map.DirToView({0.0f, 1.0f, 0.0f}), {0.0f, 1.0f, 0.0f});
     const float card = qs.card_m * (VR::GetSettings().seated ? 0.9f : 1.0f);
+    // quick_arc_pick=fan: every card in the fan's one plane, facing along its normal with its
+    // up (Q::PlaceFan), never each turned to the eyes: no card swivels on its own. No lift, no
+    // growth on the lit one (its glow and brightness only): the cards stay where their
+    // separators are.
+    const Q::V3 fan_c = map.WorldToView(map.ToWorld(rs.layout.pivot));
+    const Q::V3 fan_n = Q::Normalize(
+        map.WorldToView(map.ToWorld(rs.layout.pivot + rs.layout.toward)) - fan_c, {0.0f, 0.0f, 1.0f});
+    Q::V3 fan_up = Q::Normalize(
+        map.WorldToView(map.ToWorld(rs.layout.pivot + rs.layout.up)) - fan_c, world_up);
+    fan_up = Q::Normalize(fan_up - fan_n * Q::Dot(fan_up, fan_n), world_up);
     int name_slot = -1;
     for (int i = 0; i < rs.layout.n; ++i) {
         const int k = rs.card_slot[static_cast<size_t>(i)];
@@ -2305,15 +2991,23 @@ void BuildArc(F::List& list, const Mapping& map, const Q::Scene& scene, const Q:
         const float ease = lift * lift * (3.0f - 2.0f * lift);
         const VR::Body::Vec3 world = map.ToWorld(rs.layout.card[static_cast<size_t>(i)]);
         Q::V3 c = map.WorldToView(world);
-        const Q::V3 n = Q::Normalize(eye_view - c, {0.0f, 0.0f, -1.0f}); // toward the eye
-        c = c + n * (st.hover_lift_m * ease * scale_m);
-        Q::V3 up{0.0f, 1.0f, 0.0f};
-        up = Q::Normalize(up - n * Q::Dot(up, n), {0.0f, 1.0f, 0.0f});
+        const Q::V3 n =
+            rs.fan ? fan_n : Q::Normalize(eye_view - c, {0.0f, 0.0f, -1.0f}); // toward the eye
+        if (!rs.fan) {
+            c = c + n * (st.hover_lift_m * ease * scale_m);
+        }
+        Q::V3 up = rs.fan ? fan_up : world_up;
+        if (!rs.fan) {
+            up = Q::Normalize(up - n * Q::Dot(up, n), world_up);
+        }
         const Q::V3 right = Q::Cross(n, up);
         const float grow = (open ? 0.92f + 0.08f * fade : 0.96f + 0.04f * fade);
-        const float size = card * grow * (1.0f + st.hover_grow * ease) * scale_m;
+        const float size =
+            card * grow * (1.0f + (rs.fan ? 0.0f : st.hover_grow) * ease) * scale_m;
         const bool empty = slot.Empty();
         const bool selected = k == snap.selected;
+        // A hunter tool the hunter cannot pay for now (Q::ShortOfBullets): dimmed, its cost red.
+        const bool short_of = Q::ShortOfBullets(snap, slot);
         // A grab (warm) or a deny (muted rust) flashes the card.
         float flash = 0.0f;
         if (scene.pulse_slot == k) {
@@ -2321,55 +3015,69 @@ void BuildArc(F::List& list, const Mapping& map, const Q::Scene& scene, const Q:
             flash = t >= 0.0f && t < 0.3f ? 1.0f - t / 0.3f : 0.0f;
         }
         const bool deny = scene.pulse_deny && flash > 0.0f;
-        // The slate with its hairline frame and the hover's candlelight (writes depth: DIBR shows
-        // the card at its own depth).
-        F::Item plate = MakeItem(F::MeshId::Quad, c, right, up, n, size, size, 1.0f);
-        plate.shade = F::Shade::Card;
-        plate.color = st.slate;
-        plate.color[3] *= fade;
-        const auto& frame = deny ? st.frame_deny : selected ? st.frame_selected : st.frame;
-        plate.emissive = frame;
-        const float bright = 1.0f + 0.5f * ease + 0.6f * (deny ? 0.0f : flash);
-        for (int ch = 0; ch < 3; ++ch) {
-            plate.emissive[static_cast<size_t>(ch)] *= bright;
-        }
-        plate.emissive[3] *= fade;
-        plate.uv = {std::max(ease, deny ? 0.0f : flash) * fade, 0.0f, 0.0f, 0.0f};
-        list.Add(plate);
         // The hovered card through the fist that covers it (plate, icon and count below); every
         // card faintly wherever the scene hides it (a wall or pillar the arc opened into, the
         // hunter's own arm), so no card is ever out of sight (quick_arc_hidden_xray).
         const float xray =
             std::max(qs.hover_xray && open ? st.xray_alpha * ease : 0.0f, qs.hidden_xray);
-        AddXray(list, plate, xray);
-        // The game's icon on it (dimmed when the game would not allow it now).
+        if (rs.fan) {
+            AddFanSegment(list, map, rs, st, i, card, fan_n, fade, ease, flash, deny, selected,
+                          empty, scene.fan_out, qs.hidden_xray);
+        } else {
+            // The slate with its hairline frame and the hover's candlelight (writes depth: DIBR
+            // shows the card at its own depth).
+            F::Item plate = MakeItem(F::MeshId::Quad, c, right, up, n, size, size, 1.0f);
+            plate.shade = F::Shade::Card;
+            plate.color = st.slate;
+            plate.color[3] *= fade;
+            const auto& frame = deny ? st.frame_deny : selected ? st.frame_selected : st.frame;
+            plate.emissive = frame;
+            const float bright = 1.0f + 0.5f * ease + 0.6f * (deny ? 0.0f : flash);
+            for (int ch = 0; ch < 3; ++ch) {
+                plate.emissive[static_cast<size_t>(ch)] *= bright;
+            }
+            plate.emissive[3] *= fade;
+            plate.uv = {std::max(ease, deny ? 0.0f : flash) * fade, 0.0f, 0.0f, 0.0f};
+            list.Add(plate);
+            AddXray(list, plate, xray);
+        }
+        // The game's icon on it (dimmed when the game would not allow it now); on a fan, straight
+        // on its segment, a little bigger (no card round it).
         if (!empty && qs.icons && slot.icon >= 0) {
+            const float icon_size = size * (rs.fan ? st.fan_icon : st.icon_scale);
             F::Item icon = MakeItem(F::MeshId::Quad, c + n * (0.004f * scale_m), right, up, n,
-                                    size * st.icon_scale, size * st.icon_scale, 1.0f);
+                                    icon_size, icon_size, 1.0f);
             icon.shade = F::Shade::Icon;
             icon.tex = F::Tex::Icon;
             icon.tex_key = static_cast<u32>(slot.icon);
-            const float tint = (slot.usable ? 1.0f : 0.42f) * (1.0f + 0.15f * ease);
+            const float tint = (slot.usable && !short_of ? 1.0f : 0.42f) * (1.0f + 0.15f * ease);
             icon.color = Linear(tint, tint, tint, fade);
             // 400 of the 416 texels are the icon (BC7 padding).
             icon.uv = {0.0f, 0.0f, 400.0f / 416.0f, 400.0f / 416.0f};
             list.Add(icon);
             AddXray(list, icon, xray);
         }
-        // The count, bottom right over the box's corner as on the game's HUD.
+        // The count, bottom right over the box's corner as on the game's HUD; what a use costs
+        // there instead for an item that costs bullets ("c:6": the hunter tools and the Accursed
+        // Brew, never used up, a count of 1), red when it cannot be paid for.
         if (!empty && qs.labels) {
-            const std::string text = CountText(slot.qty);
+            const bool cost = slot.cost > 0 && slot.qty <= 1;
+            const std::string text =
+                cost ? fmt::format("c:{}", slot.cost) : CountText(slot.qty);
             const int label = list.AddLabel(text.c_str(), 48);
             if (label >= 0) {
-                const float h = size * 0.34f;
-                const Q::V3 at =
-                    c + right * (size * 0.30f) - up * (size * 0.34f) + n * (0.006f * scale_m);
+                // (The cost's three characters a little smaller and further in: on the card.)
+                const float h = size * (cost ? 0.28f : 0.34f);
+                const Q::V3 at = c + right * (size * (cost ? 0.22f : 0.30f)) -
+                                 up * (size * (cost ? 0.36f : 0.34f)) + n * (0.006f * scale_m);
                 F::Item digits = MakeItem(F::MeshId::Quad, at, right, up, n, h, h, 1.0f);
                 digits.shade = F::Shade::Text;
                 digits.tex = F::Tex::Label;
                 digits.tex_key = static_cast<u32>(label);
                 digits.fit_label = static_cast<s8>(label);
-                const auto& ink = slot.qty == 1 ? st.ochre : st.bone;
+                const auto& ink = cost ? (short_of ? st.blood : st.bone)
+                                  : slot.qty == 1 ? st.ochre
+                                                  : st.bone;
                 digits.color = Linear(ink[0], ink[1], ink[2], fade);
                 digits.emissive = {0.005f, 0.005f, 0.006f, 0.85f}; // a soft dark halo
                 list.Add(digits);
@@ -2381,27 +3089,35 @@ void BuildArc(F::List& list, const Mapping& map, const Q::Scene& scene, const Q:
         }
     }
     // The hovered (else the game's selected) item's name above the arc, in the game's font with a
-    // hairline under it, as on the game's HUD.
+    // hairline under it, as on the game's HUD; what a use costs after it ("Tiny Tonitrus  c:6",
+    // the tester's 2026-11-01: the Quicksilver Bullets a hunter tool takes, Blood Bullets first).
     if (name_slot >= 0 && qs.labels && rs.layout.n > 0) {
         const Q::Slot& slot = snap.slot[static_cast<size_t>(name_slot)];
-        const std::string name = VR::Assets::GoodsName(slot.goods);
+        std::string name = VR::Assets::GoodsName(slot.goods);
+        if (!name.empty() && slot.cost > 0) {
+            name += Q::ShortOfBullets(snap, slot)
+                        ? fmt::format("  c:{}  (have {})", slot.cost, snap.bullets)
+                        : fmt::format("  c:{}", slot.cost);
+        }
         const int label = name.empty() ? -1 : list.AddLabel(name.c_str(), 48);
         if (label >= 0) {
             const bool hovered_name = rs.hover >= 0;
             const float fade =
                 open ? EaseOut(seconds / st.fade_in_s) : 1.0f - EaseOut(since / st.fade_out_s);
             const float h = 0.017f * scale_m; // text height (cap to descender)
-            // Above the top card in the arc's (leaning) plane.
+            // Above the top card in the arc's (leaning) plane; a fan's above its rim.
             float top = -1e9f;
             for (int i = 0; i < rs.layout.n; ++i) {
                 top = std::max(top, Q::Dot(rs.layout.card[static_cast<size_t>(i)] - rs.layout.pivot,
                                            rs.layout.up));
             }
-            const Q::V3 above = rs.layout.pivot + rs.layout.up * (top + card * 0.5f + 0.028f);
+            const Q::V3 above =
+                rs.layout.pivot + rs.layout.up * (rs.fan ? FanOuter(rs, st, card) + 0.016f
+                                                         : top + card * 0.5f + 0.028f);
             const Q::V3 at = map.WorldToView(map.ToWorld(above));
             const Q::V3 name_n = Q::Normalize(eye_view - at, {0.0f, 0.0f, -1.0f});
-            Q::V3 name_up{0.0f, 1.0f, 0.0f};
-            name_up = Q::Normalize(name_up - name_n * Q::Dot(name_up, name_n), {0.0f, 1.0f, 0.0f});
+            Q::V3 name_up = world_up;
+            name_up = Q::Normalize(name_up - name_n * Q::Dot(name_up, name_n), world_up);
             const Q::V3 name_right = Q::Cross(name_n, name_up);
             const float a = (hovered_name ? 1.0f : 0.6f) * fade;
             F::Item text = MakeItem(F::MeshId::Quad, at, name_right, name_up, name_n, h, h, 1.0f);
@@ -2409,7 +3125,9 @@ void BuildArc(F::List& list, const Mapping& map, const Q::Scene& scene, const Q:
             text.tex = F::Tex::Label;
             text.tex_key = static_cast<u32>(label);
             text.fit_label = static_cast<s8>(label);
-            text.color = Linear(st.bone[0], st.bone[1], st.bone[2], a);
+            // Red when it cannot be paid for (Q::ShortOfBullets): not taken.
+            const auto& ink = Q::ShortOfBullets(snap, slot) ? st.blood : st.bone;
+            text.color = Linear(ink[0], ink[1], ink[2], a);
             text.emissive = {0.005f, 0.005f, 0.006f, 0.85f};
             list.Add(text);
             // The hovered item's name through the hand, too.
@@ -2497,6 +3215,31 @@ struct RingPlace {
 };
 RingPlace g_ring_place{};
 
+// The Hand Lantern's swing in the hand (BuildHeld; restarts hanging whenever it was not held),
+// with its pivot at the last update (world) and that place in your play space (tracking).
+VR::HandLantern::Pendulum g_lantern_swing{};
+bool g_lantern_swing_seen = false;
+VR::Body::Vec3 g_lantern_swing_pivot{};
+Q::V3 g_lantern_swing_track{};
+
+// The Hand Lantern lit in the hand: its candle's flame (Item::candle on a card), a quad facing
+// the eye in the cage's middle (`centre`, world), its y up the lantern's axis (`up`, world; `k`:
+// the lantern's scale, as its model's). Depth-tested like the cage round it: the bars in front
+// of it hide it, the gaps show it.
+void AddCandleFlame(F::List& list, const Mapping& map, VR::Body::Vec3 centre, VR::Body::Vec3 up,
+                    float k, float strength, float height) {
+    const Q::V3 c = map.WorldToView(centre);
+    const Q::V3 n = Q::Normalize(Q::V3{0.0f, 0.0f, 0.0f} - c, {0.0f, 0.0f, -1.0f});
+    const Q::V3 axis = map.DirToView(up);
+    const Q::V3 v = Q::Normalize(axis - n * Q::Dot(axis, n), {0.0f, 1.0f, 0.0f});
+    F::Item flame = MakeItem(F::MeshId::Quad, c, Q::Cross(n, v), v, n, 0.024f * k, 0.034f * k,
+                             1.0f);
+    flame.shade = F::Shade::Card;
+    flame.candle = true;
+    flame.uv = {strength, height, 0.0f, 0.0f};
+    list.Add(flame);
+}
+
 // The flash's strength now (1 at the use, 0 when over; < 0: none).
 float HoldFlash(const Q::Scene& scene, s64 now) {
     if (scene.hold_done_ns <= 0) {
@@ -2511,12 +3254,29 @@ float HoldFlash(const Q::Scene& scene, s64 now) {
 
 void AddHoldRing(F::List& list, const Mapping& map, Q::V3 c, float size, const Q::Scene& scene,
                  s64 now, bool filling) {
+    if (!scene.hold_ring) {
+        return; // a hunter tool's charge or call: the tool shows it (Scene::hold_ring)
+    }
     float progress = -1.0f;
     if (filling && scene.hold_from_ns > 0 && scene.hold_s > 0.0f) {
         progress = std::clamp(static_cast<float>(now - scene.hold_from_ns) * 1e-9f / scene.hold_s,
                               0.0f, 1.0f);
     }
-    const float flash = HoldFlash(scene, now);
+    float flash = HoldFlash(scene, now);
+    const bool celestial = scene.held_goods == VR::CallBeyond::Goods;
+    const bool old_bone = scene.held_goods == VR::OldHunterBone::Goods;
+    if (old_bone) {
+        VR::OldHunterBone::Use use{};
+        g_old_bone_use.Load(use);
+        const float pulse = VR::OldHunterBone::Pulse(use, scene.held_session_ns, now);
+        flash = pulse > 0.0f ? pulse : -1.0f;
+    }
+    if (celestial) {
+        VR::CallBeyond::Answer answer{};
+        g_call_beyond_answer.Load(answer);
+        const auto v = VR::CallBeyond::Evaluate(scene.call_beyond, answer, now);
+        flash = v.invocation > 0.0f ? v.invocation : -1.0f;
+    }
     if (progress < 0.0f && flash < 0.0f) {
         return;
     }
@@ -2538,7 +3298,10 @@ void AddHoldRing(F::List& list, const Mapping& map, Q::V3 c, float size, const Q
     const float p = std::max(progress, 0.0f);
     const ArcStyle st{};
     ring.color = {st.slate[0], st.slate[1], st.slate[2], 0.62f};     // the track
-    const std::array<float, 3> gold{0.86f, 0.60f, 0.26f};           // brass, lit
+    const std::array<float, 3> gold = celestial
+        ? std::array<float, 3>{0.48f, 0.72f, 1.2f}
+        : old_bone ? std::array<float, 3>{0.60f, 0.72f, 0.85f}
+                   : std::array<float, 3>{0.86f, 0.60f, 0.26f};
     const float warm = flash >= 0.0f ? 1.0f : p * p;
     ring.emissive = {st.bone[0] + (gold[0] - st.bone[0]) * warm,
                      st.bone[1] + (gold[1] - st.bone[1]) * warm,
@@ -2549,6 +3312,11 @@ void AddHoldRing(F::List& list, const Mapping& map, Q::V3 c, float size, const Q
     }
     ring.uv = {flash >= 0.0f ? 1.0f : p, std::max(flash, 0.0f), 0.44f,
                VR::Tune::Get("hold.ring_w", 0.022f)};
+    if (old_bone && flash >= 0.0f) {
+        ring.uv[3] = .010f; // a thin spectral ripple, using the existing ring draw
+        ring.color[3] *= .5f;
+        ring.emissive[3] *= .65f;
+    }
     ring.depth_pull = 0.05f * map.scale;
     list.Add(ring);
 }
@@ -2560,7 +3328,12 @@ void AddHoldRing(F::List& list, const Mapping& map, Q::V3 c, float size, const Q
 // The items from `first` on sit on the hunter's hand (F::Item::hand).
 void MarkHand(F::List& list, u32 first) {
     for (u32 i = first; i < list.count; ++i) {
-        list.items[i].hand = true;
+        auto& item=list.items[i];
+        item.hand = !(item.mesh==F::MeshId::MessengerChunks &&
+                      item.uv[1]>=VR::MessengerGift::BreakSeconds) &&
+                    !((item.mesh==F::MeshId::ExecutionerGloves || item.soft_glove) && item.uv[1]<0.0f) &&
+                    (item.mesh!=F::MeshId::TonitrusBridge || F::IsTonitrusChargeArc(item)) &&
+                    item.mesh!=F::MeshId::AugurSpray;
     }
 }
 
@@ -2631,7 +3404,7 @@ struct GoodsLook {
     float longest{0.10f};                    // metres (the hold ring)
     std::array<float, 3> lo{}, hi{};         // its parts' bounds (mesh metres): the belt's holder
 };
-GoodsLook GoodsLookOf(s32 goods) {
+GoodsLook GoodsLookOf(s32 goods, bool stored = false) {
     using M = F::MeshId;
     // The tubes' chamber is the vial's (vr_syringe_mesh.h); the bottle's its body.
     constexpr float TubeBottom = 0.0352f, TubeTop = 0.1408f, TubeRadius = 0.0146f;
@@ -2644,6 +3417,9 @@ GoodsLook GoodsLookOf(s32 goods) {
         return result;
     };
     switch (goods) {
+    case VR::Cigarette::Goods:
+        return stored ? reused(M::CigarettePacket,{-.027f,-.043f,-.011f},{.027f,.043f,.011f})
+                      : reused(M::Cigarette,{-.004f,-.012f,-.004f},{.005f,.064f,.004f});
     case 100:
     case 1400: return reused(M::HunterMark,{-.015f,-.030f,-.025f},{.095f,.040f,.012f});
     case 130: return {{{{M::RegisterBook}}}, 1, -1, 0, 0, 0, 0, false, .12f,
@@ -2655,7 +3431,12 @@ GoodsLook GoodsLookOf(s32 goods) {
     case 1110: return reused(M::BeastPellet,{-.015f,-.015f,-.015f},{.015f,.015f,.015f});
     case 1330: return reused(M::AshUrn,{-.022f,-.027f,-.017f},{.022f,.034f,.017f});
     case 2000: return reused(M::PhantasmShell,{-.016f,-.075f,-.015f},{.070f,.025f,.020f},{.75f,.82f,.65f});
-    case 2110: return reused(M::Skull,{-.073f,-.064f,-.111f},{.073f,.105f,.111f},{.70f,.70f,.68f});
+    case 2110: return reused(M::MessengerSkull,{-.073f,-.064f,-.111f},{.073f,.105f,.111f});
+    case 2070: return reused(M::TinyTonitrus,{-.038f,-.038f,-.135f},{.038f,.038f,.145f});
+    case 2080: return reused(M::ExecutionerGloves,VR::HunterRelics::GloveMin,VR::HunterRelics::GloveMax);
+    case VR::BlackskyEye::Goods: // the eyeball, then its clear cornea over the iris
+        return {{{{M::BlackskyEye}, {M::BlackskyCornea}}}, 2, -1, 0, 0, 0, 0, false, .032f,
+                {-.0121f, -.0121f, -.0133f}, {.0121f, .0121f, .0163f}};
     case 4320:
     case 4321:
     case 4322:
@@ -2736,8 +3517,444 @@ Q::ItemFrame HandRubFrame(const std::array<float, N>& m, const Q::HeldLook& look
     return Q::ItemFrameOf(m, look, Q::GetQuickSettings().held_scale);
 }
 
+// Render-camera owner only. One map query on release, then analytic gravity and a
+// bounded rotation of one mesh; no particle pool, allocations, or frame-by-frame casts.
+struct GloveDropRender {
+    VR::HunterRelics::DropPlan plan{};
+    std::array<VR::Body::Vec3,3> axes{};
+    VR::Body::Quat turn{};
+    std::array<float,4> drag{};
+} g_glove_drop;
+VR::HunterRelics::SoftGlove g_soft_glove; // render-camera owner, one fixed-size spring
+VR::Augur::Spray g_augur_spray; // same owner; burst stays where the fist closed
+VR::Augur::Spray g_roar_spray;  // Beast Roar's embers: the same burst, its own state and style
+// A burst of the Augur's particles (vr_inframe.vert flies them): style 0 the Augur's blood,
+// style 1 the Beast Roar's embers and ash.
+void AddSprayBurst(F::List& list,const Mapping& map,const Q::Scene& scene,s64 now,
+                   VR::Augur::Use use,const VR::Body::Vec3& origin,
+                   const std::array<VR::Body::Vec3,3>& directions,VR::Augur::Spray& state,
+                   float style) {
+    const float age=VR::Augur::SprayAge(use,scene.held_session_ns,now);
+    if(age<0 || !std::isfinite(map.scale) || map.scale<.01f || map.scale>100)return;
+    const auto at=map.Carried(origin);
+    std::array<VR::Body::Vec3,3> axes{};
+    for(int i=0;i<3;++i)axes[i]=map.Carried(origin+directions[i]*map.scale)-at;
+    const std::array<float,12> pose{axes[0].x,axes[1].x,axes[2].x,at.x,
+        axes[0].y,axes[1].y,axes[2].y,at.y,axes[0].z,axes[1].z,axes[2].z,at.z};
+    if(!state.Sample(use,scene.held_session_ns,map.space_serial,now,pose))return;
+    const auto& w=state.world;
+    const auto x=map.DirToView({w[0],w[4],w[8]}),y=map.DirToView({w[1],w[5],w[9]}),
+               z=map.DirToView({w[2],w[6],w[10]});
+    const auto p=map.WorldToView({w[3],w[7],w[11]});
+    auto spray=MakeItem(F::MeshId::AugurSpray,p,x,y,z,1,1,1);
+    spray.shade=F::Shade::Unlit;spray.uv={-2000,age,style,0};
+    // The roar's flecks never write depth: one fading over the claw drawn after it would cut a
+    // hole in it (the 2026-11-04 review; the removed smoke's "mesh disappear").
+    spray.translucent=style>.5f;
+    const auto down=map.DirToView({0,-map.scale,0});
+    spray.emissive={down.x,down.y,down.z,0};
+    list.Add(spray);
+}
+void AddAugurSpray(F::List& list,const Mapping& map,const Q::Scene& scene,s64 now,
+                   VR::Augur::Use use,const VR::Body::Vec3& origin,
+                   const std::array<VR::Body::Vec3,3>& directions) {
+    AddSprayBurst(list,map,scene,now,use,origin,directions,g_augur_spray,0.0f);
+}
+void SoftGloveMotion(F::Item& item,const Mapping& map,const Q::Scene& scene,s64 now) {
+    if(!std::isfinite(map.scale) || map.scale<.01f || map.scale>100) {
+        g_soft_glove.Reset();item.emissive={};return;
+    }
+    const Q::V3 o{item.mv[3],item.mv[7],item.mv[11]};
+    const auto at=map.Carried(map.ViewToWorld(o));
+    std::array<VR::Body::Vec3,3> axes{};
+    for(int i=0;i<3;++i)axes[i]=map.Carried(map.ViewToWorld(
+        o+Q::V3{item.mv[i],item.mv[4+i],item.mv[8+i]}))-at;
+    const auto target=(at-axes[2]*.12f)*(1.0f/map.scale);
+    const auto lag=g_soft_glove.Update(now,scene.held_session_ns,map.space_serial,
+                                      {target.x,target.y,target.z});
+    const VR::Body::Vec3 world{lag[0]*map.scale,lag[1]*map.scale,lag[2]*map.scale};
+    for(int i=0;i<3;++i) {
+        const float square=VR::Body::Dot(axes[i],axes[i]);
+        item.emissive[i]=square>1e-8f?std::clamp(VR::Body::Dot(world,axes[i])/square,-.055f,.055f):0;
+    }
+    item.emissive[3]=0;
+}
+// The gathered Executioner's Gloves in the hand against the enemies (the tester's 2026-11-04 "if it
+// hits an enemy when it is charged (even if we didn't release trigger) it still activates"): only
+// while the presenter says they are gathered (Scene::glove_armed_ns), the glove's bounding sphere
+// from its last place to this one (held still: a touch) against live enemy hurtboxes
+// (ItemSphereEnemyHit); the first contact of a gathering goes to the presenter, which fires them.
+struct GloveSample {
+    s64 ns{0}, session{0};
+    u32 charge{0}, space{0};
+    VR::Body::Vec3 centre{};
+    s64 sent_session{0}; // the gathering (take, charge) whose contact went out
+    u32 sent{0};
+};
+GloveSample g_glove_sample{};
+void GloveContactTick(const F::Item& item,const Mapping& map,const Q::Scene& scene,s64 now) {
+    namespace R=VR::HunterRelics;
+    auto& s=g_glove_sample;
+    if(scene.glove_armed_ns<=0 || scene.glove_charge==0 || now<scene.glove_armed_ns ||
+       now-scene.glove_armed_ns>VR::ShamanBlade::MaxAgeNs || !std::isfinite(map.scale) ||
+       map.scale<.01f || map.scale>100) {
+        s.ns=0;return;
+    }
+    const Q::V3 view_origin{item.mv[3],item.mv[7],item.mv[11]};
+    const auto origin=map.Carried(map.ViewToWorld(view_origin));
+    std::array<VR::Body::Vec3,3> axes{};
+    for(int i=0;i<3;++i)axes[i]=map.Carried(map.ViewToWorld(
+        view_origin+Q::V3{item.mv[i],item.mv[4+i],item.mv[8+i]}))-origin;
+    const auto centre=origin+axes[0]*R::GloveMid[0]+axes[1]*R::GloveMid[1]+axes[2]*R::GloveMid[2];
+    const bool fresh=s.ns>0 && now>s.ns && now-s.ns<=VR::ShamanBlade::MaxAgeNs &&
+                     s.session==scene.held_session_ns && s.charge==scene.glove_charge &&
+                     s.space==map.space_serial && VR::Body::IsFinite(s.centre);
+    const VR::Body::Vec3 from=fresh?s.centre:centre;
+    s={now,scene.held_session_ns,scene.glove_charge,map.space_serial,centre,s.sent_session,s.sent};
+    if((s.sent==scene.glove_charge && s.sent_session==scene.held_session_ns) ||
+       !VR::Body::IsFinite(centre))
+        return;
+    // Its bounding sphere: half its box's diagonal, as drawn.
+    const float hx=(R::GloveMax[0]-R::GloveMin[0])*.5f*VR::Body::Length(axes[0]),
+                hy=(R::GloveMax[1]-R::GloveMin[1])*.5f*VR::Body::Length(axes[1]),
+                hz=(R::GloveMax[2]-R::GloveMin[2])*.5f*VR::Body::Length(axes[2]);
+    const float radius=std::sqrt(hx*hx+hy*hy+hz*hz);
+    float fraction{};VR::Body::Vec3 away{};u32 target=VR::ShamanBlade::NoTarget;
+    if(!(radius>0) || !ItemSphereEnemyHit(from,centre,radius,map.scale,fraction,away,&target))
+        return;
+    const VR::Body::Vec3 point=from+(centre-from)*fraction;
+    // Never through a wall, a door or a floor (the controller pushed through it to an enemy on
+    // the other side; the 2026-11-04 review): the touch must be in sight of the eye.
+    if(!MapSpherePathClear(map.eye_world,point,.02f*map.scale))return;
+    const float flat=std::hypot(away.x,away.z);
+    const VR::Body::Vec3 toward=flat>1e-4f?VR::Body::Vec3{-away.x/flat,0.0f,-away.z/flat}
+                                          :VR::Body::Vec3{};
+    s.sent=scene.glove_charge;s.sent_session=scene.held_session_ns;
+    Q::PublishGloveContact({now,scene.held_session_ns,scene.glove_charge,map.space_serial,point,
+                            target,point+toward*(.3f*map.scale)});
+    LOG_INFO(Core,"VR relic: gathered gloves met an enemy (h={:#x}) at ({:.2f},{:.2f},{:.2f})",
+             target,point.x,point.y,point.z);
+}
+bool DrawGloveDrop(F::Item& item,const Mapping& map,const Q::Scene& scene,s64 now) {
+    namespace R=VR::HunterRelics;
+    constexpr VR::Body::Vec3 mid{R::GloveMid[0],R::GloveMid[1],R::GloveMid[2]};
+    const auto& request=scene.relic_drop;
+    if(request.ns>0 && !R::Matches(request,g_glove_drop.plan.request)) {
+        g_glove_drop={};g_glove_drop.plan.request=request;
+        g_glove_drop.drag=item.emissive;
+        if(request.space!=map.space_serial || request.held_since!=scene.held_session_ns ||
+           now<request.ns || now-request.ns>250*Ms) {
+            Q::PublishRelicDrop(g_glove_drop.plan);return false;
+        }
+        const Q::V3 view_origin{item.mv[3],item.mv[7],item.mv[11]};
+        const auto origin=map.Carried(map.ViewToWorld(view_origin));
+        auto& axes=g_glove_drop.axes;
+        for(int i=0;i<3;++i)axes[i]=map.Carried(map.ViewToWorld(
+            view_origin+Q::V3{item.mv[i],item.mv[4+i],item.mv[8+i]}))-origin;
+        const auto centre=origin+axes[0]*mid.x+axes[1]*mid.y+axes[2]*mid.z;
+        const R::Vector from{centre.x,centre.y,centre.z};
+        // Check the hand's path out from the head as well: a controller poked
+        // through a wall cannot start a valid throw on its other side.
+        if(!MapSpherePathClear(map.eye_world,centre,.02f*map.scale)) {
+            Q::PublishRelicDrop(g_glove_drop.plan);return false;
+        }
+        const auto v=VR::Body::TrackingToWorld({request.velocity[0],request.velocity[1],
+                                               request.velocity[2]},map.base_yaw,map.scale);
+        const float sx=VR::Body::Length(axes[0]),sy=VR::Body::Length(axes[1]),sz=VR::Body::Length(axes[2]);
+        const float hx=(R::GloveMax[0]-R::GloveMin[0])*.5f*sx,
+                    hy=(R::GloveMax[1]-R::GloveMin[1])*.5f*sy,
+                    hz=(R::GloveMax[2]-R::GloveMin[2])*.5f*sz;
+        // Bound the complete turning glove and its residual cloth bend. The 4 mm
+        // allowance covers the small curvature between our fixed 50 ms segments.
+        const float radius=std::sqrt(hx*hx+hy*hy+hz*hz)+.055f*std::max({sx,sy,sz})+.004f*map.scale;
+        const float seat=hy+.002f*map.scale;
+        const auto sweep=[](const R::Vector& a,const R::Vector& b,float r) {
+            VR::Body::Vec3 normal{};float fraction{};
+            const auto state=SweepMapSphere({a[0],a[1],a[2]},{b[0],b[1],b[2]},r,normal,fraction);
+            return R::Sweep{state==MapSweep::Hit?R::SweepState::Hit:
+                            state==MapSweep::Clear?R::SweepState::Clear:R::SweepState::Unavailable,
+                            fraction,{normal.x,normal.y,normal.z}};
+        };
+        // A glove thrown at an enemy stops on it and drops at its feet (the tester's 2026-11-04
+        // "stop on enemies"): its flight against their hurtboxes too.
+        // The enemies near it read once per throw (the plan is of this moment anyway), then each
+        // of the up to TossTries x TossSteps steps tests only those (the 2026-11-04 review: a
+        // walk of every AI list per step).
+        static EnemyCapsules foes; // the render tick's (Game:Main): 16 KB, off the stack
+        bool gathered=false;
+        const float scale=map.scale;
+        const auto foe=[&](const R::Vector& a,const R::Vector& b,float r) {
+            if(!gathered) {
+                gathered=true;
+                GatherEnemyCapsules(centre,R::GloveTossRange*scale,scale,foes);
+            }
+            float fraction{};VR::Body::Vec3 away{};
+            if(foes.count==0 || !SphereHitsCapsules({a[0],a[1],a[2]},{b[0],b[1],b[2]},r,scale,
+                                                    foes,fraction,away))
+                return R::Sweep{R::SweepState::Clear};
+            return R::Sweep{R::SweepState::Hit,fraction,{away.x,away.y,away.z}};
+        };
+        g_glove_drop.plan=R::PlanToss(request,now,from,{v.x,v.y,v.z},map.scale,radius,seat,sweep,
+                                      foe);
+        if(g_glove_drop.plan.enemy)
+            LOG_INFO(Core,"VR relic: thrown glove meets an enemy at ({:.2f},{:.2f},{:.2f}), drops at "
+                          "its feet ({:.2f},{:.2f},{:.2f})",g_glove_drop.plan.impact[0],
+                     g_glove_drop.plan.impact[1],g_glove_drop.plan.impact[2],
+                     g_glove_drop.plan.land[0],g_glove_drop.plan.land[1],g_glove_drop.plan.land[2]);
+        if(g_glove_drop.plan.valid) {
+            const auto& normal=g_glove_drop.plan.normal;
+            g_glove_drop.turn=VR::Body::FromTo(-VR::Body::Normalize(axes[1]),
+                                               {normal[0],normal[1],normal[2]});
+        }
+        Q::PublishRelicDrop(g_glove_drop.plan);
+    }
+    const auto& plan=g_glove_drop.plan;
+    if(!plan.valid || plan.request.space!=map.space_serial ||
+       plan.request.held_since!=scene.held_session_ns || now<plan.start_ns ||
+       now>plan.land_ns+850*Ms)return false;
+    RelicUse answer{};g_relic_use.Load(answer);
+    const bool same=answer.goods==R::Gloves && answer.held_since==scene.held_session_ns;
+    const auto visual=R::GloveVisual(plan,scene.held_session_ns,R::Matches(request,plan.request),
+                                    same?answer.ns:0,same&&answer.used,now);
+    item.color[3]=visual.alpha;
+    item.uv[3]=visual.burst;
+    if(!visual.detached)return false;
+    // Finish flattening before the short seating movement, so the fingers do not
+    // dip through the floor while the conservative flight sphere shrinks away.
+    const auto flat_ns=plan.tossed?plan.impact_ns:plan.land_ns;
+    const float u=std::clamp(float(now-plan.start_ns)/float(flat_ns-plan.start_ns),0.0f,1.0f);
+    const float blend=u*u*(3.0f-2.0f*u);
+    for(int i=0;i<3;++i)item.emissive[i]=g_glove_drop.drag[i]*(1.0f-blend);
+    const auto& q=g_glove_drop.turn;
+    const auto rotation=VR::Body::Normalize(VR::Body::Quat{q.x*blend,q.y*blend,q.z*blend,1+(q.w-1)*blend});
+    std::array<VR::Body::Vec3,3> world{};
+    for(int i=0;i<3;++i)world[i]=VR::Body::Rotate(rotation,g_glove_drop.axes[i]);
+    const auto c=R::DropCentre(plan,now);
+    const auto origin=VR::Body::Vec3{c[0],c[1],c[2]}-world[0]*mid.x-world[1]*mid.y-world[2]*mid.z;
+    const auto at=map.WorldToView(origin),x=map.DirToView(world[0]),y=map.DirToView(world[1]),z=map.DirToView(world[2]);
+    item.mv={x.x,y.x,z.x,at.x,x.y,y.y,z.y,at.y,x.z,y.z,z.z,at.z};
+    item.uv[1]=-1.0f;item.uv[2]=0.0f; // detached; no late hand carry or charged curl
+    return true;
+}
+
+void AddTonitrusBridge(F::List& list,const Mapping& map,const F::Item& held,
+                       const Q::Scene& scene,s64 now) {
+    namespace R=VR::HunterRelics;
+    TonitrusContact hit{};RelicUse accepted{};
+    if(!LatestTonitrusContact(hit) || !g_relic_use.Load(accepted) ||
+       accepted.goods!=R::Tonitrus || !accepted.used ||
+       accepted.held_since!=scene.held_session_ns ||
+       !R::BridgeActive(hit.cast_ns,hit.ns,accepted.ns,scene.held_session_ns,now) ||
+       !R::Finite(hit.point) || !std::isfinite(map.scale) || map.scale<.01f || map.scale>100)return;
+    // Orb centre in the actual model, including its grip fit and this frame's hand carry.
+    constexpr float orb=-.097f;
+    const auto source=map.Carried(map.ViewToWorld({held.mv[3]+held.mv[2]*orb,
+        held.mv[7]+held.mv[6]*orb,held.mv[11]+held.mv[10]*orb}));
+    const VR::Body::Vec3 end{hit.point[0],hit.point[1],hit.point[2]};
+    const auto delta=end-source;
+    const float length=VR::Body::Length(delta),metres=length/map.scale;
+    if(!std::isfinite(metres) || metres<.05f || metres>8.0f)return;
+    // The strike, then two weaker restrikes (R::BridgeStrikeAt), each along its own path: the one
+    // mesh rolled about the bolt's line and mirrored by a seed of the cast and the strike.
+    const auto strike=R::BridgeStrikeAt(float(now-hit.ns)*1e-9f);
+    if(strike.index<0 || strike.strength<=0.0f)return;
+    const std::uint32_t seed=R::BoltSeed(hit.cast_ns,strike.index);
+    const float roll=float(seed&0xFFFFu)*(6.2831853f/65536.0f);
+    const float mirror=(seed&0x10000u) ? -1.0f : 1.0f;
+    const float wide=.85f+.35f*float((seed>>17)&0xFFu)/255.0f;
+    const auto along=delta*(1.0f/length);
+    const auto across0=VR::Body::Normalize(VR::Body::Cross(along,
+        std::abs(along.y)<.9f?VR::Body::Vec3{0,1,0}:VR::Body::Vec3{1,0,0}));
+    const auto third0=VR::Body::Cross(across0,along);
+    const auto across=(across0*std::cos(roll)+third0*std::sin(roll))*mirror;
+    const auto third=third0*std::cos(roll)-across0*std::sin(roll);
+    const float spread=std::min(.24f,.07f+.055f*metres)*wide*map.scale;
+    const auto x=map.DirToView(across*spread),y=map.DirToView(delta),z=map.DirToView(third*spread);
+    const auto at=map.WorldToView(source);
+    F::Item bolt{};bolt.mesh=F::MeshId::TonitrusBridge;bolt.shade=F::Shade::Unlit;
+    bolt.mv={x.x,y.x,z.x,at.x,x.y,y.y,z.y,at.y,x.z,y.z,z.z,at.z};
+    bolt.uv={-2070.0f,strike.age,.06f*map.scale,strike.strength};
+    list.Add(bolt); // one fixed mesh, no collision queries, uploads, or per-frame allocation
+}
+
+// Tonitrus charged (core/vr/tonitrus_charge.h): a bolt from the sky onto the mace's head, the
+// bridge's mesh and timing (a strike, two restrikes, the afterglow), from SkyM above it and a
+// little to one side by the charge's seed. The head's dummy is read every frame of it, so the bolt
+// follows the mace.
+void AddTonitrusSkyBolt(F::List& list, const Mapping& map, u8* chr,
+                        const VR::TonitrusCharge::State& charge, float age) {
+    namespace R = VR::HunterRelics;
+    namespace T = VR::TonitrusCharge;
+    const auto strike = R::BridgeStrikeAt(age);
+    if (strike.index < 0 || strike.strength <= 0.0f || g_dmy_poly == nullptr ||
+        !std::isfinite(map.scale) || map.scale < .01f || map.scale > 100)
+        return;
+    alignas(16) std::array<float, 8 * 12> m{};
+    const s32 id = T::HeadDummy;
+    if (g_dmy_poly(chr, m.data(), &id, 1) < 1) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOG_WARNING(Core, "VR Tonitrus: no dummy {} on the hunter: no bolt from the sky", id);
+        }
+        return;
+    }
+    const VR::Body::Vec3 end{m[3], m[7], m[11]};
+    const std::uint32_t seed = R::BoltSeed(charge.start_ns, strike.index);
+    const float side = float((seed >> 8) & 0xFFu) * (6.2831853f / 255.0f);
+    const VR::Body::Vec3 source =
+        end + VR::Body::Vec3{.7f * std::cos(side), T::SkyM, .7f * std::sin(side)} * map.scale;
+    const auto delta = end - source;
+    const float length = VR::Body::Length(delta), metres = length / map.scale;
+    if (!R::Finite({end.x, end.y, end.z}) || !std::isfinite(metres) || metres < .05f)
+        return;
+    const float roll = float(seed & 0xFFFFu) * (6.2831853f / 65536.0f);
+    const float mirror = (seed & 0x10000u) ? -1.0f : 1.0f;
+    const float wide = .85f + .35f * float((seed >> 17) & 0xFFu) / 255.0f;
+    const auto along = delta * (1.0f / length);
+    const auto across0 = VR::Body::Normalize(VR::Body::Cross(
+        along, std::abs(along.y) < .9f ? VR::Body::Vec3{0, 1, 0} : VR::Body::Vec3{1, 0, 0}));
+    const auto third0 = VR::Body::Cross(across0, along);
+    const auto across = (across0 * std::cos(roll) + third0 * std::sin(roll)) * mirror;
+    const auto third = third0 * std::cos(roll) - across0 * std::sin(roll);
+    const float spread = std::min(.24f, .07f + .055f * metres) * wide * map.scale;
+    const auto x = map.DirToView(across * spread), y = map.DirToView(delta),
+               z = map.DirToView(third * spread);
+    const auto at = map.WorldToView(source);
+    F::Item bolt{};
+    bolt.mesh = F::MeshId::TonitrusBridge;
+    bolt.shade = F::Shade::Unlit;
+    bolt.mv = {x.x, y.x, z.x, at.x, x.y, y.y, z.y, at.y, x.z, y.z, z.z, at.z};
+    bolt.uv = {-2070.0f, strike.age, T::BoltWidthM * map.scale, strike.strength};
+    bolt.keep_charge_color = true; // its own colour through the world's flash
+    list.Add(bolt);
+}
+
+// Charged and waiting for its strike (the held model's charge full, no use yet): small arcs
+// leaping from its ball, three at a time, each a new one every 80 ms (the bridge's mesh, from
+// the ball's surface 4.5-8.5 cm out, in the model's own scale; carried with the hand as the
+// model is). From inside the ball, as first made, they hardly showed (the mock's eye dumps).
+void AddTonitrusArcs(F::List& list,const Mapping& map,const F::Item& held,s64 now) {
+    namespace R=VR::HunterRelics;
+    if(!(held.uv[2]>=.999f) || held.uv[3]>0.0f || !std::isfinite(map.scale) ||
+       map.scale<.01f || map.scale>100)return;
+    constexpr float orb=-.097f,ball=.034f; // the ball's centre and (just inside) its radius
+    constexpr s64 cycle_ns=80*Ms;
+    const VR::Body::Vec3 zc{held.mv[2],held.mv[6],held.mv[10]};
+    const float zl=VR::Body::Length(zc);
+    if(!std::isfinite(zl) || zl<1e-6f)return;
+    const VR::Body::Vec3 tip{held.mv[3]+held.mv[2]*orb,held.mv[7]+held.mv[6]*orb,
+                             held.mv[11]+held.mv[10]*orb};
+    const auto out_dir=zc*(-1.0f/zl); // from the handle through the tip
+    for(int k=0;k<3;++k) {
+        const s64 t=now+k*(cycle_ns/3);
+        const std::uint32_t seed=R::BoltSeed(t/cycle_ns,k);
+        const float age=float(t%cycle_ns)*1e-9f;
+        // A direction round the tip, leaning out from it.
+        const float u=float(seed&0x3FFu)/1023.0f*2.0f-1.0f;
+        const float phi=float((seed>>10)&0x3FFu)*(6.2831853f/1024.0f);
+        const float s=std::sqrt(std::max(0.0f,1.0f-u*u));
+        const auto dir=VR::Body::Normalize(out_dir*.9f+VR::Body::Vec3{s*std::cos(phi),u,
+                                                                     s*std::sin(phi)});
+        const float len=(.045f+.04f*float((seed>>20)&0xFFu)/255.0f)*zl;
+        const auto across=VR::Body::Normalize(VR::Body::Cross(dir,
+            std::abs(dir.y)<.9f?VR::Body::Vec3{0,1,0}:VR::Body::Vec3{1,0,0}));
+        const auto third=VR::Body::Cross(across,dir);
+        const auto x=across*(.30f*len),y=dir*len,z=third*(.30f*len);
+        const auto from=tip+dir*(ball*zl);
+        F::Item arc{};arc.mesh=F::MeshId::TonitrusBridge;arc.shade=F::Shade::Unlit;
+        // MarkHand identifies this attached arc by its negative shader width below.
+        arc.mv={x.x,y.x,z.x,from.x,x.y,y.y,z.y,from.y,x.z,y.z,z.z,from.z};
+        // (A negative width: a small arc, small flashes and no light pool, vr_inframe.vert.)
+        arc.uv={-2070.0f,age,-.013f*zl,1.0f-.6f*age/(float(cycle_ns)*1e-9f)};
+        list.Add(arc);
+    }
+}
+
+// The held Blacksky Eye (core/vr/blacksky_eye.h): its turn in the fingers (columns: where its
+// mesh axes go, in its own axes) and its shader's uv. It watches you (toward your eyes), darting;
+// at the game's yes to a shot it whips onto where it shoots (the left controller's forward, as
+// the pointed eye's shot, ToolAim) with its pupil blown wide. Kept upright. Its centre (world,
+// carried as the hand sync draws it: from his pose before the carry the meteor left a step behind
+// the eye you see, the tester's 2026-11-05 "there is an offset") and radius go to the shot's start
+// (BlackskyPupil: the meteor leaves its pupil).
+struct BlackskyLook {
+    std::array<VR::BlackskyEye::Vec, 3> turn{};
+    std::array<float, 4> uv{};
+};
+VR::BlackskyEye::Motion g_blacksky_motion{};
+struct BlackskyPlace {
+    s64 ns{0};
+    u32 space_serial{0};
+    std::array<float, 3> centre{}; // world
+    float radius{0.0f};            // world units
+};
+SeqLock<BlackskyPlace> g_blacksky_place;
+template <class ToWorld>
+BlackskyLook BlackskyEyeTurn(const Mapping& map, const Q::Scene& scene, s64 now,
+                             const VR::Body::Vec3& centre, const ToWorld& to_world_dir,
+                             const std::array<VR::Body::Vec3, 3>& axes, float k) {
+    namespace E = VR::BlackskyEye;
+    RelicUse answer{};
+    g_relic_use.Load(answer);
+    const s64 fired = answer.goods == E::Goods && answer.used &&
+                              answer.held_since == scene.held_session_ns ? answer.ns : 0;
+    const E::Look look = g_blacksky_motion.Update(now, scene.held_session_ns, fired);
+    std::array<VR::Body::Vec3, 3> w{};
+    for (int a = 0; a < 3; ++a) w[static_cast<size_t>(a)] = to_world_dir(axes[static_cast<size_t>(a)]);
+    const auto to_you = map.eye_world - centre;
+    const E::Vec watch{VR::Body::Dot(to_you, w[0]), VR::Body::Dot(to_you, w[1]),
+                       VR::Body::Dot(to_you, w[2])};
+    E::Vec line{}, up{w[0].y, w[1].y, w[2].y};
+    VR::Body::HandsSample hands{};
+    if (VR::Body::LatestHands(hands) && VR::Body::IsTracked(hands.hand[VR::Body::C0000::Left])) {
+        const auto f = fired && look.fix > 0 && E::Dot(answer.shot_ray, answer.shot_ray) > .5f
+                           ? VR::Body::Vec3{answer.shot_ray[0], answer.shot_ray[1], answer.shot_ray[2]}
+                           : VR::Body::Rotate(VR::Body::Normalize(hands.hand[VR::Body::C0000::Left].q),
+                                              VR::Body::Vec3{0.0f, 0.0f, -1.0f});
+        const auto aim = VR::Body::TrackingToWorld(f, map.base_yaw, 1.0f);
+        line = {VR::Body::Dot(aim, w[0]), VR::Body::Dot(aim, w[1]), VR::Body::Dot(aim, w[2])};
+    }
+    BlackskyLook out{};
+    out.turn = E::Turn(watch, line, up, look);
+    out.uv = {5.0f, float(now % 100'000'000'000LL) * 1e-9f, look.pupil, look.flash};
+    const auto drawn = map.Carried(centre);
+    g_blacksky_place.Store({now, map.space_serial, {drawn.x, drawn.y, drawn.z}, E::RadiusM * k});
+    return out;
+}
+
+// Glove-specific palm-space offsets (side, lift, out), measured on the posed game meshes.
+// Bone Ash supports the eye between its claw tips, several centimetres beyond the bare fingers.
+VR::Body::Vec3 HeldGloveOffset(s32 armor, bool eye) {
+    using V = VR::Body::Vec3;
+    switch (armor) {
+    case 12000: return eye ? V{-0.0035f, 0.009f, -0.006f} : V{0.0015f, 0.002f, 0.003f}; // Charred Hunter Gloves
+    case 22000: return eye ? V{} : V{-0.006f, -0.001f, -0.003f}; // Yahar'gul Black Gloves
+    case 42000: return eye ? V{0.024f, -0.0005f, 0.02f} : V{-0.0025f, 0, 0.001f}; // Bone Ash Gauntlets
+    case 52000: return eye ? V{0.006f, 0.0055f, 0.007f} : V{-0.006f, -0.0015f, -0.0015f}; // Henryk's Hunter Gloves
+    case 62000: return eye ? V{0.0065f, 0.0045f, 0.006f} : V{-0.007f, 0, -0.0015f}; // Yharnam Hunter Gloves
+    case 72000: return eye ? V{0, 0.006f, 0} : V{0, -0.002f, 0.002f}; // Hunter Gloves
+    case 82000: return eye ? V{0.002f, 0.007f, 0} : V{-0.0075f, 0.002f, -0.0055f}; // Knight's Gloves
+    case 102000: return eye ? V{-0.006f, 0.0055f, -0.005f} : V{0.0035f, -0.001f, 0.0055f}; // Cainhurst Gauntlets
+    case 112000: return eye ? V{0.006f, 0.008f, 0} : V{-0.006f, 0, -0.003f}; // Surgical Long Gloves
+    case 122000: return eye ? V{0.003f, 0.0085f, -0.0005f} : V{-0.008f, 0.001f, -0.008f}; // Choir Gloves
+    case 132000: return eye ? V{0.006f, 0.004f, 0.006f} : V{-0.0085f, 0.004f, 0.0015f}; // Gascoigne's Gloves
+    case 142000: return eye ? V{0.004f, 0.011f, -0.004f} : V{0.001f, -0.0025f, 0.0025f}; // Tomb Prospector Gloves
+    case 152000: return eye ? V{0.006f, 0.007f, 0.002f} : V{-0.006f, 0, 0.001f}; // Executioner Gauntlets
+    case 182000: return eye ? V{0.0035f, 0.007f, 0.002f} : V{-0.006f, 0, -0.006f}; // Crowfeather Manchettes
+    case 242000: return eye ? V{0, -0.006f, 0.0055f} : V{-0.0065f, 0.001f, -0.007f}; // Ashen Hunter Gloves
+    case 332000: return eye ? V{0.0055f, -0.0005f, 0.006f} : V{-0.0085f, 0.001f, -0.009f}; // Butcher Gloves
+    case 352000: return eye ? V{0, -0.006f, 0.006f} : V{0, 0.001f, -0.0005f}; // Old Hunter Gloves
+    case 372000: return eye ? V{0, 0.006f, -0.0005f} : V{-0.01f, 0.001f, -0.009f}; // Maria Hunter Gloves
+    case 382000: return eye ? V{0.008f, 0.0055f, 0} : V{-0.005f, -0.001f, 0.007f}; // Constable's Gloves
+    case 392000: return eye ? V{0.004f, 0.001f, 0.0075f} : V{-0.0085f, 0.003f, 0.0015f}; // Bloodied Arm Bands
+    default: return {};
+    }
+}
+
 void BuildHeld(F::List& list, const Mapping& map, const std::array<float, 12>& m,
-               const Q::Scene& scene, const Q::Snapshot& snap, s64 now, float scale_m) {
+               const Q::Scene& scene, const Q::Snapshot& snap, s64 now, float scale_m,
+               bool hide_monocular_source, s32 arm_armor = -1) {
     const s32 goods = scene.held_goods;
     const Q::HeldLook look = TunedLook(goods);
     if (VR::GripPreview::Enabled() && (look.model <= 0 || VR::Assets::GetModel(look.model))) {
@@ -2751,15 +3968,23 @@ void BuildHeld(F::List& list, const Mapping& map, const std::array<float, 12>& m
                      look.lift_m, look.out_m, look.side_m);
         }
     }
-    const float k = look.scale * Q::GetQuickSettings().held_scale;
+    // Enlarge these relics only while held, about the existing grip pivot. Storage
+    // keeps the reviewed profile scale; glove drops inherit this scaled draw matrix.
+    const float relic_scale =
+        goods == VR::BeastRoar::Goods ? 1.37f : goods == VR::HunterRelics::Gloves ? 1.20f :
+        goods == VR::ShamanBlade::Goods ? 1.35f : 1.0f;
+    const float k = look.scale * Q::GetQuickSettings().held_scale * relic_scale;
     // The dummy's axes (world, unit) and the grip's centre in its frame.
     const VR::Body::Vec3 dx = VR::Body::Normalize(VR::Body::Vec3{m[0], m[4], m[8]});
     const VR::Body::Vec3 dy = VR::Body::Normalize(VR::Body::Vec3{m[1], m[5], m[9]});
     const VR::Body::Vec3 dz = VR::Body::Normalize(VR::Body::Vec3{m[2], m[6], m[10]});
     const VR::Body::Vec3 origin{m[3], m[7], m[11]};
-    const VR::Body::Vec3 centre_d{VR::Tune::Get("held.cx", Q::GripCentre[0]) + look.side_m,
+    VR::Body::Vec3 centre_d{VR::Tune::Get("held.cx", Q::GripCentre[0]) + look.side_m,
                                   VR::Tune::Get("held.cy", Q::GripCentre[1]) + look.lift_m,
                                   VR::Tune::Get("held.cz", Q::GripCentre[2]) + look.out_m};
+    if (arm_armor >= 0) {
+        centre_d = centre_d + HeldGloveOffset(arm_armor, goods == VR::BlackskyEye::Goods);
+    }
     const auto to_world_dir = [&](VR::Body::Vec3 d) { return dx * d.x + dy * d.y + dz * d.z; };
     // The item's turn in the fist: about its own axis (yaw), then leaning (roll, pitch).
     const float deg = 3.14159265f / 180.0f;
@@ -2786,17 +4011,48 @@ void BuildHeld(F::List& list, const Mapping& map, const std::array<float, 12>& m
     }
     const bool have_model = look.model > 0 && VR::Assets::GetModel(look.model) != nullptr;
     if (const GoodsLook goods_look = GoodsLookOf(goods);
-        !have_model && goods_look.count > 0 && VR::Tune::Get("held.goods_models", 1.0f) >= 0.5f) {
+        goods_look.count > 0 && (goods == VR::HunterRelics::Gloves ||
+        (!have_model && VR::Tune::Get("held.goods_models", 1.0f) >= 0.5f))) {
         // Our model: placed as a game model is (its point (0, hold_y, 0) at the grip's centre).
-        const VR::Body::Vec3 hold_d = VR::Body::Rotate(turn, {look.hold_x * k, look.hold_y * k, look.hold_z * k});
-        const VR::Body::Vec3 at = origin + to_world_dir(centre_d - hold_d);
+        std::array<float, 3> stretch{1.0f, 1.0f, 1.0f};
+        float augur_squeeze = 0.0f;
+        VR::Augur::Use augur_use{};
+        VR::MessengerGift::Use gift_use{};
+        VR::MessengerGift::Visual gift_visual{};
+        if(goods==VR::MessengerGift::Goods) {
+            g_messenger_use.Load(gift_use);
+            gift_visual=VR::MessengerGift::Evaluate(gift_use,scene.held_session_ns,now);
+        }
+        if (goods == VR::Augur::Goods) {
+            g_augur_use.Load(augur_use);
+            augur_squeeze = VR::Augur::ConsumeProgress(augur_use, scene.held_session_ns, now);
+            stretch = VR::Augur::Stretch(augur_squeeze);
+        }
+        // Scale about the grip point, including tuned pivots, so squeezing cannot detach it.
+        const VR::Body::Vec3 hold_d = VR::Body::Rotate(turn,
+            {look.hold_x * k * stretch[0], look.hold_y * k * stretch[1],
+             look.hold_z * k * stretch[2]});
+        const auto draw_in = VR::Augur::DrawIn(augur_use.eaten ? 0.0f : augur_squeeze);
+        const VR::Body::Vec3 at = origin + to_world_dir(centre_d + draw_in - hold_d);
         const Q::V3 c = map.WorldToView(at);
         std::array<Q::V3, 3> cols{};
         for (int a = 0; a < 3; ++a) {
             cols[static_cast<size_t>(a)] =
-                map.DirToView(to_world_dir(axes[static_cast<size_t>(a)])) * k;
+                map.DirToView(to_world_dir(axes[static_cast<size_t>(a)])) * (k * stretch[a]);
         }
         F::Item item{};
+        bool relic_detached=false;
+        item.hide_from_monocular_eye = goods == 1411;
+        std::array<float, 4> eye_uv{};
+        if (goods == VR::BlackskyEye::Goods) {
+            const auto eye = BlackskyEyeTurn(map, scene, now, at, to_world_dir, axes, k);
+            const std::array<Q::V3, 3> base = cols;
+            for (int a = 0; a < 3; ++a) {
+                const auto& t = eye.turn[static_cast<size_t>(a)];
+                cols[static_cast<size_t>(a)] = base[0] * t[0] + base[1] * t[1] + base[2] * t[2];
+            }
+            eye_uv = eye.uv;
+        }
         item.mv = {cols[0].x, cols[1].x, cols[2].x, c.x,       cols[0].y, cols[1].y,
                    cols[2].y, c.y,       cols[0].z, cols[1].z, cols[2].z, c.z};
         for (int i = 0; i < goods_look.count; ++i) {
@@ -2828,17 +4084,110 @@ void BuildHeld(F::List& list, const Mapping& map, const std::array<float, 12>& m
             } else {
                 item.shade = F::Shade::Goods;
                 item.color = {part.tint[0], part.tint[1], part.tint[2], 1.0f};
-                item.uv = {goods == Q::QueenlyBlood ? 1.0f : 0.0f, 0.0f, 1.0f, 1.0f};
+                if(goods==VR::Augur::Goods)item.color[3]=VR::Augur::Visibility(augur_squeeze);
+                item.uv = {goods == VR::MessengerGift::Goods ? 2.0f :
+                               goods == Q::QueenlyBlood ? 1.0f : 0.0f, 0.0f, 1.0f, 1.0f};
                 item.emissive = {glow[0], glow[1], glow[2], 0.0f};
+                if (goods == VR::BlackskyEye::Goods) item.uv = eye_uv;
+                if(goods==VR::HunterRelics::Tonitrus || goods==VR::HunterRelics::Gloves) {
+                    const float charge=scene.hold_from_ns>0 && scene.hold_s>0 && now>=scene.hold_from_ns
+                        ? std::clamp(float(now-scene.hold_from_ns)*1e-9f/scene.hold_s,0.0f,1.0f) : 0.0f;
+                    item.uv={goods==VR::HunterRelics::Tonitrus?3.0f:4.0f,
+                             float(now%100'000'000'000LL)*1e-9f,charge,0.0f};
+                    RelicUse answer{};g_relic_use.Load(answer);
+                    if(answer.goods==goods && answer.used && answer.held_since==scene.held_session_ns &&
+                       now>=answer.ns && now-answer.ns<450*Ms)
+                        item.uv[3]=1.0f-float(now-answer.ns)/float(450*Ms);
+                    if(goods==VR::HunterRelics::Gloves) {
+                        SoftGloveMotion(item,map,scene,now);
+                        relic_detached=DrawGloveDrop(item,map,scene,now);
+                        if(relic_detached)g_soft_glove.Reset();
+                        else GloveContactTick(item,map,scene,now);
+                        // Keep the same spring, toss, release marker and attachment path.
+                        // If loading failed, the original procedural glove remains usable.
+                        if (have_model) {
+                            item.mesh = F::MeshId::Model;
+                            item.tex = F::Tex::Model;
+                            item.tex_key = static_cast<u32>(look.model);
+                            item.shade = F::Shade::Model;
+                            item.soft_glove = true;
+                            item.model_frame = VR::ExecutionerGlove::Frame(charge, relic_detached);
+                            item.emissive[3] = item.uv[3];
+                            // Charging: its symbols light up as it gathers and pulse once it is
+                            // full (2 + glow; vr_inframe.frag), until it leaves the hand.
+                            if (charge > 0.0f && !relic_detached && item.uv[3] <= 0.0f) {
+                                const float rise = charge * charge * (3.0f - 2.0f * charge);
+                                const float beat = float(now % 10'000'000'000LL) * 1e-9f;
+                                const float pulse = charge >= 1.0f
+                                    ? 0.5f + 0.5f * std::sin(beat * 2.0f * 3.14159265f * 1.4f)
+                                    : 0.0f;
+                                item.emissive[3] =
+                                    2.0f + std::clamp(0.62f * rise + 0.38f * pulse, 0.0f, 1.0f);
+                            }
+                        }
+                    }
+                }
+                if(goods==VR::MessengerGift::Goods) {
+                    item.uv[1]=gift_visual.seconds; // -1: intact, no vertex animation
+                    if(gift_visual.active) item.mesh=F::MeshId::MessengerChunks;
+                    // Gravity in the skull's local axes; no world simulation or particle pool.
+                    item.emissive={-to_world_dir(axes[0]).y,-to_world_dir(axes[1]).y,
+                                   -to_world_dir(axes[2]).y,0.0f};
+                    if(gift_visual.active) {
+                        // Capture where hand-sync actually draws the relic, then leave its
+                        // release frame in world space. Later controller motion cannot drag it.
+                        const auto o=map.Carried(at);
+                        std::array<VR::Body::Vec3,3> wc{};
+                        std::array<float,3> down{};
+                        for(int a=0;a<3;++a) {
+                            wc[a]=map.Carried(at+to_world_dir(axes[a])*k)-o;
+                            down[a]=-VR::Body::Normalize(wc[a]).y;
+                        }
+                        const std::array<float,12> pose{wc[0].x,wc[1].x,wc[2].x,o.x,
+                            wc[0].y,wc[1].y,wc[2].y,o.y,wc[0].z,wc[1].z,wc[2].z,o.z};
+                        const bool released=g_messenger_release.Sample(gift_use,map.space_serial,
+                                                                      gift_visual.seconds,pose,down);
+                        if(g_messenger_release.aborted) continue;
+                        if(released) {
+                            const auto& w=g_messenger_release.world;
+                            const auto c0=map.DirToView({w[0],w[4],w[8]});
+                            const auto c1=map.DirToView({w[1],w[5],w[9]});
+                            const auto c2=map.DirToView({w[2],w[6],w[10]});
+                            const auto pos=map.WorldToView({w[3],w[7],w[11]});
+                            item.mv={c0.x,c1.x,c2.x,pos.x,c0.y,c1.y,c2.y,pos.y,c0.z,c1.z,c2.z,pos.z};
+                            const auto& g=g_messenger_release.gravity;
+                            item.emissive={g[0],g[1],g[2],0};
+                        }
+                    }
+                }
             }
-            list.Add(item);
+            if (!VR::Augur::Concealed(augur_squeeze) && item.color[3]>.01f)
+                list.Add(item);
+            if(goods==VR::HunterRelics::Tonitrus && i==0) {
+                AddTonitrusArcs(list,map,item,now);
+                AddTonitrusBridge(list,map,item,scene,now);
+            }
         }
+        if(goods==VR::Augur::Goods)
+            AddAugurSpray(list,map,scene,now,augur_use,at,
+                          {to_world_dir({1,0,0}),to_world_dir({0,1,0}),to_world_dir({0,0,1})});
         // Where it is (the use's sound comes from there), and the hold ring round it.
-        const VR::Body::Vec3 at_c = map.Carried(at);
+        const VR::Body::Vec3 at_c = relic_detached ? map.ViewToWorld({item.mv[3],item.mv[7],item.mv[11]}) : map.Carried(at);
         g_held_place.Store({now, goods, {at_c.x, at_c.y, at_c.z}, {at_c.x, at_c.y, at_c.z},
                             VR::Body::Length(at_c - at) / std::max(map.scale, 1e-3f)});
-        AddHoldRing(list, map, c, std::clamp(0.75f * goods_look.longest * k, 0.06f, 0.14f), scene,
-                    now, true);
+        // Its drawn centre for the eye gate (HeldItemPoint: the Blacksky Eye held to your eye, now
+        // our own eyeball), as the game models' publish theirs.
+        if (const Q::V3 at_tracking = map.ToTracking(at_c);
+            !relic_detached && std::isfinite(at_tracking.x) && std::isfinite(at_tracking.y) &&
+            std::isfinite(at_tracking.z)) {
+            g_held_point.Store({now, map.space_serial, goods,
+                                {at_tracking.x, at_tracking.y, at_tracking.z}});
+        }
+        if (!VR::Augur::Concealed(augur_squeeze) && !relic_detached &&
+            !(goods==VR::MessengerGift::Goods &&
+              (gift_visual.active || VR::MessengerGift::Hidden(now))))
+            AddHoldRing(list, map, c, std::clamp(0.75f * goods_look.longest * k, 0.06f, 0.14f), scene,
+                        now, true);
         if (g_log >= 1 && g_held_logged != goods) {
             g_held_logged = goods;
             LOG_INFO(Core, "VR quick: held {} = our model (mesh {}, {} parts, grip {})", goods,
@@ -2847,24 +4196,175 @@ void BuildHeld(F::List& list, const Mapping& map, const std::array<float, 12>& m
         return;
     }
     if (have_model) {
-        // Model space -> dummy: centre + turn * (k * (p - hold)); -> world -> the camera's view.
-        const VR::Body::Vec3 hold_d = VR::Body::Rotate(turn, {look.hold_x * k, look.hold_y * k, look.hold_z * k});
-        const VR::Body::Vec3 at = origin + to_world_dir(centre_d - hold_d);
+        // The Hand Lantern (core/vr/hand_lantern.h): bigger in the hand, and hanging from its
+        // handle in the fist, its body below the hand whatever the wrist does, swinging as the
+        // hand moves and the hunter turns. Its model stands along +Y with the handle at the top
+        // (the grip's hold point): +Y is turned onto the pendulum's up about that point.
+        const bool lantern = goods == VR::HandLantern::Goods;
+        // Beast Roar (core/vr/beast_roar.h): the clench while the trigger is held, the burst on
+        // the game's use; its palette frame and a motion of the claw about the wrist.
+        VR::BeastRoar::Pose roar{};
+        VR::BeastRoar::Use roar_use{};
+        const bool beast = goods == VR::BeastRoar::Goods;
+        if (beast) {
+            g_beast_roar_use.Load(roar_use);
+            roar = VR::BeastRoar::Evaluate(now, scene.roar_charge_ns, roar_use);
+        }
+        const float km = lantern ? k * VR::Tune::Get("held.1412.big", VR::HandLantern::HeldScale)
+                                 : k * roar.scale;
+        // Model space -> dummy: centre + turn * (km * (p - hold)); -> world -> the camera's view.
+        const VR::Body::Vec3 hold_d =
+            VR::Body::Rotate(turn, {look.hold_x * km, look.hold_y * km, look.hold_z * km});
+        const VR::Body::Vec3 pivot = origin + to_world_dir(centre_d);
+        std::array<VR::Body::Vec3, 3> world_axes{to_world_dir(axes[0]), to_world_dir(axes[1]),
+                                                 to_world_dir(axes[2])};
+        VR::Body::Vec3 hold_w = to_world_dir(hold_d);
+        if (lantern) {
+            VR::HandLantern::Pendulum::Config swing{};
+            swing.length_m = VR::Tune::Get("held.1412.swing_m", swing.length_m);
+            swing.damping = VR::Tune::Get("held.1412.damping", swing.damping);
+            swing.body_accel = VR::Tune::Get("held.1412.run_accel", swing.body_accel);
+            // The swing's pivot where the hand sync draws it (this camera update's), and the
+            // body's share of its motion since the last update: where the point of your play
+            // space at its last place went (the hunter running, turning). The rest is the
+            // hand's own.
+            const VR::Body::Vec3 pivot_c = map.Carried(pivot);
+            const VR::Body::Vec3 body = g_lantern_swing_seen
+                                            ? map.ToWorld(g_lantern_swing_track) - g_lantern_swing_pivot
+                                            : VR::Body::Vec3{};
+            const auto up = g_lantern_swing.Step(swing, {pivot_c.x, pivot_c.y, pivot_c.z},
+                                                 {body.x, body.y, body.z},
+                                                 static_cast<double>(now) * 1e-9);
+            g_lantern_swing_pivot = pivot_c;
+            g_lantern_swing_track = map.ToTracking(pivot_c);
+            g_lantern_swing_seen = true;
+            const VR::Body::Quat hang = VR::Body::FromTo(world_axes[1], {up[0], up[1], up[2]});
+            for (auto& a : world_axes) {
+                a = VR::Body::Rotate(hang, a);
+            }
+            hold_w = VR::Body::Rotate(hang, hold_w);
+        } else {
+            g_lantern_swing.Reset();
+            g_lantern_swing_seen = false;
+        }
+        if (beast && (roar.pitch != 0.0f || roar.yaw != 0.0f)) {
+            const VR::Body::Quat flick = VR::Body::AxisAngle(world_axes[0], roar.pitch) *
+                                         VR::Body::AxisAngle(world_axes[1], roar.yaw);
+            for (auto& a : world_axes) {
+                a = VR::Body::Rotate(flick, a);
+            }
+            hold_w = VR::Body::Rotate(flick, hold_w);
+        }
+        const VR::Body::Vec3 at = pivot - hold_w + world_axes[2] * roar.push_m;
         F::Item item{};
         item.mesh = F::MeshId::Model;
+        item.hide_from_monocular_eye = goods == 1411;
         item.tex = F::Tex::Model;
         item.tex_key = static_cast<u32>(look.model);
         item.shade = F::Shade::Model;
+        if (beast) {
+            item.model_frame = roar.frame;
+            item.model_blend_frame = roar.blend_frame;
+            item.model_blend_weight = roar.blend_weight;
+        }
         const Q::V3 c = map.WorldToView(at);
         std::array<Q::V3, 3> cols{};
         for (int a = 0; a < 3; ++a) {
-            cols[static_cast<size_t>(a)] =
-                map.DirToView(to_world_dir(axes[static_cast<size_t>(a)])) * k;
+            cols[static_cast<size_t>(a)] = map.DirToView(world_axes[static_cast<size_t>(a)]) * km;
         }
         item.mv = {cols[0].x, cols[1].x, cols[2].x, c.x,       cols[0].y, cols[1].y,
                    cols[2].y, c.y,       cols[0].z, cols[1].z, cols[2].z, c.z};
         item.color = {1.0f, 1.0f, 1.0f, 1.0f};
         item.emissive = glow;
+        if (goods == VR::OldHunterBone::Goods) {
+            VR::OldHunterBone::Use use{};
+            g_old_bone_use.Load(use);
+            const float pulse = VR::OldHunterBone::Pulse(use, scene.held_session_ns, now);
+            item.emissive[0] += pulse * .30f;
+            item.emissive[1] += pulse * .40f;
+            item.emissive[2] += pulse * .52f;
+        }
+        if (goods == VR::CallBeyond::Goods) {
+            VR::CallBeyond::Answer answer{};
+            g_call_beyond_answer.Load(answer);
+            const auto v = VR::CallBeyond::Evaluate(scene.call_beyond, answer, now);
+            item.model_frame = v.frame;
+            // vr.ini call_beyond_fade_s: the colour back over it once cast, 0.4 of it let go.
+            // Cast, the world stays gathered until its first stars show (HeldGray), and
+            // call_beyond_bright lifts it, pale and luminous, with the gray.
+            const bool answered = VR::CallBeyond::CurrentAnswer(scene.call_beyond, answer, now) &&
+                                  answer.used;
+            const bool cast = answered && now - answer.ns < std::max(VR::CallBeyond::RecoveryNs,
+                                                                     VR::CallBeyond::StarWaitNs);
+            const float fade_s = VR::GetSettings().call_beyond_fade_s * (cast ? 1.0f : 0.4f);
+            const float gathered = VR::CallBeyond::HeldGray(
+                v.world_gray, answered, answer.ns,
+                VR::CallBeyond::star_ns.load(std::memory_order_acquire), now);
+            list.world_gray = g_call_beyond_gray.Update(now, scene.call_beyond.session_ns,
+                                                        gathered,
+                                                        static_cast<s64>(fade_s * 1e9f));
+            // Raised, it flares (call_beyond_flash) to the stars' pale light; a new gathering is
+            // gray again.
+            const auto& vr = VR::GetSettings();
+            const float flash =
+                v.world_gray > 0.0f ? 0.0f : VR::CallBeyond::Flash(answered, answer.ns, now);
+            list.world_bright = vr.call_beyond_bright +
+                                std::max(0.0f, vr.call_beyond_flash - vr.call_beyond_bright) * flash;
+            list.world_flash = vr.call_beyond_flash > 0.0f ? flash : 0.0f;
+            item.keep_charge_color = true;
+            item.emissive[0] += v.glow * .48f;
+            item.emissive[1] += v.glow * .72f;
+            item.emissive[2] += v.glow * 1.2f;
+        }
+        VR::AugurCreature::Visual augur_visual{};
+        VR::Augur::Use augur_use{};
+        if (goods == VR::Augur::Goods && look.model == VR::AugurCreature::Model) {
+            g_augur_use.Load(augur_use);
+            augur_visual = VR::AugurCreature::Evaluate(augur_use, scene.held_session_ns,
+                                                      scene.augur_charge_ns, now);
+            item.model_frame = augur_visual.frame;
+            item.model_blend_frame = augur_visual.blend_frame;
+            item.model_blend_weight = augur_visual.blend_weight;
+            const auto stretch = VR::AugurCreature::Stretch(augur_visual.crush);
+            const auto offset = VR::AugurCreature::Offset(augur_visual.crush);
+            for (int row = 0; row < 3; ++row) {
+                const int r = row * 4;
+                item.mv[r+3] += item.mv[r]*offset[0] + item.mv[r+1]*offset[1] + item.mv[r+2]*offset[2];
+                for (int a = 0; a < 3; ++a) item.mv[r+a] *= stretch[a];
+            }
+            AddAugurSpray(list, map, scene, now, augur_use, at,
+                          {to_world_dir({1,0,0}),to_world_dir({0,1,0}),to_world_dir({0,0,1})});
+        }
+        // Beast Roar taking root (the game's use, after the clench): a faint deep-red smoulder in
+        // the claw and a burst round it of embers, soot, ash flakes and a few sparks, the Augur's
+        // burst in style 1 (vr_inframe.vert/frag). No smoke at the hand, so nothing hides the
+        // claw; the game's own roar effect is untouched.
+        const bool roar_burst = beast && roar_use.count != 0 &&
+                                roar_use.ns >= scene.roar_charge_ns && now >= roar_use.ns;
+        if (roar_burst) {
+            const float a = static_cast<float>(now - roar_use.ns) * 1e-9f;
+            const float flare =
+                a < 0.9f ? std::exp(-a / 0.22f) * (1.0f - std::exp(-a / 0.02f)) : 0.0f;
+            item.emissive[0] += flare * .19f;
+            item.emissive[1] += flare * .015f;
+            item.emissive[2] += flare * .004f;
+        }
+        // Lit in the hand: a candle burns in it (Item::candle: its light inside the cage and its
+        // flame, AddCandleFlame; the light round it is the game's own lantern effect on the
+        // palm), flickering a little, the flame stretching with it.
+        const bool candle = lantern && g_lantern_light.load(std::memory_order_relaxed);
+        float candle_strength = 0.0f;
+        float flame_height = 1.0f;
+        if (candle) {
+            const double t = static_cast<double>(now) * 1e-9;
+            candle_strength = VR::Tune::Get("held.1412.candle", 1.0f) *
+                              (0.90f + 0.07f * static_cast<float>(std::sin(t * 7.3)) +
+                               0.03f * static_cast<float>(std::sin(t * 17.1 + 1.3)));
+            flame_height = 1.0f + 0.08f * static_cast<float>(std::sin(t * 5.9 + 0.4)) +
+                           0.04f * static_cast<float>(std::sin(t * 13.3));
+            item.candle = true;
+            item.emissive = {candle_strength, 0.0f, 0.0f, 0.0f};
+        }
         item.emissive[3] = look.hold_y; // the shader lights it like the hand there
         // Cosmetic bottle replacement; original bounds, grip transform and throw origin stay intact.
         if (look.model == 10010 && VR::Tune::Get("held.molotov_look", 1.0f) >= 0.5f) {
@@ -2897,8 +4397,94 @@ void BuildHeld(F::List& list, const Mapping& map, const std::array<float, 12>& m
             item.uv = chamber;
             item.emissive = {0.0f, 0.0f, static_cast<float>(liquid_profile), look.hold_y};
         }
-        list.Add(item);
+        // DIBR has only one centre-eye source for both eyes. When the eyepiece is at an eye,
+        // leaving the tube in that source would magnify it into the optical view. Hide it from
+        // the shared source while the optic is active; native stereo still hides only one eye.
+        const bool dibr_optic = goods == 1411 && hide_monocular_source;
+        if (!dibr_optic && augur_visual.visible) list.Add(item);
+        // The roar's burst after the claw: its embers in front of it draw over it.
+        if (roar_burst)
+            AddSprayBurst(list, map, scene, now, {roar_use.ns, scene.held_session_ns, false}, at,
+                          {to_world_dir({1,0,0}),to_world_dir({0,1,0}),to_world_dir({0,0,1})},
+                          g_roar_spray, 1.0f);
+        if (candle) {
+            AddCandleFlame(list, map, at + world_axes[1] * (-0.008f * km), world_axes[1], km,
+                           candle_strength, flame_height);
+        }
+        if (goods == 1411) {
+            // The native tube runs along model +X. Its +X cap faces the thumb in the
+            // approved hold; inset glass makes that cap read as the eyepiece. The existing
+            // native texture and the opposite end stay intact.
+            F::Item glass = item;
+            glass.mesh = F::MeshId::Plate;
+            glass.tex = F::Tex::None;
+            glass.shade = F::Shade::Lit;
+            glass.color = {0.27f, 0.40f, 0.44f, 1.0f};
+            glass.emissive = {0.02f, 0.04f, 0.05f, 0.0f};
+            constexpr VR::Body::Vec3 Eyepiece{0.063f, 0.0f, 0.006f};
+            for (int row = 0; row < 3; ++row) {
+                const int at = 4 * row;
+                // Plate's +Z normal points along the tube's +X; its round face is 32 mm wide.
+                glass.mv[at + 3] = item.mv[at + 3] +
+                                    item.mv[at] * Eyepiece.x +
+                                    item.mv[at + 1] * Eyepiece.y +
+                                    item.mv[at + 2] * Eyepiece.z;
+                glass.mv[at] = item.mv[at + 1] * 0.04f;
+                glass.mv[at + 1] = item.mv[at + 2] * 0.04f;
+                glass.mv[at + 2] = item.mv[at] * 0.008f;
+            }
+            if (!dibr_optic) list.Add(glass);
+            const VR::Body::Vec3 lens_d = centre_d + VR::Body::Rotate(turn, Eyepiece * k) - hold_d;
+            const VR::Body::Vec3 lens_world = map.Carried(origin + to_world_dir(lens_d));
+            const Q::V3 lens_tracking = map.ToTracking(lens_world);
+            if (std::isfinite(lens_tracking.x) && std::isfinite(lens_tracking.y) &&
+                std::isfinite(lens_tracking.z)) {
+                g_monocular_lens.Store({now, map.space_serial,
+                                        {lens_tracking.x, lens_tracking.y, lens_tracking.z}});
+            }
+        }
         if (const auto model = VR::Assets::GetModel(look.model)) {
+            if (goods == VR::ShamanBlade::Goods) {
+                // Native s10020 curves toward +Y at its -Z tip (the extrema share one vertex).
+                // Use the drawn placement, including that upturned tip.
+                const auto world = [&](float y, float z) {
+                    const VR::Body::Vec3 local{look.hold_x,y,z};
+                    return map.Carried(origin + to_world_dir(centre_d +
+                        VR::Body::Rotate(turn,local*k)-hold_d));
+                };
+                const BladeSample next{now,scene.held_session_ns,map.space_serial,
+                                       world(look.hold_y,-.025f),
+                                       world(model->max[1],model->min[2])};
+                const bool fresh = g_blade_sample.session==next.session &&
+                    g_blade_sample.space==next.space && now>g_blade_sample.ns &&
+                    now-g_blade_sample.ns<=VR::ShamanBlade::MaxAgeNs;
+                // Each stroke's outcome in the log (the headset run had none to read).
+                if (scene.blade_stroke != 0 && scene.blade_stroke != g_blade_logged_stroke) {
+                    if (g_blade_logged_stroke != 0 && !g_blade_touched)
+                        LOG_INFO(Core, "VR quick: Bone Blade stroke #{}: touched no enemy",
+                                 g_blade_logged_stroke);
+                    g_blade_logged_stroke = scene.blade_stroke;
+                    g_blade_touched = false;
+                }
+                if (fresh && now-g_blade_sample.ns>=4*Ms &&
+                    scene.blade_active_ns>0 && now>=scene.blade_active_ns &&
+                    now-scene.blade_active_ns<=VR::ShamanBlade::MaxAgeNs && scene.blade_stroke &&
+                    !(g_blade_last_contact.session==next.session &&
+                      g_blade_last_contact.space==next.space &&
+                      g_blade_last_contact.stroke==scene.blade_stroke)) {
+                    VR::Body::Vec3 hit{};
+                    u32 target=VR::ShamanBlade::NoTarget;
+                    if (ItemBladeContact(g_blade_sample.a,g_blade_sample.b,next.a,next.b,map.scale,hit,target)) {
+                        g_blade_last_contact={now,next.session,scene.blade_stroke,next.space,hit,target,next.a};
+                        Q::PublishBladeContact(g_blade_last_contact);
+                        g_blade_touched = true;
+                        LOG_INFO(Core, "VR quick: Bone Blade stroke #{}: touched enemy {:#x}",
+                                 scene.blade_stroke, target);
+                    }
+                }
+                if (!fresh || now-g_blade_sample.ns>=4*Ms) g_blade_sample=next;
+            }
+
             const VR::Body::Vec3 mid{0.5f * (model->min[0] + model->max[0]),
                                      0.5f * (model->min[1] + model->max[1]),
                                      0.5f * (model->min[2] + model->max[2])};
@@ -2909,6 +4495,12 @@ void BuildHeld(F::List& list, const Mapping& map, const std::array<float, 12>& m
             const VR::Body::Vec3 w_c = map.Carried(w);
             g_held_place.Store({now, goods, {at_c.x, at_c.y, at_c.z}, {w_c.x, w_c.y, w_c.z},
                                 VR::Body::Length(at_c - at) / std::max(map.scale, 1e-3f)});
+            const Q::V3 w_tracking = map.ToTracking(w_c);
+            if (std::isfinite(w_tracking.x) && std::isfinite(w_tracking.y) &&
+                std::isfinite(w_tracking.z)) {
+                g_held_point.Store({now, map.space_serial, goods,
+                                    {w_tracking.x, w_tracking.y, w_tracking.z}});
+            }
             // quick_hold_use: the ring round the model (its longest side, within 6 .. 14 cm).
             const float longest =
                 k * std::max({model->max[0] - model->min[0], model->max[1] - model->min[1],
@@ -3037,6 +4629,13 @@ constexpr float DrainFilm = 0.30f; // the red film's strength on the drained gla
 // Depth-tested a millimetre nearer: drawn over the game's vial if it lingers a frame at the
 // hand-over, still under the fingers round it.
 constexpr float DrainPull = 0.001f;
+// The empty syringe in the right fist (BloodDrawRows): its seat in R_Weapon's dummy (metres) and
+// its turn (degrees about x, then z, then y), held as a dagger, the needle below the little finger.
+// Measured in the mock (2026-11-04, live bd.* tuning): turned over, the plunger's cap just above
+// the thumb and the glass below the little finger, where the blood is seen rising; 5 cm down the
+// dummy's +Y puts the fist on the barrel's top third.
+constexpr std::array<float, 3> BloodDrawSeat{0.0f, 0.05f, 0.0f};
+constexpr std::array<float, 3> BloodDrawTurn{180.0f, 0.0f, 0.0f};
 struct DrainLog {
     u64 word{0};
     int stage{0}; // 1 first frame, 2 half, 3 empty
@@ -3194,6 +4793,93 @@ std::array<float, 3> AddVialNeedle(F::List& list, const std::array<float, 12>& v
 }
 
 // Whether the needle goes on our vial this camera update (core/vr/vial_needle.h NeedleVisible).
+// The right hand's empty syringe (core/vr/blood_draw.h; the presenter's scene): the Blood Vial's
+// antique syringe in his right fist at R_Weapon's dummy (the fist's centre; the weapon is put
+// away meanwhile), held as a dagger, its needle out of the little finger's side; the blood rises
+// in it as it draws. Its tip goes back to the presenter's stab gate on the right grip
+// (BloodDraw::ContactChannel). VR_TUNE_FILE keys (tests): bd.cx / bd.cy / bd.cz (metres in the
+// dummy's frame), bd.rx / bd.ry / bd.rz (degrees), bd.fill (0..1: a fixed level).
+VR::Held::Liquid::Motion g_blood_draw_liquid{};
+bool NeedleOn(bool ours, bool model, bool menu);
+std::array<float, 12> BloodDrawRows(const Mapping& map, const std::array<float, 12>& m) {
+    const VR::Body::Vec3 dx = VR::Body::Normalize(VR::Body::Vec3{m[0], m[4], m[8]});
+    const VR::Body::Vec3 dy = VR::Body::Normalize(VR::Body::Vec3{m[1], m[5], m[9]});
+    const VR::Body::Vec3 dz = VR::Body::Normalize(VR::Body::Vec3{m[2], m[6], m[10]});
+    const VR::Body::Vec3 origin{m[3], m[7], m[11]};
+    const auto to_world_dir = [&](VR::Body::Vec3 d) { return dx * d.x + dy * d.y + dz * d.z; };
+    const float deg = 3.14159265f / 180.0f;
+    const VR::Body::Quat turn =
+        VR::Body::AxisAngle({1.0f, 0.0f, 0.0f}, VR::Tune::Get("bd.rx", BloodDrawTurn[0]) * deg) *
+        VR::Body::AxisAngle({0.0f, 0.0f, 1.0f}, VR::Tune::Get("bd.rz", BloodDrawTurn[2]) * deg) *
+        VR::Body::AxisAngle({0.0f, 1.0f, 0.0f}, VR::Tune::Get("bd.ry", BloodDrawTurn[1]) * deg);
+    const VR::Body::Vec3 at = origin + to_world_dir({VR::Tune::Get("bd.cx", BloodDrawSeat[0]),
+                                                     VR::Tune::Get("bd.cy", BloodDrawSeat[1]),
+                                                     VR::Tune::Get("bd.cz", BloodDrawSeat[2])});
+    const Q::V3 c = map.WorldToView(at);
+    std::array<Q::V3, 3> cols{};
+    for (int a = 0; a < 3; ++a) {
+        VR::Body::Vec3 axis{};
+        (a == 0 ? axis.x : a == 1 ? axis.y : axis.z) = 1.0f;
+        cols[static_cast<size_t>(a)] = map.DirToView(to_world_dir(VR::Body::Rotate(turn, axis)));
+    }
+    return {cols[0].x, cols[1].x, cols[2].x, c.x,       cols[0].y, cols[1].y,
+            cols[2].y, c.y,       cols[0].z, cols[1].z, cols[2].z, c.z};
+}
+void BuildBloodDraw(F::List& list, const Mapping& map, const std::array<float, 12>& m, s64 now,
+                    const VR::BloodDraw::Scene& scene) {
+    namespace L = VR::Held::Liquid;
+    const auto model = VR::Assets::GetModel(DrainModel);
+    if (!model) {
+        return;
+    }
+    float shown = std::clamp(scene.fill, 0.0f, 1.0f);
+    if (const float test = VR::Tune::Get("bd.fill", -1.0f); test >= 0.0f) shown = std::min(test, 1.0f);
+    const auto rows = BloodDrawRows(map, m);
+    F::Item item{};
+    item.mv = rows;
+    // The syringe's look as the Blood Vial's (BuildVialDrain's drain.look): fitted to the vial's
+    // model, its chamber's blood level `shown`, a clean glass above it (no film: never used).
+    constexpr float bottom = 0.0352f, top = 0.1408f, radius = 0.0146f;
+    const float y0 = model->min[1], y1 = model->max[1];
+    const float fit = (y1 - y0) / 0.176f;
+    const float cx = 0.5f * (model->min[0] + model->max[0]), cz = 0.5f * (model->min[2] + model->max[2]);
+    for (int r = 0; r < 3; ++r) {
+        item.mv[4 * r + 3] += item.mv[4 * r] * cx + item.mv[4 * r + 1] * y0 + item.mv[4 * r + 2] * cz;
+        for (int a = 0; a < 3; ++a) item.mv[4 * r + a] *= fit;
+    }
+    const auto normal = LiquidSurface(g_blood_draw_liquid, map, item.mv, 0.5f * (bottom + top), now);
+    const float distance = L::Plane(normal, radius, (top - bottom) * 0.5f, shown * 0.87f);
+    item.mesh = F::MeshId::Syringe;
+    item.tex = F::Tex::None;
+    item.shade = F::Shade::Syringe;
+    item.color = {normal[0], normal[1], normal[2], distance};
+    item.uv = {bottom, top, radius, shown};
+    // z: minus the blood coming in through the needle (ShadeSyringeFn's swirl; a film is never
+    // used on the syringe, so its sign tells them apart).
+    item.emissive = {0.0f, 0.0f, -VR::BloodDraw::Inflow(scene.phase, shown), -y0 / fit};
+    item.depth_pull = DrainPull;
+    list.Add(item);
+    AddVialNeedle(list, rows, *model, now, NeedleOn(true, true, false));
+    const auto tip_view = AddVialNeedle(list, rows, *model, now, false);
+    VR::Body::BodyStatus body{};
+    if (VR::Body::LatestBodyStatus(body) && body.driven && body.injection_body.right_grip_valid) {
+        // In the right grip's own frame: the XR thread applies its current pose each frame.
+        const auto point =
+            map.ToTracking(map.Carried(map.ViewToWorld({tip_view[0], tip_view[1], tip_view[2]})));
+        VR::VialContact::Sample contact{};
+        contact.valid = true;
+        contact.ns = now;
+        contact.space = map.space_serial;
+        contact.tip = {point.x, point.y, point.z};
+        contact.body = body.injection_body;
+        contact.grip_local = true;
+        contact.grip_offset = VR::Body::Rotate(
+            VR::Body::Conjugate(VR::Body::Normalize(contact.body.right_grip_q)),
+            contact.tip - contact.body.right_grip_p);
+        VR::BloodDraw::ContactChannel().Store(contact);
+    }
+}
+
 bool NeedleOn(bool ours, bool model, bool menu) {
     VR::Held::NeedleInputs in{};
     in.setting = VR::GetSettings().vial_needle;
@@ -3510,6 +5196,34 @@ void BuildMusicBox(F::List& list, const Mapping& map, const VR::MusicBox::Scene&
     list.Add(knob);
 }
 
+// H2, the game's bullet launch (LaunchHook): for physical throws and for melee_deflect (every
+// enemy bullet's launch). Once; VR_THROW_H2_OFF never. With quick items off or not installed it
+// serves melee_deflect alone (LaunchHook returns after DeflectLaunch while !g_ready).
+bool InstallLaunchHook(u8* module) {
+    if (g_launch_hook) {
+        return true;
+    }
+    if (std::getenv("VR_THROW_H2_OFF") != nullptr) {
+        return false;
+    }
+    u8* const site = module + LaunchRva;
+    if (!Hook::MakeWritable(site, LaunchLen)) {
+        LOG_ERROR(Core, "VR quick: could not make the launch site writable");
+        return false;
+    }
+    try {
+        g_code = std::make_unique<Xbyak::CodeGenerator>(1024);
+        void* const stub = Hook::EmitHostCallStub(
+            *g_code, reinterpret_cast<void*>(&LaunchHook), LaunchCtxSig.data() + LaunchSiteOffset,
+            LaunchLen, reinterpret_cast<u64>(site + LaunchLen), Xbyak::util::r14);
+        Hook::WriteJump(site, LaunchLen, stub);
+        g_launch_hook = true;
+    } catch (const Xbyak::Error& e) {
+        LOG_ERROR(Core, "VR quick: launch hook not generated ({})", e.what());
+    }
+    return g_launch_hook;
+}
+
 } // Anonymous namespace
 
 void QueueQuickUseSound(s32 goods, s32 use_anim) {
@@ -3527,10 +5241,6 @@ void InstallQuickItems(VAddr base, u64 size) {
         return;
     }
     const auto& qs = Q::GetQuickSettings();
-    if (!qs.quick_items) {
-        LOG_INFO(Core, "VR quick: quick_items=0, not installed (Y is Square)");
-        return;
-    }
     auto* const module = reinterpret_cast<u8*>(base);
     if (size < MenuManRva + 8) {
         LOG_INFO(Core, "VR quick: eboot too small ({:#x}) for Bloodborne 1.09; not installed",
@@ -3540,6 +5250,25 @@ void InstallQuickItems(VAddr base, u64 size) {
     const auto matches = [module](u64 rva, const auto& sig) {
         return std::memcmp(module + rva, sig.data(), sig.size()) == 0;
     };
+    // melee_deflect needs only the launch hook: with quick items off or not installed, it is
+    // installed for deflection alone (it had none then, while its own line said "on").
+    const auto deflect_alone = [&](const char* why) {
+        if (!DeflectWanted()) {
+            return;
+        }
+        const bool launch = matches(LaunchCtxRva, LaunchCtxSig);
+        if (launch && InstallLaunchHook(module)) {
+            LOG_INFO(Core, "VR quick: {}; the launch hook installed for melee_deflect alone", why);
+        } else {
+            LOG_WARNING(Core, "VR quick: {}; melee_deflect has no launch hook (launch {}): no "
+                              "bullet is deflected", why, launch ? "not hooked" : "MISMATCH");
+        }
+    };
+    if (!qs.quick_items) {
+        LOG_INFO(Core, "VR quick: quick_items=0, not installed (Y is Square)");
+        deflect_alone("quick_items=0");
+        return;
+    }
     const auto verdict = [](bool ok) { return ok ? "ok" : "MISMATCH"; };
     const bool use_ok = matches(UseGoodsRva, UseGoodsSig);
     const bool menu_ok = matches(MenuManLeaRva, MenuManLeaSig);
@@ -3570,6 +5299,7 @@ void InstallQuickItems(VAddr base, u64 size) {
         LOG_WARNING(Core,
                     "VR quick: usegoods={} menuman={} goodsrow={}: NOT installed (Y is Square)",
                     verdict(use_ok), verdict(menu_ok), verdict(row_ok));
+        deflect_alone("quick items not installed");
         return;
     }
     g_base = module;
@@ -3605,6 +5335,10 @@ void InstallQuickItems(VAddr base, u64 size) {
         g_fake_target = std::sscanf(value, "%f,%f,%f", &m[0], &m[1], &m[2]) == 3;
     }
     g_markers = std::getenv("VR_QUICK_MARKERS") != nullptr;
+    if (const char* value = std::getenv("VR_SOLID_SHAPES"); value != nullptr) {
+        const std::string_view v{value};
+        g_solid_shapes = v == "new" ? 2 : v == "old" ? 3 : v == "0" ? 0 : 1;
+    }
     if (const char* value = std::getenv("VR_BURST_TEST"); value != nullptr) {
         g_burst_test_ms = std::max(std::atoi(value), 1);
     }
@@ -3619,33 +5353,35 @@ void InstallQuickItems(VAddr base, u64 size) {
             LOG_WARNING(Core, "VR quick: VR_QUICK_TEST_GIVE: AddItem signature MISMATCH");
         }
     }
-    // H2: only for physical throws.
-    if (qs.throws && launch_ok && std::getenv("VR_THROW_H2_OFF") == nullptr) {
-        u8* const site = module + LaunchRva;
-        if (!Hook::MakeWritable(site, LaunchLen)) {
-            LOG_ERROR(Core, "VR quick: could not make the launch site writable");
-        } else {
-            try {
-                g_code = std::make_unique<Xbyak::CodeGenerator>(1024);
-                void* const stub = Hook::EmitHostCallStub(
-                    *g_code, reinterpret_cast<void*>(&LaunchHook),
-                    LaunchCtxSig.data() + LaunchSiteOffset, LaunchLen,
-                    reinterpret_cast<u64>(site + LaunchLen), Xbyak::util::r14);
-                Hook::WriteJump(site, LaunchLen, stub);
-                g_launch_hook = true;
-            } catch (const Xbyak::Error& e) {
-                LOG_ERROR(Core, "VR quick: launch hook not generated ({})", e.what());
-            }
+    // H2: for physical throws, and for melee_deflect (every enemy bullet's launch).
+    const bool deflect = DeflectWanted();
+    if ((qs.throws || deflect) && launch_ok) {
+        InstallLaunchHook(module);
+    }
+    // Who the launch hook serves, or what goes without it.
+    std::string launch;
+    if (!qs.throws && !deflect) {
+        launch = "off (quick_throw=0: the game's own throw)";
+    } else {
+        std::string users;
+        if (qs.throws) {
+            users = g_launch_hook ? "physical throws" : "throws fly the game's way";
         }
+        if (deflect) {
+            users += users.empty() ? "" : ", ";
+            users += g_launch_hook ? "melee_deflect" : "no bullet is deflected";
+        }
+        launch = fmt::format("{} ({})",
+                             g_launch_hook ? "hooked"
+                             : launch_ok   ? "not hooked" // VR_THROW_H2_OFF or a failed patch
+                                           : "MISMATCH",
+                             users);
     }
     LOG_INFO(Core,
              "VR quick: installed: siteA ok usegoods ok goodsrow ok canuse {} hudbytes {} "
              "dmypoly {} quantity store {} launch {} throw sound {}{}{}{}",
              can_ok ? "ok" : "skip", dpad_ok ? "ok" : "skip", dmy_ok ? "ok" : "MISMATCH (no arc)",
-             qty_ok ? "original" : "patched (Infinite Items?)",
-             g_launch_hook ? "hooked (physical throws)"
-             : !qs.throws  ? "off (quick_throw=0: the game's own throw)"
-                           : "MISMATCH (throws fly the game's way)",
+             qty_ok ? "original" : "patched (Infinite Items?)", launch,
              g_play_sound == nullptr ? "MISMATCH" : qs.throw_sound ? "ok" : "off",
              g_log > 0 ? fmt::format(" log={}", g_log) : std::string{},
              std::string{g_dry_run ? " DRY RUN" : ""} + (g_trace_on ? " TRACE" : "") +
@@ -3657,6 +5393,109 @@ void InstallQuickItems(VAddr base, u64 size) {
 
 bool QuickItemsReady() {
     return g_ready;
+}
+
+float CallBeyondSqueeze(s64 now_ns) {
+    Q::Scene scene{};
+    VR::CallBeyond::Answer answer{};
+    if (!Q::LatestScene(scene)) return 0.0f;
+    g_call_beyond_answer.Load(answer);
+    return VR::CallBeyond::Evaluate(scene.call_beyond, answer, now_ns).squeeze;
+}
+
+float AugurSqueeze(s64 now_ns) {
+    Q::Scene scene{};
+    VR::Augur::Use use{};
+    if (!Q::LatestScene(scene) || scene.held_goods != VR::Augur::Goods)
+        return 0.0f;
+    g_augur_use.Load(use);
+    return VR::AugurCreature::Evaluate(use, scene.held_session_ns,
+                                       scene.augur_charge_ns, now_ns).squeeze;
+}
+
+float MessengerSqueeze(s64 now_ns) {
+    Q::Scene scene{};
+    VR::MessengerGift::Use use{};
+    if(!Q::LatestScene(scene) || scene.held_goods!=VR::MessengerGift::Goods) return 0.0f;
+    g_messenger_use.Load(use);
+    return VR::MessengerGift::Evaluate(use,scene.held_session_ns,now_ns).squeeze;
+}
+
+float GloveHandOpen(s64 now_ns) {
+    Q::Scene scene{};VR::HunterRelics::DropPlan plan{};RelicUse answer{};
+    if(!Q::LatestScene(scene) || scene.held_goods!=VR::HunterRelics::Gloves ||
+       !Q::LatestRelicDrop(plan))return 0;
+    g_relic_use.Load(answer);
+    const bool same=answer.goods==VR::HunterRelics::Gloves && answer.held_since==scene.held_session_ns;
+    return VR::HunterRelics::GloveVisual(plan,scene.held_session_ns,
+        VR::HunterRelics::Matches(scene.relic_drop,plan.request),same?answer.ns:0,
+        same&&answer.used,now_ns).open;
+}
+
+bool LanternLightInHand() {
+    return g_lantern_light.load(std::memory_order_relaxed);
+}
+
+bool LanternModelHidden() {
+    return g_lantern_hide.load(std::memory_order_relaxed);
+}
+
+bool LanternJustPutOut() {
+    const s64 out = g_lantern_out_ns.load(std::memory_order_relaxed);
+    if (out == 0) {
+        return false;
+    }
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    return now - out < VR::HandLantern::GlowAloneNs;
+}
+
+float BeastRoarScreenStrength(s64 now_ns) {
+    VR::BeastRoar::Use use{};
+    if (!g_beast_roar_use.Load(use) || !use.count || now_ns < use.ns) return 0.0f;
+    const float age = static_cast<float>(now_ns - use.ns) * 1e-9f;
+    if (age >= .30f) return 0.0f;
+    // Hit immediately, hold through the claw opening at 70 ms, then fade.
+    return .86f * VR::BeastRoar::Smooth(age / .015f) *
+           (1.0f - VR::BeastRoar::Smooth((age - .10f) / .20f));
+}
+
+s32 EquippedArmArmor(const u8* player) {
+    if (!Plausible(player)) return -1;
+    const auto* pgd = Read<u8*>(player + OffsetPlayerGameData);
+    return Plausible(pgd) ? Read<s32>(pgd + OffsetEgd + OffsetArmArmor) : -1;
+}
+
+bool BlackskyPupil(s64 now_ns, std::array<float, 3>& centre, float& radius) {
+    BlackskyPlace p{};
+    if (!g_blacksky_place.Load(p) || now_ns < p.ns || now_ns - p.ns > 120 * Ms ||
+        !(p.radius > 0.0f)) {
+        return false;
+    }
+    centre = p.centre;
+    radius = p.radius;
+    return true;
+}
+
+bool HeldItemPoint(u32 space_serial, s64 now_ns, s32 goods, std::array<float, 3>& position) {
+    HeldPoint p{};
+    if (!g_held_point.Load(p) || p.goods != goods || p.space_serial != space_serial ||
+        now_ns < p.ns || now_ns - p.ns > 120 * Ms) {
+        return false;
+    }
+    position = p.tracking;
+    return true;
+}
+
+bool MonocularEyepiece(u32 space_serial, s64 now_ns, std::array<float, 3>& position) {
+    MonocularLens lens{};
+    if (!g_monocular_lens.Load(lens) || lens.space_serial != space_serial ||
+        now_ns < lens.ns || now_ns - lens.ns > 120 * Ms) {
+        return false;
+    }
+    position = lens.tracking;
+    return true;
 }
 
 // quick_use_wipe: the applied paper's buff SpEffect on the hunter (the log: the game's own buff
@@ -3675,8 +5514,127 @@ void WipeBuffTick(u8* player) {
     }
 }
 
+// The Hand Lantern into the hand and back (core/vr/hand_lantern.h Carry): taken lit, the hip's
+// lantern goes out; back on the hip, it is set to the light carried. Each toggle is the game's own
+// use (UseGoods 1412, no animation), sent once the game may use an item.
+void LanternTick(u8* player, const Pointers& p, bool may_use) {
+    namespace L = VR::HandLantern;
+    s32 goods = -1;
+    s32 ffx = -1;
+    VR::Quick::LatestHeldItem(goods, ffx);
+    const bool held = goods == L::Goods;
+    if (held == g_lantern.active && !g_lantern_owe.owed) {
+        PublishLanternLight(); // nothing changes hands: the effect list is not walked
+        return;
+    }
+    const bool lit = HasEffect(player, L::LitEffect);
+    if (held && !g_lantern.active) {
+        g_lantern_owe.Owe(g_lantern.Take(lit), false);
+        LOG_INFO(Core, "VR lantern: in the hand, {}{}", lit ? "lit" : "dark",
+                 g_lantern_owe.owed ? ": the hip's lantern goes out" : "");
+    } else if (!held && g_lantern.active) {
+        g_lantern_owe.Owe(g_lantern.PutBack(lit), g_lantern.lit);
+        LOG_INFO(Core, "VR lantern: back on the hip, {}", g_lantern.lit ? "lit" : "dark");
+    }
+    PublishLanternLight();
+    const s64 now = NowNs();
+    if (!may_use || !g_lantern_owe.Due(lit, now)) {
+        return;
+    }
+    const u8* const module = DataModule(player);
+    if (UiGate() != nullptr || module == nullptr || Read<s32>(module + OffsetHp) <= 0 ||
+        Read<s32>(player + OffsetItemUseState) != 0 || HasEffect(player, ItemAnimEffect) ||
+        MenuMulti() || Read<s32>(p.egd + OffsetOverride) >= 0) {
+        return; // still owed: sent once it may be
+    }
+    const bool ran = LanternSet(player, g_lantern_owe.target);
+    const u32 refused = g_lantern_owe.refused;
+    g_lantern_owe.Sent(ran, now);
+    const char* const what = g_lantern.active        ? "put out while carried"
+                             : g_lantern_owe.target ? "lit as carried"
+                                                    : "out as carried";
+    if (ran) {
+        LOG_INFO(Core, "VR lantern: the hip's lantern {} (ran{})", what,
+                 refused != 0 ? fmt::format(" after {} refused", refused) : std::string{});
+    } else if (refused == 0) {
+        // The game said no, or its function is not the one checked: logged once per run.
+        LOG_WARNING(Core, "VR lantern: the hip's lantern {} REFUSED: asked again every {} ms", what,
+                    L::Owed::RetryNs / Ms);
+    }
+}
+
+// quick_tool_direct: what the tool used directly cost in Quicksilver Bullets (the vitals' count
+// 400 ms after the use against the one before), once.
+s32 BulletCostOf(s32 goods) {
+    return LookupGoods(goods).cost;
+}
+
+void ToolSpendTick() {
+    if (g_site.tool_goods < 0 || NowNs() - g_site.tool_ns < 400 * Ms) {
+        return;
+    }
+    // The game's ConsumeBullets takes the Blood Bullets (901) first, then the Quicksilver (900):
+    // both counted (the 2026-11-01 mock: the Blacksky Eye's 1 and the Brew's 2 came out of the
+    // kit's 5 Blood Bullets, the Quicksilver untouched).
+    VR::Vitals::Status vitals{};
+    const bool have = VR::Vitals::LatestStatus(vitals);
+    const s32 qs = have ? vitals.qs_bullets : -1;
+    const s32 blood = have ? vitals.blood_bullets : -1;
+    const s32 spent = g_site.tool_qs - qs + g_site.tool_blood - blood;
+    LOG_INFO(Core,
+             "VR quick: TOOL goods {} used directly: Quicksilver Bullets {} -> {}, Blood Bullets "
+             "{} -> {} ({}; its cost {})",
+             g_site.tool_goods, g_site.tool_qs, qs, g_site.tool_blood, blood,
+             g_site.tool_qs < 0 || qs < 0 || g_site.tool_blood < 0 || blood < 0 ? "unknown"
+             : spent > 0 ? fmt::format("spent {}", spent)
+                         : std::string{"NOTHING SPENT"},
+             BulletCostOf(g_site.tool_goods));
+    g_site.tool_goods = -1;
+}
+
+// Cancel on any observed interruption, including before the due time. Never replay a
+// cast after loading or against a replacement player; consume it before calling game code.
+[[nodiscard]] bool DeferredCastTick(u8* player, const Pointers& p, bool may_use) {
+    if (g_deferred_cast.ticket.started == 0) return false;
+    const s64 now = NowNs();
+    const bool eligible = may_use && !g_dry_run && g_use_goods != nullptr &&
+                          UseBlocked(player, p) == nullptr;
+    const auto decision = g_deferred_cast.ticket.Check(
+        now, reinterpret_cast<std::uintptr_t>(player), Read<u32>(player + OffsetHandle), eligible);
+    if (decision == VR::DeferredTool::Decision::Wait) return false;
+    const DeferredCast cast = g_deferred_cast;
+    g_deferred_cast = {};
+    const Q::Request& r = cast.r;
+    if (decision == VR::DeferredTool::Decision::Cancel || QtyOf(p, r.goods, r.slot) <= 0 ||
+        !CanUse(player, r.goods)) {
+        LOG_INFO(Core, "VR quick: TOOL goods {}: delayed cast cancelled (expired or no longer usable)",
+                 r.goods);
+        return false;
+    }
+    if (!NoteDirectTool(r.goods, r.aim, r.tool_direction, r.tool_origin)) {
+        LOG_INFO(Core, "VR quick: TOOL goods {}: its delayed UseGoods NOT cast (no placement)",
+                 r.goods);
+        return false;
+    }
+    VR::Vitals::Status vitals{};
+    const bool have_vitals = VR::Vitals::LatestStatus(vitals);
+    if (g_use_goods(player, r.goods, cast.dmy) == 0) {
+        CancelDirectTool();
+        LOG_WARNING(Core, "VR quick: TOOL goods {}: its delayed UseGoods did not run", r.goods);
+        return false;
+    }
+    g_site.tool_goods = r.goods;
+    g_site.tool_qs = have_vitals ? vitals.qs_bullets : -1;
+    g_site.tool_blood = have_vitals ? vitals.blood_bullets : -1;
+    g_site.tool_ns = NowNs();
+    LOG_INFO(Core, "VR quick: TOOL used directly: UseGoods({}, dmy {}) ran {} ms after the squeeze",
+             r.goods, cast.dmy, (NowNs() - cast.ticket.started) / Ms);
+    return true; // this update already performed an item use
+}
+
 void QuickItemsSiteA(u8* player, bool may_use) {
     if (!g_ready || player == nullptr) {
+        g_deferred_cast = {};
         return;
     }
     Pointers p{};
@@ -3685,10 +5643,17 @@ void QuickItemsSiteA(u8* player, bool may_use) {
     g_player_handle.store(Read<u32>(player + OffsetHandle), std::memory_order_relaxed);
     TraceTick(player);
     WipeBuffTick(player);
+    ToolSpendTick();
     Publish(player, valid ? &p : nullptr);
     if (!valid) {
+        g_deferred_cast = {};
         return;
     }
+    LanternTick(player, p, may_use);
+    // Evaluate even when a vial reserved the update: that cancels a pending cast.
+    // A successful deferred use reserves it for both normal and autotest requests.
+    const bool deferred_used = DeferredCastTick(player, p, may_use);
+    may_use = may_use && !deferred_used;
     Q::Request r{};
     if (Q::LatestRequest(r) && r.serial != g_site.taken_serial && r.serial != 0) {
         g_site.taken_serial = r.serial;
@@ -3888,7 +5853,11 @@ VR::Holsters::Targets BuildHolsters(F::List& list, const Mapping& map, const Q::
         for (int& assignment : h.assignment)
             if (assignment == 1)
                 assignment = 0;
+    if (!qs.shoulder_vial)
+        h.assignment[VR::Holsters::ShoulderSlot] = 0;
     h.hover = scene.holsters.assignment == h.assignment ? scene.holsters.hover : -1;
+    // (The right shoulder's vial, shoulder_vial, has no mount: its zone is the presenter's, the
+    // shoulder switch's own. The loop below draws the three mounts.)
     const auto dir = [&](VR::Body::Vec3 p) {
         return map.DirToView(p);
     };
@@ -3940,7 +5909,7 @@ VR::Holsters::Targets BuildHolsters(F::List& list, const Mapping& map, const Q::
             const RubLook rub = RubLookOf(slot.goods);
             const bool paper = rub.mesh != F::MeshId::Count;
             // Our model of it, as the hand shows it (GoodsLookOf).
-            const GoodsLook goods_look = GoodsLookOf(slot.goods);
+            const GoodsLook goods_look = GoodsLookOf(slot.goods, true);
             const bool ours = !model && goods_look.count > 0 &&
                               VR::Tune::Get("held.goods_models", 1.0f) >= 0.5f;
             const bool molotov =
@@ -3950,8 +5919,21 @@ VR::Holsters::Targets BuildHolsters(F::List& list, const Mapping& map, const Q::
             // Bare strapped items sit diagonally; their pickup centre remains the mount centre.
             const Q::V3 sx = strapped ? x * .9396926f + y * .3420201f : x;
             const Q::V3 sy = strapped ? y * .9396926f - x * .3420201f : y;
-            const float model_scale =
+            float model_scale =
                 .90f * size * look.scale * Q::GetQuickSettings().held_scale * (paper ? .9f : 1.0f);
+            // Accursed Brew: keep the waist copy compact; the chest uses its shallow fit below.
+            if (slot.goods == 2130 && i == 1)
+                model_scale *= .675f;
+            if (model && !model->animation.empty() && slot.goods == VR::CallBeyond::Goods)
+                model_scale *= VR::CallBeyond::StoredRatio(i);
+            if (slot.goods == VR::OldHunterBone::Goods)
+                model_scale *= VR::OldHunterBone::StoredRatio;
+            if (slot.goods == VR::Augur::Goods)
+                model_scale *= VR::Augur::StoredRatio;
+            if (slot.goods == VR::MessengerGift::Goods)
+                model_scale *= VR::MessengerGift::StoredRatio(i);
+            if(slot.goods==VR::HunterRelics::Tonitrus || slot.goods==VR::HunterRelics::Gloves)
+                model_scale *= VR::HunterRelics::StoredRatio(slot.goods,i);
             Q::V3 lo{-.035f, -.05f, -.012f}, hi{.035f, .05f, .012f};
             if (paper) {
                 lo = {rub.mid[0] - rub.half[0], rub.mid[1] - rub.half[1], rub.mid[2] - rub.half[2]};
@@ -3966,10 +5948,58 @@ VR::Holsters::Targets BuildHolsters(F::List& list, const Mapping& map, const Q::
                 lo = {model->min[0], model->min[1], model->min[2]};
                 hi = {model->max[0], model->max[1], model->max[2]};
             }
+            if (model && model->id == VR::AugurCreature::Model) {
+                const auto& a = VR::AugurCreature::RestMin;
+                const auto& b = VR::AugurCreature::RestMax;
+                lo = {a[0],a[1],a[2]}; hi = {b[0],b[1],b[2]};
+                if (i == 2) model_scale *= .75f; // chest smaller than waist; frame zero is static
+            }
+            const bool stored_glove = model && slot.goods == VR::HunterRelics::Gloves &&
+                                      model->id == VR::ExecutionerGlove::Model;
+            if (stored_glove) {
+                const auto& a = VR::ExecutionerGlove::StoredMin;
+                const auto& b = VR::ExecutionerGlove::StoredMax;
+                lo = {a[0], a[1], a[2]};
+                hi = {b[0], b[1], b[2]};
+            }
             const Q::V3 mid = (lo + hi) * .5f;
-            const Q::V3 dimensions = (hi - lo) * model_scale;
+            // The Hand Lantern hangs from the belt by its handle (its top at the pocket), with no
+            // holder; reached for where it hangs.
+            const bool hanging = model && slot.goods == VR::HandLantern::Goods;
+            // A hunter tool's model as the coat holds it, upright and flat (MountTurnOf); the
+            // holder and the seat take its turned size.
+            const Q::V3 extent = hi - lo;
+            // The curled fingers make its bounds deeper than its palm is wide. Keep the palm
+            // facing out of the coat instead of letting the generic thinnest-axis rule turn it
+            // sideways.
+            const Q::MountTurn turn =
+                stored_glove
+                    ? Q::MountTurn{{0, 2, 1}, {-1.0f, 1.0f, 1.0f}}
+                : model && !model->animation.empty() && slot.goods == VR::BeastRoar::Goods
+                    ? Q::MountTurn{{0, 2, 1}, {1.0f, -1.0f, 1.0f}}
+                : (model || slot.goods==VR::HunterRelics::Tonitrus || slot.goods==VR::HunterRelics::Gloves)
+                    && !strapped && !hanging && Q::HunterToolOf(slot.goods)
+                    ? Q::MountTurnOf({extent.x, extent.y, extent.z})
+                    : Q::MountTurn{};
+            const auto along = [](const Q::V3& v, int i) {
+                return i == 0 ? v.x : i == 1 ? v.y : v.z;
+            };
+            std::array<float, 3> turned{};
+            for (int a = 0; a < 3; ++a) {
+                turned[turn.to[static_cast<size_t>(a)]] = along(extent, a);
+            }
+            model_scale *= Q::StoredFitScale(
+                i, {turned[0] * model_scale, turned[1] * model_scale, turned[2] * model_scale}, size);
+            if (slot.goods == VR::BeastRoar::Goods && i == 1 &&
+                turned[2] * model_scale > .075f * size)
+                model_scale *= .075f * size / (turned[2] * model_scale);
+            const Q::V3 dimensions = Q::V3{turned[0], turned[1], turned[2]} * model_scale;
             // Fit the actual back face; a flat knife does not float like a round bottle.
-            const Q::V3 centre = seat(dimensions.z * .5f + (strapped ? 0.f : .009f * size));
+            const Q::V3 centre =
+                seat(dimensions.z * .5f + (strapped ? 0.f : .009f * size)) -
+                y * (hanging ? dimensions.y * .5f +
+                                   VR::Tune::Get("pocket.1412.drop_cm", 0.0f) * .01f * map.scale
+                             : 0.0f);
             target_at(i, centre);
             const float holder_h = std::clamp(dimensions.y * .4f, .035f * size, .12f * size);
             const Q::V3 holder_c = centre - y * (dimensions.y * .5f - holder_h * .5f);
@@ -3986,7 +6016,7 @@ VR::Holsters::Targets BuildHolsters(F::List& list, const Mapping& map, const Q::
             holder.shade = F::Shade::Apothecary;
             if (h.hover == i)
                 holder.emissive = {.12f, .065f, .02f, 0};
-            if (!strapped)
+            if (!strapped && !hanging)
                 list.Add(holder);
             if (!fresh || !Q::ShowStoredItem(scene, slot, slot_index))
                 continue;
@@ -4000,10 +6030,16 @@ VR::Holsters::Targets BuildHolsters(F::List& list, const Mapping& map, const Q::
                 for (auto n = first; n < list.count; ++n)
                     list.items[n].cull_sphere = bounds;
             } else if (ours) {
-                const Q::V3 origin = centre - (x * mid.x + y * mid.y + z * mid.z) * model_scale;
+                // The fitted dimensions above are in turned mount axes. Apply the same
+                // turn to custom geometry, not just native models, or long relics stick out.
+                const std::array<Q::V3,3> mount_axes{x,y,z};
+                const Q::V3 ax=mount_axes[turn.to[0]]*turn.sign[0];
+                const Q::V3 ay=mount_axes[turn.to[1]]*turn.sign[1];
+                const Q::V3 az=mount_axes[turn.to[2]]*turn.sign[2];
+                const Q::V3 origin = centre - (ax * mid.x + ay * mid.y + az * mid.z) * model_scale;
                 for (int p = 0; p < goods_look.count; ++p) {
                     const GoodsPart& part = goods_look.parts[static_cast<size_t>(p)];
-                    auto stored = MakeItem(part.mesh, origin, x, y, z, model_scale, model_scale,
+                    auto stored = MakeItem(part.mesh, origin, ax, ay, az, model_scale, model_scale,
                                            model_scale);
                     if (p == goods_look.liquid) {
                         // The vial's glass, its blood level and still on the belt.
@@ -4017,26 +6053,42 @@ VR::Holsters::Targets BuildHolsters(F::List& list, const Mapping& map, const Q::
                         stored.emissive = {0, 0, 0, 0};
                     } else {
                         stored.shade = F::Shade::Goods;
-                        stored.uv[0] = slot.goods == Q::QueenlyBlood ? 1.0f : 0.0f;
+                        stored.uv[0] = slot.goods == VR::MessengerGift::Goods ? 2.0f :
+                                           slot.goods == Q::QueenlyBlood ? 1.0f : 0.0f;
+                        if(slot.goods==VR::MessengerGift::Goods) stored.uv[1]=-1.0f;
+                        if(slot.goods==VR::HunterRelics::Tonitrus || slot.goods==VR::HunterRelics::Gloves)
+                            stored.uv={slot.goods==VR::HunterRelics::Tonitrus?3.0f:4.0f,0,0,0};
+                        if(slot.goods==VR::BlackskyEye::Goods)
+                            stored.uv={5.0f,0.0f,VR::BlackskyEye::PupilRest,0.0f};
                         stored.color = {part.tint[0], part.tint[1], part.tint[2], 1};
                     }
                     stored.cull_sphere = bounds;
                     list.Add(stored);
                 }
             } else {
-                const Q::V3 origin = centre - (sx * mid.x + sy * mid.y + z * mid.z) * model_scale;
+                // The model's axes on the mount's (turned: MountTurnOf).
+                const std::array<Q::V3, 3> mount_axes{sx, sy, z};
+                std::array<Q::V3, 3> axes{};
+                for (size_t a = 0; a < 3; ++a) {
+                    axes[a] = mount_axes[turn.to[a]] * turn.sign[a];
+                }
+                const Q::V3 origin =
+                    centre - (axes[0] * mid.x + axes[1] * mid.y + axes[2] * mid.z) * model_scale;
                 const auto fallback = static_cast<F::MeshId>(static_cast<u16>(F::MeshId::Bottle) +
                                                              static_cast<u16>(kind) -
                                                              static_cast<u16>(Q::MeshKind::Bottle));
                 auto stored = MakeItem(model                        ? F::MeshId::Model
                                        : kind == Q::MeshKind::Token ? F::MeshId::Token
                                                                     : fallback,
-                                       origin, sx, sy, z, model_scale, model_scale, model_scale);
+                                       origin, axes[0], axes[1], axes[2], model_scale, model_scale,
+                                       model_scale);
                 stored.shade = F::Shade::Model;
                 if (model) {
                     stored.tex = F::Tex::Model;
                     stored.tex_key = static_cast<u32>(look.model);
                     stored.emissive[3] = mid.y;
+                    if (hanging && h.hover == i)
+                        stored.emissive = {.12f, .065f, .02f, mid.y}; // no holder to glow
                 } else
                     stored.color = {.12f, .08f, .045f, 1};
                 if (molotov) {
@@ -4127,12 +6179,173 @@ void CaptureGripLab(const F::List& list, const Mapping& map,
     LOG_INFO(Core,"VR grip lab: captured request {} goods {} record {}", request, goods, list.record);
 }
 
+// VR_SOLID_SHAPES (tests; core/vr/weapon_wall.h DebugChannel): each hand's solid shape where the
+// solver holds the weapon, over the frame: weapon-clash shapes green (=new, authored/fitted
+// capsules when ready), simple wall shapes red (=old). Translucent, depth-tested their radius
+// and 5 cm nearer (a thick capsule inside a hammer's head shows through it); a capsule is a
+// cylinder with a sphere at each end.
+// With VR_BODY_SPECTATOR (tests) the frame is drawn from the spectator's camera, set after this
+// list is built (bloodborne_camera.cpp SpectatorView: from the eye along the view's heading, looking
+// at a point under the eye): the shapes are put in that camera's view instead.
+void BuildSolidShapes(F::List& list, const Mapping& map, s64 now) {
+    namespace WW = VR::WeaponWall;
+    using V = VR::Body::Vec3;
+    WW::DebugShapes d{};
+    if (!WW::DebugChannel().Load(d) || now - d.ns > 250 * Ms) {
+        return;
+    }
+    static const std::array<float, 5> spectator = [] {
+        std::array<float, 5> o{0.0f, 0.0f, 0.0f, 0.0f, 0.6f};
+        if (const char* value = std::getenv("VR_BODY_SPECTATOR"); value != nullptr) {
+            o[0] = 1.0f;
+            std::sscanf(value, "%f,%f,%f,%f", &o[1], &o[2], &o[3], &o[4]);
+        }
+        return o;
+    }();
+    V cam = map.position;
+    V ax{map.rows[0], map.rows[1], map.rows[2]};
+    V ay{map.rows[4], map.rows[5], map.rows[6]};
+    V az{map.rows[8], map.rows[9], map.rows[10]};
+    if (spectator[0] != 0.0f) {
+        const float yaw = std::atan2(az.x, az.z);
+        const V right{std::cos(yaw), 0.0f, -std::sin(yaw)};
+        const V forward{std::sin(yaw), 0.0f, std::cos(yaw)};
+        const V eye = map.position;
+        cam = eye + (right * spectator[1] - forward * spectator[3]) * map.scale;
+        cam.y += spectator[2] * map.scale;
+        const V target{eye.x, eye.y - spectator[4] * map.scale, eye.z};
+        az = VR::Body::Normalize(target - cam, forward);
+        ax = VR::Body::Normalize(V{az.z, 0.0f, -az.x}, right);
+        ay = VR::Body::Cross(az, ax);
+    }
+    const auto to_view = [&](V w) {
+        const V dd = w - cam;
+        return Q::V3{VR::Body::Dot(ax, dd), VR::Body::Dot(ay, dd), VR::Body::Dot(az, dd)};
+    };
+    const auto add = [&](const WW::ShapeCapsule& c, std::array<float, 4> color) {
+        const Q::V3 a = to_view({c.a[0], c.a[1], c.a[2]});
+        const Q::V3 b = to_view({c.b[0], c.b[1], c.b[2]});
+        const float r = std::max(c.r, 1e-4f);
+        const auto finish = [&](F::Item item) {
+            item.shade = F::Shade::Unlit;
+            item.color = color;
+            item.hand = true;
+            // Through the weapon's surface: a thick capsule lies inside its head.
+            item.depth_pull = r + 0.05f;
+            list.Add(item);
+        };
+        const float ball = r / 0.013f; // the Pellet: a 13 mm sphere
+        finish(MakeItem(F::MeshId::Pellet, a, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, ball, ball, ball));
+        const Q::V3 ab{b.x - a.x, b.y - a.y, b.z - a.z};
+        const float len = std::sqrt(ab.x * ab.x + ab.y * ab.y + ab.z * ab.z);
+        if (len < 1e-4f) {
+            return;
+        }
+        finish(MakeItem(F::MeshId::Pellet, b, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, ball, ball, ball));
+        const Q::V3 y{ab.x / len, ab.y / len, ab.z / len};
+        const Q::V3 x = Q::Normalize(Q::Cross(y, std::abs(y.z) < 0.9f ? Q::V3{0, 0, 1}
+                                                                      : Q::V3{1, 0, 0}));
+        finish(MakeItem(F::MeshId::Cylinder, a, x, y, Q::Cross(x, y), r, len, r));
+    };
+    for (const WW::DebugShapes::Hand& h : d.hand) {
+        if (g_solid_shapes != 2) {
+            for (u32 i = 0; i < h.old_count && i < h.old.size(); ++i) {
+                add(h.old[i], {0.95f, 0.12f, 0.08f, 0.38f});
+            }
+        }
+        if (g_solid_shapes != 3) {
+            for (u32 i = 0; i < h.now_count && i < h.now.size(); ++i) {
+                add(h.now[i], {0.10f, 0.95f, 0.25f, 0.38f});
+            }
+        }
+    }
+}
+
+// The split blades honed (core/vr/dual_blades.h): each blade's own steel drawn again over it,
+// light only (vr_inframe.frag's blade shine): a cold sheen on its surface while it is honed and,
+// with the ring, a band of light running over it from the guard to the tip. The model is the
+// blade as the game poses it in its grip's frame (core/vr/blade_shine_mesh.h; the melee tick's
+// LinesChannel), placed by this frame's grip dummy and carried as the hand items are. `look`: each
+// hand's (LookOf, this frame), drawn where it shows and the model is there.
+void AddBladeShine(F::List& list, const Mapping& map, u8* chr, const VR::DualBlades::Lines& lines,
+                   const std::array<VR::DualBlades::Look, 2>& looks, s64 steady) {
+    namespace D = VR::DualBlades;
+    if (g_dmy_poly == nullptr) {
+        return;
+    }
+    // Tests: VR_BLADE_SHINE_DEBUG=1 both models magenta (where they are drawn), =left the left one.
+    static const char* const debug = std::getenv("VR_BLADE_SHINE_DEBUG");
+    static const bool log_on = std::getenv("VR_BLADE_SHINE_LOG") != nullptr;     // tests
+    static std::array<s64, 2> logged{};
+    const u32 first = list.count;
+    for (int hand = 0; hand < 2; ++hand) {
+        const D::Look& look = looks[static_cast<std::size_t>(hand)];
+        if (!look.Any() || lines.model[hand] == 0) {
+            continue;
+        }
+        alignas(16) std::array<float, 8 * 12> g{};
+        const s32 id = hand == 0 ? 340 : 300; // the grips: L_Weapon's, R_Weapon's origin
+        if (g_dmy_poly(chr, g.data(), &id, 1) < 1) {
+            continue;
+        }
+        // View <- the grip's frame (the model's): the grip's axes (its matrix' columns) and origin.
+        const Q::V3 x = map.DirToView({g[0], g[4], g[8]});
+        const Q::V3 y = map.DirToView({g[1], g[5], g[9]});
+        const Q::V3 z = map.DirToView({g[2], g[6], g[10]});
+        const Q::V3 at = map.WorldToView({g[3], g[7], g[11]});
+        const auto& base = lines.base[hand];
+        const auto& tip = lines.tip[hand];
+        const float len = std::sqrt((tip[0] - base[0]) * (tip[0] - base[0]) +
+                                    (tip[1] - base[1]) * (tip[1] - base[1]) +
+                                    (tip[2] - base[2]) * (tip[2] - base[2]));
+        if (!std::isfinite(len) || len < .05f || len > 2.5f) {
+            continue;
+        }
+        const bool debug_on =
+            debug != nullptr && (std::string_view{debug} != "left" || hand == 0);
+        F::Item item{};
+        item.mesh = F::MeshId::Model;
+        item.tex_key = static_cast<u32>(lines.model[hand]);
+        item.shade = F::Shade::Unlit;
+        item.mv = {x.x, y.x, z.x, at.x, x.y, y.y, z.y, at.y, x.z, y.z, z.z, at.z};
+        item.translucent = true;
+        item.depth_pull = .0025f; // on the game's own blade surface, never behind it
+        item.uv = {-2091.0f, look.glint, look.line, look.glint_strength};
+        // The blade's line in the model's frame: where the guard is, and the tip (the band's way).
+        item.color = {base[0], base[1], base[2], debug_on ? 1.0f : 0.0f};
+        item.emissive = {tip[0], tip[1], tip[2], 0.0f};
+        // (Its middle in view: the grip's frame point through the axes above.)
+        const float m0 = .5f * (base[0] + tip[0]), m1 = .5f * (base[1] + tip[1]),
+                    m2 = .5f * (base[2] + tip[2]);
+        const Q::V3 mid_view{at.x + x.x * m0 + y.x * m1 + z.x * m2,
+                             at.y + x.y * m0 + y.y * m1 + z.y * m2,
+                             at.z + x.z * m0 + y.z * m1 + z.z * m2};
+        item.cull_sphere = {mid_view.x, mid_view.y, mid_view.z, .5f * len + .15f};
+        if (debug_on) {
+            item.depth_pull = .3f; // where it is drawn, seen through the hand
+        }
+        list.Add(item);
+        if (log_on && steady - logged[hand] > 500 * Ms) {
+            logged[hand] = steady;
+            LOG_INFO(Core,
+                     "VR blade shine: {} blade (model {:#x}) line {:.2f} glint {:.2f} ({:.2f}), "
+                     "{:.2f} m long, {:.2f} m away",
+                     hand == 0 ? "left" : "right", lines.model[hand], look.line, look.glint,
+                     look.glint_strength, len,
+                     std::sqrt(mid_view.x * mid_view.x + mid_view.y * mid_view.y +
+                               mid_view.z * mid_view.z));
+        }
+    }
+    MarkHand(list, first);
+}
+
 void QuickItemsRenderTick(u64 record_id, const float* rows, const float* position) {
     // Publish exactly once, including every early exit; never leave invisible grab targets.
     struct MountPublication {
         VR::Holsters::Targets targets{};
         ~MountPublication() { Q::PublishHolsterTargets(targets); }
     } mounts;
+    VR::FeatureCost::Scope cost{VR::FeatureCost::QuickRender};
     if (!g_ready || g_dmy_poly == nullptr || rows == nullptr || position == nullptr) {
         return;
     }
@@ -4142,22 +6355,38 @@ void QuickItemsRenderTick(u64 record_id, const float* rows, const float* positio
     InstallSoundTrace(); // VR_SOUND_TRACE (tests)
     PlayWhoosh(now);
     PlayUseSounds(now, position);
+    PlayBladeSwing(now, position, have_scene ? &scene : nullptr);
     MolotovBurstTick(now);
+    VR::MessengerGift::Visual gift_visual{};
+    if(have_scene && scene.held_goods==VR::MessengerGift::Goods) {
+        VR::MessengerGift::Use use{};
+        g_messenger_use.Load(use);
+        gift_visual=VR::MessengerGift::Evaluate(use,scene.held_session_ns,now);
+    }
+    const bool gift_hidden=VR::MessengerGift::Hidden(now);
+    if (gift_hidden) {
+        Q::Hover hover{};
+        hover.steady_ns = now;
+        Q::PublishHover(hover);
+        if(!gift_visual.active) return; // only the brief confirmed crumble may remain visible
+    }
     auto& rs = g_render;
     VR::CameraRecord rec{};
     if (!VR::GetRecord(record_id, rec) || !rec.driven || rec.menu) return;
     const bool holsters = have_scene && scene.holsters_enabled && now >= scene.holsters_ns &&
                           now - scene.holsters_ns < 250 * Ms &&
                           Q::GetQuickSettings().holster_mode != 0;
-    const bool folding = have_scene && scene.state == Q::SceneState::Closed &&
+    const bool folding = !gift_hidden && have_scene && scene.state == Q::SceneState::Closed &&
                          rs.placed_serial == scene.open_serial && scene.open_serial != 0 &&
                          now - scene.state_ns < 120 * Ms;
-    const bool open = have_scene && scene.state == Q::SceneState::Open;
+    const bool open = !gift_hidden && have_scene && scene.state == Q::SceneState::Open;
     const bool held_mesh =
         have_scene && scene.state == Q::SceneState::Holding && scene.held_goods >= 0;
     // vial_inject_drain: this frame's update made the vial in the hand ours (at its level).
     u64 drain_word = 0;
     const bool drain = HeldVialOurs(now, drain_word);
+    VR::BloodDraw::Scene blood_draw{};
+    const bool syringe = VR::BloodDraw::LatestActive(VR::Body::SteadyNowNs(), blood_draw);
     if (!g_models_requested) {
         // The held items' game models load in the background from the first tick on (one read
         // of the sfx archive), long before the first grab.
@@ -4171,7 +6400,42 @@ void QuickItemsRenderTick(u64 record_id, const float* rows, const float* positio
     // quick_hold_use: the ring's flash once the item has left the hand (used: where it last was).
     const bool flashing = have_scene && !held_mesh && g_ring_place.valid &&
                           now - g_ring_place.ns < 1000 * Ms && HoldFlash(scene, now) >= 0.0f;
-    if (!open && !folding && !held_mesh && !flashing && !g_markers && !drain && !holsters) {
+    // Kos Lights just given: its card (below), whatever the hand does.
+    const bool kos_notice = have_scene && scene.cigarette_notice.ns > 0 &&
+                            now >= scene.cigarette_notice.ns &&
+                            now - scene.cigarette_notice.ns < VR::Cigarette::NoticeNs;
+    // A cigarette thrown away: drawn as it flies and lies, with nothing in the hand (below).
+    const bool kos_toss = have_scene && scene.cigarette_toss.ns > 0 &&
+                          now >= scene.cigarette_toss.ns &&
+                          now - scene.cigarette_toss.ns < VR::Cigarette::TossNs;
+    // Tonitrus just charged: its bolt from the sky (AddTonitrusSkyBolt, below).
+    VR::TonitrusCharge::State tonitrus{};
+    const bool tonitrus_known = VR::TonitrusCharge::Latest(tonitrus) && tonitrus.serial > 0;
+    const float tonitrus_age =
+        tonitrus_known ? VR::TonitrusCharge::StrikeAgeS(now, tonitrus.start_ns) : -1.0f;
+    const bool tonitrus_bolt =
+        tonitrus_known && tonitrus_age >= 0.0f &&
+        tonitrus_age < std::max(static_cast<float>(VR::HunterRelics::BridgeLifeNs) * 1e-9f,
+                                VR::TonitrusCharge::BlinkS); // the bolt, the world's flash
+    // The split blades honed: the shine on their steel (AddBladeShine, below), only for a hand
+    // that shows it and has its model (else the rest of this tick is not run for it).
+    VR::DualBlades::Shine shine{};
+    VR::DualBlades::Lines blade_lines{};
+    std::array<VR::DualBlades::Look, 2> blade_looks{};
+    const s64 steady = VR::Body::SteadyNowNs();
+    bool blade_shine = false;
+    if (VR::DualBlades::ShineChannel().Load(shine, 4) &&
+        (shine.honed_ns[0] != 0 || shine.honed_ns[1] != 0) &&
+        VR::DualBlades::LinesChannel().Load(blade_lines, 4)) {
+        for (int h = 0; h < 2; ++h) {
+            blade_looks[static_cast<std::size_t>(h)] = VR::DualBlades::LookOf(shine, h, steady);
+            blade_shine = blade_shine || (blade_looks[static_cast<std::size_t>(h)].Any() &&
+                                          blade_lines.model[h] != 0);
+        }
+    }
+    if (!open && !folding && !held_mesh && !flashing && !g_markers && !drain && !syringe &&
+        !holsters && g_solid_shapes == 0 && !gift_visual.active && !kos_notice && !kos_toss &&
+        !tonitrus_bolt && !blade_shine) {
         return;
     }
     u8* const world = Read<u8*>(g_base + WorldChrManRva);
@@ -4235,7 +6499,7 @@ void QuickItemsRenderTick(u64 record_id, const float* rows, const float* positio
     }
     const bool arm_settled =
         arm && (status.arm_weight[0] >= 0.98f || now - rs.arm_since_ns >= 400 * Ms);
-    if (open && rs.placed_serial != scene.open_serial && !arm_settled &&
+    if (open && !scene.fan && rs.placed_serial != scene.open_serial && !arm_settled &&
         rs.waiting_serial != scene.open_serial) {
         rs.waiting_serial = scene.open_serial;
         LOG_INFO(Core,
@@ -4243,7 +6507,53 @@ void QuickItemsRenderTick(u64 record_id, const float* rows, const float* positio
                  "around your hand once it is back | t {:.3f}",
                  scene.open_serial, status.arm_weight[0], static_cast<double>(now) * 1e-9);
     }
-    if (open && rs.placed_serial != scene.open_serial && arm_settled) {
+    if (open && scene.fan && rs.placed_serial != scene.open_serial) {
+        // quick_arc_pick=fan: placed at once round the controller where the presenter opened it
+        // (Scene::fan_origin, never the hunter's fist: no wait for the arm), the arc's cards (the
+        // slots in use when it opened, in slot order, as the presenter's FanBegin) at their
+        // directions; it then stays put in your play space (and moves with you when you walk or
+        // turn), as the arc.
+        rs.placed_serial = scene.open_serial;
+        rs.placed_ns = now;
+        rs.hover = -1;
+        rs.lift.fill(0.0f);
+        rs.fan = true;
+        int n = 0;
+        for (int k = 0; k < Q::SlotCount; ++k) {
+            if ((scene.cards & (1u << k)) != 0) {
+                rs.card_slot[static_cast<size_t>(n++)] = static_cast<s8>(k);
+            }
+        }
+        Q::FanFrame frame{};
+        frame.valid = true;
+        frame.origin = {scene.fan_origin[0], scene.fan_origin[1], scene.fan_origin[2]};
+        frame.right = {scene.fan_right[0], scene.fan_right[1], scene.fan_right[2]};
+        frame.forward = {scene.fan_forward[0], scene.fan_forward[1], scene.fan_forward[2]};
+        Q::LayoutConfig config{};
+        const bool seated = VR::GetSettings().seated;
+        config.radius_m = qs.radius_m * (seated ? 0.875f : 1.0f);
+        config.card_m = qs.card_m;
+        config.span_deg = qs.span_deg;
+        rs.fan_dirs = Q::FanDirectionsOf(n, config);
+        // Just behind the hand (PlaceFanDrawn); the presenter's pick reads these cards where
+        // they are drawn (FanReadDirections from the same frame).
+        rs.layout = Q::PlaceFanDrawn(frame, rs.fan_dirs, eye, config);
+        const Q::V3 sight = eye - rs.layout.pivot;
+        LOG_INFO(Core,
+                 "VR quick: fan {} placed: {} cards round ({:.3f},{:.3f},{:.3f}) LOCAL, centre "
+                 "({:.3f},{:.3f},{:.3f}) ({:.1f} cm from it), eye ({:.3f},{:.3f},{:.3f}), "
+                 "leaning {:.0f} deg, radius {:.3f} span {:.0f} deg, the hunter's {} {:.1f} cm "
+                 "from it, arm {:.2f} | t {:.3f}",
+                 scene.open_serial, n, frame.origin.x, frame.origin.y, frame.origin.z,
+                 rs.layout.pivot.x, rs.layout.pivot.y, rs.layout.pivot.z,
+                 100.0f * Q::Length(rs.layout.pivot - frame.origin), eye.x, eye.y, eye.z,
+                 std::atan2(sight.y, std::max(Q::Length(Q::V3{sight.x, 0.0f, sight.z}), 1e-3f)) *
+                     (180.0f / 3.14159265f),
+                 config.radius_m, config.span_deg, grip_found ? "grip" : "palm",
+                 100.0f * Q::Length(hand - frame.origin), status.arm_weight[0],
+                 static_cast<double>(now) * 1e-9);
+    }
+    if (open && !scene.fan && rs.placed_serial != scene.open_serial && arm_settled) {
         // Placed once per open, around where the hunter's fist is now (once the arm follows your
         // controller again: never around his animated hand); it then stays put in your play space
         // (and moves with you when you walk or turn).
@@ -4251,6 +6561,7 @@ void QuickItemsRenderTick(u64 record_id, const float* rows, const float* positio
         rs.placed_ns = now;
         rs.hover = -1;
         rs.lift.fill(0.0f);
+        rs.fan = false;
         int n = 0;
         for (int k = 0; k < Q::SlotCount; ++k) {
             if ((scene.cards & (1u << k)) != 0) {
@@ -4290,11 +6601,19 @@ void QuickItemsRenderTick(u64 record_id, const float* rows, const float* positio
         // animation sweeping it through the cards (a dodge, a hit), nor the hand as the arc
         // unfolds around it (80 ms).
         int hover = -1;
-        if (arm && now - rs.placed_ns >= 80 * Ms) {
+        if (rs.fan) {
+            // The fan's pick is the presenter's (the controller's own pose, Scene::fan_slot): its
+            // card in this layout.
+            for (int i = 0; i < rs.layout.n; ++i) {
+                if (rs.card_slot[static_cast<size_t>(i)] == scene.fan_slot) {
+                    hover = i;
+                }
+            }
+        } else if (arm && now - rs.placed_ns >= 80 * Ms) {
             hover = PickSector(qs) ? Q::PickSector(rs.layout, hand, rs.hover)
                                    : Q::PickHover(rs.layout, hand, eye, rs.hover, qs.hover_scale);
         }
-        if (hover != rs.hover && g_log >= 1) {
+        if (hover != rs.hover && g_log >= 1 && !rs.fan) {
             // The card entered (or left): how far the hand is from it.
             const int k = hover >= 0 ? hover : rs.hover;
             const Q::V3 c = rs.layout.card[static_cast<size_t>(k)];
@@ -4345,6 +6664,18 @@ void QuickItemsRenderTick(u64 record_id, const float* rows, const float* positio
     list.record = record_id;
     list.steady_ns = now;
     list.exposure = qs.inframe_exposure;
+    if(gift_hidden) {
+        // Never expose holsters, hover cards or other attachments during disguise.
+        // The successful-use cue lasts at most 850 ms and remains tied to this take.
+        if(gift_visual.active) {
+            std::array<float,12> palm_m{};
+            std::memcpy(palm_m.data(),m.data(),sizeof(palm_m));
+            BuildHeld(list,map,palm_m,scene,snap,now,map.scale,false);
+            MarkHand(list,0);
+            if(list.count) F::Submit(list);
+        }
+        return;
+    }
     if (holsters && status_fresh && status.driven && status.mounts.valid &&
         status.mounts.character.valid && status.mounts.space == rec.space_serial) {
         // Keep the root transform and mount bones from one pose update. ChrCtrl may
@@ -4372,12 +6703,222 @@ void QuickItemsRenderTick(u64 record_id, const float* rows, const float* positio
         std::array<float, 12> palm_m{};
         std::memcpy(palm_m.data(), m.data(), sizeof(palm_m));
         const u32 first = list.count;
-        BuildHeld(list, map, palm_m, scene, snap, now, map.scale);
+        static const bool native_stereo = std::getenv("VR_NATIVE_STEREO") != nullptr;
+        s32 arm_armor = -1;
+        if (scene.held_goods == VR::BlackskyEye::Goods || scene.held_goods == VR::HunterRelics::Tonitrus) {
+            arm_armor = EquippedArmArmor(chr);
+        }
+        BuildHeld(list, map, palm_m, scene, snap, now, map.scale,
+                  rec.dibr && rec.monocular_eye >= 0 && !native_stereo, arm_armor);
         CaptureGripLab(list, map, palm_m, first, scene.held_goods);
         MarkHand(list, first); // (in his fist: inframe_hand_sync carries it, F::Carry)
+        if (scene.held_goods == VR::Cigarette::Goods) {
+            // Follow the actual lit end after attachment/scale tuning. Three analytic wisps:
+            // no particle storage, allocation, physics or smoke from stored packets.
+            const u32 end = list.count;
+            for (u32 i = first; i < end; ++i) {
+                if (list.items[i].mesh != F::MeshId::Cigarette) continue;
+                const auto& mv = list.items[i].mv;
+                const Q::V3 tip{mv[0]*.0015f + mv[1]*.063f + mv[2]*.0005f + mv[3],
+                                mv[4]*.0015f + mv[5]*.063f + mv[6]*.0005f + mv[7],
+                                mv[8]*.0015f + mv[9]*.063f + mv[10]*.0005f + mv[11]};
+                const auto origin = map.Carried(map.ViewToWorld(tip));
+                const float clock = float(now % 1'200'000'000LL) * 1e-9f;
+                for (int w = 0; w < 3; ++w) {
+                    const float age = std::fmod(clock + w*.4f, 1.2f);
+                    const float fade = std::min(age/.12f, 1.0f) * (1.0f-age/1.2f);
+                    const auto centre = map.WorldToView(origin + VR::Body::Vec3{
+                        .007f*std::sin(age*4.0f+w)*age*map.scale,
+                        (.004f+.055f*age)*map.scale, 0});
+                    const float width = (.009f+.012f*age)*map.scale;
+                    auto smoke = MakeItem(F::MeshId::Quad, centre, {1,0,0}, {0,1,0}, {0,0,1},
+                                          width, width*2.4f, 1.0f);
+                    smoke.shade = F::Shade::Unlit;
+                    smoke.translucent = true;
+                    smoke.uv = {-9000.0f, age, float(w), 0};
+                    smoke.color = {.48f,.46f,.42f,.085f*fade};
+                    list.Add(smoke);
+                }
+                break;
+            }
+        }
+        if (scene.held_goods == VR::CallBeyond::Goods) {
+            // Only the held-item branch owns this effect. Lists are rebuilt per camera;
+            // leaving this branch means no eyes, with no inactive effect update/reset poll.
+            const bool eligible = VR::CallBeyond::Sky::Eligible(
+                true, scene.call_beyond, scene.held_slot, snap, now);
+            // held_session_ns also restarts on StartCharge; the Holding phase does not.
+            // Keep the apparition continuous while squeezing the tool.
+            const float alpha = g_call_beyond_sky.Update(
+                now, rec.space_serial, eligible, scene.state_ns);
+            if (alpha > 0.0f) AddCallBeyondSky(list, map, now, alpha);
+        }
     } else if (flashing) {
         AddHoldRing(list, map, map.WorldToView(g_ring_place.at), g_ring_place.size, scene, now,
                     false);
+    }
+    const auto& puff = scene.cigarette_puff;
+    if constexpr (Common::Log::Enabled) {
+        // Each cigarette's hold, once it leaves the hand: how near the mouth it came against the
+        // zone, the frames that could smoke, its puffs (the headset run 14 had none, no sign why).
+        static Q::Scene held_cigarette{};
+        if (scene.cigarette_frames > 0) {
+            held_cigarette = scene;
+        } else if (held_cigarette.cigarette_frames > 0) {
+            const auto& c = held_cigarette;
+            LOG_INFO(Core, "VR cigarettes: a hold over: {} frames, {} could smoke, nearest the "
+                           "mouth {} (the zone {:.0f} cm), {} puffs",
+                     c.cigarette_frames, c.cigarette_ready,
+                     c.cigarette_near < 0.0f ? std::string{"never measured"}
+                                             : fmt::format("{:.1f} cm", c.cigarette_near * 100),
+                     VR::Cigarette::ZoneM * 100, c.cigarette_puffs);
+            held_cigarette = {};
+        }
+        // Each Kos Lights puff, once (the mock cannot show the smoke reliably; 2026-11-04).
+        static s64 logged_puff = 0;
+        if (puff.ns > 0 && puff.ns != logged_puff) {
+            logged_puff = puff.ns;
+            LOG_INFO(Core, "VR cigarettes: a puff (the cigarette at the mouth)");
+        }
+    }
+    if (held_mesh && scene.held_goods == VR::Cigarette::Goods &&
+        puff.space == map.space_serial && puff.ns > 0 && now >= puff.ns &&
+        now - puff.ns < VR::Cigarette::SmokeNs) {
+        const float age = float(now - puff.ns) * 1e-9f;
+        // Five small wisps, one immutable release pose; never carried with the hand. Breathed
+        // out from the lips (5 cm behind the mouth point, which sits in front of them for the
+        // fist), quick at first and slowing, rising as it goes (14 cm out and steady until the
+        // user, 2026-11-05: "we made the mouth be too far out from the head").
+        for (int w = 0; w < 5; ++w) {
+            const float t = age - w * .075f;
+            if (t < 0 || t > 1.4f) continue;
+            const float drift = .045f * std::sin(t * 3.0f + w * 1.7f) * std::min(t / .3f, 1.0f);
+            const float reach = -.05f + .30f * (1.0f - std::exp(-3.5f * t));
+            Q::V3 p{puff.origin.x + puff.forward.x * reach + drift,
+                    puff.origin.y + puff.forward.y * reach + .10f*t*t,
+                    puff.origin.z + puff.forward.z * reach};
+            const Q::V3 centre = map.WorldToView(map.ToWorld(p));
+            const float size = (.02f + .075f*t) * map.scale;
+            auto smoke = MakeItem(F::MeshId::Quad, centre, {1,0,0}, {0,1,0}, {0,0,1},
+                                  size, size, 1.0f);
+            smoke.shade = F::Shade::Unlit;
+            smoke.translucent = true;
+            smoke.uv = {-9000.0f, t, float(w), 0};
+            smoke.color = {.48f,.46f,.42f,.18f * (1.0f-t/1.4f)};
+            list.Add(smoke);
+        }
+    }
+    {
+        // A cigarette thrown away: taken into the world as it leaves the hand (so it stays where it
+        // went while he walks on), it tumbles, lands on the floor he stands on, lies there and is
+        // gone (Cigarette::TossNs). Only drawn: no physics, hit or item.
+        static s64 toss_ns = 0;
+        static VR::Body::Vec3 toss_at{}, toss_v{};
+        static float toss_floor = 0.0f, toss_g = 9.8f;
+        const auto& toss = scene.cigarette_toss;
+        if (toss.ns > 0 && toss.ns != toss_ns && toss.space == map.space_serial) {
+            toss_ns = toss.ns;
+            toss_at = map.ToWorld({toss.origin.x, toss.origin.y, toss.origin.z});
+            toss_v = VR::Body::TrackingToWorld({toss.velocity.x, toss.velocity.y, toss.velocity.z},
+                                              map.base_yaw, map.scale);
+            // His feet (his root's height), not the tracking space's floor: its origin can be at
+            // the head (the headset run 14, 2026-11-05: one "landed after 0.00 s, 0.0 m away" and
+            // hung at the hand). Unknown: a metre below the hand.
+            u8* const ctrl = Read<u8*>(chr + OffsetChrCtrl);
+            const float feet = Plausible(ctrl) ? Read<float>(ctrl + OffsetChrFrame + 0x1C) : NAN;
+            toss_floor = std::isfinite(feet) && feet < toss_at.y ? feet + .01f * map.scale
+                                                                  : toss_at.y - map.scale;
+            toss_g = 9.8f * map.scale;
+        }
+        if (toss_ns > 0 && now >= toss_ns && now - toss_ns < VR::Cigarette::TossNs) {
+            const float t = float(now - toss_ns) * 1e-9f;
+            const float drop = std::max(0.0f, toss_at.y - toss_floor);
+            const float land = (toss_v.y + std::sqrt(toss_v.y * toss_v.y + 2.0f * toss_g * drop)) /
+                               std::max(toss_g, 1e-3f);
+            const float tf = std::min(t, land);
+            if constexpr (Common::Log::Enabled) {
+                static s64 landed_logged = 0;
+                if (t >= land && landed_logged != toss_ns) {
+                    landed_logged = toss_ns;
+                    LOG_INFO(Core, "VR cigarettes: the thrown cigarette landed after {:.2f} s, "
+                                   "{:.1f} m away",
+                             land,
+                             std::hypot(toss_v.x, toss_v.z) * land / std::max(map.scale, 1e-3f));
+                }
+            }
+            VR::Body::Vec3 at =
+                toss_at + VR::Body::Vec3{toss_v.x * tf, toss_v.y * tf, toss_v.z * tf};
+            at.y -= .5f * toss_g * tf * tf;
+            const float hlen = std::hypot(toss_v.x, toss_v.z);
+            const VR::Body::Vec3 ahead = hlen > 1e-4f
+                                             ? VR::Body::Vec3{toss_v.x / hlen, 0, toss_v.z / hlen}
+                                             : VR::Body::Vec3{1, 0, 0};
+            const VR::Body::Vec3 side{ahead.z, 0, -ahead.x};
+            // End over end while it flies (8 rad/s), flat along its way once it lies.
+            const float a = t < land ? 8.0f * t : 0.0f;
+            const VR::Body::Vec3 along = t < land ? VR::Body::Vec3{ahead.x * std::cos(a), std::sin(a),
+                                                                   ahead.z * std::cos(a)}
+                                                  : ahead;
+            const VR::Body::Vec3 normal{side.y * along.z - side.z * along.y,
+                                        side.z * along.x - side.x * along.z,
+                                        side.x * along.y - side.y * along.x};
+            F::Item butt = MakeItem(F::MeshId::Cigarette, map.WorldToView(at), map.DirToView(side),
+                                    map.DirToView(along), map.DirToView(normal), map.scale,
+                                    map.scale, map.scale);
+            butt.tex = F::Tex::None;
+            butt.shade = F::Shade::Goods;
+            butt.color = {1.0f, 1.0f, 1.0f, 1.0f};
+            butt.uv = {0.0f, 0.0f, 1.0f, 1.0f};
+            list.Add(butt);
+        }
+    }
+    const auto& notice = scene.cigarette_notice;
+    if (kos_notice && notice.space == map.space_serial) {
+        // Kos Lights given: its icon and name, as the game's item popup, 60 cm ahead of you and a
+        // little low, going with you and turning with the view (quick_items.h), then fading.
+        const float age = float(now - notice.ns) * 1e-9f;
+        const float total = float(VR::Cigarette::NoticeNs) * 1e-9f;
+        const float a = std::min(age / .25f, 1.0f) * std::clamp((total - age) / .8f, 0.0f, 1.0f);
+        const Q::V3 eye{notice.origin.x, notice.origin.y, notice.origin.z};
+        const Q::V3 ahead{notice.forward.x, notice.forward.y, notice.forward.z};
+        const Q::V3 at = map.WorldToView(map.ToWorld(eye + ahead * .6f - Q::V3{0, .08f, 0}));
+        const Q::V3 n = Q::Normalize(map.WorldToView(map.ToWorld(eye)) - at, {0.0f, 0.0f, 1.0f});
+        const Q::V3 world_up = Q::Normalize(map.DirToView({0.0f, 1.0f, 0.0f}), {0.0f, 1.0f, 0.0f});
+        const Q::V3 up = Q::Normalize(world_up - n * Q::Dot(world_up, n), world_up);
+        const Q::V3 right = Q::Cross(n, up);
+        const float size = .10f * map.scale;
+        F::Item icon = MakeItem(F::MeshId::Quad, at, right, up, n, size, size, 1.0f);
+        icon.shade = F::Shade::Icon;
+        icon.tex = F::Tex::Icon;
+        // Our packet (served in memory as icon file 9000, core/vr/bloodborne_kos_lights.cpp).
+        icon.tex_key = static_cast<u32>(VR::Cigarette::CardIcon);
+        icon.color = Linear(1.0f, 1.0f, 1.0f, a);
+        icon.uv = {0.0f, 0.0f, 400.0f / 416.0f, 400.0f / 416.0f}; // BC7 padding
+        list.Add(icon);
+        std::string name = VR::Assets::GoodsName(VR::Cigarette::Goods);
+        if (name.empty()) name = "Kos Lights";
+        // Worded as a pickup (2026-11-05); the game's own item-get popup is not shown
+        // for a raw AddItem.
+        name = "Acquired, " + name;
+        if (const int label = list.AddLabel(name.c_str(), 48); label >= 0) {
+            const float h = .028f * map.scale;
+            const Q::V3 under = at - up * (size * .5f + h);
+            F::Item text = MakeItem(F::MeshId::Quad, under, right, up, n, h, h, 1.0f);
+            text.shade = F::Shade::Text;
+            text.tex = F::Tex::Label;
+            text.tex_key = static_cast<u32>(label);
+            text.fit_label = static_cast<s8>(label);
+            text.color = Linear(.86f, .80f, .68f, a);
+            text.emissive = {0.005f, 0.005f, 0.006f, 0.85f}; // a soft dark halo
+            list.Add(text);
+            F::Item line = MakeItem(F::MeshId::Quad, under - up * (.62f * h), right, up, n, h,
+                                    .10f * h, 1.0f);
+            line.shade = F::Shade::Unlit;
+            line.color = Linear(.55f, .47f, .34f, .5f * a);
+            line.fit_label = static_cast<s8>(label);
+            line.fit_pad = 0.2f;
+            list.Add(line);
+        }
     }
     if (drain) {
         std::array<float, 12> palm_m{};
@@ -4386,6 +6927,18 @@ void QuickItemsRenderTick(u64 record_id, const float* rows, const float* positio
         BuildVialDrain(list, map, palm_m, now, drain_word);
         CaptureGripLab(list, map, palm_m, first, 1000);
         MarkHand(list, first);
+    }
+    if (syringe) {
+        // The right hand's empty syringe (BuildBloodDraw) in his right fist.
+        alignas(16) std::array<float, 8 * 12> r{};
+        const s32 right_id = RightGripDummy;
+        if (g_dmy_poly(chr, r.data(), &right_id, 1) >= 1) {
+            std::array<float, 12> fist{};
+            std::memcpy(fist.data(), r.data(), sizeof(fist));
+            const u32 first = list.count;
+            BuildBloodDraw(list, map, fist, now, blood_draw);
+            MarkHand(list, first);
+        }
     }
     if (g_markers) {
         // 4 cm axes at the palm dummy (X red, Y green, Z blue), a 1 cm dot at the arc's pivot.
@@ -4413,7 +6966,19 @@ void QuickItemsRenderTick(u64 record_id, const float* rows, const float* positio
             list.Add(dot);
         }
     }
-    if (list.count > 0) {
+    if (g_solid_shapes != 0) {
+        BuildSolidShapes(list, map, now);
+    }
+    if (tonitrus_bolt) {
+        namespace T = VR::TonitrusCharge;
+        AddTonitrusSkyBolt(list, map, chr, tonitrus, tonitrus_age);
+        // ... and the world flashes with it (the in-frame backdrop, before the upscaler).
+        list.world_storm = std::max(list.world_storm, T::Blink(tonitrus_age));
+    }
+    if (blade_shine) {
+        AddBladeShine(list, map, chr, blade_lines, blade_looks, steady);
+    }
+    if (list.count > 0 || list.world_storm > 0.0f) { // the flash outlasts the bolt
         F::Submit(list);
     }
 }

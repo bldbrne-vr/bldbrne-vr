@@ -99,8 +99,9 @@ u64 Load(u64& counter) {
 // (+0xE8), Scaleform 4's DisplayInfo (X +0x00, Y +0x08, XScale +0x18, VarsSet +0xD4, V_y = 0x02).
 // The read is checked first (a finite y on the stage and a scale of a real clip); anything else
 // leaves the bar where the game puts it, logged once.
-// 690 (to stage y ~250; 780 until 2026-10-18, then 700, 620, 680, 700 and 10 px down: the tester).
-constexpr double BossRaisePx = 690.0;
+// 686 (to stage y ~254; 780 until 2026-10-18, then 700, 620, 680, 700, 10 px down, 2 more, and 2
+// more on 2026-10-30: the user).
+constexpr double BossRaisePx = 686.0;
 // Half its size (2026-10-18: the bar did not fit the view), kept centred. Its x is in its
 // parent's coordinates, and the BossTop list's origin is the stage's middle (the bars sit at a
 // negative x, about half their width): scaled about that origin, x' = x * scale keeps the bar's

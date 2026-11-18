@@ -9,8 +9,13 @@
 #include "native_stereo.h"
 #include "video_core/fast/b_handler_profile.h"
 #include "common/assert.h"
+#include "common/render_diagnostic.h"
 #include "core/vr/vr_session.h"
 #include "core/vr/eye_distance.h"
+#include "core/vr/lamp_glow.h"
+#include "core/vr/monocular.h"
+#include "core/vr/moon_screen.h"
+#include "core/vr/native_views.h"
 #include "draw_memory.h"
 #include "fused_pair.h"
 #include "lighting_reconstruction.h"
@@ -18,10 +23,13 @@
 #include "registry_lookup_cache.h"
 #include "shader_recompiler/info.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/vram_report.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/buffer_cache/sparse_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_constant_ring.h"
+#include "video_core/renderer_vulkan/vk_stereo_set_codec.h"
 #include "video_core/texture_cache/image_info.h"
 #include <array>
 #include <atomic>
@@ -29,16 +37,22 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <fmt/ranges.h>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <vk_mem_alloc.h>
 namespace NativeStereo {
-struct BufferEntry { VkDeviceSize bytes{}; VmaAllocator allocator{}; bool stream{}; VkBuffer right{}; VmaAllocation allocation{}; };
+struct BufferEntry { VkDeviceSize bytes{}; VmaAllocator allocator{}; bool stream{}; VkBuffer right{}; VmaAllocation allocation{};
+    // Sparse views (buffer_cache/sparse_pool.h): the pool, the view's guest address, and one bit
+    // per 64 KB block of `right`, set where the twin binds its own piece (else the left's).
+    VideoCore::SparsePool* sparse{}; u64 view_begin{}; std::vector<u64> private_bits;
+    std::vector<u32> twin_pieces; }; // the pieces `right` binds (ReleaseTwin gives them back)
 namespace {
 template<class H> u64 Key(H h) { return std::bit_cast<u64>(h); }
 using Buffer = BufferEntry;
@@ -64,7 +78,14 @@ const bool g_reuse_readonly_lookup = [] {
     return !setting || setting[0] != '0';
 }();
 const bool g_perf_check_set = std::getenv("VR_PERF_CHECK") != nullptr;
-const bool g_shared_shadows = std::getenv("VR_NATIVE_SHARED_SHADOWS") != nullptr;
+// VR_NATIVE_SHARED_SHADOWS ('0' off; on by default since 2026-11-04): the 4096x4096 shadow atlas
+// one layer, drawn once for both eyes (the game fits it to its one camera). Re-measured at the
+// user's settings: GPU time the same within noise, peak VRAM 170-300 MB lower (the second layer and
+// the right-eye buffer copies made from it).
+const bool g_shared_shadows = [] {
+    const char* setting = std::getenv("VR_NATIVE_SHARED_SHADOWS");
+    return !setting || setting[0] != '0';
+}();
 const bool g_reuse_camera = [] {
     const char* setting = std::getenv("VR_NATIVE_REUSE_CAMERA");
     return !setting || setting[0] != '0';
@@ -144,6 +165,15 @@ bool SharedShadowAtlas(const VideoCore::ImageInfo& info) {
         info.size.height == 4096 && info.size.depth == 1 && info.resources.layers == 1 &&
         info.resources.levels == 1 && info.num_samples == 1;
 }
+void SharedShadowPerspective(float m66, float m67) {
+    static std::atomic<bool> noted{false};
+    if (!noted.exchange(true, std::memory_order_relaxed)) {
+        LOG_WARNING(Render_Vulkan,
+                    "VR native shared shadow: a perspective camera drew into the atlas ({} / {}); "
+                    "kept shared (a light's view is the same for both eyes)",
+                    m66, m67);
+    }
+}
 namespace {
 const auto g_ipd_override = VR::EyeDistance::NativeOverride(std::getenv("VR_NATIVE_IPD"));
 const bool g_asymmetric = std::getenv("VR_NATIVE_ASYMMETRIC") != nullptr;
@@ -179,6 +209,35 @@ const bool g_light_list_audit = std::getenv("VR_LIGHT_LIST_AUDIT") != nullptr;
 float Ipd(const VR::CameraRecord& record) {
     return VR::EyeDistance::Native(record.ipd, g_ipd_override);
 }
+namespace {
+// The card's mode, decided in every session, DIBR too (LayerDrawsMode).
+std::atomic<bool> g_layer_draws{false};
+}
+bool LayerDraws() {
+    return Enabled() && g_layer_draws.load(std::memory_order_relaxed);
+}
+bool LayerDrawsMode() {
+    return g_layer_draws.load(std::memory_order_relaxed);
+}
+void ChooseLayerDraws(u32 vendor_id, u32 device_id, std::string_view device_name,
+                      bool shader_output_layer) {
+    const char* value = std::getenv("VR_NATIVE_VIEWS");
+    const std::string_view choice = value ? value : "";
+    bool layers = VR::NativeViews::LayersByDefault(vendor_id, device_id, device_name);
+    if (choice == "layers") layers = true;
+    else if (choice == "multiview") layers = false;
+    if (layers && !shader_output_layer) {
+        if (Enabled())
+            LOG_WARNING(Render_Vulkan, "Native stereo: layer draws need shaderOutputLayer; multiview");
+        layers = false;
+    }
+    g_layer_draws.store(layers, std::memory_order_relaxed);
+    if (!Enabled()) return;
+    LOG_INFO(Render_Vulkan, "Native stereo views: {} (vendor {:#x}, device {:#x}{})",
+             layers ? "layer draws, one draw per eye" : "multiview", vendor_id, device_id,
+             value ? fmt::format(", VR_NATIVE_VIEWS={}", value) : std::string{});
+    RENDER_DIAGNOSTIC_ONCE("Native stereo views: {}", layers ? "layers" : "multiview");
+}
 bool AsymmetricProjection() { return Enabled() && g_asymmetric; }
 bool MirrorFlip() { return g_mirror_flip && AsymmetricProjection(); }
 void ClearCameraPairs() { camera_pairs.clear(); }
@@ -197,12 +256,55 @@ static bool SceneLayout(const float* c) {
     return c[4]>100 && c[5]>100 && std::abs(c[5]*c[7]-1.f)<.001f && c[52]>0 && c[57]>0 &&
            c[66]==1.f && c[67]==0.f && std::abs(c[195]-1.f)<.0001f && c[50]<0.f && c[51]>0.f;
 }
+// The Monocular uses the touched eye's existing scene draw as its narrow-field optical view.
+// Keep CameraRecord::eye_fov untouched: the OpenXR submission and source crop still use the
+// headset FOV. Only scene/reconstruction projections use this narrower FOV.
+VR::Fov SceneEyeFov(const VR::CameraRecord& record, u32 eye) {
+    // Only a frame the headset placed is seen through its lenses: the game's own camera (a
+    // cutscene, a flat cinematic) keeps its projection, whatever FOVs its record carries
+    // (VR_KEEP_EYE_FOV keeps them on flat records; a code review, 2026-11-17). Every caller
+    // takes no FOV as no remap.
+    if (eye >= record.eye_fov.size() || !record.driven) return {};
+    VR::Fov f = record.eye_fov[eye];
+    if (record.monocular_eye != static_cast<s32>(eye) ||
+        !std::isfinite(record.monocular_zoom)) return f;
+    const float magnification = std::clamp(record.monocular_zoom, 1.0f, VR::Monocular::MaxZoom);
+    // The stabilized aim slides the narrowed window inside the eye's own (core/vr/monocular.h
+    // ZoomWindow): the same eye, view and draws, a few degrees of turn. No shift: as before.
+    const float shift_x =
+        std::isfinite(record.monocular_shift[0]) ? record.monocular_shift[0] : 0.0f;
+    const float shift_y =
+        std::isfinite(record.monocular_shift[1]) ? record.monocular_shift[1] : 0.0f;
+    // DrawProjection asks once per draw. The headset FOV, zoom and slide are constant within a
+    // camera update, so compute the four trigonometric remaps only once per eye and recording
+    // thread.
+    struct Memo {
+        std::array<float, 7> key{};
+        VR::Fov value{};
+        bool valid{};
+    };
+    thread_local std::array<Memo, 2> memo;
+    Memo& cached = memo[eye];
+    const std::array<float, 7> key{f.angle_left, f.angle_right, f.angle_up, f.angle_down,
+                                   magnification, shift_x, shift_y};
+    if (cached.valid && std::memcmp(cached.key.data(), key.data(), sizeof(key)) == 0) {
+        return cached.value;
+    }
+    const auto w = VR::Monocular::ZoomWindow(
+        {std::tan(f.angle_left), std::tan(f.angle_right), std::tan(f.angle_up),
+         std::tan(f.angle_down)},
+        magnification, {shift_x, shift_y});
+    cached.key = key;
+    cached.value = {std::atan(w[0]), std::atan(w[1]), std::atan(w[2]), std::atan(w[3])};
+    cached.valid = true;
+    return cached.value;
+}
 static std::array<NativeProjection::Transform,2> EyeProjections(const float* center,
                                                                const VR::CameraRecord& record) {
     std::array<NativeProjection::Transform,2> projections{};
     if (AsymmetricProjection()) {
         for (u32 eye=0; eye<2; ++eye) {
-            const auto& v = record.eye_fov[eye];
+            const auto v = SceneEyeFov(record, eye);
             projections[eye] = NativeProjection::Make(
                 {v.angle_left,v.angle_right,v.angle_up,v.angle_down},
                 1.f/center[52],1.f/center[57], false);
@@ -363,6 +465,16 @@ static bool LightingBufferImpl(Upload& stream, const float* source, u32 size,
         static_cast<const float *>(ScratchDraw::MemorySource(source, size));
     const auto layout = NativeProjection::RecognizeLighting({source,size/sizeof(float)});
     if (layout == NativeProjection::LightingLayout::None) return false;
+    if constexpr (Common::Log::Enabled) {
+        // Wet streets: the game's trace parameters (dwords 64..79), the first three buffers.
+        static std::atomic<u32> told{};
+        if (layout == NativeProjection::LightingLayout::Reflection &&
+            told.fetch_add(1, std::memory_order_relaxed) < 3) {
+            std::string line;
+            for (u32 d = 64; d < 80; ++d) line += fmt::format(" {:.6g}", source[d]);
+            LOG_INFO(Render_Vulkan, "VR reflections: trace parameters (dwords 64..79):{}", line);
+        }
+    }
     const bool decal = layout == NativeProjection::LightingLayout::Decal;
     std::array<NativeProjection::Transform,2> transforms;
     // Use this pass's inverse projection, matching CameraBuffer's per-camera
@@ -372,7 +484,7 @@ static bool LightingBufferImpl(Upload& stream, const float* source, u32 size,
     // RecognizeLighting already validated this inverse projection, including the
     // bounded roundoff allowance. Do not repeat an exact-one check here.
     for (u32 eye=0; eye<2; ++eye) {
-        const auto& v = record.eye_fov[eye];
+        const auto v = SceneEyeFov(record, eye);
         transforms[eye] = NativeProjection::Make(
             {v.angle_left,v.angle_right,v.angle_up,v.angle_down}, tan_x,tan_y, false);
     }
@@ -399,6 +511,30 @@ static bool LightingBufferImpl(Upload& stream, const float* source, u32 size,
     if (world_scale) *world_scale = record.world_scale;
     return true;
 }
+bool EyeInverseProjections(const float* source, const VR::CameraRecord& record,
+                           std::array<std::array<float, 16>, 2>& out) {
+    for (auto& m : out) std::memcpy(m.data(), source, sizeof(m));
+    if (!AsymmetricProjection()) return false;
+    if (NativeProjection::RecognizeLighting({source, 84}) !=
+        NativeProjection::LightingLayout::Cascades) return false;
+    const float tan_x = source[0], tan_y = source[5];
+    std::array<std::array<float, 16>, 2> eyes;
+    for (u32 eye = 0; eye < 2; ++eye) {
+        const auto v = SceneEyeFov(record, eye);
+        const auto transform = NativeProjection::Make(
+            {v.angle_left, v.angle_right, v.angle_up, v.angle_down}, tan_x, tan_y, false);
+        if (!transform.valid) return false;
+        std::array<float, 104> values{};
+        std::memcpy(values.data(), source, 336);
+        const float e = (eye ? .5f : -.5f) * Ipd(record) * record.world_scale;
+        NativeProjection::RemapLighting(values.data(), source,
+                                        NativeProjection::LightingLayout::Cascades, e, transform,
+                                        false);
+        std::memcpy(eyes[eye].data(), values.data(), sizeof(eyes[eye]));
+    }
+    out = eyes;
+    return true;
+}
 bool LightListShader(u64 pgm_hash) {
     return g_light_eye && AsymmetricProjection() &&
            NativeProjection::LightListLayout(pgm_hash).kind != NativeProjection::LightKind::None;
@@ -415,6 +551,26 @@ bool LightListBuffer(VideoCore::StreamBuffer& stream, const float* source, u32 s
     // One read of the list (guest memory may change under it); both eyes are made from it.
     std::array<float, LightList::MaxBytes / sizeof(float)> center;
     std::memcpy(center.data(), guest ? ScratchDraw::MemorySource(source, size) : source, size);
+    // VR_LAMP_GLOW (tests, core/vr/lamp_glow.h): the save lamps' dim glow brighter;
+    // VR_CAMERA_LIGHT: the game's grey light on the camera dimmer, or off.
+    if (list.kind == NativeProjection::LightKind::Point &&
+        (VR::LampGlow::Boost() > 1.0f || VR::CameraLight::Scale() < 1.0f)) {
+        for (u32 i = 0; i < list.count; ++i) {
+            float* p = center.data() + list.Stride() * i;
+            const float metres = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]) / world_scale;
+            float k = 1.0f;
+            if (VR::LampGlow::IsGlow(p[4], p[5], p[6], metres)) {
+                k = VR::LampGlow::Boost();
+            } else if (VR::CameraLight::Is(p[4], p[5], p[6], metres)) {
+                k = VR::CameraLight::Scale();
+            }
+            if (k != 1.0f) {
+                for (u32 c : {4u, 5u, 6u, 8u, 9u, 10u}) {
+                    p[c] *= k;
+                }
+            }
+        }
+    }
     std::array<std::array<float, LightList::MaxBytes / sizeof(float)>, 2> eyes;
     for (u32 eye = 0; eye < 2; ++eye) {
         // LightingBuffer's shift of the draw's light208 (and CameraBuffer's of its scene camera).
@@ -440,12 +596,20 @@ bool LightListBuffer(VideoCore::StreamBuffer& stream, const float* source, u32 s
                  u32(list.count), NativeProjection::Name(list.kind), pgm_hash, size, center[0],
                  eyes[0][0], eyes[1][0], world_scale);
     static std::atomic<u32> audited{0};
-    if (g_light_list_audit && audited.fetch_add(1, std::memory_order_relaxed) < 256) {
+    // The first 256 lists, then one in 64 (the views a test looks at come later).
+    const u32 audit_n = g_light_list_audit ? audited.fetch_add(1, std::memory_order_relaxed) : 0;
+    if (g_light_list_audit && (audit_n < 256 || audit_n % 64 == 0)) {
         std::string lights;
         for (u32 i = 0; i < list.count; ++i) {
             const float* p = center.data() + list.Stride() * i;
-            lights += fmt::format(" ({:.3f}, {:.3f}, {:.3f}: {:.2f} m)", p[0], p[1], p[2],
+            lights += fmt::format(" ({:.3f}, {:.3f}, {:.3f}: {:.2f} m", p[0], p[1], p[2],
                                   std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]) / world_scale);
+            // A point light's reach (1/r^2 at 3) and colour (4..6): fog_light.h IsFillLight's.
+            if (list.kind == NativeProjection::LightKind::Point)
+                lights += fmt::format(", r {:.2f} m, lum {:.2f}, rgb {:.2f} {:.2f} {:.2f}",
+                                      p[3] > 0.f ? 1.f / std::sqrt(p[3]) / world_scale : -1.f,
+                                      0.3f * p[4] + 0.6f * p[5] + 0.1f * p[6], p[4], p[5], p[6]);
+            lights += ")";
         }
         LOG_INFO(Render_Vulkan, "VR light list audit: fs {:#x}, {} {} light(s), flat view:{}",
                  pgm_hash, u32(list.count), NativeProjection::Name(list.kind), lights);
@@ -471,7 +635,7 @@ bool ScreenPointBuffer(VideoCore::StreamBuffer& stream, const float* source, u32
     const float ty = std::tan(record.vfov * .5f);
     std::array<NativeProjection::Transform, 2> transforms;
     for (u32 eye = 0; eye < 2; ++eye) {
-        const auto& v = record.eye_fov[eye];
+        const auto v = SceneEyeFov(record, eye);
         transforms[eye] = NativeProjection::Make({v.angle_left, v.angle_right, v.angle_up,
                                                   v.angle_down}, ty * record.aspect, ty, false);
         if (!transforms[eye].valid)
@@ -491,9 +655,13 @@ bool ScreenPointBuffer(VideoCore::StreamBuffer& stream, const float* source, u32
     stream.Commit();
     left = {stream.Handle(), offset, size};
     camera_pairs.push_back({left, {stream.Handle(), offset + stride, size}});
+    // The game's light shafts' centre: the visible moon, for our god rays' glow (moon_screen.h).
+    const bool shafts = pgm_hash == 0xd506a1;
+    if (shafts) {
+        VR::MoonScreen::Publish(source[at], source[at + 1]);
+    }
     // The first three of each shader: the light shafts' and the glow god rays'.
     static std::array<std::atomic<u32>, 2> logged{};
-    const bool shafts = pgm_hash == 0xd506a1;
     if (logged[shafts ? 0 : 1].fetch_add(1, std::memory_order_relaxed) < 3) {
         const auto l = NativeProjection::RemapScreenPoint(source[at], source[at + 1], transforms[0]);
         const auto r = NativeProjection::RemapScreenPoint(source[at], source[at + 1], transforms[1]);
@@ -535,7 +703,7 @@ bool ScreenRectBuffer(VideoCore::StreamBuffer& stream, const u32* source, u32 si
     for (u32 eye = 0; eye < 2; ++eye) {
         NativeProjection::Transform t{.valid = true};
         if (AsymmetricProjection()) {
-            const auto& v = record.eye_fov[eye];
+            const auto v = SceneEyeFov(record, eye);
             t = NativeProjection::Make({v.angle_left, v.angle_right, v.angle_up, v.angle_down},
                                        ty * record.aspect, ty, false);
             if (!t.valid)
@@ -611,14 +779,14 @@ std::array<std::array<float,4>,2> DrawProjection(const VR::CameraRecord& record,
     // Every draw of a camera update asks again: memoized by the exact bits of its inputs.
     struct Memo { std::array<float,10> key{}; std::array<std::array<float,4>,2> value{}; bool valid{}; };
     thread_local Memo memo;
-    const auto& l=record.eye_fov[0]; const auto& r=record.eye_fov[1];
+    const auto l=SceneEyeFov(record,0); const auto r=SceneEyeFov(record,1);
     const std::array<float,10> key{record.vfov,record.aspect,l.angle_left,l.angle_right,l.angle_up,
                                    l.angle_down,r.angle_left,r.angle_right,r.angle_up,r.angle_down};
     if (!memo.valid || std::memcmp(memo.key.data(),key.data(),sizeof(key))!=0) {
         std::array<std::array<float,4>,2> result{};
         const float ty=std::tan(record.vfov*.5f);
         for (u32 eye=0;eye<2;++eye) {
-            const auto& f=record.eye_fov[eye];
+            const auto f=SceneEyeFov(record,eye);
             const auto t=NativeProjection::Make({f.angle_left,f.angle_right,f.angle_up,f.angle_down},ty*record.aspect,ty,false);
             if (t.valid) result[eye]={t.x_scale,t.y_scale,t.x_offset,t.y_offset};
         }
@@ -660,7 +828,7 @@ bool LightScissors(const AmdGpu::Regs& regs, const VR::CameraRecord& record,
                                     ctl.xscale_enable?vp.xscale:1.f,ctl.yscale_enable?vp.yscale:1.f};
     const float ty=std::tan(record.vfov*.5f);
     for (u32 eye=0;eye<2;++eye) {
-        const auto& f=record.eye_fov[eye];
+        const auto f=SceneEyeFov(record,eye);
         const auto t=NativeProjection::Make({f.angle_left,f.angle_right,f.angle_up,f.angle_down},ty*record.aspect,ty,false);
         if (!t.valid) return false;
         result[eye]=NativeProjection::RemapScissor(rect,viewport,mirror ? NativeProjection::Flipped(t) : t);
@@ -683,7 +851,7 @@ void AuditCameraBuffer(const float* f, u32 size, u64 shader, u32 stage, u32 bind
     const float ty=scene ? 1.f/f[57] : f[layout==NativeProjection::LightingLayout::Decal?21:5];
     std::array<bool,2> covered{}, valid_eyes{};
     for (u32 eye=0;eye<2;++eye) {
-        const auto& v=record.eye_fov[eye];
+        const auto v=SceneEyeFov(record,eye);
         const std::array<float,4> fov{v.angle_left,v.angle_right,v.angle_up,v.angle_down};
         covered[eye]=NativeProjection::Make(fov,tx,ty).valid;
         valid_eyes[eye]=NativeProjection::Make(fov,tx,ty,false).valid;
@@ -724,14 +892,66 @@ BufferEntry* RegisterBuffer(vk::Buffer b,VkDeviceSize n,VmaAllocator allocator,b
     ASSERT(!meta.right); meta={n,allocator,stream};
     return &meta; // unordered_map nodes keep their address until erased
 }
+BufferEntry* RegisterSparseView(vk::Buffer b, VkDeviceSize n, VmaAllocator allocator,
+                                VideoCore::SparsePool* pool, u64 view_begin) {
+    BufferEntry* const meta = RegisterBuffer(b, n, allocator, false);
+    if (meta) {
+        std::lock_guard lock(R().mutex);
+        meta->sparse = pool;
+        meta->view_begin = view_begin;
+    }
+    return meta;
+}
 void ForgetBuffer(vk::Buffer b) {
     if(!Enabled()||!b) return;
     std::lock_guard lock(R().mutex);
     auto it=R().buffers.find(Key(VkBuffer(b)));
     if(it==R().buffers.end()) return;
     if(it->second.right) vmaDestroyBuffer(it->second.allocator,it->second.right,it->second.allocation);
+    // A sparse twin (no allocation of its own): its private pieces lose a reference. The view goes
+    // after the GPU is done with it, and so with its twin.
+    if (it->second.sparse && it->second.right) {
+        it->second.sparse->ReleaseTwin(it->second.twin_pieces);
+    }
     R().buffers.erase(it);
     ++R().buffer_generation;
+}
+VkDeviceSize ReleaseRight(Vulkan::Scheduler& s, vk::Buffer b) {
+    if(!Enabled()||!b) return 0;
+    VmaAllocator allocator{};
+    VkBuffer right{};
+    VmaAllocation allocation{};
+    VkDeviceSize bytes{};
+    {
+        std::lock_guard lock(R().mutex);
+        auto it=R().buffers.find(Key(VkBuffer(b)));
+        if(it==R().buffers.end()||!it->second.right||it->second.stream) return 0;
+        Buffer& meta=it->second;
+        if (meta.sparse) {
+            // A sparse twin: its private pieces (its only memory) go once the GPU is done with it.
+            VideoCore::SparsePool* const pool = meta.sparse;
+            const VkBuffer old = meta.right;
+            const VmaAllocator alloc = meta.allocator;
+            u64 own = 0;
+            for (const u64 word : meta.private_bits) own += std::popcount(word);
+            std::vector<u32> pieces = std::move(meta.twin_pieces);
+            std::atomic_ref<VkBuffer>(meta.right).store(VK_NULL_HANDLE, std::memory_order_release);
+            meta.private_bits.clear();
+            meta.twin_pieces.clear();
+            ++R().buffer_generation;
+            s.DeferPriorityOperation([pool, old, alloc, pieces] {
+                vmaDestroyBuffer(alloc, old, VK_NULL_HANDLE);
+                pool->ReleaseTwin(pieces);
+            });
+            return own << VideoCore::SparseLogic::BlockBits;
+        }
+        allocator=meta.allocator; right=meta.right; allocation=meta.allocation; bytes=meta.bytes;
+        std::atomic_ref<VkBuffer>(meta.right).store(VK_NULL_HANDLE, std::memory_order_release);
+        meta.allocation=VK_NULL_HANDLE;
+        ++R().buffer_generation; // carried hints and memos with the twin's handle rebuild
+    }
+    s.DeferPriorityOperation([allocator,right,allocation]{ vmaDestroyBuffer(allocator,right,allocation); });
+    return bytes;
 }
 vk::Buffer ExistingRight(vk::Buffer b) {
     if(!Enabled()||!b) return {};
@@ -747,15 +967,211 @@ void Barrier(Vulkan::Scheduler& s) {
         .dstAccessMask=vk::AccessFlagBits2::eMemoryRead|vk::AccessFlagBits2::eMemoryWrite};
     s.Commands().pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&m});
 }
+// --- Sparse twins (buffer_cache/sparse_pool.h); the caller holds the registry mutex. ---
+constexpr vk::BufferUsageFlags SparseTwinUsage =
+    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
+    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eUniformBuffer |
+    vk::BufferUsageFlagBits::eIndirectBuffer | vk::BufferUsageFlagBits::eVertexBuffer |
+    vk::BufferUsageFlagBits::eIndexBuffer;
+// [offset, offset + size) of the view, clamped, as blocks [first, end).
+static std::pair<u64, u64> SparseBlocks(const Buffer& m, u64 offset, u64 size) {
+    namespace L = VideoCore::SparseLogic;
+    const u64 end = std::min<u64>(m.bytes, size > m.bytes - std::min<u64>(offset, m.bytes)
+                                               ? m.bytes : offset + size);
+    if (offset >= end) return {0, 0};
+    return {offset >> L::BlockBits, L::AlignUp(end) >> L::BlockBits};
+}
+static bool SparseBit(const Buffer& m, u64 block) {
+    return block / 64 < m.private_bits.size() && ((m.private_bits[block / 64] >> (block % 64)) & 1);
+}
+static bool SparseAllPrivate(const Buffer& m, u64 offset, u64 size) {
+    const auto [first, end] = SparseBlocks(m, offset, size);
+    for (u64 b = first; b < end; ++b) if (!SparseBit(m, b)) return false;
+    return true;
+}
+static bool SparseAnyPrivate(const Buffer& m, u64 offset, u64 size) {
+    const auto [first, end] = SparseBlocks(m, offset, size);
+    for (u64 b = first; b < end; ++b) if (SparseBit(m, b)) return true;
+    return false;
+}
+// f(offset, size) for each run of private blocks, clipped to [offset, offset + size).
+template <class F>
+static void SparseForPrivate(const Buffer& m, u64 offset, u64 size, F&& f) {
+    namespace L = VideoCore::SparseLogic;
+    const u64 end = std::min<u64>(m.bytes, offset + std::min<u64>(size, m.bytes));
+    const auto [first, last] = SparseBlocks(m, offset, size);
+    for (u64 b = first; b < last;) {
+        if (!SparseBit(m, b)) { ++b; continue; }
+        u64 e = b;
+        while (e < last && SparseBit(m, e)) ++e;
+        const u64 lo = std::max<u64>(offset, b << L::BlockBits);
+        const u64 hi = std::min<u64>(end, e << L::BlockBits);
+        if (hi > lo) f(lo, hi - lo);
+        b = e;
+    }
+}
+// VRAM has no piece for a sparse view's twin or for the right eye's own blocks: the view's twin
+// becomes an ordinary one from then on, a full copy as before sparse twins (VMA may place it in
+// system memory), so a per-eye write never lands in the left eye's buffer. Its bytes: the old
+// sparse twin's (the right eye's own blocks with them), else the left's. The old twin goes once
+// the GPU is done with it.
+static vk::Buffer OrdinaryTwinLocked(Vulkan::Scheduler& s, vk::Buffer b, Buffer& meta) {
+    VideoCore::SparsePool* const pool = meta.sparse;
+    const VkBuffer old = meta.right;
+    std::vector<u32> old_pieces = std::move(meta.twin_pieces);
+    const VkBufferCreateInfo ci{.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=meta.bytes,
+        .usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT|VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT};
+    VkBuffer created{};
+    VmaAllocation allocation{};
+    // VRAM first, then system memory by name (the GPU reads it over PCIe, slower but right). With
+    // neither, the process is out of memory: stop here rather than hand back the left buffer.
+    for (const VmaMemoryUsage usage :
+         {VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_MEMORY_USAGE_AUTO_PREFER_HOST}) {
+        const VmaAllocationCreateInfo aci{.usage = usage};
+        if (vmaCreateBuffer(meta.allocator, &ci, &aci, &created, &allocation, nullptr) ==
+            VK_SUCCESS)
+            break;
+        created = VK_NULL_HANDLE;
+        allocation = VK_NULL_HANDLE;
+    }
+    ASSERT_MSG(created, "Sparse twins: no VRAM or system memory for a {} MiB right eye twin",
+               meta.bytes >> 20);
+    Barrier(s);
+    s.Commands().copyBuffer(old ? vk::Buffer{old} : b, vk::Buffer{created}, vk::BufferCopy{0,0,meta.bytes});
+    Barrier(s);
+    if (old) {
+        const VmaAllocator alloc = meta.allocator;
+        s.DeferPriorityOperation([pool, old, alloc, old_pieces] {
+            vmaDestroyBuffer(alloc, old, VK_NULL_HANDLE);
+            pool->ReleaseTwin(old_pieces);
+        });
+    }
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        LOG_WARNING(Render_Vulkan, "Sparse twins: no VRAM for a sparse view's right eye: its twin "
+                    "is an ordinary copy from now on ({} MiB)", meta.bytes >> 20);
+    }
+    meta.sparse = nullptr;
+    meta.private_bits.clear();
+    meta.allocation = allocation;
+    std::atomic_ref<VkBuffer>(meta.right).store(created, std::memory_order_release);
+    ++R().buffer_generation;
+    return vk::Buffer{created};
+}
+// The twin of a sparse view: made sharing the view's pieces (no copy: the right eye then reads
+// the left bytes, as a twin copied from the left buffer did). An ordinary twin when VRAM has no
+// room for it.
+static vk::Buffer SparseTwinLocked(Vulkan::Scheduler& s, vk::Buffer b, Buffer& meta) {
+    if (meta.right) return vk::Buffer{meta.right};
+    std::vector<u64> bits;
+    std::vector<u32> pieces;
+    const vk::Buffer twin =
+        meta.sparse->CreateTwin(meta.view_begin, meta.bytes, SparseTwinUsage, bits, pieces);
+    if (!twin) return OrdinaryTwinLocked(s, b, meta);
+    meta.private_bits = std::move(bits);
+    meta.twin_pieces = std::move(pieces);
+    meta.allocation = VK_NULL_HANDLE;
+    std::atomic_ref<VkBuffer>(meta.right).store(VkBuffer(twin), std::memory_order_release);
+    return twin;
+}
+// A per-eye write of [offset, offset + size) of a sparse view: the blocks the twin still shares
+// get pieces of their own, filled with the left bytes the right eye read there until now, behind
+// a NEW twin handle (the old one keeps its binds for the commands already recorded with it, and
+// goes once the GPU is done with them).
+// FAST_SPARSE_TWIN_ALL_PRIVATE=1 (a test, read once): a write makes the whole twin its own, as a
+// twin copied from the left was: the eyes of a run with it and one without must match.
+static const bool g_twin_all_private = [] {
+    const char* value = std::getenv("FAST_SPARSE_TWIN_ALL_PRIVATE");
+    return value && value[0] == '1';
+}();
+static vk::Buffer SparseWriteLocked(Vulkan::Scheduler& s, vk::Buffer b, Buffer& meta, u64 offset,
+                                    u64 size) {
+    namespace L = VideoCore::SparseLogic;
+    if (g_twin_all_private) {
+        offset = 0;
+        size = meta.bytes;
+    }
+    SparseTwinLocked(s, b, meta);
+    if (!meta.sparse) {
+        // Now an ordinary twin (OrdinaryTwinLocked made one or stopped): a per-eye write never
+        // goes to the left buffer.
+        ASSERT_MSG(meta.right, "Sparse twins: a per-eye write without a right buffer");
+        return vk::Buffer{meta.right};
+    }
+    if (SparseAllPrivate(meta, offset, size)) return vk::Buffer{meta.right};
+    const auto [first, end] = SparseBlocks(meta, offset, size);
+    if (first >= end) return vk::Buffer{meta.right};
+    std::vector<u64> fresh;
+    if (!meta.sparse->Privatize(meta.view_begin, meta.view_begin + (first << L::BlockBits),
+                                (end - first) << L::BlockBits, fresh)) {
+        return OrdinaryTwinLocked(s, b, meta); // nothing taken: a full copy keeps stereo right
+    }
+    std::vector<u64> bits;
+    std::vector<u32> pieces;
+    const vk::Buffer twin =
+        meta.sparse->CreateTwin(meta.view_begin, meta.bytes, SparseTwinUsage, bits, pieces);
+    if (!twin) {
+        meta.sparse->Unprivatize(meta.view_begin, fresh); // no right piece left uninitialized
+        return OrdinaryTwinLocked(s, b, meta);
+    }
+    std::vector<vk::BufferCopy> cow;
+    std::sort(fresh.begin(), fresh.end());
+    for (const u64 block : fresh) {
+        const u64 at = block << L::BlockBits;
+        if (!cow.empty() && cow.back().dstOffset + cow.back().size == at) {
+            cow.back().size += L::BlockSize;
+        } else {
+            cow.push_back({at, at, L::BlockSize});
+        }
+    }
+    if (!cow.empty()) {
+        Barrier(s);
+        s.Commands().copyBuffer(b, twin, cow);
+        Barrier(s);
+    }
+    VideoCore::SparsePool* const pool = meta.sparse;
+    const VkBuffer old = meta.right;
+    const VmaAllocator alloc = meta.allocator;
+    std::vector<u32> old_pieces = std::move(meta.twin_pieces);
+    s.DeferPriorityOperation([pool, old, alloc, old_pieces] {
+        vmaDestroyBuffer(alloc, old, VK_NULL_HANDLE);
+        pool->ReleaseTwin(old_pieces);
+    });
+    meta.private_bits = std::move(bits);
+    meta.twin_pieces = std::move(pieces);
+    std::atomic_ref<VkBuffer>(meta.right).store(VkBuffer(twin), std::memory_order_release);
+    ++R().buffer_generation; // carried hints and memos with the old twin's handle rebuild
+    if constexpr (Common::Log::Enabled) {
+        // How often a write needs new blocks (each a new twin handle and a memo rebuild).
+        static u64 handles = 0, blocks = 0, next_log = 1;
+        ++handles;
+        blocks += fresh.size();
+        if (handles >= next_log) {
+            next_log = handles < 64 ? handles + 8 : handles + 256;
+            LOG_INFO(Render_Vulkan, "Sparse twins: {} new twin handles so far, {} MiB made the right "
+                     "eye's own (last: {} KB of a {} MiB view)", handles,
+                     (blocks << L::BlockBits) >> 20, (fresh.size() << L::BlockBits) >> 10,
+                     meta.bytes >> 20);
+        }
+    }
+    return twin;
+}
 // Caller holds the registry mutex; `meta` is b's own entry (looked up or carried, bit 25).
 // meta.right is stored atomically: FAST_CPU_FUSED_PAIR reads carried entries without the lock.
 static vk::Buffer RightOfLocked(Vulkan::Scheduler& s,vk::Buffer b,bool create,Buffer& meta) {
+    if (meta.sparse) {
+        if (!create) return meta.right ? vk::Buffer{meta.right} : b;
+        // A write with no range: the whole twin its own, as a twin copied from the left was.
+        return SparseWriteLocked(s, b, meta, 0, meta.bytes);
+    }
     if(!meta.right&&create) {
         const VkBufferCreateInfo ci{.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=meta.bytes,
             .usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT|VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT};
         const VmaAllocationCreateInfo aci{.usage=VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VkBuffer created{};
         ASSERT(vmaCreateBuffer(meta.allocator,&ci,&aci,&created,&meta.allocation,nullptr)==VK_SUCCESS);
+        VideoCore::VramReport::Name(meta.allocator,meta.allocation,fmt::format("stereo right buffer {} MiB of handle {:#x}",meta.bytes>>20,reinterpret_cast<u64>(VkBuffer(b))));
         std::atomic_ref<VkBuffer>(meta.right).store(created, std::memory_order_release);
         Barrier(s);
         s.Commands().copyBuffer(b,meta.right,vk::BufferCopy{0,0,meta.bytes});
@@ -776,9 +1192,61 @@ vk::Buffer RightBuffer(Vulkan::Scheduler& s,vk::Buffer b,bool create) {
     std::lock_guard lock(R().mutex);
     return RightBufferLocked(s,b,create);
 }
+static vk::Buffer RightForWriteLocked(Vulkan::Scheduler& s, vk::Buffer b, Buffer& meta, u64 offset,
+                                      u64 size) {
+    return meta.sparse ? SparseWriteLocked(s, b, meta, offset, size) : RightOfLocked(s, b, true, meta);
+}
+vk::Buffer RightForWrite(Vulkan::Scheduler& s, vk::Buffer b, u64 offset, u64 size) {
+    if (!Enabled() || !b) return b;
+    std::lock_guard lock(R().mutex);
+    auto it = R().buffers.find(Key(VkBuffer(b)));
+    ASSERT_MSG(it != R().buffers.end(), "Native stereo: unregistered writable buffer");
+    return RightForWriteLocked(s, b, it->second, offset, size);
+}
+std::vector<std::pair<u64, u64>> RightOwnRanges(vk::Buffer b, u64 offset, u64 size, vk::Buffer& right) {
+    right = vk::Buffer{};
+    if (!Enabled() || !b) return {};
+    std::lock_guard lock(R().mutex);
+    auto it = R().buffers.find(Key(VkBuffer(b)));
+    if (it == R().buffers.end() || !it->second.right) return {};
+    right = vk::Buffer{it->second.right};
+    if (!it->second.sparse) return {{offset, size}};
+    std::vector<std::pair<u64, u64>> ranges;
+    SparseForPrivate(it->second, offset, size, [&](u64 o, u64 n) { ranges.emplace_back(o, n); });
+    return ranges;
+}
+bool IsSparseTwin(vk::Buffer b) {
+    if (!Enabled() || !b) return false;
+    std::lock_guard lock(R().mutex);
+    auto it = R().buffers.find(Key(VkBuffer(b)));
+    return it != R().buffers.end() && it->second.sparse != nullptr;
+}
+void CopyRight(Vulkan::Scheduler& s, vk::Buffer src, vk::Buffer dst,
+               std::span<const vk::BufferCopy> copies) {
+    if (!Enabled()) return;
+    const vk::Buffer right_src = ExistingRight(src);
+    if (!right_src) return;
+    {
+        // Sparse views both: the right eye's own pieces are the blocks', so the new view's twin
+        // binds them as it is made (sharing the rest): nothing to copy.
+        std::lock_guard lock(R().mutex);
+        auto si = R().buffers.find(Key(VkBuffer(src))), di = R().buffers.find(Key(VkBuffer(dst)));
+        if (si != R().buffers.end() && di != R().buffers.end() && si->second.sparse &&
+            di->second.sparse) {
+            SparseTwinLocked(s, dst, di->second);
+            if (di->second.sparse) return;
+            // No VRAM for a sparse twin: an ordinary one, a copy of the left bytes, which gets
+            // the source's right bytes below like any ordinary twin.
+        }
+    }
+    const vk::Buffer right_dst = RightBuffer(s, dst, true); // its own barriers when made
+    if (!right_dst || right_dst == dst) return;
+    Barrier(s);
+    s.Commands().copyBuffer(right_src, right_dst, copies);
+    Barrier(s);
+}
 void Copy(Vulkan::Scheduler& s,vk::Buffer src,vk::Buffer dst,std::span<const vk::BufferCopy> copies, bool hle, vk::Buffer outer_right) {
     ScratchProfile::Cpu scratch_cpu(19,"Copy");
-    if(!Enabled()) { s.Commands().copyBuffer(src,dst,copies); return; }
     const size_t original_regions=copies.size();
     const bool coalesce=g_coalesce_copies;
     if(coalesce && copies.size()>1){
@@ -793,8 +1261,52 @@ void Copy(Vulkan::Scheduler& s,vk::Buffer src,vk::Buffer dst,std::span<const vk:
         }
         copies=merged;
     }
+    // Flat too: the HLE copy shader's tiny adjacent ranges as separate regions cost the GPU ~8x
+    // the merged copies (flat 720p: 2.9 ms a frame against VR's 0.36 ms for the same calls).
+    if(!Enabled()) { s.Commands().copyBuffer(src,dst,copies); return; }
     // FAST_GPU_PASS_PROFILE: the HLE copy shader's copies stay in its label (many batches).
     ScratchProfile::Gpu scratch_gpu(s,40,!hle);
+    {
+        // Into a sparse view: where the source holds per-eye bytes the destination's twin gets
+        // those blocks first (RightForWrite); the right copy then goes only where the twin has
+        // blocks of its own (the shared rest is the left memory, written by the left copy).
+        std::unique_lock lock(R().mutex);
+        auto di = R().buffers.find(Key(VkBuffer(dst)));
+        if (di != R().buffers.end() && di->second.sparse) {
+            Buffer& dm = di->second;
+            auto si = R().buffers.find(Key(VkBuffer(src)));
+            const Buffer* const sm = si != R().buffers.end() ? &si->second : nullptr;
+            const vk::Buffer right_src = sm && sm->right ? vk::Buffer{sm->right} : vk::Buffer{};
+            if (right_src) {
+                for (const auto& c : copies) {
+                    if (!sm->sparse || SparseAnyPrivate(*sm, c.srcOffset, c.size)) {
+                        SparseWriteLocked(s, dst, dm, c.dstOffset, c.size);
+                    }
+                }
+            }
+            std::vector<vk::BufferCopy> right_copies;
+            if (dm.right && dm.sparse) {
+                for (const auto& c : copies) {
+                    SparseForPrivate(dm, c.dstOffset, c.size, [&](u64 o, u64 n) {
+                        right_copies.push_back({c.srcOffset + (o - c.dstOffset), o, n});
+                    });
+                }
+            } else if (dm.right) {
+                // SparseWriteLocked above found no VRAM and made the twin an ordinary one (its
+                // private bits gone): every range is the right eye's own from now on.
+                right_copies.assign(copies.begin(), copies.end());
+            }
+            const vk::Buffer right_dst = dm.right ? vk::Buffer{dm.right} : vk::Buffer{};
+            lock.unlock();
+            s.Commands().copyBuffer(src, dst, copies);
+            if (!right_copies.empty() && right_dst && right_dst != dst) {
+                Barrier(s);
+                s.Commands().copyBuffer(right_src ? right_src : src, right_dst, right_copies);
+                Barrier(s);
+            }
+            return;
+        }
+    }
     auto right_src=ExistingRight(src),right_dst=ExistingRight(dst);
     if(right_src&&!right_dst) right_dst=RightBuffer(s,dst,true);
     const bool scoped_copy = g_copy_transfer_barriers;
@@ -861,7 +1373,7 @@ void Copy(Vulkan::Scheduler& s,vk::Buffer src,vk::Buffer dst,std::span<const vk:
         auto now=std::chrono::steady_clock::now();
         if(std::chrono::duration<double>(now-last).count()>=5){
             LOG_INFO(Render_Vulkan,"VR native copy: {:.3f} s, {} calls ({} paired), {} regions ({} original), {} bytes left + {} right; transfer barriers {} coalesce {}",std::chrono::duration<double>(now-last).count(),calls,paired,regions,originals,bytes,paired_bytes,scoped_copy,coalesce);
-            LOG_INFO(Render_Vulkan, "Scratch HLE copy distribution: post-merge buckets 1/2-7/8-31/32-127/128+ = {}/{}/{}/{}/{}; dword-aligned 8+ batches {}, bytes {}", hle_batches[0], hle_batches[1], hle_batches[2], hle_batches[3], hle_batches[4], hle_aligned_large, hle_large_bytes);
+            LOG_INFO(Render_Vulkan, "HLE copy distribution: post-merge buckets 1/2-7/8-31/32-127/128+ = {}/{}/{}/{}/{}; dword-aligned 8+ batches {}, bytes {}", hle_batches[0], hle_batches[1], hle_batches[2], hle_batches[3], hle_batches[4], hle_aligned_large, hle_large_bytes);
             hle_batches.fill(0); hle_aligned_large=hle_large_bytes=0;
             calls=paired=bytes=paired_bytes=regions=originals=0;last=now;
         }
@@ -987,6 +1499,34 @@ void PairDescriptors(Vulkan::Scheduler& s,const Vulkan::Pipeline& pipeline,std::
         ++handle_stats.buffer_hits;
         return HandleVerifyNow() ? VerifyEntry(info->buffer, entry, "descriptor") : entry;
     };
+    // Sparse twins first (2026-11-06, a review; Fused::Pair does the same): a write that needs new
+    // private blocks gives its entry a new right handle (SparseWriteLocked), so a read of the same
+    // buffer paired before it in this draw would keep the old twin, whose blocks there still show
+    // the left eye. Every written sparse range is made private before anything is paired; the
+    // pass below then finds it private, and every read and write of it takes the same right.
+    for (const auto& w : original) {
+        if (w.descriptorType != vk::DescriptorType::eStorageBuffer) continue;
+        const bool written = reuse ? (w.dstBinding < cached.size() && cached[w.dstBinding]) : (*writable)[w.dstBinding];
+        if (!written) continue;
+        for (u32 i = 0; i < w.descriptorCount; ++i) {
+            const auto& left = w.pBufferInfo[i];
+            if (!left.buffer) continue;
+            std::unique_lock lock(R().mutex, std::defer_lock);
+            if (!batch_registry) lock.lock();
+            Buffer* entry = nullptr;
+            if (buffer_hints) {
+                const size_t index = HintIndex(w.pBufferInfo + i, handles->buffer_base);
+                if (index < handles->buffers.size() && handles->buffers[index].left == left.buffer)
+                    entry = handles->buffers[index].entry;
+            }
+            if (!entry) {
+                const auto it = R().buffers.find(Key(VkBuffer(left.buffer)));
+                if (it != R().buffers.end()) entry = &it->second;
+            }
+            if (entry && entry->sparse)
+                SparseWriteLocked(s, left.buffer, *entry, left.offset, left.range);
+        }
+    }
     const bool reuse_lookup = g_reuse_readonly_lookup;
     const bool check_lookup = g_perf_check_set;
     vk::Buffer memo_left{}, memo_right{};
@@ -1028,8 +1568,20 @@ void PairDescriptors(Vulkan::Scheduler& s,const Vulkan::Pipeline& pipeline,std::
                     }
                 } else {
                     memo_valid = false;
-                    right.buffer=hinted ? RightOfLocked(s,left.buffer,written,*hinted) :
-                        batch_registry ? RightBufferLocked(s,left.buffer,written) : RightBuffer(s,left.buffer,written);
+                    if (written && hinted && hinted->sparse) {
+                        right.buffer = SparseWriteLocked(s, left.buffer, *hinted, left.offset, left.range);
+                    } else if (written && !hinted) {
+                        std::unique_lock lock(R().mutex, std::defer_lock);
+                        if (!batch_registry) lock.lock();
+                        auto it = R().buffers.find(Key(VkBuffer(left.buffer)));
+                        right.buffer = it != R().buffers.end()
+                                           ? RightForWriteLocked(s, left.buffer, it->second, left.offset, left.range)
+                                           : (batch_registry ? RightBufferLocked(s, left.buffer, true)
+                                                             : RightBuffer(s, left.buffer, true));
+                    } else {
+                        right.buffer=hinted ? RightOfLocked(s,left.buffer,written,*hinted) :
+                            batch_registry ? RightBufferLocked(s,left.buffer,written) : RightBuffer(s,left.buffer,written);
+                    }
                 }
                 // Stream buffers receive CPU writes directly; mirror only the read range.
                 if(right.buffer!=left.buffer&&!written) {
@@ -1146,6 +1698,29 @@ struct CarriedOps {
         return vk::Buffer{std::atomic_ref<VkBuffer>(entry.right).load(std::memory_order_acquire)};
     }
     static bool Stream(const Buffer& entry) { return entry.stream; }
+    // A sparse view's twin shares memory with the left: a write needs its range made its own.
+    static bool Sparse(const Buffer& entry) { return entry.sparse != nullptr; }
+    vk::Buffer Write(const vk::DescriptorBufferInfo& left, Buffer& entry) {
+        ++created;
+        if (dry) return entry.right ? vk::Buffer{entry.right} : left.buffer;
+        Hold hold{*this};
+        ++recorded;
+        return SparseWriteLocked(s, left.buffer, entry, left.offset, left.range);
+    }
+    // Fused::Pair's first pass: a written sparse range made private before anything is paired, so
+    // every read and write of it in the draw takes the same right (the pass's Write then finds it
+    // private: no second twin). Not carried: the registry's entry. Others: nothing.
+    void PrivatizeWrite(const vk::DescriptorBufferInfo& left, Buffer* entry) {
+        if (dry || (entry && !entry->sparse)) return;
+        Hold hold{*this};
+        if (!entry) {
+            const auto it = R().buffers.find(Key(VkBuffer(left.buffer)));
+            if (it == R().buffers.end() || !it->second.sparse) return;
+            entry = &it->second;
+        }
+        ++recorded;
+        SparseWriteLocked(s, left.buffer, *entry, left.offset, left.range);
+    }
     // A written descriptor's buffer without its right yet: created here, in the pass's order.
     vk::Buffer Create(vk::Buffer left, Buffer& entry) {
         ++created;
@@ -1155,13 +1730,19 @@ struct CarriedOps {
         return RightOfLocked(s, left, true, entry);
     }
     // RightBufferLocked, and the entry's stream flag for the mirror.
-    vk::Buffer Lookup(vk::Buffer left, bool written, bool& stream) {
+    vk::Buffer Lookup(const vk::DescriptorBufferInfo& info, bool written, bool& stream) {
         ++lookups;
+        const vk::Buffer left = info.buffer;
         Hold hold{*this};
         const auto it = R().buffers.find(Key(VkBuffer(left)));
         ASSERT_MSG(it != R().buffers.end() || !written, "Native stereo: unregistered writable buffer");
         if (it == R().buffers.end()) return left;
         stream = it->second.stream;
+        if (written && it->second.sparse) {
+            if (dry) return it->second.right ? vk::Buffer{it->second.right} : left;
+            ++recorded;
+            return SparseWriteLocked(s, left, it->second, info.offset, info.range);
+        }
         if (written && !it->second.right) {
             ++created;
             if (!dry) {
@@ -1320,6 +1901,102 @@ bool PairCarried(Vulkan::Scheduler& s, const Vulkan::Pipeline& pipeline,
                       buffer ? Key(VkBuffer(carried.writes[at].pBufferInfo[element].buffer)) : image ? Key(VkImageView(carried.writes[at].pImageInfo[element].imageView)) : 0,
                       buffer ? carried.writes[at].pBufferInfo[element].offset : 0,
                       out.mirrors, carried.mirrors, st.mismatches);
+        }
+    }
+    return true;
+}
+bool CompactRights(const Vulkan::Pipeline& pipeline, std::span<const vk::WriteDescriptorSet> writes,
+                   const Handles& h, Vulkan::StereoSetCodec::Rights& out) {
+    using Vulkan::StereoSetCodec::Kind;
+    const auto& registry = R();
+    if (registry.buffer_generation.load(std::memory_order_acquire) != h.buffer_generation ||
+        registry.view_generation.load(std::memory_order_acquire) != h.view_generation) {
+        return false;
+    }
+    const auto writable = pipeline.NativeWritableBindings();
+    const auto handle = [](auto object) {
+        return reinterpret_cast<u64>(static_cast<typename decltype(object)::CType>(object));
+    };
+    out.paired = 0;
+    out.cameras_used = 0;
+    const auto push = [&out](u64 value) {
+        if (out.paired == out.handles.size()) {
+            out.handles.resize(out.handles.size() + 64);
+        }
+        out.handles[out.paired++] = value;
+    };
+    u32 buffer_index = 0;
+    for (const auto& w : writes) {
+        const u32 n = w.descriptorCount;
+        switch (Vulkan::StereoSetCodec::KindOf(w.descriptorType)) {
+        case Kind::Buffer: {
+            if (w.pNext || !w.pBufferInfo) {
+                return false;
+            }
+            const bool written = w.dstBinding < writable.size() && writable[w.dstBinding];
+            for (u32 i = 0; i < n; ++i, ++buffer_index) {
+                const vk::DescriptorBufferInfo& left = w.pBufferInfo[i];
+                u64 right = handle(left.buffer);
+                if (left.buffer) {
+                    // Fused::Pair's carried rules, where it needs nothing recorded or looked up.
+                    const std::size_t index = Fused::IndexIn(w.pBufferInfo + i, h.buffer_base,
+                                                             h.buffer_count);
+                    const BufferHint* const hint =
+                        index < h.buffers.size() && h.buffers[index].left == left.buffer
+                            ? &h.buffers[index]
+                            : nullptr;
+                    if (!hint || !hint->entry) {
+                        return false; // the registry lookup and the camera scan
+                    }
+                    const vk::Buffer have = CarriedOps::RightOf(*hint->entry);
+                    if (!have && written) {
+                        return false; // its right buffer would be created
+                    }
+                    if (written && CarriedOps::Sparse(*hint->entry)) {
+                        if constexpr (Common::Log::Enabled) {
+                            static std::atomic<u64> fallbacks{0};
+                            const u64 n = ++fallbacks;
+                            if ((n & (n - 1)) == 0 && n >= 1024) {
+                                LOG_INFO(Render_Vulkan, "Sparse twins: {} draws left the compact "
+                                         "pairing for a written sparse twin", n);
+                            }
+                        }
+                        return false; // a sparse twin's written range may need blocks of its own
+                    }
+                    const vk::Buffer right_buffer = have ? have : left.buffer;
+                    if (right_buffer != left.buffer && !written && CarriedOps::Stream(*hint->entry)) {
+                        return false; // a stream mirror would be recorded
+                    }
+                    right = handle(right_buffer);
+                    if (hint->camera.buffer) {
+                        if (out.cameras_used == out.cameras.size()) {
+                            out.cameras.resize(out.cameras.size() + 8);
+                        }
+                        out.cameras[out.cameras_used++] = {buffer_index, 0, hint->camera};
+                    }
+                }
+                push(right);
+            }
+            break;
+        }
+        case Kind::Image: {
+            if (w.pNext || !w.pImageInfo) {
+                return false;
+            }
+            for (u32 i = 0; i < n; ++i) {
+                const vk::DescriptorImageInfo& left = w.pImageInfo[i];
+                const std::size_t index =
+                    Fused::IndexIn(w.pImageInfo + i, h.image_base, h.image_count);
+                if (!(index < h.images.size() && h.images[index].left == left.imageView &&
+                      (h.images[index].right || !left.imageView))) {
+                    return false; // the registry's view lookup
+                }
+                push(handle(h.images[index].right));
+            }
+            break;
+        }
+        default:
+            break;
         }
     }
     return true;

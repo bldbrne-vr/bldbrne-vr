@@ -1,0 +1,37 @@
+Gehrman wheelchair - experimental, on by default (2026-11-04)
+
+Set VR_GEHRMAN_CHAIR=0 before a launch to turn it off.
+The current player's existing session is never modified by this environment setting.
+
+Bare hands grip the chair anywhere on it (its back, sides, frame: 45 cm to 1.45 m up), push/pull
+and steer; each grip is that hand's handle, and the hand is drawn there while it holds. Like a
+real wheelchair it rolls along its axis and turns on its big wheels (beside the seat, 63 cm
+ahead of the handles); they skid only when yanked hard. The hold steers it (the line between
+two hands, or one hand's turn); rolling, it steers toward where the hold puts it; standing,
+its back swings under hands moved sideways. A snap turn carries it with the hands. It keeps
+pace with a run. Let go rolling and it rolls on at that pace (up to 3.5 m/s); let go turning
+and it spins on briefly. Steps up to 30 cm are lifted at the leading edge, stairs are climbed
+and descended (no step over 30 cm), ledges stop it. Catch either handle to take control.
+Only travel while holding a handle counts toward the gift.
+Native movement is capped and requires map clearance and ground support.
+NPC conversation, menus, cinematics, stale tracking and late Gehrman story states deny interaction.
+No quest flags or save structures are written directly.
+
+Kos Lights is awarded through the native inventory API after
+10 metres and at least 4 seconds of observed movement following accepted moves.
+Owning the packet prevents duplicate grants. Progress so far survives menus, talks and
+short breaks in the same session; it is not saved.
+With VR_GEHRMAN_CHAIR=0 the earlier automatic grant applies instead.
+
+Offline evidence: c8040 (entity 2100600) contains the wheelchair and four wheel bones;
+boss Gehrman is c8050 (entity 2100800). The c8040 placement events end after placement.
+ChrIns/EnemyIns vtable +0x5F8 resolves to 0x18CD600; code signatures gate installation.
+Fixed state; no character-list scans or per-frame heap allocations in our controller.
+An atomic nonblocking guard prevents concurrent or recursive native movement callbacks.
+
+Release blockers:
+- Live validation of native warp from the pose-tail phase, animation continuity and AI response.
+- Handle alignment in every permitted seated pose; hand attachment and wheel animation.
+- Verify wall/ledge collision, dialogue, rest/load, character switching and recenter behaviour.
+- Verify the actual native item grant and frame-time cost in the headset.
+Passing the pure controller tests and syntax checks does NOT complete these live checks.

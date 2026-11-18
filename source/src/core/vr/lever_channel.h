@@ -11,6 +11,7 @@
 #include "core/vr/physical_lever.h"
 #include "core/vr/seqlock.h"
 #include <atomic>
+#include <limits>
 #include <mutex>
 
 namespace VR::Lever {
@@ -127,9 +128,16 @@ class Transport {
     // driven by fresh tracking, a hand tracked); 0 once the display mode cannot. A hand-pulled
     // lever hides its prompt only while this is fresh (lever_prompt.h ReadyNs).
     std::atomic<std::int64_t> hand_pull_ready{0};
+    // XR writer, stored before each hand_pull_ready: how high a hand reaches now, as a world Y in
+    // game units (lever_acquisition.h ReachTracker); a lever whose stem rises above it through the
+    // pull keeps its prompt (OutOfReach). Infinite until the XR side first writes it.
+    std::atomic<float> reach_top{std::numeric_limits<float>::infinity()};
     // Game thread only (native selection gate and its host classifier): which selected lever
     // instance has its prompt replaced. Read by generated code at fixed offsets.
     PromptVerdict verdict{};
+    // The same for a scripted lever's action-button prompt (the script-prompt gate and its host
+    // classifier); its `seen` and `fire` also the scheduler's (lever_prompt.h ScriptVerdict).
+    alignas(8) ScriptVerdict script_verdict{};
     // Game thread only, under the adapter's busy guard: the lever instances whose normal prompt
     // and button are back for a while (B, a refused pull).
     PromptState prompt_state{};

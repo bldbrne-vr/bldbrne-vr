@@ -98,6 +98,15 @@ struct EyeTick {
 // old camera; nullptr = none).
 VR::Vec3 ComfortEye(const EyeTick& tick, const char* reset);
 
+// The comfort camera's next eye-base height change, for the hands' pose copy (bloodborne_body.cpp
+// Gather): a copy of the filter as its last tick left it, stepped once more with that tick's
+// target moved by `root_move` (the character's move since that tick) a tick period later. The
+// same rules in every mode (rise, drop, fall, ladder); the filter itself is untouched. On stairs
+// the character root steps while the camera is smoothed, so placing the hands by the root's move
+// made them jitter against the view (the tester's 2026-11-04 report). False: no comfort tick within
+// MaxPredictAgeNs of `tick_ns`, or its output was a reset or a rejected target.
+bool ComfortNextDeltaY(std::int64_t tick_ns, const VR::Vec3& root_move, float& delta_y);
+
 // dodge_camera=0 with VR_DODGE_LOG set: the old camera's eye base, for the A/B statistics.
 void LegacyEye(const EyeTick& tick, const VR::Vec3& base);
 

@@ -31,6 +31,8 @@
 #include "core/vr/transform_settings.h"
 #include "core/vr/trick_weapons.h"
 #include "core/vr/vr_session.h"
+#include "core/vr/wheel_rev.h"
+#include "core/vr/stake_driver.h"
 
 namespace VR::Bloodborne {
 
@@ -205,6 +207,10 @@ constexpr s32 RightWeaponDummy = 300; // R_Weapon's origin (the grip)
 constexpr s32 SawSpinFfx = 252071;
 constexpr s32 SawSpinDummy = 12130;
 constexpr s32 SawSpinSlot = 30300;
+// Logarius' Wheel's spin steps (core/vr/wheel_rev.h): its sparks in a private slot too.
+constexpr s32 WheelFamily = 120;
+constexpr s32 WheelSparkSlot = 30310;
+constexpr s64 WheelSpinStaleNs = 500'000'000; // a step older than this when the game sees it
 // The right weapon's dummies the logs trace (part 0 = form A, part 2 = form B; 100-120 along the
 // blade on most weapons): the clip's motion relative to the grip.
 constexpr std::array<s32, 6> TraceDummies = {10100, 10110, 10120, 12100, 12110, 12120};
@@ -237,6 +243,20 @@ bool g_vanilla = false;   // transform=vanilla (the status says so instead of "n
 bool g_sound = false;
 bool g_ffx = false;
 TaeEventFn g_tae_event = nullptr;
+// ChrIns::AddSpEffect (PlayerIns vt+0x3F0; bloodborne_pose.cpp's): a clip's SpEffect added at the
+// switch (T::Clip::speffect). Null: its signature did not match (that clip stays on L1).
+constexpr u64 AddSpEffectRva = 0x18C6DB0;
+constexpr std::array<u8, 32> AddSpEffectSig = {
+    0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xEC,
+    0x28, 0x45, 0x89, 0xCC, 0x44, 0x89, 0xC3, 0xC5, 0xFA, 0x11, 0x65, 0xD4, 0xC5, 0xFA, 0x11, 0x5D,
+};
+constexpr u64 PlayerVtableRva = 0x538F310;
+constexpr u64 PlayerVtableRva2 = 0x538FA80;
+constexpr u32 OffsetVtableAddSpEffect = 0x3F0;
+using AddSpEffectFn = u8(PS4_SYSV_ABI*)(void* chr, s32 id, void* source, u32 a3, u32 local_only,
+                                       s32 a5, float f0, float f1, float f2, float f3, float f4,
+                                       s32 stack0);
+AddSpEffectFn g_add_speffect = nullptr;
 PlaySoundFn g_play_sound = nullptr;
 SfxSlotRequestFn g_sfx_slot = nullptr;
 DmyPolyFn g_dmy_poly = nullptr;
@@ -315,6 +335,17 @@ bool DummyMtx(u8* chr, s32 id, std::array<float, 12>& out) {
     return std::isfinite(out[3]) && std::isfinite(out[7]) && std::isfinite(out[11]);
 }
 
+// The game's own SpEffect add, as a clip's TAE would add it: on the player class only
+// (bloodborne_pose.cpp ApplyMarker's check). Site A only (outside any SpEffect-list walk).
+bool AddPlayerSpEffect(u8* player, s32 id) {
+    u8* const vtable = Read<u8*>(player);
+    const bool player_class =
+        vtable == g_base + PlayerVtableRva || vtable == g_base + PlayerVtableRva2;
+    return g_add_speffect != nullptr && player_class &&
+           Read<u8*>(vtable + OffsetVtableAddSpEffect) == g_base + AddSpEffectRva &&
+           g_add_speffect(player, id, player, 0, 1, 0, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0) != 0;
+}
+
 std::string FamilyName(s32 family) {
     const auto* f = B::Weapons::FindFamily(family);
     return f != nullptr ? std::string{f->name} : fmt::format("family {}", family);
@@ -340,6 +371,27 @@ struct SawWeaponPose {
     bool active{false};
 };
 SeqLock<SawWeaponPose> g_saw_pose;
+// Logarius' Wheel's running spin step for the detour (the pose tick writes it every update while
+// the step runs; stale or inactive: the game's own choice).
+struct WheelSpinPose {
+    u8* chr{nullptr};
+    s64 ns{0};
+    s32 clip{-1};
+    float time{0.0f};
+    bool active{false};
+};
+SeqLock<WheelSpinPose> g_wheel_pose;
+// The spin steps' buffs, handed from the pose tick to site A (in order; the presenter lets at most
+// one step wait, so two at once is the most).
+struct WheelBuff {
+    u8* chr{nullptr};
+    s32 id{0};
+    s32 step{0};
+};
+std::mutex g_wheel_buff_mutex;
+std::array<WheelBuff, 4> g_wheel_buffs{};
+u32 g_wheel_buff_count{0};
+std::atomic<bool> g_wheel_buff_due{false};
 SeqLock<HookRun> g_hook_run;
 std::atomic<bool> g_hook_active{false};
 std::atomic<u64> g_hook_frames{0}; // frames the detour handed the clip (logs)
@@ -352,6 +404,7 @@ struct SwitchRequest {
     s32 from{-1};   // the style it must still be
     s32 weapon{-1}; // the weapon it must still be
     s64 due_ns{0};
+    s32 speffect{0}; // the clip's SpEffect, added with the switch (T::Clip::speffect; 0: none)
 };
 struct SwitchResult {
     u32 run{0};
@@ -404,6 +457,16 @@ s64 PS4_SYSV_ABI WeaponAnimOverride(u8* chr, u8* frame, s32 game_id) {
         }
     }
     if (!g_hook_active.load(std::memory_order_acquire)) {
+        // Logarius' Wheel's spin step: the wheel model's own clip, the hunter's left alone. No
+        // step running (nearly always): one seqlock read, no game memory.
+        WheelSpinPose spin{};
+        if (g_wheel_pose.Load(spin) && spin.active && spin.chr == chr && chr != nullptr &&
+            chr == MainPlayer() && NowNs() - spin.ns < VR::Tricks::SawFreshNs &&
+            WeaponStyle(chr) == T::StyleFormBTwoHanded &&
+            B::Weapons::FamilyOf(RightWeapon(chr)) == WheelFamily) {
+            std::memcpy(frame + FrameClipTime, &spin.time, sizeof(spin.time));
+            return spin.clip;
+        }
         SawWeaponPose saw{};
         if (chr == nullptr || chr != MainPlayer() || !g_saw_pose.Load(saw) ||
             !saw.active || saw.chr != chr || !VR::Tricks::SawFresh(saw.ns, NowNs()) ||
@@ -542,8 +605,21 @@ struct TickState {
     const char* logged_why{nullptr};
     bool first_logged{false};
     const char* last_wait{nullptr};
+    u32 quench_seen{0}; // the newest FurnaceQuench handled
 };
 TickState g_tick{};
+VR::Tricks::StakeReturn g_stake_return; // pose thread only, like g_tick
+s64 g_stake_wait_logged{};              // the discharge whose waiting was logged
+
+// The Boom Hammer's fire spent (Combat::FurnaceQuench): its form B (style 5) back to A (1) with
+// the game's own SetWeaponStyle at site A, as a run's switch (its B->A has no clip: the parts
+// change at the switch), once the game's attack lets go of the arm (at most QuenchWaitNs after the
+// hit); older than QuenchStaleNs (a load, a pause), dropped.
+constexpr s32 BoomHammerFamily = 280;
+constexpr s32 BoomLitStyle = 5, BoomColdStyle = 1;
+constexpr s64 QuenchWaitNs = 1'500'000'000;
+constexpr s64 QuenchStaleNs = 4'000'000'000;
+constexpr u32 QuenchRunBit = 0x80000000u; // its switch's run id (never a run's)
 
 // The newest run for physical melee (TransformRun; the pose tick's thread only).
 TransformRunInfo g_info{};
@@ -674,7 +750,7 @@ void Event(Combat::TransformEventKind kind, u32 serial, float a, float b, s64 no
 }
 
 void StartRun(u8* chr, TickState& t, u32 serial, s64 now, bool flick, u32 window,
-              s64 press_ns, bool no_join) {
+              s64 press_ns, bool no_join, bool kick = false) {
     const T::Clip& c = *t.choice.clip;
     Run& r = t.run;
     if (r.active) {
@@ -692,7 +768,9 @@ void StartRun(u8* chr, TickState& t, u32 serial, s64 now, bool flick, u32 window
     r.flick = flick;
     r.no_join = no_join;
     r.window = window;
-    r.clock = flick ? T::FlickClock(c, CurrentFlick()) : T::NormalClock(c, r.timing);
+    r.clock = kick    ? T::KickClock(c)
+              : flick ? T::FlickClock(c, CurrentFlick())
+                      : T::NormalClock(c, r.timing);
     r.base_ns = now;
     r.start_t = r.clock.base_t;
     r.t = r.start_t;
@@ -769,14 +847,18 @@ void PlayCues(u8* chr, Run& r, const T::CueStep& step, s64 now) {
             u64 handle = 0;
             if (q.kind == T::CueKind::Sound) {
                 ++r.sounds;
+                const bool effect_sound = q.b == T::SoundS;
                 if (cues && g_sound && have_grip) {
                     alignas(16) std::array<float, 4> p{grip[3], grip[7], grip[11], 1.0f};
-                    const s32 type =
-                        g_sound_table != nullptr && Read<u8>(g_sound_table + 3) != 0 ? 0xA : 1;
+                    // An s<id> as event 128 plays it (type 5); a c<id> with that event's flip.
+                    const bool flip = g_sound_table != nullptr && Read<u8>(g_sound_table + 3) != 0;
+                    const s32 type = effect_sound ? T::SoundS : (flip ? 0xA : 1);
                     g_play_sound(&handle, p.data(), type, q.a);
                 }
-                Event(Combat::TransformEventKind::Detent, r.serial, static_cast<float>(q.a), r.t,
-                      now);
+                if (!effect_sound) { // (a detent is a mechanism's click, not an effect's sound)
+                    Event(Combat::TransformEventKind::Detent, r.serial, static_cast<float>(q.a),
+                          r.t, now);
+                }
             } else {
                 ++r.effects;
                 if (cues && ctl_ok) {
@@ -786,7 +868,9 @@ void PlayCues(u8* chr, Run& r, const T::CueStep& step, s64 now) {
             }
             if (g_log >= 1) {
                 LOG_INFO(Core, "VR transform: #{} t={:.3f} {} {} (event at {:.3f})", r.serial, r.t,
-                         q.kind == T::CueKind::Sound ? "sound c" : "effect",
+                         q.kind != T::CueKind::Sound ? "effect"
+                         : q.b == T::SoundS          ? "sound s"
+                                                     : "sound c",
                          q.kind == T::CueKind::Sound
                              ? fmt::format("{} handle {:#x}", q.a, handle)
                              : fmt::format("{} on dummy {} slot {}", q.a, q.b, q.c),
@@ -888,7 +972,7 @@ void StepRun(u8* chr, TickState& t, const MeleeBody& body, s64 now) {
                      r.serial, r.from, c.style, r.t);
         } else {
             std::scoped_lock lock{g_switch_mutex};
-            g_switch_req = {r.id, chr, c.style, r.from, r.weapon, now};
+            g_switch_req = {r.id, chr, c.style, r.from, r.weapon, now, c.speffect};
             g_switch_due.store(r.id, std::memory_order_release);
         }
     }
@@ -963,6 +1047,168 @@ void LogWeapon(TickState& t) {
                                         c->weapon_anim ? "" : ", no weapon clip",
                                         c->support == T::Support::Untested ? ", untested" : "")
                           : fmt::format("L1 ({})", t.choice.why != nullptr ? t.choice.why : "?"));
+}
+
+// ---- Logarius' Wheel's spin steps (core/vr/wheel_rev.h) -----------------------------------------
+
+namespace W = VR::WheelRev;
+
+struct WheelSpinRun {
+    u8* chr{nullptr};
+    u32 seen{0}; // the newest WheelSpin handled
+    s32 step{0}; // the running step (0: none)
+    s64 start_ns{0};
+    u32 sounds{0}; // bit i: W::SpinSounds[i] played
+    bool buff_asked{false};
+    s32 hp_start{-1};
+};
+WheelSpinRun g_spin{};
+
+// The running step's buff, to site A (once; the step before's goes before the next starts).
+void AskWheelBuff(u8* chr, WheelSpinRun& s) {
+    if (s.buff_asked || s.step <= 0) {
+        return;
+    }
+    s.buff_asked = true;
+    std::scoped_lock lock{g_wheel_buff_mutex};
+    if (g_wheel_buff_count < g_wheel_buffs.size()) {
+        g_wheel_buffs[g_wheel_buff_count++] = {chr, W::ClipOf(s.step).speffect, s.step};
+        g_wheel_buff_due.store(true, std::memory_order_release);
+    }
+}
+
+void EndWheelSpin(u8* chr, WheelSpinRun& s, s64 now, const char* how) {
+    if (s.step <= 0) {
+        return;
+    }
+    g_wheel_pose.Store({chr, now, -1, 0.0f, false});
+    LOG_INFO(Core, "VR wheel spin: step {} {} after {:.2f} s (HP {} -> {})", s.step, how,
+             static_cast<double>(now - s.start_ns) * 1e-9, s.hp_start, Hp(chr));
+    s.step = 0;
+}
+
+// Every main-player update: starts the step the presenter asked for (Combat::WheelSpin), then runs
+// it: the wheel model's clip for the detour, the clip's sounds at the hand and its sparks on the
+// wheel, and its buff at the step's time (to site A). The hunter's own animation is untouched.
+void WheelSpinTick(u8* chr, s64 now) {
+    WheelSpinRun& s = g_spin;
+    if (chr != s.chr) {
+        // A new character object (a load): a step of the old one is over.
+        if (s.step > 0) {
+            g_wheel_pose.Store({});
+        }
+        const u32 seen = s.seen;
+        s = {};
+        s.chr = chr;
+        s.seen = seen;
+    }
+    // Read from the game only with a new step or one running (nothing on an idle update).
+    const auto wheel_b = [chr] {
+        return WeaponStyle(chr) == T::StyleFormBTwoHanded &&
+               B::Weapons::FamilyOf(RightWeapon(chr)) == WheelFamily;
+    };
+    const bool available = g_installed && g_hooked && !g_dry_run;
+    Combat::WheelSpin req{};
+    if (Combat::LatestWheelSpin(req) && req.serial != s.seen) {
+        s.seen = req.serial;
+        const char* refuse = !available                   ? "the weapon hook is not in"
+                             : g_add_speffect == nullptr  ? "no AddSpEffect (its signature)"
+                             : !wheel_b()                 ? "not Logarius' Wheel in both hands"
+                             : now - req.ns > WheelSpinStaleNs ? "stale"
+                             : Hp(chr) <= 0               ? "dead"
+                             : g_info.active              ? "transforming"
+                                                          : nullptr;
+        if (refuse != nullptr) {
+            LOG_INFO(Core, "VR wheel spin: step {} refused ({})", req.step, refuse);
+        } else {
+            AskWheelBuff(chr, s); // the step before's buff first (the game's order)
+            const W::StepClip& c = W::ClipOf(req.step);
+            s.step = std::clamp(req.step, 1, W::Steps);
+            s.start_ns = now;
+            s.sounds = 0;
+            s.buff_asked = false;
+            s.hp_start = Hp(chr);
+            LOG_INFO(Core,
+                     "VR wheel spin: step {} (weapon clip {}, {:.2f} s; SpEffect {} at {:.2f} s) "
+                     "{:.0f} ms after the pull, HP {}",
+                     s.step, c.clip, c.length, c.speffect, c.buff_s,
+                     static_cast<double>(now - req.ns) * 1e-6, s.hp_start);
+        }
+    }
+    if (s.step <= 0) {
+        return;
+    }
+    if (const bool held = wheel_b(); !available || !held || Hp(chr) <= 0) {
+        EndWheelSpin(chr, s, now, !held ? "STOPPED (the wheel left both hands)" : "STOPPED");
+        return;
+    }
+    const W::StepClip& c = W::ClipOf(s.step);
+    const float t = static_cast<float>(now - s.start_ns) * 1e-9f;
+    if (t >= c.buff_s) {
+        AskWheelBuff(chr, s);
+    }
+    if (t >= c.length) {
+        EndWheelSpin(chr, s, now, "done");
+        return;
+    }
+    g_wheel_pose.Store({chr, now, c.clip, t, true});
+    const bool cues = T::GetTransformSettings().cues;
+    std::array<float, 12> grip{};
+    bool have_grip = false, tried_grip = false;
+    for (u32 i = 0; i < W::SpinSounds.size(); ++i) {
+        const u32 bit = 1u << i;
+        if ((s.sounds & bit) != 0 || t < W::SpinSounds[i].t) {
+            continue;
+        }
+        s.sounds |= bit;
+        if (!tried_grip) {
+            tried_grip = true;
+            have_grip = DummyMtx(chr, RightWeaponDummy, grip);
+        }
+        if (cues && g_sound && have_grip) {
+            u64 handle = 0;
+            alignas(16) std::array<float, 4> p{grip[3], grip[7], grip[11], 1.0f};
+            const s32 type = g_sound_table != nullptr && Read<u8>(g_sound_table + 3) != 0 ? 0xA : 1;
+            g_play_sound(&handle, p.data(), type, W::SpinSounds[i].id);
+        }
+    }
+    u8* const ctl = chr + OffsetSfxCtl;
+    if (cues && g_ffx && t >= W::SparkFromS && t < W::SparkToS &&
+        Read<u8*>(ctl) == g_base + SfxCtlVtableRva) {
+        const s32 dummy = W::SparkDummy;
+        g_sfx_slot(ctl, WheelSparkSlot, W::SparkFfx, &dummy, 0);
+    }
+}
+
+// Site A: the spin steps' buffs the pose tick asked for, in order (the game's own add).
+void WheelBuffSiteA(u8* player) {
+    if (!g_wheel_buff_due.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::array<WheelBuff, 4> buffs{};
+    u32 n = 0;
+    {
+        std::scoped_lock lock{g_wheel_buff_mutex};
+        buffs = g_wheel_buffs;
+        n = g_wheel_buff_count;
+        g_wheel_buff_count = 0;
+        g_wheel_buff_due.store(false, std::memory_order_release);
+    }
+    for (u32 i = 0; i < n; ++i) {
+        const WheelBuff& b = buffs[i];
+        const char* refuse =
+            b.chr != player ? "not the main player any more"
+            : WeaponStyle(player) != T::StyleFormBTwoHanded ||
+                    B::Weapons::FamilyOf(RightWeapon(player)) != WheelFamily
+                ? "the wheel left both hands"
+            : Hp(player) <= 0 ? "dead"
+                              : nullptr;
+        const bool added = refuse == nullptr && AddPlayerSpEffect(player, b.id);
+        LOG_INFO(Core, "VR wheel spin: step {}: SpEffect {} {} (HP {})", b.step, b.id,
+                 added ? std::string{"added"}
+                       : fmt::format("NOT added ({})", refuse != nullptr ? refuse : "the add"),
+                 Hp(player));
+    }
 }
 
 } // Anonymous namespace
@@ -1052,6 +1298,9 @@ void InstallTransform(VAddr base, u64 size) {
     }
     g_base = module;
     g_tae_event = reinterpret_cast<TaeEventFn>(module + TaeHandlerRva);
+    if (std::memcmp(module + AddSpEffectRva, AddSpEffectSig.data(), AddSpEffectSig.size()) == 0) {
+        g_add_speffect = reinterpret_cast<AddSpEffectFn>(module + AddSpEffectRva);
+    }
     g_sound = std::memcmp(module + PlaySoundRva, PlaySoundSig.data(), PlaySoundSig.size()) == 0 &&
               std::memcmp(module + SoundTypeRva, SoundTypeSig.data(), SoundTypeSig.size()) == 0;
     if (g_sound) {
@@ -1109,11 +1358,24 @@ bool SetSawWeaponPose(u8* chr, float time, bool active) {
     return available;
 }
 
+void ArmStakeReturn(u8* chr, s64 attack_ns) {
+    if (!g_installed || !g_native || g_dry_run || chr == nullptr || attack_ns <= 0) {
+        return;
+    }
+    s32 slot = -1;
+    const s32 weapon = RightWeapon(chr, &slot);
+    if (B::Weapons::FamilyOf(weapon) == 110 && WeaponStyle(chr) == 5) {
+        g_stake_return.Arm(reinterpret_cast<std::uintptr_t>(chr), weapon, slot, attack_ns,
+                           VR::Tricks::StakeKickOut());
+    }
+}
+
 void TransformPoseTick(u8* chr, const MeleeBody& body) {
     if (chr == nullptr) {
         return;
     }
     const s64 now = NowNs();
+    WheelSpinTick(chr, now);
     auto& t = g_tick;
     Combat::TransformStatus status{};
     status.ns = now;
@@ -1132,6 +1394,7 @@ void TransformPoseTick(u8* chr, const MeleeBody& body) {
         }
         return;
     }
+    status.native = true; // (from here on a FurnaceQuench is carried out)
     if (chr != t.chr) {
         // A new character object (a load): a run of the old one is over without a switch.
         if (t.run.active) {
@@ -1155,6 +1418,9 @@ void TransformPoseTick(u8* chr, const MeleeBody& body) {
     t.style = WeaponStyle(chr);
     t.choice =
         T::Choose(B::Weapons::FamilyOf(t.weapon), t.style, T::GetTransformSettings().untested);
+    if (t.choice.clip != nullptr && t.choice.clip->speffect > 0 && g_add_speffect == nullptr) {
+        t.choice = {nullptr, "its SpEffect cannot be added (AddSpEffect's signature)"};
+    }
     LogWeapon(t);
 
     StepRun(chr, t, body, now);
@@ -1200,6 +1466,61 @@ void TransformPoseTick(u8* chr, const MeleeBody& body) {
         break;
     }
 
+    // A discharged powered stake recovers whether it hit or missed: use the existing
+    // weapon-only B->A animation and native style switch as soon as its impulse ends.
+    // Never cut off the blast's hit window or turn recovery into a transform attack.
+    if (g_stake_return.opened != 0) {
+        Combat::MeleeWindow window{};
+        const bool open = Combat::LatestMeleeWindow(window) && window.open &&
+                          now >= window.ns && now - window.ns < StatusFreshNs;
+        const char* why = t.run.active ? "a transform runs"
+                          : g_switch_due.load(std::memory_order_acquire) != 0
+                              ? "a switch is due"
+                              : StartBlock(chr, body, t, now);
+        const bool closing = t.choice.clip != nullptr && !t.choice.clip->to_b &&
+                             B::Weapons::FamilyOf(t.weapon) == 110 && t.style == 5;
+        const s64 fired = g_stake_return.opened;
+        const bool kick = g_stake_return.kick;
+        if (g_stake_return.Update(reinterpret_cast<std::uintptr_t>(chr), t.weapon, t.slot,
+                                  closing, now, why != nullptr, open) ==
+            VR::Tricks::StakeReturn::Action::Start) {
+            StartRun(chr, t, 0, now, false, 0, now, true, kick);
+            LOG_INFO(Core, "VR stake: {} to form A {:.0f} ms after the blast{}",
+                     kick ? "kicked back" : "retracts", static_cast<double>(now - fired) * 1e-6,
+                     open ? " (its window still open)" : "");
+        } else if (why != nullptr && g_stake_return.opened != 0 && fired != g_stake_wait_logged) {
+            g_stake_wait_logged = fired; // once per discharge
+            LOG_INFO(Core, "VR stake: return waits ({}) {:.0f} ms after the blast", why,
+                     static_cast<double>(now - fired) * 1e-6);
+        }
+    }
+
+    // The Boom Hammer's fire spent: back to form A once the swing is over (QuenchWaitNs).
+    Combat::FurnaceQuench quench{};
+    if (Combat::LatestFurnaceQuench(quench) && quench.serial != t.quench_seen) {
+        const bool lit = t.style == BoomLitStyle &&
+                         B::Weapons::FamilyOf(t.weapon) == BoomHammerFamily;
+        const s64 age = now - quench.ns;
+        if (!lit || age > QuenchStaleNs) {
+            t.quench_seen = quench.serial;
+            LOG_INFO(Core, "VR transform: the Boom Hammer's spent fire not put out ({})",
+                     !lit ? "not lit any more" : "stale");
+        } else if (!t.run.active && g_switch_due.load(std::memory_order_acquire) == 0 &&
+                   (!GameAttackHasArm(body) || age >= QuenchWaitNs)) {
+            t.quench_seen = quench.serial;
+            const u32 id = QuenchRunBit | (quench.serial & ~QuenchRunBit);
+            {
+                std::scoped_lock lock{g_switch_mutex};
+                g_switch_req = {id, chr, BoomColdStyle, BoomLitStyle, t.weapon, now};
+            }
+            g_switch_due.store(id, std::memory_order_release);
+            LOG_INFO(Core, "VR transform: the Boom Hammer's fire out: back to form A {:.0f} ms "
+                           "after it was asked{}",
+                     static_cast<double>(age) * 1e-6,
+                     GameAttackHasArm(body) ? " (the attack still has the arm)" : "");
+        }
+    }
+
     // Physical melee: with the flick a swing during a transform joins it (TransformRun: the
     // stroke becomes the transform attack); without it no swing before the switch has settled.
     g_swing_block = nullptr;
@@ -1230,6 +1551,7 @@ void TransformSiteA(u8* player) {
     if (!g_installed || player == nullptr) {
         return;
     }
+    WheelBuffSiteA(player);
     const u32 due = g_switch_due.load(std::memory_order_acquire);
     if (due == 0) {
         return;
@@ -1279,6 +1601,12 @@ void TransformSiteA(u8* player) {
         res.mirror = MirrorStyle(player);
         res.ok = res.e == req.style && res.pgd == req.style && res.mirror == req.style;
         res.why = res.ok ? "" : "the style did not take";
+        // The clip's SpEffect (Logarius' Wheel B->A: 6029), as its TAE would have added it.
+        if (res.ok && req.speffect > 0) {
+            const bool added = AddPlayerSpEffect(player, req.speffect);
+            LOG_INFO(Core, "VR transform: run {}: SpEffect {} {}", due, req.speffect,
+                     added ? "added with the switch" : "NOT added");
+        }
     } else {
         res.why = refuse;
     }

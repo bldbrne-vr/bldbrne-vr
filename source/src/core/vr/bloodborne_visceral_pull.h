@@ -60,6 +60,11 @@ void InitVisceralPull(VAddr base, u64 size);
 // own victim teaches the rip. Returns true to soften HP damage for a mistimed pull.
 [[nodiscard]] bool VisceralPullOnDamage(u8* player, u8* target, s32 bullet);
 
+// The same detour, whatever visceral_pull says: a melee hit of the throwing hunter on the
+// character being thrown is a visceral's rip (a parry riposte, a backstab): riposte_style's burst
+// (core/vr/riposte_style.h).
+void RiposteOnDamage(u8* player, u8* target, s32 bullet);
+
 // OnEbootLoaded, after InstallStaggerSpeed: on only with the frame-time detour in (and the damage
 // detour to soften mistimed pulls); then the hunter's throws play in first
 // person (VR::SetVisceralFirstPerson).

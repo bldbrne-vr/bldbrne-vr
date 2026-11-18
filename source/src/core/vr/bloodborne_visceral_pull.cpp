@@ -20,6 +20,7 @@
 #include "core/vr/hook_util.h"
 #include "core/vr/bloodborne_visceral_stage.h"
 #include "core/vr/melee_settings.h"
+#include "core/vr/riposte_style.h"
 #include "core/vr/visceral_channel.h"
 #include "core/vr/visceral_pull.h"
 #include "core/vr/visceral_camera.h"
@@ -269,6 +270,10 @@ float VisceralPullMain(u8* player, s32 clip, float clip_time, float dt, bool con
     const bool pull_seen = g_current.active && Cb::VisceralPulledChannel().Load(pulled) &&
                            pulled.serial == g_current.serial;
     in.progress = pull_seen ? pulled.progress : 0.0f;
+    if (VR::Riposte::NotePull(in.progress, now)) { // your pull cuts the lunge's burst
+        LOG_INFO(Core, "VR riposte: your pull cut the lunge's burst (the camera's clock at {:.2f} s)",
+                 VR::Riposte::Camera().elapsed.load(std::memory_order_relaxed));
+    }
     in.pulled = pull_seen && pulled.pulled && pulled.ns <= now;
     in.pulled_ns = pulled.ns;
     in.ripped = ripped;
@@ -284,7 +289,7 @@ float VisceralPullMain(u8* player, s32 clip, float clip_time, float dt, bool con
     // so it never takes the world's rate.)
     const float world = partner_ok ? out.world : 1.0f;
     // Outside a throw an open visceral's staggered target takes the slot instead: its stagger
-    // runs at StaggerStretchRate (about 0.40 s longer). (It closes as the hunter's throw begins.)
+    // runs at StaggerStretchRate (about 0.60 s longer). (It closes as the hunter's throw begins.)
     Cb::VisceralOpen open{};
     u8* const staggered = !throwing && Cb::VisceralOpenChannel().Load(open) && open.open &&
                                   now - open.ns < PartnerMaxAgeNs && open.target != player &&
@@ -348,6 +353,22 @@ float VisceralPullMain(u8* player, s32 clip, float clip_time, float dt, bool con
                        "clip={} time={:.3f}s pull released={}",
                  g_current.camera_active ? "hold" : "release", g_camera_hold.Reason(),
                  state, ts, ClipName(clip), clip_time, g_hold.State() == P::Phase::Released);
+    }
+    // riposte_style's throw burst is timed from the rip (core/vr/riposte_style.h): the victim's
+    // throw state (read above) is logged as it changes, with the time since the rip, to find the
+    // game's own moment of the throw-back.
+    static int logged_ts = -1;
+    if (g_current.camera_active || throwing) {
+        if (ts != logged_ts) {
+            const s64 rip = VR::Riposte::LastRip().load(std::memory_order_relaxed);
+            LOG_INFO(Core, "VR visceral: the victim's throw state {} -> {} ({})", logged_ts, ts,
+                     rip != 0 && now - rip >= 0 && now - rip < 5000 * Ms
+                         ? fmt::format("{} ms after the rip", (now - rip) / Ms)
+                         : std::string{"before the rip"});
+            logged_ts = ts;
+        }
+    } else {
+        logged_ts = -1;
     }
     g_current.player = player;
     g_current.target = target;
@@ -440,6 +461,22 @@ bool VisceralPullOnDamage(u8* player, u8* target, s32 bullet) {
         VR::SaveSetting("visceral_pull_learned", text);
     }
     return s.failed;
+}
+
+void RiposteOnDamage(u8* player, u8* target, s32 bullet) {
+    if (!VR::GetSettings().riposte_style || bullet != -1 || g_base == nullptr ||
+        target == nullptr || target == player || !IsChr(target)) {
+        return;
+    }
+    // The hunter throws (odd), the victim is thrown (even).
+    const int ps = ThrowStateOf(player, true);
+    const int ts = ThrowStateOf(target, false);
+    if (ps <= 0 || (ps & 1) == 0 || ts <= 0 || (ts & 1) != 0) {
+        return;
+    }
+    if (VR::Riposte::Note(NowNs())) {
+        LOG_INFO(Core, "VR riposte: a visceral ripped (throw states {} / {}): the burst", ps, ts);
+    }
 }
 
 } // namespace VR::Bloodborne

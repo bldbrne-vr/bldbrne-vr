@@ -33,7 +33,7 @@ inline Extent OutputResolution(Extent left, Extent right, int scale_percent,
 inline Extent InputResolution(Extent output, Upscaler provider, Profile profile) {
     if (provider == Upscaler::Off)
         return output;
-    const auto ratio = UpscaleRatios[std::min(unsigned(profile), 2u)];
+    const auto ratio = Ratio(provider, profile);
     const auto even = [&](uint32_t x) {
         return x ? std::min(x, std::max(2u, uint32_t(std::lround(x * ratio * .5f)) * 2)) : 0u;
     };

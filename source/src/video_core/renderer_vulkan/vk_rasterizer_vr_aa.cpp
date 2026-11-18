@@ -32,7 +32,7 @@
 #include "video_core/renderer_vulkan/vk_recorder.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vr_render_taa.h"
-#include "video_core/renderer_vulkan/vr_dibr_dlss.h"
+#include "video_core/renderer_vulkan/vr_dibr_upscale.h"
 #include "video_core/renderer_vulkan/vr_smaa.h"
 #include "video_core/renderer_vulkan/vr_temporal_capture.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -157,8 +157,8 @@ u8 Rasterizer::VrAaDecide(const GraphicsPipeline* pipeline, bool indirect) {
         }
     }
     if (VR::DibrFrameActive() && vr_ui_layer && VR::UiLayerFrameMode() == 1 &&
-        vr_dibr_dlss && vr_dibr_dlss->Ready()) {
-        VrAaNote(Skipped, "experimental DIBR DLSS center reconstruction; saved AA unchanged");
+        vr_dibr_upscale && vr_dibr_upscale->Ready()) {
+        VrAaNote(Skipped, "DIBR DLSS/FSR centre reconstruction; saved AA unchanged");
         return static_cast<u8>(VR::Aa::Action::Skip);
     }
     const VR::Aa::DrawFacts facts{

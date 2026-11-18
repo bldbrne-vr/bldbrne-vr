@@ -15,8 +15,8 @@
 // context), on top of the click machine (core/vr/stick_click.h) that keeps Y held the modifier of
 // the gestures (+ B) in left_scheme=2's gameplay.
 //
-// y_menu (SteamVR by default: its dashboard owns the left Menu button and Meta's the right
-// Oculus button, so none of Menu's jobs reach the game): Y does Menu's jobs wherever Menu does
+// y_menu (SteamVR / VDXR by default, avoiding their own Menu-button dashboard gestures):
+// Y does Menu's jobs wherever Menu does
 // them on Meta Link (Place(): gameplay, the game's menus, the VR page, and the virtual screen
 // while the game shows its title, a loading screen or a cutscene).
 //  - A tap (let go within hold_s, nothing else pressed meanwhile) = Options, the game's menu (a
@@ -48,6 +48,33 @@
 // Header-only and pure: tests/test_y_menu.cpp.
 
 namespace VR::YMenu {
+
+// Keep input policy separate from the renderer's runtime/queue classification. VDXR keeps
+// its existing GPU policy; its Menu button also has Virtual Desktop's own dashboard gestures.
+constexpr bool RuntimeUsesY(std::string_view name) {
+    const auto contains = [name](std::string_view word) {
+        for (std::size_t at = 0; at + word.size() <= name.size(); ++at) {
+            bool match = true;
+            for (std::size_t i = 0; i < word.size(); ++i) {
+                const char c = name[at + i];
+                const char lower = c >= 'A' && c <= 'Z' ? char(c + ('a' - 'A')) : c;
+                if (lower != word[i]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return true;
+        }
+        return false;
+    };
+    return contains("steamvr") || contains("virtual desktop") || contains("virtualdesktop") ||
+           contains("vdxr");
+}
+
+constexpr bool Enabled(int setting, bool runtime_uses_y, bool motion_scheme2, bool y_bound) {
+    return motion_scheme2 && y_bound &&
+           (setting == 1 || (setting == 0 && runtime_uses_y));
+}
 
 // vr.ini y_menu and the env VR_Y_MENU, one parser: 0 = auto, 1 = on, 2 = off, -1 = not a y_menu
 // word (auto / on, 1, true, yes / off, 0, false, no; any case).

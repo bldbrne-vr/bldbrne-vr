@@ -14,7 +14,10 @@ struct ItemFrame { Body::Vec3 origin, x, y, z; };
 template <size_t N>
 ItemFrame ItemFrameOf(const std::array<float, N>& m, const HeldLook& look,
                       float scale_multiplier = 1.0f) {
-    using namespace Body;
+    using Body::Vec3;
+    using Body::Quat;
+    using Body::Normalize;
+    using Body::AxisAngle;
     const Vec3 dx = Normalize(Vec3{m[0], m[4], m[8]});
     const Vec3 dy = Normalize(Vec3{m[1], m[5], m[9]});
     const Vec3 dz = Normalize(Vec3{m[2], m[6], m[10]});

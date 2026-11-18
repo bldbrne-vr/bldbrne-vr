@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <string>
@@ -20,6 +21,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <dbghelp.h>
 #endif
 
 namespace Common::CrashRecord {
@@ -99,12 +101,86 @@ LONG WINAPI NoteException(EXCEPTION_POINTERS* info) {
         Append(fmt::format("exception {:#010x} at {}{}", static_cast<u32>(r->ExceptionCode),
                            where, access));
         Common::Log::Flush();
+        static std::atomic<bool> dumped{false};
+        if (DumpsEnabled() && !dumped.exchange(true)) {
+            const std::string dump = WriteDump("crash", info);
+            if (!dump.empty()) {
+                Append(fmt::format("a dump of every thread: {}", dump));
+            }
+        }
     }
     return EXCEPTION_CONTINUE_SEARCH; // the process ends as it would have, with the same code
 }
 #endif
 
 } // namespace
+
+bool DumpsEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("VR_CRASH_DUMP");
+        if (v != nullptr && *v != '\0') {
+            return v[0] != '0';
+        }
+        return Common::Log::Enabled;
+    }();
+    return on;
+}
+
+std::string WriteDump(const char* tag, void* exception) {
+#ifdef _WIN32
+    try {
+        const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        int existing = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+            existing += entry.path().extension() == ".dmp" ? 1 : 0;
+        }
+        if (existing >= 6) {
+            return {}; // a few are plenty; old ones are the player's to clear
+        }
+        using WriteFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
+                                      PMINIDUMP_EXCEPTION_INFORMATION,
+                                      PMINIDUMP_USER_STREAM_INFORMATION,
+                                      PMINIDUMP_CALLBACK_INFORMATION);
+        static HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
+        const auto write =
+            dbghelp ? reinterpret_cast<WriteFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump"))
+                    : nullptr;
+        if (write == nullptr) {
+            return {};
+        }
+        const std::time_t now = std::time(nullptr);
+        std::tm local{};
+        localtime_s(&local, &now);
+        char stamp[32]{};
+        std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &local);
+        const std::string name = fmt::format("{}-{}.dmp", tag, stamp);
+        const HANDLE file = CreateFileW((dir / name).c_str(), GENERIC_WRITE, 0, nullptr,
+                                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            return {};
+        }
+        MINIDUMP_EXCEPTION_INFORMATION exception_info{};
+        exception_info.ThreadId = GetCurrentThreadId();
+        exception_info.ExceptionPointers = static_cast<EXCEPTION_POINTERS*>(exception);
+        exception_info.ClientPointers = FALSE;
+        const auto type = static_cast<MINIDUMP_TYPE>(MiniDumpWithThreadInfo |
+                                                     MiniDumpWithUnloadedModules |
+                                                     MiniDumpWithHandleData);
+        const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), file, type,
+                              exception ? &exception_info : nullptr, nullptr, nullptr);
+        CloseHandle(file);
+        return ok ? name : std::string{};
+    } catch (...) {
+        return {};
+    }
+#else
+    (void)tag;
+    (void)exception;
+    return {};
+#endif
+}
 
 void NoteFailedCheck(const char* file, int line, bool unreachable) {
     Append(fmt::format("{} at {}:{}", unreachable ? "unreachable code reached" : "a check failed",

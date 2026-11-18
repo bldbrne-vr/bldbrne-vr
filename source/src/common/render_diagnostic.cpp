@@ -48,8 +48,10 @@ void Write(std::string_view message) noexcept {
 #endif
         char stamp[32]{};
         std::strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%SZ", &utc);
-        const auto line = fmt::format("{} pid={} build={} rev={} {}\n", stamp, pid,
-            g_version, g_scm_rev, message.substr(0, 2048));
+        // Stamp startup records too: a crash may precede the first VR settings snapshot.
+        const auto line = fmt::format("{} pid={} build={} release={} rev={} {}\n", stamp, pid,
+            g_version, g_scm_desc[0] ? g_scm_desc : "unknown",
+            g_scm_rev[0] ? g_scm_rev : "unknown", message.substr(0, 2048));
 #ifdef _WIN32
         FILE* file = _wfopen(path.c_str(), L"ab");
 #else
@@ -57,6 +59,47 @@ void Write(std::string_view message) noexcept {
 #endif
         if (file) {
             std::fwrite(line.data(), 1, line.size(), file);
+            std::fclose(file);
+        }
+    } catch (...) { /* Diagnostics must never break rendering. */ }
+}
+namespace {
+std::mutex game_mutex;
+std::string game_line;
+} // namespace
+void SetGame(std::string line) noexcept {
+    try {
+        {
+            std::scoped_lock lock{game_mutex};
+            game_line = line;
+        }
+        Write(line);
+    } catch (...) { /* Diagnostics must never break the boot. */ }
+}
+std::string Game() {
+    std::scoped_lock lock{game_mutex};
+    return game_line.empty() ? std::string{"Game: unknown"} : game_line;
+}
+void WriteHeadset(std::string_view system, unsigned width0, unsigned height0, unsigned width1,
+                  unsigned height1, unsigned max_width, unsigned max_height) noexcept {
+    try {
+        std::string name;
+        for (const char c : system.substr(0, 64))
+            if (c >= 0x20 && c < 0x7f && c != '"' && c != '\\')
+                name.push_back(c);
+        const auto text =
+            fmt::format("{{\"system\": \"{}\", \"width\": [{}, {}], \"height\": [{}, {}], \"max_width\": {}, \"max_height\": {}}}\n",
+                        name, width0, width1, height0, height1, max_width, max_height);
+        const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+#ifdef _WIN32
+        FILE* file = _wfopen((dir / "headset.json").c_str(), L"wb");
+#else
+        FILE* file = std::fopen((dir / "headset.json").c_str(), "wb");
+#endif
+        if (file) {
+            std::fwrite(text.data(), 1, text.size(), file);
             std::fclose(file);
         }
     } catch (...) { /* Diagnostics must never break rendering. */ }

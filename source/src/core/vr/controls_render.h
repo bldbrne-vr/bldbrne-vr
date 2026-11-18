@@ -36,6 +36,8 @@ struct View {
     std::string note;
     std::vector<Page::KeyItem> keys;
     Page::Glyphs glyphs{};
+    bool gestures{false}; // the pictograms' tab (Model::ShowsGestures)
+    bool pad_xbox{false}; // a gamepad drawn: an Xbox pad's (else a PlayStation one)
 };
 
 View MakeView(const Model& model, const Page::Glyphs& glyphs);

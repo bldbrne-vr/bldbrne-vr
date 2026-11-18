@@ -5,6 +5,7 @@
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/structured_control_flow.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
+#include "shader_recompiler/ir/passes/srt.h"
 #include "shader_recompiler/ir/post_order.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -29,7 +30,8 @@ IR::BlockList GenerateBlocks(const IR::AbstractSyntaxList& syntax_list) {
 }
 
 IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
-                             RuntimeInfo& runtime_info, const Profile& profile) {
+                             RuntimeInfo& runtime_info, const Profile& profile,
+                             SrtSnapshot* srt_snapshot) {
     // Ensure first instruction is expected.
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
     if (code[0] != token_mov_vcchi) {
@@ -79,7 +81,11 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     }
     Shader::Optimization::RingAccessElimination(program, runtime_info);
     Shader::Optimization::ReadLaneEliminationPass(program);
-    Shader::Optimization::FlattenExtendedUserdataPass(program);
+    Shader::Optimization::FlattenExtendedUserdataPass(program, srt_snapshot);
+    if (srt_snapshot && srt_snapshot->differs) {
+        // No flattened user data of this layout to read sharps from: the caller drops it.
+        return program;
+    }
     Shader::Optimization::ResourceTrackingPass(program, profile);
     Shader::Optimization::LowerBufferFormatToRaw(program);
     Shader::Optimization::SharedMemorySimplifyPass(program, profile);
@@ -90,6 +96,20 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
     Shader::Optimization::BillboardFaceEyePass(program, runtime_info);
     Shader::Optimization::ScreenRectPass(program);
+    // Wet blood (G-buffer programs) and the widened gloss (light programs and the ambient
+    // composite) before the reflections: the composite's specular occlusion and upsample read
+    // the widened gloss's mip.
+    Shader::Optimization::WetBloodPass(program, runtime_info);
+    Shader::Optimization::SpecularAaPass(program, runtime_info);
+    Shader::Optimization::ParticleAirPass(program, runtime_info);
+    Shader::Optimization::ParallaxPass(program, runtime_info);
+    Shader::Optimization::BumpHeightPass(program, runtime_info);
+    Shader::Optimization::MoonShadowPass(program, runtime_info);
+    Shader::Optimization::ReflectionsPass(program, runtime_info);
+    Shader::Optimization::LightShadowPass(program, runtime_info);
+    Shader::Optimization::AmbientOcclusionPass(program, runtime_info);
+    Shader::Optimization::BouncePass(program, runtime_info);
+    Shader::Optimization::AirLightPass(program, runtime_info);
     Shader::Optimization::LowerUserClipPlanes(program, runtime_info);
     Shader::Optimization::CollectShaderInfoPass(program, profile);
 

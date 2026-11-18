@@ -122,6 +122,65 @@ public:
 
     [[nodiscard]] U32 ReadConst(const Value& base, const U32& offset);
     [[nodiscard]] U32 ReadConstBuffer(const Value& handle, const U32& index, BufferInstInfo info);
+    // VR moon shadows: the moon's share of this pixel (MoonShadowPass, ir/passes/moon_shadow.h).
+    [[nodiscard]] F32 VrMoonShadow(const Value& ndc, const Value& uv, const F32& depth);
+    // VR wet streets: this pixel's reflection, weighted (rgb * a, a) (ReflectionsPass,
+    // ir/passes/reflections.h).
+    [[nodiscard]] Value VrReflection(const Value& ndc, const Value& uv, const F32& depth);
+    // Sharper wet streets (ir/passes/reflections.h UpsampleLodMax): the composite's reflection
+    // sample, depth-aware where the depth has an edge.
+    [[nodiscard]] Value VrReflectionUpsample(const Value& bilinear, const Value& uv,
+                                             const F32& depth, const F32& lod);
+    // VR light shadows: light `light`'s visibility from this pixel (LightShadowPass).
+    [[nodiscard]] F32 VrLightVisibility(const U32& light, const Value& ndc, const Value& uv,
+                                        const F32& depth);
+    // VR ambient occlusion: the share of the sky this pixel sees (AmbientOcclusionPass).
+    [[nodiscard]] F32 VrAmbientOcclusion(const Value& ndc, const Value& uv, const F32& depth);
+    // VR bounce light: the scene's diffuse light gathered round this pixel (rgb, w 0).
+    [[nodiscard]] Value VrBounceLight(const Value& ndc, const Value& uv, const F32& depth);
+    // VR light in the air (ir/passes/fog_light.h): what the frame's lights scatter towards the eye
+    // along this pixel's ray.
+    [[nodiscard]] Value VrFogLight(const Value& ndc, const Value& uv, const F32& depth);
+    // VR moonlight in the air (ir/passes/moon_shafts.h): what the moon scatters towards the eye
+    // along this pixel's ray, through the gaps in its shadow.
+    [[nodiscard]] Value VrMoonShafts(const Value& ndc, const Value& uv, const F32& depth,
+                                     const U32& sets_image);
+    // The air pass (ir/passes/air_light.h): the moon's colour probe in the light composite (the
+    // moon shafts' arguments; nothing to add), the cells' march in the shadow mask's blur (0), and
+    // what the scene's copy adds (rgb) and dims by (w, the air's transmittance minus one).
+    [[nodiscard]] Value VrAirProbe(const Value& ndc, const Value& uv, const F32& depth,
+                                   const U32& sets_image);
+    [[nodiscard]] F32 VrAirCompute();
+    [[nodiscard]] Value VrAirApply(const U32& scene_image);
+    [[nodiscard]] Value VrCinematic(const Value& colour);
+    // Filmic highlights (ir/passes/cinematic_look.h): the tone map's per-channel exponentials
+    // `e` of the floored scene light `x`, moved towards the hue-keeping curve.
+    [[nodiscard]] Value VrFilmic(const Value& x, const Value& e);
+    // Lit smoke (ir/passes/particle_air.h): the light the frame's lights give a soft particle's
+    // fragment, `e` the vector from it to the camera in world axes, `rgb` its colour.
+    [[nodiscard]] Value VrParticleAir(const Value& e, const Value& rgb);
+    // Eye adaptation (ir/passes/cinematic_look.h): the tone map's exposure factor this frame;
+    // `x` the pixel's scene light (its share of the frame's brightness is counted).
+    [[nodiscard]] F32 VrExposure(const Value& x);
+    // Less shimmer on shiny details (ir/passes/specular_aa.h): the gloss `gloss` widened by the
+    // variance of the G-buffer normal `normal` (its sample, 0.5 n + 0.5) across the pixel, the
+    // pixel's view depth from `matrix`'s rows 8..15 at `depth` gating silhouettes.
+    [[nodiscard]] F32 VrSpecularAa(const F32& gloss, const Value& normal, const F32& depth,
+                                   const U32& matrix);
+    // Raised brickwork (ir/passes/parallax.h BumpGaps), all of it only for a draw whose bump map
+    // is a height map (VrPushData::bump_depth above 0):
+    //  - VrBumpSeed: the bump map `handle`'s blue at `at` and the effect's fade there (1 near, 0
+    //    past its texture detail level's end); {1, 0} for any other draw, without a read;
+    //  - VrBumpDepth: a blue as the draw's depth, 0 (a face) to 1;
+    //  - VrBumpMarch: the move of `base` (the coordinates the material's reads are made from; `at`
+    //    is the bump map's own, from them) to where the view ray (`view`: the pixel to the camera,
+    //    world space) meets the height map; `height` and `near` are VrBumpSeed's;
+    //  - VrBumpSample: a 2D implicit-detail read at `moved` with `coords`' own gradients; the
+    //    plain read at `coords` for any other draw.
+    [[nodiscard]] Value VrBumpSeed(const U32& handle, const Value& at);
+    [[nodiscard]] F32 VrBumpDepth(const F32& height);
+    [[nodiscard]] Value VrBumpMarch(const U32& handle, const Value& view, const Value& at,
+                                    const Value& base, const F32& height, const F32& near);
 
     [[nodiscard]] U8 LoadBufferU8(const Value& handle, const Value& address, BufferInstInfo info);
     [[nodiscard]] U16 LoadBufferU16(const Value& handle, const Value& address, BufferInstInfo info);

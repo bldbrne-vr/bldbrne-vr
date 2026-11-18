@@ -10,6 +10,7 @@
 #include "video_core/native_stereo/draw_inputs.h"
 #include "common/assert.h"
 #include "common/types.h"
+#include "shader_recompiler/translation_capture.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/frontend/copy_shader.h"
 #include "shader_recompiler/frontend/tessellation.h"
@@ -60,6 +61,10 @@ struct InfoPersistent {
             return std::popcount(mask);
         }
 
+        bool MatchesStart(u32 compiled, u32 requested) const noexcept {
+            return compiled == requested || mask == 0;
+        }
+
         u32 mask;
     };
     UserDataMask ud_mask{};
@@ -97,6 +102,10 @@ struct InfoPersistent {
         }
     };
     ScreenRect vr_screen_rect{};
+    // VR (BumpHeightPass, parallax.h BumpGaps): the G-buffer program's bump map, an index into
+    // `images` (0xFF: none); the rasterizer classifies the texture bound there per draw
+    // (VrBumpClassify) and pushes its class (VrPushData::bump_depth / bump_scale).
+    u8 vr_bump_image = 0xFF;
 
     InfoPersistent() = default;
     InfoPersistent(Stage stage_, LogicalStage l_stage_, u64 pgm_hash_)
@@ -153,6 +162,23 @@ struct Info : InfoPersistent {
     VAddr pgm_base;
     bool has_storage_images{};
     bool has_discard{};
+    // VR light shadows (LightShadowPass, ir/passes/light_shadow.h): the light pre-pass's buffers
+    // (handles of its ndc-to-view matrix and of its lights) and the depth it samples (an image
+    // sample handle: image | sampler << 16). Set only for a light rectangle the pass took.
+    // `game_shadowed`: one of the game's shadowed lamp shaders (its lamps cast ours whatever
+    // their colour; its own shadow maps read as lit).
+    struct VrLightShadow {
+        bool on{};
+        u32 matrix_buffer{};
+        u32 light_buffer{};
+        u32 depth_image{};
+        bool game_shadowed{};
+        u32 count{};  // its lights (0: the AO pass)
+        u32 stride{}; // dwords a light in its list
+        // The AO pass: the game's normal buffer among its images (ambient_occlusion.h
+        // BufferNormals), ~0: none found.
+        u32 normal_image{~0u};
+    } vr_light_shadow{};
     bool has_image_gather{};
     bool has_image_query{};
     bool uses_buffer_atomic_float_min_max{};
@@ -170,6 +196,41 @@ struct Info : InfoPersistent {
     bool stores_tess_level_outer{};
     bool stores_tess_level_inner{};
     bool translation_failed{};
+    // VR moon shadows (MoonShadowPass, ir/passes/moon_shadow.h): the shadow-mask pass's cascades
+    // buffer and distance-fade buffer (0xFFFFFFFF: none), its eye depth (an image sample handle:
+    // image | sampler << 16), the shadow atlas with its compare sampler and with the depth's plain
+    // sampler (raw depths), and whether a larger atlas depth is nearer the moon. Set only for a
+    // shadow-mask program the pass took.
+    struct VrMoonShadow {
+        bool on{};
+        bool reversed{};
+        u32 cascades_buffer{};
+        u32 params_buffer{0xFFFFFFFFu};
+        u32 depth_image{};
+        u32 shadow_compare{};
+        u32 shadow_raw{};
+    } vr_moon_shadow{};
+    // VR wet streets (ReflectionsPass, ir/passes/reflections.h): the game's trace program's
+    // constants buffer (its 80 dwords, each eye's), its eye depth, G-buffer normals and last
+    // frame's colour (image sample handles: image | sampler << 16), and whether the march's
+    // jitter moves every frame (an upscaler averages it). Set only for the trace the pass took.
+    struct VrReflection {
+        bool on{};
+        bool jitter{};
+        u32 buffer{};
+        u32 depth_image{};
+        u32 normal_image{};
+        u32 colour_image{};
+    } vr_reflection{};
+    // Sharper wet streets (ReflectionsPass's composite, reflections.h UpsampleLodMax): the
+    // composite's ndc-to-view buffer (rows 2 and 3 at dwords 8..15), its full-size depth and the
+    // reflection (image sample handles). Set only for the composite the pass took.
+    struct VrReflectionUpsample {
+        bool on{};
+        u32 buffer{};
+        u32 depth_image{};
+        u32 colour_image{};
+    } vr_reflection_upsample{};
 
     std::array<Interpolation, IR::NumParams> fs_interpolation{};
 
@@ -207,6 +268,9 @@ struct Info : InfoPersistent {
                 for (const auto& read : snapshot->register_reads) {
                     if (read.pointer_index == ptr_index && read.dword_offset == dword_offset) {
                         std::memcpy(&data, read.words.data(), sizeof(T));
+                        if (g_translation_capture) [[unlikely]] {
+                            g_translation_capture->NoteRead(ptr_index, dword_offset, &data);
+                        }
                         return data;
                     }
                 }
@@ -219,6 +283,11 @@ struct Info : InfoPersistent {
             base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
         }
         std::memcpy(&data, base + dword_offset, sizeof(T));
+        if constexpr (sizeof(T) == sizeof(TranslationCapture::Read::words)) {
+            if (g_translation_capture) [[unlikely]] {
+                g_translation_capture->NoteRead(ptr_index, dword_offset, &data);
+            }
+        }
         return data;
     }
 
@@ -231,6 +300,17 @@ struct Info : InfoPersistent {
             mask &= ~(1U << index);
             push.ud_regs[bnd.user_data++] = data_view[index];
         }
+    }
+
+    [[nodiscard]] bool HasDescriptors() const {
+        return !buffers.empty() || !images.empty() || !samplers.empty();
+    }
+
+    [[nodiscard]] bool MatchesBindingStart(const Backend::Bindings& compiled,
+                                           const Backend::Bindings& requested) const {
+        // A declaration has a binding in SPIR-V even if the game's descriptor is null.
+        return compiled == requested ||
+               (!HasDescriptors() && ud_mask.MatchesStart(compiled.user_data, requested.user_data));
     }
 
     void AddBindings(Backend::Bindings& bnd) const {
@@ -250,6 +330,11 @@ struct Info : InfoPersistent {
 
     void ReadTessConstantBuffer(TessellationDataConstantBuffer& tess_constants) const {
         ASSERT(tess_consts_dword_offset >= 0); // We've already tracked the V# UD
+        if (tess_constants_override) {
+            // The startup shader build's replay (vk_shader_record.cpp): the recorded constants.
+            std::memcpy(&tess_constants, tess_constants_override, sizeof(tess_constants));
+            return;
+        }
         auto buf = ReadUdReg<AmdGpu::Buffer>(static_cast<u32>(tess_consts_ptr_base),
                                              static_cast<u32>(tess_consts_dword_offset));
         VAddr tess_constants_addr = buf.base_address;
@@ -257,7 +342,18 @@ struct Info : InfoPersistent {
                ScratchDraw::MemorySource(reinterpret_cast<const void*>(tess_constants_addr),
                                          sizeof(tess_constants)),
                sizeof(tess_constants));
+        if (g_translation_capture) [[unlikely]] {
+            const auto* p = reinterpret_cast<const u8*>(&tess_constants);
+            g_translation_capture->tess_constants.assign(p, p + sizeof(tess_constants));
+        }
     }
+
+    // Not persistent: the startup shader build's replay points it at recorded tessellation
+    // constants (ReadTessConstantBuffer then reads no guest memory).
+    const void* tess_constants_override{};
+    // Not persistent: the startup shader build's parsed fetch shader (Gcn::ParseFetchShader
+    // returns it instead of decoding guest code; the translation only uses the parsed data).
+    const void* fetch_override{};
 
     void Serialize(Serialization::Archive& ar) const;
     bool Deserialize(Serialization::Archive& ar);

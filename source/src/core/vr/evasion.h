@@ -20,8 +20,10 @@
 // you were misses for purely geometric reasons.
 //
 // Body profile: a lean up to `lean_m` pivots at the ankles (the head moves the full amount, the
-// pelvis about two thirds, the feet nearly nothing); beyond it the whole body steps. A duck lowers
-// the upper body (head fully, pelvis about half, legs not at all). Rising never lifts hurtboxes.
+// pelvis about two thirds, the feet nearly nothing); beyond it the whole body steps. A duck is a
+// crouch (the knees bend): the head fully, the pelvis about three quarters, the thighs about half,
+// the calves and feet not at all, none of the bodies over 0.5 m below 0.5 m (DuckDrop). Rising
+// never lifts hurtboxes.
 //
 // Anti-exploit (enemies aim at the character root, so a permanent offset would be a free miss):
 // a lean budget. A lean (sideways or down by `engage_m` from the stance reference) counts fully
@@ -138,9 +140,22 @@ inline float LeanReach(size_t b) {
 constexpr float LeanWeight(size_t b) {
     return RestHeight[b] / HeadHeight;
 }
-// Duck weight: nothing below 0.5 m, the head fully.
+// Duck weight, a crouch (the tester 2026-10-26: the duck should take the hips down too, so ducking
+// under a swing works): the square root of the height over 0.4 m against the head's, so the head
+// comes down fully, Spine02 0.86, Spine01 0.79, the pelvis 0.72, the thighs 0.54 and the calves
+// and feet (under 0.4 m) not at all; low sweeps still find the legs. (Until then linear from
+// 0.5 m: the pelvis 0.47, the thighs 0.22, a bow at the waist.)
+inline constexpr float DuckKneeM = 0.40f;
 inline float DuckWeight(size_t b) {
-    return std::clamp((RestHeight[b] - 0.5f) / (HeadHeight - 0.5f), 0.0f, 1.0f);
+    return std::sqrt(
+        std::clamp((RestHeight[b] - DuckKneeM) / (HeadHeight - DuckKneeM), 0.0f, 1.0f));
+}
+// A body's drop for the head's gained drop `head` (<= 0): its DuckWeight of it, but a body over
+// DuckFloorM never goes below it (the deepest duck lays nothing on the floor).
+inline constexpr float DuckFloorM = 0.50f;
+inline float DuckDrop(size_t b, float head) {
+    const float y = DuckWeight(b) * head;
+    return RestHeight[b] > DuckFloorM ? std::max(y, DuckFloorM - RestHeight[b]) : y;
 }
 
 struct Vec3 {
@@ -380,7 +395,8 @@ public:
                 continue;
             }
             const float h = gain * (LeanWeight(b) * pivot + step);
-            Vec3 o{ux * h, gain * DuckWeight(b) * dy, uz * h};
+            const float drop = DuckDrop(b, gain * dy);
+            Vec3 o{ux * h, drop, uz * h};
             Vec3 comp{};
             if (UnderUpperPos(b)) {
                 const float k = std::max(cfg.shift_reach, 0.0f);
@@ -397,7 +413,7 @@ public:
                                              : 0.0f;
             if (ik > 0.0f) {
                 const float extra = gain > 1.0f ? (gain - 1.0f) / gain : 0.0f;
-                const Vec3 real{ux * h * extra, gain * DuckWeight(b) * dy * extra, uz * h * extra};
+                const Vec3 real{ux * h * extra, drop * extra, uz * h * extra};
                 o = {o.x + (real.x - o.x) * ik, o.y + (real.y - o.y) * ik,
                      o.z + (real.z - o.z) * ik};
             }

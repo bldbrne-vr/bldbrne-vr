@@ -15,7 +15,9 @@
 #include <cstdlib>
 #include <nlohmann/json.hpp>
 #include "common/logging/log.h"
+#include "common/render_diagnostic.h"
 #include "video_core/renderer_vulkan/vr_temporal_optimizations.h"
+#include "core/vr/tonitrus_charge.h"
 namespace Vulkan {
 namespace {
 float Halton(uint32_t n, uint32_t base) {
@@ -29,7 +31,7 @@ float Halton(uint32_t n, uint32_t base) {
 }
 } // namespace
 VrTemporalScene::VrTemporalScene(const Instance &i, Scheduler &s)
-    : runtime(i, s), images(i, s), objects(i, s), camera_motion(i, s) {}
+    : runtime(i, s), images(i, s), objects(i, s), camera_motion(i, s), focus_pass(i, s) {}
 VrTemporalScene::Result VrTemporalScene::Begin(uint64_t id, const VR::Graphics::Config &config,
                                                const VrTemporalPair::Plan &next, bool cut, bool probe) {
     // Do not apply a menu acceptance midway through a stereo frame or begin history twice.
@@ -58,7 +60,7 @@ VrTemporalScene::Result VrTemporalScene::Begin(uint64_t id, const VR::Graphics::
     active = false;
     have_camera = false;
     camera_bytes_valid = false;
-    complete_motion = true;
+    valid_scene = true;
     attempted = false;
     published = false;
     output = {};
@@ -79,11 +81,10 @@ VrTemporalScene::Result VrTemporalScene::Begin(uint64_t id, const VR::Graphics::
     if (epoch != runtime.Epoch())
         have_previous = false;
     epoch = runtime.Epoch();
-    if (!objects.Begin(accepted, true, frame, epoch, cut)) {
-        have_previous = false;
-        runtime.ResetHistory();
-        return begin_result = Result::Pending;
-    }
+    // Object history is optional. A busy history slot or unavailable buffers must not
+    // stop reconstruction: PrepareRead returns no stale targets while objects is inactive,
+    // and the composer generates camera-only vectors for both eyes.
+    objects.Begin(accepted, true, frame, epoch, cut);
     const auto &size = plan.eyes[0];
     const uint32_t phases = Motion::JitterPhases(size.input_width, size.output_width);
     const uint32_t sample = uint32_t(frame % phases) + 1;
@@ -98,17 +99,37 @@ VrTemporalScene::Result VrTemporalScene::Begin(uint64_t id, const VR::Graphics::
 // and the viewport signs, so a pair equal to one whose capture returned true this frame gives
 // `current` again and the comparison succeeds: return true without parsing and inverting.
 bool VrTemporalScene::CaptureCamera(const CameraPair &data, float xs, float ys) {
-    if (!FastRender::On(MotionFast))
+    return CaptureCameraImpl(&data,
+        CameraBytes{reinterpret_cast<const std::byte*>(data[0].data()), sizeof(data[0])},
+        CameraBytes{reinterpret_cast<const std::byte*>(data[1].data()), sizeof(data[1])}, xs, ys);
+}
+bool VrTemporalScene::CaptureCameraBytes(CameraBytes left, CameraBytes right, float xs, float ys) {
+    // Compare immediately; no input pointers survive this call. Full parsing still owns a copy.
+    return CaptureCameraImpl(nullptr, left, right, xs, ys);
+}
+bool VrTemporalScene::CaptureCameraImpl(const CameraPair* owned, CameraBytes left,
+                                      CameraBytes right, float xs, float ys) {
+    const auto full_capture = [&] {
+        if (owned)
+            return CaptureCameraFull(*owned, xs, ys);
+        CameraPair data;
+        std::memcpy(data[0].data(), left.data(), left.size());
+        std::memcpy(data[1].data(), right.data(), right.size());
         return CaptureCameraFull(data, xs, ys);
+    };
+    if (!FastRender::On(MotionFast))
+        return full_capture();
     if (!active || attempted)
         return false;
     ++g_motion_fast.camera_calls;
     if (camera_bytes_valid && xs == camera_x_sign && ys == camera_y_sign &&
-        std::memcmp(&data, &camera_bytes, sizeof(CameraPair)) == 0) {
+        (owned ? std::memcmp(owned, &camera_bytes, sizeof(CameraPair)) == 0
+               : std::memcmp(left.data(), camera_bytes[0].data(), left.size()) == 0 &&
+                     std::memcmp(right.data(), camera_bytes[1].data(), right.size()) == 0)) {
         ++g_motion_fast.camera_reused;
         if (!MotionVerifySample())
             return true;
-        const bool full = CaptureCameraFull(data, xs, ys);
+        const bool full = full_capture();
         if (!full) {
             ++g_motion_fast.verify_mismatches;
             camera_bytes_valid = false;
@@ -117,9 +138,14 @@ bool VrTemporalScene::CaptureCamera(const CameraPair &data, float xs, float ys) 
         }
         return full;
     }
-    const bool captured = CaptureCameraFull(data, xs, ys);
+    const bool captured = full_capture();
     if (captured) {
-        camera_bytes = data;
+        if (owned) {
+            camera_bytes = *owned;
+        } else {
+            std::memcpy(camera_bytes[0].data(), left.data(), left.size());
+            std::memcpy(camera_bytes[1].data(), right.data(), right.size());
+        }
         camera_x_sign = xs;
         camera_y_sign = ys;
         camera_bytes_valid = true;
@@ -134,7 +160,7 @@ bool VrTemporalScene::CaptureCameraFull(const CameraPair &data, float xs, float 
         auto camera = VrMotionCamera::Read(data[eye], xs, ys);
         if (!camera) {
             problem = "invalid captured scene camera";
-            complete_motion = false;
+            valid_scene = false;
             return false;
         }
         pair[eye] = *camera;
@@ -167,7 +193,7 @@ bool VrTemporalScene::CaptureCameraFull(const CameraPair &data, float xs, float 
                 }
 #endif
                 problem = "multiple different scene cameras in one frame";
-                complete_motion = false;
+                valid_scene = false;
                 return false;
             }
         return true;
@@ -181,9 +207,9 @@ VrTemporalScene::Resolve(const std::array<VrTemporalImages::Source, 2> &sources,
     if (!active || attempted)
         return Result::Pending;
     attempted = true;
-    if (!have_camera || !complete_motion || !std::isfinite(frame_ms) || frame_ms <= 0) {
+    if (!have_camera || !valid_scene || !std::isfinite(frame_ms) || frame_ms <= 0) {
         if (problem.empty()) problem = !have_camera ? "scene camera not captured" :
-            !complete_motion ? "incomplete object motion coverage" : "invalid frame interval";
+            !valid_scene ? "invalid scene camera/depth" : "invalid frame interval";
         runtime.ResetHistory();
         have_previous = false;
         return Result::Invalid;
@@ -235,6 +261,13 @@ VrTemporalScene::Resolve(const std::array<VrTemporalImages::Source, 2> &sources,
     provider_frame.fsr4_pair = FastRender::On(Fsr4Interleave);
     const bool verify_interleave = (plan.provider_flags & VrTemporalPair::Fsr4VerifyInterleave) != 0;
     bool reset = !have_previous || last_frame == UINT64_MAX || last_frame + 1 != frame;
+    // Tonitrus' strike: a frame where its world flash jumps (the flicker's on, its dip, its second
+    // flash) starts the history afresh, or the upscaler and the TAA would average the jump away;
+    // through its smooth fade the history is kept (core/vr/tonitrus_charge.h FlashJumped). The
+    // level is this frame's own (SetFlashLevel), not the clock's at this resolve.
+    if (VR::TonitrusCharge::FlashJumped(flash_level, flash_next))
+        reset = true;
+    flash_level = flash_next;
     // FAST_FSR4_INTERLEAVE_VERIFY_RESET (diagnostic): the eyes and the twin restart together
     // halfway between comparisons, so each comparison covers only frames since that reset.
     if (verify_interleave && Fsr4InterleaveVerifyReset() &&
@@ -274,7 +307,46 @@ VrTemporalScene::Resolve(const std::array<VrTemporalImages::Source, 2> &sources,
         have_previous = false;
         return Result::Failed;
     }
+    // DLSS focus: the pair made each eye's feature its rectangle's size, so DLSS gets the
+    // rectangles cut out into images of their own (origin at the corner, as any whole eye: the
+    // same for both eyes), and the whole eyes are composed after it. A failure skips this frame
+    // and turns focus off from the next (whole-eye DLSS again).
+    const bool focus = runtime.FocusOn();
+    const auto whole = provider_frame.eyes;
+    if (focus) {
+        if (!focus_pass.Crop(provider_frame.eyes, plan.focus)) {
+            DlssFocus::Off("the rectangles could not be cut out");
+            problem = "DLSS focus: the rectangles could not be cut out";
+            runtime.ResetHistory();
+            have_previous = false;
+            return Result::Invalid;
+        }
+        provider_frame.direct_inputs = false; // the cut-outs are this frame's inputs
+        // FSR rebuilds view positions from the vertical field of view and the input's aspect:
+        // the cut-out's own (its share of the eye's height), not the whole eye's.
+        for (uint32_t eye = 0; eye < 2; ++eye)
+            provider_frame.vertical_fov[eye] =
+                2 * std::atan(std::tan(provider_frame.vertical_fov[eye] / 2) *
+                              float(plan.focus[eye].in_h) / float(size.input_height));
+    }
     const auto result = runtime.Resolve(frame, provider_frame);
+    if (result == Result::Ready && focus) {
+        std::array<VrDlssFocusPass::Eye, 2> composed{};
+        for (uint32_t eye = 0; eye < 2; ++eye)
+            composed[eye] = {sources[eye].color, vk::ImageView{whole[eye].motion.view},
+                             provider_frame.eyes[eye].output, whole[eye].output, plan.focus[eye]};
+        std::array<BbDlssImage, 2> written{};
+        if (!focus_pass.Compose(composed, size.input_width, size.input_height, jitter,
+                                reset || lockstep, frame, written)) {
+            DlssFocus::Off("the eyes could not be composed");
+            problem = "DLSS focus: the eyes could not be composed";
+            runtime.ResetHistory();
+            have_previous = false;
+            return Result::Invalid;
+        }
+        for (uint32_t eye = 0; eye < 2; ++eye)
+            provider_frame.eyes[eye].output = written[eye]; // published below
+    }
     previous = current;
     previous_jitter = jitter;
     last_frame = frame;
@@ -283,7 +355,14 @@ VrTemporalScene::Resolve(const std::array<VrTemporalImages::Source, 2> &sources,
         for (uint32_t eye = 0; eye < 2; ++eye)
             output[eye] = provider_frame.eyes[eye].output;
         published = true;
-        if (dlss) {
+        // FSR 4.1: what its bridge runs (AMD's 4.1, or FSR 3.1.5 in its place and why), in the
+        // log and the play build's diagnostics whenever it changes.
+        if (auto status = runtime.FsrBridgeStatus(); !status.empty() && status != bridge_status) {
+            bridge_status = std::move(status);
+            LOG_INFO(Render_Vulkan, "FSR 4.1 bridge: {}", bridge_status);
+            Common::RenderDiagnostic::Write("FSR 4.1 bridge: " + bridge_status);
+        }
+        if (dlss && !focus) { // focus reads the eyes into its cut-outs: neither count applies
             // Bit 46 counters: an input read in place did not move its bytes (colour 16, depth 8
             // per input pixel and eye).
             const uint64_t pixels = uint64_t(size.input_width) * size.input_height;

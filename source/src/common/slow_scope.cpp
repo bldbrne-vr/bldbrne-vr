@@ -147,6 +147,7 @@ struct UnwindModule {
     std::array<char, 64> name{};
 };
 std::vector<UnwindModule> g_unwind_modules;
+bool g_continuous{}; // VR_STALL_SAMPLER=2 (SamplerOn, before the thread starts)
 
 void LoadUnwindModules() {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
@@ -254,11 +255,23 @@ std::atomic<s64> g_request_start{0}, g_request_end{0};
 std::atomic<u32> g_request_ms10{0};
 std::atomic<u64> g_request_seq{0};
 
+thread_local bool t_sampler_thread = false;
+
 void SamplerThread() {
+    t_sampler_thread = true;
     SetCurrentThreadName("hang:Sampler");
     LoadUnwindModules();
-    const wchar_t* names[2] = {L"fast:StageB", L"shadPS4:GpuCommandProcessor"};
-    std::array<HANDLE, 2> handles{};
+    // Thread 2, the recorder (2026-10-24): stage B's drains wait for its replay.
+    // 3 and 4: the game's main and render threads (their own code has no unwind data: a sample
+    // there names the first of our frames, a system call's implementation, or nothing).
+    // 5 and 6 (2026-11-05): the present thread (each flip's frame goes back to stage A's pool
+    // there) and the OpenXR frame loop.
+    constexpr u32 Threads = 7;
+    const wchar_t* names[Threads] = {L"fast:StageB",       L"shadPS4:GpuCommandProcessor",
+                                     L"fast:Recorder",     L"Game:Main",
+                                     L"GXRenderThread",    L"shadPS4:PresentThread",
+                                     L"shadPS4:OpenXRFrameLoop"};
+    std::array<HANDLE, Threads> handles{};
     const auto find = [&] {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap == INVALID_HANDLE_VALUE) {
@@ -278,7 +291,7 @@ void SamplerThread() {
             PWSTR desc = nullptr;
             bool kept = false;
             if (SUCCEEDED(GetThreadDescription(h, &desc)) && desc != nullptr) {
-                for (u32 i = 0; i < 2; ++i) {
+                for (u32 i = 0; i < Threads; ++i) {
                     if (handles[i] == nullptr && std::wcscmp(desc, names[i]) == 0) {
                         handles[i] = h;
                         kept = true;
@@ -301,16 +314,20 @@ void SamplerThread() {
         }
     }
     u64 done_seq = 0;
+    u64 profiled = 0; // VR_STALL_SAMPLER=2: samples written so far
+    if (g_continuous && file != nullptr)
+        std::fprintf(file, "FRAME 1000\n");
     s64 next_find = 0;
     LOG_INFO(Debug, "Stall sampler: {} modules with unwind data; writing stall_samples.txt",
              g_unwind_modules.size());
     for (;;) {
         const s64 now = NowNs();
-        if ((handles[0] == nullptr || handles[1] == nullptr) && now >= next_find) {
+        const bool missing = std::find(handles.begin(), handles.end(), nullptr) != handles.end();
+        if (missing && now >= next_find) {
             next_find = now + 2'000'000'000;
             find();
         }
-        for (u8 i = 0; i < 2; ++i) {
+        for (u8 i = 0; i < Threads; ++i) {
             if (handles[i] == nullptr) {
                 continue;
             }
@@ -323,8 +340,22 @@ void SamplerThread() {
             s.ns = NowNs();
             g_written.fetch_add(1, std::memory_order_release);
         }
+        // VR_STALL_SAMPLER=2: every sample, as one long frame (a CPU profile for stallsym.py
+        // with a minimum of 0 ms).
+        if (g_continuous && file != nullptr) {
+            const u64 written = g_written.load(std::memory_order_acquire);
+            for (; profiled < written; ++profiled) {
+                const Sample& s = g_ring[profiled % RingSamples];
+                if (s.count == 0)
+                    continue;
+                std::fprintf(file, "S %u", s.thread);
+                for (u32 f = 0; f < s.count; ++f)
+                    std::fprintf(file, " %llx", static_cast<unsigned long long>(s.pcs[f]));
+                std::fputc('\n', file);
+            }
+        }
         const u64 seq = g_request_seq.load(std::memory_order_acquire);
-        if (seq != done_seq && file != nullptr) {
+        if (!g_continuous && seq != done_seq && file != nullptr) {
             done_seq = seq;
             const s64 start = g_request_start.load(std::memory_order_relaxed);
             const s64 end = g_request_end.load(std::memory_order_relaxed);
@@ -351,9 +382,10 @@ void SamplerThread() {
 bool SamplerOn() {
     static const bool on = [] {
         const char* env = std::getenv("VR_STALL_SAMPLER");
-        if (env == nullptr || env[0] != '1') {
+        if (env == nullptr || (env[0] != '1' && env[0] != '2')) {
             return false;
         }
+        g_continuous = env[0] == '2';
         std::thread(SamplerThread).detach();
         return true;
     }();
@@ -377,6 +409,10 @@ void StartSampler() {
     (void)SamplerOn();
 }
 
+bool OnSamplerThread() noexcept {
+    return t_sampler_thread;
+}
+
 } // namespace Common::Slow
 
 #else
@@ -387,6 +423,9 @@ std::string ThreadTimes(bool) {
 }
 void RequestSamples(double) {}
 void StartSampler() {}
+bool OnSamplerThread() noexcept {
+    return false;
+}
 } // namespace Common::Slow
 
 #endif

@@ -32,9 +32,8 @@
 // too: the hand toward the controller as far as it goes, the weapon turned out of what it meets.
 // The arm then holds the weapon where it is.
 //
-// After laughtt/bloodborne-vr's sandbox (gpu/xr_bridge/sandbox3d/physics_weapon.cpp: the weapon
-// chasing the hand, pushed out of what it meets), with the game's own sweep through the real level
-// in place of its hand-placed shapes, and never let through.
+// The weapon chases the hand and is pushed out of what it meets, swept through the real level with
+// the game's own cast, and never let through.
 //
 // Pure: world space, game units (the caller scales metres by the world scale); the cast is the
 // caller's. tests/test_solid_weapon.cpp.
@@ -43,15 +42,49 @@ namespace VR::Solid {
 using Body::Quat;
 using Body::Vec3;
 
+struct Capsule {
+    Vec3 a{};
+    Vec3 b{};
+    float r{0.0f};
+    bool carried{false}; // thicker than what it starts on (a hammer's head): its start's own way
+    bool detached{false}; // authored start: no earlier capsule proves it clear
+                         // from the last pose is swept first (it was clear there), then itself
+    bool sweep_tip{false}; // a separate prong: also sweep its free tip (Beast Claw only)
+};
+
+constexpr int MaxMore = 6;
+
 // The weapon in a hand, on its weapon bone (R_Weapon / L_Weapon): the hand, a sphere at the bone's
-// origin; the weapon's line, a capsule from `base` to `tip` (none: the hand alone).
+// origin; the weapon's line, a capsule from `base` to `tip` (none: the hand alone); and, fitted to
+// its model (vr.ini weapon_wall_shape, core/vr/weapon_fit.h: the folded Saw Cleaver's plate, an
+// axe's head, the scythe's blade), up to MaxMore capsules more (only with the line), each starting
+// on a point already proven clear when it is swept (the hand, the line, an earlier one) and no
+// thicker than what it starts on, or carried (a thick head: its start swept along its own way from
+// where it was clear, then itself). In Bloodborne (bloodborne_body.cpp SolidWeapons) the fitted
+// capsules meet the other weapon (Separate); walls normally meet the line, with
+// Beast Claw's two authored prongs using the existing multi-capsule sweep path.
 struct Shape {
     float hand_r{0.05f};
     bool line{false};
     Vec3 base{};
     Vec3 tip{};
     float line_r{0.02f};
+    std::array<Capsule, MaxMore> more{};
+    int extra{0};
 };
+
+// How far out of the hand the weapon reaches (its tip's arc per radian of turn).
+inline float ReachOf(const Shape& s) {
+    if (!s.line) {
+        return s.hand_r;
+    }
+    float r = std::max(Body::Length(s.tip), Body::Length(s.base));
+    for (int k = 0; k < std::min(s.extra, MaxMore); ++k) {
+        const Capsule& c = s.more[static_cast<std::size_t>(k)];
+        r = std::max(r, std::max(Body::Length(c.a), Body::Length(c.b)) + c.r);
+    }
+    return r;
+}
 
 struct Pose {
     Vec3 p{};
@@ -179,7 +212,8 @@ struct Contact {
     bool any{false};
     Vec3 point{};     // on the surface (under the sphere that touched it)
     Vec3 normal{};    // out of it
-    bool line{false}; // the weapon's line or tip (else the hand)
+    bool line{false}; // the weapon's line or tip, or one of its further capsules (else the hand)
+    int more{-1};     // ... which further capsule (-1: the line, its tip, or the hand)
 };
 
 struct Result {
@@ -188,6 +222,7 @@ struct Result {
     bool through{false}; // not reached yet (nothing around the hand clear: a crevice): the
                          // controller's pose until it is
     bool back{false};    // caught too far from the controller: back at it this update
+    bool replaced{false}; // its new shape met something where it rested: from the chest
     float off{0.0f};     // the hand's distance from the controller's pose
 };
 
@@ -225,6 +260,18 @@ public:
         Probe<Cast> probe{s, cast, c.back_m};
         Result out{};
         Pose cur = solved_;
+        // Its shape changed (a new weapon or form, its fitted shape arriving): nothing showed the
+        // new one clear where the weapon rests, and a controller held still moves nothing that
+        // would. Tested there (a carried start grown, Around); placed again from the chest only
+        // when something is in it.
+        if (ShapeChanged(s) && have_) {
+            Hit h{};
+            Vec3 at{};
+            probe.unproven = true;
+            have_ = probe.Clear(cur, cur, h, at, false);
+            probe.unproven = false;
+            out.replaced = !have_;
+        }
         if (!have_) {
             if (!Reach(target, safe, s, c, cast, cur)) {
                 out.pose = target;
@@ -237,18 +284,18 @@ public:
         // Caught far from the controller: back to it when the weapon there can be reached from the
         // chest (pressed into a wall it cannot: it stays at the wall).
         out.off = Body::Length(cur.p - target.p);
-        const float reach =
-            s.line ? std::max(Body::Length(s.tip), Body::Length(s.base)) : s.hand_r;
-        const float arc = Body::AngleBetween(cur.q, target.q) * reach;
+        const float arc = Body::AngleBetween(cur.q, target.q) * ReachOf(s);
         if (out.off > c.let_go_m || arc > c.let_go_arc_m) {
             Hit h{};
             Vec3 at{};
+            probe.unproven = true;
             if (probe.Clear({safe, target.q}, target, h, at, false)) {
                 cur = target;
                 out.contact = {};
                 out.off = 0.0f;
                 out.back = true;
             }
+            probe.unproven = false;
         }
         solved_ = cur;
         out.pose = cur;
@@ -266,9 +313,46 @@ private:
         int casts{0};
         bool line_hit{false};
         bool across{false}; // ... by the line from the hand out (not the tip's way), at:
+        int more_hit{-1};   // ... by this further capsule (-1: none of them)
+        bool unproven{false}; // `from` was never shown clear: carried starts grown instead (More)
         Pose last{};
 
+        // A carried capsule's start nothing showed clear: a sphere of the line's radius there
+        // (clear: what it starts on was swept just before) swept out from it 26 ways (to a cube's
+        // faces, edges and corners), each 1/0.88 of the way to the capsule's radius: every
+        // direction lies within acos 0.886 of one of them, so a surface anywhere within the radius
+        // stops one (and one up to 14% beyond it may: a pose refused that was clear).
+        bool Around(Vec3 a, float r, Hit& h, Vec3& at) {
+            static const std::array<Vec3, 26> dirs = [] {
+                std::array<Vec3, 26> d{};
+                std::size_t n = 0;
+                for (int x = -1; x <= 1; ++x) {
+                    for (int y = -1; y <= 1; ++y) {
+                        for (int z = -1; z <= 1; ++z) {
+                            if (x != 0 || y != 0 || z != 0) {
+                                d[n++] = Body::Normalize(Vec3{static_cast<float>(x),
+                                                              static_cast<float>(y),
+                                                              static_cast<float>(z)});
+                            }
+                        }
+                    }
+                }
+                return d;
+            }();
+            const float out = (r - s.line_r) / 0.88f;
+            if (!(out > 0.0f)) {
+                return true;
+            }
+            for (const Vec3& d : dirs) {
+                if (Sweep(a, a + d * out, s.line_r, h, at)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         bool Clear(const Pose& from, const Pose& to, Hit& h, Vec3& at, bool sweep_tip = true) {
+            more_hit = -1;
             if (Body::LengthSq(to.p - from.p) > 1e-10f && Sweep(from.p, to.p, s.hand_r, h, at)) {
                 line_hit = false;
                 across = false;
@@ -278,10 +362,22 @@ private:
                 return true;
             }
             const Vec3 tip_to = At(to, s.tip);
-            if (Sweep(to.p, tip_to, s.line_r, h, at)) {
+            // A structural handle can extend behind the grip. Prove its base from the hand,
+            // then sweep the full capsule. The old outward line already contains its base.
+            const float tip2 = Body::LengthSq(s.tip);
+            const float u = tip2 > 1e-12f ? std::clamp(Body::Dot(s.base, s.tip) / tip2, 0.0f, 1.0f) : 0.0f;
+            const bool full = Body::LengthSq(s.base - s.tip * u) > 1e-8f;
+            const Vec3 base_to = full ? At(to, s.base) : to.p;
+            if ((full && Sweep(to.p, base_to, s.line_r, h, at)) ||
+                Sweep(base_to, tip_to, s.line_r, h, at)) {
                 line_hit = true;
                 across = true;
                 last = to;
+                return false;
+            }
+            if (!More(from, to, h, at)) {
+                line_hit = true;
+                across = false;
                 return false;
             }
             const Vec3 tip_from = At(from, s.tip);
@@ -290,6 +386,48 @@ private:
                 line_hit = true;
                 across = false;
                 return false;
+            }
+            return true;
+        }
+        // The further capsules on `to`, in their order (each starts on what is swept before it; a
+        // carried one's start is swept first along its way from `from`, where it was clear, or,
+        // `unproven` (placed from the chest, turned out of a wall: `from` never shown clear),
+        // grown out of the line's sphere it starts on, Around). False with the first that meets
+        // something (more_hit says which).
+        bool More(const Pose& from, const Pose& to, Hit& h, Vec3& at) {
+            for (int k = 0; k < std::min(s.extra, MaxMore); ++k) {
+                const Capsule& c = s.more[static_cast<std::size_t>(k)];
+                const Vec3 a = At(to, c.a);
+                if (c.detached && unproven &&
+                    Sweep(to.p, a, std::min(s.hand_r, c.r), h, at)) {
+                    more_hit = k;
+                    return false;
+                }
+                if (c.carried) {
+                    const Vec3 was = At(from, c.a);
+                    const bool met = unproven ? !Around(a, c.r, h, at)
+                                              : Body::LengthSq(a - was) > 1e-10f &&
+                                                    Sweep(was, a, c.r, h, at);
+                    if (met) {
+                        more_hit = k;
+                        return false;
+                    }
+                }
+                if (Sweep(a, At(to, c.b), c.r, h, at)) {
+                    more_hit = k;
+                    return false;
+                }
+                // A fork's second free tip needs the same continuous check as
+                // the primary tip, or a fast sideways move can skip a thin bar.
+                // Never sweep from an unproven pose (initial placement/reshape).
+                if (c.sweep_tip && !unproven) {
+                    const Vec3 tip_from = At(from, c.b), tip_to = At(to, c.b);
+                    if (Body::LengthSq(tip_to - tip_from) > 1e-10f &&
+                        Sweep(tip_from, tip_to, c.r, h, at)) {
+                        more_hit = k;
+                        return false;
+                    }
+                }
             }
             return true;
         }
@@ -369,7 +507,7 @@ private:
     // goes further; a tip held off where it cannot go, under a floor, never counts as farther).
     static float Way(const Pose& from, const Pose& to, const Shape& s) {
         const float hand = Body::Length(to.p - from.p);
-        return s.line ? hand + Body::Length(s.tip) * Body::AngleBetween(from.q, to.q) : hand;
+        return s.line ? hand + ReachOf(s) * Body::AngleBetween(from.q, to.q) : hand;
     }
 
     // Reached from the chest: the hand alone toward the controller as far as it goes (sliding
@@ -385,6 +523,7 @@ private:
         out = {safe, target.q};
         Chase(out, target, hand_probe, hand, c, k);
         Probe<Cast> probe{s, cast, c.back_m};
+        probe.unproven = true;
         return !s.line || TurnOut(out, probe, s);
     }
 
@@ -394,15 +533,15 @@ private:
     template <class Cast>
     static bool TurnOut(Pose& cur, Probe<Cast>& probe, const Shape& s) {
         const Vec3 from = Body::Rotate(cur.q, s.tip);
-        const float reach = Body::Length(from);
         const auto clear = [&](Vec3 dir, Vec3& n) {
             Hit h{};
             Vec3 at{};
-            if (probe.Sweep(cur.p, cur.p + dir * reach, s.line_r, h, at)) {
+            const Pose turned{cur.p, Body::Normalize(Body::FromTo(from, dir) * cur.q)};
+            if (!probe.Clear(turned, turned, h, at, false)) {
                 n = h.n;
                 return false;
             }
-            cur.q = Body::Normalize(Body::FromTo(from, dir) * cur.q);
+            cur = turned;
             return true;
         };
         // Within 3 degrees of straight into it (or of level, for `down`): no way along it.
@@ -455,6 +594,7 @@ private:
                 break;
             }
             bool line = probe.line_hit;
+            int more = probe.more_hit;
             // The hand alone: where its sweep touched. With the weapon's line (no sweep of its
             // own), halved down to it.
             float lo = s.line ? 0.0f : std::clamp(h.f, 0.0f, 1.0f);
@@ -470,11 +610,12 @@ private:
                     h = hm;
                     at = am;
                     line = probe.line_hit;
+                    more = probe.more_hit;
                 }
             }
             const Vec3 n = probe.Normal(h, cur.p - to);
             cur.p = Body::Lerp(cur.p, to, lo);
-            contact = {true, at, n, line};
+            contact = {true, at, n, line, line ? more : -1};
             Rest(cur, s, c, contact, false, probe);
             // The rest of the way along the surface it met.
             to = cur.p + Body::Perp(to - cur.p, n);
@@ -509,12 +650,13 @@ private:
             Vec3 al{};
             if (probe.Clear(cur, laid, hl, al)) {
                 cur = laid;
-                contact = {true, At(cur, s.tip) - n * rest, n, true};
+                contact = {true, At(cur, s.tip) - n * rest, n, true, -1};
                 return;
             }
         }
         float lo = 0.0f;
         float hi = 1.0f;
+        int more = probe.more_hit;
         for (int i = 0; i < c.search; ++i) {
             const float mid = 0.5f * (lo + hi);
             Hit hm{};
@@ -525,10 +667,11 @@ private:
                 hi = mid;
                 h = hm;
                 at = am;
+                more = probe.more_hit;
             }
         }
         cur.q = Body::Slerp(cur.q, goal.q, lo);
-        contact = {true, at, probe.Normal(h, At(cur, s.tip) - At(want, s.tip)), true};
+        contact = {true, at, probe.Normal(h, At(cur, s.tip) - At(want, s.tip)), true, more};
         Rest(cur, s, c, contact, true, probe);
     }
 
@@ -545,14 +688,16 @@ private:
         Vec3 x = cur.p;
         float r = s.hand_r;
         if (k.line && s.line) {
-            const Vec3 a = At(cur, s.base);
-            const Vec3 b = At(cur, s.tip);
+            const bool more = k.more >= 0 && k.more < std::min(s.extra, MaxMore);
+            const Capsule& m = s.more[static_cast<std::size_t>(more ? k.more : 0)];
+            const Vec3 a = At(cur, more ? m.a : s.base);
+            const Vec3 b = At(cur, more ? m.b : s.tip);
             const float len2 = Body::LengthSq(b - a);
             const float u =
                 len2 > 1e-12f ? std::clamp(Body::Dot(k.point - a, b - a) / len2, 0.0f, 1.0f)
                               : 0.0f;
             x = Body::Lerp(a, b, u);
-            r = s.line_r;
+            r = more ? m.r : s.line_r;
         }
         const float m = Body::Dot(x - k.point, k.normal) - r;
         if (!(m < c.skin)) {
@@ -574,8 +719,36 @@ private:
         }
     }
 
+    // Whether the shape differs from the last step's: another count of capsules, a radius or a
+    // carried flag, or an end more than 2 mm off (a re-measured line's noise is less).
+    bool ShapeChanged(const Shape& s) {
+        const auto moved = [](Vec3 a, Vec3 b) { return Body::LengthSq(a - b) > 4e-6f; };
+        const auto resized = [](float a, float b) { return std::abs(a - b) > 1e-3f; };
+        const int n = s.line ? std::min(s.extra, MaxMore) : 0;
+        bool changed = !have_last_ || s.line != last_.line || n != last_n_ ||
+                       resized(s.hand_r, last_.hand_r);
+        if (!changed && s.line) {
+            changed = moved(s.base, last_.base) || moved(s.tip, last_.tip) ||
+                      resized(s.line_r, last_.line_r);
+        }
+        for (int k = 0; !changed && k < n; ++k) {
+            const Capsule& a = s.more[static_cast<std::size_t>(k)];
+            const Capsule& b = last_.more[static_cast<std::size_t>(k)];
+            changed = moved(a.a, b.a) || moved(a.b, b.b) || resized(a.r, b.r) ||
+                      a.carried != b.carried || a.detached != b.detached ||
+                      a.sweep_tip != b.sweep_tip;
+        }
+        last_ = s;
+        last_n_ = n;
+        have_last_ = true;
+        return changed;
+    }
+
     Pose solved_{};
     bool have_{false};
+    Shape last_{}; // the shape of the last step (ShapeChanged)
+    int last_n_{0};
+    bool have_last_{false};
 };
 
 // ---- The two weapons against each other ---------------------------------------------------------
@@ -625,86 +798,338 @@ struct Touch {
 
 constexpr float CrossM = 0.15f; // pressed this far across each other, they let each other pass
 
-// Separate along the contact normal (a by +normal, b by -normal). Previous controller poses
-// establish the approach side on first contact, including a crossing within one update. Each
-// hand yields in proportion to its inward motion at first contact (including rotation); sliding
-// or pressing further keeps that split until separation. Without history it is equal. `side`
-// keeps contact on the side it began, up to `cross` across, then the weapons pass.
+// Capsule `k` of a weapon in its hand's frame: 0 its line, 1.. its further capsules (fitted to its
+// model). False past the last, or for the bare hand.
+inline bool CapsuleOf(const Shape& s, int k, Capsule& out) {
+    if (!s.line || k < 0 || k > std::min(s.extra, MaxMore)) {
+        return false;
+    }
+    out = k == 0 ? Capsule{s.base, s.tip, s.line_r} : s.more[static_cast<std::size_t>(k - 1)];
+    return true;
+}
+
+constexpr int SeparatePasses = 4; // in touch: the deepest pair pushed apart, then the next (a crook)
+constexpr int SeparateSteps = 8;  // walked from where they were solved: at most this many steps
+
+// Separate along the contact normal (a by +normal, b by -normal). Each weapon is its line and its
+// further capsules (fitted to its model: vr.ini weapon_wall_shape); every capsule of one is tested
+// against every capsule of the other, the pair pressed deepest pushed apart first, then the next
+// one still in touch (up to SeparatePasses: a blade in the crook of another, met on two of its
+// capsules at once). A pair further apart than any contact could matter costs one dot product.
+//
+// Without solved poses (the lines alone, as in 0.7.0; the first update, after a snap turn): `side`
+// (the last contact's normal) or else the previous controller poses establish the side, including
+// a crossing within one update; else they part the way they are apart. Pressed on across each
+// other, a pair keeps to its side up to `cross` across, then the weapons pass. A line against a
+// line is one pair, one pass: as before the capsules.
+//
+// With the weapons' poses as last solved (`solved_a`, `solved_b`: apart there, or just touching),
+// the two are walked from there to where they are now in steps no capsule moves further in than
+// half the thinnest pair's thickness, each step's contacts pushed apart before the next: every
+// push is shallow, out the way the pair really met, so a contact sliding from one capsule onto the
+// next, pressed into a crook or swung through within one update ends where it touched, never
+// pushed out the far side. Held more than `cross` from where the controllers have them, they let
+// each other pass (this update's poses as they are). A pair already well inside the other where
+// last solved (passing, a shape that just changed over the other weapon, a push a wall refused)
+// lets them pass until they are apart, never popped out a guessed way.
+//
+// Each hand yields in proportion to its inward motion at first contact (including rotation, from
+// the controllers' previous poses); while touching (`side` given) the split is kept (`a_share`)
+// until separation. Without history it is equal.
 inline Touch Separate(Pose& a, const Shape& sa, Pose& b, const Shape& sb,
                       const Vec3* side = nullptr, float cross = CrossM,
                       const Pose* previous_a = nullptr, const Pose* previous_b = nullptr,
-                      float a_share = 0.5f) {
+                      float a_share = 0.5f, const Pose* solved_a = nullptr,
+                      const Pose* solved_b = nullptr) {
     Touch out{};
     if (!sa.line || !sb.line) {
         return out;
     }
-    const Vec3 a0 = At(a, sa.base);
-    const Vec3 a1 = At(a, sa.tip);
-    const Vec3 b0 = At(b, sb.base);
-    const Vec3 b1 = At(b, sb.tip);
-    float s = 0.0f;
-    float t = 0.0f;
-    Closest(a0, a1, b0, b1, s, t);
-    const Vec3 pa = Body::Lerp(a0, a1, s);
-    const Vec3 pb = Body::Lerp(b0, b1, t);
-    const Vec3 d = pa - pb;
-    const float reach = sa.line_r + sb.line_r;
     const bool continuing = side != nullptr;
-    Vec3 approach{};
     const bool history = previous_a != nullptr && previous_b != nullptr;
-    if (side == nullptr && history) {
-        float old_s{}, old_t{};
-        const Vec3 old_a0 = At(*previous_a, sa.base), old_a1 = At(*previous_a, sa.tip);
-        const Vec3 old_b0 = At(*previous_b, sb.base), old_b1 = At(*previous_b, sb.tip);
-        Closest(old_a0, old_a1, old_b0, old_b1, old_s, old_t);
-        const Vec3 old_d = Body::Lerp(old_a0, old_a1, old_s) -
-                           Body::Lerp(old_b0, old_b1, old_t);
-        if (Body::LengthSq(old_d) > reach * reach * 1e-6f) {
-            approach = Body::Normalize(old_d);
-            side = &approach;
+    const int na = 1 + std::min(sa.extra, MaxMore);
+    const int nb = 1 + std::min(sb.extra, MaxMore);
+    // The closest points of two capsules on their poses: from the one on y to the one on x.
+    const auto gap = [](const Pose& x, const Capsule& cx, const Pose& y, const Capsule& cy) {
+        const Vec3 x0 = At(x, cx.a), x1 = At(x, cx.b);
+        const Vec3 y0 = At(y, cy.a), y1 = At(y, cy.b);
+        float s{}, t{};
+        Closest(x0, x1, y0, y1, s, t);
+        return Body::Lerp(x0, x1, s) - Body::Lerp(y0, y1, t);
+    };
+    // A pair pressed into each other: its capsules, where along each they are closest, its normal.
+    struct Pair {
+        Capsule ca{}, cb{};
+        Vec3 pa{}, pb{}, normal{};
+        float s{0.0f}, t{0.0f}, reach{0.0f}, depth{0.0f};
+    };
+    // The first contact: which hand yields (its share kept while they touch).
+    const auto first_contact = [&](const Pair& p) {
+        out.any = true;
+        out.a_share = std::clamp(a_share, 0.0f, 1.0f);
+        if (!history || continuing) {
+            return;
         }
-    }
-    const bool crossed = side != nullptr && Body::Dot(d, *side) < 0.0f &&
-                         Body::LengthSq(Body::Perp(d, *side)) < reach * reach;
-    // Coincident lines can leave a tiny sideways subtraction residual in world space. Its
-    // direction is noise: keeping it would erase the approach side and flip the weapons on
-    // the next inward frame. Preserve that side within 1% of their combined radius (0.4 mm
-    // at the default thickness), using the signed gap for the matching separation depth.
-    const bool keep_side = crossed ||
-        (side != nullptr && Body::LengthSq(d) <= reach * reach * 1e-4f);
-    const float dist = keep_side ? Body::Dot(d, *side) : Body::Length(d);
-    if (dist >= reach || -dist > cross) {
-        return out;
-    }
-    // Lines crossing exactly: apart the way they met, else across both of them.
-    const Vec3 across =
-        side != nullptr ? *side
-                        : Body::Normalize(Body::Cross(a1 - a0, b1 - b0),
-                                          Body::AnyPerpendicular(a1 - a0));
-    const Vec3 n = keep_side ? *side : Body::Normalize(d, across);
-    out.any = true;
-    out.depth = reach - dist;
-    out.normal = n;
-    out.point = Body::Lerp(pa, pb, sa.line_r / reach);
-    out.a_share = std::clamp(a_share, 0.0f, 1.0f);
-    if (history && !continuing) {
         // Choose which hand yields on approach, then retain that choice for this contact.
-        // Reassigning the entire penetration from per-frame motion turns millimetres of
-        // wrist noise into centimetres of hand jumps. Compare the same material points so
-        // rotating a blade counts even when its grip stays still.
-        const Vec3 da = pa - At(*previous_a, Body::Lerp(sa.base, sa.tip, s));
-        const Vec3 db = pb - At(*previous_b, Body::Lerp(sb.base, sb.tip, t));
-        const float inward_a = -Body::Dot(da, n), inward_b = Body::Dot(db, n);
-        const float quiet = reach * 0.01f;
+        // Reassigning the entire penetration from per-frame motion turns millimetres of wrist
+        // noise into centimetres of hand jumps. Compare the same material points so rotating a
+        // blade counts even when its grip stays still.
+        const Vec3 da = p.pa - At(*previous_a, Body::Lerp(p.ca.a, p.ca.b, p.s));
+        const Vec3 db = p.pb - At(*previous_b, Body::Lerp(p.cb.a, p.cb.b, p.t));
+        const float inward_a = -Body::Dot(da, p.normal), inward_b = Body::Dot(db, p.normal);
+        const float quiet = p.reach * 0.01f;
         if (inward_a + inward_b > quiet) {
             const float wa = inward_a > quiet ? inward_a : 0.0f;
             const float wb = inward_b > quiet ? inward_b : 0.0f;
             if (wa + wb > quiet)
                 out.a_share = wa / (wa + wb);
         }
+    };
+    const auto note = [&](const Pair& p) {
+        out.normal = p.normal;
+        out.point = Body::Lerp(p.pa, p.pb, p.ca.r / p.reach);
+        out.depth = std::max(out.depth, p.depth);
+    };
+    constexpr int Pairs = (MaxMore + 1) * (MaxMore + 1);
+    const auto index = [](int i, int j) { return static_cast<std::size_t>(i * (MaxMore + 1) + j); };
+
+    if (solved_a == nullptr || solved_b == nullptr) {
+        // Each pair's side, found once the first time it is near: 0 not yet, 1 known, 2 none.
+        std::array<signed char, Pairs> how{};
+        std::array<Vec3, Pairs> sides{};
+        const int passes = na * nb > 1 ? SeparatePasses : 1;
+        for (int pass = 0; pass < passes; ++pass) {
+            Pair best{};
+            bool found = false;
+            for (int i = 0; i < na; ++i) {
+                for (int j = 0; j < nb; ++j) {
+                    Capsule ca{}, cb{};
+                    if (!CapsuleOf(sa, i, ca) || !CapsuleOf(sb, j, cb)) {
+                        continue;
+                    }
+                    const Vec3 a0 = At(a, ca.a);
+                    const Vec3 a1 = At(a, ca.b);
+                    const Vec3 b0 = At(b, cb.a);
+                    const Vec3 b1 = At(b, cb.b);
+                    float s = 0.0f;
+                    float t = 0.0f;
+                    Closest(a0, a1, b0, b1, s, t);
+                    const Vec3 pa = Body::Lerp(a0, a1, s);
+                    const Vec3 pb = Body::Lerp(b0, b1, t);
+                    const Vec3 d = pa - pb;
+                    const float reach = ca.r + cb.r;
+                    // Further apart than this, no side makes them touch (apart, or crossed past
+                    // `cross`).
+                    if (Body::LengthSq(d) > reach * reach + cross * cross) {
+                        continue;
+                    }
+                    const std::size_t k = index(i, j);
+                    if (how[k] == 0) {
+                        how[k] = 2;
+                        if (side != nullptr) {
+                            sides[k] = *side;
+                            how[k] = 1;
+                        } else if (history) {
+                            const Vec3 was = gap(*previous_a, ca, *previous_b, cb);
+                            if (Body::LengthSq(was) > reach * reach * 1e-6f) {
+                                sides[k] = Body::Normalize(was);
+                                how[k] = 1;
+                            }
+                        }
+                    }
+                    const Vec3* pair_side = how[k] == 1 ? &sides[k] : nullptr;
+                    const bool crossed = pair_side != nullptr &&
+                                         Body::Dot(d, *pair_side) < 0.0f &&
+                                         Body::LengthSq(Body::Perp(d, *pair_side)) < reach * reach;
+                    // Coincident lines can leave a tiny sideways subtraction residual in world
+                    // space. Its direction is noise: keeping it would erase the approach side and
+                    // flip the weapons on the next inward frame. Preserve that side within 1% of
+                    // their combined radius (0.4 mm at the default thickness), using the signed
+                    // gap for the matching separation depth.
+                    const bool keep_side = crossed || (pair_side != nullptr &&
+                                                       Body::LengthSq(d) <= reach * reach * 1e-4f);
+                    const float dist = keep_side ? Body::Dot(d, *pair_side) : Body::Length(d);
+                    if (dist >= reach || -dist > cross ||
+                        (found && reach - dist <= best.depth)) {
+                        continue;
+                    }
+                    // Lines crossing exactly: apart the way they met, else across both of them.
+                    const Vec3 across =
+                        pair_side != nullptr ? *pair_side
+                                             : Body::Normalize(Body::Cross(a1 - a0, b1 - b0),
+                                                               Body::AnyPerpendicular(a1 - a0));
+                    best = {ca, cb, pa, pb, keep_side ? *pair_side : Body::Normalize(d, across),
+                            s, t, reach, reach - dist};
+                    found = true;
+                }
+            }
+            if (!found) {
+                break;
+            }
+            if (pass == 0) {
+                first_contact(best);
+                out.depth = best.depth;
+                out.normal = best.normal;
+                out.point = Body::Lerp(best.pa, best.pb, best.ca.r / best.reach);
+            }
+            a.p = a.p + best.normal * (out.a_share * best.depth);
+            b.p = b.p - best.normal * ((1.0f - out.a_share) * best.depth);
+        }
+        return out;
     }
-    a.p = a.p + n * (out.a_share * out.depth);
-    b.p = b.p - n * ((1.0f - out.a_share) * out.depth);
+
+    // Near at all where the controllers have them? (Else nothing: they pass or are apart.)
+    bool close_by = false;
+    float thin_a = 0.0f, thin_b = 0.0f;
+    for (int i = 0; i < na; ++i) {
+        Capsule ca{};
+        CapsuleOf(sa, i, ca);
+        thin_a = i == 0 ? ca.r : std::min(thin_a, ca.r);
+        for (int j = 0; j < nb; ++j) {
+            Capsule cb{};
+            CapsuleOf(sb, j, cb);
+            thin_b = j == 0 ? cb.r : std::min(thin_b, cb.r);
+            const float reach = ca.r + cb.r;
+            close_by = close_by || Body::LengthSq(gap(a, ca, b, cb)) <= reach * reach + cross * cross;
+        }
+    }
+    if (!close_by) {
+        return out;
+    }
+    // A pair inside the other where last solved, by more than a quarter of their thickness (a
+    // solved touch is within a fraction of a millimetre): it lets them pass this update.
+    std::array<bool, Pairs> inside{};
+    for (int i = 0; i < na; ++i) {
+        for (int j = 0; j < nb; ++j) {
+            Capsule ca{}, cb{};
+            CapsuleOf(sa, i, ca);
+            CapsuleOf(sb, j, cb);
+            inside[index(i, j)] = !(Body::Length(gap(*solved_a, ca, *solved_b, cb)) >=
+                                    0.75f * (ca.r + cb.r));
+        }
+    }
+    // The steps: no capsule moving further than half the thinnest pair's thickness in one.
+    const float turn_a = Body::AngleBetween(solved_a->q, a.q);
+    const float turn_b = Body::AngleBetween(solved_b->q, b.q);
+    const float moved = Body::Length(a.p - solved_a->p) + turn_a * ReachOf(sa) +
+                        Body::Length(b.p - solved_b->p) + turn_b * ReachOf(sb);
+    const float step = 0.5f * (thin_a + thin_b);
+    const int steps =
+        step > 0.0f && moved > step
+            ? std::min(SeparateSteps, static_cast<int>(std::ceil(moved / step)))
+            : 1;
+    Vec3 push_a{}, push_b{};
+    bool touched = false;
+    for (int k = 1; k <= steps; ++k) {
+        const float f = static_cast<float>(k) / static_cast<float>(steps);
+        Pose x{Body::Lerp(solved_a->p, a.p, f) + push_a,
+               turn_a > 1e-5f && k < steps ? Body::Slerp(solved_a->q, a.q, f) : a.q};
+        Pose y{Body::Lerp(solved_b->p, b.p, f) + push_b,
+               turn_b > 1e-5f && k < steps ? Body::Slerp(solved_b->q, b.q, f) : b.q};
+        for (int pass = 0; pass < SeparatePasses; ++pass) {
+            // This step's pairs pressed into each other (their normals and depths; only the ones
+            // counted are read), the deepest.
+            struct Pressed {
+                float x, y, z, depth;
+                Vec3 n() const {
+                    return {x, y, z};
+                }
+            };
+            std::array<Pressed, Pairs> pressed;
+            int count = 0;
+            int deepest = 0;
+            Pair best{};
+            for (int i = 0; i < na; ++i) {
+                for (int j = 0; j < nb; ++j) {
+                    if (inside[index(i, j)]) {
+                        continue;
+                    }
+                    Capsule ca{}, cb{};
+                    CapsuleOf(sa, i, ca);
+                    CapsuleOf(sb, j, cb);
+                    const Vec3 a0 = At(x, ca.a);
+                    const Vec3 a1 = At(x, ca.b);
+                    const Vec3 b0 = At(y, cb.a);
+                    const Vec3 b1 = At(y, cb.b);
+                    float s = 0.0f;
+                    float t = 0.0f;
+                    Closest(a0, a1, b0, b1, s, t);
+                    const Vec3 pa = Body::Lerp(a0, a1, s);
+                    const Vec3 pb = Body::Lerp(b0, b1, t);
+                    const Vec3 d = pa - pb;
+                    const float reach = ca.r + cb.r;
+                    const float dist2 = Body::LengthSq(d);
+                    // Touching or nearly (within 5% of their thickness): one another's push
+                    // could press it in, so it is weighed with them.
+                    const float near_by = reach * 1.05f;
+                    if (dist2 >= near_by * near_by) {
+                        continue;
+                    }
+                    const float dist = std::sqrt(dist2);
+                    // Lines meeting exactly (not after a shallow step: a tie): the way they last
+                    // touched, else across both of them.
+                    const Vec3 n =
+                        dist > reach * 1e-4f ? d * (1.0f / dist)
+                        : touched            ? out.normal
+                        : side != nullptr    ? *side
+                                             : Body::Normalize(Body::Cross(a1 - a0, b1 - b0),
+                                                               Body::AnyPerpendicular(a1 - a0));
+                    if (count == 0 || reach - dist > best.depth) {
+                        best = {ca, cb, pa, pb, n, s, t, reach, reach - dist};
+                        deepest = count;
+                    }
+                    pressed[static_cast<std::size_t>(count++)] = {n.x, n.y, n.z, reach - dist};
+                }
+            }
+            // None pressed in by more than a 1000th of their thickness (a push's rounding): apart.
+            const float tolerance = best.reach * 1e-3f;
+            if (count == 0 || best.depth <= tolerance) {
+                break;
+            }
+            if (!touched) {
+                first_contact(best);
+                touched = true;
+            }
+            note(best);
+            // Out of the deepest; if that leaves another pressed in (a crook: out of one is into
+            // the other), out of both at once: the least push that clears both.
+            Vec3 push = best.normal * best.depth;
+            int other = -1;
+            float worst = tolerance;
+            for (int c = 0; c < count; ++c) {
+                const Pressed& q = pressed[static_cast<std::size_t>(c)];
+                const float left = q.depth - Body::Dot(q.n(), push);
+                if (c != deepest && left > worst) {
+                    worst = left;
+                    other = c;
+                }
+            }
+            if (other >= 0) {
+                const Pressed& q = pressed[static_cast<std::size_t>(other)];
+                const Vec3 qn = q.n();
+                const float c = Body::Dot(best.normal, qn);
+                const float det = 1.0f - c * c;
+                const float alpha = det > 1e-4f ? (best.depth - c * q.depth) / det : -1.0f;
+                const float beta = det > 1e-4f ? (q.depth - c * best.depth) / det : -1.0f;
+                if (alpha >= 0.0f && beta >= 0.0f) {
+                    push = best.normal * alpha + qn * beta;
+                } else if (best.depth - c * q.depth <= tolerance) {
+                    push = qn * q.depth; // out of the other clears the deepest too
+                }
+            }
+            const Vec3 pa = push * out.a_share;
+            const Vec3 pb = push * -(1.0f - out.a_share);
+            x.p = x.p + pa;
+            y.p = y.p + pb;
+            push_a = push_a + pa;
+            push_b = push_b + pb;
+        }
+    }
+    if (!touched || Body::Length(push_a) + Body::Length(push_b) > cross) {
+        return {}; // apart all the way, or held too far from the controllers: they pass
+    }
+    a.p = a.p + push_a;
+    b.p = b.p + push_b;
     return out;
 }
 
