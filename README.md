@@ -243,6 +243,16 @@ Thanks to **[ID-Gamer](https://github.com/ID-Gamer)** for the third-person gamep
 
 ## Changelog
 
+### 0.9.6
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.6)
+
+- **New graphics**: lanterns, torches and gunshots cast real shadows, fog hangs where it lies and is lit by lamps and the moon, with moonlight in the air, deeper shading, wet streets and reflecting water. The game turns on what your graphics card has room for; cards under 10 GB keep the game's own look.
+- **A film look for everyone**: softer highlights, eyes that adjust to the dark, and cobbles and bricks with real depth.
+- **Dismemberment**: the Beast Claw, the Burial Blade's scythe and a hard enough blow take limbs off.
+- **Viscerals you can feel, cutscenes framed as the game shot them**, and a night that changes under the blood moon.
+- **Faster**, sharper weapons, more reliable Meta Link starts, and many fixes.
+
 ### 0.9.5
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.5)
