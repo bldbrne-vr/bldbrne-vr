@@ -58,6 +58,38 @@ dep_check() {
     return 1
 }
 
+steamvr_settings_recommended_trims() {
+    # Known NVIDIA-observed crash triggers (frunk camera/room view + desktop mirror view).
+    # Idempotent: appends the sections only if missing. Revert = delete the two sections.
+    local cfg="" base
+    for base in "${STEAM_HOME:-}" "$HOME/.local/share/Steam" "$HOME/.steam/steam"; do
+        [ -n "$base" ] || continue
+        if [ -f "$base/config/steamvr.settings" ]; then cfg="$base/config/steamvr.settings"; break; fi
+        [ -d "$base/config" ] && { cfg="$base/config/steamvr.settings"; break; }
+    done
+    if [ -z "$cfg" ]; then
+        echo "steamvr.settings not found — install SteamVR first."
+        return 1
+    fi
+    touch "$cfg"
+    local changed=0
+    if ! grep -aq "enableCamera" "$cfg"; then
+        printf '\n[camera]\nenableCamera = false\nenableCameraForRoomView = false\n' >> "$cfg"
+        changed=1
+    fi
+    if ! grep -aq "mirrorview" "$cfg"; then
+        printf '\n[mirrorview]\nmirrorviewfullscreen = false\n' >> "$cfg"
+        changed=1
+    fi
+    if [ "$changed" = 1 ]; then
+        echo "Applied recommended SteamVR trims to $cfg:"
+        echo "  frunk camera + desktop mirror view off (known NVIDIA compositor crash triggers)."
+        echo "  Tradeoff: no in-VR camera/mirror. Revert by deleting those sections."
+    else
+        echo "SteamVR trims already present — nothing to do."
+    fi
+}
+
 runtime_setup() {
     echo "== OpenXR runtime setup =="
     local vrpathreg
@@ -67,6 +99,7 @@ runtime_setup() {
         return 1
     fi
     "$vrpathreg" setthis
+    steamvr_settings_recommended_trims
     if have_cmd openxr_runtime_list; then
         echo; openxr_runtime_list 2>&1 | sed -n '1,6p'
     else

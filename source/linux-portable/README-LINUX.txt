@@ -24,7 +24,10 @@ REQUIREMENTS
 INSTALL / RUN
   1. Extract this archive anywhere (e.g. ~/apps/bldbrne-vr).
   2. ./bbvr.sh  →  1) Check dependencies.
-  3. ./bbvr.sh  →  2) Register SteamVR's OpenXR runtime (one time per system).
+  3. ./bbvr.sh  →  2) Set up SteamVR's OpenXR runtime (one time per system). This also
+     applies the recommended SteamVR trims (frunk camera + desktop mirror view off):
+     known NVIDIA compositor crash triggers. Reversible by deleting the two sections in
+     ~/.local/share/Steam/config/steamvr.settings.
   4. ./bbvr.sh  →  3) Headset smoke test. A JSON with your headset's per-eye dimensions
      (Index native = [2468,2468] x [2740,2740]) proves the whole chain works.
   5. ./bbvr.sh  →  4) Play in VR. The first run asks for the game folder and remembers it
@@ -39,17 +42,9 @@ CONTROLS / SETTINGS
 
 TROUBLESHOOTING
   - SteamVR compositor dies at the cutscene-to-first-person transition (NVIDIA-observed):
-    it segfaults in NVIDIA's OpenGL path. Trim GL surfaces in SteamVR's
-    ~/.local/share/Steam/config/steamvr.settings (relaunch SteamVR between edits):
-
-      [camera]
-      enableCamera = false
-      enableCameraForRoomView = false
-
-      [mirrorview]
-      mirrorviewfullscreen = false
-
-    Verified together on the test bench: with both sections the takeover holds.
+    option 2 installs the standard trims automatically; if it still happens, check the
+    sections exist in ~/.local/share/Steam/config/steamvr.settings and that SteamVR was
+    fully restarted afterwards.
   - Frozen SteamVR after a crash: kill vrserver vrcompositor vrmonitor vrdashboard
     vrwebhelper vrstartup by exact name (pkill -x <name>), then relaunch SteamVR.
   - 'vrserver' missing right after setup: SteamVR boots lazily; the runtime appears when a
