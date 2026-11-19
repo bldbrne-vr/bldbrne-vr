@@ -12,13 +12,35 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 An unofficial, independent VR mod for Bloodborne. No game files are included.
 
-## Linux (community build)
+## Linux (community build — tested on CachyOS/Arch)
 
-This fork builds the VR binary natively on Linux — the patches and the full recipe live in
-[`source/LINUX-BUILD.md`](source/LINUX-BUILD.md). Verified end to end on a Valve Index
-through SteamVR's OpenXR runtime (SteamVR registers as the OpenXR runtime with one command).
-No game files are included; bring your own dump, as always. The Windows download below is
-upstream's.
+This fork builds the VR binary natively on Linux. **Tested on CachyOS (Arch-based) only** —
+other distros are untested and may need their own package names or fixes. Verified end to
+end on a Valve Index through SteamVR's OpenXR runtime. The mod ships none of the game:
+bring your own Bloodborne 1.09 dump. The Windows download below is upstream's.
+
+Quick start (Arch/CachyOS; full recipe in [`source/LINUX-BUILD.md`](source/LINUX-BUILD.md)):
+
+```sh
+sudo pacman -S --needed git cmake clang ninja openxr
+
+git clone https://github.com/Dr-Bongjoose/bldbrne-vr
+cd bldbrne-vr/source
+git submodule update --init --recursive
+for d in externals/*/; do [ -f "$d/.gitmodules" ] && git -C "$d" submodule update --init --recursive; done
+
+cmake -B build-clang -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_SYSTEM_JSONCPP=OFF
+ninja -C build-clang shadps4
+
+"$HOME/.local/share/Steam/steamapps/common/SteamVR/bin/linux64/vrpathreg" setthis   # once
+build-clang/shadps4 --benchmark-headset=/tmp/headset.json    # smoke test, exits by itself
+build-clang/shadps4 --openxr /path/to/Bloodborne-1.09-dump   # play
+```
+
+First build ~35 min; later updates are incremental (~minutes per pass). If SteamVR's
+compositor crashes at the cutscene transition (seen on NVIDIA), apply the GL-surface trims
+from the guide's SteamVR stability notes.
 
 ## Download
 

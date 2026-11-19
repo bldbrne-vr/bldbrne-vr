@@ -3,13 +3,19 @@
 Community guide (AGPL-3.0-or-later, like the rest of this source tree — keep the copyright
 notices and credits, and publish derived works under the same licence).
 
-This is NOT an official build path — upstream releases target Windows. Verified working:
-full in-VR play session of Bloodborne through SteamVR's OpenXR runtime on an Index
-(SteamVR 2.19.3, NVIDIA 620.70.06).
+**Tested on CachyOS (Arch-based) with NVIDIA 620.70.06, SteamVR 2.19.3 and a Valve Index.**
+Package names and Steam paths below are Arch/CachyOS-flavoured; other distros need their own
+equivalents and are untested.
+
+This is NOT an official build path — upstream releases target Windows.
 
 ## Prerequisites
 
-- Clang 20+ (verified 23.1.5), Ninja, CMake 3.28+, git
+```sh
+sudo pacman -S --needed git cmake clang ninja openxr
+```
+
+- Clang 20+ (verified 23.1.5), Ninja, CMake 3.28+, git — the pacman line covers all of it
 - System `openxr` package (the loader + `openxr_runtime_list` tools)
 - SteamVR installed through Steam (it ships the Linux OpenXR runtime)
 - Your own Bloodborne 1.09 dump (BYOD — the mod ships none of the game)
