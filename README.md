@@ -243,6 +243,16 @@ Thanks to **[ID-Gamer](https://github.com/ID-Gamer)** for the third-person gamep
 
 ## Changelog
 
+### 0.9.65
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.65)
+
+- **Laurence no longer crashes the game**: walking into his fight could close the game or leave the room gray.
+- **No more stray glow orbs**: cold blue balls of light with no lamp behind them are gone; candles, lanterns and fires keep their glow.
+- **Hunter tools no longer refuse with "no bullets" when you have them** (the game's own HUD with the health or stamina colours on).
+- **Blood bullets by syringe** never take your health and then show a refusal.
+- **Smoother start**: the shaders of the items in your hands are built before the first frame of the world.
+
 ### 0.9.61
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.61)
