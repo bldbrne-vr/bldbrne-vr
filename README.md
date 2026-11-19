@@ -44,7 +44,8 @@ from the guide's SteamVR stability notes.
 
 ## Download
 
-- [Portable (zip)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Portable.zip)
+- **[Linux portable (community)](https://github.com/Dr-Bongjoose/bldbrne-vr/releases/latest/download/Bldbrne-VR-linux-portable.tar.gz)** — build of this fork, tested on CachyOS — see the Linux section below
+- [Portable (zip)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Portable.zip) (recommended)
 - [Installer (Windows)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Setup.exe)
 
 ## Supported game version

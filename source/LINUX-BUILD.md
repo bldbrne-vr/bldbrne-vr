@@ -125,3 +125,11 @@ takeover holds with both sections present.
 - Iterate one error per rebuild; they surface one file at a time until the link.
 
 First build ~35 min; updates are incremental passes (~260 objects, minutes).
+
+## Packaged release (this fork)
+
+The fork publishes a ready-made Linux portable matching this guide — binary + the
+`bbvr.sh` launcher (dep-check / OpenXR registration / smoke test / play) + instructions:
+see this fork's **Releases** for `Bldbrne-VR-<version>-linux-portable.tar.gz`. It is built
+from this tree by `linux-portable/make-package.sh <version> <binary>` (the script refuses
+to pack when game-data markers are present and verifies the packaged binary's sha256).
