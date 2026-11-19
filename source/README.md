@@ -8,6 +8,13 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 An unofficial, independent VR mod for Bloodborne. No game files are included.
 
+## Linux (community build)
+
+This fork builds the VR binary natively on Linux — the patches and the full recipe live in
+[`LINUX-BUILD.md`](LINUX-BUILD.md). Verified end to end on a Valve Index through SteamVR's
+OpenXR runtime (SteamVR registers as the OpenXR runtime with one command). No game files are
+included; bring your own dump, as always. The Windows download below is upstream's.
+
 ## Download
 
 - [Portable (zip)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Portable.zip) (recommended)
