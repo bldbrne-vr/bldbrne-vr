@@ -4,16 +4,20 @@ SPDX-FileCopyrightText: 2026 BB-VR contributors
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-# Night of the Hunt VR
+> **Community Linux fork.** This directory is the source tree behind the Linux
+> portable release of Night of the Hunt VR — an unofficial VR mod for
+> Bloodborne. What this fork is, the Linux download and the build guide live in
+> the root [README](../README.md); the Linux build recipe is in
+> [`LINUX-BUILD.md`](LINUX-BUILD.md). The rest of this page is the mod's own
+> documentation, which also covers the upstream
+> [Windows](https://github.com/bldbrne-vr/bldbrne-vr) builds.
 
-An unofficial, independent VR mod for Bloodborne. No game files are included.
+# Night of the Hunt VR
 
 ## Download
 
-- [Portable (zip)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Portable.zip) (recommended)
-- [Installer (Windows)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Setup.exe)
-
-Already on 0.2.6 or earlier? Let the launcher update, then choose **Install the new version** on the Play page once. Your settings and saves come with you.
+- **[Linux portable (community build)](https://github.com/Dr-Bongjoose/bldbrne-vr/releases/latest/download/Bldbrne-VR-linux-portable.tar.gz)** — binary + `bbvr.sh` launcher, from this fork's releases.
+- Windows (upstream only): [portable ZIP](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Portable.zip) · [installer](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Setup.exe).
 
 ## Supported game version
 
@@ -65,7 +69,7 @@ These are the default **Motion** controls with **Move with: Left stick**, using 
 - **Levers:** with **Physical levers** enabled, grip and pull with either hand.
 - **Bare hands:** unarmed, your fingers follow yours. Touch a dead enemy to push it; squeeze the grip on it to grab, lift or drag it.
 
-[Full controls and weapon guide](https://github.com/bldbrne-vr/bldbrne-vr/blob/main/CONTROLS.md) — weapon-specific transformations, bow use, paired blades, gestures and alternate controls.
+[Full controls and weapon guide](../CONTROLS.md) — weapon-specific transformations, bow use, paired blades, gestures and alternate controls.
 
 **Using different controls?** Hold both stick clicks for one second to switch Motion / Buttons. **Move with: Right stick** swaps sticks, stick clicks and face-button actions; triggers, grips and weapon hands stay in place.
 

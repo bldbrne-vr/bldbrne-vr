@@ -36,6 +36,7 @@
 
 namespace Vulkan::GpuCrash {
 
+#undef None
 enum class Kind : u8 {
     None,
     CommandsBegin, // a: the command buffer's tick

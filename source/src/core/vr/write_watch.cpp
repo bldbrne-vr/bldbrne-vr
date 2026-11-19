@@ -153,7 +153,7 @@ bool Arm(const std::array<const void*, Slots>& addresses, const std::array<u64, 
     return SetAll(addresses);
 #else
     (void)addresses;
-    (void)stride;
+    (void)strides;
     (void)module;
     (void)size;
     return false;

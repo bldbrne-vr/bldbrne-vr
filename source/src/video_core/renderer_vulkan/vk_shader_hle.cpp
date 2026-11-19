@@ -243,7 +243,7 @@ bool DestinationsOverlapPacked(std::span<const vk::BufferCopy> copies) {
         if (begin < end) {
             return true;
         }
-        end = std::max(end, begin + (key & 0xFFFF'FFFFull));
+        end = std::max<u64>(end, begin + (key & 0xFFFF'FFFFull));
     }
     return false;
 }

@@ -100,6 +100,7 @@ class VrStereoWarp {
 public:
     using CameraParams = VrStereo::CameraParams;
 
+#undef None
     enum class HudMode : u32 {
         None = 0,          ///< the warp shows the captured scene only
         Diff = 1,          ///< HUD = where the final image differs from the pre-HUD scene copy

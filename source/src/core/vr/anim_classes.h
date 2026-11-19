@@ -363,7 +363,7 @@ inline std::int64_t AnimHoldNs(std::int32_t id, float cap_s) {
     if (!(length > 0.0f)) {
         return cap;
     }
-    return std::min(cap, ns(length) + AnimExtraNs);
+    return std::min<std::int64_t>(cap, ns(length) + AnimExtraNs);
 }
 
 // What took the arms (highest first).
