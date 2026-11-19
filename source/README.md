@@ -4,34 +4,20 @@ SPDX-FileCopyrightText: 2026 BB-VR contributors
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
+> **Community Linux fork.** This directory is the source tree behind the Linux
+> portable release of Night of the Hunt VR — an unofficial VR mod for
+> Bloodborne. What this fork is, the Linux download and the build guide live in
+> the root [README](../README.md); the Linux build recipe is in
+> [`LINUX-BUILD.md`](LINUX-BUILD.md). The rest of this page is the mod's own
+> documentation, which also covers the upstream
+> [Windows](https://github.com/bldbrne-vr/bldbrne-vr) builds.
+
 # Night of the Hunt VR
-
-An unofficial, independent VR mod for Bloodborne. No game files are included.
-
-## Linux (community build — tested on CachyOS/Arch)
-
-This fork builds the VR binary natively on Linux. **Tested on CachyOS (Arch-based) only** —
-other distros are untested and may need their own package names or fixes. Verified end to
-end on a Valve Index through SteamVR's OpenXR runtime, with SteamVR registering as the
-OpenXR runtime via a single command. No game files are included; bring your own dump, as
-always. The Windows download below is upstream's.
-
-Quick start (Arch/CachyOS; see [`LINUX-BUILD.md`](LINUX-BUILD.md) for the full recipe and
-the SteamVR stability notes):
-
-1. `sudo pacman -S --needed git cmake clang ninja openxr`
-2. Clone this fork, then `git submodule update --init --recursive` and run the same command
-   per external (the recipe in LINUX-BUILD.md shows the exact loop).
-3. Configure with Clang and `BUILD_WITH_SYSTEM_JSONCPP=OFF`, then `ninja -C build-clang shadps4`.
-4. `vrpathreg setthis` (once), smoke test with `--benchmark-headset`, then
-   `shadps4 --openxr <dump path>`.
 
 ## Download
 
-- [Portable (zip)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Portable.zip) (recommended)
-- [Installer (Windows)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Setup.exe)
-
-Already on 0.2.6 or earlier? Let the launcher update, then choose **Install the new version** on the Play page once. Your settings and saves come with you.
+- **[Linux portable (community build)](https://github.com/Dr-Bongjoose/bldbrne-vr/releases/latest/download/Bldbrne-VR-linux-portable.tar.gz)** — binary + `bbvr.sh` launcher, from this fork's releases.
+- Windows (upstream only): [portable ZIP](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Portable.zip) · [installer](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Setup.exe).
 
 ## Supported game version
 
@@ -83,7 +69,7 @@ These are the default **Motion** controls with **Move with: Left stick**, using 
 - **Levers:** with **Physical levers** enabled, grip and pull with either hand.
 - **Bare hands:** unarmed, your fingers follow yours. Touch a dead enemy to push it; squeeze the grip on it to grab, lift or drag it.
 
-[Full controls and weapon guide](https://github.com/bldbrne-vr/bldbrne-vr/blob/main/CONTROLS.md) — weapon-specific transformations, bow use, paired blades, gestures and alternate controls.
+[Full controls and weapon guide](../CONTROLS.md) — weapon-specific transformations, bow use, paired blades, gestures and alternate controls.
 
 **Using different controls?** Hold both stick clicks for one second to switch Motion / Buttons. **Move with: Right stick** swaps sticks, stick clicks and face-button actions; triggers, grips and weapon hands stay in place.
 

@@ -52,7 +52,8 @@ TROUBLESHOOTING
 
 LICENCE / SOURCE
   This build is of the AGPL-3.0-or-later source at
-  https://github.com/Dr-Bongjoose/bldbrne-vr (tag v0.9.61-linux.1 — the same tag you
-  downloaded this release from), which forks Bldbrne-VR by pkalogiros and contributors.
+  https://github.com/Dr-Bongjoose/bldbrne-vr (the release tag you downloaded
+  this archive from — see the fork's Releases page), which forks Bldbrne-VR by
+  pkalogiros and contributors.
   Upstream: https://github.com/bldbrne-vr/bldbrne-vr (Windows releases).
   Binary patches and the build recipe: source/LINUX-BUILD.md in the same repository.
