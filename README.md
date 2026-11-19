@@ -243,6 +243,13 @@ Thanks to **[ID-Gamer](https://github.com/ID-Gamer)** for the third-person gamep
 
 ## Changelog
 
+### 0.9.68
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.68)
+
+- **Tilting your head no longer splits the picture**: the camera now rolls with your head, so near things (hands, weapon) no longer sit at different heights in the two eyes. That could feel cross-eyed or queasy. `camera_roll=0` in vr.ini goes back.
+- **Foveated upscaling covers the view more evenly up and down** on headsets that see farther down than up (Quest 3).
+
 ### 0.9.65
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.65)
