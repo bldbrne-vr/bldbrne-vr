@@ -17,6 +17,17 @@
 
 #include "core/vr/vr_session.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+
+// X11/X.h (pulled in through the windowing headers) defines atom-name macros --
+// None, Always, Bool, True, False --
+// that collide with engine enum members below (HudMode::None, CompareFunc::Always, ...).
+// Clear those macros for the rest of this translation unit.
+#undef Bool
+#undef None
+#undef True
+#undef False
+#undef Always
+
 #include "video_core/renderer_vulkan/vr_stereo_warp.h"
 
 namespace Vulkan {
