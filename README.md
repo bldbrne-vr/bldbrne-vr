@@ -8,18 +8,73 @@ SPDX-License-Identifier: GPL-2.0-or-later
   <img src="assets/icon.png" alt="Bldbrne-VR icon" width="180">
 </p>
 
-# Night of the Hunt VR
+# Night of the Hunt VR — Linux community build
 
-An unofficial, independent VR mod for Bloodborne. No game files are included.
+Community fork of
+[Night of the Hunt VR](https://github.com/bldbrne-vr/bldbrne-vr), an
+unofficial, independent VR mod for Bloodborne. This fork exists to build that
+mod **natively on Linux**: the GUI launcher is Windows-only and the native
+build is the working path there too (the Windows binary dies under Wine).
+Verified end to end on a Valve Index through SteamVR's OpenXR runtime. No
+game files are included — bring your own Bloodborne 1.09 dump (BYOD, as
+upstream requires).
 
-## Linux (community build — tested on CachyOS/Arch)
+- **Download:** [Bldbrne-VR-linux-portable.tar.gz](https://github.com/Dr-Bongjoose/bldbrne-vr/releases/latest/download/Bldbrne-VR-linux-portable.tar.gz) — binary + `bbvr.sh` launcher
+- **Build from source:** [`source/LINUX-BUILD.md`](source/LINUX-BUILD.md) (CachyOS/Arch recipe)
+- **Controls:** [`CONTROLS.md`](CONTROLS.md)
+- **On Windows?** This fork ships Linux only. [Official Windows releases and documentation are upstream's.](https://github.com/bldbrne-vr/bldbrne-vr/releases)
 
-This fork builds the VR binary natively on Linux. **Tested on CachyOS (Arch-based) only** —
-other distros are untested and may need their own package names or fixes. Verified end to
-end on a Valve Index through SteamVR's OpenXR runtime. The mod ships none of the game:
-bring your own Bloodborne 1.09 dump. The Windows download below is upstream's.
+## Quick start (portable)
 
-Quick start (Arch/CachyOS; full recipe in [`source/LINUX-BUILD.md`](source/LINUX-BUILD.md)):
+```sh
+tar -xzf Bldbrne-VR-linux-portable.tar.gz
+cd bldbrne-vr-0.9.61-linux
+./bbvr.sh          # 1 dep check → 2 OpenXR setup → 3 smoke test → 4 play
+```
+
+The package is self-contained: its own VR build of shadPS4 plus the launcher,
+no separate emulator install. Setup step 2 registers SteamVR as your OpenXR
+runtime (SteamVR must be installed and launched at least once — it ships the
+runtime) and applies the SteamVR stability trims: frunk camera and desktop
+mirror off, known NVIDIA compositor-crash triggers, reversible in
+`steamvr.settings` (see [`source/LINUX-BUILD.md`](source/LINUX-BUILD.md)). The
+first run asks for your Bloodborne 1.09 dump folder (the one containing
+`eboot.bin`) and remembers it. Config and saves live in `~/.local/share/shadps4/`;
+more detail sits in `README-LINUX.txt` inside the package.
+
+Newest release: [v0.9.61-linux.2](https://github.com/Dr-Bongjoose/bldbrne-vr/releases/tag/v0.9.61-linux.2) —
+each release's notes list the packed binary's sha256.
+
+**Tested on:** CachyOS (Arch-based) · NVIDIA 620.70.06 · SteamVR 2.19.3 · Valve
+Index. Other distros and headsets are untested.
+
+## Controls
+
+These are default **Motion** controls with **Move with: Left stick**, using
+Touch-style button names (X/Y left, A/B right): swing to attack, trigger to
+shoot or parry, lean or duck to dodge physically, **A** to dodge, **B** to
+interact. For your headset's actual bindings, choose **Show VR controls** on
+the in-game VR settings page.
+
+[Full controls and weapon guide](CONTROLS.md) — weapon transformations, bow
+use, paired blades, gestures, gamepad play styles and alternate layouts.
+
+## Windows
+
+This fork is Linux-only. The official Windows installer and portable ZIP —
+with the full Windows documentation (`Bldbrne-VR.exe`, launcher saves, the
+`Simplified Rendering` and save-backup workflow) — live upstream:
+
+[bldbrne-vr/bldbrne-vr releases](https://github.com/bldbrne-vr/bldbrne-vr/releases)
+([portable ZIP](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Portable.zip) ·
+[installer](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Setup.exe))
+
+## Build from source
+
+The full recipe — externals, Clang configuration, OpenXR runtime
+registration, the `--benchmark-headset` smoke test and NVIDIA SteamVR
+stability notes — is [`source/LINUX-BUILD.md`](source/LINUX-BUILD.md). Short
+version (Arch/CachyOS):
 
 ```sh
 sudo pacman -S --needed git cmake clang ninja openxr
@@ -38,223 +93,51 @@ build-clang/shadps4 --benchmark-headset=/tmp/headset.json    # smoke test, exits
 build-clang/shadps4 --openxr /path/to/Bloodborne-1.09-dump   # play
 ```
 
-First build ~35 min; later updates are incremental (~minutes per pass). If SteamVR's
-compositor crashes at the cutscene transition (seen on NVIDIA), apply the GL-surface trims
-from the guide's SteamVR stability notes.
+First build ~35 min; later updates are incremental (~minutes per pass). The
+whole source tree, including the mod's own code, is in [`source/`](source).
 
-## Download
+## What this fork changes
 
-- **[Linux portable (community)](https://github.com/Dr-Bongjoose/bldbrne-vr/releases/latest/download/Bldbrne-VR-linux-portable.tar.gz)** — build of this fork, tested on CachyOS — see the Linux section below
-- [Portable (zip)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Portable.zip) (recommended)
-- [Installer (Windows)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Setup.exe)
+On top of upstream 0.9.61 — the port is documented in
+[the upstream PR](https://github.com/bldbrne-vr/bldbrne-vr/pull/41) and
+[`source/LINUX-BUILD.md`](source/LINUX-BUILD.md):
 
-## Supported game version
+- Native Linux build fixes, all cross-platform safe (Windows never compiles
+  the Linux paths): MSVC-vs-glibc type identity, the dead non-Windows stub in
+  `write_watch.cpp`, X11 atom-macro collisions with engine enum members.
+- [`source/linux-portable/`](source/linux-portable) — the `bbvr.sh` launcher
+  and `make-package.sh` packaging behind the release tarball.
+- [`source/LINUX-BUILD.md`](source/LINUX-BUILD.md) — the build guide.
 
-Bloodborne for PS4, version 1.09. Tested with CUSA03173 and CUSA00900.
+## Game version
 
-## How to use
+Bloodborne for PS4, version 1.09. Tested with CUSA03173 and CUSA00900. No
+game files are included, provided or accepted anywhere in this project.
 
-1. Install the mod (or extract the portable ZIP) and open `Bldbrne-VR.exe`.
-2. Connect your headset and start your VR software.
-3. Choose your **Game folder** — the Bloodborne 1.09 folder containing `eboot.bin`.
-4. **Have an existing save from shadPS4?** Choose its home folder under **Saves folder (optional)**. Otherwise, skip this step: your saves stay with the mod.
-5. Launch the game, put on your headset, and enjoy the hunt!
+## Settings
 
-**No separate shadPS4 is needed.** The mod ships its own VR build of shadPS4 and always uses it; it is updated together with the launcher.
+Linux has no GUI launcher (that is upstream's Windows tooling), so this fork
+does not carry the launcher's options tables — the in-game **VR settings**
+page contains almost all of them, and
+[upstream's README](https://github.com/bldbrne-vr/bldbrne-vr#options)
+documents the launcher itself. Linux specifics (config, saves, trims) are in
+`README-LINUX.txt` inside the release package.
 
-Weaker graphics card, or the game crashes often? Tick **Simplified Rendering** on the Play page (some AMD cards start with it on).
+## Releases
 
-The first start builds the game's shaders before you play (after an update, the VR ones once more); The Old Hunters' are included if you own it. Existing saves are used in place; use **Save backups** in the launcher to back them up before playing.
+- This fork's Linux builds: [fork releases](https://github.com/Dr-Bongjoose/bldbrne-vr/releases) —
+  `Bldbrne-VR-<version>-linux-portable.tar.gz`, sha256 in the notes.
+- Upstream Windows releases and their changelog:
+  [bldbrne-vr/bldbrne-vr releases](https://github.com/bldbrne-vr/bldbrne-vr/releases).
 
-## Controls
+## Credits
 
-These are the default **Motion** controls with **Move with: Left stick**, using Touch-style button names (X/Y left, A/B right). For your headset's bindings, choose **Show VR controls** on the in-game VR page.
-
-### LEFT CONTROLLER
-
-- **Move:** push the stick. **Run:** click it while moving; centre it to stop running.
-- **Jump:** while running forward, press **A** on the right controller or click the left stick again. Steering away from your run direction makes A dodge instead.
-- **Shoot / parry:** aim your gun and press the trigger.
-- **Quick items:** squeeze the grip to open the quick-item fan, move your hand a little toward an item to light it and use the trigger to take or use it; pull the hand away to close. With body slots enabled, grip at a pouch to take its item, or reach over your right shoulder with the left hand and grip for a Blood Vial.
-- **Heal:** press **X**, then bring the vial to your wrist or body. Press X again to put it away. With **Blood Vial: Button**, X heals directly.
-- **Y:** open the quick-item menu. On SteamVR's menu layout, Y opens the game menu instead; hold it to recenter.
-- **Menu:** open the game menu; hold to recenter. On SteamVR, this button opens the dashboard instead.
-
-### RIGHT CONTROLLER
-
-- **Attack:** swing your weapon. **Heavy attack:** hold the trigger to charge, then swing. A short ring tells you a charged attack is ready.
-- **Grip:** transform or prepare a physical weapon action; see the examples below.
-- **Turn:** move the stick left/right. **Target / lock on:** click the stick.
-- **Switch weapons:** hold the stick click and push left/right for that hand's equipped weapons.
-- **Next quick item:** flick the stick down. **Blood bullets:** hold it up.
-- **Dodge:** press **A**, steering with the movement stick. While running forward, A jumps.
-- **Interact:** press **B** to talk, open doors or pick up items.
-- **Roll:** while moving, press **A+B together**, or **B then A in quick succession**, to roll in the movement-stick direction. While locked on, this becomes a quickstep.
-
-### Physical actions
-
-- **Soft dodge:** lean, step or duck to move the hunter out of a blow. A quick lean, or a quick duck of at least 18 cm, also gives a moment of invincibility. This physical evasion does not play a roll animation; the separate lean-to-roll option is off by default.
-- **Switch at the shoulder:** with **Shoulder weapon switch** enabled, tap **B at your right shoulder** or **Y at your left shoulder**. Hold there for about **0.4 seconds** to go unarmed; tap again to draw your weapon back.
-- **Two-hand a weapon:** squeeze the right grip to free your left hand, bring the left hand to the handle, then squeeze the left grip. Release **both grips** to let go. The Whirligig Saw skips the initial right-grip squeeze.
-- **Split Blade of Mercy / Rakuyo:** squeeze the right grip, grip the hilt with your left hand, then pull apart. To rejoin, bring the blades together side by side and squeeze the left grip again.
-- **Physical gestures:** near the Doll, bow, point/wave, or raise a hand for rally/approval. Make Contact is also recognised; see the guide below for its pose and encounter. The corresponding gesture must be learned. Hold **Y**, then press **B** for the normal gesture menu.
-- **Levers:** with **Physical levers** enabled, grip and pull with either hand.
-
-[Full controls and weapon guide](CONTROLS.md) — weapon-specific transformations, bow use, paired blades, gestures and alternate controls.
-
-**Using different controls?** Hold both stick clicks for one second to switch Motion / Buttons. **Move with: Right stick** swaps sticks, stick clicks and face-button actions; triggers, grips and weapon hands stay in place.
-
-### Playing with a gamepad
-
-Choose **Play style: Gamepad, first person** or **Gamepad, third person** on the Play page. You play with the game's own buttons; the options that need tracked hands are set for you and locked, and your motion settings come back when you switch to Motion controls. Your VR controllers keep working alongside.
-
-- **Options:** tap for the game's menu (it also skips cutscenes). Hold 0.7 seconds to recenter; on the flat screen, hold 2.5 seconds to go back to VR.
-- **First person:** the right stick turns you; hold it back to turn around.
-- **Third person:** the right stick moves the camera; hold **L3** and push the right stick up or down to zoom.
-- **VR settings:** the **VR** tile in the game's menu opens them, and they work with the pad: L1/R1 change tabs, L2/R2 change values.
-- Xbox pads show Xbox button icons.
-
-## Options
-
-The launcher's **VR settings** has the same tabs as the in-game VR page, plus Graphics and Extras. Choose **Save settings**, or launch to apply changes. Defaults are for a new setup; settings you changed are kept. **Play style** and **Simplified Rendering** are on the Play page.
-
-<details>
-<summary>You</summary>
-
-| Option | Default | What it does |
-| --- | --- | --- |
-| **Height** | As the hunter | As the hunter: his eye height. As the player: your real height (from the headset's floor). |
-| **Adjust height** | 0 cm | Taller or shorter, from the choice above. Also corrects a floor that is a few cm off. |
-| **World size (eye distance)** | Headset | A smaller eye distance makes the world look larger. |
-| **Hunter's body** | Full | See the hunter's whole body, only his hands and forearms, or only his hands. |
-| **Body near your eyes** | Fade | Full body only: fade his coat where it comes close to your eyes. |
-| **Tracked posture** | Lean | Lean keeps the spine's length as you move your head. |
-| **Skip ladder climbs** | On | Long ladders: the screen goes dark while he climbs to the end. |
-
-</details>
-
-<details>
-<summary>Controls</summary>
-
-| Option | Default | What it does |
-| --- | --- | --- |
-| **Move with** | Left stick | Which thumb walks. Also swaps stick clicks and face-button actions; your right hand still holds the blade. |
-| **Turning** | Snap 30° | Turn in fixed steps (snap) or continuously (smooth). |
-| **Control style** | Motion | Motion: swing to attack. Buttons: the classic layout. |
-| **Stance** | Standing | Seated: smaller swings and throws, the lap counts for the vial. |
-| **Vibration** | 7 / 10 | Strength of every vibration. 0 turns it off. |
-| **Blood Vial** | Stab to inject | Stab the vial into your wrist, or use a button. |
-| **X button** | Fan menu | Fan menu: opens and closes your quick items. Vial: readies a Blood Vial to stab. |
-| **Gun laser** | Off | A thin line from the gun's barrel. |
-| **Grip adjust** | On | Stand still and hold A+B for about 1.2 seconds to set how the weapon sits in your hand. |
-
-</details>
-
-<details>
-<summary>Combat</summary>
-
-| Option | Default | What it does |
-| --- | --- | --- |
-| **Solid weapons** | On | Stop at walls and each other. Weapons only: just each other. |
-| **Blade sounds** | On | Your weapons ring when they meet; draw one along the other to sharpen it. |
-| **Riposte burst** | On | A visceral's rip flashes the view black, red and white with ink outlines, for under a second. |
-| **Ragdoll** | Normal | An enemy your blade kills goes limp at once, thrown by your swing. Off: its death animation. |
-| **Two-handed controls** | Original | Optimized: the stick transforms, the left trigger grabs (hold, or toggle). |
-| **Grip guide** | On | Hold the right grip to show where your left hand can grab. |
-| **Flick to reload** | Wrist flick | After a shot, release the trigger and flick the muzzle up (or down sharply) to reload. |
-| **VR Grab attacks** | Off | Stay in VR during enemy grabs. The view follows the hunter. |
-
-</details>
-
-<details>
-<summary>Items & world</summary>
-
-| Option | Default | What it does |
-| --- | --- | --- |
-| **Item access** | Grip + Body | No Grip: the left grip no longer opens the item menu (grabbing and holding still work). No Body: no body pouches. |
-| **Quick item menu** | Fan A | Fan A (gothic panes) or B (brass): reach toward an item from where the menu opened; pull away to close. Boxes: your fist on an item picks it. |
-| **Shoulder vial** | On | Reach over your right shoulder with the left hand and squeeze the grip to draw a vial. |
-| **Shoulder weapon switch** | On | B at the right shoulder / Y at the left: tap to switch, hold about 0.4 seconds for unarmed. |
-| **VR interactions** | Immersive | Doors and chests open, lamps light and knocks on doors are answered without pulling you out of your eyes. Flat: the hunter's own animations. |
-| **Physical levers** | On | Grip a lever with either hand and pull. |
-| **Lamp rest & travel** | On | Rest, refill and travel between lit lamps. Offline only. Experimental. |
-| **Physical summon bell** | On | First person: B draws the bell; shake it to summon. B again cancels. |
-| **Doll respec** | On | The Doll lets you move points between attributes for free at the same level (minimums 7/8/9/9/5/6). |
-
-</details>
-
-<details>
-<summary>HUD & feedback</summary>
-
-| Option | Default | What it does |
-| --- | --- | --- |
-| **Health & stamina** | Wrist gauge | On your wrist, or in the corner like the game. |
-| **Low-health warning** | On | A heartbeat in both hands and dark edges when your health is low. |
-| **Echoes & Insight** | Look down | Look down: they show when you look down at your feet. |
-| **Hit flash** | On | The edges of your view flash red when you are hit. |
-| **HUD size** | Medium | The size of the health bars, items and prompts. |
-| **Low-health edges** | Medium | A red edge below 30% health; it takes priority over the exhaustion color. |
-| **Exhaustion color** | On | Colors soften briefly at exhausted stamina, then fade back. |
-| **Health bars** | Bosses only | Bosses only: the boss's bar near the top. All: also over enemies you hit. |
-
-</details>
-
-<details>
-<summary>Picture</summary>
-
-| Option | Default | What it does |
-| --- | --- | --- |
-| **Anti-aliasing** | SMAA | Game FXAA, dual-eye SMAA, or None. |
-| **Distant detail** | Performance | Performance uses the game's simpler distant models; Balanced adds detail; Quality keeps full models at a higher cost. |
-| **Contrast / Saturation / Gamma** | 0% | Light and dark separation, color intensity (-100 is monochrome) and midtone brightness. 0 is unchanged. |
-| **Foveated rendering** | Auto | Less detail toward the lens edges for more FPS. |
-| **Water reflections** | On | Off leaves out the scene mirrored in water for more FPS where there is water. |
-| **Far shadows** | Reduced | Reduced skips the farthest shadows for more FPS in big areas. |
-
-</details>
-
-<details>
-<summary>Difficulty</summary>
-
-| Option | Default | What it does |
-| --- | --- | --- |
-| **Extra health** | +10% | More maximum health for the hunter. |
-| **Longer dodge invincibility** | Off | Extra invincibility after a quickstep or roll, in 1/30-second steps. Does not apply to backsteps. |
-| **Light attack stamina** | 80% | Light swing cost. Strong swings cost 100%; low stamina makes them light. |
-| **Damage dealt** | 0% | Your attack damage, from -60% to +30%. |
-
-</details>
-
-<details>
-<summary>Graphics</summary>
-
-| Option | Default | What it does |
-| --- | --- | --- |
-| **Scaling** | 0% (headset resolution) | Resolution relative to what the headset requests. Higher is sharper and costs more. |
-| **Upscaler** | Off | Renders smaller, then reconstructs both eyes: DLSS (NVIDIA RTX), FSR 4, FSR 4.1.2 (AMD RX 6000 and newer) or FSR 3.1.5. Applies at the next start. |
-| **Quality preset** | Balanced | How small it renders before upscaling, from Ultra Performance to Ultra Quality. |
-| **Foveated upscale** | Medium | DLSS or FSR works only the middle of each eye and a lighter pass smooths the edges, for more frames. Off: the whole eye. |
-| **Native stereo eyes** | Auto | Multiview: the driver repeats each draw. Layers: each eye on its own, which fixes a white right eye on AMD RX 6000 cards. Auto picks for your card. |
-
-</details>
-
-<details>
-<summary>Extras</summary>
-
-| Option | Default | What it does |
-| --- | --- | --- |
-| **Camera** | First person | The starting perspective. Third person turns the VR body off. |
-| **Scenes on a screen** | On | Viscerals, grabs, levers and ladders play from the game's camera on a virtual screen. Off: they stay in first person. |
-
-</details>
-
-The in-game VR page also has **Show VR controls**, a picture of what each button does on your controllers or gamepad.
-
----
-
-## Source
-
-A source snapshot is in [source](source).
+Night of the Hunt VR (Bldbrne-VR) is by
+[pkalogiros and bldbrne-vr contributors](https://github.com/bldbrne-vr/bldbrne-vr);
+this fork would not have anything to port without it. Thanks to upstream's
+testers — **Dirol** (dishisolo), **BlizzardNight** and **Chip** — and to
+**[ID-Gamer](https://github.com/ID-Gamer)** for the third-person gamepad
+camera work.
 
 ## Affiliation and rights
 
@@ -265,75 +148,3 @@ Bloodborne and PlayStation are trademarks of Sony Interactive Entertainment. Rig
 No game files are included. You must provide your own lawfully obtained copy of Bloodborne. Please do not request or share game files here.
 
 For software licences, third-party notices and attribution, see [Notices](source/NOTICE.md), [Licence](source/LICENSE) and [Credits](source/CREDITS.md).
-
-## Thanks
-
-Thanks to **Dirol** (dishisolo), **BlizzardNight** and **Chip** for awesome feedback, suggestions and bug reports.
-
-Thanks to **[ID-Gamer](https://github.com/ID-Gamer)** for the third-person gamepad camera work behind the new Gamepad play styles.
-
-## Changelog
-
-### 0.9.61
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.61)
-
-- **The launcher's start-up file is replaced**: Windows Defender began to block it on 18 November in every version from 0.9.3 to 0.9.6. It is the packaging tool's own stub, unchanged since 0.9.3; this version ships it as a new file that Defender passes.
-- If Windows removed the file and the launcher no longer starts, install again from the new installer. Nothing else changes: the game is 0.9.6's.
-
-### 0.9.6
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.6)
-
-- **New graphics**: lanterns, torches and gunshots cast real shadows, fog hangs where it lies and is lit by lamps and the moon, with moonlight in the air, deeper shading, wet streets and reflecting water. The game turns on what your graphics card has room for; cards under 10 GB keep the game's own look.
-- **A film look for everyone**: softer highlights, eyes that adjust to the dark, and cobbles and bricks with real depth.
-- **Dismemberment**: the Beast Claw, the Burial Blade's scythe and a hard enough blow take limbs off.
-- **Viscerals you can feel, cutscenes framed as the game shot them**, and a night that changes under the blood moon.
-- **Faster**, sharper weapons, more reliable Meta Link starts, and many fixes.
-
-### 0.9.5
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.5)
-
-- **The Kos Parasite, reborn**: with the Milkweed rune, lash its tentacles, spit poison and perform the ritual; without it, punch.
-- **Weapons that answer your swing**: Tonitrus calls down lightning, the Moonlight Sword's wave hits what you swing at, split blades hone, the Amygdalan Arm slams, and the bow turns near misses into hits.
-- **Weapon switches that land**: a press at your shoulder counts the moment you reach it, even mid-swing.
-- **Smoother menus and a faster first start**: the game holds your headset's refresh rate, and shader preparation runs about twice as fast.
-- **GPU Tweak III crash fixed**, easier chest grabs, smoother levers and doors, and more fixes.
-
-### 0.9.4
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.4)
-
-- **Play with a gamepad**: a new Play style, first or third person; your motion settings come back when you switch back.
-- **The Beast Cutter swings like a heavy chain**: its reach follows your swing, and it no longer folds into your hand.
-- **Hear the full charge**: the game's own charge sound when a charged attack is ready.
-- **Knock on doors in VR** and **lean out of the way a little easier**.
-- **More frames, fewer hitches**: about 3% faster native stereo, no freeze on arrival, fewer stutters in The Old Hunters, and fixes.
-
-### 0.9.32
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.32)
-
-- **VR menus hold steady on Virtual Desktop**: the settings and lamp menus no longer sway the world with your head.
-- **The Brain of Mensis lever works**: it uses the game's own prompt again.
-- **The Amygdalan Arm snaps back cleaner**: small swings pull it straight back in, no more flailing.
-- **Dodging explained** in the controls guide: lean, step aside or duck under a swing.
-
-### 0.9.31
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.31)
-
-- **Ludwig's arena no longer crashes**: walking into the Ludwig fight could close the game.
-
-### 0.9.3
-
-[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.3)
-
-- **The Amygdalan Arm, alive**: in whip form it lashes out to 3.5 m, grabs and hurls whatever it hits, and stabs straight ahead from a still hand.
-- **Stake Driver, kicked shut**: the charged blast slams the stake back into its normal form, with a second jolt in your hand as it locks.
-- **No more slowdown in long sessions**: the frame rate holds after hours and many areas.
-- **Foveated upscaling on by default**: DLSS or FSR on the middle of each eye, more frames everywhere else.
-- **Doors, chests and lamps in VR, and a Doll respec**: open and light them without leaving your eyes, move your stat points for free at the Doll, ladder skip on by default, a new launcher, and fixes.
-
-Older versions: see the [releases](https://github.com/bldbrne-vr/bldbrne-vr/releases).
