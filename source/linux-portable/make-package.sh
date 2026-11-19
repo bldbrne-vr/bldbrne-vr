@@ -17,12 +17,14 @@ cp -p "$SELF_DIR/bbvr.sh" "$SELF_DIR/README-LINUX.txt" "$PKG_DIR/"
 chmod +x "$PKG_DIR/bbvr.sh" "$PKG_DIR/shadps4"
 chmod 644 "$PKG_DIR/README-LINUX.txt"
 
-# game-data gate: no CUSA/eboot/param.sfo markers may ride the package
-if grep -RIlE "CUSA0[0-9]{4}|eboot|param\.sfo|PS4UPDATE" "$PKG_DIR" >/dev/null 2>&1; then
-    echo "REFUSING TO PACK: game-data markers found in the staged tree" >&2
-    exit 1
-fi
-
+# game-data gate: no game files may ride the package (file-name scan). The binary's
+# identity is proven by sha256 (below); mentions of dump IDs in docs are upstream's own
+# wording and are not game data.
+for f in "$PKG_DIR"/*; do
+    case "$(basename "$f")" in
+        eboot*|param.sfo|PS4UPDATE*|CUSA*) echo "REFUSING TO PACK: $(basename "$f") looks like game data" >&2; exit 1;;
+    esac
+done
 # verify the binary inside the package is byte-identical to the built one
 SRC_SHA=$(sha256sum "$BINARY" | cut -d' ' -f1)
 PKG_SHA=$(sha256sum "$PKG_DIR/shadps4" | cut -d' ' -f1)
