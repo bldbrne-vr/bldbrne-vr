@@ -243,6 +243,17 @@ Thanks to **[ID-Gamer](https://github.com/ID-Gamer)** for the third-person gamep
 
 ## Changelog
 
+### 0.9.7
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.7)
+
+- **The Chikage's scabbard is real**: slide the blade into it at your hip or in your left hand to coat it in blood, then snap it out for a quick draw that dashes forward and cuts hard.
+- **Change graphics while you play**: lamp shadows, lighting, moon glow and parallax switch in the VR menu without a restart.
+- **The Bloodletter is a real flail**: heavy in one hand, your left hand can take its hilt, and you can smash its blood explosion down yourself. You feel the blood pulse as it builds, and the blast hits like a hammer.
+- **Smoother SteamVR**: your weapon hitches far less in your hand, most of all on a Quest through Link.
+- **Fog you can fight through**: shots cut a lane through it and explosions blow it away.
+- **Also**: sharper lamp shadows (Low, Medium, High), quicker lean and duck dodges, whips that cost stamina per lash, mods in the launcher, and a batch of fixes.
+
 ### 0.9.68
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.68)
