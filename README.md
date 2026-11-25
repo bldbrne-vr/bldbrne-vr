@@ -243,6 +243,16 @@ Thanks to **[ID-Gamer](https://github.com/ID-Gamer)** for the third-person gamep
 
 ## Changelog
 
+### 0.9.75
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.75)
+
+- **Your weapons talk**: the first time you take up a trick weapon, a Yharnam voice tells you how to use it in VR.
+- **Left-handed play**: one switch mirrors the whole world, so your main weapon is in your left hand.
+- **Dynamic resolution**: heavy scenes drop a little sharpness instead of frames, then climb back.
+- **Far fewer first-time stutters**: shaders for your settings are prepared at startup, now covering Yahar'gul, Cainhurst, the Nightmares and The Old Hunters.
+- **Also**: hits buzz a little harder when they land, choose how many free vials you get, Tonitrus crackles blue-white, better throws and Bowblade arrows, an easier Chikage scabbard, and a batch of fixes.
+
 ### 0.9.7
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.7)
