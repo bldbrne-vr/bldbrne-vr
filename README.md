@@ -243,6 +243,14 @@ Thanks to **[ID-Gamer](https://github.com/ID-Gamer)** for the third-person gamep
 
 ## Changelog
 
+### 0.9.76
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.76)
+
+- **Left-handed on the Play page**: one tick next to Play style puts your weapon in your left hand.
+- **Clearer settings**: "Game default" now says what it means, like "Game default (Off)".
+- **Fewer floating orbs**: the glowing balls over the Corpse Pile's heaps and in the Research Hall's archway are gone.
+
 ### 0.9.75
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.75)
