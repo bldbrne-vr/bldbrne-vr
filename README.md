@@ -243,6 +243,16 @@ Thanks to **[ID-Gamer](https://github.com/ID-Gamer)** for the third-person gamep
 
 ## Changelog
 
+### 0.9.77
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.77)
+
+- **No hat in your face**: every hat and helmet is hidden in first person, drapes too.
+- **Cleaner sound**: no more crackles and pops when the sound ran dry.
+- **Blacksky Eye aim mark**: a faint mark shows where its meteor will land.
+- **Heavier Tonitrus, easier grabs**: levers, the two-handed grip and fan cards are more forgiving.
+- **Lingering fog and quicker ladders**, plus memory savings and fixes.
+
 ### 0.9.76
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.76)
