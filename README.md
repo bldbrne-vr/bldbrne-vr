@@ -243,6 +243,16 @@ Thanks to **[ID-Gamer](https://github.com/ID-Gamer)** for the third-person gamep
 
 ## Changelog
 
+### 0.9.78
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.78)
+
+- **Hit a lever to work it**: smack or shoot a Chalice Dungeon lever and it moves.
+- **Lock-on follow** (off by default): your view keeps the locked target in front of you.
+- **Honed steel that really shines**: the Blades of Mercy and the Rakuyo polish their own steel.
+- **Foveation changes on the fly**, and no more black corners at the edges of your view.
+- **Quicker ladders and earlier status warnings**, plus memory savings and fixes.
+
 ### 0.9.77
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.77)
