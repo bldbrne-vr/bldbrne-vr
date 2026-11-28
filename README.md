@@ -17,6 +17,8 @@ An unofficial, independent VR mod for Bloodborne. No game files are included.
 - [Portable (zip)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Portable.zip)
 - [Installer (Windows)](https://github.com/bldbrne-vr/bldbrne-vr/releases/latest/download/Bldbrne-VR-win-Setup.exe)
 
+**Antivirus warning on an older version?** Before 0.9.79, Windows Defender and some other antivirus programs flagged the small `Bldbrne-VR.exe` in the install folder as a virus. It was a false alarm: that file is the standard starter from Velopack, the installer we use, but it carried a spare copy of the launcher's pictures, and that made it look suspicious. 0.9.79 fixes it, and updating replaces the old file. Windows Defender reports 0.9.79 as clean; a couple of smaller scanners may still flag the starter until they finish reviewing it.
+
 ## Supported game version
 
 Bloodborne for PS4, version 1.09. Tested with CUSA03173 and CUSA00900.
