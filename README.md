@@ -243,6 +243,13 @@ Thanks to **[ID-Gamer](https://github.com/ID-Gamer)** for the third-person gamep
 
 ## Changelog
 
+### 0.9.79
+
+[Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.79)
+
+- **Antivirus false alarm fixed**: the small Bldbrne-VR.exe starter in the install folder no longer carries a spare copy of the launcher's pictures, which made antivirus programs flag it. Updating replaces it.
+- Everything else is the same as 0.9.78.
+
 ### 0.9.78
 
 [Release notes and downloads](https://github.com/bldbrne-vr/bldbrne-vr/releases/tag/v0.9.78)
