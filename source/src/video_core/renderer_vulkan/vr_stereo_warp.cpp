@@ -1098,8 +1098,22 @@ bool VrStereoWarp::Warp(vk::CommandBuffer cmdbuf, const std::array<const EyeTarg
 
 void VrStereoWarp::EnsureEyeImages(EyeImages& images, vk::Extent2D left, vk::Extent2D right) {
     const std::array<vk::Extent2D, 2> extents{left, right};
+    // Left-handed play (SetEyeFormat): the headset's 8-bit sRGB format, mutable to the UNORM view
+    // every pass uses, its two formats listed so the driver can keep its compression. The lists
+    // are static: the image's stored create info may keep pointing at them.
+    static const std::array<vk::Format, 2> rgba_formats{vk::Format::eR8G8B8A8Srgb,
+                                                        vk::Format::eR8G8B8A8Unorm};
+    static const std::array<vk::Format, 2> bgra_formats{vk::Format::eB8G8R8A8Srgb,
+                                                        vk::Format::eR8G8B8A8Unorm};
+    static const vk::ImageFormatListCreateInfo rgba_list{
+        .viewFormatCount = 2, .pViewFormats = rgba_formats.data()};
+    static const vk::ImageFormatListCreateInfo bgra_list{
+        .viewFormatCount = 2, .pViewFormats = bgra_formats.data()};
+    const bool typed = eye_format == vk::Format::eR8G8B8A8Srgb ||
+                       eye_format == vk::Format::eB8G8R8A8Srgb;
+    const vk::Format want = typed ? eye_format : vk::Format::eR8G8B8A8Unorm;
     for (u32 e = 0; e < 2; ++e) {
-        if (images.image[e] && images.extent[e] == extents[e]) {
+        if (images.image[e] && images.extent[e] == extents[e] && images.format[e] == want) {
             continue;
         }
         if (images.image[e]) {
@@ -1113,12 +1127,19 @@ void VrStereoWarp::EnsureEyeImages(EyeImages& images, vk::Extent2D left, vk::Ext
         images.view[e].reset();
         images.extent[e] = extents[e];
         images.layout[e] = vk::ImageLayout::eUndefined;
+        images.format[e] = want;
         if (extents[e].width == 0 || extents[e].height == 0) {
             continue;
         }
         const vk::ImageCreateInfo image_ci{
+            .pNext = !typed                                   ? nullptr
+                     : want == vk::Format::eB8G8R8A8Srgb ? static_cast<const void*>(&bgra_list)
+                                                          : static_cast<const void*>(&rgba_list),
+            .flags = typed ? vk::ImageCreateFlagBits::eMutableFormat |
+                                 vk::ImageCreateFlagBits::eExtendedUsage
+                           : vk::ImageCreateFlags{},
             .imageType = vk::ImageType::e2D,
-            .format = vk::Format::eR8G8B8A8Unorm,
+            .format = want,
             .extent{
                 .width = extents[e].width,
                 .height = extents[e].height,

@@ -168,6 +168,27 @@ inline std::string ApplyEdits(std::string_view text, const std::vector<Edit>& ed
     return result;
 }
 
+// Every value of `key` in `text`, in the file's order (a hand-edited file can hold a key twice; the
+// loader reads each line in turn).
+inline std::vector<std::string> ValuesOf(std::string_view text, std::string_view key) {
+    std::vector<std::string> result;
+    size_t at = 0;
+    while (at <= text.size()) {
+        size_t end = text.find('\n', at);
+        if (end == std::string_view::npos) {
+            end = text.size();
+        }
+        if (auto kv = ParseLine(text.substr(at, end - at)); kv && kv->key == Trim(key)) {
+            result.push_back(std::move(kv->value));
+        }
+        if (end == text.size()) {
+            break;
+        }
+        at = end + 1;
+    }
+    return result;
+}
+
 // The value of `key` in `text` (the last line wins, as the loader), or nullopt.
 inline std::optional<std::string> ValueOf(std::string_view text, std::string_view key) {
     std::optional<std::string> result;

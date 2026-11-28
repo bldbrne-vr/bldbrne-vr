@@ -61,6 +61,10 @@ bool AsymmetricProjection();
 // False, both the flat camera's, without asymmetric eyes or when the layout is not that.
 bool EyeInverseProjections(const float* cascades336, const VR::CameraRecord&,
                            std::array<std::array<float, 16>, 2>& out);
+// The lamp shadows' edge pass (vr_shadow_edges.h): each eye's inverse projection (ndc x, y, raw
+// depth -> its view) as LightingBuffer last remapped a light pass's camera (the lamp shaders' own
+// matrix, light_shadow.h SceneMaps::EdgePass), outside a mirror's pass. False before the first.
+bool LightInverseProjections(std::array<std::array<float, 16>, 2>& out);
 // The scene projection for one eye. A held Monocular narrows only its optical eye;
 // the headset submission continues to use CameraRecord::eye_fov unchanged.
 VR::Fov SceneEyeFov(const VR::CameraRecord&, u32 eye);

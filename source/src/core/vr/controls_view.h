@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "core/vr/headset_panels.h"
+#include "core/vr/mirror_world.h"
 #include "core/vr/page_pad.h"
 #include "core/vr/thumb_layout.h"
 #include "core/vr/vr_page.h"
@@ -496,6 +497,13 @@ inline Words FallbackWords(const Thumbs::Entry& e) {
     return {t, {}, e.what != nullptr ? std::string{e.what} + "." : std::string{}};
 }
 
+// Left-handed play (Config::layout.mirror): a help text's words about your hands and body ("the
+// left grip at your left hip") for the other side (core/vr/mirror_world.h SideWords). Names of
+// controls never go through it: they come mirrored already. Right-handed: as written.
+inline std::string Sided(const Config& c, std::string_view text) {
+    return c.layout.mirror ? Mirror::SideWords(text) : std::string{text};
+}
+
 // Gameplay words for one entry of the scheme table (VR::Thumbs::Entries ids). `names` names the
 // player's controls (on this family) for the help lines.
 inline Words EntryWords(const Thumbs::Entry& e, const Config& c,
@@ -513,12 +521,12 @@ inline Words EntryWords(const Thumbs::Entry& e, const Config& c,
         if (id == "heavy")
             return {"Heavy / special", "bow string unchanged", "Heavy attack; Bloodletter / Kos special or Whirligig spin. Bow: nock, draw, release."};
         if (id == "transform")
-            return {"Slide right hand", "hold grip; release to catch", "While two-handing, hold to slide the right hand. Stick tap transforms."};
+            return {Sided(c, "Slide right hand"), "hold grip; release to catch", Sided(c, "While two-handing, hold to slide the right hand. Stick tap transforms.")};
         if (id == "take")
-            return {"Slide left hand / items", "hold grip; release to catch", "While two-handing, hold to slide the left hand. Detach with left trigger to use items."};
+            return {Sided(c, "Slide left hand / items"), "hold grip; release to catch", Sided(c, "While two-handing, hold to slide the left hand. Detach with left trigger to use items.")};
     }
     const auto name = [&](Control logical) {
-        return NameOf(parts, Thumbs::Physical(logical, c.layout.swap));
+        return NameOf(parts, Thumbs::Pressed(logical, c.layout.swap, c.layout.mirror));
     };
     if (id == "move") {
         return {"Move", {}, "Walk and run; the hunter keeps facing where you look."};
@@ -594,7 +602,8 @@ inline Words EntryWords(const Thumbs::Entry& e, const Config& c,
         }
         if (c.right_grip_draw) {
             return {"Attack", "with the grip: heavy",
-                    "Weapon drawn (right grip): the next swing is heavy. Else the game's R1."};
+                    Sided(c, "Weapon drawn (right grip): the next swing is heavy. Else the "
+                             "game's R1.")};
         }
         if (c.melee_physical && c.swings) {
             return {"Heavy attack", "hold, then swing",
@@ -605,8 +614,9 @@ inline Words EntryWords(const Thumbs::Entry& e, const Config& c,
     if (id == "transform") {
         if (classic) {
             return {"Transform", {},
-                    "Transforms the weapon (the game's L1). Threaded Cane / Beast Cutter: "
-                    "hold the left grip 0.08 s, then release before changing back."};
+                    Sided(c, "Transforms the weapon (the game's L1). Threaded Cane / Beast "
+                             "Cutter: hold the left grip 0.08 s, then release before changing "
+                             "back.")};
         }
         if (c.right_grip_draw) {
             return {"Draw weapon", "hold: swings attack",
@@ -623,7 +633,7 @@ inline Words EntryWords(const Thumbs::Entry& e, const Config& c,
         if (scheme2) {
             return {"Item arc", "hold: modifier", "Tap: the item arc."}; // + its combos
         }
-        return {"Item arc", {}, "Your quick items above your left hand. Again: close it."};
+        return {"Item arc", {}, Sided(c, "Your quick items above your left hand. Again: close it.")};
     }
     if (id == "arc_tap") {
         if (!c.quick_arc || !c.arc_l3) {
@@ -649,13 +659,14 @@ inline Words EntryWords(const Thumbs::Entry& e, const Config& c,
             return {"Item arc", "on an item: take it",
                     std::string{"Hold: opens your items at your hand. On an item: takes it while "
                                 "squeezed; let go to throw it or put it back."} +
-                        (belt ? " At your left hip: a Blood Vial." : "")};
+                        (belt ? Sided(c, " At your left hip: a Blood Vial.") : std::string{})};
         }
         if (scheme2) {
             const bool belt = c.belt_vial && c.layout.inject;
             return {"Item arc", belt ? "at your hip: Blood Vial" : "again: close it",
-                    belt ? "Opens the item arc at your hand. At your left hip: a Blood Vial."
-                         : "Opens the item arc at your hand; again: closes it."};
+                    belt ? Sided(c, "Opens the item arc at your hand. At your left hip: a Blood "
+                                    "Vial.")
+                         : std::string{"Opens the item arc at your hand; again: closes it."}};
         }
         return {"Take item", "from the arc",
                 "Squeeze on an item to take it; let go mid-swing to throw it."};
@@ -908,9 +919,13 @@ inline Callout GameplayCallout(const DrawnPart& d, int index, const Config& c,
 // The game's own menus (and these VR pages): one layout for every scheme, never swapped (the
 // presenter's menu branch). The help names the other buttons as this family does (Frame's X and
 // Y are its d-pad).
+// (`physical`: the menu layout's control; left-handed play's is the other hand's, MenuCallout.)
 inline Words MenuWords(Control physical, const Config& c, const std::vector<DrawnPart>& parts) {
-    const std::string a = NameOf(parts, Control::A), b = NameOf(parts, Control::B),
-                      y = NameOf(parts, Control::Y);
+    // Left-handed play: the controllers trade hands at the bindings (Thumbs::Mirrored).
+    const auto at = [&](Control menu) {
+        return NameOf(parts, c.layout.mirror ? Thumbs::Mirrored(menu) : menu);
+    };
+    const std::string a = at(Control::A), b = at(Control::B), y = at(Control::Y);
     switch (physical) {
     case Control::A:
         return {"Confirm", "selected option", "Confirms the selected option."};
@@ -959,12 +974,15 @@ inline Words MenuWords(Control physical, const Config& c, const std::vector<Draw
         return {"Next tab", "VR page: next value",
                 "The next tab or page (the game's R1). On the VR page: the highlighted row's next "
                 "value."};
+    // (Left-handed play: the key guide names the other grip, KeyGlyphs::MirroredGlyphs.)
     case Control::GripL:
         return {"\xE2\x96\xA1", "VR page: previous tab",
-                "The game's \xE2\x96\xA1 (LG in its key guide). On the VR page: the previous tab."};
+                std::string{"The game's \xE2\x96\xA1 ("} + (c.layout.mirror ? "RG" : "LG") +
+                    " in its key guide). On the VR page: the previous tab."};
     case Control::GripR:
         return {"\xE2\x96\xB3", "VR page: next tab",
-                "The game's \xE2\x96\xB3 (RG in its key guide). On the VR page: the next tab."};
+                std::string{"The game's \xE2\x96\xB3 ("} + (c.layout.mirror ? "LG" : "RG") +
+                    " in its key guide). On the VR page: the next tab."};
     case Control::Menu:
         if (c.layout.menu_runtime) {
             return {"Runtime menu", "its dashboard",
@@ -998,7 +1016,9 @@ inline Callout MenuCallout(const DrawnPart& d, int index, const Config& c,
                 out.controls.end()) {
                 out.controls.push_back(b.control);
             }
-            const Words w = MenuWords(b.control, c, parts);
+            // (Left-handed play: this control does the other hand's menu job.)
+            const Words w = MenuWords(c.layout.mirror ? Thumbs::Mirrored(b.control) : b.control,
+                                      c, parts);
             if (w.title.empty()) {
                 continue;
             }
@@ -1038,7 +1058,9 @@ inline std::vector<Callout> GestureCallouts(const Config& c, const std::vector<D
     std::vector<Callout> g;
     const bool motion = !c.layout.classic;
     const bool scheme2 = motion && c.layout.left_scheme == 2;
-    const auto phys = [&](Control logical) { return Thumbs::Physical(logical, c.layout.swap); };
+    const auto phys = [&](Control logical) {
+        return Thumbs::Pressed(logical, c.layout.swap, c.layout.mirror);
+    };
     const auto name = [&](Control logical) { return NameOf(parts, phys(logical)); };
     if (motion && c.swings) {
         Callout s;
@@ -1048,12 +1070,12 @@ inline std::vector<Callout> GestureCallouts(const Config& c, const std::vector<D
             s.help = "No button: a fast swing is light; wound up through a big arc it is heavy.";
         } else {
             s.sub = "one swing, one attack";
-            s.help = "Each swing of the right controller is one attack (melee=vanilla).";
+            s.help = Sided(c, "Each swing of the right controller is one attack (melee=vanilla).");
         }
         if (c.right_grip_draw) {
-            s.sub = "with the right grip held";
+            s.sub = Sided(c, "with the right grip held");
         }
-        s.controls = {Control::TriggerR};
+        s.controls = {phys(Control::TriggerR)};
         s.picto = Picto::Swing;
         s.motion = Motion::RightSwing;
         g.push_back(s);
@@ -1063,7 +1085,7 @@ inline std::vector<Callout> GestureCallouts(const Config& c, const std::vector<D
         s.title = "Aim the gun";
         s.sub = "it fires along its barrel";
         s.help = "The shot leaves along the gun's barrel at the pull, not where you face.";
-        s.controls = {Control::TriggerL};
+        s.controls = {phys(Control::TriggerL)};
         s.picto = Picto::Gun;
         g.push_back(s);
     }
@@ -1072,14 +1094,14 @@ inline std::vector<Callout> GestureCallouts(const Config& c, const std::vector<D
     // arms it as before, the pouch and the shoulder still draw one.
     const bool vial_by_grip = scheme2 && c.quick_arc && c.layout.inject;
     const bool x_arc = vial_by_grip && c.x_fan;
-    if (motion && c.layout.inject && x_arc && IsBound(parts, Control::GripL)) {
+    if (motion && c.layout.inject && x_arc && IsBound(parts, phys(Control::GripL))) {
         Callout s;
         s.title = "Blood Vial";
-        s.sub = "left grip at your belt or shoulder";
-        s.help = std::string{"Squeeze the left grip at your vial pouch or over your right shoulder, "
-                             "then stab your wrist, chest, belly or thigh"} +
+        s.sub = Sided(c, "left grip at your belt or shoulder");
+        s.help = Sided(c, "Squeeze the left grip at your vial pouch or over your right shoulder, "
+                          "then stab your wrist, chest, belly or thigh") +
                  (c.seated ? " or lap" : "") + " to inject it.";
-        s.controls = {Control::GripL};
+        s.controls = {phys(Control::GripL)};
         s.picto = Picto::Vial;
         g.push_back(s);
     } else if (motion && c.layout.inject && !x_arc && IsBound(parts, phys(Control::X))) {
@@ -1088,28 +1110,29 @@ inline std::vector<Callout> GestureCallouts(const Config& c, const std::vector<D
         s.sub = name(Control::X) + ", then stab";
         s.help = std::string{"With a vial armed, stab your wrist, chest, belly or thigh"} +
                  (c.seated ? " or lap" : "") + " to inject it." +
-                 (vial_by_grip ? " The left grip at your vial pouch or over your right shoulder "
-                                 "draws one too."
-                               : "");
+                 (vial_by_grip ? Sided(c, " The left grip at your vial pouch or over your right "
+                                          "shoulder draws one too.")
+                               : std::string{});
         s.controls = {phys(Control::X)};
         s.picto = Picto::Vial;
         g.push_back(s);
     }
     if (motion && c.quick_arc &&
-        IsBound(parts, scheme2 ? Control::GripL : phys(Control::Y))) {
+        IsBound(parts, scheme2 ? phys(Control::GripL) : phys(Control::Y))) {
         Callout a;
         a.title = "Item arc";
         if (scheme2 && c.grip_hold) {
-            a.sub = NameOf(parts, Control::GripL) + ", reach, squeeze";
-            a.help = "Hold the left grip" +
+            a.sub = name(Control::GripL) + ", reach, squeeze";
+            a.help = Sided(c, "Hold the left grip") +
                      (x_arc ? " (or press " + name(Control::X) + ")" : std::string{}) +
                      " to open your items at your hand; squeeze it on an item to take it, the "
                      "trigger uses it.";
-            a.controls = {Control::GripL};
+            a.controls = {phys(Control::GripL)};
         } else if (scheme2) {
-            a.sub = NameOf(parts, Control::GripL) + ", reach, trigger";
-            a.help = "The left grip opens your items at your hand; the trigger on an item takes it.";
-            a.controls = {Control::GripL};
+            a.sub = name(Control::GripL) + ", reach, trigger";
+            a.help = Sided(c, "The left grip opens your items at your hand; the trigger on an "
+                              "item takes it.");
+            a.controls = {phys(Control::GripL)};
         } else {
             const std::string y = name(Control::Y);
             a.sub = y + (y.size() <= 6 ? ", then reach an item" : ", reach an item");
@@ -1125,19 +1148,19 @@ inline std::vector<Callout> GestureCallouts(const Config& c, const std::vector<D
         t.sub = by_trigger ? "swing, let go of the trigger" : "swing, let go of the grip";
         t.help = by_trigger ? "Hold the item with the trigger, swing, and let go of it to throw."
                             : "Hold the item with the grip, swing, and let go of it to throw.";
-        t.controls = {by_trigger ? Control::TriggerL : Control::GripL};
+        t.controls = {phys(by_trigger ? Control::TriggerL : Control::GripL)};
         t.picto = Picto::Throw;
         t.motion = Motion::LeftThrow;
         g.push_back(t);
     }
     if (scheme2 && c.belt_vial && c.layout.inject && !vial_by_grip &&
-        IsBound(parts, Control::GripL)) {
+        IsBound(parts, phys(Control::GripL))) {
         Callout b;
         b.title = "Belt vial";
-        b.sub = "left grip at your hip";
-        b.help = std::string{"Squeeze the left grip at your left hip"} +
+        b.sub = Sided(c, "left grip at your hip");
+        b.help = Sided(c, "Squeeze the left grip at your left hip") +
                  (c.seated ? " (beside the lap)" : "") + " to draw a Blood Vial.";
-        b.controls = {Control::GripL};
+        b.controls = {phys(Control::GripL)};
         b.picto = Picto::Belt;
         g.push_back(b);
     }
@@ -1192,24 +1215,24 @@ inline std::vector<Callout> Build(Tab tab, const Config& c, const std::vector<Dr
     }
     if (tab == Tab::Gameplay && !c.layout.classic && c.swings) {
         Callout s;
-        s.right = true;
+        s.right = !c.layout.mirror; // the weapon hand's column (left-handed: your left)
         s.title = "Swing: attack";
         s.sub = c.right_grip_draw  ? "with the grip held"
                 : c.melee_physical ? "no button needed"
                                    : "one swing, one blow";
         s.help = c.melee_physical
                      ? "Swing the blade: fast is light, wound up through a big arc is heavy."
-                     : "Each swing of the right controller is one attack.";
+                     : Sided(c, "Each swing of the right controller is one attack.");
         s.picto = Picto::Swing;
         s.motion = Motion::RightSwing;
         out.push_back(s);
     }
     if (tab == Tab::Menus) {
         Callout p;
-        p.right = true;
+        p.right = !c.layout.mirror; // the pointing hand's column (left-handed: your left)
         p.title = "Point";
         p.sub = "trigger clicks on VR pages";
-        p.help = "On these VR pages the right controller points; its trigger clicks.";
+        p.help = Sided(c, "On these VR pages the right controller points; its trigger clicks.");
         p.picto = Picto::Pointer;
         out.push_back(p);
     }
@@ -1428,8 +1451,9 @@ public:
         Rebuild();
         focus = callouts.empty() ? -1 : 0;
         prev = now;
-        prev_swing = now.right_speed >= SwingLightSpeed;
-        prev_throw = now.left_speed >= SwingLightSpeed;
+        // (Left-handed play: your left hand swings the weapon, your right one throws.)
+        prev_swing = (c.layout.mirror ? now.left_speed : now.right_speed) >= SwingLightSpeed;
+        prev_throw = (c.layout.mirror ? now.right_speed : now.left_speed) >= SwingLightSpeed;
         dirty = true;
     }
 
@@ -1530,8 +1554,10 @@ public:
                 }
             }
         }
-        const bool swing = in.right_speed >= SwingLightSpeed;
-        const bool thrown = in.left_speed >= SwingLightSpeed;
+        // (Left-handed play: your left hand swings the weapon, your right one throws.)
+        const bool mirror = config.layout.mirror;
+        const bool swing = (mirror ? in.left_speed : in.right_speed) >= SwingLightSpeed;
+        const bool thrown = (mirror ? in.right_speed : in.left_speed) >= SwingLightSpeed;
         // A swing lasts a fifth of a second: it stays lit a moment after, to be seen.
         swing_lit = swing ? MotionLightHold : std::max(0.0f, swing_lit - in.dt);
         throw_lit = thrown ? MotionLightHold : std::max(0.0f, throw_lit - in.dt);

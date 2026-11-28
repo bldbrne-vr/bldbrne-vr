@@ -17,9 +17,10 @@
 // spills warm onto the walls round it, a red carpet tints the stones beside it.
 namespace Shader::Optimization::BounceLight {
 
-// Startup policy (vr.ini bounce_light, VR_BOUNCE_LIGHT=0|1 overrides it): with an upscaler only.
-inline bool Enabled(bool vr, bool setting, bool upscaler, const char* override_value) {
-    return override_value ? override_value[0] != '0' : vr && setting && upscaler;
+// Startup policy (vr.ini bounce_light, VR_BOUNCE_LIGHT=0|1 overrides it): with an upscaler or
+// without (light_shadow.h Enabled).
+inline bool Enabled(bool vr, bool setting, const char* override_value) {
+    return override_value ? override_value[0] != '0' : vr && setting;
 }
 
 // The game's light composite program (the flag is set only for it; the pass checks its shape).

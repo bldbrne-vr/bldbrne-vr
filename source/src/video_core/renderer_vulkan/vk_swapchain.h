@@ -22,11 +22,8 @@ public:
     explicit Swapchain(const Instance& instance, const Frontend::WindowSDL& window);
     ~Swapchain();
 
-    /// Creates (or recreates) the swapchain with a given size.
-    void Create(u32 width, u32 height);
-
-    /// Recreates the swapchain with a given size and current surface.
-    void Recreate(u32 width, u32 height);
+    /// Rebuild using the latest drawable size. Call without holding a queue mutex.
+    void Recreate();
 
     /// Acquires the next image in the swapchain.
     bool AcquireNextImage();

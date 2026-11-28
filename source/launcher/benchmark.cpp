@@ -843,25 +843,57 @@ Json ToJson(const Result &r) {
             {"reason", r.reason},
             {"repeats", samples}};
 }
+std::vector<VR::Ini::Edit> SettingEdits(const Candidate &candidate, int target_hz) {
+    // The model is the preset's (candidate.model only names it): never pin one in vr.ini. The
+    // anti-aliasing and DIBR's eye TAA are the player's (PictureSettings: the scan measured theirs).
+    std::vector<VR::Ini::Edit> edits{{"graphics_config", GraphicsText(candidate.graphics)},
+                                     {"dlss_model", "builtin"},
+                                     {"refresh_hz", std::to_string(target_hz)}};
+    if (FoveatedUpscaleAvailable(candidate.graphics, candidate.stereo))
+        edits.push_back({"upscale_focus", std::to_string(candidate.upscale_focus)});
+    return edits;
+}
+PictureLines PictureSettings(const std::string &ini) {
+    static const std::vector<std::string> keys = [] {
+        // The scan's own: what it picks, and what it holds still to measure (a fixed size, its
+        // uncapped frame rate, the player's frame timing set apart).
+        constexpr std::string_view scan_owned[]{"graphics_config", "upscale_focus",
+                                                "dynamic_resolution", "dlss_model", "refresh_hz",
+                                                "frame_cap", "game_fps", "frame_hooks"};
+        // No row: the lamps' glow in the air and the moon glow's steps (the card's new graphics,
+        // core/vr/card_tier.h), and DIBR's eye TAA (a scan's Apply wrote it until 0.9.76).
+        std::vector<std::string> out{"fog_light", "moon_shafts_quality", "dibr_eye_taa"};
+        for (const auto &row : Settings()) {
+            const std::string_view tab = row.category;
+            if (tab != "Picture" && tab != "Graphics")
+                continue;
+            for (const auto &key : row.keys)
+                if (std::find(std::begin(scan_owned), std::end(scan_owned), key) ==
+                        std::end(scan_owned) &&
+                    std::find(out.begin(), out.end(), key) == out.end())
+                    out.push_back(key);
+        }
+        return out;
+    }();
+    PictureLines out;
+    for (const auto &key : keys)
+        if (auto value = VR::Ini::ValueOf(ini, key))
+            out.emplace_back(key, std::move(*value));
+    return out;
+}
+Profile AppliedProfile(Profile profile, const Candidate &candidate, int target_hz) {
+    profile.stereo =
+        candidate.stereo == StereoPreset::Native ? StereoChoice::Native : StereoChoice::Dibr;
+    profile.refresh_hz = target_hz;
+    profile.follow_headset = false; // Pin the recommendation to the measured target.
+    return profile;
+}
 Profile ApplySettings(const Paths &paths, const Profile &profile, const Candidate &candidate,
                       int target_hz, const std::string &expected_ini) {
     if (!ValidGameRefreshHz(target_hz))
         throw std::runtime_error("Invalid recommended refresh rate.");
-    // The model is the preset's (candidate.model only names it): never pin one in vr.ini.
-    std::vector<VR::Ini::Edit> edits{{"graphics_config", GraphicsText(candidate.graphics)},
-                                     {"dlss_model", "builtin"},
-                                     {"aa_mode", "smaa"},
-                                     {"refresh_hz", std::to_string(target_hz)}};
-    if (FoveatedUpscaleAvailable(candidate.graphics, candidate.stereo))
-        edits.push_back({"upscale_focus", std::to_string(candidate.upscale_focus)});
-    if (candidate.stereo == StereoPreset::Dibr)
-        edits.push_back({"dibr_eye_taa", "0.25"});
-    const auto next_ini = VR::Ini::ApplyEdits(expected_ini, edits);
-    auto next = profile;
-    next.stereo =
-        candidate.stereo == StereoPreset::Native ? StereoChoice::Native : StereoChoice::Dibr;
-    next.refresh_hz = target_hz;
-    next.follow_headset = false; // Pin the recommendation to the measured target.
+    const auto next_ini = VR::Ini::ApplyEdits(expected_ini, SettingEdits(candidate, target_hz));
+    const auto next = AppliedProfile(profile, candidate, target_hz);
     const auto previous_profile = Read(paths.Profile());
     next.Save(paths);
     const auto applied_profile = Read(paths.Profile());
@@ -873,6 +905,84 @@ Profile ApplySettings(const Paths &paths, const Profile &profile, const Candidat
         throw;
     }
     return next;
+}
+// A key's value in the game: vr.ini's line, else the game's default (CodeDefault; for the DLSS
+// model, the preset's own: core/vr/dlss_model.h); nullopt when neither is known.
+static std::optional<std::string> InGame(const std::string &ini, const std::string &key) {
+    if (auto value = VR::Ini::ValueOf(ini, key))
+        return value;
+    return key == "dlss_model" ? std::optional<std::string>("builtin") : CodeDefault(key);
+}
+bool SettingsInUse(const Profile &profile, const std::string &ini, const Candidate &candidate,
+                   int target_hz) {
+    const auto next = AppliedProfile(profile, candidate, target_hz);
+    if (next.stereo != profile.stereo || next.refresh_hz != profile.refresh_hz ||
+        next.follow_headset != profile.follow_headset)
+        return false;
+    for (const auto &edit : SettingEdits(candidate, target_hz)) {
+        if (edit.key == "graphics_config") {
+            // As the game reads it: a line it refuses, or none, is its default.
+            if (ParseGraphics(VR::Ini::ValueOf(ini, edit.key)) != candidate.graphics)
+                return false;
+            continue;
+        }
+        const auto now = InGame(ini, edit.key);
+        if (!now || !SameValue(*now, *edit.value))
+            return false;
+    }
+    return true;
+}
+// The upscaler and its preset as the Graphics tab names them ("DLSS Quality"); "Off" without one.
+static std::string UpscalerText(const GraphicsFields &f) {
+    const char *name = f[2] == 1 ? "DLSS" : f[2] == 2 ? "FSR 4" : f[2] == 3 ? "FSR 3.1.5"
+                     : f[2] == 4 ? "FSR 4.1.2" : nullptr;
+    return name ? std::string(name) + " " + PresetName(f[f[2] == 1 ? 3 : 4]) : "Off";
+}
+static std::string StereoText(StereoChoice choice) {
+    return choice == StereoChoice::Auto ? "Auto"
+           : StereoLabel(choice == StereoChoice::Dibr ? StereoPreset::Dibr : StereoPreset::Native);
+}
+static std::string FrameCapText(const Profile &profile) {
+    return profile.follow_headset ? "Follow headset" : std::to_string(profile.refresh_hz) + " FPS";
+}
+// What the launcher's choice row for `key` shows for a value: the label of the option it picks
+// ("Medium"), else the value itself.
+static std::string ShownChoice(const std::string &key, const std::optional<std::string> &value) {
+    if (!value)
+        return "Game default";
+    for (const auto &row : Settings())
+        if (row.keys.size() == 1 && row.keys[0] == key)
+            for (const auto &option : row.options)
+                if (SameValue(*value, option.values[0]))
+                    return option.label;
+    return *value;
+}
+std::vector<AppliedSetting> AppliedSettings(const Profile &before, const std::string &before_ini,
+                                            const Candidate &candidate, int target_hz) {
+    std::vector<AppliedSetting> out;
+    const auto add = [&](const char *name, std::string value, std::string was) {
+        out.push_back({name, value, was == value ? std::string{} : std::move(was)});
+    };
+    const auto after = AppliedProfile(before, candidate, target_hz);
+    add("Stereo rendering", StereoText(after.stereo), StereoText(before.stereo));
+    const auto &now = candidate.graphics;
+    const auto was = ParseGraphics(VR::Ini::ValueOf(before_ini, "graphics_config"));
+    add("Upscaler", UpscalerText(now), UpscalerText(was));
+    add("Output scale", std::to_string(100 + now[1]) + "%", std::to_string(100 + was[1]) + "%");
+    const auto dlss5 = [](const GraphicsFields &f) { return f[2] == 1 && f[5]; };
+    if (dlss5(now) || dlss5(was))
+        add("DLSS 5", dlss5(now) ? "On" : "Off", dlss5(was) ? "On" : "Off");
+    for (const auto &edit : SettingEdits(candidate, target_hz)) {
+        const auto old = InGame(before_ini, edit.key);
+        if (edit.key == "upscale_focus")
+            add("Foveated upscale", ShownChoice(edit.key, edit.value),
+                ShownChoice(edit.key, old));
+        // The preset's own model, named only when a pinned one is replaced.
+        else if (edit.key == "dlss_model" && old && !SameValue(*old, *edit.value))
+            add("DLSS model", "The preset's own", *old);
+    }
+    add("Game frame-rate cap", FrameCapText(after), FrameCapText(before));
+    return out;
 }
 std::string UncapPatch(const std::string &xml) { return PatchFrameRate(xml, 360); }
 

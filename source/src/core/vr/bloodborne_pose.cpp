@@ -165,8 +165,12 @@ struct ForcedFlag {
 std::vector<ForcedFlag> g_forced;
 bool g_forced_read = false;
 // VR_SET_FLAGS_DIE=1 (tests only): the hunter dies 3 s after the flags first hold, so the map
-// reloads with them (the time of day is read at a load).
+// reloads with them (the time of day is read at a load). =<seconds> (more than 3): that long after
+// they hold, after a warp as well: a warp to a lamp, then a death there (2026-11-21: a death
+// reloads none of its own area's files, so the Fog row's switch waits for another area).
 bool g_forced_die = false;
+s64 g_forced_die_ns = 3'000'000'000;
+bool g_die_after_warp = false;
 // VR_SET_FLAGS_WARP=<return point> (tests only): instead of a death, the lamp travel's own two calls
 // (the respawn setter, then warp effect 2101) once the flags hold 3 s. A list ("<a>,<b>,...") is a
 // tour: each next warp VR_SET_FLAGS_WARP_EVERY seconds (default 45) after the hunter is in the
@@ -228,6 +232,10 @@ void ForceFlags(u8* player) {
             p = end[2] == ',' ? end + 3 : end + 2;
         }
         g_forced_die = std::getenv("VR_SET_FLAGS_DIE") != nullptr;
+        if (const char* die = std::getenv("VR_SET_FLAGS_DIE"); die != nullptr && std::atoll(die) > 3) {
+            g_forced_die_ns = std::atoll(die) * 1'000'000'000LL;
+            g_die_after_warp = true;
+        }
         if (const char* warp = std::getenv("VR_SET_FLAGS_WARP"); warp != nullptr) {
             for (const char* p = warp; *p != 0;) {
                 char* end = nullptr;
@@ -304,11 +312,11 @@ void ForceFlags(u8* player) {
         ++g_warp_next;
         g_forced_warp = g_warp_tour.size() > 1 ? g_warp_tour[g_warp_next % g_warp_tour.size()] : -1;
         g_forced_held_ns = 0;
-        g_forced_die = false;
+        g_forced_die = g_forced_die && g_die_after_warp;
         return;
     }
     u8* const data = Module(player, L::OffsetDataModule);
-    if (g_forced_die && now - g_forced_held_ns > 3'000'000'000 && data != nullptr &&
+    if (g_forced_die && now - g_forced_held_ns > g_forced_die_ns && data != nullptr &&
         Read<s32>(data + OffsetHp) > 0) {
         const s32 zero = 0;
         std::memcpy(data + OffsetHp, &zero, sizeof(zero)); // test only

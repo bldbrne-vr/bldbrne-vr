@@ -47,6 +47,7 @@ enum class BufferType : u32 {
     VrAirProbe,       // the moon's colour, summed by the light composite (host-visible)
     VrFogGrid,        // the fog grid's cells, both eyes' (ir/passes/fog_grid.h; vr_fog_grid.h):
                       // written by a dispatch of our own, read by the scene's copy
+    VrShadowEdges,    // the edge pass's two bits a lamp a pixel (light_shadow.h EdgePass)
 };
 
 // VR host images (vr_host_image.cpp): an image a shader reads that is none of its draw's own, a

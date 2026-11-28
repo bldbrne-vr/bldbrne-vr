@@ -88,4 +88,10 @@ struct Shine {
 };
 bool GetShine(u64 key, Shine& out);
 
+// The Chikage's scabbard as a model for the in-frame renderer (core/vr/chikage.h: the game does
+// not draw it in first person): VR::Assets::GetModel's id, 0 until the worker has built it from
+// the weapon's own file, or when it could not. A later equip can retry.
+void AskScabbard();
+s32 ScabbardModel();
+
 } // namespace VR::Bloodborne::WeaponShape

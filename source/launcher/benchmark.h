@@ -114,6 +114,23 @@ Json ToJson(const Result &result);
 // Persist only the measured graphics choice; return the new profile after both writes succeed.
 Profile ApplySettings(const Paths &paths, const Profile &profile, const Candidate &candidate,
                       int target_hz, const std::string &expected_ini);
+// The vr.ini lines ApplySettings writes for a candidate (its upscaler, preset and output scale,
+// Foveated upscale, the frame-rate cap; never the picture settings, PictureSettings), and the
+// profile it saves (the candidate's stereo, its target as a fixed frame-rate cap).
+std::vector<VR::Ini::Edit> SettingEdits(const Candidate &candidate, int target_hz);
+Profile AppliedProfile(Profile profile, const Candidate &candidate, int target_hz);
+// Whether the saved settings already do what ApplySettings would set (a line vr.ini lacks counts
+// as the game's default): Apply would change nothing, so the scan window shows the suggestion as
+// in use (2026-11-25, the user: after Apply the window only asked to apply again).
+bool SettingsInUse(const Profile &profile, const std::string &ini, const Candidate &candidate,
+                   int target_hz);
+// The settings Apply sets, named as the launcher names them ("Foveated upscale", "Medium"), each
+// with its value in `before` and `before_ini` when that differs (empty: the same).
+struct AppliedSetting {
+    std::string name, value, before;
+};
+std::vector<AppliedSetting> AppliedSettings(const Profile &before, const std::string &before_ini,
+                                            const Candidate &candidate, int target_hz);
 std::string UncapPatch(const std::string &xml);
 std::string FileHash(const fs::path &path);
 // Only explicit, hash-verified savedata files are copied. No user's live home
@@ -134,8 +151,19 @@ struct Request {
     unsigned display_hz = 0; // Auto: target rate. Research overrides do not cap game rendering.
     std::vector<std::string> candidate_ids; // Optional explicit subset for automated validation.
 };
+// The player's own picture settings, the vr.ini lines that hold them (a line the file lacks is the
+// game's default, for this card where it goes by the card): every key of the Picture tab's rows (anti-
+// aliasing, distant detail, color, foveation, shadows, the new graphics, the film look), of the
+// launcher's Graphics rows but the scan's own (Foveated upscale, Dynamic Resolution), and the ones
+// without a row (the lamps' glow, the moon glow's steps, DIBR's eye TAA). A scan measures with them (2026-11-25, the user: "for smaller settings like shadows, ao, etc -
+// we should use what the launcher already has. Only for resolution and choice of upscaler we should
+// let the scan set it"): it picks the stereo, the upscaler and its preset, the output scale and
+// Foveated upscale, for the picture the player plays.
+using PictureLines = std::vector<std::pair<std::string, std::string>>;
+PictureLines PictureSettings(const std::string &ini);
 struct Report {
     int target_hz = 90;
+    PictureLines picture; // what it measured with (PictureSettings)
     fs::path folder;
     std::vector<Result> results;
     std::optional<size_t> recommended;

@@ -291,9 +291,10 @@ Hover HitTest(const std::vector<HitBox>& boxes, float x, float y) {
 // label and gilt hairlines above and below it, all fading out toward their ends (the settings
 // page's row glow sits in its label column, away from a centred word, and read as faint: the
 // user, 2026-10-14). `alpha` scales it (the page itself, then a lighter copy on the glow).
-void SelectionBand(Canvas& c, float cx_stage, float cy_stage, float half_w_stage, float alpha) {
+void SelectionBand(Canvas& c, float cx_stage, float cy_stage, float half_w_stage, float alpha,
+                   float half_height = 17.0f) {
     const float cx = Canvas::ToX(cx_stage), cy = Canvas::ToY(cy_stage);
-    const float hw = half_w_stage * PageScale, hh = 17.0f * PageScale;
+    const float hw = half_w_stage * PageScale, hh = half_height * PageScale;
     const int X0 = static_cast<int>(std::floor(cx - hw)), X1 = static_cast<int>(std::ceil(cx + hw));
     const int Y0 = static_cast<int>(std::floor(cy - hh - 2)),
               Y1 = static_cast<int>(std::ceil(cy + hh + 2));
@@ -422,14 +423,22 @@ bool Render(const Assets& assets, const View& v, Image& page_out, Image& glow_ou
                 // little dimmer, so which one is active reads at a glance.
                 const bool on = r.selected && r.enabled;
                 const float text_w = std::min(width, room) * size / 24.f;
-                const float cy = oy + LabelDy - 8.0f;
+                const bool has_detail = !r.value.empty();
+                const float cy = has_detail ? oy + 28.0f : oy + LabelDy - 8.0f;
                 if (on) {
-                    SelectionBand(page, PanelCentreX, cy, 0.5f * text_w + 140.0f, 1.0f);
-                    SelectionBand(glow, PanelCentreX, cy, 0.5f * text_w + 140.0f, 0.5f);
+                    const float half_width = 0.5f * text_w + 140.0f;
+                    const float half_height = has_detail ? 23.0f : 17.0f;
+                    SelectionBand(page, PanelCentreX, cy, half_width, 1.0f, half_height);
+                    SelectionBand(glow, PanelCentreX, cy, half_width, 0.5f, half_height);
                 }
                 constexpr Rgb Unselected{176.0f / 255, 176.0f / 255, 172.0f / 255};
-                DrawText(page, font, r.label, PanelCentreX, oy + LabelDy, Align::Centre,
+                const float label_y = oy + (has_detail ? 27.0f : LabelDy);
+                DrawText(page, font, r.label, PanelCentreX, label_y, Align::Centre,
                          !r.enabled ? TabDim : on ? Gilt : Unselected, 1.f, size);
+                if (has_detail) {
+                    DrawText(page, font, r.value, PanelCentreX, oy + 46.0f, Align::Centre,
+                             r.enabled ? Unselected : TabDim, 1.0f, 18.0f);
+                }
                 continue;
             }
             DrawText(page, font, r.label, PanelCentreX, oy + LabelDy, Align::Centre, ink, 1.f,

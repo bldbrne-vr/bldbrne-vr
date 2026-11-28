@@ -139,8 +139,19 @@ struct DeathAnim {
     float ragdoll_at_s{0.0f}; // where the game would have switched to the ragdoll
 };
 
+// The chr whose TAE a chr plays. c2631 and c2632 have none of their own (their anibnd holds a
+// skeleton and a000_000000 only; each has its own ragdoll in its chrbnd) and run c2630's: NpcParam
+// 263000 / 263080 on c2632 in the headset logs, every kill of one "none of its deaths ends in the
+// ragdoll" until 2026-11-20 (the tester: "when I kill an enemy their default animation plays"). The
+// other chrs without a TAE (c2711/c2712, c3111, c4071, c4542, c5111 ...) borrow from chrs whose
+// deaths all end animated: the same verdict either way, so they are not listed.
+inline std::int32_t DeathTableChr(std::int32_t chr_id) {
+    return chr_id == 2631 || chr_id == 2632 ? 2630 : chr_id;
+}
+
 // One table lookup: `id` is the full TimeAct id.
 inline bool FindDeath(std::int32_t chr_id, std::int32_t id, DeathAnim& out) {
+    chr_id = DeathTableChr(chr_id);
     const std::uint64_t key =
         static_cast<std::uint64_t>(chr_id) * DeathKeyChr + static_cast<std::uint64_t>(id);
     const auto it =
@@ -181,7 +192,7 @@ inline bool ChrCanRagdoll(std::int32_t chr_id) {
     if (chr_id <= 0 || chr_id > 9999) {
         return false;
     }
-    const std::uint64_t lo = static_cast<std::uint64_t>(chr_id) * DeathKeyChr;
+    const std::uint64_t lo = static_cast<std::uint64_t>(DeathTableChr(chr_id)) * DeathKeyChr;
     const auto it =
         std::lower_bound(RagdollDeaths.begin(), RagdollDeaths.end(), lo,
                          [](const RagdollDeath& d, std::uint64_t k) { return d.key < k; });

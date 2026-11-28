@@ -355,6 +355,39 @@ void AccurateTimer::End() {
         target_interval - std::chrono::duration_cast<std::chrono::nanoseconds>(now - start_time);
 }
 
+void PreciseSleepUntil(std::chrono::steady_clock::time_point deadline,
+                       std::chrono::nanoseconds spin) {
+#ifdef _WIN32
+    // One high-resolution timer per thread, closed when the thread ends.
+    struct HighResolutionTimer {
+        HANDLE handle = ::CreateWaitableTimerExW(nullptr, nullptr,
+                                                 CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                 TIMER_ALL_ACCESS);
+        ~HighResolutionTimer() {
+            if (handle != nullptr) {
+                ::CloseHandle(handle);
+            }
+        }
+    };
+    static thread_local HighResolutionTimer high_resolution;
+    const HANDLE timer = high_resolution.handle;
+    auto now = std::chrono::steady_clock::now();
+    if (timer != nullptr && deadline - now > spin) {
+        const auto wait =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now - spin).count();
+        LARGE_INTEGER due{.QuadPart = -static_cast<LONGLONG>(wait / 100)};
+        if (::SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) {
+            ::WaitForSingleObject(timer, INFINITE);
+        }
+    }
+    while (std::chrono::steady_clock::now() < deadline) {
+        ::YieldProcessor();
+    }
+#else
+    std::this_thread::sleep_until(deadline);
+#endif
+}
+
 u32 CurrentThreadId() {
 #ifdef _WIN32
     return static_cast<u32>(::GetCurrentThreadId());

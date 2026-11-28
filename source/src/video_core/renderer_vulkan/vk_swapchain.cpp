@@ -10,6 +10,8 @@
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_submit_lock_trace.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace Vulkan {
@@ -24,7 +26,7 @@ Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& windo
     FindPresentFormat();
     FindPresentMode();
 
-    Create(window.GetWidth(), window.GetHeight());
+    Recreate();
     ImGui::Core::Initialize(instance, window, image_count, surface_format.format);
 }
 
@@ -33,12 +35,15 @@ Swapchain::~Swapchain() {
     instance.GetInstance().destroySurfaceKHR(surface);
 }
 
-void Swapchain::Create(u32 width_, u32 height_) {
-    width = width_;
-    height = height_;
-    needs_recreation = false;
-
+void Swapchain::Recreate() {
     Destroy();
+    // A drag may have moved on while the GPU finished using the old images.
+    const auto size = window.GetPixelSize();
+    width = size.width;
+    height = size.height;
+    needs_recreation = false;
+    frame_index = 0;
+    LOG_DEBUG(Render_Vulkan, "Recreate the swapchain: width={} height={} HDR={}", width, height, needs_hdr);
 
     SetSurfaceProperties();
 
@@ -80,32 +85,13 @@ void Swapchain::Create(u32 width_, u32 height_) {
     RefreshSemaphores();
 }
 
-void Swapchain::Recreate(u32 width_, u32 height_) {
-    LOG_DEBUG(Render_Vulkan, "Recreate the swapchain: width={} height={} HDR={}", width_, height_,
-              needs_hdr);
-    Create(width_, height_);
-}
-
 void Swapchain::SetHDR(bool hdr) {
     if (needs_hdr == hdr) {
         return;
     }
 
-    {
-        // vkDeviceWaitIdle (here and in Recreate): with the present queue's lock
-        // (Instance::GetPresentQueueMutex; the graphics queue's is not taken here, as before) and
-        // the OpenXR runtime's own queue's (Instance::GetXrQueueMutex: its xrEndFrame submits
-        // there without the graphics queue's lock). The caller (the flip) holds no other lock.
-        std::scoped_lock present_lock{instance.GetXrQueueMutex(), instance.GetPresentQueueMutex()};
-        auto result = instance.GetDevice().waitIdle();
-        if (result != vk::Result::eSuccess) {
-            LOG_WARNING(ImGui, "Failed to wait for Vulkan device idle on mode change: {}",
-                        vk::to_string(result));
-        }
-
-        needs_hdr = hdr;
-        Recreate(width, height);
-    }
+    needs_hdr = hdr;
+    Recreate();
     ImGui::Core::OnSurfaceFormatChange(needs_hdr ? SURFACE_FORMAT_HDR.format
                                                  : surface_format.format);
 }
@@ -120,6 +106,9 @@ bool Swapchain::AcquireNextImage() {
     case vk::Result::eSuccess:
         break;
     case vk::Result::eSuboptimalKHR:
+        // Acquire succeeded. Consume its semaphore in the normal submit before rebuilding.
+        needs_recreation = true;
+        return true;
     case vk::Result::eErrorSurfaceLostKHR:
     case vk::Result::eErrorOutOfDateKHR:
     case vk::Result::eErrorUnknown:
@@ -263,8 +252,21 @@ void Swapchain::SetSurfaceProperties() {
 }
 
 void Swapchain::Destroy() {
-    vk::Device device = instance.GetDevice();
-    const auto wait_result = device.waitIdle();
+    if (!swapchain) {
+        return;
+    }
+    const vk::Device device = instance.GetDevice();
+    vk::Result wait_result;
+    {
+        const Common::Log::DeferScope log_defer;
+        const LockTrace::Start lock_start;
+        // vkDeviceWaitIdle requires exclusive host access to every queue on the device.
+        std::scoped_lock locks{Scheduler::submit_mutex, instance.GetXrQueueMutex(),
+                               instance.GetPresentQueueMutex()};
+        LockTrace::Hold trace{"desktop swapchain", lock_start};
+        LockTrace::Phase phase{"vkDeviceWaitIdle"};
+        wait_result = device.waitIdle();
+    }
     if (wait_result != vk::Result::eSuccess) {
         LOG_WARNING(Render_Vulkan, "Failed to wait for device to become idle: {}",
                     vk::to_string(wait_result));
@@ -275,9 +277,8 @@ void Swapchain::Destroy() {
     }
     images_view.clear();
 
-    if (swapchain) {
-        device.destroySwapchainKHR(swapchain);
-    }
+    device.destroySwapchainKHR(swapchain);
+    swapchain = nullptr;
 
     for (const auto& sem : image_acquired) {
         device.destroySemaphore(sem);

@@ -3,12 +3,17 @@
 
 #include "core/vr/bloodborne_woods_shadows.h"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include <miniz.h>
@@ -106,8 +111,9 @@ std::string Serve(Core::FileSys::MntPoints& mnt, const char* path, Change&& chan
 // game's own): not started, and none of ours in their place.
 // A kind's patch: VR_FOG_EMIT_FLOOR / _FAR / _INDOOR / _BOSS = "rx,ry,rz,density,fall,edge,noise,glow".
 struct FogPlan {
-    u32 kinds{};  // 1 << FogEmitters::Kind: taken over
+    u32 kinds{};  // 1 << FogEmitters::Kind: taken over (while the fog is on: FogWanted)
     bool ours{};  // ... with the fog grid's patches in their places
+    bool live{};  // on and off by the menu's Fog row (vr.ini fog_banks); else VR_FOG_EMITTERS's
     struct Shape {
         float rx, ry, rz, density, fall, edge, noise, glow, clear;
     };
@@ -115,26 +121,29 @@ struct FogPlan {
     std::string asked;
 };
 
-// The plan, read once (VR_FOG_EMITTERS and the kinds' shapes).
+// The plan, read once (VR_FOG_EMITTERS and the kinds' shapes): what the fog banks take over while
+// they are on, whatever the menu's row says at the start (FogWanted: it switches them at the next
+// load of an area since 2026-11-21).
 const FogPlan& Fog() {
     static const FogPlan plan = [] {
         namespace F = VR::FogEmitters;
         FogPlan p;
         // (The menu's Fog row, vr.ini fog_banks, by the card where not set: what VR_FOG_EMITTERS=1
-        // asks for. The switch, where given, wins: tests, and =0 for the game's own fog.)
+        // asks for. The switch, where given, wins for the session: tests, and =0 for the game's
+        // own fog.)
         const char* env = std::getenv("VR_FOG_EMITTERS");
-        if ((env == nullptr || env[0] == 0) && VR::GetSettings().fog_banks) {
+        p.live = env == nullptr || env[0] == 0;
+        if (p.live) {
             env = "1";
         }
-        if (!VR::IsEnabled() || env == nullptr || env[0] == 0) {
+        if (!VR::IsEnabled()) {
             return p;
         }
-        // Only with the fog grid drawing this session (moonlight in the air on, an upscaler: both
-        // read at start). Without it the game's fog stays the game's: never a place with none.
+        // Only with the fog grid drawing this session and the moonlight in the air (on with the
+        // fog whatever moon_shafts says, VR::MoonGlowOn; off only by VR_MOON_SHAFTS=0). Without it
+        // the game's fog stays the game's: never a place with none.
         if (!Shader::Optimization::FogGrid::Enabled() ||
-            !Shader::Optimization::MoonShafts::Enabled(true, VR::MoonGlowOn(VR::GetSettings()),
-                                                       VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
-                                                       std::getenv("VR_MOON_SHAFTS"))) {
+            !Shader::Optimization::MoonShafts::Enabled(true, true, std::getenv("VR_MOON_SHAFTS"))) {
             return p;
         }
         p.asked = env;
@@ -182,7 +191,6 @@ const FogPlan& Fog() {
         // at 10 m, with thin and thick of it.)
         // (Floor fog from 2 m of the eye, not 6: the tester, 2026-11-16, "yes do the fog around the feet
         // too": it lies knee-high round him, and his wake shows in it.)
-        Shader::Optimization::FogGrid::FogTaken() = p.ours && p.kinds != 0;
         p.shapes[0] = shape("VR_FOG_EMIT_FLOOR", {9.0f, 2.2f, 9.0f, 0.26f, 0.8f, 0.7f, 2.4f, 2.8f, 2.0f});
         p.shapes[1] = shape("VR_FOG_EMIT_FAR", {18.0f, 4.0f, 18.0f, 0.08f, 0.0f, 0.95f, 0.5f, 1.8f, 16.0f});
         p.shapes[2] = shape("VR_FOG_EMIT_INDOOR", {5.0f, 2.5f, 5.0f, 0.20f, 0.0f, 0.7f, 1.5f, 1.0f, 0.0f});
@@ -193,9 +201,61 @@ const FogPlan& Fog() {
     return plan;
 }
 
-// A map's file: its lingering fog effects of the plan's kinds not started, their places given to
-// the fog grid. True: the file was changed.
-bool FogChange(Bytes& msb, u16 map, std::string& what) {
+// The fog banks on now: the menu's row (switched at the next load of an area; read through its
+// published copy, any thread), or the session's VR_FOG_EMITTERS.
+bool FogWanted(const FogPlan& plan) {
+    return plan.kinds != 0 && (!plan.live || VR::FogBanksAsked());
+}
+
+// The fog banks switch without a restart (2026-11-21, the user: "change the graphics and see and
+// feel the difference without requiring to reboot the game"). The game reads an area's map file as
+// it loads the area, and the game's lingering fog is in it: so each map file carries ours as a
+// switched layer (file_override.h SetFileOverrideLayer), on while the fog is (FogFilesOn, asked at
+// each open: a change made at the title screen holds for the first load), and the area loaded now
+// keeps the fog it came with until it is loaded again (travel to another area: a lamp of the same
+// area and a death there reload nothing, the mock showed): never the game's fog and ours at once,
+// nor neither. Each open says which it was (FogFileOpened), and the fog grid
+// draws ours in a map only when its file came with them (FogStateTick).
+// The fog row as the frame tick last saw it (its log line, the layers' first build).
+std::atomic<bool> g_fog_files_on{false};
+// The fog each map's file was last opened with: 0 not opened yet, 1 the game's, 2 ours (MapSlot).
+std::array<std::atomic<u8>, 64> g_map_fog{};
+// The files with a fog layer (path, map), filled at the start; queued at the first want.
+std::vector<std::pair<std::string, u16>> g_fog_layers;
+// Every layer queued or built: set only once QueueFogLayers has queued them all (the 2026-11-21
+// review: set before, another thread's open found its layer neither built nor queued).
+std::atomic<bool> g_fog_layers_queued{false};
+
+// A map's place in g_map_fog: areas 21 to 36, blocks 0 to 3 (MapFiles); -1 for any other.
+constexpr int MapSlot(u32 area, u32 block) {
+    return area >= 21 && area <= 36 && block <= 3 ? static_cast<int>((area - 21) * 4 + block) : -1;
+}
+
+// The game opens a map's file as it loads that area ("/app0/dvdroot_ps4/map/mapstudio/
+// m24_01_00_01.msb.dcx"): whether it came with our fog (file_override.h FileOverrideLayerOpened).
+void FogFileOpened(std::string_view path, bool applied) {
+    const std::size_t slash = path.rfind('/');
+    const std::string_view name = slash == std::string_view::npos ? path : path.substr(slash + 1);
+    const auto digit = [&](std::size_t i) { return name[i] >= '0' && name[i] <= '9'; };
+    if (name.size() < 6 || (name[0] != 'm' && name[0] != 'M') || !digit(1) || !digit(2) || name[3] != '_' ||
+        !digit(4) || !digit(5)) {
+        return;
+    }
+    const u32 area = static_cast<u32>(name[1] - '0') * 10 + static_cast<u32>(name[2] - '0');
+    const u32 block = static_cast<u32>(name[4] - '0') * 10 + static_cast<u32>(name[5] - '0');
+    if (const int slot = MapSlot(area, block); slot >= 0) {
+        g_map_fog[static_cast<std::size_t>(slot)].store(applied ? 2 : 1, std::memory_order_relaxed);
+    }
+    LOG_INFO(Core, "VR fog: m{:02}_{:02} loaded with {} fog ({})", area, block, applied ? "our" : "the game's",
+             name);
+}
+
+// A map's file: its lingering fog effects of the plan's kinds found; with `silence` not started
+// (the fog layer's file), with `add_places` their places given to the fog grid (once, at the
+// start).
+// True: the file was changed.
+bool FogChange(Bytes& msb, u16 map, std::string& what, bool silence, bool add_places,
+               bool* understood = nullptr) {
     namespace F = VR::FogEmitters;
     namespace Patches = Shader::Optimization::FogPatches;
     const FogPlan& plan = Fog();
@@ -205,12 +265,24 @@ bool FogChange(Bytes& msb, u16 map, std::string& what) {
     std::vector<F::Found> found;
     if (!F::Find(msb, found)) {
         what += "fog: not a map file it understands";
+        if (understood != nullptr) {
+            *understood = false;
+        }
         return false;
     }
+    // (The places left to the game: neither stopped nor made a patch. fog_emitters.h GamesOwn.)
+    std::erase_if(found, [map](const F::Found& f) { return F::GamesOwn(map, f.emitter); });
     auto& patches = Patches::EmitterPatches();
-    const u32 silenced = F::Silence(msb, found, plan.kinds);
+    const u32 silenced =
+        silence ? F::Silence(msb, found, plan.kinds)
+                : static_cast<u32>(std::ranges::count_if(found, [&](const F::Found& f) {
+                      return (plan.kinds >> static_cast<u32>(f.emitter.kind) & 1u) != 0;
+                  }));
     u32 added = 0;
     for (const F::Found& f : found) {
+        if (!add_places) {
+            break;
+        }
         const u32 k = static_cast<u32>(f.emitter.kind);
         if (!plan.ours || (plan.kinds >> k & 1u) == 0) {
             continue;
@@ -242,7 +314,7 @@ bool FogChange(Bytes& msb, u16 map, std::string& what) {
     // the fog gate (-322.9 -185.9 494.4) and the way out (-347.2 -185.9 469.3), as floor banks
     // with the floor fog taken over. VR_FOG_SHADOWS_ROOM=0: none; any other number: their light,
     // times (0.85 of the floor banks' where it is not set: "a tiny bit darker", the same day).
-    if (map == 0x1B00 && plan.ours && (plan.kinds >> static_cast<u32>(F::Kind::Floor) & 1u) != 0) {
+    if (add_places && map == 0x1B00 && plan.ours && (plan.kinds >> static_cast<u32>(F::Kind::Floor) & 1u) != 0) {
         static const float light = [] {
             const char* const env = std::getenv("VR_FOG_SHADOWS_ROOM");
             return env != nullptr ? std::clamp(static_cast<float>(std::atof(env)), 0.0f, 2.0f) : 0.85f;
@@ -264,9 +336,112 @@ bool FogChange(Bytes& msb, u16 map, std::string& what) {
             }
         }
     }
-    what += std::to_string(silenced) + " of " + std::to_string(found.size()) + " lingering fog effects not started, " +
+    what += std::to_string(silenced) + " of " + std::to_string(found.size()) +
+            (silence ? " lingering fog effects not started, " : " lingering fog effects to take over, ") +
             std::to_string(added) + " new places for the fog grid";
-    return silenced != 0;
+    return silence && silenced != 0;
+}
+
+// A map file's fog layer: the file under it (the game's own, or the woods shadows') with the plan's
+// kinds of lingering fog not started; empty when it has none of them. An exception (a file the
+// parser does not understand among them: the 2026-11-21 review, it counted as one with nothing
+// to take over, our fog drawn over the game's): not built, the game's own served.
+Bytes FogLayerFile(const std::string& path, u16 map) {
+    auto& mnt = *Common::Singleton<Core::FileSys::MntPoints>::Instance();
+    std::optional<Bytes> file;
+    {
+        const Core::FileSys::FileOverrideLayerBypass under;
+        file = mnt.ReadFile(path);
+    }
+    if (!file) {
+        throw std::runtime_error("not readable");
+    }
+    VR::TpfPatch::Dcx dcx{};
+    auto data = Unpack(*file, dcx);
+    if (!data) {
+        throw std::runtime_error("not a DCX that unpacks");
+    }
+    std::string what;
+    bool understood = true;
+    if (!FogChange(*data, map, what, true, false, &understood)) {
+        if (!understood) {
+            throw std::runtime_error("not a map file it understands");
+        }
+        return {};
+    }
+    Bytes packed = Pack(*file, dcx, *data);
+    if (packed.empty()) {
+        throw std::runtime_error("not packed again");
+    }
+    return packed;
+}
+
+// Every fog layer queued (the first time the fog is asked for: file_override.h
+// QueueFileOverrideLayer, one worker, one file after another, some 0.7 s of one core, long before
+// the next load of an area; an open that wants one not started builds it itself). Two callers at
+// once both queue: a layer queued, building or built is left as it is.
+void QueueFogLayers() {
+    if (g_fog_layers_queued.load(std::memory_order_acquire)) {
+        return;
+    }
+    try {
+        for (const auto& [path, map] : g_fog_layers) {
+            Core::FileSys::QueueFileOverrideLayer(path, [path, map] { return FogLayerFile(path, map); });
+        }
+    } catch (...) {
+        return; // (out of memory: tried again at the next call)
+    }
+    g_fog_layers_queued.store(true, std::memory_order_release);
+}
+
+// The fog layers' switch, asked at each open of a map file (any thread, outside the overrides'
+// lock). On, the layers are queued if they were not yet: the row turned on at the title screen, in
+// a session started without the fog, before the frame's tick saw it (the 2026-11-21 review: that
+// first load came with the game's fog); the open builds its own file if it was not started.
+bool FogFilesOn() {
+    const bool on = FogWanted(Fog());
+    if (on) {
+        QueueFogLayers();
+    }
+    return on;
+}
+
+// A map file's fog layer registered (the start, before the game opens a map), built at once while
+// the fog is on.
+void FogLayer(const std::string& path, u16 map, bool build) {
+    Core::FileSys::SetFileOverrideLayer(path, FogFilesOn, FogFileOpened, std::string{Tag} + ": fog banks");
+    g_fog_layers.emplace_back(path, map);
+    if (build) {
+        Core::FileSys::BuildFileOverrideLayer(path, [path, map] { return FogLayerFile(path, map); });
+    }
+}
+
+// Once a frame (the loop thread): the menu's row into the files' layers, and the fog the hunter's
+// map was loaded with into the fog grid's switch (FogGrid::FogTaken: its patches, their shapes, the
+// grid's reach) and the moon glow's (VR::MoonGlowOn: ours need it until the area loads again).
+void FogStateTick(u16 map) {
+    const FogPlan& plan = Fog();
+    if (plan.kinds == 0) {
+        return;
+    }
+    const bool wanted = FogWanted(plan);
+    if (g_fog_files_on.exchange(wanted, std::memory_order_acq_rel) != wanted) {
+        if (wanted) {
+            QueueFogLayers();
+        }
+        LOG_INFO(Core, "VR fog: {} from the next load of an area (the one loaded now keeps its own)",
+                 wanted ? "our fog banks" : "the game's fog");
+    }
+    if (map == 0) {
+        // (No map known this frame, a loading screen or a field that is no map id: the state as it
+        // was. A real map outside the table, a chalice dungeon's, follows the row below.)
+        return;
+    }
+    const int slot = MapSlot(map >> 8, map & 0xFFu);
+    const u8 loaded = slot >= 0 ? g_map_fog[static_cast<std::size_t>(slot)].load(std::memory_order_relaxed) : 0;
+    const bool ours = loaded != 0 ? loaded == 2 : wanted;
+    Shader::Optimization::FogGrid::FogTakenNow().store(plan.ours && ours, std::memory_order_relaxed);
+    VR::FogBanksLoaded().store(ours, std::memory_order_relaxed);
 }
 
 // The game's lingering fog taken over by the fog grid (core/vr/fog_emitters.h). A test stage,
@@ -285,18 +460,31 @@ constexpr u8 MapFiles[][3] = {
 };
 
 // The two verified hanging lantern models occur only in the Woods. Read its two map states
-// once for the lamp memory's fixture lookup.
+// once for the lamp memory's fixture lookup. And the lights that get no halo (map_objects.h
+// NoHaloModels, NoHaloSpots): the files of NoHaloMaps (the Fishing Hamlet's, 77 KB, and the
+// Hunter's Nightmare's for the Corpse Pile's heaps, 140 KB).
+// VR_FOG_NOHALO=0 (tests): none.
 void MapObjectsEbootLoaded() {
     namespace O = VR::MapObjects;
-    if (!Shader::Optimization::FogLight::Fixtures()) {
+    const bool lanterns = Shader::Optimization::FogLight::Fixtures();
+    const bool no_halo = [] {
+        const char* const env = std::getenv("VR_FOG_NOHALO");
+        return env == nullptr || env[0] != '0';
+    }();
+    if (!lanterns && !no_halo) {
         return;
     }
     const auto started = std::chrono::steady_clock::now();
     auto& mnt = *Common::Singleton<Core::FileSys::MntPoints>::Instance();
     std::vector<std::pair<u16, std::vector<O::Place>>> maps;
+    std::vector<std::pair<u16, std::vector<O::NoHaloAnchor>>> anchors;
     u32 files_read = 0;
     for (const auto& f : MapFiles) {
-        if (f[0] != 27 || f[1] != 0) {
+        const bool woods = lanterns && f[0] == 27 && f[1] == 0;
+        const bool listed = no_halo && std::ranges::any_of(O::NoHaloMaps, [&](const auto& m) {
+                                return m[0] == f[0] && m[1] == f[1];
+                            });
+        if (!woods && !listed) {
             continue;
         }
         char path[96];
@@ -306,18 +494,27 @@ void MapObjectsEbootLoaded() {
             if (auto file = mnt.ReadFile(path)) {
                 VR::TpfPatch::Dcx dcx{};
                 if (const auto data = Unpack(*file, dcx)) {
-                    auto it = std::ranges::find(maps, map, [](const auto& m) { return m.first; });
-                    if (it == maps.end()) {
-                        it = maps.insert(maps.end(), {map, {}});
+                    if (woods) {
+                        auto it = std::ranges::find(maps, map, [](const auto& m) { return m.first; });
+                        if (it == maps.end()) {
+                            it = maps.insert(maps.end(), {map, {}});
+                        }
+                        files_read += O::Read(*data, it->second) ? 1 : 0;
                     }
-                    files_read += O::Read(*data, it->second) ? 1 : 0;
+                    if (listed) {
+                        auto it = std::ranges::find(anchors, map, [](const auto& m) { return m.first; });
+                        if (it == anchors.end()) {
+                            it = anchors.insert(anchors.end(), {map, {}});
+                        }
+                        files_read += O::ReadNoHalo(*data, it->second) ? 1 : 0;
+                    }
                 }
             }
         } catch (const std::exception&) {
             // (out of memory, an unreadable file: see above)
         }
     }
-    std::size_t objects = 0;
+    std::size_t objects = 0, no_halos = 0;
     try {
         auto& all = O::All();
         all.reserve(maps.size());
@@ -327,13 +524,31 @@ void MapObjectsEbootLoaded() {
                 all.emplace_back(map, O::Table{std::move(places)});
             }
         }
+        // (The spots by hand join their map's anchors.)
+        if (no_halo) {
+            for (const O::NoHaloSpot& s : O::NoHaloSpots) {
+                auto it = std::ranges::find(anchors, s.map, [](const auto& m) { return m.first; });
+                if (it == anchors.end()) {
+                    it = anchors.insert(anchors.end(), {s.map, {}});
+                }
+                it->second.push_back(O::AnchorOf(s));
+            }
+        }
+        auto& none = O::NoHaloAll();
+        for (auto& [map, list] : anchors) {
+            if (!list.empty()) {
+                no_halos += list.size();
+                none.emplace_back(map, std::move(list));
+            }
+        }
     } catch (const std::exception&) {
         O::All().clear();
-        objects = 0;
+        O::NoHaloAll().clear();
+        objects = no_halos = 0;
     }
     O::Publish();
-    LOG_INFO(Core, "VR map lanterns: {} placements of {} maps from {} files ({:.1f} ms)",
-             objects, O::All().size(), files_read,
+    LOG_INFO(Core, "VR map lanterns: {} placements of {} maps; lights without a halo: {} in {} maps; {} files ({:.1f} ms)",
+             objects, O::All().size(), no_halos, O::NoHaloAll().size(), files_read,
              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
 }
 
@@ -342,6 +557,11 @@ void FogEmittersEbootLoaded(bool woods_too) {
     if (plan.kinds == 0) {
         return;
     }
+    // (The fog as at the start, before the first load of an area: FogStateTick from then on.)
+    const bool wanted = FogWanted(plan);
+    g_fog_files_on.store(wanted, std::memory_order_release);
+    Shader::Optimization::FogGrid::FogTakenNow().store(plan.ours && wanted, std::memory_order_relaxed);
+    VR::FogBanksLoaded().store(wanted, std::memory_order_relaxed);
     const auto& files = MapFiles;
     const auto started = std::chrono::steady_clock::now();
     auto& mnt = *Common::Singleton<Core::FileSys::MntPoints>::Instance();
@@ -372,18 +592,29 @@ void FogEmittersEbootLoaded(bool woods_too) {
             }
         }
         if (f[0] == 27 && !woods_too) {
-            continue;
+            continue; // (WoodsShadowsEbootLoaded's: under the woods shadows' own change)
         }
         char path[96];
         std::snprintf(path, sizeof(path), "/app0/dvdroot_ps4/map/MapStudio/m%02u_%02u_00_%02u.msb.dcx", f[0], f[1], f[2]);
         const u16 map = static_cast<u16>((f[0] << 8) | f[1]);
+        // Its places for the fog grid, from the file as the game has it; then its fog layer.
         std::string line;
         try {
-            line = Serve(mnt, path, [&](Bytes& msb, std::string& what) { return FogChange(msb, map, what); });
+            if (auto file = mnt.ReadFile(path)) {
+                VR::TpfPatch::Dcx dcx{};
+                if (auto data = Unpack(*file, dcx)) {
+                    FogChange(*data, map, line, false, true);
+                } else {
+                    line = "not a DCX that unpacks";
+                }
+            } else {
+                line = "not readable";
+            }
         } catch (const std::exception& e) {
-            line = std::string{"failed ("} + e.what() + "): the game's own";
+            line = std::string{"failed ("} + e.what() + ")";
         }
-        served += line.ends_with(": served") ? 1 : 0;
+        FogLayer(path, map, wanted);
+        ++served;
         if constexpr (Common::Log::Enabled) {
             report += std::string{report.empty() ? "" : "; "} + (path + 32) + ": " + line;
         }
@@ -397,8 +628,11 @@ void FogEmittersEbootLoaded(bool woods_too) {
         std::scoped_lock lock{P::FitMutex()};
         P::Fits().assign(P::EmitterPatches().size(), {});
     }
-    LOG_INFO(Core, "VR fog emitters ({}{}): {} map files served, {} places and {} lamps in all ({:.1f} ms): {}", plan.asked,
-             plan.ours ? "" : ", none of ours", served, Shader::Optimization::FogPatches::EmitterPatches().size(), lamps_read,
+    LOG_INFO(Core,
+             "VR fog emitters ({}{}): {} map files with a fog layer ({}), {} places and {} lamps in all ({:.1f} ms): {}",
+             plan.asked, plan.ours ? "" : ", none of ours", served,
+             wanted ? "on: served from the first load" : "off until the menu's Fog row turns it on",
+             Shader::Optimization::FogPatches::EmitterPatches().size(), lamps_read,
              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), report);
 }
 
@@ -624,12 +858,19 @@ static void MistGroundTick(float x, float y, float z) {
     }
 }
 
+void FogStateFrame() {
+    FogStateTick(static_cast<u16>(VR::GameArea::Slot().load(std::memory_order_relaxed) >> 16));
+}
+
 void FogLampReachTick(float x, float y, float z) {
     namespace M = VR::MapLights;
+    const u16 map_now = static_cast<u16>(VR::GameArea::Slot().load(std::memory_order_relaxed) >> 16);
+    // (The menu's Fog row, and the fog this map was loaded with.)
+    FogStateTick(map_now);
     MistGroundTick(x, y, z);
-    // (One thing a frame: a floor bank's fit first, then a lamp's walls.)
-    if (Fog().kinds != 0 &&
-        FogPatchFitOne(x, y, z, static_cast<u16>(VR::GameArea::Slot().load(std::memory_order_relaxed) >> 16))) {
+    // (One thing a frame: a floor bank's fit first, then a lamp's walls. Only where the fog
+    // banks are ours.)
+    if (Shader::Optimization::FogGrid::FogTaken() && FogPatchFitOne(x, y, z, map_now)) {
         return;
     }
     if (!Shader::Optimization::FogGrid::Lamps::MapLamps()) {
@@ -732,14 +973,21 @@ void WoodsShadowsEbootLoaded() {
             what = r.understood ? std::to_string(r.changed) + " of " + std::to_string(r.parts) +
                                       " map pieces now cast"
                                 : "not a map file it understands";
-            // (The woods' lingering fog taken over too: one served file a path.)
+            // (The woods' lingering fog: its places here, and the fog layer over this file below.)
             std::string fog;
-            const bool fog_changed = FogChange(msb, 0x1B00, fog);
+            FogChange(msb, 0x1B00, fog, false, true);
             if (!fog.empty()) {
                 what += "; " + fog;
             }
-            return (r.understood && r.changed != 0) || fog_changed;
+            return r.understood && r.changed != 0;
         });
+    }
+    // The woods' fog layers, over the files just served (FogLayerFile reads them as they are
+    // served without it).
+    if (Fog().kinds != 0) {
+        for (const char* path : Woods::MsbPaths) {
+            FogLayer(path, 0x1B00, FogWanted(Fog()));
+        }
     }
     run(Woods::GparamPath, [](Bytes& data, std::string& what) {
         const bool ok = Woods::PatchGparam(data, 0);

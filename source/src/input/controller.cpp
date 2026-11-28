@@ -131,6 +131,22 @@ PadLayers::Physical GameController::Physical() {
     return m_layers.PhysicalNow();
 }
 
+void GameController::SetPhysicalMirrorX(bool on) {
+    std::lock_guard lock{m_state_mutex};
+    if (!m_layers.SetMirrorX(on)) {
+        return;
+    }
+    // A stick held through the change: the game gets it the new way at once.
+    const u64 timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+    for (const Input::Axis axis : {Input::Axis::LeftX, Input::Axis::RightX}) {
+        const int a = std::to_underlying(axis);
+        if (!m_layers.inj_axis[a]) {
+            m_state.OnAxis(axis, m_layers.Shown(a, m_layers.phys_axes[a]), timestamp, false);
+        }
+    }
+    PushStateLocked(timestamp);
+}
+
 void GameController::UpdateGyro(const float gyro[3]) {
     std::lock_guard lock{m_state_mutex};
     std::memcpy(gyro_buf, gyro, sizeof(gyro_buf));

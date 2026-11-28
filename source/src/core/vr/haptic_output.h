@@ -300,15 +300,20 @@ constexpr float ImpactMinDamage = 1.0f;
 // crunch (haptic_melee_crunch).
 constexpr float ImpactCrunchWeight = 0.5f;
 
+// A landed hit's extra energy (2026-11-24: "when we swing and we hit an enemy can we
+// have ... a tiny bit stronger vibration?"). Its full part is already the motor's most (1.0), so
+// the energy is the time and the fade: the full part x1.2 and every later level x1.2 (to 1.0).
+constexpr float ImpactBoost = 1.2f;
+
 // The impact (x `gain`, haptic_melee_hit), with `hold_ms` (haptic_melee_hit_ms, 65):
-// full (1.0) for hold_ms + 15 ms x weight (65 .. 80 ms: a Quest Touch motor needs the length to
-// read as a blow; 1.0 is its most, so the energy is the time), then fading from 0.70 .. 0.85 to
-// 0 over 80 .. 115 ms: about 150 ms for a light nick, 165 for a Saw Cleaver light. A heavy one
-// (weight >= ImpactCrunchWeight, `crunch`) instead drops away over 25 ms, and after 40 ms of
-// silence a second shorter blow, the crunch (0.85 for 30 ms, fading from 0.55 over 50 ms):
-// about 220 ms. A gain above 1 lengthens the full part (x gain), below 1 lowers every level.
-// hold_ms 0: the old impact (0.9 .. 1.0 for 20 .. 30 ms, then from 0.6 .. 0.8 of that over
-// 65 .. 100 ms; never a crunch).
+// full (1.0) for (hold_ms + 15 ms x weight) x ImpactBoost (78 .. 96 ms: a Quest Touch motor needs
+// the length to read as a blow; 1.0 is its most, so the energy is the time), then fading from
+// 0.84 .. 1.0 to 0 over 80 .. 115 ms: about 160 ms for a light nick, 175 for a Saw Cleaver light.
+// A heavy one (weight >= ImpactCrunchWeight, `crunch`) instead drops away from 0.72 over 25 ms,
+// and after 40 ms of silence a second shorter blow, the crunch (1.0 for 30 ms, fading from 0.66
+// over 50 ms): about 235 ms. A gain above 1 lengthens the full part (x gain), below 1 lowers every
+// level after it (the full part keeps gain). hold_ms 0: the old impact (0.9 .. 1.0 for 20 .. 30 ms,
+// then from 0.6 .. 0.8 of that over 65 .. 100 ms; never a crunch, no boost).
 inline Shape MeleeImpact(float weight, float gain, float hold_ms = 0.0f, bool crunch = false) {
     const float w = Clamp01(weight);
     const float g = std::isfinite(gain) ? std::clamp(gain, 0.0f, 1.5f) : 1.0f;
@@ -318,18 +323,19 @@ inline Shape MeleeImpact(float weight, float gain, float hold_ms = 0.0f, bool cr
     }
     Shape s{};
     s.peak = std::min(g, 1.0f);
-    s.hold_ms = (std::min(hold_ms, 300.0f) + 15.0f * w) * std::max(g, 1.0f);
+    const float b = g * ImpactBoost; // every level after the full part
+    s.hold_ms = (std::min(hold_ms, 300.0f) + 15.0f * w) * std::max(g, 1.0f) * ImpactBoost;
     if (crunch && w >= ImpactCrunchWeight && s.peak > 0.0f) {
-        s.tail_from = std::min(0.6f * g, 1.0f);
+        s.tail_from = std::min(0.6f * b, 1.0f);
         s.tail_ms = 25.0f;
         s.crunch_gap_ms = 40.0f;
-        s.crunch = std::min(0.85f * g, 1.0f);
+        s.crunch = std::min(0.85f * b, 1.0f);
         s.crunch_ms = 30.0f;
-        s.crunch_tail_from = std::min(0.55f * g, 1.0f);
+        s.crunch_tail_from = std::min(0.55f * b, 1.0f);
         s.crunch_tail_ms = 50.0f;
         return s;
     }
-    s.tail_from = std::min((0.70f + 0.15f * w) * g, 1.0f);
+    s.tail_from = std::min((0.70f + 0.15f * w) * b, 1.0f);
     s.tail_ms = 80.0f + 35.0f * w;
     return s;
 }

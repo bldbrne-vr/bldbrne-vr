@@ -175,7 +175,8 @@ std::unique_ptr<Xbyak::CodeGenerator> refill_code;
 bool refill_failed{};
 bool vial_transfer_ready{};
 
-void PS4_SYSV_ABI RefillFinished(u8* storage, void*) {
+// After the game's own refill: `count` vials when it left none carried and none stored.
+void GrantIfOut(u8* storage, int count) {
     if (!ready || refill_failed)
         return;
     u8* data = Global(GameData);
@@ -192,7 +193,7 @@ void PS4_SYSV_ABI RefillFinished(u8* storage, void*) {
     // Do not call AddItem or disturb the ordinary full/partial refill unless both are empty.
     const int room = carried && stored && *carried == 0 && *stored == 0
                          ? Function<RoomFn>(0x1b5ca20)(&vial) : 0;
-    const int grant = P::EmptyVialRefillGrant(carried, stored, room);
+    const int grant = P::EmptyVialRefillGrant(carried, stored, room, count);
     if (!grant) {
         LOG_INFO(Core, "VR vial refill: replenishment finished, carried={} storage={} room={}, no grant",
                  carried.value_or(-1), stored.value_or(-1), room);
@@ -207,6 +208,10 @@ void PS4_SYSV_ABI RefillFinished(u8* storage, void*) {
         refill_failed = true; // no automatic retries after an unexpected native result
         LOG_ERROR(Core, "VR vial refill: verification failed; fallback disabled for this session");
     }
+}
+
+void PS4_SYSV_ABI RefillFinished(u8* storage, void*) {
+    GrantIfOut(storage, VR::EmptyVialRefillCount());
 }
 
 void InstallVialRefill(u64 size) {
@@ -238,8 +243,9 @@ void InstallVialRefill(u64 size) {
         }
         refill_code = std::move(code);
         Hook::WriteJump(base + RefillEndRva, RefillEndBytes.size(), stub);
-        LOG_INFO(Core, "VR vial refill: installed, grant 3 only after native refill leaves carried "
-                       "and storage empty (offline)");
+        LOG_INFO(Core, "VR vial refill: installed, grant {} (empty_vial_refill) only after native "
+                       "refill leaves carried and storage empty (offline)",
+                 VR::EmptyVialRefillCount());
     } catch (const Xbyak::Error& e) {
         LOG_ERROR(Core, "VR vial refill: OFF, could not generate completion hook: {}", e.what());
     }
@@ -283,7 +289,9 @@ bool Warp(u8* player) {
     u8* storage = Read<u8*>(Global(GameData) + 8);
     storage = Read<u8*>(storage + 0x5b0);
     const auto stock = CountInventory(storage, items[0]);
-    const auto plan = P::PlanVialRest(before[0], stock, room[0], !refill_failed);
+    // One count for the plan and the grant (the page could change it in between).
+    const int vials_when_out = VR::EmptyVialRefillCount();
+    const auto plan = P::PlanVialRest(before[0], stock, room[0], !refill_failed, vials_when_out);
     if (!vial_transfer_ready || !plan) {
         Refuse("vial replenishment unavailable");
         return false;
@@ -304,7 +312,7 @@ bool Warp(u8* player) {
         Refuse("vial storage transfer verification failed; no warp and no retry");
         return false;
     }
-    RefillFinished(storage, nullptr);
+    GrantIfOut(storage, vials_when_out);
     const int grant = plan->grant;
     const auto vials_after = Count(egd, items[0]);
     LOG_INFO(Core, "VR lamp: vials {} -> {}, storage {} -> {}, transferred {}, free grant {}",

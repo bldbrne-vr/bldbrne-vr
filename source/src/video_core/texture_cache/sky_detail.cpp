@@ -263,14 +263,14 @@ void Scan() {
     // Every folder the game's files can come from: the base game, its update and a mods folder
     // (the plain lookup gives only the first that has the map folder: a mods folder with one
     // map file in it hid the whole base game, 2026-10-29).
-    using HostPathType = Core::FileSys::MntPoints::HostPathType;
     std::vector<std::filesystem::path> roots;
     std::error_code ec;
-    for (const auto type : {HostPathType::Base, HostPathType::Patch, HostPathType::Mod}) {
-        auto root = mnt->GetHostPath("/app0/dvdroot_ps4/map", nullptr, type);
-        if (!root.empty() && std::filesystem::is_directory(root, ec) &&
-            std::ranges::find(roots, root) == roots.end()) {
-            roots.push_back(std::move(root));
+    if (const auto* mount = mnt->GetMount("/app0")) {
+        for (auto it = mount->backends.rbegin(); it != mount->backends.rend(); ++it) {
+            if (auto folder = (*it)->RootHostPath()) {
+                auto root = *folder / "dvdroot_ps4/map";
+                if (std::filesystem::is_directory(root, ec)) roots.push_back(std::move(root));
+            }
         }
     }
     u32 lists = 0, read = 0, skipped = 0;

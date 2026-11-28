@@ -1,21 +1,6 @@
 #include "resource.h"
 #include <winver.h>
 
+// Only the icon is a resource. Velopack copies every resource of the launcher into the install
+// root's stub; the images are compiled in instead (embed_assets.cmake).
 IDI_APP_ICON ICON "assets/app-icon.ico"
-IDR_CONTROLLER_QUEST_LEFT RCDATA "assets/controllers/quest-left.png"
-IDR_CONTROLLER_QUEST_RIGHT RCDATA "assets/controllers/quest-right.png"
-IDR_CONTROLLER_PSVR2_LEFT RCDATA "assets/controllers/psvr2-left.png"
-IDR_CONTROLLER_PSVR2_RIGHT RCDATA "assets/controllers/psvr2-right.png"
-IDR_CONTROLLER_FRAME_LEFT RCDATA "assets/controllers/frame-left.png"
-IDR_CONTROLLER_FRAME_RIGHT RCDATA "assets/controllers/frame-right.png"
-IDR_CONTROLLER_INDEX_LEFT RCDATA "assets/controllers/index-left.png"
-IDR_CONTROLLER_INDEX_RIGHT RCDATA "assets/controllers/index-right.png"
-
-IDR_THEME_YHARNAM RCDATA "assets/theme/yharnam.jpg"
-IDR_THEME_LEATHER RCDATA "assets/theme/leather.png"
-IDR_THEME_FRAME RCDATA "assets/theme/frame.png"
-IDR_THEME_BUTTON_FRAME RCDATA "assets/theme/button-frame.png"
-IDR_THEME_LAUNCH_PLAQUE RCDATA "assets/theme/launch-plaque.png"
-IDR_THEME_CABINET_FRAME RCDATA "assets/theme/cabinet-frame.png"
-IDR_THEME_HARDWARE RCDATA "assets/theme/hardware.png"
-IDR_THEME_SCROLLBAR RCDATA "assets/theme/scrollbar-eye.png"

@@ -279,11 +279,15 @@ bool AvPlayerSource::Start() {
                       m_video_stream_index.value());
             return false;
         }
-        const auto pitch = Common::AlignUp<u32>(m_video_codec_context->width, 64);
-        const auto height = Common::AlignUp<u32>(m_video_codec_context->height, 16);
-        const auto size = (pitch * height * 3) / 2;
+        const auto layout = Videodec::NV12Layout::From(m_video_codec_context->width,
+                                                       m_video_codec_context->height);
+        if (!layout.Fits(UINT32_MAX)) {
+            LOG_ERROR(Lib_AvPlayer, "Video dimensions exceed the frame buffer allocator's range");
+            return false;
+        }
         for (u64 index = 0; index < m_max_num_video_framebuffers; ++index) {
-            m_video_buffers.Push(GuestBuffer(m_memory_replacement, 0x100, size, true));
+            m_video_buffers.Push(GuestBuffer(m_memory_replacement, 0x100,
+                                             static_cast<u32>(layout.Bytes()), true));
         }
     }
     if (m_audio_stream_index) {
@@ -629,6 +633,9 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
 
 AvPlayerSource::AVFramePtr AvPlayerSource::ConvertVideoFrame(const AVFrame& frame) {
     auto nv12_frame = AVFramePtr{av_frame_alloc(), &ReleaseAVFrame};
+    if (!nv12_frame) {
+        return nv12_frame;
+    }
     nv12_frame->best_effort_timestamp = frame.best_effort_timestamp;
     nv12_frame->pts = frame.pts;
     nv12_frame->pkt_dts = frame.pkt_dts < 0 ? 0 : frame.pkt_dts;
@@ -641,19 +648,19 @@ AvPlayerSource::AVFramePtr AvPlayerSource::ConvertVideoFrame(const AVFrame& fram
     nv12_frame->crop_left = frame.crop_left;
     nv12_frame->crop_right = frame.crop_right;
 
-    av_frame_get_buffer(nv12_frame.get(), 0);
-
-    if (m_sws_context == nullptr) {
-        m_sws_context =
-            SWSContextPtr(sws_getContext(frame.width, frame.height, AVPixelFormat(frame.format),
-                                         nv12_frame->width, nv12_frame->height, AV_PIX_FMT_NV12,
-                                         SWS_FAST_BILINEAR, nullptr, nullptr, nullptr),
-                          &ReleaseSWSContext);
+    if (av_frame_get_buffer(nv12_frame.get(), 0) < 0) {
+        return AVFramePtr{nullptr, &ReleaseAVFrame};
+    }
+    m_sws_context.reset(sws_getCachedContext(m_sws_context.release(), frame.width, frame.height,
+        AVPixelFormat(frame.format), frame.width, frame.height, AV_PIX_FMT_NV12, SWS_FAST_BILINEAR,
+        nullptr, nullptr, nullptr));
+    if (!m_sws_context) {
+        return AVFramePtr{nullptr, &ReleaseAVFrame};
     }
     const auto res = sws_scale(m_sws_context.get(), frame.data, frame.linesize, 0, frame.height,
                                nv12_frame->data, nv12_frame->linesize);
-    if (res < 0) {
-        LOG_ERROR(Lib_AvPlayer, "Could not convert to NV12: {}", av_err2str(res));
+    if (res != frame.height) {
+        LOG_ERROR(Lib_AvPlayer, "NV12 conversion returned {} for a {}-row frame", res, frame.height);
         return AVFramePtr{nullptr, &ReleaseAVFrame};
     }
     return nv12_frame;
@@ -675,21 +682,25 @@ static u64 FrameTimestampMillis(const AVFrame& frame, AVRational time_base) {
     return millis > 0 ? u64(millis) : 0;
 }
 
-Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame) {
+std::optional<Frame> AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame) {
     ASSERT(frame.format == AV_PIX_FMT_NV12);
 
     auto p_buffer = buffer.GetBuffer();
-    Videodec::CopyNV12Data(p_buffer, frame);
+    const auto layout = Videodec::NV12Layout::From(frame.width, frame.height);
+    if (!p_buffer || !layout.Fits(buffer.Size()) ||
+        !layout.ValidPlanes(frame.data[0], frame.linesize[0], frame.data[1], frame.linesize[1])) {
+        return std::nullopt;
+    }
+    Core::Memory::Instance()->InvalidateMemory(reinterpret_cast<VAddr>(p_buffer), layout.Bytes());
+    layout.Copy<true>(p_buffer, frame.data[0], frame.linesize[0], frame.data[1], frame.linesize[1]);
 
     const auto stream_index = m_streams[m_video_stream_index.value()].ffmpeg_index;
     const auto stream = m_avformat_context->streams[stream_index];
     const auto timestamp = FrameTimestampMillis(frame, stream->time_base);
 
     const auto width = Common::AlignUp<u32>(frame.width, 16);
-    const auto pitch = Common::AlignUp<u32>(frame.width, 64);
-    const auto height = Common::AlignUp<u32>(frame.height, 16);
-    Core::Memory::Instance()->InvalidateMemory(reinterpret_cast<VAddr>(p_buffer),
-                                               (width * height * 3) / 2);
+    const auto pitch = layout.pitch;
+    const auto height = layout.padded_height;
 
     return Frame{
         .buffer = std::move(buffer),
@@ -746,6 +757,10 @@ void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
                 break;
             }
             auto up_frame = AVFramePtr(av_frame_alloc(), &ReleaseAVFrame);
+            if (!up_frame) {
+                m_state.OnError();
+                return;
+            }
             res = avcodec_receive_frame(m_video_codec_context.get(), up_frame.get());
             if (res < 0) {
                 if (res == AVERROR_EOF) {
@@ -765,15 +780,25 @@ void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
                     break;
                 }
                 if (up_frame->format != AV_PIX_FMT_NV12) {
-                    const auto nv12_frame = ConvertVideoFrame(*up_frame);
-                    if (nv12_frame == nullptr) {
+                    if (!Videodec::NV12Layout::From(up_frame->width, up_frame->height)
+                             .Fits(buffer->Size())) {
                         m_state.OnError();
                         return;
                     }
-                    m_video_frames.Push(PrepareVideoFrame(std::move(buffer.value()), *nv12_frame));
-                } else {
-                    m_video_frames.Push(PrepareVideoFrame(std::move(buffer.value()), *up_frame));
+                    up_frame = ConvertVideoFrame(*up_frame);
+                    if (!up_frame) {
+                        m_state.OnError();
+                        return;
+                    }
                 }
+                auto frame = PrepareVideoFrame(std::move(*buffer), *up_frame);
+                if (!frame) {
+                    LOG_ERROR(Lib_AvPlayer, "Invalid video planes or insufficient frame buffer for {}x{}",
+                              up_frame->width, up_frame->height);
+                    m_state.OnError();
+                    return;
+                }
+                m_video_frames.Push(std::move(*frame));
                 m_video_frames_cv.Notify();
             }
         }

@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_submit_lock_trace.h"
 #include "video_core/renderer_vulkan/vr_device_lost.h"
+#include "video_core/renderer_vulkan/vr_mirror_xr.h"
 #include "video_core/vram_report.h"
 
 namespace Vulkan {
@@ -760,7 +761,9 @@ bool VrOverlayRenderer::CreatePipelines() {
             .rasterizerDiscardEnable = false,
             .polygonMode = vk::PolygonMode::eFill,
             .cullMode = cull,
-            .frontFace = vk::FrontFace::eCounterClockwise,
+            // (Left-handed play: the flipped picture turns every outside face clockwise.)
+            .frontFace = settings.mirror ? vk::FrontFace::eClockwise
+                                         : vk::FrontFace::eCounterClockwise,
             .depthBiasEnable = false,
             .lineWidth = 1.0f,
         };
@@ -923,6 +926,9 @@ bool VrOverlayRenderer::LocateEyes(XrTime display_time, EyeViews& out) const {
         XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
     if ((state.viewStateFlags & needed) != needed) {
         return false;
+    }
+    if (settings.mirror) {
+        VrMirrorXr::Views(views.data(), count); // left-handed play: the mirror's eyes
     }
     for (u32 i = 0; i < 2; ++i) {
         out.pose[i] = views[i].pose;
@@ -1107,6 +1113,12 @@ void VrOverlayRenderer::PrepareDraw(u32 slot_index) {
     std::array<O::Vec3, 2> eye_pos;
     for (u32 i = 0; i < 2; ++i) {
         view_proj[i] = ViewProjection(pending.pose[i], pending.fov[i], settings.near_m);
+        if (settings.mirror) {
+            // Clip x reversed: the picture comes out flipped (row 0 of the matrix).
+            for (u32 col = 0; col < 4; ++col) {
+                view_proj[i].At(0, col) = -view_proj[i].At(0, col);
+            }
+        }
         const XrVector3f& p = pending.pose[i].position;
         eye_pos[i] = {p.x, p.y, p.z};
     }

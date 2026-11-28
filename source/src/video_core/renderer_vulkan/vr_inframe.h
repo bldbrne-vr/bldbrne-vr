@@ -63,10 +63,8 @@ public:
     VrInFrame(const VrInFrame&) = delete;
     VrInFrame& operator=(const VrInFrame&) = delete;
 
-    /// Starts building the item meshes (vertices, indices, ranges; with their occlusion bakes) on
-    /// a thread of their own, if not started yet. Every VrInFrame (one per eye) takes that one
-    /// library: called when VR starts, long before the first world frame needs it.
-    static void PrewarmMeshes();
+    /// At VR startup, start the mesh worker and compile the two shaders shared by both eyes.
+    static void Prewarm();
 
     struct Target {
         vk::ImageView color_view;   // sRGB view of the scene colour (eColorAttachmentOptimal)
@@ -130,12 +128,16 @@ public:
     // scene colour in eTransferSrcOptimal, `src_format` its own format; each eye's from its
     // `source_layer`). The eyes' mip chains go level by level, one barrier per level for all of
     // them. An eye without a probe (too small, a failure) lights its items with a neutral scene.
+    // `inset`: the probe is made from `src` less that many pixels on each side (dynamic
+    // resolution's view, for items drawn at the headset's projection); its size stays half of
+    // `extent` either way.
     struct ProbeSource {
         VrInFrame* renderer{};
         u32 source_layer{0};
     };
     static void ProbeScenes(const RecorderProxy& cmdbuf, std::span<const ProbeSource> eyes,
-                            vk::Image src, vk::Format src_format, vk::Extent2D extent);
+                            vk::Image src, vk::Format src_format, vk::Extent2D extent,
+                            vk::Offset2D inset = {});
     // Creates the pipeline for these formats ahead of the first list (no hitch at the first use),
     // for this camera's planes (0: the usual ones); the translucent one on a worker.
     void Warm(vk::Format color_format, vk::Format depth_format, float near_z = 0.0f,

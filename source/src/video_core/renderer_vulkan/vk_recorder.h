@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_push_split.h"
 #include "video_core/renderer_vulkan/vk_stereo_set_codec.h"
+#include "video_core/renderer_vulkan/vr_render_core_placement.h"
 
 #ifdef MemoryBarrier
 #undef MemoryBarrier
@@ -200,6 +201,9 @@ public:
         return enabled && !raw_borrowed;
     }
     void Configure(); // producer command-buffer boundary; drains when mode changes
+#ifdef _WIN32
+    void SetStageBThread(void* thread);
+#endif
     bool Threaded() const noexcept {
         return threaded;
     }
@@ -418,5 +422,10 @@ private:
     // FAST_CPU_DRIVER_CALLS (producer-owned): sets written by the replay, the bytes their packets
     // took, sets written by the recording thread (recorder off or raw) and raw drains it forced.
     u64 set_writes_encoded{}, set_write_bytes{}, set_writes_direct{}, set_writes_raw{};
+#ifdef _WIN32
+    void* stage_b_thread{};
+    RenderCorePlacement core_placement;
+    void UpdateCorePlacement();
+#endif
 };
 } // namespace Vulkan

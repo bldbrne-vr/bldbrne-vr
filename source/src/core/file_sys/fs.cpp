@@ -13,8 +13,14 @@
 #include "core/file_sys/devices/nop_device.h"
 #include "core/file_sys/file_override.h"
 #include "core/file_sys/fs.h"
+#include "core/file_sys/mod_layers.h"
 
 namespace Core::FileSys {
+
+#ifdef _WIN32
+// The launcher checks this export before starting a runtime with managed mod layers enabled.
+extern "C" __declspec(dllexport) void BldbrneVRManagedModsV1() {}
+#endif
 
 // Iterates a pre-collected entry list produced by merging the backend stack.
 class MergedDirectory final : public IDirectory {
@@ -124,10 +130,15 @@ void MntPoints::Mount(const std::filesystem::path& host_folder, const std::strin
         return make_backend(OverlayPath(base, suffix), /*ro=*/true);
     };
     // check for mods , updates,patch
+    size_t first_game_backend = 0;
     if (eligible_for_overlays) {
+        for (const auto& package : GameMods::Active(host_folder)) {
+            stack.push_back(std::make_shared<HostFsBackend>(package / "content", true));
+        }
         if (auto mods = probe_overlay(host_folder, "-mods")) {
             stack.push_back(std::move(mods));
         }
+        first_game_backend = stack.size();
         if (!ignore_game_patches) {
             auto patch = probe_overlay(host_folder, "-UPDATE");
             if (!patch) {
@@ -143,7 +154,7 @@ void MntPoints::Mount(const std::filesystem::path& host_folder, const std::strin
     ASSERT_MSG(base, "Mount: base path does not resolve to a backend: {}", host_folder.string());
     stack.push_back(std::move(base));
 
-    m_mnt_pairs.emplace_back(host_folder, guest_folder_sanitized, read_only, std::move(stack));
+    m_mnt_pairs.emplace_back(host_folder, guest_folder_sanitized, read_only, std::move(stack), first_game_backend);
 }
 
 void MntPoints::Unmount(const std::filesystem::path& host_folder, const std::string& guest_folder) {
@@ -210,6 +221,18 @@ std::filesystem::path MntPoints::GetHostPath(std::string_view path, bool* is_rea
 
     // Remove device (e.g /app0) from path to retrieve relative path.
     const auto rel_path = std::string_view{corrected_path}.substr(mount->mount.size() + 1);
+    if (path_type == HostPathType::Default) {
+        for (size_t i = 0; i < mount->first_game_backend; ++i) {
+            const auto& layer = mount->backends[i];
+            if (auto root = layer->RootHostPath(); root && *root != mods_path) {
+                const auto candidate = *root / rel_path;
+                if (std::filesystem::exists(candidate)) {
+                    if (is_read_only) *is_read_only = true;
+                    return candidate;
+                }
+            }
+        }
+    }
     host_path /= rel_path;
     patch_path /= rel_path;
     mods_path /= rel_path;
@@ -541,6 +564,40 @@ std::optional<std::vector<u8>> MntPoints::ReadFile(std::string_view guest_path) 
         return std::nullopt;
     }
     return buf;
+}
+
+std::optional<std::vector<u8>> MntPoints::ReadGameAsset(std::string_view relative, u64 max_size) {
+    const std::filesystem::path path{relative};
+    if (relative.empty() || path.has_root_path() ||
+        std::find(path.begin(), path.end(), "..") != path.end()) {
+        return std::nullopt;
+    }
+    // Snapshot ownership under the mount lock. Archive I/O can outlive an unmount.
+    std::vector<std::shared_ptr<IBackend>> layers;
+    {
+        std::scoped_lock lock{m_mutex};
+        for (const auto& mount : m_mnt_pairs) {
+            if (mount.mount == "/app0") {
+                layers.assign(mount.backends.begin() + mount.first_game_backend, mount.backends.end());
+                break;
+            }
+        }
+    }
+    for (const auto& layer : layers) {
+        auto file = layer->Open(relative, Common::FS::FileAccessMode::Read);
+        if (!file) {
+            continue;
+        }
+        const u64 size = file->Size();
+        if (!size || size > max_size) {
+            continue;
+        }
+        std::vector<u8> bytes(size);
+        if (file->Read(bytes.data(), size) == static_cast<s64>(size)) {
+            return bytes;
+        }
+    }
+    return std::nullopt;
 }
 
 int HandleTable::CreateHandle() {

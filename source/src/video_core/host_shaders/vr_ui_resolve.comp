@@ -425,12 +425,19 @@ void MarkerCompose(ivec2 p, inout vec3 k, inout vec3 t) {
     }
     const float s = MarkerScale();
     const vec2 c = 0.5 * vec2(float(b.x + b.z + 1u), float(b.y + b.w + 1u));
-    const vec2 lo = floor(c + s * (vec2(b.xy) - c)) - 1.0;
-    const vec2 hi = ceil(c + s * (vec2(b.zw + 1u) - c));
+#ifdef MIRROR_MARKER
+    // Left-handed play (core/vr/mirror_world.h): drawn about the mirror of its centre across the
+    // band, where the flipped eyes show its target; the marker itself as the game drew it.
+    const vec2 at = vec2(float(pc.band.z) - c.x, c.y);
+#else
+    const vec2 at = c;
+#endif
+    const vec2 lo = floor(at + s * (vec2(b.xy) - c)) - 1.0;
+    const vec2 hi = ceil(at + s * (vec2(b.zw + 1u) - c));
     if (float(p.x) < lo.x || float(p.y) < lo.y || float(p.x) > hi.x || float(p.y) > hi.y) {
         return;
     }
-    const vec2 src = c + (vec2(p) + 0.5 - c) / s - 0.5; // pixel centres at integers
+    const vec2 src = c + (vec2(p) + 0.5 - at) / s - 0.5; // pixel centres at integers
     const ivec2 i0 = ivec2(floor(src));
     const vec2 f = src - vec2(i0);
     vec3 km = vec3(0.0);

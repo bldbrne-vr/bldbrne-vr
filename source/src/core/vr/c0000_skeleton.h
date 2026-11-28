@@ -277,6 +277,7 @@ constexpr std::int32_t DmyIdLockOn = 220;         // lock-on point on Spine1 (ch
 constexpr std::int32_t DmyIdRightWeaponBase = 300; // weapon attach (FormA) on R_Weapon
 constexpr std::int32_t DmyIdRightTwoHand = 320;   // two-handed grip on R_Weapon
 constexpr std::int32_t DmyIdRightTwoHandBig = 322; // transformed greatswords/hammer, optional
+constexpr std::int32_t DmyIdKatanaCase = 412; // the Chikage's scabbard on B_Weapon_Case_spine, optional
 constexpr std::int32_t DmyIdLeftWeaponBase = 340; // off-hand weapon attach on L_Weapon
 constexpr std::int32_t DmyIdLeftShield = 341; // shield attach on L_Weapon
 constexpr std::int32_t DmyIdLeftHand = 344;       // on L_Hand (the wrist)
@@ -300,6 +301,7 @@ struct Skeleton {
     DummyPoly right_weapon_base{};
     DummyPoly right_two_hand{};
     DummyPoly right_two_hand_big{}; // optional; absent rigs retain the estimated grip rail
+    DummyPoly katana_case{};        // optional (id 0: none): core/vr/chikage.h
     DummyPoly left_weapon_base{};
     DummyPoly left_shield{}; // optional clash attachment
     DummyPoly left_gun{};

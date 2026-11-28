@@ -68,7 +68,7 @@ MapSweep SweepMapSphere(Body::Vec3 from, Body::Vec3 to, float radius,
                        Body::Vec3& normal, float& fraction);
 
 // This character's live collision body (its ragdoll's capsules, world), those within 6 m x scale
-// of `root`; the count written (0: none readable).
+// of `root`. Returned endpoints are finite and radii are finite and positive. Returns the count written.
 size_t VictimCapsules(const u8* victim, Body::Vec3 root, float scale,
                       std::span<GrabCamera::CollisionCapsule> out);
 

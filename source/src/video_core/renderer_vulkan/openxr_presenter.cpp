@@ -76,6 +76,7 @@
 #include "core/vr/furnace_audio.h"
 #include "core/vr/grip_adjust.h"
 #include "core/vr/gun_aim.h"
+#include "core/vr/lock_follow.h"
 #include "core/vr/gun_settings.h"
 #include "core/vr/gun_reload.h"
 #include "core/vr/gun_reload_audio.h"
@@ -96,6 +97,8 @@
 #include "core/vr/grip_preview.h"
 #include "core/vr/melee_settings.h"
 #include "core/vr/charge_audio.h"
+#include "core/vr/chikage.h"
+#include "core/vr/blood_blast.h"
 #include "core/vr/thunder_audio.h"
 #include "core/vr/tonitrus_charge.h"
 #include "core/vr/dual_blades.h"
@@ -185,6 +188,7 @@
 #include "video_core/renderer_vulkan/vr_eye_upscale.h"
 #include "video_core/renderer_vulkan/vr_eye_cant.h"
 #include "video_core/renderer_vulkan/vr_late_warp.h"
+#include "video_core/renderer_vulkan/vr_mirror_xr.h"
 #include "video_core/renderer_vulkan/vr_overlay.h"
 #include "video_core/renderer_vulkan/vr_ui_compose.h"
 #include "video_core/renderer_vulkan/vr_page_layer.h"
@@ -881,6 +885,9 @@ std::string MemorySummary(const Instance& instance) {
 // Translates controller state into emulated DualShock 4 input. Only changes are forwarded,
 // so a physical gamepad keeps working alongside the VR controllers.
 class PadMapper {
+    enum class TransformPulse : u8 { None, Gesture, Lift };
+    static constexpr int TransformBit = std::countr_zero(static_cast<u32>(PadButton::L1));
+
 public:
     // One deliberate gesture = one press that lasts long enough for the game to sample it
     // (the game reads the pad once per frame). A press requested while the button is down
@@ -893,6 +900,8 @@ public:
         if ((suppress_left > 0.0f && !deliberate) || pulse.queued) {
             return false;
         }
+        pulse.transform = TransformPulse::None;
+        pulse.sent = false;
         if (pulse.left > 0.0f || (last_mask & (1u << bit)) != 0) {
             pulse.queued = true;
             pulse.gap = std::max(0.07f, 1.5f * frame);
@@ -901,6 +910,27 @@ public:
         }
         pulse.left = MinPress();
         return true;
+    }
+
+    bool PressHandTransform(bool lift) {
+        if (!Press(PadButton::L1)) {
+            return false;
+        }
+        pulses[TransformBit].transform = lift ? TransformPulse::Lift : TransformPulse::Gesture;
+        return true;
+    }
+
+    bool HandTransformPending() const {
+        const auto& pulse = pulses[TransformBit];
+        return pulse.transform != TransformPulse::None && (pulse.queued || pulse.left > 0.0f);
+    }
+
+    // True if a lift's press was cancelled before reaching the emulated pad.
+    bool InterruptHandTransform() {
+        auto& pulse = pulses[TransformBit];
+        const bool refund_lift = pulse.transform == TransformPulse::Lift && !pulse.sent;
+        pulse = {};
+        return refund_lift;
     }
 
     float MinPress() const {
@@ -973,6 +1003,7 @@ public:
             if (pulse.left > 0.0f) {
                 mask |= 1u << bit;
                 pulse.left -= dt;
+                pulse.sent = true;
             }
         }
         // The emulated pad sets L2/R2 for any non-zero trigger axis, so drive the analog
@@ -1065,6 +1096,8 @@ private:
         float left{}; // remaining press time
         float gap{};  // forced release before a queued press
         bool queued{};
+        TransformPulse transform{TransformPulse::None};
+        bool sent{};
     };
     std::array<Pulse, 32> pulses{};
     std::array<float, 32> released{}; // see ReleasedFor
@@ -1175,6 +1208,43 @@ HapticPattern InjectThump(float amplitude) {
     pattern.own = true; // a clean thump: the armed vial's hum and any rumble wait
     return pattern.Pulse(std::clamp(amplitude * VR::GetSettings().haptic_inject, 0.0f, 1.0f),
                          InjectThumpMs);
+}
+
+// The Bloodletter's blast (UpdateBloodBlast, the game's BloodBlast melee event), felt as the
+// weapon is: a heavy flail full of blood, never a flat buzz.
+// Its trigger held: the blood pulsing low in the trigger's hand, BloodHoldHumLow at the press
+// rising to BloodHoldHumArmed armed, each beat dipping to BloodHoldPulseFloor of it between; the
+// pulse quickens from BloodHoldBeatHz to the armed heartbeat's (BloodArmedBeatS, the sword hand's
+// tick) and keeps step with it armed.
+// The blood exploding: a crack, the deep slam of the blast, its roll, then the burst's wet second
+// throb dying off (about 0.55 s; steps of 35 ms or more: a Touch motor over Link blurs shorter
+// ones), owning its hand while it plays; on PS VR2's Sense the crack crisp, the rest deep. The
+// other hand at BloodBlastBoomOther.
+// (A steady level gets no haptic floor: the dips stay over the least a Touch motor renders, ~0.1,
+// as weapon_hum's idle, so the pulse throbs instead of cutting out.)
+// Each beat's swing over 0.05 (and 15 %): what makes Output::Step send a new level at once.
+constexpr float BloodHoldHumLow = 0.17f;
+constexpr float BloodHoldHumArmed = 0.26f;
+constexpr float BloodHoldPulseFloor = 0.62f;
+constexpr float BloodHoldBeatHz = 1.8f;
+constexpr float BloodArmedBeatS = 0.45f;
+constexpr float BloodBlastBoomOther = 0.8f;
+constexpr s64 BloodBlastBoomNs = 560'000'000; // its length: the blast's own hits wait it out
+HapticPattern BloodBlastBoom(float k) {
+    HapticPattern pattern{};
+    pattern.priority = 2;
+    pattern.own = true;
+    pattern.impact = true;
+    const auto at = [k](float level) { return std::clamp(level * k, 0.0f, 1.0f); };
+    return pattern.Hz(240.0f)
+        .Pulse(at(1.0f), 35.0f)
+        .Hz(60.0f)
+        .Pulse(at(1.0f), 90.0f)
+        .Hz(50.0f)
+        .Ramp(at(0.8f), at(0.3f), 150.0f)
+        .Hz(45.0f)
+        .Pulse(at(0.6f), 45.0f)
+        .Ramp(at(0.5f), 0.0f, 230.0f);
 }
 
 // Blood Vial self-injection: the stab zones (the right hand and wrist, the forearm, the elbow and
@@ -1676,9 +1746,18 @@ struct OpenXRPresenter::Impl {
         if (!CreateSession()) {
             return;
         }
+        // Left-handed play: decided once, before the bindings (SuggestBindings) and the overlay.
+        mirror_world = VR::LatchMirrorWorld();
         actions.ready = CreateActions();
         if (!actions.ready) {
             LOG_WARNING(Render_Vulkan, "OpenXR controller actions unavailable; use a gamepad");
+            if (mirror_world) {
+                // Left-handed play needs the VR controllers (a gamepad is never mirrored).
+                mirror_world = false;
+                VR::ClearMirrorWorld();
+                LOG_WARNING(Render_Vulkan, "VR left-handed: off (no VR controllers: a gamepad "
+                                           "plays right-handed)");
+            }
         }
         InitOverlay();
         InitLateWarp();
@@ -1984,6 +2063,17 @@ struct OpenXRPresenter::Impl {
             system_name.assign(system_properties.systemName,
                                strnlen(system_properties.systemName, XR_MAX_SYSTEM_NAME_SIZE));
             panel = VrEyeScale::KnownPanel(system_name);
+            steamvr_meta_link = VrXrQueuePolicy::SteamVrOverMetaLink(system_name);
+            if (xr_runtime == VrXrQueuePolicy::Runtime::SteamVr) {
+                LOG_INFO(Render_Vulkan, "VR: SteamVR's display-time retarget {}",
+                         Plus0NextDisplay(steamvr_meta_link)
+                             ? (steamvr_meta_link ? "on (a Quest through Meta's Link)"
+                                                  : "on for this headset (VR_PLUS0_NEXT_DISPLAY=1)")
+                             : (steamvr_meta_link
+                                    ? "off (VR_PLUS0_NEXT_DISPLAY=0)"
+                                    : "off: a native SteamVR headset (VR_PLUS0_NEXT_DISPLAY=1 "
+                                      "turns it on)"));
+            }
             LOG_INFO(Render_Vulkan, "OpenXR system: '{}' (vendor {:#x}){}", system_name,
                      system_properties.vendorId,
                      panel.size.width != 0
@@ -2094,6 +2184,7 @@ struct OpenXRPresenter::Impl {
         const s64 offset = VrXrLayers::ClockOffset(samples);
         const bool apply = VrXrLayers::ApplyClockOffset(offset, xr_runtime);
         xr_clock_offset_ns = apply ? offset : 0;
+        xr_clock_calibrated = true;
         LOG_INFO(Render_Vulkan, "VR: XrTime offset vs steady_clock: {:.3f} ms ({})",
                  static_cast<double>(offset) * 1e-6,
                  apply ? "applied: every XrTime the presenter compares with the steady clock is "
@@ -2163,16 +2254,21 @@ struct OpenXRPresenter::Impl {
             handles[static_cast<size_t>(XB::Act::TouchTriggerLeft) + i] = actions.touch[i];
         }
 
+        // Left-handed play: each control drives the other hand's action (XB::Mirror; its own
+        // paths, so every profile stays valid). Right-handed: the action as listed.
+        const auto handle = [&](XB::Act act) {
+            return handles[static_cast<size_t>(mirror_world ? XB::Mirror(act) : act)];
+        };
         const auto suggest = [&](const char* profile, std::span<const XB::Binding> map,
                                  std::span<const XB::Binding> touches) {
             std::vector<XrActionSuggestedBinding> bindings;
             bindings.reserve(map.size() + touches.size());
             for (const XB::Binding& b : map) {
-                bindings.push_back({handles[static_cast<size_t>(b.act)], Path(b.path)});
+                bindings.push_back({handle(b.act), Path(b.path)});
             }
             for (const XB::Binding& b : touches) {
-                if (handles[static_cast<size_t>(b.act)] != XR_NULL_HANDLE) {
-                    bindings.push_back({handles[static_cast<size_t>(b.act)], Path(b.path)});
+                if (handle(b.act) != XR_NULL_HANDLE) {
+                    bindings.push_back({handle(b.act), Path(b.path)});
                 }
             }
             XrInteractionProfileSuggestedBinding suggested{
@@ -2260,7 +2356,8 @@ struct OpenXRPresenter::Impl {
                             p.path, XrResultText(result), p.fallback_layout);
             }
         }
-        LOG_INFO(Render_Vulkan, "OpenXR bindings: {} controller profiles accepted", accepted);
+        LOG_INFO(Render_Vulkan, "OpenXR bindings: {} controller profiles accepted{}", accepted,
+                 mirror_world ? " (left-handed: the controllers trade hands)" : "");
         return accepted > 0;
     }
 
@@ -2389,6 +2486,7 @@ struct OpenXRPresenter::Impl {
         os.scale = s.overlay_scale;
         os.msaa = static_cast<u32>(s.overlay_msaa);
         os.exposure = s.overlay_brightness;
+        os.mirror = mirror_world; // left-handed play: both overlays drawn flipped
         vial_attach.offset_m = {s.vial_offset_mm[0] * 1e-3f, s.vial_offset_mm[1] * 1e-3f,
                                 s.vial_offset_mm[2] * 1e-3f};
         vial_attach.rotation_deg = {s.vial_rot_deg[0], s.vial_rot_deg[1], s.vial_rot_deg[2]};
@@ -2440,6 +2538,9 @@ struct OpenXRPresenter::Impl {
             return;
         }
         const auto start = std::chrono::steady_clock::now();
+        // Left-handed play: its eyes made in the swapchain's format and blitted in mirrored
+        // (VrLateWarp::SetMirror), before its first frame.
+        late.SetMirror(mirror_world);
         if (!late.Init(VrLateWarp::FromInstance(instance, Scheduler::submit_mutex), session,
                        format)) {
             return;
@@ -2816,6 +2917,11 @@ struct OpenXRPresenter::Impl {
                         XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                     if (CheckXr(xrBeginSession(session, &begin_info), "session begin")) {
                         session_running = true;
+                        steamvr_target_history = {};
+                        steamvr_retarget_rejected = false;
+                        guard_last_predicted = 0;
+                        last_end_return_ns = 0;
+                        ready_phase_set = false;
                         session_refresh_hz = 0.0f;
                         shortest_period = 0;
                         RequestRefreshRate();
@@ -2991,7 +3097,10 @@ struct OpenXRPresenter::Impl {
         }
         const VR::Space::Shift delta =
             VR::Space::FromHead(last_head.head.orientation, last_head.head.position);
-        const VR::Space::Shift offset = VR::Space::Compose(app_space, delta);
+        // Left-handed play: the head is the mirror's; the new LOCAL is made in your room (its
+        // pose goes to OpenXR) and what is kept moves by the mirror's delta (ChangeSpace).
+        const VR::Space::Shift offset =
+            VR::Space::Compose(app_space, mirror_world ? VR::Mirror::YawShift(delta) : delta);
         XrReferenceSpaceCreateInfo info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
         info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
         info.poseInReferenceSpace = RuntimeSpacePose(offset);
@@ -3062,7 +3171,8 @@ struct OpenXRPresenter::Impl {
             }
         }
         recenter_fade.CutToBlack();
-        ChangeSpace(shift, space);
+        // Left-handed play: the runtime's pose is in your room; what is kept is in the mirror.
+        ChangeSpace(mirror_world ? VR::Mirror::YawShift(shift) : shift, space);
         LOG_INFO(Render_Vulkan, "VR: the headset recentred (LOCAL){}; space {}{}",
                  shift.known ? fmt::format(": forward turned {:.1f} deg, origin moved ({:.3f}, "
                                            "{:.3f}, {:.3f}) m, the view keeps its direction",
@@ -3214,6 +3324,13 @@ struct OpenXRPresenter::Impl {
                result == XR_ERROR_CALL_ORDER_INVALID || result == XR_ERROR_TIME_INVALID;
     }
 
+    // A rejected display time (SteamVR and an adjusted XrFrameEndInfo::displayTime): not the
+    // depth's or the overlay's fault, so it never starts their probes (the UI's and the late
+    // warp's skip it through IsSessionState); GuardDisplayTime stops adjusting for the session.
+    static bool IsTimeError(XrResult result) {
+        return result == XR_ERROR_TIME_INVALID;
+    }
+
     static bool IsLoss(XrResult result) {
         return result == XR_ERROR_SESSION_LOST || result == XR_ERROR_INSTANCE_LOST ||
                result == XR_ERROR_RUNTIME_FAILURE;
@@ -3255,11 +3372,14 @@ struct OpenXRPresenter::Impl {
                 const char* layout = VR::XrBindings::LayoutOf(name, dpad);
                 LOG_INFO(Render_Vulkan, "OpenXR {} controller profile: {} ({} layout)", hand, name,
                          *layout != '\0' ? layout : "unknown");
-                if (std::string_view{hand} == "/user/hand/left") {
-                    // No Y (the WMR trackpad clicks): left_scheme=2's modifier is the left stick
-                    // click held with the stick centred (UpdateGameplay).
-                    left_y_bound =
-                        VR::XrBindings::Binds(name, dpad, VR::XrBindings::Act::ButtonY);
+                // No Y (the WMR trackpad clicks): left_scheme=2's modifier is the left stick
+                // click held with the stick centred (UpdateGameplay). Left-handed play: the
+                // game's Y is your right controller's control that the map gives B.
+                namespace XB = VR::XrBindings;
+                if (std::string_view{hand} ==
+                    (mirror_world ? "/user/hand/right" : "/user/hand/left")) {
+                    left_y_bound = XB::Binds(
+                        name, dpad, mirror_world ? XB::Mirror(XB::Act::ButtonY) : XB::Act::ButtonY);
                 }
             } else {
                 LOG_INFO(Render_Vulkan, "OpenXR {} controller: none", hand);
@@ -3524,7 +3644,9 @@ struct OpenXRPresenter::Impl {
             lock_iter.submit_start = LockTrace::Now();
             Submit(frame_state);
             lock_iter.submitted = LockTrace::Now();
-            UpdatePacing();
+            if (!std::exchange(paced_early, false)) { // (VR_EARLY_VBLANK: Submit sent it already)
+                UpdatePacing();
+            }
             lock_wait_ns += lock_wait_frame_ns;
             lock_wait_max_ns = std::max(lock_wait_max_ns, lock_wait_frame_ns);
             // After xrEndFrame, so the memory queries and the log never delay a frame.
@@ -3803,6 +3925,152 @@ struct OpenXRPresenter::Impl {
         return seconds >= window.start && seconds < window.start + window.duration;
     }
 
+    // VR_DOUBLE_GUARD_MS=<ms> (SteamVR only; a test, off by default; 2026-11-21): an XR frame
+    // SteamVR gave the same predicted display time as the one before (its +0: the previous
+    // xrEndFrame returned before the refresh that shows that frame) goes to xrEndFrame no sooner
+    // than this long after that return, so it lands on the next refresh instead of replacing the
+    // previous frame on the same one (a game frame never on screen, then a repeat: the weapon
+    // jumps two steps and holds one). Only +0 frames, at most the guard. The SteamVR mock with
+    // double takes (fogcap/mockxr_steam, VR_MOCK_NOTE): repeats seen 26-28 -> 11-15 per 5 s (about
+    // 8 of them its scripted holds); without double takes about neutral. A `VR double guard:`
+    // line every 5 s.
+    //
+    // VR_DOUBLE_GUARD_GRID=<ms> (SteamVR only; a test, off by default): the same aim without
+    // SteamVR's flag: on our own steady refresh grid (the predicted display times' grid + where
+    // SteamVR's xrEndFrame usually returns on it, softly averaged) an early return is one before
+    // its slot, and the next frame waits for that slot + <ms>.
+    //
+    // VR_PLUS0_NEXT_DISPLAY (SteamVR over Meta's Link only by default; =1 also on native SteamVR
+    // headsets, =0 off): use a vacant earlier refresh when a +2 leaves time for it; a +0 that
+    // would share the refresh the previous frame claimed asks for the next one
+    // (VrXrQueuePolicy::SteamVrTargetHistory). Neither adjustment delays following predictions.
+    // Native SteamVR headsets keep the runtime's predictions: its compositor runs at a high GPU
+    // priority there, without Meta's stacked on it, and the retarget is only measured over Link.
+    XrTime GuardDisplayTime(XrTime predicted, bool stereo_submitted) {
+        if (xr_runtime != VrXrQueuePolicy::Runtime::SteamVr) {
+            return predicted;
+        }
+        const auto wait_ns = [](const char* key, s64 fallback) {
+            const char* v = std::getenv(key);
+            if (v == nullptr) {
+                return fallback;
+            }
+            const double ms = std::atof(v);
+            return std::isfinite(ms) ? static_cast<s64>(std::clamp(ms, 0.0, 4.0) * 1e6)
+                                     : fallback;
+        };
+        static const s64 guard = wait_ns("VR_DOUBLE_GUARD_MS", 0);
+        static const s64 grid_margin = wait_ns("VR_DOUBLE_GUARD_GRID", -1);
+        const bool retarget = Plus0NextDisplay(steamvr_meta_link) && !steamvr_retarget_rejected;
+        if (guard <= 0 && grid_margin < 0 && !retarget) {
+            return predicted;
+        }
+        const s64 period = static_cast<s64>(display_period);
+        const bool same = guard_last_predicted > 0 && period > 0 && predicted > 0 &&
+                          std::llabs(static_cast<s64>(predicted - guard_last_predicted)) <
+                              period / 2;
+        guard_last_predicted = predicted;
+        s64 now = SteadyNs();
+        s64 until = 0;
+        guard_same += same;
+        if (guard > 0 && same && last_end_return_ns != 0) {
+            until = last_end_return_ns + guard;
+        }
+        if (grid_margin >= 0 && ready_phase_set && last_end_return_ns != 0 && period > 0) {
+            // The slot the last return belongs to: the expected return nearest it.
+            const s64 base = ready_grid_ns + ready_phase_ns;
+            const s64 k = std::llround(static_cast<double>(last_end_return_ns - base) /
+                                       static_cast<double>(period));
+            until = std::max(until, base + k * period + grid_margin);
+        }
+        if (until > now) {
+            ++guard_waits;
+            guard_wait_ms += static_cast<double>(until - now) * 1e-6;
+            Common::PreciseSleepUntil(
+                std::chrono::steady_clock::time_point{std::chrono::nanoseconds{until}});
+            now = SteadyNs();
+        }
+        const XrTime target = retarget && stereo_submitted && xr_clock_calibrated
+                                  ? steamvr_target_history.Next(predicted, period, SteadyToXr(now))
+                                  : predicted;
+        guard_earlier += target < predicted;
+        guard_next += target > predicted;
+        ++guard_frames;
+        if (guard_log_ns == 0) {
+            guard_log_ns = now;
+        } else if (now - guard_log_ns >= 5'000'000'000LL) {
+            LOG_INFO(Render_Vulkan,
+                     "VR double guard: {} XR frames, {} with SteamVR's +0, {} targets earlier, "
+                     "{} later, {} held back (avg {:.2f} ms); returns {:+.2f} ms from the grid on "
+                     "average, clock calibrated {}",
+                     guard_frames, guard_same, guard_earlier, guard_next, guard_waits,
+                     guard_waits != 0 ? guard_wait_ms / static_cast<double>(guard_waits) : 0.0,
+                     static_cast<double>(ready_phase_ns) * 1e-6, xr_clock_calibrated);
+            guard_log_ns = now;
+            guard_frames = guard_same = guard_waits = guard_next = guard_earlier = 0;
+            guard_wait_ms = 0.0;
+        }
+        return target;
+    }
+    // The retarget for this SteamVR headset (GuardDisplayTime is SteamVR's only): over Meta's Link
+    // unless VR_PLUS0_NEXT_DISPLAY is off; on a native SteamVR headset only when it is on.
+    static bool Plus0NextDisplay(bool meta_link) {
+        static const char* const v = std::getenv("VR_PLUS0_NEXT_DISPLAY");
+        if (VrXrQueuePolicy::EnvOff(v)) {
+            return false;
+        }
+        return meta_link || VrXrQueuePolicy::EnvOn(v);
+    }
+    // After xrEndFrame (SteamVR, VR_DOUBLE_GUARD_GRID): where the return falls on the refresh grid
+    // of the predicted display time (always on a refresh, whatever SteamVR's +0/+2), averaged.
+    void NoteReadyGrid(XrTime predicted) {
+        static const bool grid = std::getenv("VR_DOUBLE_GUARD_GRID") != nullptr;
+        if (!grid || xr_runtime != VrXrQueuePolicy::Runtime::SteamVr || predicted == 0 ||
+            display_period <= 0) {
+            return;
+        }
+        const s64 period = static_cast<s64>(display_period);
+        const auto wrap = [period](s64 d) {
+            d %= period;
+            if (d < -period / 2) {
+                d += period;
+            } else if (d >= period / 2) {
+                d -= period;
+            }
+            return d;
+        };
+        const s64 grid_ns = XrToSteady(predicted);
+        const s64 off = wrap(last_end_return_ns - grid_ns);
+        if (!ready_phase_set) {
+            ready_phase_ns = off;
+            ready_phase_set = true;
+        } else {
+            ready_phase_ns = wrap(ready_phase_ns +
+                                  std::llround(0.05 * static_cast<double>(wrap(off - ready_phase_ns))));
+        }
+        ready_grid_ns = grid_ns;
+    }
+    // VR_MOCK_NOTE=1 (tests): the shown pair's serial to the mock runtime (a benchmark_xr.dll that
+    // exports MockXrNoteFrame), which scores what each refresh shows. Elsewhere: nothing.
+    static void MockNoteFrame(u64 serial) {
+#ifdef _WIN32
+        using NoteFn = void (*)(u64);
+        static const NoteFn note = []() -> NoteFn {
+            if (std::getenv("VR_MOCK_NOTE") == nullptr) {
+                return nullptr;
+            }
+            HMODULE mock = GetModuleHandleA("benchmark_xr.dll");
+            return mock ? reinterpret_cast<NoteFn>(GetProcAddress(mock, "MockXrNoteFrame"))
+                        : nullptr;
+        }();
+        if (note != nullptr) {
+            note(serial);
+        }
+#else
+        (void)serial;
+#endif
+    }
+
     void UpdateHead(XrTime display_time) {
         if (TestTrackingLoss()) {
             VR::PublishHead({});
@@ -3846,6 +4114,11 @@ struct OpenXRPresenter::Impl {
             count != 2) {
             VR::PublishHead({});
             return;
+        }
+        // Left-handed play: the head and the eyes in the mirror (vr_mirror_xr.h).
+        if (mirror_world) {
+            VrMirrorXr::Located(head);
+            VrMirrorXr::Views(views.data(), count);
         }
 
         constexpr XrSpaceLocationFlags needed =
@@ -4102,6 +4375,9 @@ struct OpenXRPresenter::Impl {
         if (XR_FAILED(xrLocateSpace(space, local_space, time, &location))) {
             return;
         }
+        if (mirror_world) {
+            VrMirrorXr::Located(location); // the pose and its velocity in the mirror
+        }
         const XrSpaceLocationFlags flags = location.locationFlags;
         hand.position_valid = (flags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
         hand.position_tracked = (flags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT) != 0;
@@ -4285,9 +4561,15 @@ struct OpenXRPresenter::Impl {
         XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
         info.action = action;
         XrActionStateVector2f state{XR_TYPE_ACTION_STATE_VECTOR2F};
-        return XR_SUCCEEDED(xrGetActionStateVector2f(session, &info, &state)) && state.isActive
-                   ? state.currentState
-                   : XrVector2f{0.0f, 0.0f};
+        XrVector2f v = XR_SUCCEEDED(xrGetActionStateVector2f(session, &info, &state)) &&
+                               state.isActive
+                           ? state.currentState
+                           : XrVector2f{0.0f, 0.0f};
+        // Left-handed play (vr_mirror_xr.h): a stick pushed to your right is the mirror's left.
+        if (mirror_world) {
+            v.x = VR::Mirror::StickX(v.x);
+        }
+        return v;
     }
 
     struct HandState {
@@ -4327,6 +4609,9 @@ struct OpenXRPresenter::Impl {
         location.next = &velocity;
         if (XR_FAILED(xrLocateSpace(space, local_space, time, &location))) {
             return hand;
+        }
+        if (mirror_world) {
+            VrMirrorXr::Located(location); // the pose and its velocity in the mirror
         }
         constexpr XrSpaceLocationFlags tracked =
             XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
@@ -4422,7 +4707,8 @@ struct OpenXRPresenter::Impl {
     // The control that carries `logical` now, by name ("left stick click", or with the swap
     // "right stick click"): the log says what the player pressed.
     const char* ThumbName(VR::Thumbs::Control logical) const {
-        return VR::Thumbs::LabelFor(logical, thumbs_swapped);
+        // (Left-handed play: the control where your hand presses it, VR::Thumbs::Mirrored.)
+        return VR::Thumbs::LabelFor(logical, thumbs_swapped, mirror_world);
     }
 
     // The vibration of the hand that carries `logical` (a tick for a thumb control goes to the
@@ -4496,7 +4782,7 @@ struct OpenXRPresenter::Impl {
         // Prefer Y where Menu has runtime dashboard gestures (SteamVR / VDXR).
         const bool menu_runtime = runtime_y_menu;
         const VR::Thumbs::Layout layout{settings.left_scheme, settings.controls_classic, swap,
-                                        settings.inject, y_menu, menu_runtime};
+                                        settings.inject, y_menu, menu_runtime, mirror_world};
         VR::SetYMenu(y_menu, menu_runtime); // the VR page's controls view
         if (!thumbs_logged || !(*thumbs_logged == layout)) {
             thumbs_logged = layout;
@@ -4526,8 +4812,27 @@ struct OpenXRPresenter::Impl {
     bool free_camera_sticks_armed = false;
 
     void ResetMachines() {
+        blood_blast_gate.Reset();
+        blood_blast_window = 0;
+        blood_blast_pending = false;
+        blood_blast_beat = 0.0f;
+        blood_hum_level = 0.0f; // (the sustains are zeroed below)
+        blood_hum_phase = 0.0f;
+        blood_boom_ns = 0;
+        if (blood_check_enemy) {
+            blood_check_enemy = false;
+            VR::BloodBlast::g_check_enemy.store(false, std::memory_order_relaxed);
+        }
         free_camera_y.Reset();
         free_camera_sticks_armed = false;
+        chikage_context_ns = VR::Body::SteadyNowNs();
+        chikage_draw_request = VR::Chikage::DrawRequest::None;
+        chikage_owns_grip = chikage_hand_held = chikage_sheathed = false;
+        chikage_pose_weapon = -1;
+        chikage_draw_window = 0;
+        chikage_grip_down = true; // a squeeze held across the switch cannot start a grab
+        chikage_step_until = chikage_depth_ns = 0;
+        chikage_rasp = chikage_slide = 0.0f;
         ResetMenuThumbs();
         melee.Reset();
         if (melee_window.Current().open) {
@@ -5493,8 +5798,11 @@ struct OpenXRPresenter::Impl {
         head.next = &head_velocity;
         constexpr XrSpaceLocationFlags head_valid =
             XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
-        const bool head_ok = XR_SUCCEEDED(xrLocateSpace(view_space, local_space, time, &head)) &&
-                             (head.locationFlags & head_valid) == head_valid;
+        const bool head_located = XR_SUCCEEDED(xrLocateSpace(view_space, local_space, time, &head));
+        if (head_located && mirror_world) {
+            VrMirrorXr::Located(head); // the head and its velocity in the mirror
+        }
+        const bool head_ok = head_located && (head.locationFlags & head_valid) == head_valid;
         const VR::Vec3 head_v =
             head_ok && (head_velocity.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT)
                 ? VR::Vec3{head_velocity.linearVelocity.x, head_velocity.linearVelocity.y,
@@ -5691,8 +5999,32 @@ struct OpenXRPresenter::Impl {
         };
         // While Menu is held both sticks belong to the Menu combos below; while the weapon grip
         // adjust has the weapon frozen the hunter stands still.
-        const XrVector2f move_game =
+        XrVector2f move_game =
             in[PhysMenu] || grip_adjust.Frozen() ? XrVector2f{0.0f, 0.0f} : move;
+        // Lock-on follow (core/vr/lock_follow.h MoveCommit, lockon_move_commit_s): the stick steers
+        // along the view, so the view's follow turns are taken off a held stick: a run, a strafe
+        // or a dodge keeps its direction through them, easing back to the view.
+        {
+            const float follow_turn = VR::TakeLockFollowTurn();
+            const bool was_committed = move_commit.Active();
+            float commit = 0.0f;
+            // While the game's camera faces the target the stick is relative to the target
+            // (LockAimYaw): the view's turns do not move it, nothing to take off.
+            float aim_yaw = 0.0f;
+            if (!screen_context && !menu_context && !page.IsOpen() && !VR::LockAimYaw(aim_yaw)) {
+                commit = move_commit.Step(VR::GetSettings().lockon_move_commit_s, follow_turn,
+                                          move_game.x, move_game.y, dt);
+            } else {
+                move_commit.Reset();
+            }
+            if (commit != 0.0f) {
+                VR::LockFollow::RotateStick(move_game.x, move_game.y, commit);
+                if (!was_committed) {
+                    LOG_INFO(Render_Vulkan, "VR input: lock-on follow: the run keeps its "
+                             "direction ({:+.0f} deg taken off the stick)", commit * 57.2957795f);
+                }
+            }
+        }
         std::array<s32, 6> axes{axis(move_game.x), axis(-move_game.y), 128, 128, 0, 0};
 
         // Menu (every context): tap = Options, hold (0.7 s) = recenter the view (StartRecenter;
@@ -5751,7 +6083,17 @@ struct OpenXRPresenter::Impl {
                 std::abs(move.x) > 1.5f * std::abs(move.y)) {
                 stereo_armed = false;
                 menu_long_fired = true;
-                const s32 mode = VR::CycleStereoMode(move.x > 0.0f ? 1 : -1);
+                // Left-handed play: mono and AER are not mirrored (their frames take the unflipped
+                // copy, which holds the last mirrored pair), so the mode stays as it is: its own
+                // pulses (mode 2's) answer the push.
+                const VR::StereoConfig live = VR::GetStereo();
+                const s32 mode = mirror_world ? (live.stereo ? live.mode : 0)
+                                              : VR::CycleStereoMode(move.x > 0.0f ? 1 : -1);
+                if (mirror_world) {
+                    LOG_INFO(Render_Vulkan, "VR left-handed: Menu + stick left/right: the stereo "
+                                            "mode stays {} (mono and AER are not mirrored)",
+                             VR::StereoModeName(mode));
+                }
                 const HapticPattern pattern =
                     mode == 0 ? Tick(0.3f, 250.0f, 2)
                               : Repeat(static_cast<u32>(mode), 0.5f, 40.0f, 110.0f, 2);
@@ -5911,6 +6253,28 @@ struct OpenXRPresenter::Impl {
             in = Gate(raw);
         }
         const auto native_menu = VR::PagePad::NativeMenuButtons(EmulatorSettings.IsCircleEnter());
+        // Left-handed play: a page, a menu, the title or the virtual screen is never flipped (what
+        // is read keeps its pixels), so here a stick pushed right steps right: its x as your thumb
+        // pushes it (GetVector reversed it for the mirrored world). Right-handed: as they are.
+        const XrVector2f move_read =
+            mirror_world ? XrVector2f{-move_game.x, move_game.y} : move_game;
+        const XrVector2f look_read =
+            mirror_world ? XrVector2f{-look_game.x, look_game.y} : look_game;
+        // The gamepad's and the keyboard's own sticks (and the mouse's) the same way: mirrored in
+        // gameplay, as the world is, and as pushed on what is read (Input::GameController).
+        if (mirror_world) {
+            const bool pad_mirror = !(screen_context || menu_context || page.IsOpen());
+            if (pad_mirror != pad_mirror_x) {
+                pad_mirror_x = pad_mirror;
+                (*Common::Singleton<Input::GameControllers>::Instance())[0]->SetPhysicalMirrorX(
+                    pad_mirror);
+                if (!pad_mirror_logged) {
+                    pad_mirror_logged = true;
+                    LOG_INFO(Render_Vulkan, "VR left-handed: the gamepad's and the keyboard's "
+                                            "sticks mirrored in gameplay (as pushed in menus)");
+                }
+            }
+        }
         if (screen_context || menu_context || page.IsOpen()) {
             // Virtual screen: Quest menu conventions. While the game itself shows its title,
             // menus or a loading screen (no gameplay camera updates), the left stick steps
@@ -5927,7 +6291,7 @@ struct OpenXRPresenter::Impl {
             }
             if (page.IsOpen()) {
                 // The VR page has the controllers; the game's grid under it gets nothing.
-                UpdatePage(in, move_game, look_game, time, dt);
+                UpdatePage(in, move_read, look_read, time, dt);
                 axes[0] = axes[1] = axes[2] = axes[3] = 128;
                 ResetMenuThumbs(); // a click or X held into the page is no tap after it
             } else if (menu_context && !menu_open) {
@@ -6001,17 +6365,17 @@ struct OpenXRPresenter::Impl {
                     hold(PadButton::L3, hin[PhysStickL]);
                     hold(PadButton::R3, hin[PhysStickR]);
                 }
-                const float left_len = std::hypot(move_game.x, move_game.y);
-                const float right_len = std::hypot(look_game.x, look_game.y);
-                MenuStick(left_len >= right_len ? move_game : look_game, dt);
+                const float left_len = std::hypot(move_read.x, move_read.y);
+                const float right_len = std::hypot(look_read.x, look_read.y);
+                MenuStick(left_len >= right_len ? move_read : look_read, dt);
                 axes[0] = axes[1] = axes[2] = axes[3] = 128;
             } else {
                 // The screen chosen with Menu during gameplay: the DS4 layout, sticks analog,
                 // as the hands hold them (the standard layout with swap_sticks too). Y stays
                 // Triangle with y_menu (a full pad; Tab, which chose it, brings VR back).
                 const PhysicalState hin = thumbs_swapped ? SwapThumbs(in) : in;
-                const XrVector2f stick_l = thumbs_swapped ? look_game : move_game;
-                const XrVector2f stick_r = thumbs_swapped ? move_game : look_game;
+                const XrVector2f stick_l = thumbs_swapped ? look_read : move_read;
+                const XrVector2f stick_r = thumbs_swapped ? move_read : look_read;
                 hold(PadButton::Cross, hin[PhysA]);
                 hold(PadButton::Circle, hin[PhysB]);
                 hold(PadButton::Square, hin[PhysX]);
@@ -6070,6 +6434,13 @@ struct OpenXRPresenter::Impl {
         const bool walk_body_ok = VR::Body::LatestBodyStatus(walk_body) &&
             walk_now >= walk_body.steady_ns && walk_now - walk_body.steady_ns < 150'000'000 &&
             walk_body.roomscale_ok;
+        if (pad.HandTransformPending() &&
+            (screen_context || menu_context || page.IsOpen() || !VR::IsFirstPerson() ||
+             TransformInterrupted(walk_body, walk_now))) {
+            if (pad.InterruptHandTransform()) {
+                right_grip.CancelCooldown();
+            }
+        }
         const bool walk_allowed = settings.roomscale_walk && settings.positional &&
             !settings.seated && VR::IsFirstPerson() && VR::IsImmersive() &&
             !screen_context && !menu_context && !page.IsOpen() && !VR::CinematicActive() &&
@@ -6539,6 +6910,179 @@ struct OpenXRPresenter::Impl {
     // the hunter's arm cannot reach: a faint tick on that hand; the body turned itself off: the
     // deny pattern on both) and the ghost hands' opacity per controller (ghost_hands), which the
     // VR overlay draws (DrawOverlay); its changes are logged with VR_BODY_LOG.
+    // The Chikage's scabbard (core/vr/chikage.h; the body's pose copy judges it on the drawn
+    // models): what each step feels like, the blood a seated blade comes out with (ChikageBloody:
+    // the same blade, its next hit that lands worth more) and the quick draw (UpdatePhysicalMelee
+    // opens its window; the step forward: ApplyChikageStep).
+    void OnScabbardEvent(const VR::Body::BodyEvent& e) {
+        using K = VR::Body::BodyEventKind;
+        const auto& ts = VR::Tricks::GetTrickSettings();
+        if (screen_context || menu_context || VR::Page::Runtime::Get().IsOpen() ||
+            !VR::Tricks::Scabbard(RightFamily()) ||
+            !VR::Chikage::FreshDraw(e.pose_ns, VR::Body::SteadyNowNs(), chikage_context_ns,
+                                    e.weapon_id, chikage_pose_weapon)) return;
+        const bool feel = ts.haptics;
+        auto& lh = haptics[0];
+        auto& rh = haptics[1];
+        switch (e.kind) {
+        case K::ScabbardLunge:
+            // The step forward as the pull gets going (chikage.h LungeShare), unless an enemy is
+            // right ahead; the draw itself then keeps it (ScabbardDraw).
+            // (The dash moves the hunter now: bloodborne_body.cpp asks it. The stick's step never
+            // joins it, whatever an older vr.ini still holds in chikage_draw_step_ms: a code
+            // review, 2026-11-20: a generated 320 would have added the slow second movement.)
+            chikage_lunge_ns = VR::Body::SteadyNowNs();
+            chikage_lunge_blocked = e.side == 1;
+            chikage_draw_weapon = e.weapon_id;
+            break;
+        case K::ScabbardTaken:
+            // A light tick in the left hand (2026-11-20: "when we select the scabbard
+            // the left controller should do a light vibration once").
+            if (feel) {
+                lh.Play(Tick(0.25f, 14.0f, 1));
+            }
+            break;
+        case K::ScabbardIn:
+            if (feel) {
+                rh.Play(Tick(0.2f, 12.0f, 1));
+            }
+            break;
+        case K::ScabbardSeated:
+            if (feel) {
+                // The blade taking blood: a wet, heavy beat in the sword hand.
+                HapticPattern beat{};
+                beat.priority = 2;
+                beat.Pulse(0.7f, 30.0f).Ramp(0.35f, 0.0f, 180.0f);
+                rh.Play(beat);
+                lh.Play(Tick(0.2f, 15.0f, 1));
+            }
+            break;
+        case K::ScabbardHome:
+            if (feel) {
+                rh.Play(Tick(0.6f, 18.0f, 2));
+                lh.Play(Tick(0.3f, 14.0f, 1));
+            }
+            break;
+        case K::ScabbardOut:
+            if (feel) {
+                rh.Play(Tick(0.2f, 10.0f, 1));
+            }
+            if (e.side == 1) {
+                ChikageBloody();
+            }
+            break;
+        case K::ScabbardDraw:
+            ChikageBloody();
+            // The step forward from the draw itself, not its attack's opening a few updates later
+            // (2026-11-20 night: "go forward a little sooner"), when the pull did not
+            // already start it (ScabbardLunge, the same withdrawal) or found an enemy right ahead.
+            if (VR::Body::SteadyNowNs() - chikage_lunge_ns > 500'000'000) {
+                chikage_step_until = VR::Body::SteadyNowNs() +
+                                     static_cast<s64>(ts.chikage_draw_step_ms * 1e6f);
+            }
+            chikage_draw_request = VR::Chikage::DrawRequest::New;
+            chikage_draw_ns = e.pose_ns;
+            chikage_draw_weapon = e.weapon_id;
+            chikage_draw_power = std::clamp(e.b, 0.0f, 1.0f);
+            if (feel) {
+                HapticPattern slash{};
+                slash.priority = 3;
+                slash.Pulse(0.75f + 0.25f * chikage_draw_power, 35.0f).Ramp(0.6f, 0.0f, 170.0f);
+                rh.Play(slash);
+                lh.Play(Tick(0.3f, 18.0f, 1));
+            }
+            LOG_INFO(Render_Vulkan, "VR chikage: QUICK DRAW at {:.2f} m/s (power {:.2f})", e.a,
+                     chikage_draw_power);
+            break;
+        default:
+            break;
+        }
+    }
+
+    // A seated blade came out of the scabbard: bloodied for BloodS, from the next swing on (the
+    // game shows it: Combat::ChikageBlood); spent by the first hit that lands with it
+    // in the damage hook, gone with the blooded form.
+    void ChikageBloody() {
+        if (RightFormB()) return;
+        const s64 now = VR::Body::SteadyNowNs();
+        chikage_blood_until_ns = now + static_cast<s64>(VR::Chikage::BloodS * 1e9f);
+        chikage_blood_from = melee_window.Current().serial + 1;
+        chikage_blood_weapon = chikage_pose_weapon;
+        VR::Combat::PublishChikageBlood({chikage_blood_until_ns});
+        LOG_INFO(Render_Vulkan, "VR chikage: the blade comes out bloodied ({:.0f} s, its next hit "
+                                "that lands +{:.0f}%)",
+                 VR::Chikage::BloodS, VR::Tricks::GetTrickSettings().chikage_blood_pct);
+    }
+
+    // The quick draw's step forward (chikage_draw_step_ms): the left stick ahead of the view, as
+    // the game's own draw steps in.
+    void ApplyChikageStep(std::array<s32, 6>& axes) {
+        if (!chikage_step_until) return;
+        if (VR::Body::SteadyNowNs() >= chikage_step_until ||
+            chikage_pose_weapon != chikage_draw_weapon ||
+            std::abs(axes[0] - 128) > 19 || axes[1] > 147) {
+            chikage_step_until = 0;
+            return;
+        }
+        axes[0] = 128;
+        axes[1] = 1; // full ahead
+    }
+
+    // The left hand at the Chikage's scabbard or holding it (the body's status): that squeeze is
+    // the scabbard's, never the quick items' (hand_owns_grip, until it opens).
+    void UpdateChikageGrip() {
+        const bool enabled = VR::Tricks::Scabbard(RightFamily());
+        if (!enabled && chikage_pose_weapon < 0 && !chikage_owns_grip && !chikage_blood_until_ns &&
+            !chikage_rasp && !chikage_depth_ns) return;
+        VR::Body::BodyStatus body{};
+        const s64 now = VR::Body::SteadyNowNs();
+        const bool fresh = enabled && VR::Body::LatestBodyStatus(body) && body.driven &&
+                           body.weapon_family == VR::Chikage::Family && body.scabbard_pose_ns > chikage_context_ns &&
+                           now >= body.scabbard_pose_ns && now - body.scabbard_pose_ns < VR::Chikage::DrawFreshNs;
+        chikage_pose_weapon = fresh ? body.weapon_id : -1;
+        chikage_sheathed = fresh && body.scabbard_in &&
+                            (body.scabbard_loaded || body.scabbard_depth > VR::Chikage::SheathedM);
+        const bool taking = fresh && body.scabbard_near && !chikage_grip_down;
+        chikage_owns_grip = hand_grip_l &&
+                            (chikage_owns_grip || taking || (fresh && body.scabbard_held));
+        // A simultaneous trigger press must not fire between the grab and the next body pose.
+        chikage_hand_held = chikage_owns_grip && fresh && (body.scabbard_held || body.scabbard_near);
+        chikage_grip_down = hand_grip_l;
+        hand_owns_grip = hand_owns_grip || chikage_owns_grip;
+        // The blade sliding in its scabbard: a rasp in the sword hand by how fast it slides (the
+        // body's depth, as often as it is new); only the level this wrote is taken back.
+        {
+            auto& rh = haptics[1];
+            float rasp = 0.0f;
+            if (fresh && body.scabbard_in && VR::Tricks::GetTrickSettings().haptics) {
+                if (body.scabbard_pose_ns != chikage_depth_ns && chikage_depth_ns != 0) {
+                    const float dt = static_cast<float>(body.scabbard_pose_ns - chikage_depth_ns) * 1e-9f;
+                    if (dt > 0.0f && dt < 0.2f) {
+                        chikage_slide = (body.scabbard_depth - chikage_depth) / dt;
+                    }
+                }
+                rasp = VR::Chikage::SlideRasp(chikage_slide);
+            } else {
+                chikage_slide = 0.0f;
+            }
+            chikage_depth = body.scabbard_depth;
+            chikage_depth_ns = fresh && body.scabbard_in ? body.scabbard_pose_ns : 0;
+            if (rh.sustain == chikage_rasp || rh.sustain == 0.0f) {
+                rh.sustain = rasp;
+                chikage_rasp = rasp;
+            } else if (rasp == 0.0f) {
+                chikage_rasp = 0.0f; // another owns the hand's level now
+            }
+        }
+        // Its blood is the clean blade's: gone with another weapon in the hand or the blooded form.
+        if (chikage_blood_until_ns != 0 &&
+            (chikage_blood_until_ns <= now || !enabled || (fresh && chikage_pose_weapon != chikage_blood_weapon) ||
+             RightFormB())) {
+            chikage_blood_until_ns = 0;
+            VR::Combat::PublishChikageBlood({0});
+        }
+    }
+
     void UpdateBodyFeedback(float dt) {
         namespace B = VR::Body;
         const auto& body = B::GetBodySettings();
@@ -6550,6 +7094,10 @@ struct OpenXRPresenter::Impl {
                 if (body.body_haptics && (e.side == 0 || e.side == 1)) {
                     haptics[static_cast<size_t>(e.side)].Play(Tick(0.1f, 10.0f, 0));
                 }
+                continue;
+            }
+            if (e.kind >= B::BodyEventKind::ScabbardIn && e.kind <= B::BodyEventKind::ScabbardLunge) {
+                OnScabbardEvent(e);
                 continue;
             }
             if (body.body_haptics) {
@@ -6678,6 +7226,20 @@ struct OpenXRPresenter::Impl {
             g.confirm = "Pad";
             g.back = "Menu";
         }
+        if (mirror_world) {
+            // Left-handed play: each control drives the other hand's action (XrBindings::Mirror):
+            // the tabs come from the other hand's grip, the values from the other trigger, and
+            // back from the face button that is not the Y menu's (UpdatePage's b).
+            g.prev = "RG";
+            g.next = "LG";
+            g.value_prev = "RT";
+            g.value_next = "LT";
+            if (g.back == "B") {
+                g.back = VR::Thumbs::LabelFor(YMenuOwns(PhysB) ? VR::Thumbs::Control::Y
+                                                                : VR::Thumbs::Control::B,
+                                              thumbs_swapped, true);
+            }
+        }
         return g;
     }
 
@@ -6711,24 +7273,34 @@ struct OpenXRPresenter::Impl {
         const auto touch = [this](size_t i) {
             return actions.touch[i] != XR_NULL_HANDLE && GetBool(actions.touch[i]);
         };
-        const XrVector2f ls = GetVector(actions.move);
-        const XrVector2f rs = GetVector(actions.look);
+        // Left-handed play: each control on your controllers drives the other hand's action
+        // (XrBindings::Mirror), so a light reads the action its control drives: the left trigger
+        // lights as the left trigger whatever it does. `m`: that swap; touch indices as
+        // actions.touch's (trigger L/R, A, B, X, Y, stick L/R).
+        const bool m = mirror_world;
+        const auto pick = [m](XrAction normal, XrAction mirrored) { return m ? mirrored : normal; };
+        const XrVector2f ls = GetVector(pick(actions.move, actions.look)); // your left stick
+        const XrVector2f rs = GetVector(pick(actions.look, actions.move));
         pi.live = true;
         pi.dt = dt;
-        set(C::TriggerL, GetFloat(actions.trigger_left) >= 0.5f, touch(0));
-        set(C::TriggerR, GetFloat(actions.trigger_right) >= 0.5f, touch(1));
-        set(C::A, GetBool(actions.button_a), touch(2));
-        set(C::B, GetBool(actions.button_b), touch(3));
-        set(C::X, GetBool(actions.button_x), touch(4));
-        set(C::Y, GetBool(actions.button_y), touch(5));
-        set(C::StickL, std::hypot(ls.x, ls.y) > 0.5f, touch(6));
-        set(C::StickR, std::hypot(rs.x, rs.y) > 0.5f, touch(7));
-        set(C::ClickL, GetBool(actions.stick_left), false);
-        set(C::ClickR, GetBool(actions.stick_right), false);
-        set(C::GripL, GetFloat(actions.grip_left) >= 0.6f, false);
-        set(C::GripR, GetFloat(actions.grip_right) >= 0.6f, false);
+        set(C::TriggerL, GetFloat(pick(actions.trigger_left, actions.trigger_right)) >= 0.5f,
+            touch(m ? 1 : 0));
+        set(C::TriggerR, GetFloat(pick(actions.trigger_right, actions.trigger_left)) >= 0.5f,
+            touch(m ? 0 : 1));
+        set(C::A, GetBool(pick(actions.button_a, actions.button_x)), touch(m ? 4 : 2));
+        set(C::B, GetBool(pick(actions.button_b, actions.button_y)), touch(m ? 5 : 3));
+        set(C::X, GetBool(pick(actions.button_x, actions.button_a)), touch(m ? 2 : 4));
+        set(C::Y, GetBool(pick(actions.button_y, actions.button_b)), touch(m ? 3 : 5));
+        set(C::StickL, std::hypot(ls.x, ls.y) > 0.5f, touch(m ? 7 : 6));
+        set(C::StickR, std::hypot(rs.x, rs.y) > 0.5f, touch(m ? 6 : 7));
+        set(C::ClickL, GetBool(pick(actions.stick_left, actions.stick_right)), false);
+        set(C::ClickR, GetBool(pick(actions.stick_right, actions.stick_left)), false);
+        set(C::GripL, GetFloat(pick(actions.grip_left, actions.grip_right)) >= 0.6f, false);
+        set(C::GripR, GetFloat(pick(actions.grip_right, actions.grip_left)) >= 0.6f, false);
         set(C::Menu, GetBool(actions.menu), false);
-        const std::array<XrSpace, 2> spaces{actions.grip_space_left, actions.grip_space_right};
+        // (Your left controller is the grip pose the mirror calls right.)
+        const std::array<XrSpace, 2> spaces{m ? actions.grip_space_right : actions.grip_space_left,
+                                            m ? actions.grip_space_left : actions.grip_space_right};
         for (size_t h = 0; h < 2; ++h) {
             const HandState s = LocateHand(spaces[h], time);
             float speed = 0.0f;
@@ -6848,6 +7420,11 @@ struct OpenXRPresenter::Impl {
                 float u = 0.0f, v = 0.0f;
                 if (VR::Page::RayHit(page_surface, o3, d3, u, v)) {
                     on_page = true;
+                    // Left-handed play: the page hangs reflected but reads unflipped (its picture
+                    // keeps its pixels), so the mirror's spot on it is yours reflected across it.
+                    if (mirror_world) {
+                        u = 1.0f - u;
+                    }
                     pi.ray_x = VR::Page::PageX0 + u * (VR::Page::PageX1 - VR::Page::PageX0);
                     pi.ray_y = VR::Page::PageY0 + v * (VR::Page::PageY1 - VR::Page::PageY0);
                 }
@@ -7182,7 +7759,9 @@ struct OpenXRPresenter::Impl {
         }
         const float anchor_yaw = page_yaw + page_yaw_offset;
         const float anchor_pitch = VR::Page::PagePitch(page_pitch, page_view_pitch);
-        const float yaw = anchor_yaw - dx_px * deg_per_px / RadToDeg;
+        // (Left-handed play: the offset to the other side, so the page, reflected back with its
+        // picture unflipped, has its frame on the anchor as in right-handed play.)
+        const float yaw = anchor_yaw - (mirror_world ? -dx_px : dx_px) * deg_per_px / RadToDeg;
         const float pitch = anchor_pitch - dy;
         const VR::Quat facing = VR::QuatFromYawPitch(yaw, pitch);
         const float distance = s.ui_menu_distance_m;
@@ -7454,7 +8033,7 @@ struct OpenXRPresenter::Impl {
                              now - body.steady_ns < 250'000'000 &&
                              body.left_weapon_family == 10; // Bare Fists
         // The Wheel's spin owns the trigger: never the game's L2 too (its canned spin, the hunter's).
-        const bool no_gun = unarmed || freed || no_special || wheel_rev_on ||
+        const bool no_gun = unarmed || freed || chikage_hand_held || no_special || wheel_rev_on ||
                             (two_hand.Engaged() && !canned) || (kos_spit_on && !kos_spit.ritual);
         gun_trigger_wait = in[PhysTriggerL] && (gun_trigger_wait || no_gun);
         if (kos_spit_on && kos_spit.ritual) {
@@ -7963,6 +8542,7 @@ struct OpenXRPresenter::Impl {
             UpdateTwoHand(in, left, right, gesture, dt);
         }
         UpdateHandTransform(in, left, right, gesture, dt);
+        UpdateChikageGrip();
         // Y cannot open/use quick items while the left hand holds the handle.
         // Own through release so detaching during a held Y cannot replay its tap.
         const bool block_item_y = supported_before || (OptimizedTwoHand() && two_hand.Engaged()) ||
@@ -8043,6 +8623,17 @@ struct OpenXRPresenter::Impl {
             l3_click.NoteCombo(); // L3 + Y was the game's Square: no L3 or tap on the release
             LOG_INFO(Render_Vulkan, "VR input: {} + {}: the game's Square", ThumbName(TC::ClickL),
                      ThumbName(TC::Y));
+        }
+
+        // Lock-on follow (vr.ini lockon_follow, core/vr/lock_follow.h): you looked away from the
+        // target, so the lock is released with the game's own lock-on button (one tap), only while
+        // it is still locked on.
+        if (VR::TakeLockCancel() && VR::IsLockedOn()) {
+            if (pad.Press(PadButton::R3)) {
+                LOG_INFO(Render_Vulkan, "VR input: lock-on released (you looked away): R3");
+            } else {
+                LOG_INFO(Render_Vulkan, "VR input: lock-on release dropped (input suppressed)");
+            }
         }
 
         // Right stick click. Classic: R3 (lock on) while it is held. Motion: a tap is R3, sent
@@ -8157,6 +8748,7 @@ struct OpenXRPresenter::Impl {
         } else {
             optimized_special_wait = false;
         }
+        UpdateBloodBlast(weapon_in, quick, right, gesture, dt);
         UpdateGun(weapon_in, quick, held);
         // The attachment trigger never starts the saw in the optimized scheme.
         if (OptimizedTwoHand() && RightFamily() != 320) weapon_in[PhysTriggerL] = false;
@@ -8426,6 +9018,7 @@ struct OpenXRPresenter::Impl {
         }
 
         UpdateLeanDodge(in, look, right, gesture, axes, dt);
+        ApplyChikageStep(axes);
         ApplyRoll(axes, dt);
     }
 
@@ -8804,6 +9397,8 @@ struct OpenXRPresenter::Impl {
             iframes_active && VR::IsImmersive() && !VR::CinematicActive() && !in[PhysMenu];
         VR::Lean::Config iframes_config = config;
         iframes_config.cooldown_s = settings.lean_iframes_cooldown_ms * 0.001f;
+        // The early lean: a short grant at once, extended by the full lean (lean_dodge.h EarlyMs).
+        iframes_config.early_hold_s = VR::Lean::EarlyHoldS;
         const VR::Lean::Output iframes_out = lean_iframes.Update(iframes_input, iframes_config);
         // One cooldown for the lean's and the duck's grants: mixing them never protects more often
         // than leaning alone.
@@ -8817,7 +9412,35 @@ struct OpenXRPresenter::Impl {
                 ? settings.lean_iframes_ms -
                       static_cast<s32>(std::lround((input.t - iframes_granted_t) * 1000.0))
                 : 0;
-        if (iframes_out.fire && !iframes_ready() && after_duck_ms > 0) {
+        if (iframes_out.early && iframes_ready()) {
+            // The lean's first moment: invulnerable at once, for EarlyMs (the full lean extends it).
+            const char* const name = direction(iframes_out.angle_deg);
+            // (Never past the player's own lean_iframes_ms: a code review, 2026-11-20.)
+            const u32 early_ms = std::min<u32>(VR::Lean::EarlyMs,
+                                               static_cast<u32>(std::max(settings.lean_iframes_ms, 0)));
+            const bool granted = early_ms > 0 && VR::Bloodborne::IframesLeanGrant(early_ms, name);
+            iframes_granted_t = input.t;
+            iframes_granted_duck = false;
+            iframes_early_t = input.t;
+            LOG_INFO(Core,
+                     "VR lean: I-FRAMES {} ms early {} ({:+.0f} deg) | head {:.2f} m/s travel "
+                     "{:.2f} m{}",
+                     early_ms, name, iframes_out.angle_deg, iframes_out.speed,
+                     iframes_out.dist, granted ? "" : " - NOT GIVEN (the i-frame hook is not installed)");
+        } else if (iframes_out.fire && iframes_early_t >= 0.0 && input.t - iframes_early_t < 0.4) {
+            // The same lean, now full: its grant to lean_iframes_ms from the early one's start.
+            const s32 rest = settings.lean_iframes_ms -
+                             static_cast<s32>(std::lround((input.t - iframes_early_t) * 1000.0));
+            const char* const name = direction(iframes_out.angle_deg);
+            const bool granted =
+                rest > 0 && VR::Bloodborne::IframesLeanGrant(static_cast<u32>(rest), name);
+            iframes_early_t = -1.0;
+            LOG_INFO(Core,
+                     "VR lean: I-FRAMES extended by the full lean: {} ms more ({} ms in all) {} | "
+                     "head {:.2f} m/s travel {:.2f} m{}",
+                     std::max(rest, 0), settings.lean_iframes_ms, name, iframes_out.speed,
+                     iframes_out.dist, granted || rest <= 0 ? "" : " - NOT GIVEN");
+        } else if (iframes_out.fire && !iframes_ready() && after_duck_ms > 0) {
             const char* const name = direction(iframes_out.angle_deg);
             const bool granted =
                 VR::Bloodborne::IframesLeanGrant(static_cast<u32>(after_duck_ms), name);
@@ -8853,7 +9476,7 @@ struct OpenXRPresenter::Impl {
                      iframes_out.dist);
         }
 
-        // Duck i-frames (duck_iframes_ms, 135 by default; the tester 2026-10-26): a quick duck
+        // Duck i-frames (duck_iframes_ms, 145 by default; the tester 2026-10-26): a quick duck
         // (core/vr/lean_dodge.h DuckDetector, the neck pivot: looking down moves nothing) makes
         // the hunter invulnerable for that many ms of game time, through the lean's grant and its
         // cooldown. With lean_dodge too (a duck is no dodge).
@@ -9344,16 +9967,34 @@ struct OpenXRPresenter::Impl {
         for (u32 i = 0; i < count; ++i) {
             const Cb::TransformEvent& e = events[i];
             // A hand transform's lock is the gesture's own clunk (UpdateHandTransform).
-            const bool by_hand = e.serial != 0 && e.serial == hand_transform_serial;
+            // A right-stick Saif transform also uses the hand clock, but has no
+            // physical gesture clunk of its own.
+            const bool by_hand = !e.saif && e.serial != 0 && e.serial == hand_transform_serial;
             switch (e.kind) {
             case Cb::TransformEventKind::Detent:
                 if (feel && !by_hand) {
-                    weapon_hand.Play(Tick(0.3f, 8.0f, 0));
+                    if (e.saif) {
+                        HapticPattern sweep{};
+                        sweep.priority = 0;
+                        weapon_hand.Play(sweep.Hz(VR::Haptics::BodyHz).Ramp(0.14f, 0.29f, 26.0f));
+                    } else {
+                        weapon_hand.Play(Tick(0.3f, 8.0f, 0));
+                    }
                 }
                 break;
+            case Cb::TransformEventKind::BladeSeated:
             case Cb::TransformEventKind::Locked:
                 if (feel && !by_hand) {
-                    weapon_hand.Play(clack);
+                    if (e.saif) {
+                        // The extended blade seats with more weight than the folding blade.
+                        const bool extended = e.a == 1.0f;
+                        weapon_hand.Play(HapticPattern{}
+                            .Hz(VR::Haptics::TickHz).Pulse(extended ? 0.55f : 0.42f, 12.0f)
+                            .Hz(VR::Haptics::BodyHz).Ramp(extended ? 0.29f : 0.19f, 0.0f,
+                                                         extended ? 24.0f : 15.0f));
+                    } else {
+                        weapon_hand.Play(clack);
+                    }
                 }
                 break;
             case Cb::TransformEventKind::Denied:
@@ -9503,15 +10144,18 @@ struct OpenXRPresenter::Impl {
             blood_draw_hit = {};
         }
         VR::Vitals::Status vitals{};
-        bd.bullets_valid = VR::Vitals::LatestStatus(vitals) && vitals.ok &&
+        bd.bullets_valid = VR::Vitals::LatestStatus(vitals) && vitals.ok && vitals.blood_bullets >= 0 &&
                            now - vitals.steady_ns < 500'000'000;
         bd.bullets = vitals.blood_bullets;
-        // The game's D-pad up instead: site A's own count (the HUD may read none).
-        if (std::int32_t count = -1; D::BulletsFor(blood_draw_ask, count) && count >= 0) {
-            bd.bullets = count;
-            bd.bullets_valid = true;
-        }
         bd.answer = D::AnswerFor(blood_draw_ask);
+        std::int32_t fallback_bullets = -1;
+        if (bd.answer == D::Answer::Unavailable) {
+            // Site A publishes the count before offering D-pad up. Compare only samples
+            // from this request, and only once the input was sent.
+            D::BulletsFor(blood_draw_ask, fallback_bullets);
+            bd.bullets = fallback_bullets;
+            bd.bullets_valid = blood_draw_pad_up && fallback_bullets >= 0;
+        }
         blood_draw_out = blood_draw.Update(bd);
         if (blood_draw_hit.stab) {
             if (blood_draw_out.stab_too_soon) {
@@ -9566,7 +10210,7 @@ struct OpenXRPresenter::Impl {
                      blood_draw_ask, bd.bullets_valid ? bd.bullets : -1);
         } else if (bd.gameplay && bd.tracked &&
                    bd.answer == D::Answer::Unavailable && !blood_draw_pad_up &&
-                   blood_draw.State() == D::Phase::Drawing) {
+                   blood_draw.BeginFallback(fallback_bullets)) {
             // No direct path (its signatures): the game's own D-pad up, its clip and all; the
             // machine waits for the Blood Bullets to rise.
             blood_draw_pad_up = true;
@@ -9942,8 +10586,119 @@ struct OpenXRPresenter::Impl {
     s32 RightFamily() const {
         return two_hand_status_ok ? two_hand_status.family : -1;
     }
+    // The Bloodletter only: the Chikage keeps its transform clicks and scabbard beats (the user,
+    // 2026-11-26: "let's make the chikage how it was before").
+    static bool HasBloodFormBuzz(s32 family) {
+        return family == VR::BloodBlast::Family;
+    }
     bool RightFormB() const {
         return two_hand_status_ok && two_hand_status.style >= 3 && two_hand_status.style <= 5;
+    }
+
+    // The Bloodletter's blood explosion, two ways (core/vr/blood_blast.h): its special's trigger
+    // (the left one; the right one in the optimized two-handed controls, already in weapon_in's
+    // left) goes to the game only as a tap's press; held BloodBlast::ArmS it arms, and the flail
+    // brought down into the floor, a wall or an enemy requests the blast without the animation.
+    void UpdateBloodBlast(PhysicalState& weapon_in, const VR::Quick::Output& quick,
+                          const HandState& right, const GestureFrame& gesture, float dt) {
+        namespace BB = VR::BloodBlast;
+        const s32 family = RightFamily();
+        // Classic routes straight to the game's L2. Only motion melee can deliver our slam.
+        bool flail = family == BB::Family && two_hand_status_ok &&
+                     two_hand_status.style == VR::TwoHand::StyleTwoHanded &&
+                     !VR::GetSettings().controls_classic && VR::GetSettings().gestures &&
+                     VR::Melee::GetMeleeSettings().physical;
+        if (flail) {
+            const auto* weapon = VR::Body::Weapons::FindFamily(family);
+            flail = weapon != nullptr &&
+                    VR::Tricks::InKeyList(VR::Tricks::GetTrickSettings().l2_canned, weapon->key);
+        }
+        const bool ready = flail && !quick.block_l2 && VR::IsImmersive() && !VR::CinematicActive();
+        bool contact = false;
+        if (ready && blood_blast_gate.WatchingImpact()) {
+            const s64 touch = std::max(BB::g_map_touch_ns.load(std::memory_order_relaxed),
+                                       BB::g_enemy_touch_ns.load(std::memory_order_relaxed));
+            contact = blood_touch_history.Consume(touch, VR::Body::SteadyNowNs());
+        }
+        // The hand's speed down relative to the head, as the swing classifier's (the user,
+        // 2026-11-21: "make it relative to the head"): ducking or dropping while armed is no slam.
+        const float hand_vy = right.velocity.y - (gesture.head_ok ? gesture.head_velocity.y : 0.0f);
+        const BB::Out o = blood_blast_gate.Step(weapon_in[PhysTriggerL], dt, hand_vy, ready, contact,
+                                                right.valid);
+        if (const bool check = blood_blast_gate.NeedsEnemyContact(); check != blood_check_enemy) {
+            blood_check_enemy = check;
+            BB::g_check_enemy.store(check, std::memory_order_relaxed);
+        }
+        if (flail || o.holding || o.game_press) {
+            weapon_in[PhysTriggerL] = o.game_press;
+        }
+        const bool feel = VR::Tricks::GetTrickSettings().haptics;
+        if (o.armed) {
+            blood_touch_history.seen_ns = VR::Body::SteadyNowNs();
+            if (feel) haptics[1].Play(Tick(0.35f, 30.0f, 1));
+            LOG_INFO(Render_Vulkan, "VR bloodletter: the blast ARMED (the trigger held {:.2f} s): bring "
+                                    "the flail down", BB::ArmS);
+        }
+        if (o.cancelled) {
+            if (feel) haptics[1].Play(Tick(0.12f, 10.0f, 0));
+            LOG_INFO(Render_Vulkan, "VR bloodletter: the blast let go without a smash: nothing");
+        }
+        if (o.fired) {
+            blood_blast_pending = true;
+            blood_blast_ns = VR::Body::SteadyNowNs();
+        }
+        // The trigger held (2026-11-21: "a low vibration when the left trigger is
+        // held"): the blood pulsing low in the trigger's hand (the right one in the optimized
+        // two-handed controls), quickening as it arms, in step with the heartbeat armed; it ends
+        // with the hold (a tap, the blast, let go).
+        BloodHoldHum(feel ? blood_blast_gate.HoldShare() : 0.0f, OptimizedTwoHand() ? 1u : 0u, dt,
+                     o.armed);
+        // Armed: a faint heartbeat in the sword hand until it fires or is let go.
+        if (blood_blast_gate.Armed() && feel) {
+            blood_blast_beat += dt;
+            if (blood_blast_beat >= BloodArmedBeatS) {
+                blood_blast_beat -= BloodArmedBeatS; // (in step with the hold's beat: no drift)
+                haptics[1].Play(Tick(0.18f, 20.0f, 0));
+            }
+        } else {
+            blood_blast_beat = 0.0f;
+        }
+    }
+
+    // The blast's hold hum (UpdateBloodBlast): `share` of the way to armed (0: none) in `hand`;
+    // `armed`: it armed this frame (its beat starts with the armed tick). A continuous level as
+    // the other hums (UpdateWeaponHum): it takes the hand only when no other feel holds a level
+    // there, and clears only its own.
+    void BloodHoldHum(float share, u32 hand, float dt, bool armed) {
+        float level = 0.0f;
+        if (share > 0.0f) {
+            // The beat: a peak at each whole phase, a soft dip between (cos^4).
+            const float hz =
+                BloodHoldBeatHz + (1.0f / BloodArmedBeatS - BloodHoldBeatHz) * share;
+            blood_hum_phase = armed ? 0.0f
+                                    : std::fmod(blood_hum_phase + std::max(dt, 0.0f) * hz, 1.0f);
+            const float c = std::cos(blood_hum_phase * 6.2831853f);
+            const float beat = c > 0.0f ? c * c * c * c : 0.0f;
+            const float peak = BloodHoldHumLow + (BloodHoldHumArmed - BloodHoldHumLow) * share;
+            level = peak * (BloodHoldPulseFloor + (1.0f - BloodHoldPulseFloor) * beat);
+        } else {
+            blood_hum_phase = 0.0f; // (the next hold starts on a beat)
+        }
+        if (blood_hum_level > 0.0f && (level <= 0.0f || hand != blood_hum_hand)) {
+            auto& was = haptics[blood_hum_hand];
+            if (was.sustain == blood_hum_level) {
+                was.sustain = 0.0f;
+            }
+            blood_hum_level = 0.0f;
+        }
+        if (level > 0.0f) {
+            auto& h = haptics[hand];
+            if (h.sustain <= 0.0f || (blood_hum_level > 0.0f && h.sustain == blood_hum_level)) {
+                h.sustain = level;
+                blood_hum_level = level;
+                blood_hum_hand = hand;
+            }
+        }
     }
 
     bool OptimizedTwoHand() const {
@@ -9970,18 +10725,35 @@ struct OpenXRPresenter::Impl {
                VR::Tricks::InKeyList(VR::Tricks::GetTrickSettings().l2_canned, weapon->key);
     }
 
+    static bool TransformInterrupted(const VR::Body::BodyStatus& body, s64 now) {
+        return body.transform_interrupted && body.steady_ns > 0 && now - body.steady_ns < 250'000'000;
+    }
+
     // A transform the hands made (a grab, a let-go, a charge, a gesture): the weapon-only one at
     // once (its flick start, the gesture's own feel its lock), or L1 for the weapons whose effect
     // lives in the hunter's animation (Tonitrus, the Chikage, the Bloodletter) or that have no
     // weapon-only clip. True if one went to the game.
-    bool HandTransformNow(const char* what) {
+    bool HandTransformNow(const char* what, bool lift = false) {
         const s32 family = RightFamily();
         bool native = false;
-        if (!VR::Tricks::UsesL1(family)) {
+        if (!VR::Tricks::UsesL1(family) || VR::Tricks::Scabbard(family)) {
             native = StartNativeTransform(nullptr, true);
         }
         // The saw must never fall back to a whole-character transform animation.
-        const bool l1 = !native && family != VR::Tricks::SawFamily && pad.Press(PadButton::L1);
+        const bool can_send_l1 = !native && family != VR::Tricks::SawFamily;
+        const bool tracked_transform = can_send_l1 && VR::Tricks::GetTrickSettings().hand_transform &&
+                                       VR::IsFirstPerson();
+        if (tracked_transform) {
+            VR::Body::BodyStatus body{};
+            if (VR::Body::LatestBodyStatus(body) &&
+                TransformInterrupted(body, VR::Body::SteadyNowNs())) {
+                LOG_INFO(Render_Vulkan, "VR hand transform: {} ignored (the hunter is recovering)",
+                         what);
+                return false;
+            }
+        }
+        const bool l1 = can_send_l1 &&
+                        (tracked_transform ? pad.PressHandTransform(lift) : pad.Press(PadButton::L1));
         const s64 now = VR::Body::SteadyNowNs();
         if (native || l1) {
             hand_transform_ns = transform_request_ns = now; // (a reflex grip after: none)
@@ -10137,7 +10909,17 @@ struct OpenXRPresenter::Impl {
             right_grip.Seed(static_cast<u32>(now ^ (now >> 32)));
             furnace_seeded = true;
         }
-        const Tr::RightGrip::Out o = right_grip.Step(f, use, family, ts);
+        const bool lift_interrupted = use == Tr::GripUse::Lift && TransformInterrupted(body, now) &&
+                                      VR::IsFirstPerson();
+        if (edge && use == Tr::GripUse::Lift && tonitrus_lift_ns && arms && !lift_interrupted) {
+            VR::TonitrusCharge::State charge{};
+            if (VR::TonitrusCharge::Latest(charge) && charge.MayRetryLift(tonitrus_lift_ns) &&
+                body.steady_ns > charge.interrupted_ns && now - body.steady_ns < 250'000'000) {
+                right_grip.CancelCooldown();
+                tonitrus_lift_ns = 0;
+            }
+        }
+        const Tr::RightGrip::Out o = right_grip.Step(f, use, family, ts, lift_interrupted);
         right_grip_ready = o.ready;
         const bool engine = use == Tr::GripUse::Pull;
         // The furnace's growl while it idles, louder, higher and brighter revved up
@@ -10249,9 +11031,12 @@ struct OpenXRPresenter::Impl {
                                  : family == 320          ? "held: the bow"
                                  : o.struck               ? "struck: lit"
                                  : engine                 ? "revved up: lit"
-                                                          : "held: charged");
+                                                          : "held: charged",
+                                 use == Tr::GripUse::Lift);
             charge_serial = sent && hand_transform_serial != serial_before ? hand_transform_serial
                                                                             : 0;
+            tonitrus_lift_ns = sent && use == Tr::GripUse::Lift && VR::IsFirstPerson()
+                                   ? hand_transform_ns : 0;
             if (sent) {
                 if (feel && family == 130) { // the crack, then the charge crackling
                     rh.Play(HapticPattern{big}
@@ -10542,9 +11327,8 @@ struct OpenXRPresenter::Impl {
         // stay in the hand and wait for their acts (Q::ToolKeepOf, Q::ToolGestureOf).
         c.tap_pick = qs.tap_pick;
         c.tap_use_s = qs.tap_use_ms * 0.001f;
-        // The grip takes from the fan and holds; the fan is back after a quick use (Q::Config).
+        // The grip takes from the fan and holds; the fan stays closed after (Q::Config).
         c.grip_hold = qs.grip_hold;
-        c.fan_return_s = qs.fan_return_ms * 0.001f;
         c.grip_open_s = qs.grip_open_ms * 0.001f;
         c.tool_keep = qs.tool_keep;
         c.tool_gestures = qs.tool_gestures;
@@ -10681,6 +11465,7 @@ struct OpenXRPresenter::Impl {
                                                                      : actions.aim_space_left,
                            fresh_time);
             q.hand_now_valid = fresh.valid;
+            q.hand_now_ns = fresh_time;
             q.hand_p_now = {fresh.position.x, fresh.position.y, fresh.position.z};
             q.hand_v_now = {fresh.velocity.x, fresh.velocity.y, fresh.velocity.z};
             q.hand_q_now = {fresh.orientation.x, fresh.orientation.y, fresh.orientation.z,
@@ -12443,7 +13228,24 @@ struct OpenXRPresenter::Impl {
         const s64 now = VR::Body::SteadyNowNs();
         T::GameStatus st{};
         // Fresh within 1 s: a hitch (a shader compile, a loading stall) never lets go of the grip.
-        two_hand_status_ok = T::LatestGameStatus(st) && now - st.ns < 1'000'000'000;
+        const bool fresh = T::LatestGameStatus(st) && now - st.ns < 1'000'000'000;
+        // Bloodletter uses the game’s L1 animation. A confirmed A/B transition avoids buzzing on
+        // a refused input.
+        const auto& prev = two_hand_status;
+        if (fresh && two_hand_status_ok && HasBloodFormBuzz(st.family) &&
+            prev.family == st.family && st.ns > prev.ns && st.ns - prev.ns < 250'000'000 &&
+            now - st.ns < 250'000'000 && now - two_hand_update_ns < 250'000'000 &&
+            ((prev.style == VR::Transform::StyleFormA && VR::Transform::IsFormB(st.style)) ||
+             (VR::Transform::IsFormB(prev.style) && st.style == VR::Transform::StyleFormA)) &&
+            VR::Transform::GetTransformSettings().haptics) {
+            const bool bloodletter = st.family == VR::BloodBlast::Family;
+            const bool powered = VR::Transform::IsFormB(st.style);
+            haptics[1].Play(HapticPattern{}.Hz(VR::Haptics::BodyHz)
+                                .Pulse(bloodletter ? (powered ? 0.32f : 0.22f) : 0.15f, 15.0f)
+                                .Ramp(bloodletter ? 0.15f : 0.08f, 0.0f,
+                                      bloodletter ? 36.0f : 12.0f));
+        }
+        two_hand_status_ok = fresh;
         two_hand_status = st;
         // A gap in the gameplay input (a menu, the virtual screen, a long hitch): let go at once,
         // the grip still squeezed stays the grab's and grabs nothing again until it is let go.
@@ -12911,6 +13713,9 @@ struct OpenXRPresenter::Impl {
             hand_transform.Step(frame, kind, form_b, right_grip_ready, ts);
         hand_owns_grip = (hand_owns_grip || o.owns_grip) && hand_grip_l;
         hand_weapon_grab = o.gesture == Tr::Gesture::Grab;
+        if (o.show_split_hilt && !blocked[PhysGripL] && !physical_lever_out.owns_grip[0]) {
+            split_hilt_frame = xr_frames;
+        }
         // The hilt held: its pull in both hands, rising as they part.
         if (o.holding && ts.haptics) {
             // Felt from its start (a steady level gets no haptic floor), the steel sliding in
@@ -12993,7 +13798,7 @@ struct OpenXRPresenter::Impl {
                 rh.Play(big);
                 break;
             case Tr::Gesture::Stab: // driven in: a deep thud through both hands, then its heartbeat
-                lh.Play(big.Pulse(0.8f, 40.0f).Ramp(0.6f, 0.0f, 250.0f));
+                lh.Play(big.Pulse(0.78f, 40.0f).Ramp(0.6f, 0.0f, 250.0f));
                 rh.Play(HapticPattern{big}
                             .Gap(150.0f)
                             .Pulse(0.5f, 25.0f)
@@ -13018,7 +13823,7 @@ struct OpenXRPresenter::Impl {
         const s64 now = VR::Body::SteadyNowNs();
         VR::Body::BodyStatus body{};
         const bool fresh = VR::Body::LatestBodyStatus(body) && now - body.steady_ns < 250'000'000;
-        const bool in_hand = fresh && Tr::IsShieldFamily(body.left_weapon_family);
+        const bool in_hand = fresh && !chikage_hand_held && Tr::IsShieldFamily(body.left_weapon_family);
         if (ts.shield_raise && in_hand && shield_guard_seen &&
             body.guard_serial != shield_guard_serial) {
             // As big as the blow: the guard reaction the game played (small .. the guard
@@ -13893,7 +14698,7 @@ struct OpenXRPresenter::Impl {
             two_hand_blade.speed, dt, two_settings.swing_hum);
         UpdateWeaponHum(physical, RightTipSpeed(physical_right, physical_gesture, config), dt);
         UpdateLeftMelee(left, gesture, config,
-                        physical && left_swings && !physical_lever_out.owns_grip[0], dt);
+                        physical && left_swings && !chikage_hand_held && !physical_lever_out.owns_grip[0], dt);
         if (!physical) {
             UpdateBladeShots(physical_right, physical_gesture, trigger, blade_shot, swings, dt); // (its end)
         }
@@ -15094,6 +15899,7 @@ struct OpenXRPresenter::Impl {
         p.budget_downgraded = w.downgraded;
         p.powered = w.powered;
         p.contact_hold = w.contact_hold && !w.powered && !w.flick;
+        p.carried_lashes = p.contact_hold ? w.lashes : 0;
         p.unsupported_family = VR::TwoHand::UnsupportedFamily(
             OptimizedTwoHand() && VR::TwoHand::GetTwoHandSettings().enabled &&
                 two_hand_status_ok && p.ns >= two_hand_status.ns &&
@@ -15105,7 +15911,24 @@ struct OpenXRPresenter::Impl {
         p.two_hand = two_hand_swing.serial == w.serial
                          ? two_hand_swing.Factor(VR::TwoHand::GetTwoHandSettings())
                          : 1.0f;
+        // The Bloodletter's flail: every swing of it x two_hand_damage, one hand or two (the user,
+        // 2026-11-21: "make the bloodletter do 0.9 damage in its transformed form since its unfair
+        // otherwise ... except its blast", the game's own L2, which no window carries).
+        p.blood_blast = blood_blast_window != 0 && w.serial == blood_blast_window;
+        if (p.blood_blast) {
+            p.two_hand = 1.0f; // (its blast: the game's full damage, one hand or two)
+        } else if (VR::TwoHand::OneHandAlso(RightFamily()) && RightFormB()) {
+            p.two_hand = std::clamp(VR::TwoHand::GetTwoHandSettings().damage, 0.5f, 2.0f);
+        }
+        if (chikage_blood_until_ns && chikage_pose_weapon == chikage_blood_weapon && w.serial >= chikage_blood_from &&
+            VR::Tricks::Scabbard(RightFamily()) && !RightFormB()) {
+            p.chikage_coat = chikage_blood_until_ns;
+        }
         p.damage_scale = DualScale(1);
+        if (chikage_draw_window && w.serial == chikage_draw_window) {
+            p.chikage_draw_weapon = chikage_draw_weapon;
+            p.damage_scale *= chikage_draw_scale;
+        }
         Cb::PublishMeleeWindow(p);
     }
 
@@ -15195,9 +16018,13 @@ struct OpenXRPresenter::Impl {
                                                  need)
                                    : std::string{});
                 }
-                const bool again = e.serial != 0 && e.serial == melee_impact_serial &&
-                                   at - melee_impact_ns < 60'000'000 &&
-                                   weight <= melee_impact_weight;
+                // The Bloodletter's blast lands its own hits while its boom (BloodBlastBoom) plays:
+                // they would cut it short (the same priority, an impact); the boom is their feel.
+                const bool in_boom = e.serial != 0 && e.serial == blood_blast_window &&
+                                     blood_boom_ns != 0 && at - blood_boom_ns < BloodBlastBoomNs;
+                const bool again = in_boom || (e.serial != 0 && e.serial == melee_impact_serial &&
+                                               at - melee_impact_ns < 60'000'000 &&
+                                               weight <= melee_impact_weight);
                 if (feel && gain > 0.0f && !again) {
                     // haptic_melee_hit_ms (65): full for 65+ ms, a decay, a heavy hit's crunch,
                     // and the guard: nothing but another impact cuts it for 200 ms (the same
@@ -15653,6 +16480,12 @@ struct OpenXRPresenter::Impl {
                 }
                 break;
             case Cb::MeleeEventKind::Opened: {
+                if (chikage_draw_window && e.serial == chikage_draw_window &&
+                    e.b == static_cast<float>(VR::Melee::MoveKind::Charged) &&
+                    VR::Chikage::FreshDraw(chikage_draw_ns, VR::Body::SteadyNowNs(), chikage_context_ns,
+                                           chikage_draw_weapon, chikage_pose_weapon)) {
+                    // (The step: the pull's lunge or the draw: ScabbardLunge / ScabbardDraw.)
+                }
                 if (e.b == static_cast<float>(VR::Melee::MoveKind::Light)) {
                     const auto& ms = VR::Melee::GetMeleeSettings();
                     VR::Melee::BudgetConfig cfg{};
@@ -15666,6 +16499,18 @@ struct OpenXRPresenter::Impl {
                 }
                 break;
             }
+            case Cb::MeleeEventKind::BloodBlast:
+                if (e.serial == blood_blast_window && blood_blast_window != 0) {
+                    blood_blast_gate.ConfirmBlast();
+                    if (VR::Tricks::GetTrickSettings().haptics) {
+                        // The blood exploding (2026-11-21: "a vibration bump/blast"):
+                        // BloodBlastBoom in both hands, the flail's the strongest.
+                        haptics[0].Play(BloodBlastBoom(BloodBlastBoomOther));
+                        haptics[1].Play(BloodBlastBoom(1.0f));
+                        blood_boom_ns = VR::Body::SteadyNowNs();
+                    }
+                }
+                break;
             case Cb::MeleeEventKind::Refunded:
                 break;
             case Cb::MeleeEventKind::Ended:
@@ -16489,13 +17334,68 @@ struct OpenXRPresenter::Impl {
         const M::Window before = melee_window.Current();
         // The release owns this frame; a coincident classified swing cannot spend a second
         // combo charge before the powered window is opened.
-        if (discharge) {
+        // The Chikage's blade in its scabbard: sliding it is no swing. Its quick draw opens the
+        // charged row at once, as a discharge does (core/vr/chikage.h DrawDamageScale).
+        bool quick_draw = false;
+        if (chikage_draw_request != VR::Chikage::DrawRequest::None) {
+            if (VR::Chikage::FreshDraw(chikage_draw_ns, now, chikage_context_ns,
+                                       chikage_draw_weapon, chikage_pose_weapon)) {
+                const bool can_follow = !VR::GetSettings().right_grip_draw && !chikage_sheathed &&
+                                        right.valid && gesture.head_ok && ti.top == M::MoveKind::Charged;
+                quick_draw = VR::Chikage::TakeDraw(chikage_draw_request, now - chikage_draw_ns,
+                                                   swings, swing_block == FaceBlock, can_follow);
+                if (!quick_draw && chikage_draw_request == VR::Chikage::DrawRequest::None) {
+                    chikage_draw_window = 0;
+                    LOG_INFO(Render_Vulkan, "VR chikage: quick draw expired or blocked ({})",
+                             swing_block ? swing_block : "no eligible follow-through");
+                }
+            } else {
+                chikage_draw_request = VR::Chikage::DrawRequest::None;
+            }
+        }
+        // The Bloodletter's blast (UpdateBloodBlast): a powered window of its own row, at once.
+        const bool blood_blast = blood_blast_pending && now - blood_blast_ns < 250'000'000 &&
+                                 RightFamily() == VR::BloodBlast::Family && RightFormB();
+        blood_blast_pending = false;
+        if (blood_blast) {
+            ti.top = M::MoveKind::Charged;
+            discharge = true;
+        }
+        if (discharge || quick_draw || chikage_sheathed || blood_blast_gate.WatchingImpact()) {
             ti.fired = false;
             ti.stroke_live = false;
         }
         M::TrackerOutput to = melee_window.Step(ti, tc);
-        if (discharge) {
-            const M::TrackerOutput r = melee_window.OpenPowered(ti, tc);
+        if (discharge || quick_draw) {
+            // A gentle overhead slam can leave the face zone below the ordinary 2 m/s re-arm
+            // speed. Allow its confirmed impact for this window only. SwingGate records any
+            // current blocker before face recovery; a clutch still needs its actual grip.
+            if (blood_blast && !swings && !VR::GetSettings().right_grip_draw &&
+                swing_block == FaceBlock && !hand_at_face && right.valid && gesture.head_ok) {
+                ti.swings = true;
+            }
+            // The cutting draw stays live through the arc after the tip clears.
+            const M::TrackerOutput r = melee_window.OpenPowered(ti, tc, quick_draw ? M::PoweredMove::CuttingDraw
+                                                                           : M::PoweredMove::Discharge);
+            ti.swings = swings;
+            if (blood_blast) {
+                blood_blast_window = r.opened ? melee_window.Current().serial : 0;
+                if (!r.opened && VR::Tricks::GetTrickSettings().haptics) {
+                    haptics[1].Play(Repeat(2, 0.15f, 10.0f, 50.0f, 3));
+                }
+                LOG_INFO(Render_Vulkan, "VR bloodletter: the blast's window {}",
+                         r.opened ? fmt::format("#{}", blood_blast_window)
+                                  : std::string{"did not open (no charged row, stamina or charges)"});
+            }
+            if (quick_draw) {
+                chikage_draw_window = r.opened ? melee_window.Current().serial : 0;
+                chikage_draw_scale =
+                    VR::Chikage::DrawDamageScale(chikage_draw_power, RightFormB());
+                LOG_INFO(Render_Vulkan, "VR chikage: the quick draw's window {} (hits x{:.2f})",
+                         r.opened ? fmt::format("#{}", chikage_draw_window)
+                                  : std::string{"did not open (no charged row, stamina or charges)"},
+                         chikage_draw_scale);
+            }
             to.opened = r.opened;
             to.committed = r.committed;
             to.closed = to.closed || r.closed;
@@ -17207,7 +18107,11 @@ struct OpenXRPresenter::Impl {
                      // why == nullptr ? "SHOWN" : "hidden: ", why == nullptr ? "" : why);
         // }
         // guide_grip_was = in.raw[PhysGripR];
-        if (guide) {
+        const bool split_guide = split_hilt_frame == xr_frames && right_grip_ready &&
+                                 two_settings.guide && gameplay && colors_visible && in.grip_space &&
+                                 in.grip[1].pose_valid && in.grip[1].orientation_valid &&
+                                 !vial_on && !held_shown && VR::Quick::WeaponGrabAvailable(quick.GetPhase());
+        if (guide || split_guide) {
             const auto& st = two_hand_status;
             // A missing fully tracked body sample must not hide an otherwise valid
             // input-space guide (the runtime can infer controller position). Prefer
@@ -17223,8 +18127,13 @@ struct OpenXRPresenter::Impl {
             //     LOG_INFO(Render_Vulkan, "VR two-hand guide: not drawn (the handle is not
             //     valid)");
             // }
-            handle.blade_clear = two_hand_blade_clear.Get(st.family);
-            if (handle.valid) {
+            if (handle.valid && split_guide) {
+                // Just beyond the sword fist, on the pommel side of the joined hilt.
+                const auto centre = handle.right + handle.dir * 0.045f;
+                O::AppendGripGuide(items, {centre.x, centre.y, centre.z},
+                                   {handle.dir.x, handle.dir.y, handle.dir.z}, 0.040f, 0.025f);
+            } else if (handle.valid) {
+                handle.blade_clear = two_hand_blade_clear.Get(st.family);
                 // The grabbable rail: off the right fist itself (ZoneOf), across it only when
                 // the blade side has bare shaft.
                 const auto rail = VR::TwoHand::RailOf(handle);
@@ -18112,6 +19021,9 @@ struct OpenXRPresenter::Impl {
                 (location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) == 0) {
                 return; // not tracked yet: try again next frame
             }
+            if (mirror_world) {
+                VrMirrorXr::Located(location); // one pose relative to another: the same rule
+            }
             float yaw{}, pitch{};
             const VR::Pose pose = FromXr(location.pose);
             VR::YawPitchFromQuat(pose.orientation, yaw, pitch);
@@ -18135,11 +19047,64 @@ struct OpenXRPresenter::Impl {
         const s64 period = std::max<s64>(frame_state.predictedDisplayPeriod, 1);
         const s64 p = frame_state.predictedDisplayTime;
         s64 step = 1;
+        // VR_WALL_SLOTS=1 (SteamVR only; a test): the refreshes since the last XR
+        // frame from the steady clock between xrWaitFrame returns, not the predicted display
+        // times. SteamVR paces in xrEndFrame, and its predicted display time jumps +2 then +0
+        // while the loop runs a steady refresh apart (2026-11-20: +0 14.6 / +2 6.2 per 5 s, the
+        // +0s holding a ready pair back "for an even cadence" 12.4 per 5 s; Meta: 0.07).
+        // VR_WALL_SLOTS=2: one refresh per XR frame (SteamVR's xrEndFrame paces the loop), with
+        // the steady clock only settling real misses: the refreshes owed since an anchor, a one
+        // refresh lead or lag tolerated (SteamVR's 20 ms hold then 2 ms return counts 1, 1).
+        // On SteamVR it is 2 unless VR_WALL_SLOTS says otherwise (0: the predicted display times,
+        // as before; 1: the plain steady-clock step). Every other runtime counts as before.
+        static const int wall_slots = [] {
+            const char* v = std::getenv("VR_WALL_SLOTS");
+            return v == nullptr || v[0] == '\0' ? 2 : (v[0] == '1' ? 1 : (v[0] == '2' ? 2 : 0));
+        }();
+        const s64 wall_now = SteadyNs();
         if (c.last_display_time != 0) {
             step = std::llround(static_cast<double>(p - c.last_display_time) /
                                 static_cast<double>(period));
+            if (wall_slots != 0 && xr_runtime == VrXrQueuePolicy::Runtime::SteamVr &&
+                last_slot_wall_ns > 0) {
+                s64 wall_step = std::llround(static_cast<double>(wall_now - last_slot_wall_ns) /
+                                             static_cast<double>(period));
+                if (wall_slots == 2) {
+                    if (wall_anchor_ns == 0 || period != wall_anchor_period) {
+                        wall_anchor_ns = last_slot_wall_ns;
+                        wall_anchor_period = period;
+                        wall_given = 0;
+                    }
+                    const s64 owed =
+                        std::llround(static_cast<double>(wall_now - wall_anchor_ns) /
+                                     static_cast<double>(period)) -
+                        wall_given;
+                    if (owed > 64 || owed < -64) { // a long stall or a clock jump: start over
+                        wall_anchor_ns = wall_now - period;
+                        wall_given = 0;
+                        wall_step = 1;
+                    } else {
+                        wall_step = owed >= 3 ? owed - 1 : (owed <= -1 ? 0 : 1);
+                    }
+                    wall_given += wall_step;
+                }
+                if (wall_step != step) {
+                    ++wall_slot_disagree[std::clamp<s64>(step, 0, 3)];
+                }
+                step = wall_step;
+                if (wall_now - wall_slot_log_ns > 5'000'000'000) {
+                    wall_slot_log_ns = wall_now;
+                    LOG_INFO(Render_Vulkan,
+                             "VR wall slots: steps from the steady clock; the predicted display "
+                             "time said otherwise {} / {} / {} / {} times at +0/+1/+2/+3",
+                             wall_slot_disagree[0], wall_slot_disagree[1],
+                             wall_slot_disagree[2], wall_slot_disagree[3]);
+                    wall_slot_disagree = {};
+                }
+            }
             ++c.slot_steps[std::clamp<s64>(step, 0, 3)];
         }
+        last_slot_wall_ns = wall_now;
         c.last_display_time = p;
         // The refreshes since the last XR frame: the frame cap's vblank (UpdatePacing) and the
         // DIBR pairs' holds (AdoptStereo) count them, not the loop's iterations, so a refresh the
@@ -18252,7 +19217,7 @@ struct OpenXRPresenter::Impl {
     // Frame thread, every 5 s with the cadence (before it is reset): the `VR latency:` line. Game
     // frame times are the DIBR pairs' hand-over intervals (this window, and since the session
     // started: the 1% / 0.1% worst); missed latches; the late warp's head pose age at xrEndFrame
-    // and at its display time; the shown image's age (its camera update) at its display time.
+    // and at the requested display target; the shown image's age at that target.
     // VR_FRAME_TIMES=1 also logs every interval of the window (offline percentiles).
     void LogLatency(std::vector<float>& times, u32 long_gaps) {
         const auto rank = [](std::vector<float>& v, double q) -> double {
@@ -18329,7 +19294,7 @@ struct OpenXRPresenter::Impl {
                  "skipped, {} images up 3+ refreshes, {} never shown; head pose -> xrEndFrame avg "
                  "{:.2f} / p99 {:.2f} / max {:.2f} ms, pose -> display {:.1f} ms ({} late-warped XR "
                  "frames, {} shown unwarped); shown image (camera update) -> display avg {:.1f} / "
-                 "p99 {:.1f} / max {:.1f} ms",
+                 "p99 {:.1f} / max {:.1f} ms (requested OpenXR display target)",
                  p50, p99, p999, window_max, times.size(), long_gaps, frame_time_count,
                  session(0.99), session(0.999), session_max, c.slot_steps[2] + c.slot_steps[3],
                  c.holds[2] + c.holds[3] + c.holds[4], c.unshown, avg(l.pose_to_end_ms),
@@ -18649,6 +19614,10 @@ struct OpenXRPresenter::Impl {
             count != 2 || (state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0) {
             return;
         }
+        if (mirror_world) {
+            // In the mirror as every other layer's views (Submit reflects them all back).
+            VrMirrorXr::Views(located.data(), count);
+        }
         const bool position = (state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
         for (u32 i = 0; i < 2; ++i) {
             XrCompositionLayerProjectionView& view = base.views[i];
@@ -18712,6 +19681,7 @@ struct OpenXRPresenter::Impl {
         u32 ui_layers = 0;
         const bool ui_probe_frame = ui_probe; // BuildUiLayers leaves the UI out of it
         late_pose_ns = 0;
+        s64 image_tick_ns = 0;
 
         WaitForStereoGpu();
         if (session_state == XR_SESSION_STATE_FOCUSED &&
@@ -18881,12 +19851,7 @@ struct OpenXRPresenter::Impl {
                 if (!late_used) {
                     ++latency.unwarped;
                 }
-                if (content[0].source.tick_ns != 0 && latency.image_age_ms.size() < 4096) {
-                    latency.image_age_ms.push_back(static_cast<float>(
-                        static_cast<double>(XrToSteady(frame_state.predictedDisplayTime) -
-                                            content[0].source.tick_ns) *
-                        1e-6));
-                }
+                image_tick_ns = content[0].source.tick_ns;
                 for (u32 i = 0; i < 2 && !late_used; ++i) {
                     views[i].pose = content[i].pose;
                     views[i].fov = content[i].projection.fov;
@@ -18905,9 +19870,17 @@ struct OpenXRPresenter::Impl {
                     dibr_optical_source = &optical_source;
                     auto& image_rect =
                         views[static_cast<u32>(optical_source.monocular_eye)].subImage.imageRect;
+                    const XrRect2Di whole = image_rect;
                     image_rect = MonocularImageRect(
                         image_rect, views[static_cast<u32>(optical_source.monocular_eye)].fov,
                         optical_source.monocular_zoom, optical_source.monocular_shift);
+                    if (mirror_world) {
+                        // Left-handed play: the eye's picture is flipped, and so is its crop
+                        // (taken from the mirror's view as before, then mirrored within the eye).
+                        image_rect.offset.x =
+                            VR::Mirror::RectX(image_rect.offset.x, image_rect.extent.width,
+                                              whole.offset.x, whole.extent.width);
+                    }
                 }
                 if (!late_used && content[0].depth_swapchain >= 0 &&
                     content[1].depth_swapchain >= 0 &&
@@ -19096,6 +20069,18 @@ struct OpenXRPresenter::Impl {
             }
         }
 
+        // Left-handed play: every layer back into your room (vr_mirror_xr.h), the HUD's pieces with
+        // the rest: they keep their pictures (readable) and move to the mirrored side of your view,
+        // where the hands and the item fan they fade for are (UiPieceOccluded is the mirror's). The
+        // pictures of the world were flipped where they were written.
+        if (mirror_world && layer_count != 0) {
+            mirror_layers.Convert(layers.data(), layer_count, XR_NULL_HANDLE);
+            if (mirror_layers.Unconverted() != 0 && !mirror_layers_logged) {
+                mirror_layers_logged = true;
+                LOG_WARNING(Render_Vulkan, "VR left-handed: {} layer(s) of a frame left unmirrored",
+                            mirror_layers.Unconverted());
+            }
+        }
         XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
         const auto end_start = std::chrono::steady_clock::now();
         struct EndTimer {
@@ -19118,34 +20103,68 @@ struct OpenXRPresenter::Impl {
             frame_lock.unlock();
         }
         XrResult end = XR_SUCCESS;
+        // VR_EARLY_VBLANK (SteamVR only; on by default, =0 turns it off): the game's vblank goes out now,
+        // with this frame's images chosen, instead of after xrEndFrame, which SteamVR blocks for
+        // most of a refresh: the game starts its next frame while SteamVR takes this one, as it does
+        // on Meta's runtime, whose xrEndFrame returns at once (2026-11-21).
+        static const bool early_vblank = [] {
+            const char* v = std::getenv("VR_EARLY_VBLANK");
+            return v == nullptr || v[0] != '0';
+        }();
+        if (early_vblank && xr_runtime == VrXrQueuePolicy::Runtime::SteamVr) {
+            UpdatePacing();
+            paced_early = true;
+        }
+        MockNoteFrame(late_shown_serial);
+        const bool stereo_submitted = image_tick_ns != 0 && layer_count != 0;
+        end_info.displayTime = GuardDisplayTime(frame_state.predictedDisplayTime, stereo_submitted);
         Common::SyncLog::Line("end disp=%lld rec=%llu head_t=%lld layers=%u",
-                              static_cast<long long>(frame_state.predictedDisplayTime),
+                              static_cast<long long>(end_info.displayTime),
                               static_cast<unsigned long long>(late_shown_record.id),
                               static_cast<long long>(late_shown_record.head_time), layer_count);
         {
             LockTrace::Phase phase{"xrEndFrame"};
             end = xrEndFrame(session, &end_info);
         }
-        VR::Page::Runtime::Get().ImagePresented(
-            XR_SUCCEEDED(end) ? submitted_page_revision : 0);
-        if (late_used && warp_done_semaphore && XR_SUCCEEDED(end)) {
+        last_end_return_ns = SteadyNs();
+        NoteReadyGrid(frame_state.predictedDisplayTime);
+        const bool accepted = XR_SUCCEEDED(end);
+        if (xr_runtime == VrXrQueuePolicy::Runtime::SteamVr) {
+            if (accepted) {
+                steamvr_target_history = stereo_submitted
+                                             ? VrXrQueuePolicy::SteamVrTargetHistory{
+                                                   frame_state.predictedDisplayTime,
+                                                   end_info.displayTime, display_period}
+                                             : VrXrQueuePolicy::SteamVrTargetHistory{};
+            } else if (end == XR_ERROR_TIME_INVALID &&
+                       end_info.displayTime != frame_state.predictedDisplayTime) {
+                steamvr_retarget_rejected = true;
+                LOG_WARNING(Render_Vulkan, "SteamVR rejected an adjusted display time; using "
+                                           "the runtime's predictions for this session");
+            }
+        }
+        VR::Page::Runtime::Get().ImagePresented(accepted ? submitted_page_revision : 0);
+        if (accepted && image_tick_ns != 0 && latency.image_age_ms.size() < 4096) {
+            latency.image_age_ms.push_back(static_cast<float>(
+                static_cast<double>(XrToSteady(end_info.displayTime) - image_tick_ns) * 1e-6));
+        }
+        if (late_used && warp_done_semaphore && accepted) {
             {
                 std::scoped_lock lk{warp_done_mutex};
                 if (warp_done_queue.size() < 64) {
                     warp_done_queue.push_back(
                         {late.LastDoneValue(), SteadyNs(),
-                         XrToSteady(frame_state.predictedDisplayTime)});
+                         XrToSteady(end_info.displayTime)});
                 }
             }
             warp_done_cv.notify_one();
         }
-        if (late_used && late_pose_ns != 0 && XR_SUCCEEDED(end) &&
+        if (late_used && late_pose_ns != 0 && accepted &&
             latency.pose_to_end_ms.size() < 4096) {
             latency.pose_to_end_ms.push_back(
                 static_cast<float>(static_cast<double>(SteadyNs() - late_pose_ns) * 1e-6));
             latency.pose_to_display_ms +=
-                static_cast<double>(XrToSteady(frame_state.predictedDisplayTime) - late_pose_ns) *
-                1e-6;
+                static_cast<double>(XrToSteady(end_info.displayTime) - late_pose_ns) * 1e-6;
         }
         if (ui_probe_frame) {
             // The frame without the UI layers after a rejected one with them: accepted twice in a
@@ -19226,7 +20245,7 @@ struct OpenXRPresenter::Impl {
                             depth_reject_code);
             } else {
                 depth_strikes = 0;
-                if (overlay_layer != nullptr && !IsLoss(end)) {
+                if (overlay_layer != nullptr && !IsLoss(end) && !IsTimeError(end)) {
                     overlay_probe = true;
                     overlay_reject_code = static_cast<s32>(end);
                 }
@@ -19252,7 +20271,7 @@ struct OpenXRPresenter::Impl {
                             base.reject_code);
                 break;
             case VrXrLayers::BaseProbe::Verdict::NotCause:
-                if (overlay_layer != nullptr && !IsLoss(end)) {
+                if (overlay_layer != nullptr && !IsLoss(end) && !IsTimeError(end)) {
                     overlay_probe = true;
                     overlay_reject_code = static_cast<s32>(end);
                 }
@@ -19267,7 +20286,7 @@ struct OpenXRPresenter::Impl {
             // Then the late warp's pair: the next frame shows the game-rate pair.
             late_probe = true;
             late_reject_code = static_cast<s32>(end);
-        } else if (XR_FAILED(end) && depth_chained && !IsLoss(end)) {
+        } else if (XR_FAILED(end) && depth_chained && !IsLoss(end) && !IsTimeError(end)) {
             // Probed first: the next frame goes without the depth (the overlay's probe follows if
             // that one is rejected too).
             depth_probe = true;
@@ -19277,7 +20296,8 @@ struct OpenXRPresenter::Impl {
             // next frame goes without it (the overlay's probe follows if that one is rejected too).
             base.probe.Rejected();
             base.reject_code = static_cast<s32>(end);
-        } else if (XR_FAILED(end) && overlay_layer != nullptr && !IsLoss(end)) {
+        } else if (XR_FAILED(end) && overlay_layer != nullptr && !IsLoss(end) &&
+                   !IsTimeError(end)) {
             overlay_probe = true;
             overlay_reject_code = static_cast<s32>(end);
         } else if (XR_SUCCEEDED(end) && overlay_layer != nullptr) {
@@ -19642,6 +20662,13 @@ struct OpenXRPresenter::Impl {
             if (!ensured) {
                 return;
             }
+            if (mirror_world && immersive && !tag.menu) {
+                // Left-handed play: this path copies the world unflipped. The swapchains exist
+                // now (the GPU thread's RecordStereoCopy needs them); the last mirrored pair
+                // stays up instead of this frame (HoldUnflipped).
+                HoldUnflipped("the mono copy");
+                return;
+            }
             if (tag.menu) {
                 // The menu panel has its own swapchain: the last eye images stay untouched and
                 // are shown dimmed around it.
@@ -19925,6 +20952,10 @@ struct OpenXRPresenter::Impl {
                 ensured = EnsureSwapchains(extent);
             }
             if (!ensured) {
+                return false;
+            }
+            if (mirror_world) {
+                HoldUnflipped("the stereo copy"); // left-handed play: never unflipped eyes
                 return false;
             }
             bool fits = swapchain_extent == extent && !scaler_image;
@@ -20479,6 +21510,21 @@ struct OpenXRPresenter::Impl {
         return std::clamp<u32>(static_cast<u32>(std::floor(ratio + 0.15)), 1, 4);
     }
 
+    // The shown pair's hold against MinHold: its refreshes up (`refreshes`). VR_ADOPT_BY_SUBMIT=1
+    // (SteamVR only, a hold of one refresh; on by default, =0 off): or the XR frames it was
+    // submitted in (`submits`), so a newer finished pair goes up once the shown one was submitted,
+    // whatever SteamVR's predicted display time said (2026-11-20: a +0 there held a ready pair).
+    u32 HeldForHold(u32 refreshes, u32 submits) const {
+        static const bool by_submit = [] { // on by default; VR_ADOPT_BY_SUBMIT=0 turns it off
+            const char* v = std::getenv("VR_ADOPT_BY_SUBMIT");
+            return v == nullptr || v[0] != '0';
+        }();
+        if (by_submit && xr_runtime == VrXrQueuePolicy::Runtime::SteamVr && MinHold() == 1) {
+            return std::max(refreshes, submits);
+        }
+        return refreshes;
+    }
+
     // xr_mutex and submit_mutex held (GPU thread): pair `pair`'s two swapchains hold `extent`.
     // Re-created only when an eye crop grows (a little larger than needed, so small crop changes
     // keep them); never the pair on display.
@@ -20599,8 +21645,10 @@ struct OpenXRPresenter::Impl {
     }
 
     bool DepthWanted() const {
+        // (Left-handed play: the eyes' depth would go up unflipped, so none is sent and no depth
+        // swapchain is made.)
         return Runtime().has_depth && depth_format != 0 && VR::GetSettings().xr_depth &&
-               !depth_disabled.load(std::memory_order_relaxed);
+               !depth_disabled.load(std::memory_order_relaxed) && !mirror_world;
     }
 
     // vr.ini eye_size (vr_eye_scale.h; any thread): each eye's size in its swapchain for eye
@@ -20727,6 +21775,61 @@ struct OpenXRPresenter::Impl {
         }
     }
 
+    // Left-handed play: an eye frame that only has an unflipped path (the mono copy, the stereo
+    // copy, eyes the blit cannot flip exactly) is held back, the last mirrored pair staying up: the
+    // runtime keeps turning it with your head, so the world stays still. Shown unflipped it would
+    // turn the wrong way as you turn (the eyes were made from the mirror's head): never. The first
+    // is logged, and a long run of them (no mirrored eyes for about half a second) once; the VR
+    // pair line counts them (any thread: atomics).
+    static constexpr u32 MirrorHoldWarn = 30;
+    void HoldUnflipped(const char* path) {
+        if (mirror_refused.fetch_add(1, std::memory_order_relaxed) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "VR left-handed: a frame from {} held back (the last mirrored pair stays; "
+                     "the VR pair line counts them)",
+                     path);
+        }
+        const u32 run = mirror_refused_run.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (run >= MirrorHoldWarn && !mirror_hold_warned.exchange(true)) {
+            LOG_WARNING(Render_Vulkan,
+                        "VR left-handed: no mirrored eyes for {} frames ({}): the last mirrored "
+                        "picture holds (unflipped eyes would turn the world the wrong way)",
+                        run, path);
+        }
+    }
+    // A mirrored pair goes up: the run of held-back frames starts again.
+    void MirroredPairShown() {
+        mirror_refused_run.store(0, std::memory_order_relaxed);
+    }
+
+    // Left-handed play (RecordStereoCopy, the GPU thread under xr_mutex): whether the eyes can be
+    // flipped exactly in the blit that replaces their copy: the same format on both sides (native
+    // stereo's eyes come in the swapchain's own) and one the card blits from and to (optimal
+    // tiling; Vulkan requires both for the 8-bit sRGB formats). The card is asked once a format.
+    bool MirrorBlitReady(vk::Format eye_format) {
+        const auto swap = static_cast<vk::Format>(swapchain_format);
+        if (eye_format != swap) {
+            if (!mirror_format_logged) {
+                mirror_format_logged = true;
+                LOG_WARNING(Render_Vulkan,
+                            "VR left-handed: the eyes come as {}, the headset takes {}: they are "
+                            "not shown (the last mirrored pair stays)",
+                            vk::to_string(eye_format), vk::to_string(swap));
+            }
+            return false;
+        }
+        if (mirror_blit_format != swap) {
+            mirror_blit_format = swap;
+            const vk::FormatProperties props = instance.GetPhysicalDevice().getFormatProperties(swap);
+            const vk::FormatFeatureFlags need =
+                vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eBlitDst;
+            mirror_blit_ok = (props.optimalTilingFeatures & need) == need;
+            LOG_INFO(Render_Vulkan, "VR left-handed: the eyes are flipped by a blit in {}{}",
+                     vk::to_string(swap), mirror_blit_ok ? "" : ": NOT supported by this card");
+        }
+        return mirror_blit_ok;
+    }
+
     // vr.ini canted_eyes on a canted display (core/vr/eye_cant.h): the record's eyes are turned
     // from the head and each eye image is turned into its own view before the headset
     // (VrEyeCant). Off: the parallel eyes, for the runtime to turn.
@@ -20747,10 +21850,11 @@ struct OpenXRPresenter::Impl {
         // eyes (it turns its own every refresh; this pair is then only its fallback, parallel).
         const bool correction_requested = TurnEyes(tag.record);
         const bool correction_delegated = late_enabled.load() && eyes.late.valid;
+        // (Left-handed play: eye_cant's MIRROR build writes each turned eye flipped.)
         bool turn = correction_requested && !correction_delegated;
         if (turn && !eye_cant.Ready() && !eye_cant_tried) {
             eye_cant_tried = true;
-            eye_cant.Init(instance.GetDevice(), instance.GetAllocator());
+            eye_cant.Init(instance.GetDevice(), instance.GetAllocator(), mirror_world);
         }
         turn = turn && eye_cant.Ready();
         for (u32 i = 0; i < 2; ++i) {
@@ -20770,6 +21874,7 @@ struct OpenXRPresenter::Impl {
         std::array<u32, 2> indices{};
         std::array<u32, 2> depth_indices{};
         bool with_depth = false;
+        bool flip = false; // left-handed play: the eyes flipped by the blit (MirrorBlitReady)
         {
             const Common::Log::DeferScope log_defer; // its log lines: once the lock is released
             const LockTrace::Start lock_start;
@@ -20781,6 +21886,16 @@ struct OpenXRPresenter::Impl {
             if (swapchains[0].handle == XR_NULL_HANDLE || !stereo_copy_compatible ||
                 dibr_recording.valid) {
                 return false; // the present thread creates the eye swapchains with a first frame
+            }
+            if (mirror_world) {
+                // Left-handed play: the eyes flipped by the blit that replaces their copy; eyes
+                // it cannot flip exactly are held back (HoldUnflipped).
+                flip = MirrorBlitReady(eyes.image_format);
+                if (!flip) {
+                    HoldUnflipped("the eye blit");
+                    return false;
+                }
+                MirroredPairShown();
             }
             // stereo_adopt_finished (VrStereoQueue): a pair neither shown nor waiting; with the
             // queue full, a waiting one gives way (replaced by this newer frame before it was
@@ -20925,7 +22040,22 @@ struct OpenXRPresenter::Impl {
                                               static_cast<s32>(out.height)}}};
                 }
             }
-            if (!turned[i]) {
+            if (!turned[i] && flip) {
+                // Left-handed play: the eye flipped left to right on its way in, at the cost of
+                // the copy it replaces (one blit, the same format both sides: MirrorBlitReady).
+                const s32 w = static_cast<s32>(eyes.extent[i].width);
+                const s32 h = static_cast<s32>(eyes.extent[i].height);
+                const vk::ImageBlit region{
+                    .srcSubresource = layers,
+                    .srcOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{w, h, 1}},
+                    .dstSubresource = layers,
+                    .dstOffsets = std::array{vk::Offset3D{w, 0, 0}, vk::Offset3D{0, h, 1}},
+                };
+                cmdbuf.blitImage(eyes.image[i], vk::ImageLayout::eTransferSrcOptimal,
+                                 xr_images[i], vk::ImageLayout::eTransferDstOptimal, region,
+                                 vk::Filter::eNearest);
+                frame.projections[i] = {fov, {{0, 0}, {w, h}}};
+            } else if (!turned[i]) {
                 const vk::ImageCopy region{
                     .srcSubresource = layers,
                     .srcOffset = {0, 0, 0},
@@ -21171,6 +22301,9 @@ struct OpenXRPresenter::Impl {
             dibr_queue[dibr_queued] = frame;
             dibr_queue[dibr_queued].valid = true;
             ++dibr_queued;
+            if (waiting_for_stereo_publish) {
+                stereo_published.notify_one();
+            }
             UpdateLateBusy();
             published_seq = std::max(published_seq, frame.seq);
             if (last_dibr_publish_ns != 0) {
@@ -21211,17 +22344,55 @@ struct OpenXRPresenter::Impl {
         }
     }
 
-    // Frame thread, before Submit takes its locks: a published DIBR pair whose turn has come but
-    // whose GPU work is still running is waited for a little (at most 40% of a refresh and 4 ms), so
-    // it goes up in this XR frame instead of the next (about half a refresh less latency).
+    // Frame thread, before Submit takes its locks. SteamVR's publish wait and the GPU wait
+    // share one deadline so a pair published late cannot start a fresh wait.
     void WaitForStereoGpu() {
         MasterSemaphore* gpu = nullptr;
         u64 tick = 0;
+        using Clock = std::chrono::steady_clock;
+        std::optional<Clock::time_point> deadline;
+        const auto gpu_budget =
+            std::chrono::nanoseconds{std::clamp<s64>(display_period, 0, 10'000'000) * 2 / 5};
+        // VR_WAIT_PUBLISH_MS=<ms> (SteamVR only; 5 by default, =0 turns it off): a new pair is due but none
+        // is published yet: wait up to that long for the game's next one before choosing. SteamVR
+        // takes the frame at its next refresh whatever xrEndFrame's call time, and its take wobbles
+        // around the refresh, so a pick a little early found nothing (2026-11-21 mock: 42 of the
+        // 34 repeats per 5 s were "nothing published"; Meta 4).
+        static const auto publish_budget = [] {
+            const char* v = std::getenv("VR_WAIT_PUBLISH_MS");
+            const double ms = v != nullptr ? std::atof(v) : 5.0;
+            return std::chrono::nanoseconds{
+                static_cast<s64>((std::isfinite(ms) ? std::clamp(ms, 0.0, 6.0) : 5.0) * 1e6)};
+        }();
         {
-            std::scoped_lock lk{xr_mutex};
-            if (dibr_queued == 0 || (!panel_shown && ShownDibrPair() >= 0 &&
-                                     dibr_held_frames + held_refreshes < MinHold())) {
+            std::unique_lock lk{xr_mutex};
+            const bool can_wait_publish = xr_runtime == VrXrQueuePolicy::Runtime::SteamVr &&
+                publish_budget.count() > 0 && display_period > 0 &&
+                accepting_frames.load(std::memory_order_relaxed);
+            if (dibr_queued == 0 && !can_wait_publish) {
                 return;
+            }
+            const bool immersive_pair = !panel_shown && ShownDibrPair() >= 0;
+            if (immersive_pair &&
+                HeldForHold(dibr_held_frames + held_refreshes, dibr_shown_submits + 1) < MinHold()) {
+                return;
+            }
+            if (dibr_queued == 0) {
+                if (!immersive_pair) {
+                    return;
+                }
+                const auto start = Clock::now();
+                deadline = start + std::min(std::max(publish_budget, gpu_budget),
+                                            std::chrono::nanoseconds{display_period / 2});
+                waiting_for_stereo_publish = true;
+                const bool published = stereo_published.wait_until(
+                    lk, std::min(start + publish_budget, *deadline),
+                    [this] { return dibr_queued != 0; });
+                waiting_for_stereo_publish = false;
+                ++adopt_publish_waits[published ? 1 : 0];
+                if (!published) {
+                    return;
+                }
             }
             // None when a waiting pair is already done, else the oldest (the first to finish).
             const auto entries = QueueEntries();
@@ -21236,18 +22407,25 @@ struct OpenXRPresenter::Impl {
         if (gpu->IsFree(tick)) {
             return;
         }
-        const u64 budget =
-            static_cast<u64>(std::clamp<s64>(display_period * 2 / 5, 0, 4'000'000));
         const vk::Semaphore semaphore = gpu->Handle();
         const vk::SemaphoreWaitInfo wait{
             .semaphoreCount = 1,
             .pSemaphores = &semaphore,
             .pValues = &tick,
         };
-        const s64 start = SteadyNs();
-        VrDeviceLost::Note(instance.GetDevice().waitSemaphores(&wait, budget),
+        const auto start = Clock::now();
+        auto budget = gpu_budget;
+        if (deadline) {
+            budget = std::min(budget, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          *deadline - start));
+        }
+        if (budget.count() <= 0) {
+            return;
+        }
+        VrDeviceLost::Note(instance.GetDevice().waitSemaphores(&wait, static_cast<u64>(budget.count())),
                            "the frame thread's wait for a DIBR pair's GPU work");
-        cadence.gpu_wait_ns += SteadyNs() - start;
+        cadence.gpu_wait_ns +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
         ++cadence.gpu_wait_calls;
     }
 
@@ -21256,16 +22434,37 @@ struct OpenXRPresenter::Impl {
     void AdoptStereo() {
         // Refreshes since the shown pair went up (NoteDisplaySlot; a missed one counts too).
         dibr_held_frames += std::exchange(held_refreshes, 0u);
+        if (ShownDibrPair() >= 0) {
+            ++dibr_shown_submits; // submitted in the last XR frame (HeldForHold)
+        }
+        const u32 held = HeldForHold(dibr_held_frames, dibr_shown_submits);
         // The shown pair has had its game frame's worth of refreshes and the next game frame is not
         // ready: it stays up one refresh longer (a miss of the frame cap's cadence).
-        const bool due = !panel_shown && ShownDibrPair() >= 0 && dibr_held_frames >= MinHold();
+        const bool due = !panel_shown && ShownDibrPair() >= 0 && held >= MinHold();
+        // VR adopt (5 s, the SteamVR study 2026-11-21): at each XR frame with a new pair due, was
+        // nothing published yet, a pair published but its GPU work unfinished, or one put up.
+        if (const s64 now = SteadyNs(); now - adopt_log_ns > 5'000'000'000) {
+            if (adopt_log_ns != 0) {
+                LOG_INFO(Render_Vulkan,
+                         "VR adopt: {} XR frames with a pair due: nothing published {}, published "
+                         "but its GPU work unfinished {}, put up {}; waits for a publish (VR_WAIT_"
+                         "PUBLISH_MS) {}, of them in time {}",
+                         adopt_due[0] + adopt_due[1] + adopt_due[2], adopt_due[0], adopt_due[1],
+                         adopt_due[2], adopt_publish_waits[0] + adopt_publish_waits[1],
+                         adopt_publish_waits[1]);
+            }
+            adopt_log_ns = now;
+            adopt_due = {};
+            adopt_publish_waits = {};
+        }
         if (dibr_queued == 0) {
             if (due) {
+                ++adopt_due[0];
                 NotePacingMiss();
             }
             return;
         }
-        if (!panel_shown && ShownDibrPair() >= 0 && dibr_held_frames < MinHold()) {
+        if (!panel_shown && ShownDibrPair() >= 0 && held < MinHold()) {
             ++cadence.hold_waits;
             return;
         }
@@ -21276,9 +22475,13 @@ struct OpenXRPresenter::Impl {
         if (pick < 0) {
             ++cadence.gpu_waits;
             if (due) {
+                ++adopt_due[1];
                 NotePacingMiss();
             }
             return;
+        }
+        if (due) {
+            ++adopt_due[2];
         }
         ConfirmPacingMiss(dibr_held_frames);
         DibrFrame adopted = dibr_queue[pick];
@@ -21368,6 +22571,7 @@ struct OpenXRPresenter::Impl {
         late_shown_rows = {adopted.flip_record, adopted.aux_record};
         UpdateLateBusy();
         dibr_held_frames = 0;
+        dibr_shown_submits = 0;
         if (staged.valid && !staged.shown) {
             ++pair_stats.incomplete; // an AER left eye from before a mode switch
         }
@@ -21522,6 +22726,9 @@ struct OpenXRPresenter::Impl {
             (head.locationFlags & needed) != needed) {
             ++st.no_head;
             return late.Reuse(views, recenter_serial);
+        }
+        if (mirror_world) {
+            VrMirrorXr::Located(head); // the head at display time, in the mirror
         }
         const VR::CameraRecord& rec = late_shown_record;
         VR::Quat q_s = VR::QuatFromYawPitchRoll(rec.head_yaw, rec.head_pitch, rec.head_roll);
@@ -25508,6 +26715,30 @@ struct OpenXRPresenter::Impl {
             shown_overlay_composed = snapshot != nullptr;
             return want_ui;
         }
+        // Left-handed play: the eye images were flipped on their way in (RecordStereoCopy), so
+        // they are your room's views: each is drawn on with its own camera there (eye i's image
+        // is the mirror of eye i's view, so its camera is that view reflected) and every piece
+        // reflected back into the room, the HUD's with the rest (as Submit's VrMirrorXr::Layers):
+        // readable, on the mirrored side. Right-handed: as built.
+        std::array<XrPosef, 2> eye_poses = frame.eye_poses;
+        std::array<XrFovf, 2> eye_fovs{frame.projections[0].fov, frame.projections[1].fov};
+        XrPosef ui_frame_pose = frame.ui.frame_pose;
+        std::array<VrUiGeometry::Piece, 2> page_drawn = page_pieces;
+        if (mirror_world) {
+            for (u32 i = 0; i < 2; ++i) {
+                eye_poses[i] = VrMirrorXr::Pose(eye_poses[i]);
+                eye_fovs[i] = VrMirrorXr::Fov(eye_fovs[i]);
+            }
+            ui_frame_pose = VrMirrorXr::Pose(ui_frame_pose);
+            // (A piece fixed to the view sits at the frame's pose times its own: both reflected,
+            // the same rule as one in LOCAL.)
+            for (u32 i = 0; i < piece_count; ++i) {
+                pieces[i].pose = VrMirrorXr::Pose(pieces[i].pose);
+            }
+            for (u32 i = 0; i < page_piece_count && i < page_drawn.size(); ++i) {
+                page_drawn[i].pose = VrMirrorXr::Pose(page_drawn[i].pose);
+            }
+        }
         const auto cmd = ui_compose.Begin();
         if (!cmd) return false;
         const vk::Image atlas_image = atlas ? vk::Image{atlas->images[atlas->index].image} : vk::Image{};
@@ -25538,12 +26769,12 @@ struct OpenXRPresenter::Impl {
             const auto& rect = frame.projections[i].rect;
             ui_compose.Draw(cmd, targets[i], {u32(rect.extent.width),u32(rect.extent.height)},
                             atlas_view, ui_chain_extent, {pieces.data(),piece_count},
-                            frame.eye_poses[i],frame.projections[i].fov,frame.ui.frame_pose);
+                            eye_poses[i],eye_fovs[i],ui_frame_pose);
             if (bake_page) // its bake image is left in shader-read layout by its copy
                 ui_compose.Draw(cmd, targets[i], {u32(rect.extent.width),u32(rect.extent.height)},
                                 page_layer.BakeView(u32(page_image)), page_layer.BakeExtent(),
-                                {page_pieces.data(), page_piece_count}, frame.eye_poses[i],
-                                frame.projections[i].fov, frame.ui.frame_pose);
+                                {page_drawn.data(), std::min<u32>(page_piece_count, 2)},
+                                eye_poses[i], eye_fovs[i], ui_frame_pose);
         }
         auto restore = read;
         restore.srcStageMask=vk::PipelineStageFlagBits2::eFragmentShader;
@@ -25577,11 +26808,12 @@ struct OpenXRPresenter::Impl {
             cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1, .pMemoryBarriers=&blend_order});
             const auto size = overlay_in_eye.OffscreenExtent();
             for (u32 i=0; i<2; ++i) {
-                const auto& fov=frame.projections[i].fov;
+                // (Left-handed play: half i was drawn flipped, the room's view of eye i's image.)
+                const auto& fov=eye_fovs[i];
                 const float l=std::tan(fov.angleLeft), r=std::tan(fov.angleRight);
                 const float u=std::tan(fov.angleUp), d=std::tan(fov.angleDown);
                 VrUiGeometry::Piece screen{};
-                screen.pose=frame.eye_poses[i];
+                screen.pose=eye_poses[i];
                 const auto& q=screen.pose.orientation;
                 const auto offset=VR::Rotate(VR::Quat{q.x,q.y,q.z,q.w},
                                              VR::Vec3{(l+r)*0.5f,(u+d)*0.5f,-1.0f});
@@ -25592,7 +26824,7 @@ struct OpenXRPresenter::Impl {
                 screen.rect={{s32(i*size.width/2),0},{s32(size.width/2),s32(size.height)}};
                 const auto& rect=frame.projections[i].rect;
                 ui_compose.Draw(cmd,targets[i],{u32(rect.extent.width),u32(rect.extent.height)},
-                    overlay_in_eye.OffscreenView(),size,{&screen,1},frame.eye_poses[i],fov,frame.ui.frame_pose);
+                    overlay_in_eye.OffscreenView(),size,{&screen,1},eye_poses[i],fov,ui_frame_pose);
             }
         }
         const auto sync = xrq.PlanGameBatch(0); // acquire was already waited by the game's copy
@@ -25934,13 +27166,16 @@ struct OpenXRPresenter::Impl {
                  "{:.1f} / max {:.1f} mm ({} measured), dyaw avg {:.3f} / max {:.3f} deg; shown "
                  "to both eyes: {} right eyes (start {}, unpaired {}, turn {}, age {}, yaw {}), "
                  "{} left eyes (incomplete {}, expired {}); {} mono frames; {} DIBR pairs (both "
-                 "eyes from one game frame, age 0), {} DIBR fallbacks",
+                 "eyes from one game frame, age 0), {} DIBR fallbacks{}",
                  mode, s.frames[0], s.frames[1], s.pairs, s.late, s.age_ms / pairs, s.age_max_ms,
                  s.wait_ms / pairs, s.wait_max_ms, s.camera_mm / camera_pairs, s.camera_max_mm,
                  s.camera_pairs, s.yaw_deg / pairs, s.yaw_max_deg, s.fallbacks, s.fallback_start,
                  s.fallback_unpaired, s.fallback_turn, s.fallback_age, s.fallback_yaw,
                  s.incomplete + s.expired, s.incomplete, s.expired, s.mono, s.dibr,
-                 s.dibr_fallback);
+                 s.dibr_fallback,
+                 mirror_world ? fmt::format("; left-handed: {} eye frames held back so far",
+                                            mirror_refused.load(std::memory_order_relaxed))
+                              : std::string{});
     }
 
     const Instance& instance;
@@ -26032,6 +27267,33 @@ struct OpenXRPresenter::Impl {
     // never waits for xrEndFrame. Else everything runs as before.
     VrXrQueue xrq;
     VrXrQueuePolicy::Runtime xr_runtime{VrXrQueuePolicy::Runtime::Other};
+    // VR_WALL_SLOTS (NoteDisplaySlot): the last xrWaitFrame return, and the steps the predicted
+    // display time disagreed with (by its step), for a line every 5 s.
+    s64 last_slot_wall_ns{0};
+    s64 wall_slot_log_ns{0};
+    s64 wall_anchor_ns{0};     // VR_WALL_SLOTS=2: the anchor, its period, the refreshes given since
+    s64 wall_anchor_period{0};
+    s64 wall_given{0};
+    u32 dibr_shown_submits{0}; // VR_ADOPT_BY_SUBMIT: XR frames the shown pair was submitted in
+    bool paced_early{false};   // VR_EARLY_VBLANK: Submit already sent this XR frame's vblank
+    // VR_DOUBLE_GUARD_MS: the last xrEndFrame's return (steady ns), the last predicted display
+    // time, the 5 s log.
+    s64 last_end_return_ns{0};
+    XrTime guard_last_predicted{0};
+    VrXrQueuePolicy::SteamVrTargetHistory steamvr_target_history;
+    bool steamvr_retarget_rejected{false};
+    bool steamvr_meta_link{false}; // SteamVR's system is a Quest through Meta's Link (system_name)
+    u64 guard_frames{0}, guard_same{0}, guard_waits{0}, guard_next{0}, guard_earlier{0};
+    double guard_wait_ms{0.0};
+    s64 guard_log_ns{0};
+    // VR_DOUBLE_GUARD_GRID: a point of the refresh grid (steady ns) and the usual return on it.
+    s64 ready_grid_ns{0};
+    s64 ready_phase_ns{0};
+    bool ready_phase_set{false};
+    s64 adopt_log_ns{0};       // the `VR adopt:` line (AdoptStereo): its last time, its counts
+    std::array<u32, 3> adopt_due{};
+    std::array<u32, 2> adopt_publish_waits{}; // VR_WAIT_PUBLISH_MS: waits that timed out / got one
+    std::array<u32, 4> wall_slot_disagree{};
     bool runtime_y_menu{};
     bool swapchain_mips{true}; // the UI and page swapchains may have mips (SwapchainMips)
     u64 late_acquire_value{0}; // own queue: the late warp's acquired image (VrXrQueue)
@@ -26061,6 +27323,7 @@ struct OpenXRPresenter::Impl {
     // XrTime minus the steady clock (SteadyNs), when applied (MeasureXrClock: 1 ms or more, not
     // Meta's runtime); else 0, XrTime taken as the steady clock (XrToSteady, SteadyToXr).
     s64 xr_clock_offset_ns{0};
+    bool xr_clock_calibrated{false};
     std::array<EyeSwapchain, SwapchainCount> swapchains{};
     vk::Extent2D swapchain_extent{};
     vk::Extent2D source_extent{};
@@ -26193,6 +27456,8 @@ struct OpenXRPresenter::Impl {
     // one whose GPU work is done goes up (AdoptStereo). One with stereo_adopt_finished=0.
     std::array<DibrFrame, VrStereoQueue::MaxWaiting> dibr_queue{};
     u32 dibr_queued{0};
+    std::condition_variable stereo_published;
+    bool waiting_for_stereo_publish{false}; // xr_mutex
     struct QueueStats {
         u32 ahead{};    // pairs put up while a newer one was still being drawn
         u32 skipped{};  // older finished pairs dropped behind a newer finished one
@@ -26400,6 +27665,26 @@ struct OpenXRPresenter::Impl {
     bool quick_arc_ready{false};
     // The left controller's map binds Y (LogInteractionProfiles; false: WMR trackpad clicks).
     bool left_y_bound{true};
+    // Left-handed play (core/vr/mirror_world.h, vr_mirror_xr.h): this session's mirror, fixed
+    // before the actions are made (VR::LatchMirrorWorld). False all session in right-handed play,
+    // where nothing below that tests it runs.
+    bool mirror_world{false};
+    // The frame's layers copied back into your room (Submit, the frame thread only).
+    VrMirrorXr::Layers mirror_layers;
+    // The gamepad's and the keyboard's sticks mirrored now (gameplay; the frame thread).
+    bool pad_mirror_x{false};
+    bool pad_mirror_logged{false};
+    bool mirror_layers_logged{false};
+    // The eyes' flip (MirrorBlitReady; the GPU thread, xr_mutex held).
+    vk::Format mirror_blit_format{vk::Format::eUndefined};
+    bool mirror_blit_ok{false};
+    bool mirror_format_logged{false};
+    // Eye frames held back in left-handed play rather than shown unflipped (the fallbacks), the
+    // run of them since the last mirrored pair, and whether a long run was logged
+    // (HoldUnflipped).
+    std::atomic<u64> mirror_refused{0};
+    std::atomic<u32> mirror_refused_run{0};
+    std::atomic<bool> mirror_hold_warned{false};
     // The sprint latch, A's leap / dodge and the second click (left_scheme=2), and the Circle
     // edges of a leap or a dodge out of a sprint (both schemes): core/vr/left_locomotion.h.
     VR::Loco::Controller loco;
@@ -26408,6 +27693,7 @@ struct OpenXRPresenter::Impl {
     int loco_log_dash{-2}; // VR_LOCO_LOG: the last logged dash reading (391, 390)
     int loco_log_window{-2};
     int loco_log_jump{-2};     // ... the game's jump reading
+    VR::LockFollow::MoveCommit move_commit{}; // lockon_move_commit_s
     bool loco_log_ahead{true}; // ... the stick ahead of the hunter (the no-dash rule) or a strafe
     // A leap or a dodge started this frame (UpdateLocomotion), for the quick items (it closes the
     // open arc); nullptr: none.
@@ -26640,6 +27926,7 @@ struct OpenXRPresenter::Impl {
     bool weapon_weight_active{}, weapon_weight_mesh{};
     VR::Body::TrackedHand guide_weapon_hand{};
     u64 guide_weapon_frame{};
+    u64 split_hilt_frame{}; // input offered the unlatched hilt on this XR frame
     VR::Combat::ThrustState thrust_state{};
     u32 thrust_logged_window{0};
     // Simon's Bowblade's bow (vr.ini bow; UpdateBow): its state, whether its bow form is up, the
@@ -26699,6 +27986,7 @@ struct OpenXRPresenter::Impl {
     s64 slip_ns{0};             // ... the hand slipped off the handle (it may take it again)
     bool zone_was{false};       // ... the left hand in the handle zone last frame (its cue)
     u32 charge_serial{0};       // UpdateRightGrip: the charge's native pull (its refusal: no cooldown)
+    s64 tonitrus_lift_ns{};     // latest lift sent by this grip; another weapon's Fire replaces it
     int grip_quarter{0};        // ... the charge's build: its detents passed
     float arm_beat_s{0.0f};     // ... the armed Bloodletter's heartbeat clock
     s64 grab_transform_ns{0};   // ... the grab's transform on its way since (0: none)
@@ -27193,8 +28481,43 @@ struct OpenXRPresenter::Impl {
     VR::Lean::DuckDetector duck_iframes{}; // duck_iframes_ms: a quick duck, i-frames only
     u32 duck_space{0};                     // the recenter_serial its history is in
     double iframes_granted_t{-1e9};        // the last lean or duck grant (s): their cooldown
+    double iframes_early_t{-1.0}; // the early lean's grant (lean_dodge.h EarlyMs), -1 none
     bool iframes_granted_duck{false};      // ... it was a duck's (a lean may still top it up)
     XrVector2f lean_stick{0.0f, 0.0f}; // the dodge direction (+y = view forward)
+    // The Chikage's quick draw (core/vr/chikage.h; OnScabbardEvent, UpdatePhysicalMelee).
+    VR::Chikage::DrawRequest chikage_draw_request{VR::Chikage::DrawRequest::None};
+    s64 chikage_blood_until_ns{0};    // the scabbard's blood on the clean blade lasts until then
+    s32 chikage_blood_weapon{-1};
+    u32 chikage_blood_from{0};        // ... for the right hand's windows from this serial on
+    float chikage_draw_power{0.0f};   // ... 0 .. 1 by its speed
+    u32 chikage_draw_window{0};       // the melee window it opened (0: none)
+    float chikage_draw_scale{1.0f};   // ... whose hits x this
+    s64 chikage_step_until{};
+    s64 chikage_lunge_ns{};          // the pull's lunge (ScabbardLunge) of the last withdrawal
+    bool chikage_lunge_blocked{false}; // ... found an enemy right ahead: no step
+    s64 chikage_context_ns{};
+    s32 chikage_pose_weapon{-1};
+    s32 chikage_draw_weapon{-1};
+    bool chikage_sheathed{};
+    bool chikage_hand_held{};
+    bool chikage_grip_down{};
+    bool chikage_owns_grip{false};    // the left squeeze is its scabbard's (UpdateChikageGrip)
+    s64 chikage_draw_ns{0};           // when the quick draw came (its window opens fresh or not)
+    VR::BloodBlast::Gate blood_blast_gate{}; // the Bloodletter's trigger: a tap, or armed and smashed
+    VR::BloodBlast::ContactHistory blood_touch_history{};
+    bool blood_check_enemy{false};
+    float blood_blast_beat{0.0f};       // the armed heartbeat's clock
+    float blood_hum_level{0.0f};        // the hold hum's level in its hand (BloodHoldHum; 0 none)
+    u32 blood_hum_hand{0};              // ... that hand
+    float blood_hum_phase{0.0f};        // ... and its beat (0..1: a peak at 0)
+    s64 blood_boom_ns{0};               // when the blast's boom began (0: none)
+    bool blood_blast_pending{false};    // a smash for the melee step to open ...
+    s64 blood_blast_ns{0};              // ... when
+    u32 blood_blast_window{0};          // the blast's window (serial; 0 none)
+    float chikage_depth{0.0f};        // the blade's depth in the scabbard at chikage_depth_ns ...
+    s64 chikage_depth_ns{0};          // ... the body status it came with (0: not in)
+    float chikage_slide{0.0f};        // m/s along the scabbard, from the last two
+    float chikage_rasp{0.0f};         // the sword hand's level this wrote
     float lean_stick_left{0.0f};       // the left stick is held in it this much longer
     float lean_circle_in{0.0f};        // Circle is pressed in this long
     bool lean_logged{false};

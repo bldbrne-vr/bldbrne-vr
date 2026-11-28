@@ -20,9 +20,9 @@
 namespace Shader::Optimization::AmbientOcclusion {
 
 // Startup policy (vr.ini ambient_occlusion, VR_AMBIENT_OCCLUSION=0|1 overrides it): with an
-// upscaler only, like the light shadows (the pass then runs at its input size).
-inline bool Enabled(bool vr, bool setting, bool upscaler, const char* override_value) {
-    return override_value ? override_value[0] != '0' : vr && setting && upscaler;
+// upscaler or without, like the light shadows (light_shadow.h Enabled).
+inline bool Enabled(bool vr, bool setting, const char* override_value) {
+    return override_value ? override_value[0] != '0' : vr && setting;
 }
 
 // Our AO off but the lamp shadows' mask on (light_shadow.h SceneMaps::Mask, the light shadows on):
@@ -37,6 +37,17 @@ inline bool MaskOnly(bool ours, bool light_shadows, bool mask) {
 inline constexpr bool IsAoProgram(u64 hash) {
     return hash == 0xcbbca5dcu || hash == 0x83da8467u || hash == 0x7b1a6a02u ||
            hash == 0x63bf8617u;
+}
+
+// The game's upsample of a half-size AO (83da8467's: red = the occlusion, the rest packed depth)
+// to the eye's size: 4 bilinear taps, each weighted by its depth's match and by 1 / its distance
+// from the pixel, the distance taken from fract(uv * the half size). A pixel's centre never
+// sits on a half-size texel's corner, but a 4x4 foveation block's centre (2 pixels in, on an
+// even pixel edge) does: the distance is 0, the weight 1/0, and the block black (a 2x2 block's
+// centre is half a texel in, fine). The only such program in every test run's shader cache
+// (619 programs: the Chalice dungeons, the woods, Gascoigne, the lifts, Cainhurst...).
+inline constexpr bool IsUpsampleProgram(u64 hash) {
+    return hash == 0xc45c51cbu;
 }
 
 // The search: RadiusM around the pixel (metres), at least MinPixels and at most MaxPixels on

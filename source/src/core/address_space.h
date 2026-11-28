@@ -8,11 +8,9 @@
 #include "common/arch.h"
 #include "common/enum.h"
 #include "common/types.h"
+#include "core/memory_backing.h"
 
 namespace Core {
-
-// Keep the initial direct-memory range and its physical backing on the same bound.
-[[nodiscard]] u64 InitialDirectMemorySize();
 
 enum class MemoryPermission : u32 {
     None = 0,
@@ -34,6 +32,12 @@ public:
 
     [[nodiscard]] u8* BackingBase() const noexcept {
         return backing_base;
+    }
+    [[nodiscard]] u64 BackingSizeBytes() const noexcept {
+        return backing.size;
+    }
+    [[nodiscard]] const MemoryBackingLayout& BackingLayout() const noexcept {
+        return backing;
     }
 
     [[nodiscard]] VAddr SystemManagedVirtualBase() noexcept {
@@ -92,6 +96,7 @@ public:
 
 private:
     struct Impl;
+    const MemoryBackingLayout backing;
     std::unique_ptr<Impl> impl;
     u8* backing_base{};
     u8* system_managed_base{};

@@ -8,6 +8,7 @@
 // Repair the error epilogue and the two cancellation/reset sites, preserving the
 // guest's registers, flags and red zone. No worker/queue replacement or FPS change.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -16,6 +17,7 @@
 #include <xbyak/xbyak.h>
 
 #include "common/logging/log.h"
+#include "core/memory.h"
 #include "core/vr/bloodborne_render_jobs.h"
 #include "core/vr/hook_util.h"
 #include "core/vr/near_code.h"
@@ -124,7 +126,128 @@ bool Prepare(u64 base, u64 size, u64 rva, const u8* original, size_t length, voi
 }
 } // namespace
 
+namespace {
+// The render resource cache (adapted from bbport 0fc2921, gpu/games/bloodborne/hooks_jobs.cpp
+// ResourceCacheBacking). The cache the render jobs build their draws' tables in has its own
+// 160 MiB range heap, apart from the graphics heaps. Laurence's opening cinematic fills it:
+// allocations of 20-40 KiB fail, each failed job leaves its draws without their resource tables
+// (null pointers in the user data), and the picture loses everything near (2026-11-18: 8192+
+// failed jobs within seconds, the same at 30 and 60 fps and at any render size; the emulator read
+// through the null tables and ended, the "crash on triggering the Laurence fight"). The game
+// allocates its 160 MiB as always; right after, its result and the size the range heap is set up
+// with are replaced by 512 MiB of direct memory of our own (bbport: 320 MiB still failed), so
+// nothing is taken from what the game's areas load into. Without that much direct memory free the
+// game's own cache stays. VR_RENDER_RESOURCE_CACHE_MB=160: the game's cache as it is.
+constexpr u64 CacheRva = 0x216b21d;
+// mov rcx, rbx; mov [rcx + 0x10], rax: right after the allocator's Allocate(size, 16) returns.
+constexpr std::array<u8, 7> CacheBytes{0x48, 0x89, 0xd9, 0x48, 0x89, 0x41, 0x10};
+
+u64 PS4_SYSV_ABI OnCacheBacking(u64 block, u8* record) {
+    constexpr u32 native_bytes = 160u << 20;
+    u32 asked{};
+    std::memcpy(&asked, record + 0x54, sizeof(asked));
+    if (asked != native_bytes || block == 0) {
+        return block;
+    }
+    static const u32 bytes = [] {
+        const char* env = std::getenv("VR_RENDER_RESOURCE_CACHE_MB");
+        const long mb = env != nullptr ? std::strtol(env, nullptr, 10) : 512;
+        return static_cast<u32>(std::clamp(mb, 160l, 512l)) << 20;
+    }();
+    if (bytes == native_bytes) {
+        return block;
+    }
+    auto* const memory = Core::Memory::Instance();
+    constexpr u64 alignment = 64ull << 10;
+    const PAddr phys = memory->Allocate(0, memory->GetTotalDirectSize(), bytes, alignment, 0);
+    if (phys == static_cast<PAddr>(-1)) {
+        LOG_WARNING(Core, "Render resource cache: no direct memory for {} MiB: the game's 160 MiB",
+                    bytes >> 20);
+        return block;
+    }
+    void* address = nullptr;
+    const s32 result = memory->MapMemory(
+        &address, 0, bytes, Core::MemoryProt::CpuReadWrite | Core::MemoryProt::GpuReadWrite,
+        Core::MemoryMapFlags::NoFlags, Core::VMAType::Direct, "render resource cache", false, phys,
+        alignment);
+    if (result != 0 || address == nullptr) {
+        memory->Free(phys, bytes, false);
+        LOG_WARNING(Core, "Render resource cache: {} MiB not mapped (error {:#x}): the game's 160 MiB",
+                    bytes >> 20, static_cast<u32>(result));
+        return block;
+    }
+    // (The creation record can be a stack object.)
+    std::memcpy(record + 0x54, &bytes, sizeof(bytes));
+    LOG_INFO(Core, "Render resource cache: {} MiB of our direct memory at {} (the game's 160 MiB "
+                   "stays allocated)", bytes >> 20, fmt::ptr(address));
+    return reinterpret_cast<u64>(address);
+}
+
+// The site follows a call's return: the volatile registers and the flags are dead, the stack is
+// aligned and no red zone is in use. The stub hands the block (rax) and the creation record (r14)
+// over, takes the block to use back in rax, runs the two instructions the jump replaced and
+// returns behind them.
+std::unique_ptr<Xbyak::CodeGenerator> cache_code;
+void InstallResourceCache(VAddr base, u64 size) {
+    using namespace Xbyak::util;
+    if (cache_code || size < CacheRva + CacheBytes.size()) {
+        return;
+    }
+    auto* const site = reinterpret_cast<u8*>(base + CacheRva);
+    if (std::memcmp(site, CacheBytes.data(), CacheBytes.size()) != 0) {
+        LOG_WARNING(Core, "Render resource cache: 1.09 signature differs; the game's 160 MiB");
+        return;
+    }
+    cache_code = std::make_unique<Xbyak::CodeGenerator>(4096);
+    auto& c = *cache_code;
+    s32 displacement{};
+    u8* relay{};
+    try {
+        void* const stub = const_cast<u8*>(c.getCurr());
+        c.mov(rdi, rax);
+        c.mov(rsi, r14);
+        c.mov(rax, reinterpret_cast<u64>(&OnCacheBacking));
+        c.call(rax);
+        for (const u8 b : CacheBytes) {
+            c.db(b);
+        }
+        c.db(0xff);
+        c.db(0x25);
+        c.dd(0);
+        c.dq(base + CacheRva + CacheBytes.size());
+        c.ready();
+        relay = Hook::NearAlloc(base, size, 14);
+        if (relay == nullptr ||
+            !Hook::Rel32(base + CacheRva + 5, reinterpret_cast<u64>(relay), displacement)) {
+            LOG_WARNING(Core, "Render resource cache: no relay near the code; the game's 160 MiB");
+            return;
+        }
+        relay[0] = 0xff;
+        relay[1] = 0x25;
+        std::memset(relay + 2, 0, 4);
+        const auto target = reinterpret_cast<u64>(stub);
+        std::memcpy(relay + 6, &target, sizeof(target));
+        Hook::FlushCode(relay, 14);
+    } catch (const Xbyak::Error& e) {
+        LOG_ERROR(Core, "Render resource cache: stub not emitted: {}", e.what());
+        return;
+    }
+    if (!Hook::MakeWritable(site, CacheBytes.size())) {
+        return;
+    }
+    site[0] = 0xe9;
+    std::memcpy(site + 1, &displacement, sizeof(displacement));
+    std::memset(site + 5, 0x90, CacheBytes.size() - 5);
+    Hook::FlushCode(site, CacheBytes.size());
+    LOG_INFO(Core, "Render resource cache: its backing is replaced when the game creates it");
+}
+} // namespace
+
 void RenderJobsEbootLoaded(VAddr base, u64 size) {
+    if (const char* cache = std::getenv("VR_RENDER_RESOURCE_CACHE_MB");
+        cache == nullptr || std::strtol(cache, nullptr, 10) != 160) {
+        InstallResourceCache(base, size);
+    }
     const char* enabled = std::getenv("VR_RENDER_JOB_FIX");
     if (code || (enabled && enabled[0] == '0'))
         return;

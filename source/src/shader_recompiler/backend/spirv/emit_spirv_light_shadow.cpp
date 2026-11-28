@@ -186,7 +186,19 @@ void SceneSetup(EmitContext& ctx) {
     s.scene_buffer = maps_it == buffers.end() ? 0u : static_cast<u32>(std::distance(buffers.begin(), maps_it));
     s.scene_body = body;
     s.scene_count = ctx.OpUMin(ctx.U32[1], BodyRead(ctx, body, Body::SlotsAt), ctx.ConstU32(Scene::Slots));
-    s.scene_half = ctx.OpBitwiseAnd(ctx.U32[1], BodyRead(ctx, body, Body::SlotsAt + 2), ctx.ConstU32(1u));
+    const Id half_and_edges = BodyRead(ctx, body, Body::SlotsAt + 2);
+    s.scene_half = ctx.OpBitwiseAnd(ctx.U32[1], half_and_edges, ctx.ConstU32(1u));
+    if (ctx.runtime_info.vr_light_shadows && Scene::Edges()) {
+        s.edge_slots = ctx.OpBitwiseAnd(ctx.U32[1], ctx.OpShiftRightLogical(ctx.U32[1], half_and_edges, ctx.ConstU32(Scene::EdgeSlotShift)),
+                                        ctx.ConstU32((1u << Scene::Slots) - 1u));
+    }
+    // (The edge lamps for the mask's march: the others march PlainStepShare, light_shadow.h.)
+    if (Scene::Edges() && Scene::PlainStepShare() > Scene::MarchStepShare()) {
+        s.edge_set = Sirit::ValidId(s.edge_slots)
+                         ? s.edge_slots
+                         : ctx.OpBitwiseAnd(ctx.U32[1], ctx.OpShiftRightLogical(ctx.U32[1], half_and_edges, ctx.ConstU32(Scene::EdgeSlotShift)),
+                                            ctx.ConstU32((1u << Scene::Slots) - 1u));
+    }
     s.scene_capacity = BodyRead(ctx, body, Body::SlotsAt + 3);
     for (u32 r = 0; r < 3; ++r) {
         const auto rf = [&](u32 d) { return ctx.OpBitcast(ctx.F32[1], BodyRead(ctx, body, Body::SlotsAt + d)); };
@@ -278,7 +290,8 @@ Id SlotStepScale(EmitContext& ctx, Id k) {
 // A loop for k in [0, count) (u32 ids): `body(k)` emits an iteration (its own constructs closed);
 // `more()`, when given, is asked in the header too (a bool id: false ends the loop early).
 template <typename F, typename M = std::nullptr_t>
-void LoopCount(EmitContext& ctx, Id count, F&& body, M&& more = nullptr) {
+void LoopCount(EmitContext& ctx, Id count, F&& body, M&& more = nullptr,
+               spv::LoopControlMask control = spv::LoopControlMask::MaskNone) {
     const Id var = Private(ctx, ctx.U32[1]);
     ctx.OpStore(var, ctx.u32_zero_value);
     const Id header = ctx.OpLabel(), body_l = ctx.OpLabel(), cont = ctx.OpLabel(), merge = ctx.OpLabel();
@@ -290,7 +303,7 @@ void LoopCount(EmitContext& ctx, Id count, F&& body, M&& more = nullptr) {
     if constexpr (!std::is_same_v<std::decay_t<M>, std::nullptr_t>) {
         go = ctx.OpLogicalAnd(ctx.U1[1], go, more());
     }
-    ctx.OpLoopMerge(merge, cont, spv::LoopControlMask::MaskNone);
+    ctx.OpLoopMerge(merge, cont, control);
     ctx.OpBranchConditional(go, body_l, merge);
     ctx.AddLabel(body_l);
     body(k);
@@ -813,6 +826,18 @@ Id MaskPtr(EmitContext& ctx, Id index) {
                : ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index);
 }
 
+// A word of the edge pass's buffer (light_shadow.h SceneMaps::EdgePass).
+Id EdgesPtr(EmitContext& ctx, u32 handle, Id index) {
+    const auto& buffer = ctx.buffers[handle];
+    if (const Id offset = buffer.Offset(EmitContext::PointerSize::B32); Sirit::ValidId(offset)) {
+        index = ctx.OpIAdd(ctx.U32[1], index, offset);
+    }
+    const auto [id, pointer_type] = buffer.Alias(EmitContext::PointerType::U32);
+    return ctx.runtime_info.native_stereo
+               ? ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, ctx.u32_zero_value, index)
+               : ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index);
+}
+
 // The old march (below), its step rule and the other eye (light_shadow.h SceneMaps::MarchMode).
 Id March(EmitContext& ctx, Id l, Id dist, Id end, Id count, Id delta, bool adaptive);
 Id MarchSteps(EmitContext& ctx, Id l, Id w, Id here, float share, Id coarse = Id{}, Id boost = Id{});
@@ -1239,6 +1264,15 @@ void SceneMaskWrite(EmitContext& ctx) {
                                     ? ctx.OpFMin(f1, ctx.OpFMul(f1, boost, near), ctx.ConstF32(std::max(close_ratio, near_ratio)))
                                     : near;
                     }
+                    // (A lamp that is not one of the frame's edge lamps: PlainStepShare's steps,
+                    // light_shadow.h; its close and near boosts with it.)
+                    if (Sirit::ValidId(s.edge_set)) {
+                        const Id bit = ctx.OpShiftLeftLogical(u1, u(1u), ctx.OpUMin(u1, k, u(Scene::Slots - 1)));
+                        const Id edge_lamp = ctx.OpINotEqual(b1, ctx.OpBitwiseAnd(u1, s.edge_set, bit), u(0u));
+                        const Id plain = ctx.OpSelect(f1, edge_lamp, ctx.ConstF32(1.0f),
+                                                      ctx.ConstF32(Scene::PlainStepShare() / Scene::MarchStepShare()));
+                        boost = Sirit::ValidId(boost) ? ctx.OpFMul(f1, boost, plain) : plain;
+                    }
                     if (Scene::StepDial()) {
                         const Id dial = SlotStepScale(ctx, k);
                         boost = Sirit::ValidId(boost) ? ctx.OpFMul(f1, boost, dial) : dial;
@@ -1480,7 +1514,7 @@ Id CasterVisibility(EmitContext& ctx, u32 buf, Id p, Id lamp, Id clear) {
 // a scale h.z, and the surface the eye sees at that ndc lies at q / (h.z w), w the matrix's w row on
 // (ndc, its depth, 1). h is linear along the ray: one H^-1 L by cross products for the light, then a
 // step is a few multiply-adds, one divide for the picture's coordinates and one for the gap.
-Id MaskEdge(EmitContext& ctx, u32 light, Id k, Id got, Id blend, Id lo, Id hi) {
+Id MaskEdge(EmitContext& ctx, Id light_base, Id k, Id got, Id blend, Id lo, Id hi) {
     namespace Scene = Tune::SceneMaps;
     auto& s = ctx.vr_light_shadow;
     const auto& info = ctx.info.vr_light_shadow;
@@ -1492,13 +1526,13 @@ Id MaskEdge(EmitContext& ctx, u32 light, Id k, Id got, Id blend, Id lo, Id hi) {
     const auto [far_in, far_out] = Scene::EdgeFar();
     const Id nearness = ctx.OpFClamp(f1, mul(ctx.OpFSub(f1, f(far_out), s.edge_own), f(1.0f / (far_out - far_in))), f(0.0f), f(1.0f));
     const Id spread = ctx.OpFSub(f1, hi, lo);
+    // k is zero-based and s.scene_count is clamped to the allocated slot table.
+    const Id valid_slot = ctx.OpLogicalAnd(b1, ctx.OpINotEqual(b1, got, ctx.u32_zero_value),
+                                           ctx.OpULessThan(b1, k, s.scene_count));
     Id go = ctx.OpLogicalAnd(
-        b1, ctx.OpLogicalAnd(b1, ctx.OpINotEqual(b1, got, ctx.u32_zero_value), s.edge_ok),
+        b1, ctx.OpLogicalAnd(b1, valid_slot, s.edge_ok),
         ctx.OpLogicalAnd(b1, ctx.OpFOrdGreaterThanEqual(b1, spread, f(float(Scene::EdgeRange()) - 0.5f)),
                          ctx.OpFOrdGreaterThan(b1, nearness, f(0.0f))));
-    if (Sirit::ValidId(s.edge_budget)) {
-        go = ctx.OpLogicalAnd(b1, go, ctx.OpUGreaterThan(b1, ctx.OpLoad(u1, s.edge_budget), ctx.u32_zero_value));
-    }
     // Tests (VR_SHADOW_EDGES_SHOW 3..7): black where one gate of the march holds: 3 the neighbours'
     // spread, 4 a slot and the picture's coordinates, 5 near enough, 6 the budget, 7 all of them.
     if (Scene::EdgeShow() >= 3 && Scene::EdgeShow() <= 7) {
@@ -1514,8 +1548,7 @@ Id MaskEdge(EmitContext& ctx, u32 light, Id k, Id got, Id blend, Id lo, Id hi) {
             gate = ctx.OpFOrdGreaterThan(b1, nearness, f(0.0f));
             break;
         case 6:
-            gate = Sirit::ValidId(s.edge_budget) ? ctx.OpUGreaterThan(b1, ctx.OpLoad(u1, s.edge_budget), ctx.u32_zero_value)
-                                                 : ctx.OpFOrdGreaterThan(b1, f(1.0f), f(0.0f));
+            gate = ctx.true_value; // Slot and per-pixel budget already passed at the call site.
             break;
         default:
             break;
@@ -1529,7 +1562,7 @@ Id MaskEdge(EmitContext& ctx, u32 light, Id k, Id got, Id blend, Id lo, Id hi) {
     ctx.OpBranchConditional(go, go_l, go_done);
     ctx.AddLabel(go_l);
     {
-        const auto rd = [&](u32 c) { return ctx.OpBitcast(f1, EmitReadConstBuffer(ctx, info.light_buffer, u(8 * light + c))); };
+        const auto rd = [&](u32 c) { return ctx.OpBitcast(f1, EmitReadConstBuffer(ctx, info.light_buffer, ctx.OpIAdd(u1, light_base, u(c)))); };
         const Id pv = s.edge_pv;
         const Id l = ctx.OpCompositeConstruct(f3, std::array{rd(0), rd(1), rd(2)});
         const Id to = ctx.OpFSub(f3, l, pv);
@@ -1541,6 +1574,18 @@ Id MaskEdge(EmitContext& ctx, u32 light, Id k, Id got, Id blend, Id lo, Id hi) {
         const SlotRead slot = SceneSlot(ctx, k);
         const Id end = ctx.OpFMin(f1, ctx.OpFSub(f1, dist, slot.clear), f(Tune::MaxM));
         const Id span = ctx.OpFSub(f1, end, f(Tune::StartM));
+        const Id worth = ctx.OpLogicalAnd(b1, ctx.OpFOrdGreaterThanEqual(b1, mul(fall, spread), f(Scene::EdgeMinContrast)),
+                                          ctx.OpFOrdGreaterThan(b1, span, f(0.0f)));
+        if (Scene::EdgeShow() == 8) {
+            ctx.OpStore(out, ctx.OpSelect(f1, worth, f(0.0f), f(15.0f)));
+        }
+        const Id trace = ctx.OpLabel(), trace_done = ctx.OpLabel();
+        ctx.OpSelectionMerge(trace_done, spv::SelectionControlMask::MaskNone);
+        ctx.OpBranchConditional(worth, trace, trace_done);
+        ctx.AddLabel(trace);
+        if (Sirit::ValidId(s.edge_seen)) {
+            ctx.OpStore(s.edge_seen, ctx.OpBitwiseOr(u1, ctx.OpLoad(u1, s.edge_seen), ctx.OpShiftLeftLogical(u1, u(1), k)));
+        }
         // H's columns and the light's h (Cramer's rule: the columns' cross products).
         const auto col = [&](u32 c) {
             return ctx.OpCompositeConstruct(f3, std::array{x(s.edge_rows[0], c), x(s.edge_rows[1], c), x(s.edge_rows[2], c)});
@@ -1570,21 +1615,23 @@ Id MaskEdge(EmitContext& ctx, u32 light, Id k, Id got, Id blend, Id lo, Id hi) {
         // In front of the eye: h.z keeps the pixel's own sign (h.z w is the pixel's depth over the
         // point's).
         const auto in_front = [&](Id hz) { return ctx.OpFOrdGreaterThan(b1, mul(hz, s.edge_w), f(1e-4f)); };
-        // The steps: one each EdgePixels of the ray on the picture (its end behind the eye: all).
-        const Id hz_end = ctx.OpFma(f1, dhz, end, hz0);
-        const Id uv_end = ctx.OpFDiv(f2, ctx.OpFAdd(f2, uv0, ctx.OpVectorTimesScalar(f2, duv, end)),
-                                     ctx.OpCompositeConstruct(f2, std::array{hz_end, hz_end}));
-        const Id uv_here = ctx.OpVectorTimesScalar(f2, uv0, s.edge_w);
-        const Id pixels = ctx.OpLength(f1, ctx.OpFDiv(f2, ctx.OpFSub(f2, uv_end, uv_here), ctx.OpFMax(f2, s.edge_pixel, ctx.ConstF32(1e-7f, 1e-7f))));
-        const Id most = f(float(Scene::EdgeSteps()));
-        const Id steps_f = ctx.OpSelect(
-            f1, in_front(hz_end),
-            ctx.OpFClamp(f1, mul(pixels, f(1.0f / Scene::EdgePixels())), f(float(std::min(Scene::EdgeMinSteps, Scene::EdgeSteps()))), most), most);
-        // ... none where the edge is too faint to matter or there is no room to march.
-        const Id worth = ctx.OpLogicalAnd(b1, ctx.OpFOrdGreaterThanEqual(b1, mul(fall, spread), f(Scene::EdgeMinContrast)),
-                                          ctx.OpFOrdGreaterThan(b1, span, f(0.0f)));
-        const Id count = ctx.OpSelect(u1, worth, ctx.OpConvertFToU(u1, ctx.OpFAdd(f1, steps_f, f(0.5f))), ctx.u32_zero_value);
-        const Id inv_count = ctx.OpFDiv(f1, f(1.0f), ctx.OpFMax(f1, ctx.OpConvertUToF(f1, count), f(1.0f)));
+        // A fixed step count needs no projected endpoint or screen-space ray length.
+        const u32 max_steps = Scene::EdgeSteps();
+        Id ray_steps = u(max_steps);
+        Id inv_count = f(1.0f / float(max_steps));
+        if (max_steps > Scene::EdgeMinSteps) {
+            const Id hz_end = ctx.OpFma(f1, dhz, end, hz0);
+            const Id uv_end = ctx.OpFDiv(f2, ctx.OpFAdd(f2, uv0, ctx.OpVectorTimesScalar(f2, duv, end)),
+                                         ctx.OpCompositeConstruct(f2, std::array{hz_end, hz_end}));
+            const Id uv_here = ctx.OpVectorTimesScalar(f2, uv0, s.edge_w);
+            const Id pixels = ctx.OpLength(f1, ctx.OpFDiv(f2, ctx.OpFSub(f2, uv_end, uv_here), ctx.OpFMax(f2, s.edge_pixel, ctx.ConstF32(1e-7f, 1e-7f))));
+            const Id most = f(float(max_steps));
+            const Id steps_f = ctx.OpSelect(
+                f1, in_front(hz_end),
+                ctx.OpFClamp(f1, mul(pixels, f(1.0f / Scene::EdgePixels())), f(float(Scene::EdgeMinSteps)), most), most);
+            ray_steps = ctx.OpConvertFToU(u1, ctx.OpFAdd(f1, steps_f, f(0.5f)));
+            inv_count = ctx.OpFDiv(f1, f(1.0f), ctx.OpConvertUToF(f1, ray_steps));
+        }
         Id seed = f(0.5f);
         if (Scene::EdgeNoise() == 1) {
             const Id gx = EmitGetAttribute(ctx, IR::Attribute::FragCoord, 0, 0);
@@ -1599,7 +1646,7 @@ Id MaskEdge(EmitContext& ctx, u32 light, Id k, Id got, Id blend, Id lo, Id hi) {
         ctx.OpStore(v_off, ctx.u32_zero_value);
         ctx.OpStore(v_unsure, ctx.u32_zero_value);
         LoopCount(
-            ctx, count,
+            ctx, ray_steps,
             [&](Id i) {
                 const Id share = mul(ctx.OpFAdd(f1, ctx.OpConvertUToF(f1, i), seed), inv_count);
                 const Id t = ctx.OpFma(f1, span, mul(share, share), f(Tune::StartM));
@@ -1633,32 +1680,195 @@ Id MaskEdge(EmitContext& ctx, u32 light, Id k, Id got, Id blend, Id lo, Id hi) {
             [&] {
                 return ctx.OpIEqual(b1, ctx.OpBitwiseOr(u1, ctx.OpLoad(u1, v_hit), ctx.OpLoad(u1, v_off)), ctx.u32_zero_value);
             });
-        const Id marched = ctx.OpINotEqual(b1, count, ctx.u32_zero_value);
         const Id hit = ctx.OpINotEqual(b1, ctx.OpLoad(u1, v_hit), ctx.u32_zero_value);
         // (His body is not on the picture where the head is left out: a lamp that casts his shadow
         // never takes a clear ray's word.)
         const Id clear = ctx.OpLogicalAnd(
-            b1, ctx.OpLogicalAnd(b1, marched, ctx.OpLogicalNot(b1, hit)),
+            b1, ctx.OpLogicalNot(b1, hit),
             ctx.OpLogicalAnd(b1, ctx.OpIEqual(b1, ctx.OpLoad(u1, v_unsure), ctx.u32_zero_value),
                              ctx.OpLogicalNot(b1, SlotHas(ctx, slot.flags, Scene::SlotHis))));
         const Id lit = ctx.OpFma(f1, ctx.OpFSub(f1, hi, blend), f(Scene::EdgeClear()), blend);
         const Id sharp = ctx.OpSelect(f1, hit, lo, ctx.OpSelect(f1, clear, lit, blend));
         Id value = ctx.OpFma(f1, ctx.OpFSub(f1, sharp, blend), nearness, blend);
         if (Scene::EdgeShow() == 8) {
-            value = ctx.OpSelect(f1, worth, f(0.0f), f(15.0f)); // (entered: black where worth a march, lit where not)
+            value = f(0.0f);
         } else if (Scene::EdgeShow() == 1) {
-            value = ctx.OpSelect(f1, marched, f(0.0f), blend);
+            value = f(0.0f);
         } else if (Scene::EdgeShow() == 2) {
             value = ctx.OpSelect(f1, hit, f(0.0f), ctx.OpSelect(f1, clear, f(15.0f), blend));
         }
         ctx.OpStore(out, value);
-        if (Sirit::ValidId(s.edge_budget)) {
-            ctx.OpStore(s.edge_budget, ctx.OpISub(u1, ctx.OpLoad(u1, s.edge_budget), ctx.OpSelect(u1, marched, u(1u), ctx.u32_zero_value)));
-        }
+        ctx.OpBranch(trace_done);
+        ctx.AddLabel(trace_done);
     }
     ctx.OpBranch(go_done);
     ctx.AddLabel(go_done);
     return ctx.OpLoad(f1, out);
+}
+
+// Read one light from the mask. The multi-light edge shader calls this inside a single
+// generated loop; ordinary mask shaders keep their constant buffer offsets.
+Id MaskLight(EmitContext& ctx, Id index, Id light_base, u32 tint) {
+    namespace Scene = Tune::SceneMaps;
+    auto& s = ctx.vr_light_shadow;
+    const auto& info = ctx.info.vr_light_shadow;
+    const Id f1 = ctx.F32[1], f3 = ctx.F32[3], u1 = ctx.U32[1], b1 = ctx.U1[1];
+    const auto u = [&](u32 v) { return ctx.ConstU32(v); };
+    // Its slot: the CPU's match for this draw (light_shadow.h SceneMaps::DrawSlotsAt: a byte each).
+    namespace Body = Shader::Optimization::BodyShadow;
+    const Id byte = ctx.OpBitwiseAnd(
+        u1, ctx.OpShiftRightLogical(u1, BodyReadAt(ctx, s.scene_body,
+            ctx.OpIAdd(u1, u(Body::SlotsAt + Scene::DrawSlotsAt), ctx.OpShiftRightLogical(u1, index, u(2u)))),
+            ctx.OpIMul(u1, ctx.OpBitwiseAnd(u1, index, u(3u)), u(8u))), u(255u));
+    // (0: the CPU did not see this draw's list: the nearest slot within SlotKeepM of the light, here;
+    // 255: it did, no slot.)
+    const Id found = Private(ctx, u1);
+    ctx.OpStore(found, ctx.OpSelect(u1, ctx.OpIEqual(b1, byte, u(255u)), ctx.u32_zero_value, byte));
+    const Id gpu_l = ctx.OpLabel(), gpu_done = ctx.OpLabel();
+    const Id branch_cond_1 = ctx.OpIEqual(b1, byte, ctx.u32_zero_value);
+    ctx.OpSelectionMerge(gpu_done, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(branch_cond_1, gpu_l, gpu_done);
+    ctx.AddLabel(gpu_l);
+    {
+        const auto rd = [&](u32 c) {
+            return ctx.OpBitcast(f1, EmitReadConstBuffer(ctx, info.light_buffer, ctx.OpIAdd(u1, light_base, u(c))));
+        };
+        const Id wl = ToWorld(ctx, ctx.OpFAdd(f3, ctx.OpCompositeConstruct(f3, std::array{rd(0), rd(1), rd(2)}), s.scene_shift));
+        const Id best = Private(ctx, f1);
+        ctx.OpStore(best, ctx.ConstF32(Scene::SlotKeepM * Scene::SlotKeepM));
+        LoopCount(ctx, s.scene_count, [&](Id k) {
+            const SlotRead slot = SceneSlot(ctx, k);
+            const Id dv = ctx.OpFSub(f3, wl, slot.lamp);
+            const Id d2 = ctx.OpDot(f1, dv, dv);
+            const Id take = ctx.OpLogicalAnd(b1, SlotHas(ctx, slot.flags, Scene::SlotUsed),
+                                             ctx.OpFOrdLessThan(b1, d2, ctx.OpLoad(f1, best)));
+            ctx.OpStore(best, ctx.OpSelect(f1, take, d2, ctx.OpLoad(f1, best)));
+            ctx.OpStore(found, ctx.OpSelect(u1, take, ctx.OpIAdd(u1, k, u(1u)), ctx.OpLoad(u1, found)));
+        });
+    }
+    ctx.OpBranch(gpu_done);
+    ctx.AddLabel(gpu_done);
+    const Id got = ctx.OpLoad(u1, found);
+    // After either slot lookup, zero means fully lit. In multi-light programs the
+    // whole draw can skip interpolation for that lamp, including its edge verdict.
+    const bool skip_unassigned = info.count >= 4 && tint == 0 && Scene::EdgePass();
+    Id mask_result{}, mask_done{};
+    if (skip_unassigned) {
+        mask_result = Private(ctx, f1);
+        mask_done = ctx.OpLabel();
+        const Id assigned = ctx.OpLabel();
+        ctx.OpStore(mask_result, ctx.ConstF32(1.0f));
+        const Id has_slot = ctx.OpINotEqual(b1, got, u(0));
+        ctx.OpSelectionMerge(mask_done, spv::SelectionControlMask::MaskNone);
+        ctx.OpBranchConditional(has_slot, assigned, mask_done);
+        ctx.AddLabel(assigned);
+    }
+    const Id k = ctx.OpISub(u1, ctx.OpUMax(u1, got, u(1u)), u(1u));
+    const Id wi = ctx.OpShiftRightLogical(u1, k, u(3u));
+    const Id shift = ctx.OpShiftLeftLogical(u1, ctx.OpBitwiseAnd(u1, k, u(7u)), u(2u));
+    Id weighted = ctx.ConstF32(0.0f);
+    // (The edges' march: the lowest and highest of the neighbours that count here.)
+    const bool edges = Sirit::ValidId(s.edge_corner[0]);
+    std::array<Id, 4> values;
+    for (u32 c = 0; c < 4; ++c) {
+        Id word = s.mask_corner[c][Scene::MaskSlotWords - 1];
+        for (u32 j = Scene::MaskSlotWords - 1; j-- > 0;) {
+            word = ctx.OpSelect(u1, ctx.OpIEqual(b1, wi, u(j)), s.mask_corner[c][j], word);
+        }
+        const Id v = ctx.OpConvertUToF(f1, ctx.OpBitwiseAnd(u1, ctx.OpShiftRightLogical(u1, word, shift), u(15u)));
+        weighted = ctx.OpFAdd(f1, weighted, ctx.OpFMul(f1, v, s.mask_w[c]));
+        values[c] = v;
+    }
+    if (edges && Sirit::ValidId(s.edge_packed)) {
+        // The edge pass's verdict for this light's slot (light_shadow.h EdgePass): its rank among
+        // the frame's edge lamps names its two bits; a hit takes the lowest neighbour, a clear ray
+        // EdgeClear() of the way to the highest, by the pixel's nearness (EdgeFar, as the march).
+        // A pixel without a verdict for it (nearly all) skips the rest behind a branch.
+        const Id safe_k = ctx.OpUMin(u1, k, u(Scene::Slots - 1));
+        const Id slot_bit = ctx.OpShiftLeftLogical(u1, u(1), safe_k);
+        const Id is_edge = ctx.OpLogicalAnd(
+            b1, ctx.OpLogicalAnd(b1, ctx.OpULessThanEqual(b1, got, s.scene_count), ctx.OpINotEqual(b1, got, u(0))),
+            ctx.OpINotEqual(b1, ctx.OpBitwiseAnd(u1, s.edge_slots, slot_bit), u(0)));
+        const Id rank = ctx.OpBitCount(u1, ctx.OpBitwiseAnd(u1, s.edge_slots, ctx.OpISub(u1, slot_bit, u(1))));
+        const Id capacity = u(Scene::EdgePassLampCapacity(Scene::EdgeBits()));
+        const Id code = ctx.OpSelect(
+            u1, ctx.OpLogicalAnd(b1, is_edge, ctx.OpULessThan(b1, rank, capacity)),
+            ctx.OpBitwiseAnd(u1, ctx.OpShiftRightLogical(u1, s.edge_packed, ctx.OpIAdd(u1, ctx.OpIMul(u1, rank, u(2u)), u(4u))), u(3u)),
+            u(0u));
+        const Id result = Private(ctx, f1);
+        ctx.OpStore(result, weighted);
+        const Id act = ctx.OpINotEqual(b1, code, u(0u));
+        const Id refine = ctx.OpLabel(), done = ctx.OpLabel();
+        ctx.OpSelectionMerge(done, spv::SelectionControlMask::MaskNone);
+        ctx.OpBranchConditional(act, refine, done);
+        ctx.AddLabel(refine);
+        {
+            Id lowest = ctx.ConstF32(15.0f), highest = ctx.ConstF32(0.0f);
+            for (u32 c = 0; c < values.size(); ++c) {
+                const Id counts = ctx.OpINotEqual(b1, ctx.OpBitwiseAnd(u1, s.edge_packed, u(1u << c)), u(0u));
+                lowest = ctx.OpFMin(f1, lowest, ctx.OpSelect(f1, counts, values[c], ctx.ConstF32(15.0f)));
+                highest = ctx.OpFMax(f1, highest, ctx.OpSelect(f1, counts, values[c], ctx.ConstF32(0.0f)));
+            }
+            const Id lit = ctx.OpFma(f1, ctx.OpFSub(f1, highest, weighted), ctx.ConstF32(Scene::EdgeClear()), weighted);
+            const Id sharp = ctx.OpSelect(f1, ctx.OpIEqual(b1, code, u(Scene::EdgeHit)), lowest,
+                                          ctx.OpSelect(f1, ctx.OpIEqual(b1, code, u(Scene::EdgeClearCode)), lit, weighted));
+            Id value = ctx.OpFma(f1, ctx.OpFSub(f1, sharp, weighted), s.edge_near, weighted);
+            if (Scene::EdgeShow() == 2) {
+                value = ctx.OpSelect(f1, ctx.OpIEqual(b1, code, u(Scene::EdgeHit)), ctx.ConstF32(0.0f),
+                                     ctx.OpSelect(f1, ctx.OpIEqual(b1, code, u(Scene::EdgeClearCode)),
+                                                  ctx.ConstF32(15.0f), weighted));
+            }
+            ctx.OpStore(result, value);
+        }
+        ctx.OpBranch(done);
+        ctx.AddLabel(done);
+        weighted = ctx.OpLoad(f1, result);
+    } else if (edges) {
+        // Guard the optional work with the frame's stable slot flag. Unknown slots keep the blend.
+        const Id safe_k = ctx.OpUMin(u1, k, u(Scene::Slots - 1));
+        const Id slot_bit = ctx.OpShiftLeftLogical(u1, u(1), safe_k);
+        Id selected = ctx.OpLogicalAnd(b1, ctx.OpULessThanEqual(b1, got, s.scene_count),
+            ctx.OpLogicalAnd(b1, ctx.OpINotEqual(b1, got, u(0)),
+                ctx.OpINotEqual(b1, ctx.OpBitwiseAnd(u1, s.edge_slots, slot_bit), u(0))));
+        if (Sirit::ValidId(s.edge_seen)) {
+            const Id seen = ctx.OpLoad(u1, s.edge_seen);
+            selected = ctx.OpLogicalAnd(b1, selected, ctx.OpLogicalAnd(b1,
+                ctx.OpIEqual(b1, ctx.OpBitwiseAnd(u1, seen, slot_bit), u(0)),
+                ctx.OpULessThan(b1, ctx.OpBitCount(u1, seen), u(Scene::EdgeLights))));
+        }
+        const Id result = Private(ctx, f1);
+        ctx.OpStore(result, weighted);
+        const Id refine = ctx.OpLabel(), done = ctx.OpLabel();
+        ctx.OpSelectionMerge(done, spv::SelectionControlMask::MaskNone);
+        ctx.OpBranchConditional(selected, refine, done);
+        ctx.AddLabel(refine);
+        Id lowest = ctx.ConstF32(15.0f), highest = ctx.ConstF32(0.0f);
+        for (u32 c = 0; c < values.size(); ++c) {
+            lowest = ctx.OpFMin(f1, lowest, ctx.OpSelect(f1, s.edge_corner[c], values[c], ctx.ConstF32(15.0f)));
+            highest = ctx.OpFMax(f1, highest, ctx.OpSelect(f1, s.edge_corner[c], values[c], ctx.ConstF32(0.0f)));
+        }
+        ctx.OpStore(result, MaskEdge(ctx, light_base, k, got, weighted, lowest, highest));
+        ctx.OpBranch(done);
+        ctx.AddLabel(done);
+        weighted = ctx.OpLoad(f1, result);
+    }
+    const Id vis = ctx.OpFMul(f1, weighted, ctx.ConstF32(1.0f / 15.0f));
+    if (skip_unassigned) {
+        ctx.OpStore(mask_result, vis);
+        ctx.OpBranch(mask_done);
+        ctx.AddLabel(mask_done);
+        return ctx.OpLoad(f1, mask_result);
+    }
+    const Id out = ctx.OpSelect(f1, ctx.OpINotEqual(b1, got, ctx.u32_zero_value), vis, ctx.ConstF32(1.0f));
+    if (tint == 0) {
+        return out;
+    }
+    // Tests (Scene::Tint): the blocked share of the light keeps its slot's colour in this channel.
+    Id colour = ctx.ConstF32(1.0f);
+    for (u32 j = 0; j < Scene::Slots && j < 16; ++j) {
+        colour = ctx.OpSelect(f1, ctx.OpIEqual(b1, k, u(j)), ctx.ConstF32(Scene::TintColours[j][tint - 1]), colour);
+    }
+    return ctx.OpFAdd(f1, out, ctx.OpFMul(f1, ctx.OpFSub(f1, ctx.ConstF32(1.0f), out), colour));
 }
 
 // A lamp shader's light with the mask (light_shadow.h SceneMaps::Mask): its slot's 4 bits at this
@@ -1797,7 +2007,45 @@ Id MaskVisibility(EmitContext& ctx, u32 light, Id ndc, Id uv, Id depth, u32 tint
                 own_facing = ctx.OpSelect(f3, ctx.OpFOrdLessThan(b1, ctx.OpDot(f1, n, ctx.OpFNegate(f3, pv)), ctx.ConstF32(0.0f)),
                                           ctx.OpFNegate(f3, n), n);
             }
-            if (Scene::Edges() && Sirit::ValidId(uv)) {
+            const auto edges_it = std::ranges::find(ctx.info.buffers, BufferType::VrShadowEdges,
+                                                    &BufferResource::buffer_type);
+            if (Sirit::ValidId(s.edge_slots) && Scene::EdgePass() && edges_it != ctx.info.buffers.end()) {
+                // The edge pass (light_shadow.h EdgePass): this pixel's byte, two bits a frame's
+                // edge lamp, when the pass ran this frame (its serial in the buffer and the slot
+                // header agree) and the pixel is in its picture; else 0 (every lamp's blend).
+                namespace Body = Shader::Optimization::BodyShadow;
+                const u32 eb = static_cast<u32>(std::distance(ctx.info.buffers.begin(), edges_it));
+                s.edge_pv = pv;
+                s.edge_own = own;
+                const Id x = ctx.OpConvertFToU(u1, EmitGetAttribute(ctx, IR::Attribute::FragCoord, 0, 0));
+                const Id y = ctx.OpConvertFToU(u1, EmitGetAttribute(ctx, IR::Attribute::FragCoord, 1, 0));
+                Id eye = u(0u);
+                if (ctx.runtime_info.native_stereo && ctx.runtime_info.native_multiview) {
+                    eye = ctx.NativeEyeIndex();
+                }
+                const Id serial = ctx.OpLoad(u1, EdgesPtr(ctx, eb, u(Scene::EdgeHeaderAt)));
+                const Id ew = ctx.OpLoad(u1, EdgesPtr(ctx, eb, u(Scene::EdgeHeaderAt + 1)));
+                const Id eh = ctx.OpLoad(u1, EdgesPtr(ctx, eb, u(Scene::EdgeHeaderAt + 2)));
+                const Id wq = ctx.OpLoad(u1, EdgesPtr(ctx, eb, u(Scene::EdgeHeaderAt + 3)));
+                const Id want = ctx.OpBitwiseAnd(
+                    u1, ctx.OpShiftRightLogical(u1, BodyRead(ctx, s.scene_body, Body::SlotsAt + 2), u(Scene::EdgeSerialShift)),
+                    u(Scene::EdgeSerialMask));
+                const Id valid = ctx.OpLogicalAnd(
+                    b1, ctx.OpLogicalAnd(b1, ctx.OpIEqual(b1, serial, want), ctx.OpINotEqual(b1, want, u(0u))),
+                    ctx.OpLogicalAnd(b1, ctx.OpULessThan(b1, x, ew), ctx.OpULessThan(b1, y, eh)));
+                // (A pixel's bits, light_shadow.h EdgeBits: a byte, four pixels a word; 16 bits for
+                // High's five lamps, two a word.)
+                const bool wide = Scene::EdgeBits() == 16;
+                const Id at = ctx.OpIAdd(u1, u(Scene::EdgeDataAt),
+                                         ctx.OpIAdd(u1, ctx.OpIMul(u1, ctx.OpIAdd(u1, ctx.OpIMul(u1, eye, eh), y), wq),
+                                                    ctx.OpShiftRightLogical(u1, x, u(wide ? 1u : 2u))));
+                const Id word = ctx.OpLoad(u1, EdgesPtr(ctx, eb, ctx.OpSelect(u1, valid, at, u(Scene::EdgeHeaderAt))));
+                const Id byte = ctx.OpBitwiseAnd(
+                    u1, ctx.OpShiftRightLogical(u1, word, ctx.OpShiftLeftLogical(u1, ctx.OpBitwiseAnd(u1, x, u(wide ? 1u : 3u)),
+                                                                                u(wide ? 4u : 3u))),
+                    u(wide ? 0xFFFFu : 255u));
+                s.edge_code = ctx.OpSelect(u1, valid, byte, u(0u));
+            } else if (Sirit::ValidId(s.edge_slots) && Sirit::ValidId(uv) && !Scene::EdgePass()) {
                 // The edges' march (light_shadow.h SceneMaps::Edges): what each light's needs of
                 // this one-time part, and the picture's coordinates from ndc (uv = a ndc + b, each
                 // axis its own; Setup's way: derivatives, here in the entry block).
@@ -1818,8 +2066,8 @@ Id MaskVisibility(EmitContext& ctx, u32 light, Id ndc, Id uv, Id depth, u32 tint
                 s.edge_ok = ctx.OpLogicalAnd(b1, ctx.OpFOrdGreaterThan(b1, ctx.OpFAbs(f1, dnx), ctx.ConstF32(1e-9f)),
                                              ctx.OpFOrdGreaterThan(b1, ctx.OpFAbs(f1, dny), ctx.ConstF32(1e-9f)));
                 if (info.count > 1) {
-                    s.edge_budget = Private(ctx, u1);
-                    ctx.OpStore(s.edge_budget, u(Scene::EdgeLights));
+                    s.edge_seen = Private(ctx, u1);
+                    ctx.OpStore(s.edge_seen, u(0));
                 }
             }
         }
@@ -1860,12 +2108,32 @@ Id MaskVisibility(EmitContext& ctx, u32 light, Id ndc, Id uv, Id depth, u32 tint
             const Id ok = ctx.OpFOrdGreaterThan(b1, sum, ctx.ConstF32(1e-3f));
             // (Little to go by: under half the blend's weight survived the depth and facing tests.
             // The edges' march then takes all four neighbours as its bounds: MaskVisibility below.)
-            s.mask_unsure = ctx.OpFOrdLessThan(b1, sum, ctx.ConstF32(0.5f));
+            const bool edges = Sirit::ValidId(s.edge_pv);
+            const Id unsure = edges ? ctx.OpFOrdLessThan(b1, sum, ctx.ConstF32(0.5f)) : Id{};
             const Id any = ctx.OpFOrdLessThan(b1, best_rel, ctx.ConstF32(1e29f));
             for (u32 c = 0; c < 4; ++c) {
                 const Id only = ctx.OpSelect(f1, ctx.OpIEqual(b1, best_c, u(c)), ctx.ConstF32(1.0f), ctx.ConstF32(0.0f));
                 wt[c] = ctx.OpSelect(f1, ok, ctx.OpFDiv(f1, wt[c], ctx.OpFMax(f1, sum, ctx.ConstF32(1e-3f))),
                                      ctx.OpSelect(f1, any, only, bil[c]));
+                if (edges) {
+                    // A weak blend admits all corners. Every lamp uses this same set.
+                    s.edge_corner[c] = ctx.OpLogicalOr(b1, unsure, ctx.OpFOrdGreaterThan(b1, wt[c], ctx.ConstF32(0.0f)));
+                }
+            }
+            if (edges && Sirit::ValidId(s.edge_code)) {
+                // The edge pass (light_shadow.h EdgePass): what the lights need of this pixel kept in
+                // two values through the lamp shader's light loop: the corner set (bits 0..3) with the
+                // pass's byte (bits 4..11), and the nearness. Four flags, the byte and the distance
+                // held apart cost every lamp pixel (their registers through the game's light loop).
+                Id packed = ctx.OpShiftLeftLogical(u1, s.edge_code, u(4u));
+                for (u32 c = 0; c < 4; ++c) {
+                    packed = ctx.OpBitwiseOr(u1, packed, ctx.OpSelect(u1, s.edge_corner[c], u(1u << c), u(0u)));
+                }
+                s.edge_packed = packed;
+                const auto [far_in, far_out] = Scene::EdgeFar();
+                s.edge_near = ctx.OpFClamp(
+                    f1, ctx.OpFMul(f1, ctx.OpFSub(f1, ctx.ConstF32(far_out), s.edge_own), ctx.ConstF32(1.0f / (far_out - far_in))),
+                    ctx.ConstF32(0.0f), ctx.ConstF32(1.0f));
             }
         }
         s.mask_w = wt;
@@ -1873,89 +2141,28 @@ Id MaskVisibility(EmitContext& ctx, u32 light, Id ndc, Id uv, Id depth, u32 tint
     if (!Sirit::ValidId(s.mask_word[0])) {
         return ctx.ConstF32(1.0f);
     }
-    // Its slot: the CPU's match for this draw (light_shadow.h SceneMaps::DrawSlotsAt: a byte each).
-    namespace Body = Shader::Optimization::BodyShadow;
     const u32 index = info.stride != 0 ? (8 * light) / info.stride : 0;
     if (index >= Scene::DrawLights) {
         return ctx.ConstF32(1.0f);
     }
-    const Id byte = ctx.OpBitwiseAnd(
-        u1, ctx.OpShiftRightLogical(u1, BodyRead(ctx, s.scene_body, Body::SlotsAt + Scene::DrawSlotsAt + index / 4),
-                                    u(8 * (index % 4))),
-        u(255u));
-    // (0: the CPU did not see this draw's list: the nearest slot within SlotKeepM of the light, here;
-    // 255: it did, no slot.)
-    const Id found = Private(ctx, u1);
-    ctx.OpStore(found, ctx.OpSelect(u1, ctx.OpIEqual(b1, byte, u(255u)), ctx.u32_zero_value, byte));
-    const Id gpu_l = ctx.OpLabel(), gpu_done = ctx.OpLabel();
-    const Id branch_cond_1 = ctx.OpIEqual(b1, byte, ctx.u32_zero_value);
-    ctx.OpSelectionMerge(gpu_done, spv::SelectionControlMask::MaskNone);
-    ctx.OpBranchConditional(branch_cond_1, gpu_l, gpu_done);
-    ctx.AddLabel(gpu_l);
-    {
-        const auto rd = [&](u32 c) {
-            return ctx.OpBitcast(f1, EmitReadConstBuffer(ctx, info.light_buffer, u(8 * light + c)));
-        };
-        const Id wl = ToWorld(ctx, ctx.OpFAdd(f3, ctx.OpCompositeConstruct(f3, std::array{rd(0), rd(1), rd(2)}), s.scene_shift));
-        const Id best = Private(ctx, f1);
-        ctx.OpStore(best, ctx.ConstF32(Scene::SlotKeepM * Scene::SlotKeepM));
-        LoopCount(ctx, s.scene_count, [&](Id k) {
-            const SlotRead slot = SceneSlot(ctx, k);
-            const Id dv = ctx.OpFSub(f3, wl, slot.lamp);
-            const Id d2 = ctx.OpDot(f1, dv, dv);
-            const Id take = ctx.OpLogicalAnd(b1, SlotHas(ctx, slot.flags, Scene::SlotUsed),
-                                             ctx.OpFOrdLessThan(b1, d2, ctx.OpLoad(f1, best)));
-            ctx.OpStore(best, ctx.OpSelect(f1, take, d2, ctx.OpLoad(f1, best)));
-            ctx.OpStore(found, ctx.OpSelect(u1, take, ctx.OpIAdd(u1, k, u(1u)), ctx.OpLoad(u1, found)));
-        });
+    const u32 count = std::min(info.count, Scene::DrawLights);
+    if (count < 2 || !info.stride || !Sirit::ValidId(s.edge_corner[0]) || Scene::Tint() || Scene::EdgePass()) {
+        return MaskLight(ctx, u(index), u(8 * light), tint);
     }
-    ctx.OpBranch(gpu_done);
-    ctx.AddLabel(gpu_done);
-    const Id got = ctx.OpLoad(u1, found);
-    const Id k = ctx.OpISub(u1, ctx.OpUMax(u1, got, u(1u)), u(1u));
-    const Id wi = ctx.OpShiftRightLogical(u1, k, u(3u));
-    const Id shift = ctx.OpShiftLeftLogical(u1, ctx.OpBitwiseAnd(u1, k, u(7u)), u(2u));
-    Id weighted = ctx.ConstF32(0.0f);
-    // (The edges' march: the lowest and highest of the neighbours that count here.)
-    const bool edges = Scene::Edges() && Sirit::ValidId(s.edge_pv);
-    Id lowest = ctx.ConstF32(15.0f), highest = ctx.ConstF32(0.0f);
-    Id lowest_all = ctx.ConstF32(15.0f), highest_all = ctx.ConstF32(0.0f);
-    for (u32 c = 0; c < 4; ++c) {
-        Id word = s.mask_corner[c][Scene::MaskSlotWords - 1];
-        for (u32 j = Scene::MaskSlotWords - 1; j-- > 0;) {
-            word = ctx.OpSelect(u1, ctx.OpIEqual(b1, wi, u(j)), s.mask_corner[c][j], word);
-        }
-        const Id v = ctx.OpConvertUToF(f1, ctx.OpBitwiseAnd(u1, ctx.OpShiftRightLogical(u1, word, shift), u(15u)));
-        weighted = ctx.OpFAdd(f1, weighted, ctx.OpFMul(f1, v, s.mask_w[c]));
-        if (edges) {
-            const Id counts = ctx.OpFOrdGreaterThan(b1, s.mask_w[c], ctx.ConstF32(0.0f));
-            lowest = ctx.OpFMin(f1, lowest, ctx.OpSelect(f1, counts, v, ctx.ConstF32(15.0f)));
-            highest = ctx.OpFMax(f1, highest, ctx.OpSelect(f1, counts, v, ctx.ConstF32(0.0f)));
-            lowest_all = ctx.OpFMin(f1, lowest_all, v);
-            highest_all = ctx.OpFMax(f1, highest_all, v);
-        }
+    if (index >= count) {
+        return ctx.ConstF32(1.0f);
     }
-    if (edges) {
-        // (An unsure blend, a thin or detailed thing between blocks that saw something else: all
-        // four neighbours bound the march; the read alone showed the one block it fell back to as
-        // a square. 2026-11-15.)
-        if (Sirit::ValidId(s.mask_unsure)) {
-            lowest = ctx.OpSelect(f1, s.mask_unsure, lowest_all, lowest);
-            highest = ctx.OpSelect(f1, s.mask_unsure, highest_all, highest);
-        }
-        weighted = MaskEdge(ctx, light, k, got, weighted, lowest, highest);
+    // One copy of the edge march even in the twelve-light Woods shader. The array
+    // belongs to this fragment invocation; neither eye writes to a shared buffer.
+    const Id ptr = ctx.TypePointer(spv::StorageClass::Private, f1);
+    if (!Sirit::ValidId(s.edge_visibility)) {
+        s.edge_visibility = Private(ctx, ctx.TypeArray(f1, u(count)));
+        LoopCount(ctx, u(count), [&](Id i) {
+            const Id vis = MaskLight(ctx, i, ctx.OpIMul(u1, i, u(info.stride)), 0);
+            ctx.OpStore(ctx.OpAccessChain(ptr, s.edge_visibility, i), vis);
+        }, nullptr, spv::LoopControlMask::DontUnroll);
     }
-    const Id vis = ctx.OpFMul(f1, weighted, ctx.ConstF32(1.0f / 15.0f));
-    const Id out = ctx.OpSelect(f1, ctx.OpINotEqual(b1, got, ctx.u32_zero_value), vis, ctx.ConstF32(1.0f));
-    if (tint == 0) {
-        return out;
-    }
-    // Tests (Scene::Tint): the blocked share of the light keeps its slot's colour in this channel.
-    Id colour = ctx.ConstF32(1.0f);
-    for (u32 j = 0; j < Scene::Slots && j < 16; ++j) {
-        colour = ctx.OpSelect(f1, ctx.OpIEqual(b1, k, u(j)), ctx.ConstF32(Scene::TintColours[j][tint - 1]), colour);
-    }
-    return ctx.OpFAdd(f1, out, ctx.OpFMul(f1, ctx.OpFSub(f1, ctx.ConstF32(1.0f), out), colour));
+    return ctx.OpLoad(f1, ctx.OpAccessChain(ptr, s.edge_visibility, u(index)));
 }
 
 // Tests: the light's class bit (body_shadow.h ProbeAt) from its dword 7.
@@ -4945,16 +5152,20 @@ Id VrFogLightParts(EmitContext& ctx, Id ndc, Id uv, Id depth, bool air_part, boo
         fill = ctx.OpVectorTimesScalar(
             ctx.F32[3], ctx.OpFMul(ctx.F32[3], surface, ctx.OpLoad(ctx.F32[3], fill_sum)), fill_strength);
     }
-    // The muzzle flash (FogLight's Muzzle*): while it shines, the surface lit by it (its colour,
-    // the falloff, the normal) and shadowed by the lamp shadows' march towards it.
+    // The shared surface light uses its colour, falloff and surface normal. Gun and torch also
+    // use the shadow march; the atmospheric Tonitrus light uses full visibility.
     Id muzzle = ctx.ConstF32(0.0f, 0.0f, 0.0f);
-    if (air_shadows && surface_part) {
+    if (surface_part) {
         const auto mzf = [&](u32 k) {
             return ctx.OpBitcast(ctx.F32[1], FogRead(ctx, fog, ctx.ConstU32(FogTune::MuzzleDword + k)));
         };
         const Id mz_var = Private(ctx, ctx.F32[3]);
         ctx.OpStore(mz_var, ctx.ConstF32(0.0f, 0.0f, 0.0f));
-        const Id shines = ctx.OpFOrdGreaterThan(ctx.U1[1], mzf(7), ctx.ConstF32(0.5f));
+        const Id signed_core = mzf(7);
+        const Id core = ctx.OpFAbs(ctx.F32[1], signed_core);
+        // With shadowed air disabled, only the unshadowed Tonitrus owns a visible slot.
+        const Id shines = air_shadows ? ctx.OpFOrdGreaterThan(ctx.U1[1], core, ctx.ConstF32(0.5f))
+                                      : ctx.OpFOrdLessThan(ctx.U1[1], signed_core, ctx.ConstF32(-0.5f));
         const Id lit_label = ctx.OpLabel(), lit_done = ctx.OpLabel();
         ctx.OpSelectionMerge(lit_done, spv::SelectionControlMask::MaskNone);
         ctx.OpBranchConditional(shines, lit_label, lit_done);
@@ -4969,12 +5180,26 @@ Id VrFogLightParts(EmitContext& ctx, Id ndc, Id uv, Id depth, bool air_part, boo
                                       ctx.ConstF32(0.0f));
             const Id falloff = ctx.OpFMax(
                 ctx.F32[1],
-                sub(ctx.OpFDiv(ctx.F32[1], ctx.ConstF32(1.0f), add(d2, FiniteClamp(ctx, mzf(7), 0.5f, 50.0f))),
+                sub(ctx.OpFDiv(ctx.F32[1], ctx.ConstF32(1.0f), add(d2, FiniteClamp(ctx, core, 0.5f, 50.0f))),
                     FiniteClamp(ctx, mzf(3), 0.0f, 100.0f)),
                 ctx.ConstF32(0.0f));
-            const Id end = ctx.OpFClamp(ctx.F32[1], sub(dist, ctx.ConstF32(Tune::ClearM)),
-                                        ctx.ConstF32(Tune::StartM), ctx.ConstF32(Tune::MaxM));
-            const Id vis = March(ctx, l, dist, end, ctx.ConstU32(FogTune::MuzzleSteps));
+            Id vis = ctx.ConstF32(1.0f);
+            if (air_shadows) {
+                // The slot is uniform across the draw. Only a gun flash or raised torch traces.
+                const Id visibility = Private(ctx, ctx.F32[1]);
+                ctx.OpStore(visibility, vis);
+                const Id trace = ctx.OpLabel(), done = ctx.OpLabel();
+                const Id casts = ctx.OpFOrdGreaterThan(ctx.U1[1], signed_core, ctx.ConstF32(0.0f));
+                ctx.OpSelectionMerge(done, spv::SelectionControlMask::MaskNone);
+                ctx.OpBranchConditional(casts, trace, done);
+                ctx.AddLabel(trace);
+                const Id end = ctx.OpFClamp(ctx.F32[1], sub(dist, ctx.ConstF32(Tune::ClearM)),
+                                            ctx.ConstF32(Tune::StartM), ctx.ConstF32(Tune::MaxM));
+                ctx.OpStore(visibility, March(ctx, l, dist, end, ctx.ConstU32(FogTune::MuzzleSteps)));
+                ctx.OpBranch(done);
+                ctx.AddLabel(done);
+                vis = ctx.OpLoad(ctx.F32[1], visibility);
+            }
             const Id colour = FiniteClamp(
                 ctx, ctx.OpCompositeConstruct(ctx.F32[3], std::array{mzf(4), mzf(5), mzf(6)}), 0.0f,
                 64.0f, 3);

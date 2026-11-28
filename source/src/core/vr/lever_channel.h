@@ -132,6 +132,8 @@ class Transport {
     // game units (lever_acquisition.h ReachTracker); a lever whose stem rises above it through the
     // pull keeps its prompt (OutOfReach). Infinite until the XR side first writes it.
     std::atomic<float> reach_top{std::numeric_limits<float>::infinity()};
+    // (A lever's tall height, lever_acquisition.h Tall, is worked out by the game side from the
+    // body's anchor, and only in the Chalice Dungeons: nothing written for it every frame.)
     // Game thread only (native selection gate and its host classifier): which selected lever
     // instance has its prompt replaced. Read by generated code at fixed offsets.
     PromptVerdict verdict{};

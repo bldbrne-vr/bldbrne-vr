@@ -49,9 +49,12 @@ void* EmitHostCallStub(Xbyak::CodeGenerator& c, void* fn, const u8* original, si
 // Like EmitHostCallStub, but `load_args` emits the moves into rdi, rsi, rdx, rcx (System V) right
 // after the saves, while every guest register (rbp, r12-r15 and the argument registers) still
 // holds its guest value; `fn` gets no saved_ymm pointer. For read-only hooks (logs).
+// `result_in_rsi`: `fn`'s return value (rax) becomes the guest's rsi for the replayed code (a hook
+// that changes the second argument; it returns the guest's rsi to leave it as it was).
 void* EmitHostCallStubWith(Xbyak::CodeGenerator& c, void* fn, const u8* original, size_t length,
                            u64 return_address,
-                           const std::function<void(Xbyak::CodeGenerator&)>& load_args);
+                           const std::function<void(Xbyak::CodeGenerator&)>& load_args,
+                           bool result_in_rsi = false);
 
 // Overwrites `length` (>= 14) bytes at `site` with `jmp qword [rip+0]; dq target`, padded
 // with NOPs.

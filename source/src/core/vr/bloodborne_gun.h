@@ -82,7 +82,9 @@ void BladeShotTick(u8* chr, const BladeBody& body);
 // The projectile launch tail (core/vr/bloodborne_quickitems.cpp, 0x19F7835, same thread as the
 // emitter): VR_GUN_LOG's readback of our ray against the launched velocity, and the child
 // bullets along it.
-void GunLaunchTail(u8* projectile);
+void GunLaunchTail(u8* projectile, u8* saved_ymm);
+// Same launch site: xmm0 holds the lifetime the game is about to store for this projectile.
+void PS4_SYSV_ABI BowRangeLaunch(u8* projectile, u8* saved_ymm);
 
 // SolveBody (loop thread): the recoil kick on the left arm's target, model space
 // (gun_recoil_visual; none without a recent shot).

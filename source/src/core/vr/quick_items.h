@@ -859,6 +859,43 @@ inline V3 SpinVelocity(V3 w, Qt q, V3 r, float max_mps = 2.5f) {
     return l > max_mps ? s * (max_mps / l) : s;
 }
 
+// A Molotov can peak between two tracked input poses. Across a short hitch the distance
+// the grip actually travelled gives its mean velocity, even if both reported velocities
+// missed the peak. Only use it when both endpoints corroborate the same stroke.
+struct MolotovGripSample {
+    std::int64_t ns{}; // actual time of the located grip in the runtime's clock
+    V3 position{}, velocity{};
+    std::uint32_t space{};
+
+    V3 ThroughGap(const MolotovGripSample& next, float max_speed) const {
+        if (ns <= 0 || next.ns <= ns || next.space != space) {
+            return {};
+        }
+        const auto elapsed_ns = next.ns - ns;
+        if (elapsed_ns < 20'000'000 || elapsed_ns > 60'000'000) {
+            return {};
+        }
+        const V3 mean = (next.position - position) * (1e9f / static_cast<float>(elapsed_ns));
+        const float speed = Length(mean);
+        const float before = Length(velocity), after = Length(next.velocity);
+        if (!(before >= 0.5f && after >= 0.5f && std::max(before, after) >= 1.0f &&
+              before <= max_speed && after <= max_speed &&
+              speed > std::max(before, after) && speed <= max_speed &&
+              speed <= 2.5f * std::max(before, after) &&
+              Dot(mean, velocity) >= 0.65f * speed * before &&
+              Dot(mean, next.velocity) >= 0.65f * speed * after)) {
+            return {};
+        }
+        return mean;
+    }
+};
+
+// Keep natural overhand lobs. A much more oblique wind-up lends progressively less extra
+// speed and steering to the final release. Bounds are the cosines of 75 and 50 degrees.
+inline float MolotovPeakShare(float alignment) {
+    return SmoothStep(0.25881905f, 0.64278761f, alignment);
+}
+
 // ---- Release velocity (HIGGS style) ------------------------------------------------------------
 
 // The hand's recent velocities (LOCAL, m/s) at the times they are for: the grip located at the
@@ -957,7 +994,7 @@ public:
     // the release's direction at most throw_peak_turn_deg toward it (TurnToward): the earlier
     // sample is often further up the swing (the tester's two such throws: 46-56 degrees up).
     V3 PeakBefore(double now, double window_s, V3 release, float max_angle_deg = 75.0f,
-                  float min_release = 0.6f) const {
+                  float min_release = 0.6f, bool taper_wide = false) const {
         const float rel_speed = Length(release);
         if (rel_speed < min_release) {
             return {};
@@ -966,13 +1003,22 @@ public:
         const float min_cos = std::cos(max_angle_deg * (3.14159265f / 180.0f));
         int peak = -1;
         float best = -1.0f;
+        float best_score = -1.0f;
         for (std::size_t i = 0; i < count; ++i) {
             const Sample& s = At(i);
             const float speed = Length(s.v);
-            if (now - s.t <= window_s && s.t <= now + 1e-4 && speed > 1e-3f &&
-                Dot(s.v, dir) / speed >= min_cos && speed >= best && !Spike(i, now)) {
-                best = speed;
-                peak = static_cast<int>(i);
+            if (now - s.t <= window_s && s.t <= now + 1e-4 && speed > 1e-3f) {
+                const float alignment = Dot(s.v, dir) / speed;
+                if (!(alignment >= min_cos)) {
+                    continue;
+                }
+                const float score = taper_wide ? (speed - rel_speed) * MolotovPeakShare(alignment)
+                                               : speed;
+                if (score >= best_score && !Spike(i, now)) {
+                    best_score = score;
+                    best = speed;
+                    peak = static_cast<int>(i);
+                }
             }
         }
         if (peak < 0) {
@@ -983,7 +1029,8 @@ public:
         for (int i = peak - 1; i <= peak + 1; ++i) {
             if (i >= 0 && i < static_cast<int>(count)) {
                 const Sample& s = At(static_cast<std::size_t>(i));
-                if (s.t <= now + 1e-4 && Length(s.v) >= 0.85f * best &&
+                if (s.t <= now + 1e-4 && (!taper_wide || now - s.t <= window_s) &&
+                    Length(s.v) >= 0.85f * best &&
                     !Spike(static_cast<std::size_t>(i), now) &&
                     Dot(s.v, dir) / Length(s.v) >= min_cos) {
                     sum = sum + s.v;
@@ -3396,6 +3443,11 @@ struct Scene {
     HunterRelics::DropRequest relic_drop{};
     CallBeyond::State call_beyond{};
     std::int64_t held_session_ns{}; // cosmetic use cues must belong to the current take/press
+    // The held Blacksky Eye's shot (core/vr/blacksky_mark.h, its mark): the left controller's
+    // aim ray as its pointed shot takes it (LOCAL unit; zero: no eye, or no aim), and whether it is
+    // held to an eye (its shot then where you look).
+    std::array<float, 3> eye_aim{};
+    bool eye_at_eye{false};
     Holsters::Layout holsters{};
     bool holsters_enabled{false};
     std::int64_t holsters_ns{0};
@@ -4070,7 +4122,8 @@ struct Config {
     // and flies when it is let go (the grip's release path: the fresh poses, the rise wait, the
     // look-back, the spike filter; a slow release puts it back on the arc), a usable is used at
     // that pull. The trigger off the cards is the gun (the arc closes); the grip with an item in
-    // the hand puts it back (the arc stays open); after a throw the arc closes (opt-in reopen_s >
+    // the hand puts it back (the fan closes, ToArc; other layouts stay open); after a throw the
+    // arc closes (opt-in reopen_s >
     // 0 and stack: it is back that long for the next one). belt_vial: the grip at the left hip
     // (Input::at_hip) draws a Blood Vial (Output::draw_vial) and never opens the arc. No stack
     // squeeze, no quick draw, no nearest-card grab, no fist rule for the gun (the grip is not a
@@ -4177,11 +4230,8 @@ struct Config {
     // body pocket's); the trigger uses it (a ring fills while it is held, a tool's act, the crush
     // is the trigger hard), a throwable flies when the grip is let go, and letting go of anything
     // else puts it back. The trigger off an item is always the gun (the arc closes). An item put
-    // back within fan_return_s of its take (a wrong pick) brings the arc back for the next one;
-    // one used (used up, thrown, a kept tool used) or held longer leaves it closed (the user,
-    // 2026-11-06). Off: the trigger takes (quick_tap_pick).
+    // back leaves the fan closed until explicitly opened again.
     bool grip_hold{false};
-    float fan_return_s{3.0f};
     // quick_grip_open_ms (left_scheme=2): the grip in the air opens the arc once squeezed this
     // long (the tester's 2026-11-01 pick, 80 ms: a hand closing on its own opens nothing); 0 = at
     // the squeeze. Y and X open it at once.
@@ -4257,6 +4307,7 @@ struct Input {
     // orientation and the angular velocity between those (rad/s, LOCAL); and (VR_THROW_TRACE) the
     // runtime's own angular velocity at the display time (rad/s, LOCAL).
     bool hand_now_valid{false};
+    std::int64_t hand_now_ns{}; // actual pose time, for travel across an input hitch
     V3 hand_p_now{};
     V3 hand_v_now{};
     Qt hand_q_now{};
@@ -4694,7 +4745,6 @@ public:
         if (corpse_grip_claimed_) {
             y_square_ = false;
             grip_open_t_ = -1.0;
-            fan_return_until_ = 0.0;
             regrab_slot_ = -1;
             regrab_l2_wait_ = false;
             holster_timing_.Reset();
@@ -4987,7 +5037,7 @@ public:
             break;
         case Phase::Holding:
         case Phase::Committing: {
-            // left_scheme=2: the grip puts the item back on the arc (it stays open), with the hand
+            // left_scheme=2: the grip puts the item back (ToArc: the fan closes), with the hand
             // still (PutBack2: a clench during a throw is none); the trigger let go is the
             // release, through the same path as the grip's opening in scheme 1. (quick_use_crush:
             // on an item to crush the grip is the crush, never a put-back: CrushGate in HoldTick.
@@ -5019,7 +5069,7 @@ public:
                 const bool glove = GloveFlung(grip_release);
                 if (!grip_on_ && !release_pending_ && !(throwable && grip_release) && !toss &&
                     !glove) {
-                    FanBack(c, in, out, "the grip let go: put back", true);
+                    PutAway(out, "the grip let go: put back", true);
                     break;
                 }
                 UpdateHolding(c, in, out, y_edge,
@@ -5102,9 +5152,7 @@ public:
     }
 
 private:
-    // `feel`: its unfurl's vibration (none for the fan back by itself after a quick use:
-    // FanReturnTick).
-    void Open(const Config& c, const Input& in, Output& out, bool feel = true) {
+    void Open(const Config& c, const Input& in, Output& out) {
         const int n = in.snapshot.Count();
         if (n == 0) {
             out.Haptics(Haptic::Empty);
@@ -5133,7 +5181,6 @@ private:
         if (fan_) {
             FanBegin(in);
         }
-        fan_return_until_ = 0.0;
         grip_open_t_ = -1.0;
         ++open_serial_;
         Enter(Phase::Open);
@@ -5153,9 +5200,7 @@ private:
         pull_slot_ = -1;
         last_dwelled_ = false;
         reopen_until_ = 0.0;
-        if (feel) {
-            out.Haptics(Haptic::Unfurl);
-        }
+        out.Haptics(Haptic::Unfurl);
         out.Log("OPEN n=" + std::to_string(n) + " sel=" + std::to_string(in.snapshot.selected) +
                 (toggle_by_[0] == 'Y' ? "" : std::string{" by "} + toggle_by_) +
                 (fan_ ? FanFrameText() : std::string{}));
@@ -5163,8 +5208,7 @@ private:
 
     // ---- quick_arc_pick=fan ----------------------------------------------------------------
 
-    // A fan's frame round the controller where it is now (an open, or the fan back after an
-    // item went back or a throw: there round the hand again, a new placement), and its cards: the
+    // Anchor the fan to the controller on open. Its cards are the
     // slots in use when it opened (cards_), in slot order, as the render hook lays them out.
     void FanBegin(const Input& in) {
         fan_frame_ = MakeFanFrame(in.hand_p, in.head_valid ? in.head_p : in.hand_p,
@@ -5502,9 +5546,6 @@ private:
         cigarette_puff_ = {};
         cigarette_near_ = -1.0f;
         cigarette_frames_ = cigarette_ready_ = cigarette_puffs_ = 0;
-        take_t_ = in.t;
-        used_since_take_ = false;
-        fan_return_until_ = 0.0;
         eye_side_ = -1;
         swing_.Reset();
         pocket_pull_ = false;
@@ -5648,6 +5689,24 @@ private:
                 return;
             }
         }
+        if (held_goods_ == 1200 && c.throws && c.throw_fresh && !release_pending_) {
+            const bool tracked = in.hand_now_valid && in.hand_valid && in.arm_weight >= 0.9f;
+            const MolotovGripSample sample{tracked ? in.hand_now_ns : 0, in.hand_p_now,
+                                           in.hand_v_now, in.holster_space};
+            if (grip_release) {
+                // The hand's travel is the grip's alone; the throw is read at the bottle, as the
+                // normal reading takes it (fresh_): add the wrist's flick over the same gap
+                // (hand_wv_now is the turn between these two input poses) at the bottle's offset.
+                const V3 travel = molotov_grip_.ThroughGap(sample, c.throw_max_hand_speed);
+                molotov_gap_v_ =
+                    Length(travel) > 0.0f && c.throw_spin > 0.0f
+                        ? travel + SpinVelocity(in.hand_wv_now, in.hand_q_now,
+                                                ReleaseOffsetOf(held_goods_)) *
+                                       c.throw_spin
+                        : travel;
+            }
+            molotov_grip_ = sample;
+        }
         // A throw waiting for the hand's peak (throw_rise_wait_s): it goes once the hand stops
         // speeding up or the wait is over, whatever else happens meanwhile (a few frames).
         if (release_pending_) {
@@ -5782,7 +5841,7 @@ private:
             }
             if (grip_release && held_goods_ == Cigarette::Goods && grip_held_ && !grip_on_) {
                 // quick_grip_hold: let go slowly (or the game has the arm), it goes back.
-                FanBack(c, in, out, "the grip let go: put back", true);
+                PutAway(out, "the grip let go: put back", true);
                 return;
             }
             if (grip_release) {
@@ -5805,7 +5864,7 @@ private:
                     // the music box felt weird; let go unplayed, it is a cancel: back below).
                     PutAway(out, "trigger let go: the music box played", true);
                 } else if (c.left_scheme == 2) {
-                    // The trigger that took it let go away from the mouth: back on the arc.
+                    // The trigger that took it let go away from the mouth: put back (ToArc).
                     ToArc(in, out,
                           mouth_item_ ? "trigger let go away from the mouth: back"
                                       : "trigger let go" + early + ": back",
@@ -6695,7 +6754,15 @@ private:
         // extrapolates the acceleration lets them run a little past the peak when the grip opens
         // at or after it (then the fresh one alone would read less than before).
         const V3 v_display = history_.Release(release_t_);
-        const V3 v_fresh = UseFresh(c, in.t) ? fresh_.Release(in.t) : V3{};
+        const bool molotov = held_goods_ == 1200;
+        V3 v_fresh = UseFresh(c, in.t) ? fresh_.Release(in.t) : V3{};
+        const bool use_gap = molotov && c.throw_fresh && in.hand_now_valid && in.hand_valid &&
+                             in.arm_weight >= 0.9f &&
+                             in.holster_space == molotov_grip_.space &&
+                             Length(molotov_gap_v_) > Length(v_fresh);
+        if (use_gap) {
+            v_fresh = molotov_gap_v_;
+        }
         const bool fresh = Length(v_fresh) > 0.0f && Length(v_fresh) >= Length(v_display);
         const VelocityHistory& h = fresh ? fresh_ : history_;
         const double at = fresh ? in.t : release_t_;
@@ -6707,21 +6774,32 @@ private:
         // drift as it puts the item back never throws from the reach before it.
         const V3 v_peak = c.throw_peak_window_s > 0.0f
                               ? h.PeakBefore(at, c.throw_peak_window_s, v_release, 75.0f,
-                                             c.throw_min_speed)
+                                             c.throw_min_speed, molotov)
                               : V3{};
-        const bool use_peak = Length(v_peak) > Length(v_release);
-        const V3 v = use_peak ? TurnToward(v_release, v_peak, c.throw_peak_turn_deg) *
-                                    Length(v_peak)
-                              : v_release;
+        const float release_speed = Length(v_release), peak_speed = Length(v_peak);
+        const bool use_peak = peak_speed > release_speed;
+        V3 v = v_release;
+        if (use_peak) {
+            const float share = molotov && release_speed > 0.0f
+                                    ? MolotovPeakShare(Dot(v_release, v_peak) /
+                                                       (release_speed * peak_speed))
+                                    : 1.0f;
+            const float speed = share == 1.0f ? peak_speed
+                                              : release_speed + share * (peak_speed - release_speed);
+            v = TurnToward(v_release, v_peak, c.throw_peak_turn_deg * share) * speed;
+        }
         const float speed = Length(v);
         const bool arm = release_arm_;
         if (use_peak) {
             out.Log("release " + std::to_string(Length(v_release)).substr(0, 4) +
-                    " m/s, earlier peak " + std::to_string(speed).substr(0, 4) + " m/s within " +
+                    " m/s, earlier peak " + std::to_string(peak_speed).substr(0, 4) + " m/s within " +
                     std::to_string(static_cast<int>(c.throw_peak_window_s * 1000.0f)) +
-                    " ms: the peak counts");
+                    " ms: used " + std::to_string(speed).substr(0, 4) + " m/s");
         }
         if (c.throw_trace) {
+            if (use_gap && fresh) {
+                out.Log("Molotov release used tracked travel across the input gap");
+            }
             TraceRelease(c, in, out, v_release, v_peak, v, fresh,
                          speed < c.throw_min_speed ? "released slowly: put back"
                          : !arm                    ? "the game has the arm: put back"
@@ -6737,7 +6815,7 @@ private:
             Throw(c, in, out, v, fresh, Length(v_fresh), Length(v_display));
         } else if (grip_held_) {
             // quick_grip_hold: no throw, the grip let go of it: back.
-            FanBack(c, in, out,
+            PutAway(out,
                     !arm ? "let go while the game had the arm"
                          : "let go slowly (" + std::to_string(speed).substr(0, 4) + " m/s)",
                     true);
@@ -6747,7 +6825,7 @@ private:
                  !arm ? "trigger let go while the game had the arm"
                       : "trigger let go slowly (" + std::to_string(speed).substr(0, 4) + " m/s)");
         } else if (c.left_scheme == 2) {
-            // left_scheme=2: back on the arc, which stays open for the next pick.
+            // left_scheme=2: put back (ToArc: the fan closes, other layouts stay open).
             ToArc(in, out,
                   !arm ? "trigger let go while the game had the arm: put back"
                        : "trigger let go slowly (" + std::to_string(speed).substr(0, 4) +
@@ -7004,9 +7082,6 @@ private:
     // Y's open would (the hunter's hand, the slots); not with the trigger held (a clench round
     // the gun) nor with a vial in the hand (the needle's fist).
     void UpdateIdle2(const Config& c, const Input& in, Output& out, bool grip_edge) {
-        if (FanReturnTick(c, in, out, grip_edge)) {
-            return;
-        }
         // quick_grip_open_ms: the squeeze still on that long opens it (let go before, nothing:
         // Update); checked again then, as at the squeeze.
         if (grip_open_t_ >= 0.0) {
@@ -7071,6 +7146,7 @@ private:
         const bool settled = in.t - placed_t >= c.hover_delay_s;
         // The fan (D1 of the plan): its lit slot is the hover; the centre and out of the fan are
         // "off the cards" (the gun's). Its take waits for the arm (below).
+        const FanOffset previous_pick = fan_pick_.at;
         int fan_hover = -1;
         if (fan_ && (fan_hover = FanHover(c, in, out)) == -2) {
             return;
@@ -7089,6 +7165,11 @@ private:
                 last_dwelled_ = in.t - hover_since_ >= dwell - 1e-6;
                 hover_lost_t_ = in.t;
                 left_card_p_ = in.hand_p;
+                if (fan_ && c.grip_hold) {
+                    // Measure slip from the last lit pose, including the frame that lost the card.
+                    left_card_p_ = fan_frame_.origin + fan_frame_.right * previous_pick.x +
+                                   fan_frame_.up * previous_pick.y + fan_frame_.forward * previous_pick.z;
+                }
             }
             if (hovered >= 0) {
                 out.Haptics(hovered_any_ ? Haptic::Detent : Haptic::FirstDetent);
@@ -7096,6 +7177,10 @@ private:
                 hover_since_ = in.t;
             }
             hover_slot_ = hovered;
+        }
+        if (fan_ && c.grip_hold && hovered < 0 &&
+            (!in.hand_valid || fan_pick_.out || Length(in.hand_p - left_card_p_) > 0.01f)) {
+            last_dwelled_ = false;
         }
         // Only a lit card keeps the arc open (the hand moving does not: a fight).
         if (hovered >= 0) {
@@ -7135,6 +7220,10 @@ private:
                 pull_t_ = in.t;
                 pull_lit_from_ = hover_since_;
                 pull_by_grip_ = true;
+            } else if (fan_ && arm && last_hover_ >= 0 && last_dwelled_ &&
+                       in.t - hover_lost_t_ <= 0.075 + 1e-9) {
+                TakeByTrigger(c, in, out, last_hover_, "fan grip grace", true);
+                return;
             } else if (!fan_ && arm && last_hover_ >= 0 && last_dwelled_ &&
                        in.t - hover_lost_t_ <= c.late_hover_s && still_since_left) {
                 TakeByTrigger(c, in, out, last_hover_, "late hover", true);
@@ -7241,7 +7330,7 @@ private:
         }
     }
 
-    // left_scheme=2, an item in the hand: a squeeze of the grip puts it back on the arc, with the
+    // left_scheme=2, an item in the hand: a squeeze of the grip puts it back (ToArc), with the
     // hand still. A squeeze while the hand moves (putback_max_speed in the last 100 ms) is a
     // clench, not a put-back; one with the hand still goes putback_wait_s later, unless the hand
     // starts moving (putback_max_speed: a wind-up) or the trigger is let go meanwhile (a throw:
@@ -7397,11 +7486,15 @@ private:
         }
     }
 
-    // The arc open again where it was (its placement kept: the same open serial; it fades in) with
+    // The fan stays closed. Other arc layouts open again where they were (its placement kept: the same open serial; it fades in) with
     // the hand empty and the gun back in it: an item put back, a refused use or throw, or after a
     // throw (`until` > 0: it closes then unless the hand reaches a card).
     void ToArc(const Input& in, Output& out, const std::string& why, double until,
                bool put_back) {
+        if (fan_) {
+            PutAway(out, why, put_back);
+            return;
+        }
         if (put_back) {
             out.Haptics(Haptic::PutBack);
         }
@@ -7421,13 +7514,6 @@ private:
         hold_item_ = hold_use_ = hold_spent_ = false;
         ClearGestures();
         Enter(Phase::Open);
-        if (fan_) {
-            // The fan back round the hand where it is now (a new placement: the render hook
-            // places it again), never round where it was: after a throw or a put-back the hand can
-            // be anywhere, and the old centre would light a slot, or dismiss it, at once.
-            ++open_serial_;
-            FanBegin(in);
-        }
         open_t_ = in.t; // the hover waits hover_delay_s again (no take as it fades in)
         last_activity_ = in.t;
         open_hand_ = activity_hand_ = in.hand_p;
@@ -7478,11 +7564,8 @@ private:
             KeepTool(c, in, out, false); // (UseGoods at once: no animation)
             return;
         }
-        // quick_grip_hold: used up or thrown, the arc stays closed (FanBack); otherwise (nothing
-        // spent) it is a put-back.
         if (grip_held_) {
-            used_since_take_ = used_since_take_ || done;
-            FanBack(c, in, out, thrown_ ? "thrown" : done ? "used" : OutcomeName(o), false);
+            PutAway(out, thrown_ ? "thrown" : done ? "used" : OutcomeName(o), false);
             return;
         }
         const bool again = !done || (thrown_ && c.stack && c.reopen_s > 0.0f);
@@ -7579,7 +7662,6 @@ private:
         }
         StopActs(out);
         Enter(Phase::Idle);
-        fan_return_until_ = 0.0;
         held_slot_ = -1;
         held_goods_ = -1;
         held_ffx_ = -1;
@@ -7676,6 +7758,7 @@ private:
         pick_wait_ = false;
         grip_held_ = false;
         eye_side_ = -1;
+        eye_aim_ = {};
         swing_.Reset();
         items_waited_ = false;
     }
@@ -7776,6 +7859,10 @@ private:
             if (in.eye_valid && in.eye_tracked) {
                 eye_side_ = Monocular::SelectEye(in.eye_d, eye_side_);
             }
+            // Its mark follows the ray its pointed shot would take (UseTool's tool_direction).
+            eye_aim_ = in.aim_valid || in.hand_valid
+                           ? Rotate(in.aim_valid ? in.aim_q : in.hand_q, {0, 0, -1})
+                           : V3{};
             if (eye_side_ >= 0) {
                 std::snprintf(text, sizeof(text), "held to the %s eye (%.1f cm from it)",
                               eye_side_ == 0 ? "left" : "right",
@@ -7965,7 +8052,6 @@ private:
     // (quick_tool_direct) has none: it stays in sight.
     void KeepTool(const Config& c, const Input& in, Output& out, bool busy) {
         Enter(Phase::Holding);
-        used_since_take_ = true; // kept after its use: putting it back later never brings the arc
         tool_busy_ = busy;
         busy_t_ = in.t;
         resting_ = c.left_scheme == 2;
@@ -8402,69 +8488,6 @@ private:
                                         : v;
     }
 
-    // quick_grip_hold: the item the grip took left the hand (`why`; `put_back`: the put-back's
-    // tick): the arc is back for the next one only when it was put back unused within
-    // fan_return_s of its take (a wrong pick let go). Used (a throw, a drink, a kept tool used)
-    // or held longer (a tool through a fight, a long look), it stays closed (the user,
-    // 2026-11-06: a use is the end of it). Never with a vial in the hand.
-    void FanBack(const Config& c, const Input& in, Output& out, const std::string& why,
-                 bool put_back) {
-        const double held = in.t - take_t_;
-        char text[64];
-        std::snprintf(text, sizeof(text), "%.1f s after its take", held);
-        const bool back = !used_since_take_ && c.fan_return_s > 0.0f &&
-                          held <= c.fan_return_s + 1e-6 && !in.vial_busy && !out.draw_vial;
-        if (put_back) {
-            out.Haptics(Haptic::PutBack);
-        }
-        out.Log("PUT (" + why + ", " + text +
-                (back               ? ": the arc comes back once the hand settles)"
-                 : used_since_take_ ? ": used, the arc stays closed)"
-                                    : ": the arc stays closed)"));
-        Idle(out, true);
-        // (Never round the hand where it is now: at the mouth after a drink, the face would be
-        // in the fan; out in front after a throw, the arm in its follow-through.)
-        fan_return_until_ = back ? in.t + FanReturnWaitS : 0.0;
-    }
-    // FanBack's arc opens, silently, once the hand has settled (slower than FanSettleMps against
-    // the head, at least FanSettleM from the eyes) within FanReturnWaitS; a squeeze, X, a pull of
-    // the gun (not the trigger still held from the item's use) or a fight meanwhile and it does not
-    // (the grip's squeeze opens it as ever).
-    static constexpr double FanReturnWaitS = 2.0;
-    static constexpr float FanSettleMps = 0.5f;
-    static constexpr float FanSettleM = 0.30f;
-    // True: the arc opened (or the return was dropped and nothing else is to be done this frame).
-    bool FanReturnTick(const Config& c, const Input& in, Output& out, bool grip_edge) {
-        if (fan_return_until_ <= 0.0) {
-            return false;
-        }
-        const char* drop = grip_edge                   ? "a squeeze"
-                           : in.t > fan_return_until_  ? "the hand never settled"
-                           : in.x_edge || in.vial_busy ? "the vial"
-                           : in.trigger_latch && !l2_fresh_needed_ ? "the trigger (the gun)"
-                           : in.combat                 ? "a fight"
-                           : !in.body || !in.snapshot_fresh || in.snapshot.Count() == 0
-                               ? "no quick items"
-                               : nullptr;
-        if (drop != nullptr) {
-            fan_return_until_ = 0.0;
-            out.Log(std::string{"the arc's return dropped ("} + drop + ")");
-            return false;
-        }
-        const bool settled = in.hand_valid && in.head_valid &&
-                             Length(in.hand_v - in.head_v) < FanSettleMps &&
-                             Length(in.hand_p - in.head_p) >= FanSettleM &&
-                             in.arm_weight >= c.arm_min;
-        if (!settled) {
-            return true;
-        }
-        fan_return_until_ = 0.0;
-        toggle_by_ = "the next one";
-        regrab_slot_ = -1;
-        Open(c, in, out, false); // silent: you did not open it (the tester's 2026-10-30 call)
-        return true;
-    }
-
     [[nodiscard]] bool Throwable(const Config& c) const {
         return held_class_.use == UseKind::Throw && c.throws;
     }
@@ -8540,15 +8563,12 @@ private:
     std::int64_t roar_charge_ns_{};
     bool charge_full_{false};     // ... gathered, waiting to be raised (logged once)
     int eye_side_{-1};            // Eye: at that eye (0 left, 1 right; -1 none: SelectEye)
+    V3 eye_aim_{};                // Eye: its pointed shot's ray (LOCAL; Scene::eye_aim)
     SwingGate swing_{};           // Swing: the stroke down (Tiny Tonitrus, the Gloves)
     bool items_waited_{false};    // a held act waiting for the game's item window (logged)
-    // quick_grip_hold: the item in the hand was taken by the grip, which holds it (take_t_: when
-    // it was taken, FanBack's fan_return_s); an open arc's pull_slot_ was the grip's.
+    // The grip holds the item until release.
     bool grip_held_{false};
-    double take_t_{0.0};
-    bool used_since_take_{false}; // used since its take (FanBack: the arc stays closed)
     bool pull_by_grip_{false};
-    double fan_return_until_{0.0}; // FanBack: the arc opens once the hand settles, until then
     double grip_open_t_{-1.0};     // quick_grip_open_ms: the grip in the air squeezed then (-1: none)
 
     bool holster_held_{false};
@@ -8574,6 +8594,10 @@ private:
         if (p == Phase::Idle)
             holster_held_ = false;
         if (p != phase_) {
+            if (p == Phase::Holding) {
+                molotov_grip_.ns = 0;
+                molotov_gap_v_ = {};
+            }
             phase_ = p;
             state_ns_ = steady_ns_;
         }
@@ -8630,6 +8654,11 @@ private:
         s.cigarette_puffs = cigarette ? cigarette_puffs_ : 0;
         s.cigarette_notice = cigarette_notice_;
         s.held_session_ns = in_hand ? hold_from_base_ns_ : 0;
+        const bool eye = in_hand && held_goods_ == BlackskyEye::Goods &&
+                         tool_gesture_ == ToolGesture::Eye;
+        s.eye_aim = eye ? std::array<float, 3>{eye_aim_.x, eye_aim_.y, eye_aim_.z}
+                        : std::array<float, 3>{};
+        s.eye_at_eye = eye && eye_side_ >= 0;
         s.blade_active_ns = phase_ == Phase::Holding && held_goods_ == ShamanBlade::Goods
                                 ? blade_active_ns_ : 0;
         s.blade_stroke = s.blade_active_ns ? blade_stroke_.Serial() : 0;
@@ -8781,6 +8810,8 @@ private:
     VelocityHistory history_{}; // the item's velocity (the grip's + its spin), display times
     VelocityHistory spin_{};    // the spin part (the log)
     VelocityHistory fresh_{};      // ... from the grip located at the input times (throw_fresh)
+    MolotovGripSample molotov_grip_{};
+    V3 molotov_gap_v_{}; // set on grip release, retained only for that throw's pending peak
     VelocityHistory fresh_spin_{}; // ... its spin part (the log)
     // The grip opened at release_t_ (the game had the arm then: !release_arm_); the throw waits
     // for the hand's peak while release_pending_ (throw_rise_wait_s).

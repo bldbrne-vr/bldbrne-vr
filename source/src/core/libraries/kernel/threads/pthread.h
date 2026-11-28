@@ -272,6 +272,8 @@ struct SchedParam {
 
 #define THR_RELTIME (const OrbisKernelTimespec*)-1
 
+void PthreadCancelInterrupt() noexcept;
+
 struct Pthread {
     static constexpr u32 ThrMagic = 0xd09ba115U;
     static constexpr u32 MaxDeferWaiters = 50;
@@ -322,7 +324,8 @@ struct Pthread {
     bool will_sleep;
     bool has_user_waiters;
     int nwaiter_defer;
-    WakeSemaphore* defer_waiters[MaxDeferWaiters]{};
+    Pthread* defer_waiters[MaxDeferWaiters]{};
+    std::atomic<unsigned> pending_deferred_wakes{};
     Pthread* join_target{};
     std::mutex join_wait_mutex;
     std::condition_variable join_wait_cv;
@@ -364,14 +367,23 @@ struct Pthread {
     }
 
     void WakeAll() {
+        if (nwaiter_defer == 0) {
+            return;
+        }
+        // Async cancellation must not separate a wake from dropping its lifetime reference.
+        critical_count.fetch_add(1, std::memory_order_acq_rel);
         for (int i = 0; i < nwaiter_defer; i++) {
-            WakeSemaphore* waiter = defer_waiters[i];
+            Pthread* waiter = defer_waiters[i];
             defer_waiters[i] = nullptr;
             if (waiter != nullptr) {
-                waiter->release();
+                waiter->wake_sema.release();
+                waiter->pending_deferred_wakes.fetch_sub(1, std::memory_order_release);
             }
         }
         nwaiter_defer = 0;
+        if (critical_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            PthreadCancelInterrupt();
+        }
     }
 
     void ClearWake() {
@@ -435,7 +447,6 @@ using PthreadT = Pthread*;
 extern thread_local Pthread* g_curthread;
 
 void PthreadTestCancel();
-void PthreadCancelInterrupt() noexcept;
 #ifndef _WIN32
 bool IsPthreadCancelSignal(int native_signal) noexcept;
 #endif

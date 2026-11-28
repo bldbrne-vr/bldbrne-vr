@@ -9,14 +9,19 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <cmath>
+#include "core/vr/chikage_clip.h"
 #include <optional>
 #include <string>
+#include <string_view>
 #include "common/types.h"
 #include "core/vr/play_style.h"
 #include "core/vr/aa_mode.h"
 #include "core/vr/assist_settings.h"
 #include "core/vr/cinematic_state.h"
 #include "core/vr/space_shift.h"
+#include "core/vr/vial_refill.h"
 
 // Game-agnostic VR state shared between the OpenXR frame thread, the game's camera
 // hook (guest thread), the GPU command thread and the presenter.
@@ -77,6 +82,9 @@ struct HeadState {
 struct CameraRecord {
     u64 id{};
     bool driven{false};   // true when the camera was driven by the headset
+    u8 s1_render_drop{};  // draw copy only: percentage removed from each input dimension
+    u8 s1_previous_drop{}; // draw copy only: the last flip's s1_render_drop (what the game's
+                           // histories were drawn with: the temporal SSAO's, wet streets')
     float head_yaw{};     // radians, tracking space, + = turned left
     float head_pitch{};   // radians, tracking space, + = looking up
     float head_roll{};    // radians about the view axis, + = the head's right side up (camera_roll)
@@ -155,6 +163,8 @@ struct CameraRecord {
     // tick (the render-camera hook, while the VR body runs): the renderer knows his own parts'
     // draws by their object transform standing exactly there (vk_rasterizer_vr_draws.cpp), so a
     // hunter NPC standing close is never taken for him.
+    Chikage::BladeClip scabbard_clip{};
+    Vec3 scabbard_grip{}; // owner of this frame's blade draw
     bool has_player_position{false};
     Vec3 player_position{};
     // stereo_mode 2 (DIBR) was in effect for this update: the camera sits at the head centre and
@@ -250,12 +260,11 @@ struct Settings {
     // legs included, ends up that much behind the camera (nothing is bent), so less of his collar
     // and chest is right under your eyes; your hands stay on your controllers.
     float fp_ahead_m{0.0f};
-    float fp_ahead_down_m{0.03f}; // with the body cutaway: the chosen design (option c)
-    // The render camera rolls with your head about the view axis, so the eye cameras (AER) and
-    // the warp's baseline (DIBR) lie on the line between your eyes. 0 = a level camera (the old
-    // behaviour: with the head tilted, near objects get vertical disparity, about 1.5 deg on a hand
-    // at 0.5 m per 12 deg of tilt).
-    bool camera_roll{false};
+    float fp_ahead_down_m{0.03f}; // with the body cutaway: the user's pick (option c)
+    // Roll the render camera with your head so the stereo baseline follows your eyes in both
+    // Native stereo and DIBR. Turning this off keeps the render camera level.
+    bool camera_roll{true};
+    bool camera_roll_on_seen{false}; // the old generated default has been migrated
     bool positional{true};      // real head movement moves the game camera (6DoF)
     float positional_limit_m{0.5f}; // max distance the head may move the camera
     // ...and below the recentered head (core/vr/head_room.h: the sphere above, a cylinder of its
@@ -891,6 +900,10 @@ struct Settings {
     // Set on the VR settings page (core/vr/vr_page.h) or by hand: the sticks swapped (movement on
     // the right stick, core/vr/thumb_layout.h).
     bool swap_sticks{false};
+    // Left-handed play (the launcher's Controls > Left-handed; core/vr/mirror_world.h): the world
+    // in the headset mirrored, the weapon in your left hand, the gun in your right. Only with
+    // motion controls in first person; read once at the start (MirrorWorld). 0 = right-handed.
+    bool left_handed{false};
     float menu_hud_scale{0.25f};
     u64 hud_after_vs{0x34f1f46b160}; // Bloodborne: vertex shader of the final composite
     // The game's UI on its own compositor layers (renderer_vulkan/vr_ui_layer.h): every UI draw is
@@ -1161,6 +1174,27 @@ struct Settings {
     // Third person, locked on: the game's orbit pitch is capped here (degrees, + = the camera
     // above, as orbit_pitch_deg), so a tall enemy does not lift the camera high. 90 = no cap.
     float lockon_pitch_max_deg{90.0f};
+    // Lock-on follow (core/vr/lock_follow.h), first person: 0 off, 1 snap, 2 smooth, 3 centred
+    // (always centred; the game's camera faces the target in every mode but off). Locked on,
+    // the view turns (yaw only) when the target moves lockon_follow_zone_deg from where it
+    // belongs; your head more than lockon_cancel_deg from it for lockon_cancel_s releases the lock
+    // (0 s = never); smooth turns at most lockon_follow_deg_per_s.
+    int lockon_follow{0};
+    float lockon_follow_zone_deg{30.0f};
+    float lockon_cancel_deg{40.0f};
+    float lockon_cancel_s{0.25f};
+    float lockon_follow_deg_per_s{90.0f};
+    // Centred: the camera's smoothing, seconds (its lag behind a target moving round you).
+    float lockon_follow_smooth_s{0.15f};
+    // Centred: never further than this off the middle (degrees); the smoothing works inside it.
+    float lockon_follow_max_off_deg{10.0f};
+    // Up close (metres from the hunter to the lock point, along the ground: under a big boss, or
+    // one lunging through you) the view holds still; it follows again 0.4 m further out. 0 = never.
+    float lockon_follow_near_m{0.8f};
+    // Lock-on follow: a direction held on the left stick keeps going the same way in the world
+    // through the view's follow turns, easing back to the view over this long (seconds; letting
+    // go or pushing a new way ends it at once). 0 = the stick always follows the view.
+    float lockon_move_commit_s{0.6f};
     float vertical_smoothing_ms{120.0f}; // camera height smoothing (stairs, rolls); 0 = off
     // Dodge comfort camera (first person, core/vr/motion_camera.h): the view travels with the body
     // when you dodge; height changes from stairs and falls arrive smoothed. 0 = the old camera.
@@ -1211,8 +1245,8 @@ struct Settings {
     // of the head dodges in that direction.
     bool lean_dodge{false};
     // m/s head speed (1.3 until 2026-10-27, 1.18 until 2026-11-01, 1.12 until 2026-11-08, 1.08
-    // and then 1.07 until 2026-11-10, 1.04 until 2026-11-17)
-    float lean_dodge_speed{1.00f};
+    // and then 1.07 until 2026-11-10, 1.04 until 2026-11-17, 1.00 until 2026-11-20)
+    float lean_dodge_speed{0.96f};
     float lean_dodge_dist_m{0.11f}; // head travel within 250 ms (0.15, then 0.12 until 2026-11-08)
     float lean_dodge_cooldown_ms{600.0f}; // between two lean dodges
     // Physical evasion (core/vr/bloodborne_evasion.h): your real lean, step and duck move the
@@ -1232,6 +1266,15 @@ struct Settings {
     bool evasion_pelvis{true};         // false: the pelvis capsule never moves
     bool evasion_feedback{true};       // haptics: a knock at a wall, a whoosh on a near miss
     s32 player_hp_bonus_pct{Assists::DefaultHpBonus}; // extra max HP for the hunter, %
+    // Blood Vials the game's own refill (a death, a lamp) adds when it leaves none carried and
+    // none stored, 1..8 (core/vr/vial_refill.h; offline only).
+    s32 empty_vial_refill{Lamps::DefaultVialsWhenOut};
+    // Weapon voice lines (core/vr/weapon_voice.h): a weapon's line the first time it comes to hand
+    // (with the default motion controls, first person); its volume in % (0..200); the lines heard
+    // (vr.ini weapon_voice_heard: their keys; remove it to hear them all again).
+    bool weapon_voice{true};
+    s32 weapon_voice_volume{100};
+    u64 weapon_voice_heard{0};
     s32 outgoing_damage_pct{0};       // player outgoing HP damage adjustment, -60..30 percent
     s32 offhand_damage_pct{10};        // extra damage of the left-hand weapon (gun etc.), %
     // Instant ragdoll on a right-hand melee kill (core/vr/bloodborne_ragdoll.h): an enemy whose
@@ -1253,8 +1296,9 @@ struct Settings {
     // controls; lean_dodge=1 dodges for real instead). The user, 2026-10-15: 100 ms, then 180 ms
     // with a 480 ms cooldown. Still under a pressed quickstep's (0 .. 0.367 s of its animation
     // plus dodge_iframes_extra).
-    // (180, then 200 from 2026-10-15 night; 250 from 2026-10-25; 270 from 2026-11-08)
-    s32 lean_iframes_ms{270};
+    // (180, then 200 from 2026-10-15 night; 250 from 2026-10-25; 270 from 2026-11-08; 280 from
+    // 2026-11-20)
+    s32 lean_iframes_ms{280};
     bool lean_250_seen{false}; // the one-time lean_iframes_ms 180 / 200 -> 250 migration ran
     bool lean_118_seen{false}; // the one-time lean_dodge_speed 1.3 -> 1.18 migration ran
     bool ragdoll_18_seen{false}; // the one-time melee_ragdoll_vanilla_pct 22 -> 18 migration ran
@@ -1265,15 +1309,23 @@ struct Settings {
     // the one-time lean_dodge_speed 1.07 -> 1.04 and duck_iframes_ms 125 -> 135 migration ran
     bool lean_104_seen{false};
     bool lean_100_seen{false}; // the one-time lean_dodge_speed 1.04 -> 1.00 migration ran
+    // the one-time lean_dodge_speed 1.00 -> 0.96 and lean_iframes_ms 270 -> 280 migration ran
+    bool lean_096_seen{false};
+    // the one-time lean_iframes_cooldown_ms 480 -> 470 migration ran
+    bool lean_cd_470_seen{false};
     bool heavy_130_seen{false}; // the one-time heavy_windup_deg 110 -> 130 migration ran
-    float lean_iframes_cooldown_ms{480.0f};
-    // Duck i-frames (the tester 2026-10-26: 125 ms; 135 from 2026-11-10): a quick duck of the head
+    float lean_iframes_cooldown_ms{470.0f}; // (480 until 2026-11-20: "the cooldown is 0.47s")
+    // Duck i-frames (the tester 2026-10-26: 125 ms; 135 from 2026-11-10; 145 from 2026-11-20): a quick duck of the head
     // (core/vr/lean_dodge.h DuckDetector: the neck pivot down at least duck_speed and 18 cm) makes
     // the hunter invulnerable for this many ms of game time (0 .. 300, 0 = off), through the lean's
     // grant and sharing its lean_iframes_cooldown_ms. Standing, motion controls; vr.ini only.
-    s32 duck_iframes_ms{135};
+    s32 duck_iframes_ms{145};
     // The duck's speed down (m/s, averaged over 60 ms; 0.5 .. 3): Lean::DuckConfig::speed.
-    float duck_speed{1.3f};
+    // (1.3 until 2026-11-20, the user: "a tiny tiny bit easier to trigger (speed wise)". Not 1.25:
+    // the bends to look low of the 2026-10-27 run reached 1.25 m/s, and those must not fire.)
+    float duck_speed{1.27f};
+    // the one-time duck_speed 1.3 -> 1.27 and duck_iframes_ms 135 -> 145 migration ran
+    bool duck_127_seen{false};
     // Attacks through dodges (core/vr/anim_classes.h GateOut::dodge_attack): a physical swing or a
     // gun shot works at any moment of a backstep, quickstep or roll (the dodge plays on; 0 = they
     // wait for the dodge's own attack window, as the game). dodge_attack_iframes=0: the dodge's
@@ -1304,7 +1356,7 @@ struct Settings {
     // Resting, travel and the Hunter's Dream from a lamp keep the game's animation either way.
     bool vr_interactions{true};
     // Foveated upscaling (renderer_vulkan/vr_dlss_focus.h): DLSS or FSR only on the middle of
-    // each eye, its own TAA around it. 0 Off, 1 Quality, 2 Medium, 3 Performance; read at start.
+    // each eye, its own TAA around it. 0 Off, 1 Quality, 2 Medium, 3 Performance; adjustable in game.
     // Medium by default (2026-11-07: "should be on by default", then "make Medium the
     // default not quality"); it only acts in native stereo with DLSS (not DLSS 5) or FSR, so DIBR,
     // the upscaler off and DLSS 5 (its own neural centre) are untouched.
@@ -1312,20 +1364,23 @@ struct Settings {
     // Light shadows (shader_recompiler/ir/passes/light_shadow.h; the tester, 2026-11-09: "our hand
     // lantern and torch cast real shadows"): the lights near you (a lantern, a torch, a gun's
     // flash) shadow what stands between them and what they light, through the eyes' depth.
-    // Read at start (it is in the light shaders); VR_LIGHT_SHADOWS=0|1 overrides it.
+    // Live since 2026-11-21 (the light shaders of the new choice are made at the switch);
+    // VR_LIGHT_SHADOWS=0|1 overrides it for the session.
     // (Off where the player has not chosen and the card has under 12 GB: core/vr/card_tier.h,
     // 0.9.6. With DLSS or FSR only, as before.)
     bool light_shadows{false};
-    // Lamp shadow detail (vr.ini light_shadow_detail=low|high; light_shadow.h High; the user,
-    // 2026-11-17: "I want to add a high setting available in settings"). Low (the default): every
-    // lamp's shadows from the half-res shadow mask. High: the lamps that matter most (a torch or
-    // lantern in your hand, the lamps lighting the most of the view, three at most) march their
-    // shadows at full resolution, sharp and detailed like the first lamp shadows; costs more GPU.
-    // Read at start (it is in the light shaders); VR_LIGHT_SHADOW_DETAIL=low|high overrides it.
-    bool light_shadow_high{false};
+    // Lamp shadow detail (vr.ini light_shadow_detail=lite|medium|high; light_shadow.h TierOf and
+    // SceneMaps::EdgeTierLamps; the tester, 2026-11-20): every lamp's shadows from the half-res
+    // shadow mask, and the frame's edge lamps sharp near the eye: Low ("lite") two lamps to 3 m
+    // with fewer march steps, Medium (the default; "low" and "0" read as Medium) three to 5 m, High
+    // five to 6 m (2026-11-21). (High was
+    // the hero lamps' full-resolution march from 2026-11-17 until 2026-11-20.) Live since
+    // 2026-11-21, as light_shadows; VR_LIGHT_SHADOW_DETAIL=lite|medium|high overrides it.
+    u8 light_shadow_tier{1};
     // Ambient occlusion (shader_recompiler/ir/passes/ambient_occlusion.h): a horizon-based
     // occlusion of the ambient light computed in the game's own AO pass, in place of its own.
-    // Read at start; VR_AMBIENT_OCCLUSION=0|1 overrides it. Needs DLSS or FSR.
+    // Live (the menu's Lighting row; checked 2026-11-21); VR_AMBIENT_OCCLUSION=0|1 overrides it.
+    // Needs DLSS or FSR.
     bool ambient_occlusion{true};
     // Moon shadows (shader_recompiler/ir/passes/moon_shadow.h; the tester, 2026-11-09: AAA 2026
     // lighting): the moon's and the sun's shadows sharp where an object meets the ground and
@@ -1336,7 +1391,7 @@ struct Settings {
     // row of the menu sets it any more.)
     bool moon_shadows{false};
     // Bounce light (shader_recompiler/ir/passes/bounce_light.h): one bounce of the scene's diffuse
-    // light in the game's light composite. Read at start; VR_BOUNCE_LIGHT=0|1 overrides it.
+    // light in the game's light composite. Live (the Lighting row); VR_BOUNCE_LIGHT=0|1 overrides it.
     // Needs DLSS or FSR. ApplyCardDefaults enables it for the top VRAM tier unless vr.ini
     // specifies bounce_light.
     bool bounce_light{false};
@@ -1348,14 +1403,17 @@ struct Settings {
     // Moon shafts (shader_recompiler/ir/passes/moon_shafts.h; the tester, 2026-11-09: "AAA 2026
     // lighting"): the moon's light scattered by the air, shadowed by the game's moon shadows:
     // beams through windows and between trees, moonlit mist with dark pockets, in the game's
-    // light composite. Read at start; VR_MOON_SHAFTS=0|1 overrides it (VR_MOON_SHAFTS_DENSITY
-    // its strength). Needs DLSS or FSR.
+    // light composite. Live (the Moon glow row; checked 2026-11-21); VR_MOON_SHAFTS=0|1 overrides
+    // it (VR_MOON_SHAFTS_DENSITY its strength). Needs DLSS or FSR.
     bool moon_shafts{false};
     // The fog (vr.ini fog_banks; the menu's Fog row, 0.9.6): the game's lingering fog banks taken
     // over by the fog grid (core/vr/fog_emitters.h: the floor's and the boss rooms', what
     // VR_FOG_EMITTERS=1 asks for) with the ground mist. It needs the moon's glow, which is on
     // with it whatever moon_shafts says (MoonGlowOn; the tester: "when MIST is on - then moon glow
-    // (godrays) is on"). By the card where not set (card_tier.h). Read at start.
+    // (godrays) is on"). By the card where not set (card_tier.h). Switches at the next load of an
+    // area since 2026-11-21, travel to another area (the game's fog is in each area's map file:
+    // core/vr/bloodborne_woods_shadows.cpp FogStateTick; a death reloads nothing); it was read at
+    // start before.
     bool fog_banks{false};
     // The ground mist (shader_recompiler/ir/passes/air_light.h Mist): drifting fog low over the
     // ground where the area has it (Mist::AreaShare: the Forbidden Woods). It takes the moonlight's
@@ -1394,8 +1452,8 @@ struct Settings {
     // Raised brickwork (shader_recompiler/ir/passes/parallax.h BumpGaps; the tester, 2026-11-11:
     // "bumpy 3D stones"; its own setting since 2026-11-12, it was part of ambient_occlusion):
     // brick walls, big stone blocks and roof shingles get real depth, their joints sunk and
-    // shaded; every other surface is drawn as the game draws it. Read at start (it is in the
-    // G-buffer shaders); VR_BUMP_GAPS=0|1 overrides it.
+    // shaded; every other surface is drawn as the game draws it. Live (the G-buffer shaders of
+    // the new choice are made at the switch; checked 2026-11-21); VR_BUMP_GAPS=0|1 overrides it.
     bool raised_bricks{true};
     // The Doll's respec: her list gets "Rechannel Blood Echoes", her Level Up where an attribute
     // can go down to the origin's start and a freed level goes anywhere for nothing; confirmed at
@@ -1460,7 +1518,9 @@ struct Settings {
     float cinematic_throw_timeout_s{20.0f}; // a throw state this old is ignored
     // Ladders: the climb is flat, getting on and off stay in VR.
     bool cinematic_ladder{true};
-    float cinematic_ladder_enter_delay_ms{500.0f}; // climbing after the mount before going flat
+    float cinematic_ladder_enter_delay_ms{360.0f}; // climbing after the mount before going flat
+    bool ladder_enter_400_seen{false};            // one-time upgrade of the old 500 ms default
+    bool ladder_enter_360_seen{false};            // one-time upgrade of the 400 ms default
     float cinematic_ladder_min_flat_ms{1000.0f};   // shorter predicted flat periods stay in VR
     bool ladder_min_1000_seen{false};             // one-time upgrade of the old 1500 ms default
     bool newgfx_096_seen{false}; // one time: 0.9.5's water_reflections goes back to "by the card"
@@ -1479,13 +1539,57 @@ struct Settings {
 };
 
 Settings& GetSettings();
+// Live requests used by the refill hook and the renderer. The Settings fields hold the
+// startup and default values used by the ini parser and the settings page.
+[[nodiscard]] int EmptyVialRefillCount();
+struct LampShadowRequest {
+    bool enabled{false};
+    u8 tier{1};
+};
+[[nodiscard]] LampShadowRequest GetLampShadowRequest();
+void ApplyLampShadowChoice(std::string_view enabled, std::string_view tier);
 // The new graphics the player has not chosen, by the graphics card's memory (core/vr/card_tier.h):
 // set into `settings` before its file is read (a key in the file wins), and what the in-game
 // page's Defaults go back to.
 void ApplyCardDefaults(Settings& settings);
-// The moon's glow, haze and rays draw: asked for, or the fog is on (it needs them).
-inline bool MoonGlowOn(const Settings& settings) {
-    return settings.moon_shafts || settings.fog_banks;
+// The fog banks in the hunter's map as its file was loaded (core/vr/bloodborne_woods_shadows.cpp
+// FogStateTick: the menu's Fog row switches them at the next load of an area; until then the area
+// keeps the fog it came with, and the moon glow it needs).
+inline std::atomic<bool>& FogBanksLoaded() {
+    static std::atomic<bool> loaded{false};
+    return loaded;
+}
+// The Fog and Moon glow rows as asked (vr.ini fog_banks, moon_shafts), published together for the
+// threads that read them outside the settings' own: the game's file threads opening a map file
+// (core/vr/bloodborne_woods_shadows.cpp FogWanted) and the renderer's (MoonGlowOn), while the menu
+// writes the settings (a code reviews, 2026-11-21: the plain bools were read there). Stored whole
+// by PublishFrameSettings at the start (VR::LoadSettings, before the renderer starts), a row's bit
+// by ApplySetting at its live change.
+inline constexpr u8 AskFogBanks = 1u << 0;
+inline constexpr u8 AskMoonShafts = 1u << 1;
+inline std::atomic<u8>& GraphicsAsked() {
+    static std::atomic<u8> asked{0};
+    return asked;
+}
+inline u8 GraphicsAskedOf(const Settings& settings) {
+    return static_cast<u8>((settings.fog_banks ? AskFogBanks : 0u) |
+                           (settings.moon_shafts ? AskMoonShafts : 0u));
+}
+inline void PublishGraphicsAsked(u8 bit, bool on) {
+    if (on) {
+        GraphicsAsked().fetch_or(bit, std::memory_order_acq_rel);
+    } else {
+        GraphicsAsked().fetch_and(static_cast<u8>(~bit), std::memory_order_acq_rel);
+    }
+}
+inline bool FogBanksAsked() {
+    return (GraphicsAsked().load(std::memory_order_acquire) & AskFogBanks) != 0;
+}
+// The moon's glow, haze and rays draw: asked for, or the fog is on (it needs them), or the area
+// was loaded with it. Any thread (the rows read from their published copy).
+inline bool MoonGlowOn() {
+    return (GraphicsAsked().load(std::memory_order_acquire) & (AskFogBanks | AskMoonShafts)) != 0 ||
+           FogBanksLoaded().load(std::memory_order_relaxed);
 }
 void LoadSettings();
 
@@ -1568,8 +1672,10 @@ void PublishAreaDimRemoved(bool removed);
 // fade and the arrival's queued text effects must not read as an area name or a banner.
 // PublishLampWarp(false) as it starts, (true) once the new player is there.
 void PublishLampWarp(bool arrived);
-// Unknown/same-map transitions permit extra cleanup only under memory pressure. The lamp
-// adapter may confirm a cross-map arrival from a verified source and accepted destination.
+// Unknown/same-map transitions permit extra cleanup only under memory pressure (the buffer
+// cache also runs a gentler pass once its sparse pool is large). A cross-map arrival is confirmed
+// by the lamp adapter (a verified source and accepted destination) or by a replacement player
+// whose map id differs from the last player's (bloodborne_heal.cpp HealSignalUpdate).
 void RequestTransitionTextureCleanup(bool area_changed = false);
 // One render-thread consumer: sequence in bits 1..63, coalesced area-change hint in bit 0.
 [[nodiscard]] u64 TakeTransitionTextureCleanupRequest();
@@ -1729,6 +1835,10 @@ struct CameraOverride {
     // applies (core/vr/render_tilt.h), else view_pitch. Only the render camera's orientation.
     float render_pitch{};
     float view_yaw{};
+    // Lock-on follow (lockon_follow): the yaw the game's own camera is given while locked on in
+    // first person: toward the target, so the stick moves you round it as the flat game's lock-on
+    // does and the game keeps its lock (it let go of targets off the view). NAN = view_yaw.
+    float game_view_yaw{NAN};
     // Render camera roll about its forward axis (radians, + = the camera's right side up): the
     // head's own roll, so the stereo baseline is the line between your eyes (camera_roll).
     float view_roll{};
@@ -1806,6 +1916,7 @@ void SetRecordProjection(u64 id, float vfov, float aspect, float near_z, float f
 void SetRecordHeldProxy(u64 id, const Vec3& a, const Vec3& b, float radius);
 // The render-camera hook (the VR body's anchor): the camera's dip under the nominal eye height over
 // the hunter's feet for camera record `id` (CameraRecord::floor_dip_m, metres).
+void SetRecordScabbardClip(u64 id, Chikage::BladeClip plane, Vec3 grip);
 void SetRecordFloorDip(u64 id, float dip_m);
 // The render-camera hook (the VR body's anchor): the hunter's model origin for camera record `id`
 // (CameraRecord::player_position, game units).
@@ -1853,6 +1964,8 @@ bool RecordShadowCasters(u64 id, ShadowCasters& out);
 // none) and advances the eye.
 // finish_rendering drains the draw worker, recorder and GPU; called only for an AA change.
 FrameTag OnGpuFrameBoundary(u64 flip, void (*finish_rendering)());
+// Called by the decoder after executing or queuing a flip, before the next draw packet.
+void LatchNextDrawResolution();
 Aa::Mode GetActiveAaMode();
 Aa::Mode GetRequestedAaMode();
 // Per-draw stereo parameters for the vertex shader (see ApplyStereoShift).
@@ -2024,6 +2137,18 @@ bool SpaceShiftBetween(u32 from, u32 to, Space::Shift& shift);
 [[nodiscard]] bool SpaceShiftApplied(u32 serial, u64& first_record);
 // True while the game camera is locked on to a target.
 [[nodiscard]] bool IsLockedOn();
+// Lock-on follow (vr.ini lockon_follow): the game's lock-on hook, every game update, any thread:
+// locked on to an enemy, and the world yaw from the eye to its lock point (game convention) and
+// its distance (flat, game units; logs).
+void NoteLockTarget(bool locked, bool have_yaw, float target_yaw, float distance = 0.0f);
+// Presenter, its input pass: the follow asked to release the lock (looking away); true once.
+[[nodiscard]] bool TakeLockCancel();
+// Presenter, its input pass: the view's follow turns since the last call (radians, + = right),
+// for lockon_move_commit_s (LockFollow::MoveCommit).
+[[nodiscard]] float TakeLockFollowTurn();
+// Lock-on follow: the game's camera faces the target (the stick's reference): its yaw (game
+// convention). False: the view's own yaw is the game's.
+[[nodiscard]] bool LockAimYaw(float& yaw);
 // Game rumble (scePadSetVibration), forwarded to the controllers as haptics.
 void SetPadRumble(u8 small_motor, u8 large_motor);
 // Frame cap (vr.ini frame_cap): the emulated vblank follows the headset. The game waits for the
@@ -2044,6 +2169,18 @@ void GetPadRumble(float& small_motor, float& large_motor); // 0..1
 // Set by the game integration when a first-person camera mod is detected.
 void SetFirstPersonDetected(bool detected);
 [[nodiscard]] bool IsFirstPerson();
+// Left-handed play (core/vr/mirror_world.h): whether this session mirrors the world. Decided once
+// by the OpenXR presenter when its session is up, before it makes the controllers' bindings
+// (LatchMirrorWorld: left_handed, play_style and IsFirstPerson as loaded at the start), and only
+// while that presenter runs the headset (XrPresenterActive): with no headset session (OpenXR could
+// not start, the simulated head) nothing is mirrored, the sound included. False all session in
+// right-handed play. Safe from any thread.
+[[nodiscard]] bool MirrorWorld();
+// The OpenXR presenter, once (its constructor, after CreateSession): the decision, returned.
+bool LatchMirrorWorld();
+// The OpenXR presenter when its controller actions cannot be made (a gamepad plays): off for the
+// session, before anything else asks.
+void ClearMirrorWorld();
 // First person: how far (m) the camera is placed ahead of the hunter's eyes for a view pitch
 // (radians, + = down): fp_ahead_m + fp_ahead_down_m ramped in from 25 to 60 deg down
 // (VR_TUNE_FILE fp.ahead_m / fp.ahead_down_m: live A/B). The camera adds it to fp_forward_m; the

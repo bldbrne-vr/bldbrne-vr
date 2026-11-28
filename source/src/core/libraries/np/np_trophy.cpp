@@ -10,6 +10,7 @@
 #include "common/path_util.h"
 #include "common/slot_vector.h"
 #include "core/emulator_settings.h"
+#include "core/file_sys/staged_read.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_error.h"
 #include "core/libraries/np/np_trophy.h"
@@ -287,13 +288,11 @@ s32 PS4_SYSV_ABI sceNpTrophyDestroyHandle(OrbisNpTrophyHandle handle) {
     return ORBIS_OK;
 }
 
-u64 ReadFile(Common::FS::IOFile& file, void* buf, u64 nbytes) {
-    const auto* memory = Core::Memory::Instance();
-    // Invalidate up to the actual number of bytes that could be read.
-    const auto remaining = file.GetSize() - file.Tell();
-    memory->InvalidateMemory(reinterpret_cast<VAddr>(buf), std::min<u64>(nbytes, remaining));
-
-    return file.ReadRaw<u8>(buf, nbytes);
+static int ReadIcon(Common::FS::IOFile& file, void* buf, u64 capacity, u64 icon_size) {
+    const auto result = Core::FileSys::ThreadReadBuffer().Copy(buf, std::min(capacity, icon_size),
+        [&file](u8* data, size_t size) { return file.ReadRaw<u8>(data, size); },
+        [](VAddr addr, u64 size) { Core::Memory::Instance()->InvalidateMemory(addr, size); });
+    return result ? ORBIS_OK : ORBIS_NP_TROPHY_ERROR_OUT_OF_MEMORY;
 }
 
 int PS4_SYSV_ABI sceNpTrophyGetGameIcon(OrbisNpTrophyContext context, OrbisNpTrophyHandle handle,
@@ -319,7 +318,7 @@ int PS4_SYSV_ABI sceNpTrophyGetGameIcon(OrbisNpTrophyContext context, OrbisNpTro
     u64 icon_size = icon.GetSize();
 
     if (buffer != nullptr) {
-        ReadFile(icon, buffer, *size);
+        return ReadIcon(icon, buffer, *size, icon_size);
     } else {
         *size = icon_size;
     }
@@ -631,7 +630,7 @@ int PS4_SYSV_ABI sceNpTrophyGetTrophyIcon(OrbisNpTrophyContext context, OrbisNpT
     }
 
     if (buffer != nullptr) {
-        ReadFile(icon, buffer, *size);
+        return ReadIcon(icon, buffer, *size, icon.GetSize());
     } else {
         *size = icon.GetSize();
     }

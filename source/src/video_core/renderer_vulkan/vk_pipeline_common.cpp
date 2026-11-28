@@ -10,7 +10,9 @@
 #include <bit>
 
 #include "common/hash.h"
+#include "core/vr/moon_screen.h"
 #include "shader_recompiler/eye_spec.h"
+#include "shader_recompiler/ir/passes/air_light.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/fast_render.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -165,6 +167,9 @@ u32 Pipeline::VrFsBuffers() const {
         for (u32 i = 0; fs != nullptr && i < fs->buffers.size(); ++i) {
             const auto& buffer = fs->buffers[i];
             switch (buffer.buffer_type) {
+            case Shader::BufferType::VrShadowGrid:
+                bits |= VrFsShadowGrid;
+                break;
             case Shader::BufferType::VrBodyMaps:
                 bits |= VrFsBodyMaps;
                 break;
@@ -179,9 +184,17 @@ u32 Pipeline::VrFsBuffers() const {
             case Shader::BufferType::VrDepthPyramid:
                 bits |= VrFsDepthPyramid;
                 break;
+            case Shader::BufferType::VrShadowEdges:
+                bits |= VrFsShadowEdges;
+                break;
             default:
                 break;
             }
+        }
+        // Air compositing and the native moon-ray accounting can run without a VR buffer.
+        if (fs && (Shader::Optimization::AirLight::IsApplyProgram(fs->pgm_hash) ||
+                   VR::MoonScreen::IsGameRaysProgram(fs->pgm_hash))) {
+            bits |= VrFsAirOrMoonPass;
         }
         vr_fs_buffers = bits;
         vr_fs_buffers_ready = true;

@@ -36,6 +36,7 @@ class VkCtxScope;
 namespace Vulkan {
 
 class Instance;
+struct FoveationCache;
 struct PassBreakStats; // FAST_PASS_BREAK_STATS (vk_scheduler.cpp)
 
 struct RenderAttachment {
@@ -564,6 +565,17 @@ public:
         foveation_inner_floor = inner;
     }
 
+    /// Dynamic resolution (core/vr/s1_dynamic_resolution.h): the percent each side of the view
+    /// is drawn smaller in the passes about to begin (0: full scale). Their foveation map's zones
+    /// follow the view (vr_foveation.h Map scale), so a drop also shades fewer full-rate pixels.
+    /// Set by the rasterizer at the frame's first scene draw, 0 once the scene is reconstructed.
+    void SetFoveationDrop(u32 drop) {
+        foveation_drop = drop < 100 ? drop : 0;
+    }
+    /// The drop the stereo passes' rate maps follow now (0 with VR_FOVEATION_DRS=0): what any pass
+    /// that must match the mask's full-rate zone (vr_shadow_edges.comp FoveaAt) has to use.
+    [[nodiscard]] u32 FoveationDrop() const;
+
     /// DIBR (VR_FOVEATED_DIBR, on by default): the size of its mono scene, whose single-view
     /// passes then take foveation too. Set at each DIBR composite; {} = none.
     void SetMonoFoveation(vk::Extent2D extent);
@@ -747,6 +759,9 @@ public:
     bool RecorderThreaded() const noexcept {
         return recorder.Threaded();
     }
+#ifdef _WIN32
+    void SetStageBThread(void* thread) { recorder.SetStageBThread(thread); }
+#endif
     /// VR_FRAME_MATCH (diagnostic): the main recorder, read-only.
     const CommandRecorder& RecorderView() const noexcept {
         return recorder;
@@ -1002,8 +1017,10 @@ private:
     RenderState render_state;
     bool is_rendering = false;
     void (*pass_end_hook)(Scheduler&) = nullptr; // SetPassEndHook
+    std::unique_ptr<FoveationCache> foveation_cache;
     bool foveation_blocked = false; // BlockFoveation
     float foveation_inner_floor = 0.0f; // SetFoveationInnerFloor
+    u32 foveation_drop = 0;             // SetFoveationDrop
     bool pass_foveated = false;     // the open pass has the foveation rate map
     vk::Extent2D mono_foveation{};  // SetMonoFoveation
     vk::Extent2D foveation_eye{};   // SetFoveationEye

@@ -280,15 +280,11 @@ std::optional<PrepProgramResult> PipelineCache::PrepareProgramLocked(const PrepS
                 if (found == reads.end()) return {};
                 read.words = found->words;
             } else {
-                const u32* base = owned.user.data();
+                const u32* base = Shader::Info::UserDataTable(owned.user, a.sgpr_base);
+                if (!base) return {};
                 if (a.sgpr_base == u32(Shader::IR::NumScalarRegs)) {
                     if (a.dword_offset > owned.user.size() || owned.user.size() - a.dword_offset < 4)
                         return {};
-                } else {
-                    if (a.sgpr_base > owned.user.size() || owned.user.size() - a.sgpr_base < 2)
-                        return {};
-                    std::memcpy(&base, owned.user.data() + a.sgpr_base, sizeof(base));
-                    base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
                 }
                 if (!CopyRaw(read.words.data(), reinterpret_cast<const void*>(VAddr(base) + size_t(a.dword_offset) * sizeof(u32)), sizeof(read.words))) return {};
             }
@@ -456,15 +452,10 @@ bool PrepareVertexBlob(const PreparedDraw& draw, const AmdGpu::Regs& regs,
         const auto& read = vs->register_reads[i];
         if (read.pointer_index != attrib.sgpr_base || read.dword_offset != attrib.dword_offset)
             return false;
-        // VertexAttribute::GetSharp (fetch_shader.h:40-48) over the V# ReadUdReg returns.
         AmdGpu::Buffer buffer;
         static_assert(sizeof(buffer) == sizeof(read.words));
         std::memcpy(&buffer, read.words.data(), sizeof(buffer));
-        buffer.base_address += attrib.inst_offset;
-        if (attrib.data_format) {
-            buffer.data_format = attrib.data_format;
-            buffer.num_format = attrib.num_format;
-        }
+        buffer = attrib.ApplyOverrides(buffer);
         // SurfaceFormat would assert: Stage A meets it as before (BBV vk_draw_prep.cpp:141-150).
         const auto format =
             LiverpoolToVK::TrySurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());

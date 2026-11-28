@@ -24,9 +24,11 @@ public:
     // Both eyes are validated before any commands are recorded. This composes camera vectors
     // with the matching G-buffer object vectors. No allocations/dispatches while disabled.
     // `twin` (FAST_DLSS_DIRECT_VERIFY, bit 46; may be null): a third pass with its own output,
-    // the DLSS twin's motion from the copied depth.
+    // the DLSS twin's motion from the copied depth. Only DLSS (whole-eye or foveated) supplies a
+    // nonzero render_drop, using the same subrectangle for both game eyes.
     bool Record(const VR::Graphics::Config& accepted, bool provider_ready,
-                const std::array<Eye, 2>& eyes, const Eye* twin, uint32_t views = 2);
+                const std::array<Eye, 2>& eyes, const Eye* twin, uint32_t views = 2,
+                unsigned render_drop = 0);
 
 private:
     bool Init();

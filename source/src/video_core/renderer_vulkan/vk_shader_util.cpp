@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
+#include <utility>
 #include <glslang/Include/ResourceLimits.h>
 #include <glslang/Public/ShaderLang.h>
 #include <glslang/SPIRV/GlslangToSpv.h>
@@ -159,8 +160,8 @@ bool InitializeCompiler() {
 }
 } // Anonymous namespace
 
-vk::ShaderModule Compile(std::string_view code, vk::ShaderStageFlagBits stage, vk::Device device,
-                         std::vector<std::string> defines) {
+std::vector<u32> CompileGlsl(std::string_view code, vk::ShaderStageFlagBits stage,
+                             std::vector<std::string> defines) {
     if (!InitializeCompiler()) {
         return {};
     }
@@ -251,7 +252,13 @@ vk::ShaderModule Compile(std::string_view code, vk::ShaderStageFlagBits stage, v
         LOG_INFO(Render_Vulkan, "SPIR-V conversion messages: {}", spv_messages);
     }
 
-    return CompileSPV(out_code, device);
+    return out_code;
+}
+
+vk::ShaderModule Compile(std::string_view code, vk::ShaderStageFlagBits stage, vk::Device device,
+                         std::vector<std::string> defines) {
+    const auto words = CompileGlsl(code, stage, std::move(defines));
+    return words.empty() ? vk::ShaderModule{} : CompileSPV(words, device);
 }
 
 vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device) {

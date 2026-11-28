@@ -4,8 +4,11 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <string_view>
 #include <utility>
 
 #include "common/types.h"
@@ -24,11 +27,12 @@
 namespace Shader::Optimization::LightShadow {
 
 // Startup policy shared by compilation and cache preloading (vr.ini light_shadows,
-// VR_LIGHT_SHADOWS=0|1 overrides it): only light rectangles' fragment stages take it, and only
-// with an upscaler (2026-11-09: "only available with dlss or fsr on (since it would be
-// too expensive at max/high res)"; the light pass then runs at its smaller input size).
-inline bool Enabled(bool vr, bool setting, bool upscaler, const char* override_value) {
-    return override_value ? override_value[0] != '0' : vr && setting && upscaler;
+// VR_LIGHT_SHADOWS=0|1 overrides it): only light rectangles' fragment stages take it. With an
+// upscaler or without (until 0.9.68 with one only, the tester, 2026-11-09: "too expensive at
+// max/high res"; then 2026-11-19, the user: "we need to make these work with upscaling off as
+// well (no need not to)").
+inline bool Enabled(bool vr, bool setting, const char* override_value) {
+    return override_value ? override_value[0] != '0' : vr && setting;
 }
 
 // A light marches when it is this close to the eye (view-space metres): the lantern or torch in
@@ -428,15 +432,14 @@ inline std::pair<float, float> Graze() {
     return v;
 }
 inline constexpr float NormalMinM = 0.01f;
-// With the mask, a lamp casts out to its own range from the eye (2026-11-13 evening, the user: "22m
-// needs to be a hard limit. But if a light is smaller, smaller limits are good too"): RangePerReach
-// times its reach, at least RangeMinM, never past NearLightM (22 m), fading over the last
-// RangeFadeShare of it. A candle (2 m) casts to 8 m, a 3.5 m lamp to 14 m, a fire to 22 m; the 16
-// slots go to the lamps near you (up to the evening it was 40 m for every lamp, fading over 10: a
-// faint lamp 33 m off held a slot while the candles in a niche beside you had none).
+// The mask fades a lamp over the last fifth of its range from the eye. A 2 m candle
+// casts to 8 m on every tier. Large lights reach 22 m on Low and Medium, 23.5 m on High.
 inline constexpr float RangePerReach = 4.0f;
 inline constexpr float RangeMinM = 6.0f;
 inline constexpr float RangeFadeShare = 0.2f;
+constexpr float MaskedLightRangeM(float reach_m, u32 tier) {
+    return std::clamp(reach_m * RangePerReach, RangeMinM, tier == 2 ? 23.5f : NearLightM);
+}
 inline constexpr float MatchM = 0.02f; // a lamp is a slot's within this (and 2% of its reach)
 // Contact shadows (2026-11-13 dawn, Old Yharnam against the old march: grass and fern fronds near
 // the eye shading themselves and the ground; a cube's texel, 8 cm at a fire's distance, never holds
@@ -637,12 +640,42 @@ inline float PyramidRefine() {
     }();
     return v;
 }
+// The mask writer and its lamp readers must use the same adaptive profile.
+inline bool Edges();
+inline u32 EdgeTier();
+// A step share's test switch: its value within [lo, hi], or -1 where it is not set.
+inline float EnvStepShare(const char* name, float lo, float hi) {
+    const char* const env = std::getenv(name);
+    return env != nullptr ? std::clamp(static_cast<float>(std::atof(env)), lo, hi) : -1.0f;
+}
+// Low's march (2026-11-21, the user: "weak/gentle settings for low", "make the torch cheaper for
+// low but let it be as it is for medium"): every lamp LowStepShare, a close lamp (the held torch)
+// LowCloseStepShare, no near boost; Medium and High as before. At Oedon Chapel (2000x2160 a eye)
+// with the torch 7.86 ms of GPU a frame against 8.13 with Medium's steps (no boosts alone: 7.95),
+// without it 7.44 against 7.59. The tier is published before any program is made.
+inline constexpr float LowStepShare = 0.3f;
+inline constexpr float LowCloseStepShare = 0.4f;
+inline bool LowSteps() {
+    return Edges() && EdgeTier() == 0;
+}
 inline float MarchStepShare() {
-    static const float v = [] {
-        const char* const env = std::getenv("VR_SCENE_MARCH_STEPS");
-        return env != nullptr ? std::clamp(static_cast<float>(std::atof(env)), 0.1f, 2.0f) : 0.5f;
-    }();
-    return v;
+    static const float env = EnvStepShare("VR_SCENE_MARCH_STEPS", 0.1f, 2.0f);
+    // (With the edges: 0.22 from fa118f20e, 0.4 since 2026-11-20, the user: "let's give them
+    // 0.4", the edge lamps' shadows past the edges' reach and outside the centre being theirs.)
+    return env >= 0.0f ? env : !Edges() ? 0.5f : LowSteps() ? LowStepShare : 0.4f;
+}
+// The lamps without sharp edges (2026-11-20, the user: "I don't know if adaptive edges worsen the
+// non-adaptive edges too much. I am wondering if we can increase a bit the number of rays for the
+// lights that don't cast adaptive edges so that it is closer to how it was before, and slightly
+// reduce the adaptive edges ones"): with the edges every slot lamp's march had taken
+// MarchStepShare's 0.22 (0.5 before them) to pay for the edge lamps; a slot lamp that is not one
+// of the frame's edge lamps (the slot header's edge bits) marches PlainStepShare instead, its close
+// and near boosts scaled with it, and the edge lamps keep MarchStepShare (the edge pass sharpens
+// theirs). VR_SCENE_PLAIN_STEPS=<share> (tests; at or under MarchStepShare: every lamp as before).
+// (Low: LowStepShare, every lamp alike.)
+inline float PlainStepShare() {
+    static const float env = EnvStepShare("VR_SCENE_PLAIN_STEPS", 0.1f, 2.0f);
+    return env >= 0.0f ? env : !Edges() ? MarchStepShare() : LowSteps() ? LowStepShare : 0.5f;
 }
 // Close lamps (2026-11-13 night, the user: "for very close lights (like the torch I hold) to have
 // more detailed shadows. But only for like, super close ones"): a slot lamp within CloseInM of the
@@ -653,12 +686,11 @@ inline float MarchStepShare() {
 // VR_SCENE_CLOSE_STEPS=<share> (tests; at or under MarchStepShare: off).
 inline constexpr float CloseInM = 1.0f;
 inline constexpr float CloseOutM = 1.6f;
+// (2026-11-21 at Oedon Chapel, Medium: the torch's shadows ~0.5 ms of GPU a frame, ~0.2 of it this
+// boost. Low: LowCloseStepShare.)
 inline float CloseStepShare() {
-    static const float v = [] {
-        const char* const env = std::getenv("VR_SCENE_CLOSE_STEPS");
-        return env != nullptr ? std::clamp(static_cast<float>(std::atof(env)), 0.0f, 3.0f) : 1.0f;
-    }();
-    return v;
+    static const float env = EnvStepShare("VR_SCENE_CLOSE_STEPS", 0.0f, 3.0f);
+    return env >= 0.0f ? env : !Edges() ? 1.0f : LowSteps() ? LowCloseStepShare : 0.8f;
 }
 // Near pixels (2026-11-13 night, the user: "increase ... how many rays we fire etc when we're
 // nearby, and decrease in the distance"): a pixel within NearStepInM of the eye marches
@@ -668,12 +700,10 @@ inline float CloseStepShare() {
 // at or under MarchStepShare: off).
 inline constexpr float NearStepInM = 1.5f;
 inline constexpr float NearStepOutM = 4.0f;
+// (Low: none, its share MarchStepShare's.)
 inline float NearStepShare() {
-    static const float v = [] {
-        const char* const env = std::getenv("VR_SCENE_NEAR_STEPS");
-        return env != nullptr ? std::clamp(static_cast<float>(std::atof(env)), 0.0f, 3.0f) : 0.75f;
-    }();
-    return v;
+    static const float env = EnvStepShare("VR_SCENE_NEAR_STEPS", 0.0f, 3.0f);
+    return env >= 0.0f ? env : !Edges() ? 0.75f : LowSteps() ? LowStepShare : 0.6f;
 }
 // The step dial (the same night, the user: "or be smart and reduce it if ... gpu time is increased
 // too much"): the mask march's steps times StepDialScale[level], written in each slot's dword 11
@@ -848,6 +878,60 @@ inline constexpr u32 SlotHis = 4u;
 // of what the best other lamp does: two lamps lighting about as much never trade the sharp shadows
 // back and forth as you walk.
 inline constexpr u32 SlotHero = 8u;
+// Slot header word 2: bit zero selects the cube half; one read supplies every lamp's edge flag.
+inline constexpr u32 EdgeSlotShift = 1;
+inline constexpr u32 EdgeLamps = 3; // (Medium's: EdgeTierLamps)
+// Low / Medium / High (vr.ini light_shadow_detail=lite|medium|high, the tester, 2026-11-20:
+// "medium, 4 lamps at 4m. low, 2 lamps at 4m. high, 5 lamps at 5m"): the frame's edge lamps and
+// how far from the eye their edges are sharp: wholly sharp to EdgeTierInM, none from EdgeTierOutM
+// (EdgeFar). Medium is the default. Set once at start (vk_pipeline_cache.cpp VrLightShadowLevel)
+// before any program is made: the lamp shaders hold the reach and the edge pass's layout. The lamp
+// programs hold it: a change here is a VrFragmentRevision.
+// (2026-11-21, the user: Medium "detailed shadows up close ... for up to 4m or so", sharp to 4 m
+// and gone by 5 m, three lamps: at Oedon Chapel it cost what the old Medium did, four lamps sharp
+// to 2.5 m and gone by 4.5 m; a fourth lamp at 4 to 5 m was 0.1 to 0.2 ms more. The same day,
+// "good settings for high, and weak/gentle settings for low": High sharp to 5 m and gone by 6
+// (it cost what 3 to 5 m did; 6 to 7 m ~0.1 ms more), Low sharp to 2 m and gone by 3, with fewer
+// march steps (LowSteps).)
+inline constexpr std::array<u32, 3> EdgeTierLamps{2, 3, 5};
+inline constexpr std::array<float, 3> EdgeTierInM{2.0f, 4.0f, 5.0f};
+inline constexpr std::array<float, 3> EdgeTierOutM{3.0f, 5.0f, 6.0f};
+static_assert(EdgeTierLamps[1] == EdgeLamps);
+inline constexpr u32 EdgeTierMedium = 1;
+inline std::atomic<u32> g_edge_tier{EdgeTierMedium};
+// The tier of the program being made on this thread (TierScope, from its key: TranslateProgram
+// and EmitSPIRV), -1 for none: the session's tier (g_edge_tier) switches live since 2026-11-21,
+// and a program made while it changes must keep the tier its key says.
+inline thread_local int t_program_tier = -1;
+inline u32 EdgeTier() {
+    const int own = t_program_tier;
+    return own >= 0 ? std::min<u32>(static_cast<u32>(own), 2u)
+                    : std::min<u32>(g_edge_tier.load(std::memory_order_relaxed), 2u);
+}
+struct TierScope {
+    int previous;
+    explicit TierScope(int tier) : previous{t_program_tier} {
+        t_program_tier = tier;
+    }
+    ~TierScope() {
+        t_program_tier = previous;
+    }
+    TierScope(const TierScope&) = delete;
+    TierScope& operator=(const TierScope&) = delete;
+};
+inline u32 EdgeLampsNow() {
+    return EdgeTierLamps[EdgeTier()];
+}
+// The edge pass's bits a pixel: two a lamp, a byte for four lamps, 16 bits beyond (High's five).
+inline u32 EdgeBits() {
+    return EdgeLampsNow() > 4 ? 16u : 8u;
+}
+inline constexpr u32 EdgeMaxLamps = 5; // vr_shadow_edges.comp's parameters hold five
+// Each selected lamp has a two-bit verdict in the compute pass's packed pixel.
+constexpr u32 EdgePassLampCapacity(u32 pixel_bits) {
+    return std::min(pixel_bits / 2u, EdgeMaxLamps);
+}
+static_assert(Slots + EdgeSlotShift <= 32);
 inline constexpr u32 HeroLamps = 3;
 inline constexpr float HeroKeepShare = 0.67f;
 // A lamp keeps its slot within SlotKeepM (and the same reach): a moving one (the torch in your
@@ -939,7 +1023,7 @@ inline bool Mask() {
     }();
     return on;
 }
-// The mask's edges marched again at the lamp draws' own resolution (VR_SHADOW_EDGES=1, 2026-11-15,
+// The mask's edges marched again at the lamp draws' own resolution (on by default; VR_SHADOW_EDGES=0 restores the original mask step counts;
 // the user: "razor sharp close by, ok for more messy far away"; the mask is half-res, in blocks of
 // up to 4 x 4 in the foveated ring, and a lamp pixel blends its four neighbours: every edge a soft
 // ramp). Where the four neighbours' values for the lamp's slot differ by EdgeRange or more (of 15)
@@ -956,7 +1040,7 @@ inline bool Mask() {
 inline bool Edges() {
     static const bool on = [] {
         const char* const env = std::getenv("VR_SHADOW_EDGES");
-        return Mask() && env != nullptr && env[0] == '1';
+        return Mask() && (env == nullptr || env[0] == '1');
     }();
     return on;
 }
@@ -967,14 +1051,14 @@ inline constexpr u32 EdgeMinSteps = 6;
 inline u32 EdgeSteps() {
     static const u32 n = [] {
         const char* const env = std::getenv("VR_SHADOW_EDGES_STEPS");
-        return env != nullptr ? std::clamp(static_cast<unsigned>(std::atoi(env)), 2u, 96u) : 24u;
+        return env != nullptr ? std::clamp(static_cast<unsigned>(std::atoi(env)), 2u, 96u) : EdgeMinSteps;
     }();
     return n;
 }
 inline float EdgePixels() {
     static const float v = [] {
         const char* const env = std::getenv("VR_SHADOW_EDGES_PX");
-        return env != nullptr ? std::clamp(static_cast<float>(std::atof(env)), 0.5f, 32.0f) : 2.0f;
+        return env != nullptr ? std::clamp(static_cast<float>(std::atof(env)), 0.5f, 32.0f) : 5.0f;
     }();
     return v;
 }
@@ -982,7 +1066,7 @@ inline float EdgePixels() {
 inline u32 EdgeRange() {
     static const u32 n = [] {
         const char* const env = std::getenv("VR_SHADOW_EDGES_RANGE");
-        return env != nullptr ? std::clamp(static_cast<unsigned>(std::atoi(env)), 1u, 15u) : 3u;
+        return env != nullptr ? std::clamp(static_cast<unsigned>(std::atoi(env)), 1u, 15u) : 8u;
     }();
     return n;
 }
@@ -994,10 +1078,11 @@ inline float EdgeClear() {
     }();
     return v;
 }
-// In full within the first of the eye, none from the second (metres). VR_SHADOW_EDGES_FAR=<in,out>.
+// In full within the first of the eye, none from the second (metres): by the tier (EdgeTierInM,
+// EdgeTierOutM; 1.5 and 3.5 until 2026-11-20). VR_SHADOW_EDGES_FAR=<in,out> (tests) for every tier.
 inline std::pair<float, float> EdgeFar() {
-    static const std::pair<float, float> v = [] {
-        std::pair<float, float> out{5.0f, 9.0f};
+    static const std::pair<float, float> pinned = [] {
+        std::pair<float, float> out{-1.0f, -1.0f};
         if (const char* const env = std::getenv("VR_SHADOW_EDGES_FAR")) {
             char* end = nullptr;
             const float a = std::strtof(env, &end);
@@ -1010,7 +1095,18 @@ inline std::pair<float, float> EdgeFar() {
         }
         return out;
     }();
-    return v;
+    if (pinned.second > 0.0f) {
+        return pinned;
+    }
+    return {EdgeTierInM[EdgeTier()], EdgeTierOutM[EdgeTier()]};
+}
+// The edge pass sharpens pixels within EdgeFar's second of the eye only, and a lamp lights nothing
+// past its reach: one whose light ends before that zone (its distance less its reach) gets no edge
+// pick. The 2026-11-24 review: on High two 10 m street lamps 20 m off took the picks of candles 4
+// to 4.5 m away. EdgeZoneSlackM covers the eyes' and the slot anchor's offsets from the list's eye.
+inline constexpr float EdgeZoneSlackM = 0.25f;
+constexpr bool LightsEdgeZone(float eye_m, float reach_m, float zone_m) {
+    return eye_m - reach_m < zone_m + EdgeZoneSlackM;
 }
 // The steps' offset: 1 a fixed pattern by the pixel's place (interleaved gradient noise, the same
 // every frame: nothing crawls), 0 none. VR_SHADOW_EDGES_NOISE (tests).
@@ -1023,6 +1119,49 @@ inline u32 EdgeNoise() {
 }
 // A pixel marches for at most this many of a lamp draw's lights (the first with an edge there).
 inline constexpr u32 EdgeLights = 2;
+// The edge pass (2026-11-19, the user: "make the adaptive edges faster than before but higher
+// quality"): the march above moved out of the lamp shaders into one dispatch of our own before the
+// frame's first lamp draw (vr_shadow_edges.h; host_shaders/vr_shadow_edges.comp), both eyes at the
+// lamp draws' own size. Held in the lamp shaders, the march's code cost every lamp pixel ~0.33 ms
+// at 2000x2160 a eye even where nothing marched (its registers: measured with no lamp marching).
+// The pass marches the frame's EdgeLamps (up to all four at a pixel, EdgePassSteps steps) where a
+// lamp's four mask neighbours differ by EdgeRange or more, and writes two bits a lamp a pixel:
+// EdgeHit (the lowest neighbour), EdgeClear (toward the highest), 0 (the blend as it was). A lamp
+// shader reads one word a pixel; a pass that did not run this frame (its serial, the slot header's
+// EdgeSerialShift bits, not the buffer's) leaves the blend. VR_SHADOW_EDGE_PASS=0: the march in the
+// lamp shaders as before.
+inline bool EdgePass() {
+    static const bool on = [] {
+        const char* const env = std::getenv("VR_SHADOW_EDGE_PASS");
+        return Edges() && (env == nullptr || env[0] != '0');
+    }();
+    return on;
+}
+inline u32 EdgePassSteps() {
+    static const u32 n = [] {
+        const char* const env = std::getenv("VR_SHADOW_EDGE_PASS_STEPS");
+        return env != nullptr ? std::clamp(static_cast<unsigned>(std::atoi(env)), 2u, 64u) : 10u;
+    }();
+    return n;
+}
+inline constexpr u32 EdgeHit = 1u, EdgeClearCode = 2u;
+// The pass sharpens only in the mask's full-rate centre (2026-11-20: "sharpen edges only
+// in the centre"): beyond MaskFoveaInner (or the foveation's inner zone) the mask is worked out in
+// 2x1, 2x2 and 4x4 blocks, and an edge made sharp from them was their staircase, stripes along
+// every shadow's border; there the lamps keep the blend, as before the edges. This much inside the
+// border (of the way from the eye's axis to the picture's edge), clear of the ring's first blocks.
+inline constexpr float EdgeFoveaMargin = 0.03f;
+// The pass's buffer: EdgeParamWords of its parameters (the host's), the header (serial, width,
+// height, words a row), then a byte a pixel (four to a word), the left eye's rows, then the right's.
+inline constexpr u32 EdgeParamWords = 160;
+inline constexpr u32 EdgeHeaderAt = EdgeParamWords;
+inline constexpr u32 EdgeDataAt = EdgeHeaderAt + 4;
+// The serial of this frame's edge pass (0: none): the slot header's dword 2, bits EdgeSerialShift
+// up (EdgeSerialMask), above the edge lamps' bits. (Until 2026-11-19 it took dword 13, which is
+// DrawSlotsAt: every lamp draw lost its first four lights' slots.)
+inline constexpr u32 EdgeSerialShift = 17;
+inline constexpr u32 EdgeSerialMask = 0x7FFFu;
+static_assert(Slots + EdgeSlotShift <= EdgeSerialShift && EdgeSerialShift + 15 <= 32);
 // ... and only where the lamp's falloff (1 at the lamp, 0 at its reach) times the spread (of 15)
 // is at least this: a faint edge at a lamp's rim stays the blend.
 inline constexpr float EdgeMinContrast = 1.5f;
@@ -1086,16 +1225,43 @@ inline bool GridSplat() {
 // (the old method's march: its steps, the other eye's picture, the grid where neither eye sees,
 // his body) instead of the mask's half-res read; every other lamp reads the mask as at Low.
 // Read at start (the lamp shaders hold it). VR_LIGHT_SHADOW_DETAIL=low|high (tests) overrides it.
-inline bool High(bool setting, const char* override_value) {
-    const bool high =
-        override_value ? (override_value[0] == 'h' || override_value[0] == '1') : setting;
-    return high && SceneMaps::Mask(); // (without the mask every lamp marches anyway)
+// (Removed 2026-11-20, the user: "remove the old high which was full tracing at high res": High
+// is now SceneMaps' edge tier, five lamps' sharp edges to 5 m. The heroes' march stays in the
+// emitter, never compiled: no program asks for level 2.)
+// The tier from the setting (vr.ini light_shadow_detail) or VR_LIGHT_SHADOW_DETAIL (tests): lite
+// (Low), medium, high; "low", "0" and anything else Medium ("low" was every generated file's line
+// and the old Low, which had four edge lamps), "high" and "1" High.
+inline u32 TierOf(std::string_view value) {
+    return value == "lite" ? 0u : value == "high" || value == "1" ? 2u : SceneMaps::EdgeTierMedium;
 }
-// A light rectangle's RuntimeInfo::vr_light_shadows: 0 none, 1 the shadows (Low with the mask), 2
-// High (the heroes' own march compiled in).
-inline u8 Level(bool enabled, bool high) {
-    return enabled ? (high ? 2 : 1) : 0;
+// A light rectangle's RuntimeInfo::vr_light_shadows: 0 none, else the shadows with the mask and the
+// tier's edges: 1 Medium (the value Low had before the tiers: its cached programs still load), 3
+// Low, 4 High. (2 was the old High's heroes, never made now.)
+constexpr u8 Level(bool enabled, u32 tier) {
+    return enabled ? (tier == 0 ? 3 : tier == 2 ? 4 : 1) : 0;
 }
+// The tier a program's key says (SceneMaps::TierScope), -1 for none: a light rectangle's level (3
+// Low, 1 Medium, 4 High, 2 the old High), else the AO pass's mask writer's tier bits
+// (RuntimeInfo::VrAoLampLow 4, VrAoLampHigh 32, with VrAmbientOcclusionBit 1 and VrAoLampShadows
+// 16).
+constexpr int ProgramTier(u8 light_level, u8 ao_bits) {
+    if (light_level != 0) {
+        return light_level == 3 ? 0 : light_level == 1 ? 1 : 2;
+    }
+    if ((ao_bits & (1u | 16u)) == (1u | 16u)) {
+        return (ao_bits & 4u) != 0 ? 0 : (ao_bits & 32u) != 0 ? 2 : 1;
+    }
+    return -1;
+}
+// The AO mask writer's tier bits for a tier (ProgramTier's inverse).
+constexpr u8 AoTierBits(u32 tier) {
+    return tier == 0 ? u8{4} : tier == 2 ? u8{32} : u8{0};
+}
+static_assert(ProgramTier(Level(true, 0), 0) == 0 && ProgramTier(Level(true, 1), 0) == 1 &&
+              ProgramTier(Level(true, 2), 0) == 2);
+static_assert(ProgramTier(0, 1 | 16 | AoTierBits(0)) == 0 && ProgramTier(0, 1 | 16 | AoTierBits(1)) == 1 &&
+              ProgramTier(0, 1 | 16 | AoTierBits(2)) == 2 && ProgramTier(0, 1) == -1 &&
+              ProgramTier(0, 16 | 4) == -1);
 // One loop over a lamp shader's lights (2026-11-12 night, the cost sweep at Oedon Chapel: with a
 // copy of the shadow code per light a 12-light shader was huge, so few pixels ran at once and
 // every extra part cost several times its own work). VR_LIGHT_LOOP=0 (tests): a copy each.

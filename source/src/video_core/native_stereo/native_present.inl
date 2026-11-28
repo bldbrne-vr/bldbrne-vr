@@ -5,13 +5,13 @@
 // You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
-// Native stereo: crop/format-copy the two rendered layers; no DIBR reconstruction.
-void Presenter::RecordNativeStereo(vk::CommandBuffer cmd, Frame& frame, VideoCore::Image& source, vk::Extent2D size, vk::Format guest_view_format) {
-    if (!openxr_presenter || !frame.vr_tag.immersive || !source.native_stereo) return;
+// Scratchpad native stereo: crop/format-copy the two rendered layers; no DIBR reconstruction.
+bool Presenter::RecordNativeStereo(vk::CommandBuffer cmd, Frame& frame, VideoCore::Image& source, vk::Extent2D size, vk::Format guest_view_format) {
+    if (!openxr_presenter || !frame.vr_tag.immersive || !source.native_stereo) return false;
     const auto format=openxr_presenter->EyeSwapchainFormat();
     if (format==vk::Format::eUndefined) {
         RENDER_DIAGNOSTIC_ONCE("native eye format unavailable (may be session startup)");
-        return;
+        return false;
     }
     // The guest flip's view describes the stored colour bytes, not the backing image's
     // typeless allocation. A typed blit from that allocation swaps R/B a second time.
@@ -34,6 +34,9 @@ void Presenter::RecordNativeStereo(vk::CommandBuffer cmd, Frame& frame, VideoCor
                          (scene.extent == size ||
                           (whole.width && scene.extent == vk::Extent2D{whole.width, whole.height}));
     const vk::Extent2D world_size = ui_free ? scene.extent : size;
+    // This frame's raw guest layers can have a widened projection and unshaded margins.
+    // Refuse that source before allocating eye images or recording a swapchain copy.
+    if (S1Drs::enabled && rasterizer->DrsFrame().ShouldHold(ui_free)) return false;
     if (ui_free) {
         RENDER_DIAGNOSTIC_ONCE("native scene source={}x{} layers={} guest_format={} eye_format={} upscale={}x{}",
             world_size.width, world_size.height, scene.layers, static_cast<int>(guest_view_format),
@@ -102,7 +105,7 @@ void Presenter::RecordNativeStereo(vk::CommandBuffer cmd, Frame& frame, VideoCor
             crops[0].rect.extent.width, crops[0].rect.extent.height,
             crops[1].rect.extent.width, crops[1].rect.extent.height, eye_limit.width,
             eye_limit.height);
-        return;
+        return false;
     }
     // The old feedback path runs in DIBR late warp. Native eyes need their own
     // optional pass; take one game-state sample and apply identical strengths to both eyes.
@@ -444,4 +447,5 @@ void Presenter::RecordNativeStereo(vk::CommandBuffer cmd, Frame& frame, VideoCor
     static u64 count=0;
     if (++count%300==0) LOG_BENCHMARK_INFO(Render_Vulkan,"VR native stereo: {} pairs, {}x{} per-eye source, IPD {:.1f} mm, multiview colour, direct copy {}",
         count,size.width,size.height,NativeStereo::Ipd(frame.vr_tag.record)*1000.f,frame.vr_published);
+    return eyes_ok && ui_free;
 }

@@ -26,8 +26,12 @@ namespace VR::Lever {
 
 using Body::Vec3;
 
-constexpr float GrabRadius = 0.22f; // forgiving reach; the held fist pins to the actual handle
-constexpr float SlipDistance = 0.30f;
+// Forgiving reach; the held fist pins to the actual handle. (0.22 m until 2026-11-25, the user:
+// "increase a tiny bit the range of which we can grab them".) A held hand slips this far from the
+// lever's grip: the same 8 cm beyond the reach as before, so a lever caught at the edge of the
+// reach along its stem does not slip at once.
+constexpr float GrabRadius = 0.25f;
+constexpr float SlipDistance = GrabRadius + 0.08f;
 constexpr float MaxAge = 0.15f;
 constexpr float MaxFrame = 0.10f;
 constexpr float Press = 0.75f;

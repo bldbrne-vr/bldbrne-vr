@@ -9,6 +9,7 @@
 
 #include "core/vr/controls_view.h"
 #include "core/vr/headset_panels.h"
+#include "core/vr/mirror_world.h"
 #include "core/vr/monocular.h"
 #include "core/vr/vr_page.h"
 #include "core/vr/y_menu.h"
@@ -111,12 +112,29 @@ Section FromCallouts(std::string title, Tab tab, const Config &c,
 
 } // namespace
 
+bool LeftHanded(const Lookup &value) {
+    if (!Flag(value, "left_handed", false)) {
+        return false; // right-handed: one lookup
+    }
+    const auto style = value("play_style");
+    const auto first = value("first_person");
+    const auto stereo = value("stereo");
+    const auto mode = value("stereo_mode");
+    const auto ui = value("ui_layer");
+    return (!style || style->empty() || *style == "motion" || *style == "0") &&
+           !(first && VR::Mirror::ThirdPersonWord(*first)) &&
+           !(stereo && (*stereo == "0" || *stereo == "false")) &&
+           (!mode || mode->empty() || *mode == "2") && (!ui || ui->empty() || *ui == "1");
+}
+
 Config ConfigFrom(const Lookup &value, bool menu_runtime) {
     Config c;
     c.layout.left_scheme =
         std::clamp(static_cast<int>(std::lround(Number(value, "left_scheme", 2.0f))), 1, 2);
     c.layout.classic = value("controls") == "classic";
     c.layout.swap = Flag(value, "swap_sticks", false);
+    // Left-handed play (core/vr/mirror_world.h): the controllers trade hands.
+    c.layout.mirror = LeftHanded(value);
     c.layout.inject = Flag(value, "inject", true);
     // The presenter's YMenuActive: motion scheme 2, on explicitly or auto on SteamVR / VDXR.
     int y_menu = 0;
@@ -218,10 +236,14 @@ std::vector<Section> Interactions(Platform platform, const Lookup &value, std::s
     const bool swap = VR::Page::SticksSwapped(store);
     // The guide's words with this controller's names: {A} {B} {X} {Y} and {move} {turn} as the
     // layout has them, {button:B} the button itself (thumb_layout.h Expand).
+    const bool mirror = VR::Page::PageMirror(store); // left-handed play
     const auto say = [&](const std::string &text) {
-        return VR::Thumbs::Expand(text, swap, [&](VR::Thumbs::Control physical) {
-            return VR::ControlsView::NameOf(parts, physical);
-        });
+        return VR::Thumbs::Expand(
+            text, swap,
+            [&](VR::Thumbs::Control physical) {
+                return VR::ControlsView::NameOf(parts, physical);
+            },
+            mirror);
     };
     const bool menu_runtime = MenuRuntime(platform, runtime_name);
     const Config c = ConfigFrom(value, menu_runtime);
@@ -237,9 +259,14 @@ std::vector<Section> Interactions(Platform platform, const Lookup &value, std::s
                                                         : "Menu";
     std::vector<Section> out;
     const auto section = [&](const char *title) { out.push_back({title, {}, {}}); };
+    // Left-handed play: the guide's words about your hands and body for the other side (its
+    // buttons' names come mirrored from say).
+    const auto sided = [&](std::string_view text) {
+        return mirror ? VR::Mirror::SideWords(text) : std::string{text};
+    };
     const auto line = [&](const char *title, const std::string &help, const char *words,
                           const char *row = nullptr) {
-        out.back().lines.push_back({{}, title, {}, say(help), words, row});
+        out.back().lines.push_back({{}, sided(title), {}, say(sided(help)), words, row});
     };
 
     section("Weapons");
@@ -315,6 +342,14 @@ std::vector<Section> Interactions(Platform platform, const Lookup &value, std::s
                     : "Whirligig Saw in both hands: hold a trigger to spin it."),
          "reiterpallasch rifle spear stake driver moonlight sword wave whirligig saw spin shoot "
          "blast special");
+    if (!c.layout.classic) {
+        line("Bloodletter",
+             std::string("With physical combat, transform it into the flail. Tap the ") +
+                 (optimized ? "right" : "left") +
+                 " trigger for its blood blast. For a physical slam, hold that trigger until you feel "
+                 "the heartbeat, then keep holding and bring the flail down against the floor or an enemy.",
+             "bloodletter flail blood blast slam heartbeat trigger");
+    }
     line("Amygdalan Arm",
          "With physical combat, transform the Arm and swing to crack its tentacle in the "
          "direction of your swing. Keep swinging to keep it out. Press the right trigger with "
@@ -504,8 +539,8 @@ std::vector<Section> Interactions(Platform platform, const Lookup &value, std::s
         fan = "Press {Y} to open your quick items above your hand. Reach an item and squeeze the "
               "grip to take it. Pull the left trigger to use it.";
     if (c.quick_arc && c.grip_hold)
-        fan += " Put an unused item back within about three seconds and the fan reopens once "
-               "your hand settles. Using or throwing an item closes it.";
+        fan += " Putting an item back, using it or throwing it closes the fan. Open it again "
+               "for the next one.";
     line("Quick item fan", fan,
          "quick items fan menu inventory consumables select pick use", "quick_arc_pick");
     line("Throw an item",
@@ -776,9 +811,16 @@ RowText RowWords(const char *id, Platform platform, const Lookup &value) {
     return {VR::Page::RowLabel(r, store), VR::Page::RowHelp(r, store)};
 }
 
-std::string PlatformNote(Platform platform) {
+std::string PlatformNote(Platform platform, bool left_handed) {
     switch (platform) {
     case Platform::Quest:
+        // (Left-handed play: the game's Y is your right controller's B.)
+        if (left_handed) {
+            return "Quest Link / Air Link: Menu opens the game's menu. SteamVR or Virtual "
+                   "Desktop's VDXR: with the default motion controls, tap B for the game menu or a "
+                   "cutscene's skip prompt; hold B for 0.7 seconds to recenter. PICO, Vive Focus "
+                   "and HP Reverb G2 controllers have the same buttons.";
+        }
         return "Quest Link / Air Link: Menu opens the game's menu. SteamVR or Virtual Desktop's "
                "VDXR: with the default motion controls, tap Y for the game menu or a cutscene's "
                "skip prompt; hold Y for 0.7 seconds to recenter. PICO, Vive Focus and HP "
@@ -788,7 +830,8 @@ std::string PlatformNote(Platform platform) {
                "gives the game the Sense controllers in the Quest's layout: Cross where A is, "
                "Circle B, Square X, Triangle Y; L1 and R1 are the grips, L2 and R2 the triggers, "
                "L3 and R3 the stick clicks. Create, Options and the PS button stay SteamVR's: with "
-               "the default controls Triangle opens the game's menu. If a button does something "
+               "the default controls " + std::string{left_handed ? "Circle" : "Triangle"} +
+               " opens the game's menu. If a button does something "
                "else, SteamVR's controller bindings for the game show where it went. On PC, "
                "Sony's app only gives the Sense controllers basic rumble. The free PSVR2 Toolkit "
                "makes the vibration much richer, and the game uses it: crisp clicks, deep thumps.";

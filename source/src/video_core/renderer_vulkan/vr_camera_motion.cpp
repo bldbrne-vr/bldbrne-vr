@@ -7,6 +7,7 @@
 #include "video_core/renderer_vulkan/vr_temporal_profile.h"
 #include <cmath>
 #include "common/logging/log.h"
+#include "core/vr/s1_dynamic_resolution.h"
 #include "video_core/host_shaders/vr_temporal_motion_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -54,7 +55,9 @@ bool VrCameraMotion::Init() {
         return false;
     auto p = device.createComputePipelineUnique(
         {},
-        {.stage = {.stage = vk::ShaderStageFlagBits::eCompute, .module = module, .pName = "main"},
+        {.flags = S1Drs::enabled ? vk::PipelineCreateFlagBits::eDispatchBase
+                                 : vk::PipelineCreateFlags{},
+         .stage = {.stage = vk::ShaderStageFlagBits::eCompute, .module = module, .pName = "main"},
          .layout = *layout});
     device.destroyShaderModule(module);
     if (p.result != vk::Result::eSuccess)
@@ -63,10 +66,11 @@ bool VrCameraMotion::Init() {
     return true;
 }
 bool VrCameraMotion::Record(const VR::Graphics::Config& accepted, bool provider_ready,
-                            const std::array<Eye, 2>& eyes, const Eye* twin, uint32_t views) {
+                            const std::array<Eye, 2>& eyes, const Eye* twin, uint32_t views,
+                            unsigned render_drop) {
     if (accepted.upscaler == VR::Graphics::Upscaler::Off || !provider_ready || failed)
         return false;
-    if (views != 1 && views != 2) return false;
+    if ((views != 1 && views != 2) || render_drop > 30) return false;
     std::array<const Eye*, 3> passes{&eyes[0], &eyes[1], nullptr};
     if (twin) passes[views] = twin;
     const uint32_t count = views + (twin ? 1u : 0u);
@@ -134,8 +138,16 @@ bool VrCameraMotion::Record(const VR::Graphics::Config& accepted, bool provider_
         cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *layout, 0, writes);
         cmd.pushConstants(*layout, vk::ShaderStageFlagBits::eCompute, 0,
                           uint32_t(sizeof(eye.camera)), &eye.camera);
-        cmd.dispatch((uint32_t(eye.camera.size[0]) + 7) / 8, (uint32_t(eye.camera.size[1]) + 7) / 8,
-                     1);
+        const auto width = uint32_t(eye.camera.size[0]);
+        const auto height = uint32_t(eye.camera.size[1]);
+        // The optional comparison eye remains the full-dispatch reference.
+        if (render_drop && i < views) {
+            const auto x = S1Drs::MotionGroups(width, render_drop);
+            const auto y = S1Drs::MotionGroups(height, render_drop);
+            cmd.dispatchBase(x.first, y.first, 0, x.count, y.count, 1);
+        } else {
+            cmd.dispatch((width + 7) / 8, (height + 7) / 8, 1);
+        }
         barriers[i] = {.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
                        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
                        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,

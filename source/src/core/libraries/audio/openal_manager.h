@@ -10,6 +10,9 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#ifndef AL_ALEXT_PROTOTYPES
+#define AL_ALEXT_PROTOTYPES
+#endif
 #include <AL/al.h>
 #include <AL/alc.h>
 #include <AL/alext.h>
@@ -52,6 +55,7 @@ struct DeviceContext {
     ALCcontext* context{nullptr};
     std::string device_name;
     int port_count{0};
+    u32 reopen_generation{0};
     // Opened as the system default (follows it when it changes), and the context's attributes,
     // for alcReopenDeviceSOFT.
     bool follows_default{false};
@@ -72,6 +76,26 @@ struct DeviceContext {
         }
         port_count = 0;
     }
+};
+
+// Port registration keeps the context alive. Restore the caller's thread context on
+// every exit, including guest threads that continue running after a port closes.
+class ScopedALContext {
+public:
+    explicit ScopedALContext(ALCcontext* target)
+        : previous(alcGetThreadContext()), bound(target && alcSetThreadContext(target)) {}
+    ~ScopedALContext() {
+        if (bound) {
+            alcSetThreadContext(previous);
+        }
+    }
+    ScopedALContext(const ScopedALContext&) = delete;
+    ScopedALContext& operator=(const ScopedALContext&) = delete;
+    explicit operator bool() const { return bound; }
+
+private:
+    ALCcontext* previous;
+    bool bound;
 };
 
 class OpenALDevice {
@@ -141,30 +165,18 @@ public:
         }
     }
 
-    bool MakeCurrent(const std::string& device_name) {
+    [[nodiscard]] ScopedALContext Bind(const std::string& device_name, u32* generation = nullptr) {
         std::lock_guard<std::mutex> lock(mutex);
 
         FollowOutputLocked();
         auto it = devices.find(KeyOf(device_name));
-        if (it == devices.end() || !it->second.IsValid()) {
-            return false;
+        if (it == devices.end()) {
+            return ScopedALContext(nullptr);
         }
-
-        // Store current device for this thread (simplified - in practice you might want
-        // thread-local storage)
-        current_context = it->second.context;
-        return alcMakeContextCurrent(it->second.context);
-    }
-
-    // Counts the devices moved to another output; a port seeing it change restarts its queue.
-    u32 Reopens() const {
-        return reopens.load(std::memory_order_acquire);
-    }
-
-    void ReleaseContext() {
-        std::lock_guard<std::mutex> lock(mutex);
-        alcMakeContextCurrent(nullptr);
-        current_context = nullptr;
+        if (generation) {
+            *generation = it->second.reopen_generation;
+        }
+        return ScopedALContext(it->second.context);
     }
 
     // Get the default device name
@@ -223,7 +235,7 @@ private:
     // is moved to the new default with alcReopenDeviceSOFT (sources, buffers and the context
     // stay). Any device that lost its output (unplugged) is reopened too, checked once a second.
     // A move that failed stays pending and is tried again at each once-a-second check, until one
-    // works or the default changes again. Called with the mutex held, from MakeCurrent (every
+    // works or the default changes again. Called with the mutex held, from Bind (every
     // audio output).
     void FollowOutputLocked() {
         const bool event = default_changed.exchange(false, std::memory_order_acq_rel);
@@ -247,7 +259,7 @@ private:
             if (!ok && target)
                 ok = reopen(ctx.device, nullptr, ctx.attrs.data());
             if (ok) {
-                reopens.fetch_add(1, std::memory_order_acq_rel);
+                ++ctx.reopen_generation;
             } else if (ctx.follows_default && connected) {
                 follow_pending = true; // still on the old output: again in a second
             }
@@ -473,9 +485,7 @@ private:
 
     std::unordered_map<std::string, DeviceContext> devices;
     mutable std::mutex mutex;
-    ALCcontext* current_context{nullptr}; // For thread-local tracking
     std::atomic<bool> default_changed{false};
-    std::atomic<u32> reopens{0};
     bool follow_pending{false}; // a default change not followed yet (the mutex)
     std::chrono::steady_clock::time_point next_output_check{};
     LPALCREOPENDEVICESOFT reopen{nullptr};

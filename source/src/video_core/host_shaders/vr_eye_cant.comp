@@ -77,7 +77,11 @@ void main() {
         return;
     }
     // The turned eye's ray through this pixel (its own frame: x right, y up, -z forward) ...
-    const vec2 uv = (vec2(p) + 0.5) / vec2(pc.dst.zw);
+    vec2 uv = (vec2(p) + 0.5) / vec2(pc.dst.zw);
+#ifdef MIRROR
+    // Left-handed play (core/vr/mirror_world.h): the eye written flipped left to right.
+    uv.x = 1.0 - uv.x;
+#endif
     const vec3 ray = vec3(mix(pc.dst_tan.x, pc.dst_tan.y, uv.x), mix(pc.dst_tan.z, pc.dst_tan.w, uv.y),
                           -1.0);
     // ... in the parallel eye's (the head's) frame.

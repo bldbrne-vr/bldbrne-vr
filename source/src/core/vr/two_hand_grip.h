@@ -69,8 +69,13 @@ struct Settings {
     bool optimized_controls{false}; // opt-in: stick transforms, trigger toggles, grips slide
     bool trigger_hold{true}; // optimized scheme: hold left trigger; false toggles attachment
     bool hold_b_reposition{true}; // runtime always true; false supports automatic-slide test rigs
-    float zone_m{0.11f};         // two_hand_zone_cm: the handle zone's radius (9 -> 11 cm, the tester 2026-10-28)
+    // two_hand_zone_cm: the handle zone's radius (9 -> 11 cm, the tester 2026-10-28; 11 -> 11.3 cm,
+    // the tester 2026-11-25, to make bringing the hands together and squeezing a little easier: "up
+    // the area trigger by 0.5cm", then 11.34, then "actually do 11.3cm"; the grip guide's glow
+    // keeps its own size).
+    float zone_m{0.113f};
     bool zone_seen{false};       // two_hand_zone_seen: the 9 -> 11 cm migration ran (0.8.3)
+    bool zone_1125_seen{false};  // two_hand_zone_1125_seen: the 2026-11-25 11 -> 11.3 cm migration ran
     float release_m{0.25f};      // legacy two_hand_release_cm (no geometric release)
     float twist_deg{75.0f};      // legacy two_hand_twist_deg (no geometric release)
     // two_hand_damage: a two-handed swing's hits x this. 0.90 (2026-11-04: two-handed
@@ -290,15 +295,17 @@ constexpr float FixedGripMaxM = 1.20f; // ... a separate second handle (the Whee
 constexpr float GameGripConeDeg = 40.0f; // ... along the handle (R_Weapon +-Y)
 
 // Families whose two-handed form has no single handle for both hands: dual blades (Blade of
-// Mercy 40, Rakuyo 270), the bow (Simon's Bowblade 320), claws and fists; and the Bloodletter
-// (290), whose transformed form is held in one hand in VR (design choice, 2026-10-13).
+// Mercy 40, Rakuyo 270), the bow (Simon's Bowblade 320), claws and fists. (The Bloodletter (290)
+// was one of them, its flail held in one hand in VR (the user's choice, 2026-10-13); since
+// 2026-11-21 its handle takes the left hand too, if you want: the user, "allow the hunter to place
+// the left hand at the hilt and hold grip to hold it with both hands (making it a bit lighter) -
+// but releasing left grip ends up single hand wielding the transformed version again".)
 constexpr bool SharedHandle(std::int32_t family) {
     switch (family) {
     case 10:  // Bare Fists
     case 40:  // Blade of Mercy
     case 90:  // Beast Claw
     case 270: // Rakuyo
-    case 290: // Bloodletter
     case 320: // Simon's Bowblade
     case 340: // Fist of Gratia
     case 370:
@@ -319,10 +326,14 @@ constexpr bool TwoHandedForm(std::int32_t family, std::int32_t style) {
     return style == StyleTwoHanded && SharedHandle(family);
 }
 
+// A two-handed form that is as much a one-handed one: the Bloodletter's flail (its left hand is
+// a choice, SharedHandle above), never "unsupported" in the optimized scheme.
+constexpr bool OneHandAlso(std::int32_t family) { return family == 290; }
+
 // Only weapons with an actual shared two-hand handle need support. Slow supported
 // thrusts qualify too: this penalty does not use the swing-speed bonus threshold.
 constexpr int UnsupportedFamily(bool optimized, bool attached, int family, int style) {
-    return optimized && !attached && TwoHandedForm(family, style) ? family : -1;
+    return optimized && !attached && TwoHandedForm(family, style) && !OneHandAlso(family) ? family : -1;
 }
 
 constexpr float UnsupportedDamage(int unsupported_family, int attack_family,

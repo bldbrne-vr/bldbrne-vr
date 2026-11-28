@@ -149,16 +149,19 @@ inline float WholeFrameRatio(const Config& c) {
 }
 // In memory only (Serialize is what vr.ini keeps): 3 bits per preset since Ultra Quality. The
 // upscaler's low two bits stay at 4 and its third (FSR 4.1) is bit 37, so 0..3 pack as before.
+// Panel-fit recommendations can use any whole percent, e.g. -23 on Quest 3.
+inline constexpr unsigned ScaleShift = 38;
+inline constexpr uint64_t PackedScaleMask = uint64_t{127} << ScaleShift;
 inline constexpr uint64_t Pack(const Config& c) {
-    return uint64_t((c.scale_percent + 50) / 10) | (uint64_t(int(c.upscaler) & 3) << 4) |
+    return (uint64_t(c.scale_percent + 50) << ScaleShift) | (uint64_t(int(c.upscaler) & 3) << 4) |
            (uint64_t(c.dlss) << 6) | (uint64_t(c.fsr4) << 9) | (uint64_t(c.dlss5) << 12) |
            (uint64_t(NeuralPreset(c.neural)) << 13) | (uint64_t(c.intensity) << 16) |
            (uint64_t(c.detail) << 23) | (uint64_t(c.lighting) << 30) |
            (uint64_t((int(c.upscaler) >> 2) & 1) << 37);
 }
 inline Config Unpack(uint64_t v) {
-    return {int(v & 15) * 10 - 50, Upscaler(((v >> 4) & 3) | (((v >> 37) & 1) << 2)),
-            Profile((v >> 6) & 7),
+    return {int((v & PackedScaleMask) >> ScaleShift) - 50,
+            Upscaler(((v >> 4) & 3) | (((v >> 37) & 1) << 2)), Profile((v >> 6) & 7),
             Profile((v >> 9) & 7), bool((v >> 12) & 1),    NeuralPreset(Profile((v >> 13) & 7)),
             int((v >> 16) & 127),  int((v >> 23) & 127),   int((v >> 30) & 127)};
 }
@@ -229,7 +232,7 @@ inline std::optional<Config> Parse(std::string_view text) {
         if (end != text.npos)
             text.remove_prefix(end + 1);
     }
-    if (n[0] != 1 || n[1] < -50 || n[1] > 50 || n[1] % 10 || n[2] < 0 || n[2] > 4 || n[3] < 0 ||
+    if (n[0] != 1 || n[1] < -50 || n[1] > 50 || n[2] < 0 || n[2] > 4 || n[3] < 0 ||
         n[3] >= ProfileCount || n[4] < 0 || n[4] >= ProfileCount || n[5] < 0 || n[5] > 1 || n[6] < 0 || n[6] > 2 ||
         n[7] < 0 || n[7] > 100 || n[8] < 0 || n[8] > 100 || n[9] < 0 || n[9] > 100)
         return {};
@@ -280,6 +283,18 @@ inline std::atomic<bool> whole_frame_requested{true};
 // vr.ini foveation (video_core/renderer_vulkan/vr_foveation.h): -1 not set (Auto: on where the card supports it), 0 off,
 // 1 on, 2 performance, 3 light. Live: the next eye-sized pass takes it (vk_scheduler.cpp).
 inline std::atomic<int> foveation{-1};
+inline constexpr int FfrPending = -2, FfrUnavailable = -3, FfrOverride = -4, FfrNoMap = -5;
+// The last eligible scene pass's recorded attachment (or full rate).
+inline std::atomic<int> foveation_applied{FfrPending};
+inline std::atomic<int> upscale_focus{2};
+
+inline const char* FoveationFeedback(int requested, int applied) {
+    if (applied == FfrOverride) return "Fixed by VR_FOVEATED for this session.";
+    if (applied == FfrUnavailable) return "Unavailable on this Vulkan device.";
+    if (applied == FfrNoMap) return "Full rate: the scene rate map is unavailable.";
+    if (requested != applied) return "Waiting for an immersive scene pass.";
+    return applied == 0 ? "Scene pass confirmed: full rate." : "Scene pass confirmed: rate map active.";
+}
 // DIBR (stereo_mode 2, one centre render) with DLSS, FSR 4 or FSR 3.1.5: the same whole-frame
 // patch as S1 (SetS1), reconstructed once for the centre before the DIBR warp (renderer_vulkan/
 // vr_dibr_upscale.cpp). DLSS 5 is not offered there. VR_DIBR_UPSCALE=0 (tests, A/B) keeps the old

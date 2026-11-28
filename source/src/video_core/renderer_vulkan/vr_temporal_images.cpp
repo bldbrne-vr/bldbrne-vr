@@ -86,6 +86,12 @@ void VrTemporalImages::ReleaseVerify() {
     verify = std::move(empty);
     twin_motion = std::move(empty_motion);
 }
+void VrTemporalImages::Suspend(const VrTemporalPair::Plan& next) {
+    ready = false;
+    // The provider is reconfiguring. Keep compatible whole-eye surfaces unpublished until Prepare.
+    if (!allocated.SameWholeEyeLayout(next))
+        Release();
+}
 void VrTemporalImages::Release() {
     ready = false;
     allocated = {};
@@ -165,9 +171,10 @@ static vk::Format OutputFormat(const VR::Graphics::Config &accepted,
 }
 bool VrTemporalImages::Allocate(const VrTemporalPair::Plan &plan, vk::Format output_format,
                                 vk::Format color_format) {
-    if (allocated == plan && allocated_output == output_format &&
-        allocated_color == color_format && eyes[0][3].image)
+    if (allocated.SameWholeEyeLayout(plan) && allocated_output == output_format &&
+        allocated_color == color_format && eyes[0][3].image) {
         return true;
+    }
     Release();
     const std::array formats{color_format, vk::Format::eR32Sfloat,
                              vk::Format::eR16G16Sfloat, output_format};

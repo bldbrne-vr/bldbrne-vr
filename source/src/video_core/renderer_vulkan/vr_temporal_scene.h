@@ -53,7 +53,9 @@ class VrTemporalScene {
     void InvalidateScene() { valid_scene = false; }
     // Before Resolve: the Tonitrus flash this frame is drawn with (InFrame::StormFor its record).
     void SetFlashLevel(float level) { flash_next = level; }
-    Result Resolve(const std::array<VrTemporalImages::Source, 2> &sources, float frame_ms);
+    Result Resolve(const std::array<VrTemporalImages::Source, 2> &sources, float frame_ms,
+                   unsigned render_drop = 0);
+    bool DynamicRegionSupported() const { return dynamic_region_supported; }
     std::optional<std::array<BbDlssImage, 2>> Output() const;
     bool Merge(const std::array<vk::ImageView, 2>& scene) { return published && images.Merge(scene); }
     const std::string &Problem() const { return problem.empty() ? runtime.Problem() : problem; }
@@ -82,6 +84,9 @@ class VrTemporalScene {
     std::array<float, 2> jitter{}, previous_jitter{};
     std::array<BbDlssImage, 2> output{};
     uint64_t frame{}, last_frame{}, epoch{};
+    unsigned last_render_drop{};
+    bool dynamic_region_supported{};
+    unsigned quality_short_side{}, quality_floor{100};
     float flash_level{}; // Tonitrus' world flash at the last resolve (TonitrusCharge::FlashJumped)
     float flash_next{};  // ... this frame's (SetFlashLevel)
     Result begin_result{Result::Disabled};

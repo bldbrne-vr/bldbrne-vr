@@ -13,11 +13,12 @@
 // The view's colour as combat feedback (vr.ini health_color / stamina_color), the same strengths
 // for both eyes (native stereo: native_present.inl's pass; DIBR: the late warp):
 //  - health: below 30% HP a dark red creeps in from the edges of the view (full near 5%);
-//  - desaturation: out of stamina (10% or less) the view drains of colour and dims (the shaders
+//  - desaturation: out of stamina (7.7% or less) the view drains of colour and dims (the shaders
 //    take 30% of its value off the brightness), deepest while it is empty, easing as it refills,
-//    gone once it is past 25% again. Stamina that only runs low, never out, leaves it alone.
-//    (2026-10-15, the tester: much more noticeable by default: 0.85 at strength 1 from 0.75, from
-//    10% from 5%, the default strength 0.7 from 0.5 (0.9 and 0.8 briefly: too strong).)
+//    gone once it is past 22% again. Stamina that only runs low, never out, leaves it alone.
+//    (2026-10-15, the user: much more noticeable by default: 0.85 at strength 1 from 0.75, from
+//    10% from 5%, the default strength 0.7 from 0.5 (0.9 and 0.8 briefly: too strong).
+//    2026-11-25, the user: it started too soon: from 7.7%, gone past 22% (were 10% and 25%).)
 namespace VR::VitalColor {
 struct Config {
     bool health{}, stamina{};
@@ -28,8 +29,8 @@ struct Output {
 };
 constexpr float MaxHealth = .45f;        // the red at the edges at health_color_strength 1
 constexpr float MaxDesaturation = .85f;  // grey at stamina_color_strength 1 (never all grey)
-constexpr float OutOfStamina = .10f;     // at or below this share: out
-constexpr float RecoveredStamina = .25f; // above it: recovered
+constexpr float OutOfStamina = .077f;    // at or below this share: out
+constexpr float RecoveredStamina = .22f; // above it: recovered
 class State {
 public:
     Output Update(const Vitals::Status& s, const Config& c, bool gameplay, std::int64_t now,
@@ -61,7 +62,9 @@ public:
             .6f + .4f * std::clamp((RecoveredStamina - stamina) / RecoveredStamina, 0.f, 1.f);
         const float exhaustion =
             exhausted_ ? MaxDesaturation * Gain(c.stamina_gain) * depth : 0.f;
-        desat_ += (exhaustion - desat_) * (1 - std::exp(-dt / (exhaustion > desat_ ? .08f : .3f)));
+        // In with a 0.1 s time constant (0.08 until 2026-11-25, the user: "a tiny tiny tiiny bit
+        // gentler when it appears"), out with 0.3 s.
+        desat_ += (exhaustion - desat_) * (1 - std::exp(-dt / (exhaustion > desat_ ? .1f : .3f)));
         if (!c.stamina)
             desat_ = 0;
         // Keep health red legible while both conditions are active.

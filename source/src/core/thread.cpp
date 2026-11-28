@@ -24,7 +24,13 @@ static constexpr u32 ORBIS_FPUCW = 0x037f;
 
 NativeThread::NativeThread() : native_handle{0} {}
 
-NativeThread::~NativeThread() {}
+NativeThread::~NativeThread() {
+#ifdef _WIN64
+    if (native_handle) {
+        CloseHandle(native_handle);
+    }
+#endif
+}
 
 int NativeThread::Create(ThreadFunc func, void* arg) {
 #ifndef _WIN64
@@ -39,15 +45,24 @@ int NativeThread::Create(ThreadFunc func, void* arg) {
 #endif
 }
 
-void NativeThread::Exit() {
-    if (!native_handle) {
-        return;
+void NativeThread::WaitForExit() {
+#ifdef _WIN64
+    const auto result = WaitForSingleObject(native_handle, INFINITE);
+    ASSERT(result == WAIT_OBJECT_0);
+#else
+    // A successful guest join precedes collection. Detached threads are joined by the collector.
+    if (!joined) {
+        const int result = pthread_join(reinterpret_cast<pthread_t>(native_handle), nullptr);
+        ASSERT(result == 0);
+        joined = true;
     }
+#endif
+}
 
+void NativeThread::Exit() {
     tid = 0;
 
 #ifdef _WIN64
-    native_handle = nullptr;
     ExitThread(0);
 #else
     // Disable and free the signal stack.

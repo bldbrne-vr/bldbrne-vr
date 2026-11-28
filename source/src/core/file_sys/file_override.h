@@ -38,6 +38,55 @@ void SetFileOverrideDeferred(const std::string& guest_path,
 // Removes a registration (no-op if there is none).
 void ClearFileOverride(const std::string& guest_path);
 
+// A switched layer over a path (the mod's fog, core/vr/bloodborne_woods_shadows.cpp: the menu's
+// Fog row applies at the next load of an area, without a restart). While `on()` says so at an open
+// (asked outside the lock; one load's opens and stats see the same file: file_override_decide.h),
+// the layer's file is served; otherwise the path is served as if no layer were registered
+// (its plain override, or the game's own file). `opened`, where given, is told at
+// every open of the path (not a stat's: FileOverrideStatScope) whether the layer applied (it
+// applies too while on when its build left the file as it was; not while on and never built).
+// Replaces an earlier layer of the same path.
+using FileOverrideLayerOn = bool (*)();
+using FileOverrideLayerOpened = void (*)(std::string_view guest_path, bool applied);
+void SetFileOverrideLayer(const std::string& guest_path, FileOverrideLayerOn on,
+                          FileOverrideLayerOpened opened, std::string tag);
+
+// The layer's file, built by `build` on a worker thread started now (the start: every layer at
+// once); once (a layer built, being built or queued is left as it is; a path without a layer is
+// ignored). `build` reads the file under the layer itself (in a FileOverrideLayerBypass scope) and
+// returns the changed file, or an empty vector when it leaves the file as it was; an exception:
+// not built, the file under it is served and the open told the layer did not apply (logged). An
+// open while the layer is on and its build runs waits for it (logged).
+void BuildFileOverrideLayer(const std::string& guest_path, std::function<std::vector<u8>()> build);
+
+// As BuildFileOverrideLayer, queued (in play): one worker builds the queued layers one after
+// another; an open that wants a layer whose build has not started builds it itself, at once (it
+// waits behind no other layer's build), and one whose build is running waits for that one only.
+// No exception leaves it (none in the worker either).
+void QueueFileOverrideLayer(const std::string& guest_path, std::function<std::vector<u8>()> build);
+
+// While one of these lives on a thread, that thread's opens see no layers: the file as served
+// under them (a layer's build reads its own path so).
+class FileOverrideLayerBypass {
+public:
+    FileOverrideLayerBypass();
+    ~FileOverrideLayerBypass();
+    FileOverrideLayerBypass(const FileOverrideLayerBypass&) = delete;
+    FileOverrideLayerBypass& operator=(const FileOverrideLayerBypass&) = delete;
+};
+
+// While one of these lives on a thread, that thread's opens are a stat's (the kernel's stat: the
+// file's size as the next open serves it): a layer decides as for an open, and that decision is
+// the next open's, however late (a code review, 2026-11-21), but `opened` is not told (a stat is
+// no load).
+class FileOverrideStatScope {
+public:
+    FileOverrideStatScope();
+    ~FileOverrideStatScope();
+    FileOverrideStatScope(const FileOverrideStatScope&) = delete;
+    FileOverrideStatScope& operator=(const FileOverrideStatScope&) = delete;
+};
+
 // MntPoints::Open: the registered file for this sanitized guest path, or nullptr.
 std::unique_ptr<IFile> OpenFileOverride(std::string_view guest_path);
 

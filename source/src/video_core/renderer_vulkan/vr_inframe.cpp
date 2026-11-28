@@ -20,6 +20,7 @@
 #include "common/thread.h"
 #include "core/vr/bloodborne_assets.h"
 #include "core/vr/sever_reveal.h"
+#include "core/vr/vr_session.h"
 #include "video_core/host_shaders/vr_inframe_frag.h"
 #include "video_core/host_shaders/vr_inframe_vert.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -266,6 +267,8 @@ O::MeshData BuildMesh(F::MeshId id) {
         return O::ApothecaryCaseMesh();
     case F::MeshId::QuickHolster:
         return O::QuickHolsterMesh();
+    case F::MeshId::QuickHolsterLow:
+        return O::QuickHolsterMesh(true);
     case F::MeshId::StoredSyringe:
         return O::AntiqueSyringeMesh(18);
     case F::MeshId::VictorianMolotov:
@@ -356,6 +359,18 @@ O::MeshData BuildMesh(F::MeshId id) {
     return QuadMesh();
 }
 
+struct InFrameShaders {
+    std::vector<u32> vertex;
+    std::vector<u32> fragment;
+};
+
+const InFrameShaders& ItemShaders() {
+    static const InFrameShaders shaders{
+        CompileGlsl(HostShaders::VR_INFRAME_VERT, vk::ShaderStageFlagBits::eVertex),
+        CompileGlsl(HostShaders::VR_INFRAME_FRAG, vk::ShaderStageFlagBits::eFragment)};
+    return shaders;
+}
+
 } // Anonymous namespace
 
 VrInFrame::VrInFrame(const Instance& instance_, Scheduler& scheduler_)
@@ -409,16 +424,17 @@ VrInFrame::VrInFrame(const Instance& instance_, Scheduler& scheduler_)
         return;
     }
     pipeline_layout = std::move(pl.value);
-    const vk::ShaderModule v =
-        Compile(HostShaders::VR_INFRAME_VERT, vk::ShaderStageFlagBits::eVertex, device);
-    const vk::ShaderModule f =
-        Compile(HostShaders::VR_INFRAME_FRAG, vk::ShaderStageFlagBits::eFragment, device);
-    if (!v || !f) {
+    const auto& shaders = ItemShaders();
+    if (shaders.vertex.empty() || shaders.fragment.empty()) {
         Fail("shader compilation");
         return;
     }
-    vert = v;
-    frag = f;
+    vert = CompileSPV(shaders.vertex, device);
+    frag = CompileSPV(shaders.fragment, device);
+    if (!vert || !frag) {
+        Fail("shader module creation");
+        return;
+    }
     auto s = device.createSamplerUnique({
         .magFilter = vk::Filter::eLinear,
         .minFilter = vk::Filter::eLinear,
@@ -611,8 +627,9 @@ std::shared_future<std::shared_ptr<const MeshLibrary>> MeshLibraryFuture() {
 }
 } // Anonymous namespace
 
-void VrInFrame::PrewarmMeshes() {
+void VrInFrame::Prewarm() {
     (void)MeshLibraryFuture();
+    (void)ItemShaders();
 }
 
 bool VrInFrame::BuildMeshes() {
@@ -884,7 +901,8 @@ bool VrInFrame::PrepareProbe(vk::Format src_format, vk::Extent2D extent) {
 }
 
 void VrInFrame::ProbeScenes(const RecorderProxy& cmdbuf, std::span<const ProbeSource> eyes,
-                            vk::Image src, vk::Format src_format, vk::Extent2D extent) {
+                            vk::Image src, vk::Format src_format, vk::Extent2D extent,
+                            vk::Offset2D inset) {
     std::array<VrInFrame*, 2> probes{};
     std::array<u32, 2> layers{};
     u32 count = 0;
@@ -923,14 +941,19 @@ void VrInFrame::ProbeScenes(const RecorderProxy& cmdbuf, std::span<const ProbeSo
             0, ProbeLevels);
     // Halving blits with a linear filter: each level averages 2 x 2 texels of the one above.
     s32 w = static_cast<s32>(extent.width), h = static_cast<s32>(extent.height);
+    // The first level's source: the scene less the inset on each side (none if that would leave
+    // less than half of either side).
+    const bool inset_fits = inset.x >= 0 && inset.y >= 0 && 4 * inset.x < w && 4 * inset.y < h;
+    const s32 ix = inset_fits ? inset.x : 0, iy = inset_fits ? inset.y : 0;
     for (u32 level = 0; level < ProbeLevels; ++level) {
         const s32 nw = std::max(w / 2, 1), nh = std::max(h / 2, 1);
+        const s32 x0 = level == 0 ? ix : 0, y0 = level == 0 ? iy : 0;
         for (u32 i = 0; i < count; ++i) {
             const vk::ImageBlit blit{
                 .srcSubresource = {vk::ImageAspectFlagBits::eColor, level == 0 ? 0u : level - 1,
                                    level == 0 ? layers[i] : 0u, 1},
-                .srcOffsets =
-                    std::array<vk::Offset3D, 2>{vk::Offset3D{0, 0, 0}, vk::Offset3D{w, h, 1}},
+                .srcOffsets = std::array<vk::Offset3D, 2>{vk::Offset3D{x0, y0, 0},
+                                                          vk::Offset3D{w - x0, h - y0, 1}},
                 .dstSubresource = {vk::ImageAspectFlagBits::eColor, level, 0, 1},
                 .dstOffsets =
                     std::array<vk::Offset3D, 2>{vk::Offset3D{0, 0, 0}, vk::Offset3D{nw, nh, 1}},
@@ -1810,6 +1833,8 @@ bool VrInFrame::RecordList(const RecorderProxy& cmdbuf, const Target& t, const C
         if (!group_waits(g.token))
             VR::Sever::g_reveals.Uploaded(g.token, g.count, t.depth_layer, camera.model_eye_mask);
     }
+    // Left-handed play (core/vr/mirror_world.h): the finished eyes are flipped left to right.
+    const bool mirror = VR::MirrorWorld();
     for (u32 i = 0; i < list.count; ++i) {
         const F::Item& item = list.items[i];
         Prepared& p = prepared[i];
@@ -1916,6 +1941,17 @@ bool VrInFrame::RecordList(const RecorderProxy& cmdbuf, const Target& t, const C
             p.push.mv[0] *= k;
             p.push.mv[4] *= k;
             p.push.mv[8] *= k;
+        }
+        // Left-handed play: what is meant to be read (a label, a count, an item's icon: centred
+        // quads) is drawn mirrored here, its X axis reversed about its own centre, so it reads
+        // right once the eye is flipped; the hold ring with it (it fills clockwise). No culling
+        // here and normals follow the transform (vr_inframe.vert), so nothing else changes.
+        if (mirror && ((item.mesh == F::MeshId::Quad &&
+                        (item.shade == F::Shade::Text || item.tex == F::Tex::Icon)) ||
+                       item.shade == F::Shade::HoldRing)) {
+            p.push.mv[0] = -p.push.mv[0];
+            p.push.mv[4] = -p.push.mv[4];
+            p.push.mv[8] = -p.push.mv[8];
         }
         ++drawn;
     }

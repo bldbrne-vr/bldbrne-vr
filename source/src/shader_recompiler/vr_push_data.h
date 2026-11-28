@@ -25,6 +25,7 @@ namespace Shader {
 struct VrCut {
     // Reserved cut codes: EncodeCut caps near at 32766 mm, so these cannot be normal body cuts.
     // The Monocular hides the hunter's foreground draw in only the magnified eye.
+    static constexpr u32 BladeMouth = 0x7ffe'ffffu; // reserved, vertex clip on the Chikage
     static constexpr u32 MonocularLeft = 0x7fff'ffffu;
     static constexpr u32 MonocularRight = 0xffff'ffffu;
     static constexpr s32 MonocularEye(u32 code) {
@@ -33,6 +34,10 @@ struct VrCut {
     static constexpr u32 MonocularCode(s32 eye) {
         return eye == 0 ? MonocularLeft : eye == 1 ? MonocularRight : 0;
     }
+    // Low half outside EncodeCut's valid near radii. The pipeline key only uses the part.
+    static constexpr u32 Hone = 0xfff0u;
+    static constexpr bool IsHone(u32 code) { return (code & 0xfffcu) == Hone; }
+    static constexpr u32 HoneLocation = 12;
     float near_units{};
     float scale{};
     bool back{};
@@ -104,7 +109,7 @@ struct VrPushData {
         if (VrCut::MonocularEye(code) >= 0) {
             code = VrCut::MonocularEye(free_cut) >= 0 ? 0 : free_cut;
         }
-        if (code == 0) {
+        if (code == 0 || code == VrCut::BladeMouth || VrCut::IsHone(code)) {
             cut_near = -1.0f;
             cut_scale = 1.0f;
             return;

@@ -267,7 +267,7 @@ public:
     /// capture, or both native-stereo eyes) and the check's reference. Outside a render pass; X in `layout`.
     bool CaptureScene(const RecorderProxy& cmdbuf, vk::Image x, vk::ImageLayout layout,
                       vk::Format format, vk::Extent2D extent,
-                      const vk::ComponentMapping& components, u32 layers = 1);
+                      const vk::ComponentMapping& components, u32 layers = 1, unsigned drop = 0);
     [[nodiscard]] bool HasScene() const {
         return scene_valid;
     }

@@ -96,6 +96,10 @@ public:
         u32 msaa{4};        // 1, 2, 4 or 8 (lowered to what the device supports)
         float exposure{1.0f};
         float near_m{0.03f};
+        // Left-handed play (core/vr/mirror_world.h): each eye's picture drawn flipped left to right
+        // (clip x reversed, the front faces turning clockwise with it), the presenter reflecting the
+        // layer back. Fixed at Init: the pipelines are made with it.
+        bool mirror{false};
     };
 
     struct Stats {

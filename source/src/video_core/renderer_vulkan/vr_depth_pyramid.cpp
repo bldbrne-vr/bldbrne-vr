@@ -33,6 +33,19 @@ VrDepthPyramid::~VrDepthPyramid() {
     }
 }
 
+void VrDepthPyramid::Release() {
+    if (!buffer) {
+        return;
+    }
+    scheduler.DeferOperation([allocator = instance.GetAllocator(), old = buffer, old_memory = memory] {
+        vmaDestroyBuffer(allocator, old, old_memory);
+    });
+    buffer = vk::Buffer{};
+    memory = nullptr;
+    capacity = 0;
+    used = 0;
+}
+
 uint64_t VrDepthPyramid::BytesFor(uint32_t width, uint32_t height) {
     uint64_t texels = 0;
     for (uint32_t level = 1; level <= Levels; ++level) {

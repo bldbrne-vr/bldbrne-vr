@@ -45,7 +45,7 @@ struct Forced {
 // (The lamp rest & travel page, lamp_travel, is the player's own in first person: the gamepad
 // drives VR pages, D-pad / left stick, Cross, Circle, L1 / R1; the tester, 2026-11-09. Third
 // person sets it off below.)
-inline constexpr std::array<Forced, 25> GamepadForced{{
+inline constexpr std::array<Forced, 26> GamepadForced{{
     {"controls", "classic"},           // buttons only: no swings, lean dodge, lean / duck i-frames
     {"visceral_pull", "0"},            // a visceral never waits ~20 s for a pull
     {"physical_summon_bell", "0"},     // the sign's press summons, no ring needed
@@ -73,6 +73,8 @@ inline constexpr std::array<Forced, 25> GamepadForced{{
     {"gun_wrist_reload", "0"},   // shots fired from the pad never wait for a wrist flick
     {"pose_gestures", "0"},      // the Doll's bow from resting controllers and a look down
     {"ghost_hands", "0"},        // no see-through hands where the controllers lie
+    // Left-handed play mirrors the world for tracked hands only (core/vr/mirror_world.h).
+    {"left_handed", "0"},
 }};
 inline constexpr std::array<Forced, 1> FirstPersonForced{{{"first_person", "1"}}};
 // Third person: the game's camera already shows the hunter, so its interactions play in VR as the

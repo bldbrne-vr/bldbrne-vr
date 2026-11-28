@@ -18,6 +18,9 @@
 
 #include "common/logging/log.h"
 #include "core/vr/bloodborne_levers.h"
+#include "core/vr/bloodborne_evasion.h"
+#include "core/vr/bloodborne_melee.h"
+#include "core/vr/body_channel.h"
 #include "core/vr/summon_bell.h"
 #include "core/vr/body_frame.h"
 #include "core/vr/chest_open.h"
@@ -30,6 +33,7 @@
 #include "core/vr/lever_models.h"
 #include "core/vr/lever_pose_edit.h"
 #include "core/vr/lever_settings.h"
+#include "core/vr/lever_smack.h"
 #include "core/vr/vr_session.h"
 
 #ifdef _WIN32
@@ -223,6 +227,10 @@ u32 HandleOf(u64 address) {
     return std::numeric_limits<u32>::max();
 }
 
+namespace Chest {
+void ArmLeadAt(u32 handle, s32 row, s32 clip, float start);
+}
+
 // Game-thread adapter. Kept behind the development switch until rendered interaction
 // and original gameplay completion have been validated together.
 namespace LiveLever {
@@ -311,6 +319,14 @@ struct Dispatch {
     s32 index{-1};
     u32 actor{};
     bool active{}, seen{};
+    // A Chalice lever struck into action (ServeSmack): its own clip plays from rest, as the
+    // game's button plays it; a hand's pull already placed the lever and skips it.
+    bool keep_clip{};
+    // ... and goes on past its wait for the hunter's hand (Smack::ClipLeadS; Chest::ArmLeadAt,
+    // as a door's): the struck lever's object, its row, the clip time it goes on to.
+    u32 handle{0xFFFFFFFF};
+    s32 action{};
+    float lead{};
 };
 thread_local Dispatch dispatch;
 // Only the synchronous event created by our own original acceptance call may be changed.
@@ -323,7 +339,10 @@ void RewriteEvent(u64 block, u64 record, u32 remote) {
         static_cast<u32>(event[3]) != dispatch.actor || !Writable(record, sizeof(event)))
         return;
     event[4] = -1; // no hunter event animation (first person and hand control stay active)
-    event[6] = -1; // the physical pull already placed the lever; do not replay its clip
+    if (!dispatch.keep_clip)
+        event[6] = -1; // the physical pull already placed the lever; do not replay its clip
+    else if (dispatch.lead > 0.0f)
+        Chest::ArmLeadAt(dispatch.handle, dispatch.action, event[6], dispatch.lead);
     event[7] = 2;  // original event's non-alignment path; mode 0 DOES align to its dummy
     std::memcpy(reinterpret_cast<void *>(record), event.data(), sizeof(event));
     dispatch.seen = true;
@@ -701,6 +720,7 @@ struct RecentLever {
     bool armed{};
     float angle{}; // where its handle stands (a parked capstan's bar)
     bool scripted{}; // a scripted lever: `row` holds its object's address, no block or rows
+    bool chalice{};  // a Chalice lever (lever_smack.h): while armed, blows near it are looked at
 };
 RecentLever recent;
 // The action-block array and this block's rows as the game has them now; the actor identity.
@@ -752,22 +772,41 @@ void Demote(u64 row, u32 handle, s64 until) {
     channel.PromptChanged(); // next selection pass reclassifies (and keeps the prompt)
 }
 
-// Out of reach (lever_acquisition.h OutOfReach): the stem's lowest grip rises above the XR side's
-// reach through the pull. Logged once per lever instance (the last few remembered), with both
-// heights, so a headset log shows why a lever kept its prompt. Under the busy guard.
+// Out of reach or tall (lever_acquisition.h OutOfReach, Tall): the stem's lowest grip rises above
+// the XR side's reach through the pull, or more than TallAboveFeetM over the hunter's feet. It
+// keeps its prompt (Classify) and stays armed for a hand (Scan, CheckArmed). So does a Chalice
+// turning lever (2026-11-26, of its bar: "it can be grabbed but it is too big too far to
+// be pulled"): walking its bar a quarter turn round its hub asks for more room than most play
+// spaces have. Logged once per lever instance (the last few remembered), with the heights, so a
+// headset log shows why a lever kept its prompt. Under the busy guard.
 std::array<u32, 4> reach_noted{0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
 size_t reach_noted_next = 0;
 bool BeyondReach(const L::Rig &rig, u32 handle, s32 action, const L::Model *model) {
     const float top = L::Channel().reach_top.load(std::memory_order_acquire);
-    if (!L::OutOfReach(rig, top))
+    const bool out = L::OutOfReach(rig, top);
+    // Tall and turning levers are the Chalice Dungeons' alone (no lever elsewhere is tall:
+    // LeverModels.OnlyTheChaliceDoorLeversAreTall): nothing of it is worked out in the main game.
+    const bool in_chalice = !out && L::Smack::InChalice();
+    float tall = std::numeric_limits<float>::infinity(); // from the hunter's feet, as he stands
+    if (in_chalice) {
+        VR::Body::Anchor anchor{};
+        if (VR::Body::LatestAnchor(anchor) && anchor.valid)
+            tall = anchor.chr_t.y + L::TallAboveFeetM * anchor.world_scale;
+    }
+    const bool high = in_chalice && L::Tall(rig, tall);
+    const bool turning = in_chalice && !high && model && model->motion == L::Motion::Capstan &&
+                         L::Smack::Chalice(model->name);
+    if (!out && !high && !turning)
         return false;
     if (std::find(reach_noted.begin(), reach_noted.end(), handle) == reach_noted.end()) {
         reach_noted[reach_noted_next] = handle;
         reach_noted_next = (reach_noted_next + 1) % reach_noted.size();
-        LOG_INFO(Core, "VR lever: handle={:#x} row {} ({}) out of reach: its stem's lowest grip "
-                       "rises to y={:.2f} through the pull, a hand reaches y={:.2f} (game units): "
-                       "the game's own prompt and button",
-                 handle, action, model ? model->name : "?", L::LowestGripTop(rig), top);
+        LOG_INFO(Core, "VR lever: handle={:#x} row {} ({}) {}: its stem's lowest grip rises to "
+                       "y={:.2f} through the pull, a hand reaches y={:.2f}, tall from y={:.2f} "
+                       "(game units): the game's own prompt and button, and a hand may still pull it",
+                 handle, action, model ? model->name : "?",
+                 out ? "out of reach" : high ? "tall" : "a Chalice turning lever",
+                 L::LowestGripTop(rig), top, tall);
     }
     return true;
 }
@@ -841,6 +880,9 @@ void Classify(u64 row, u64 actor, u64 block) {
         seen.rig = rig;
         seen.armed = true;
         seen.angle = angle;
+        seen.chalice = L::Smack::InChalice() && model && L::Smack::Chalice(model->name);
+        if (seen.chalice)
+            L::Smack::Posted().NoteLeverNear(now);
         if (recent.row != seen.row || recent.handle != seen.handle || !recent.armed)
             LOG_INFO(Core, "VR lever: handle={:#x} armed: grabbable while you stay within "
                            "{:.1f} m of its hinge",
@@ -1139,6 +1181,8 @@ void Scan() {
         const L::Model *model{};
         float angle{}; // where its handle stands (a parked capstan's bar)
     } best, nearest; // the nearest within its arm radius; the nearest at all (the note)
+    int best_beyond = 2; // best's out of reach (1) or not (0); 2: none yet
+    const float reach_top = channel.reach_top.load(std::memory_order_acquire);
     u32 inspected = 0;
     constexpr s32 Chunk = 32; // rows read per copy: a block's table in a few reads
     std::array<u8, Chunk * 0x140> chunk{};
@@ -1182,14 +1226,20 @@ void Scan() {
                 const L::Model *model = nullptr;
                 float angle{};
                 pose.handle = handle;
+                // (Out of reach arms too: its prompt stays, Classify, and a hand may pull it.)
                 if (!ReadPoseStorage(object, pose) ||
-                    !Bind(pose, binding, rig, &model, action, &angle) ||
-                    BeyondReach(rig, handle, action, model))
+                    !Bind(pose, binding, rig, &model, action, &angle))
                     continue;
                 const auto metres = L::Scaled(rig, to_m);
                 const float reach = L::ScanReach(metres, head, hands, where.tracked);
-                if (reach < best.distance)
+                // One out of reach arms only when no lever a hand reaches is in arm's length:
+                // arming it would stop the scans that find the reachable one.
+                const int beyond = L::OutOfReach(rig, reach_top) ? 1 : 0;
+                if (std::isfinite(reach) &&
+                    (beyond < best_beyond || (beyond == best_beyond && reach < best.distance))) {
                     best = {row, block, handle, action, reach, rig, model, angle};
+                    best_beyond = beyond;
+                }
                 const float away = L::ArmDistance(metres, head, true, hands, where.tracked);
                 if (away < nearest.distance)
                     nearest = {row, block, handle, action, away, rig, model, angle};
@@ -1205,6 +1255,15 @@ void Scan() {
                  nearest.distance, L::ArmRadius(L::Scaled(nearest.rig, to_m)), where.head.x,
                  where.head.y, where.head.z);
     }
+    // A Chalice lever near: a blow or a solid weapon's strike is looked at for the next while
+    // (lever_smack.h LeverNear); elsewhere a swing wakes nothing.
+    const bool in_chalice = L::Smack::InChalice(); // (elsewhere: no name compared, no note)
+    const auto chalice = [in_chalice](const L::Model *m) {
+        return in_chalice && m && L::Smack::Chalice(m->name);
+    };
+    if ((best.row && chalice(best.model)) ||
+        (nearest.row && chalice(nearest.model) && nearest.distance <= L::Smack::NearM))
+        L::Smack::Posted().NoteLeverNear(now);
     RecentLever seen{};
     if (!best.row || !LiveIdentity(best.row, best.block, actor, seen))
         return;
@@ -1212,6 +1271,7 @@ void Scan() {
     seen.rig = best.rig;
     seen.armed = true;
     seen.angle = best.angle;
+    seen.chalice = chalice(best.model);
     if (recent.row != seen.row || recent.handle != seen.handle || !recent.armed)
         LOG_INFO(Core,
                  "VR lever: handle={:#x} row {} ({}): armed by proximity, {:.2f} m from its "
@@ -1269,17 +1329,27 @@ void CheckArmed() {
         why = "used or running";
     else if (!ReadPose(handle, pose))
         why = "animating";
-    else if (!Bind(pose, binding, rig, nullptr, action, &angle))
+    else if (!Bind(pose, binding, rig, &model, action, &angle))
         why = "not at rest";
-    // Out of reach from where the hunter stands now (armed from higher up, say, as he landed):
-    // its prompt is the game's again (the selection classifier keeps it).
-    if (!why && BeyondReach(rig, seen.handle, action, model))
-        why = "out of reach from where you stand";
+    // Out of reach from where the hunter stands now: its prompt is the game's again (the
+    // selection classifier keeps it), and it stays armed for a hand that does reach it (the
+    // user, 2026-11-26: tall or unreachable levers are hand-pulled AND keep B). Logged once.
+    if (!why)
+        BeyondReach(rig, seen.handle, action, model);
     // a refused pull gave it back to the game's button: no hand pull meanwhile, so the
     // game's own pull never meets a held lever.
     if (!why && channel.prompt_state.Demoted(seen.row, seen.handle, now))
         why = "its normal prompt and button are back for now";
     const bool armed = why == nullptr;
+    if (armed && seen.chalice) {
+        // Still near it (the hunter's chest within NearM of its hinge; armed alone says nothing
+        // of distance, and this check also answers every blow's wake): blows stay looked at.
+        std::array<float, 3> feet{};
+        if (VR::GameArea::Hunter(feet, 500) &&
+            Body::Length(Body::Vec3{feet[0], feet[1] + 1.2f, feet[2]} - rig.pivot) <=
+                L::Smack::NearM)
+            L::Smack::Posted().NoteLeverNear(now);
+    }
     if (recent.armed != armed)
         LOG_INFO(Core, "VR lever: handle={:#x} {}", seen.handle,
                  armed ? "armed again" : fmt::format("not grabbable now ({})", why));
@@ -1884,6 +1954,358 @@ void Unpark(u64 queue, u64 objects) {
     parked = {};
     served();
 }
+
+// Chalice levers struck into action (core/vr/lever_smack.h; the tester, 2026-11-26: "we make them
+// smackable (weapon attack or being shot by the player = activation IF the lever can be
+// activated)"): a blow of the right weapon's blade through a Chalice lever's stem or bar, or one of
+// the player's shots along a clear line to it, operates it as the game's own button does: the
+// game's acceptance with the hunter's animation and alignment left out (RewriteEvent) and the
+// lever's own clip kept (Dispatch keep_clip), so it moves from rest and its event runs. Only while
+// the game would let that lever be used now: its row selectable, its rig bound at rest, the game's
+// own check (Permitted) passing and interaction not blocked. A turning lever the hand left
+// part-turned (parked) is put back at rest first (Unpark), the blow waiting up to
+// Smack::PendingNs for it. The Chalice levers near a blow or a shot are looked up then (no work
+// while neither comes), and again after Smack::RescanNs. Game thread, under the busy guard.
+// VR_LEVER_SMACK=0 (tests): none.
+struct ChaliceLever {
+    u64 row{}, block{};
+    u32 handle{};
+    s32 action{};
+    L::Rig rig{};
+    const L::Model *model{};
+};
+std::array<ChaliceLever, 16> chalice{};
+std::array<float, 16> chalice_away{}; // each one's object from where the list was made
+size_t chalice_count = 0;
+s64 chalice_ns = 0;
+Body::Vec3 chalice_at{};
+float chalice_range = 0.0f;
+u64 shot_seen = 0;
+u64 blade_seen = 0;   // the inbox's blade serial read up to
+u64 contact_seen = 0; // ... and its solid weapons' contacts
+u32 struck_handle = 0xFFFFFFFF; // the lever the game last took from a strike, and when
+s64 struck_ns = 0;
+u32 refused_handle = 0xFFFFFFFF; // the lever a refusal was last logged for, and when
+s64 refused_ns = 0;
+struct PendingSmack {
+    u64 row{}, block{};
+    u32 handle{};
+    s64 since{};
+    const char *how{};
+} pending_smack;
+
+bool SmackEnabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("VR_LEVER_SMACK");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
+// The usable Chalice levers within `range` (game units) of `at`, their rigs bound at rest (or at
+// a parked bar's true rest). Under the busy guard.
+void ScanChalice(Body::Vec3 at, float range, s64 now) {
+    chalice_count = 0;
+    chalice_ns = now;
+    chalice_at = at;
+    chalice_range = range;
+    u64 manager{}, blocks{};
+    s32 block_count{};
+    if (!ReadAt(reinterpret_cast<u64>(g_base) + ObjActManRva, manager) ||
+        !ReadAt(manager + 0x20, block_count) || block_count <= 0 || block_count > 256 ||
+        !ReadAt(manager + 0x28, blocks))
+        return;
+    u32 inspected = 0;
+    constexpr s32 Chunk = 32;
+    std::array<u8, Chunk * 0x140> rows_copy{};
+    for (s32 b = 0; b < block_count && inspected < ScanMaxRows; ++b) {
+        const u64 block = blocks + static_cast<u64>(b) * 0xD8;
+        u64 rows{};
+        s32 row_count{};
+        if (!ReadAt(block + 0x90, rows) || !ReadAt(block + 0x98, row_count) || row_count <= 0 ||
+            row_count > 65536)
+            continue;
+        for (s32 first = 0; first < row_count && inspected < ScanMaxRows; first += Chunk) {
+            const s32 n = std::min(Chunk, row_count - first);
+            inspected += static_cast<u32>(n);
+            if (!Copy(rows + static_cast<u64>(first) * 0x140, rows_copy.data(),
+                      static_cast<size_t>(n) * 0x140))
+                break;
+            for (s32 i = 0; i < n; ++i) {
+                if (!PhysicalLeverAction(
+                        Field<s32>(rows_copy, static_cast<size_t>(i) * 0x140 + 0x80)))
+                    continue;
+                const u64 row = rows + static_cast<u64>(first + i) * 0x140;
+                u64 param{};
+                u32 handle{};
+                s32 state{}, action{};
+                if (!Row(row, block, param, handle, state, &action) || !Selectable(state))
+                    continue;
+                Pose pose{};
+                std::array<u8, 0x2E0> object{};
+                if (!Object(handle, pose.object, object))
+                    continue;
+                const Body::Vec3 where{Field<float>(object, 0x24C), Field<float>(object, 0x25C),
+                                       Field<float>(object, 0x26C)};
+                const float away = Body::Length(where - at);
+                if (!(away <= range))
+                    continue;
+                // A full list keeps the nearest (what a blow or a shot meets is near where it is).
+                size_t slot = chalice_count;
+                if (slot == chalice.size()) {
+                    size_t farthest = 0;
+                    for (size_t k = 1; k < chalice.size(); ++k)
+                        if (chalice_away[k] > chalice_away[farthest])
+                            farthest = k;
+                    if (!(away < chalice_away[farthest]))
+                        continue;
+                    slot = farthest;
+                }
+                pose.handle = handle;
+                L::BoneBinding binding{};
+                L::Rig rig{};
+                const L::Model *model = nullptr;
+                if (!ReadPoseStorage(object, pose) ||
+                    !Bind(pose, binding, rig, &model, action) || !model ||
+                    !L::Smack::Chalice(model->name))
+                    continue;
+                chalice[slot] = {row, block, handle, action, rig, model};
+                chalice_away[slot] = away;
+                if (slot == chalice_count)
+                    ++chalice_count;
+            }
+        }
+    }
+}
+
+// Operates a struck Chalice lever as the game's own button would, if the game lets it be used now
+// (re-checked here, just before the one irreversible acceptance). Under the busy guard.
+// Whether the strike settled it (the game took it, or it waits for its bar to come back to rest);
+// false: refused here (just struck, not usable, blocked, not permitted) and another lever the same
+// blow met may be tried. A refusal is logged once a second per lever, not every pass of a swing.
+bool Strike(const ChaliceLever &lever, const char *how, s64 now) {
+    auto &channel = L::Channel();
+    const char *name = lever.model ? lever.model->name : "?";
+    if (lever.handle == struck_handle && now - struck_ns < L::Smack::StruckAgainNs)
+        return false; // taken a moment ago: not again from the same swing (whatever its row says)
+    const auto refused = [&](const char *why) {
+        if (lever.handle != refused_handle || now - refused_ns > 1'000'000'000) {
+            refused_handle = lever.handle;
+            refused_ns = now;
+            LOG_INFO(Core, "VR lever: handle={:#x} ({}) struck by {}: {}", lever.handle, name, how,
+                     why);
+        }
+        return false;
+    };
+    u64 param{};
+    u32 handle{};
+    s32 state{}, action{};
+    if (!Row(lever.row, lever.block, param, handle, state, &action) || handle != lever.handle ||
+        !Selectable(state))
+        return refused("not usable now (used or running)");
+    if (parked.model && parked.handle == lever.handle) {
+        channel.RequestUnpark(now);
+        pending_smack = {lever.row, lever.block, lever.handle, now, how};
+        LOG_INFO(Core, "VR lever: handle={:#x} ({}) struck by {}: its part-turned bar goes back "
+                       "to rest first",
+                 lever.handle, name, how);
+        return true;
+    }
+    // As strict as the game's own selection (its prompt and B): what it would not offer, a blow
+    // or a shot does not do either.
+    if (InteractionBlocked(SelectBlocked))
+        return refused("the game blocks interaction now");
+    const u64 actor = SelectionActor();
+    u32 actor_handle{};
+    u64 rows{};
+    if (!actor || !ReadAt(actor + 8, actor_handle) || actor_handle == 0xFFFFFFFF ||
+        !ReadAt(lever.block + 0x90, rows) || lever.row < rows)
+        return false;
+    if (!Permitted(lever.row, actor))
+        return refused("the game does not permit it now");
+    const auto index = static_cast<s32>((lever.row - rows) / 0x140);
+    struct Scope {
+        ~Scope() { dispatch = {}; }
+    } scope;
+    dispatch = {lever.block, index,  actor_handle, true,
+                false,       true,   lever.handle, action,
+                L::Smack::ClipLeadS(lever.model ? lever.model->name : nullptr)};
+    using Accept = bool(PS4_SYSV_ABI *)(u64, s32, u32);
+    const bool accepted =
+        reinterpret_cast<Accept>(g_base + AcceptRva)(lever.block, index, actor_handle);
+    const bool matched = dispatch.seen;
+    LOG_INFO(Core, "VR lever: handle={:#x} row {} ({}) struck by {}: accepted={} event_matched={}",
+             lever.handle, action, name, how, accepted, matched);
+    // The list is stale now (its row runs): a later blow or shot looks again.
+    chalice_count = 0;
+    if (accepted) {
+        struck_handle = lever.handle;
+        struck_ns = now;
+    }
+    return true;
+}
+
+void ServeSmack() {
+    namespace S = L::Smack;
+    // Outside the Chalice Dungeons: nothing (the inbox takes no posts there either).
+    if (!S::InChalice()) {
+        pending_smack = {};
+        return;
+    }
+    auto &channel = L::Channel();
+    auto &inbox = S::Posted();
+    if (!SmackEnabled() || !g_runtime_enabled || g_motion_test || !L::Enabled())
+        return;
+    const s64 now = NowNs();
+    // Every blade sample since the last look, each a blow when fresh and fast.
+    std::array<S::BladePair, S::Inbox::Ring> samples{};
+    u64 latest = blade_seen;
+    const size_t count = inbox.BladesSince(blade_seen, samples, latest);
+    const auto swung = [now](const S::Blade &b) {
+        return b.ns != 0 && now >= b.ns && now - b.ns <= S::BladeFreshNs &&
+               Body::Length(b.tip_vel) >= S::MinTipSpeedMps;
+    };
+    const S::Blade *last_blow = nullptr;
+    for (size_t k = 0; k < count; ++k)
+        if (swung(samples[k].now))
+            last_blow = &samples[k].now;
+    const bool blow = last_blow != nullptr;
+    // The newest shot and solid weapon's strike, while fresh (one older is taken and dropped: a
+    // pass that could not serve it must not replay it later).
+    S::Shot shot{};
+    u64 serial = shot_seen;
+    const bool fired = inbox.NewShot(serial, shot) && now >= shot.ns &&
+                       now - shot.ns <= S::ShotFreshNs;
+    // A solid weapon stopped by something: a blow when that is a Chalice lever's own body.
+    S::Contact contact{};
+    u64 contact_serial = contact_seen;
+    const bool knocked = inbox.NewContact(contact_serial, contact) && now >= contact.ns &&
+                         now - contact.ns <= S::ShotFreshNs;
+    if (!blow && !fired && !knocked && !pending_smack.row) {
+        blade_seen = latest;
+        shot_seen = serial;
+        contact_seen = contact_serial;
+        return;
+    }
+    Guard guard;
+    if (!guard.acquired || edit.Owned() || channel.work.load(std::memory_order_acquire)) {
+        // A hand's hold owns the levers (or another thread has them): a shot waits a tick; the
+        // gate is asked to come back for it.
+        channel.RequestNearbyCheck(now);
+        return;
+    }
+    blade_seen = latest;
+    shot_seen = serial;
+    contact_seen = contact_serial;
+    // A blow waiting for its parked turning lever's bar to come back to rest.
+    if (pending_smack.row) {
+        if (now - pending_smack.since > S::PendingNs) {
+            LOG_INFO(Core, "VR lever: handle={:#x} struck by {}: its bar did not come back to rest "
+                           "in time; strike it again",
+                     pending_smack.handle, pending_smack.how);
+            pending_smack = {};
+        } else if (!(parked.model && parked.handle == pending_smack.handle)) {
+            const auto waited = pending_smack;
+            pending_smack = {};
+            Pose pose{};
+            std::array<u8, 0x2E0> object{};
+            u64 param{};
+            u32 handle{};
+            s32 state{}, action{};
+            L::BoneBinding binding{};
+            L::Rig rig{};
+            const L::Model *model = nullptr;
+            if (Row(waited.row, waited.block, param, handle, state, &action) &&
+                handle == waited.handle && Object(handle, pose.object, object) &&
+                (pose.handle = handle, ReadPoseStorage(object, pose)) &&
+                Bind(pose, binding, rig, &model, action) && model && S::Chalice(model->name))
+                Strike({waited.row, waited.block, handle, action, rig, model}, waited.how, now);
+            else
+                LOG_INFO(Core, "VR lever: handle={:#x} struck by {}: back at rest, but no longer "
+                               "usable or bound; dropped",
+                         waited.handle, waited.how);
+        }
+    }
+    if (pending_smack.row)
+        channel.RequestNearbyCheck(now); // back next frame until its bar is at rest
+    if (!blow && !fired && !knocked)
+        return;
+    // A shot's list reaches its range from the gun (the blade near the hunter within it).
+    const Body::Vec3 at = fired ? shot.start : blow ? last_blow->tip : contact.point;
+    const float range = (fired ? S::ShotRangeM : S::BladeReachM) + 3.0f;
+    // (The list reaches 3 m past the blade's reach: it holds while the tip stays within 3 m.)
+    if (chalice_ns == 0 || now - chalice_ns > S::RescanNs || chalice_range < range ||
+        Body::Length(at - chalice_at) > 3.0f)
+        ScanChalice(at, range, now);
+    // A blow settles at the first lever that takes it; one refused (used, blocked) leaves the
+    // others it met to try.
+    for (size_t k = 0; blow && k < count; ++k) {
+        if (!swung(samples[k].now))
+            continue;
+        for (size_t i = 0; i < chalice_count; ++i) {
+            if (S::BladeStrikes(S::Strikeable(chalice[i].rig), samples[k].now,
+                                samples[k].before) &&
+                Strike(chalice[i], "a blow", now))
+                return;
+        }
+    }
+    for (size_t i = 0; knocked && i < chalice_count; ++i) {
+        if (S::OwnBody(S::Strikeable(chalice[i].rig), contact.point, 1.0f, S::ContactBodyM) &&
+            Strike(chalice[i], "a blow on its body", now))
+            return;
+    }
+    if (fired) {
+        size_t best = chalice_count;
+        float nearest = std::numeric_limits<float>::infinity();
+        for (size_t i = 0; i < chalice_count; ++i) {
+            const auto hit = S::ShotStrikes(S::Strikeable(chalice[i].rig), shot);
+            if (hit && *hit < nearest) {
+                nearest = *hit;
+                best = i;
+            }
+        }
+        if (best == chalice_count)
+            return;
+        // A clear line to it: no wall, floor or door in between (the map's own collision), short
+        // of the lever's own body (S::OwnBody: what the line meets that near the stem is the
+        // lever, such as the door levers' wheel rim). No collision to ask: no strike.
+        const float length = Body::Length(shot.dir);
+        const Body::Vec3 dir = shot.dir * (1.0f / std::max(length, 1e-6f));
+        const Body::Vec3 short_of = shot.start + dir * std::max(nearest - 0.15f, 0.0f);
+        if (nearest > 0.2f) {
+            namespace E = VR::Bloodborne;
+            Body::Vec3 normal{};
+            float fraction = 0.0f;
+            const auto sweep = E::SweepMapSphere(shot.start, short_of, 0.02f, normal, fraction);
+            const Body::Vec3 met = shot.start + (short_of - shot.start) * fraction;
+            const bool own =
+                sweep == E::MapSweep::Hit && S::OwnBody(S::Strikeable(chalice[best].rig), met);
+            if (sweep == E::MapSweep::Unavailable || (sweep == E::MapSweep::Hit && !own)) {
+                LOG_INFO(Core, "VR lever: handle={:#x} ({}) in a shot's line {:.1f} away, but {}",
+                         chalice[best].handle, chalice[best].model->name, nearest,
+                         sweep == E::MapSweep::Unavailable
+                             ? "the map's collision is not there to ask"
+                             : "something stands in between");
+                return;
+            }
+        }
+        // An enemy in the line first takes the game's bullet: never the lever behind it (live
+        // enemies' hurt capsules round the line, read on this thread, the game's main loop).
+        static EnemyCapsules foes; // 16 KB, the object update's thread only
+        const float before_lever = std::max(nearest - 0.15f, 0.0f);
+        if (before_lever > 0.2f &&
+            GatherEnemyCapsules(shot.start + dir * (before_lever * 0.5f),
+                                before_lever * 0.5f + 0.5f, 1.0f, foes) > 0 &&
+            S::EnemyInTheWay(shot.start, shot.start + dir * before_lever, foes.capsules.data(),
+                             std::min(foes.count, EnemyCapsules::Max))) {
+            LOG_INFO(Core, "VR lever: handle={:#x} ({}) in a shot's line {:.1f} away, but an "
+                           "enemy stands in front of it",
+                     chalice[best].handle, chalice[best].model->name, nearest);
+            return;
+        }
+        Strike(chalice[best], "a shot", now);
+    }
+}
 } // namespace LiveLever
 
 void Observe(const char *stage, u64 row, u64 actor, s32 allowed,
@@ -2029,7 +2451,10 @@ void PS4_SYSV_ABI UpdateObjects(u64 queue, u64 objects) noexcept {
         LiveLever::MotionRequest();
         LiveLever::Update(queue, objects);
         LiveLever::Unpark(queue, objects);
+        // (CheckArmed takes the nearby check first: a come-back that ServeSmack asks for below
+        // stays set for the next frame.)
         LiveLever::CheckArmed();
+        LiveLever::ServeSmack(); // Chalice levers struck by a blow or a shot (lever_smack.h)
         LiveLever::Scan();
         LiveLever::ServiceArmed();
         Chest::ServeLead();
@@ -2130,6 +2555,7 @@ struct Lead {
     s32 row{};
     float start{};
     s64 armed_ns{};
+    bool lever{}; // a struck Chalice lever's (ArmLeadAt), not a door's
 };
 Lead g_lead;
 std::atomic<u8> g_lead_armed{};
@@ -2143,6 +2569,18 @@ void ArmLead(u32 handle, s32 row, s32 clip) {
     if (start <= 0.0f || handle == 0xFFFFFFFF || !Object(handle, address, object))
         return;
     g_lead = {handle, Field<u32>(object, 0x20C), clip, row, start, LiveLever::NowNs()};
+    g_lead_armed.store(1, std::memory_order_release);
+}
+
+// A Chalice lever struck into action (LiveLever::Strike, from its event): its own clip waits
+// for the hunter's hand on it before it moves (lever_smack.h ClipLeadS), and goes on from `start`
+// as a door's does, so the blow or the shot moves it at once.
+void ArmLeadAt(u32 handle, s32 row, s32 clip, float start) {
+    u64 address{};
+    std::array<u8, 0x2E0> object{};
+    if (!(start > 0.0f) || handle == 0xFFFFFFFF || !Object(handle, address, object))
+        return;
+    g_lead = {handle, Field<u32>(object, 0x20C), clip, row, start, LiveLever::NowNs(), true};
     g_lead_armed.store(1, std::memory_order_release);
 }
 
@@ -2172,7 +2610,8 @@ void ServeLead() {
     const Lead lead = g_lead;
     const auto drop = [&](const char *why) {
         g_lead_armed.store(0, std::memory_order_release);
-        LOG_INFO(Core, "VR open: door clip of row {} left as the game made it ({})", lead.row, why);
+        LOG_INFO(Core, "VR open: {} clip of row {} left as the game made it ({})",
+                 lead.lever ? "lever" : "door", lead.row, why);
     };
     if (LiveLever::NowNs() - lead.armed_ns > LeadWindowNs)
         return drop("its clip never started");
@@ -2193,9 +2632,10 @@ void ServeLead() {
     std::memcpy(reinterpret_cast<void *>(control + 0xC), &lead.start, sizeof(float));
     g_lead_armed.store(0, std::memory_order_release);
     LOG_INFO(Core,
-             "VR open: door clip {} (event clip {}) of row {} went on from {:.2f} s to {:.2f} s "
-             "(its wait for the hunter's push)",
-             Field<s32>(object, 0x208), lead.clip, lead.row, time, lead.start);
+             "VR open: {} clip {} (event clip {}) of row {} went on from {:.2f} s to {:.2f} s "
+             "(its wait for the hunter's {})",
+             lead.lever ? "lever" : "door", Field<s32>(object, 0x208), lead.clip, lead.row, time,
+             lead.start, lead.lever ? "hand" : "push");
 }
 
 void RewriteEvent(u64 block, u64 record, u32 remote) {
@@ -2500,6 +2940,8 @@ void InstallLeverProbe(VAddr base, u64 size) {
             code->mov(rax, reinterpret_cast<u64>(&Lever::Channel().unpark));
             code->cmp(qword[rax], 0);
             code->jne(active);
+            // (A blow or a shot at a Chalice lever comes in through the nearby check above:
+            // lever_smack.h Inbox::Wake. No check of its own here.)
         }
         code->jmp(inactive);
         code->L(active);

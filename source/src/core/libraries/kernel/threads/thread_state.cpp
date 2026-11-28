@@ -3,7 +3,6 @@
 
 #include <boost/container/small_vector.hpp>
 #include "common/alignment.h"
-#include "common/scope_exit.h"
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/kernel/threads/sleepq.h"
@@ -28,41 +27,48 @@ ThreadState::ThreadState() {
                                       Core::MemoryProt::CpuReadWrite, Core::MemoryMapFlags::NoFlags,
                                       Core::VMAType::File, "ThrHeap");
     ASSERT_MSG(ret == 0, "Unable to allocate thread heap memory {}", ret);
-    thread_heap.Initialize(heap_addr, ThrHeapSize);
+    thread_heap.Initialize(heap_addr, sizeof(Pthread) * MaxThreads);
 }
 
 void ThreadState::Collect(Pthread* curthread) {
     boost::container::small_vector<Pthread*, 8> work_list;
     {
         std::scoped_lock lk{thread_list_lock};
+        if (gc_list.size() < GcThreshold) {
+            return;
+        }
         for (auto it = gc_list.begin(); it != gc_list.end();) {
             Pthread* td = *it;
-            if (td->tid != TidTerminated) {
+            if (td->tid != TidTerminated ||
+                td->pending_deferred_wakes.load(std::memory_order_acquire) != 0) {
                 ++it;
                 continue;
             }
-            FreeStack(&td->attr);
             work_list.push_back(td);
             it = gc_list.erase(it);
         }
     }
     for (Pthread* td : work_list) {
+        // TidTerminated wakes joiners before the host finishes using the record and guest stack.
+        td->native_thr->WaitForExit();
+        {
+            std::scoped_lock lk{thread_list_lock};
+            FreeStack(&td->attr);
+        }
         Free(curthread, td);
     }
 }
 
 void ThreadState::TryCollect(Pthread* thread) {
-    SCOPE_EXIT {
-        thread->lock->unlock();
-    };
     if (!thread->ShouldCollect()) {
+        thread->lock->unlock();
         return;
     }
 
     thread->refcount++;
     thread->lock->unlock();
     std::scoped_lock lk{thread_list_lock};
-    thread->lock->lock();
+    std::scoped_lock thread_guard{*thread->lock};
     thread->refcount--;
     if (thread->ShouldCollect()) {
         threads.erase(thread);
@@ -71,29 +77,12 @@ void ThreadState::TryCollect(Pthread* thread) {
 }
 
 Pthread* ThreadState::Alloc(Pthread* curthread) {
-    Pthread* thread = nullptr;
     if (curthread != nullptr) {
-        if (GcNeeded()) {
-            Collect(curthread);
-        }
-        if (!free_threads.empty()) {
-            std::scoped_lock lk{free_thread_lock};
-            if (!free_threads.empty()) {
-                thread = free_threads.back();
-                free_threads.pop_back();
-            }
-        }
+        Collect(curthread);
     }
+    Pthread* thread = thread_heap.Allocate();
     if (thread == nullptr) {
-        if (total_threads > MaxThreads) {
-            return nullptr;
-        }
-        total_threads.fetch_add(1);
-        thread = thread_heap.Allocate();
-        if (thread == nullptr) {
-            total_threads.fetch_sub(1);
-            return nullptr;
-        }
+        return nullptr;
     }
     Core::Tcb* tcb = nullptr;
     if (curthread != nullptr) {
@@ -103,15 +92,10 @@ Pthread* ThreadState::Alloc(Pthread* curthread) {
         tcb = TcbCtor(thread, 1 /* initial tls */);
     }
     if (tcb != nullptr) {
-        // Initialize thread struct memory to 0. This is safe since it will be constructed
-        // immediately after.
-        std::memset(static_cast<void*>(thread), 0, sizeof(Pthread));
-        std::construct_at(thread);
         thread->tcb = tcb;
         thread->sleepqueue = new SleepQueue{};
     } else {
         thread_heap.Free(thread);
-        total_threads.fetch_sub(1);
         thread = nullptr;
     }
     return thread;
@@ -124,23 +108,8 @@ void ThreadState::Free(Pthread* curthread, Pthread* thread) {
     } else {
         TcbDtor(thread->tcb);
     }
-    thread->tcb = nullptr;
-    auto* sleepqueue = thread->sleepqueue;
-    bool should_free;
-    {
-        std::scoped_lock lk{free_thread_lock};
-        if (free_threads.size() >= MaxCachedThreads) {
-            should_free = true;
-        } else {
-            should_free = false;
-            free_threads.push_back(thread);
-        }
-    }
-    if (should_free) {
-        delete sleepqueue;
-        thread_heap.Free(thread);
-        total_threads.fetch_sub(1);
-    }
+    delete thread->sleepqueue;
+    thread_heap.Free(thread);
 }
 
 int ThreadState::FindThread(Pthread* thread, const bool include_dead) {

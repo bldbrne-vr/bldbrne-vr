@@ -89,7 +89,7 @@ vec2 StatusVeins(vec2 q, float reach, float beats, float width) {
     const float b_main = jit - sd * (0.04 + 0.08 * h2) * s1;
     const vec3 at = vec3(b_main, jit + sd * (0.17 + 0.08 * h) * s1,
                          b_main + sd * (0.09 + 0.04 * h) * s2);
-    const vec3 wide = vec3(width * pow(max(1.0 - t, 0.0), 1.1),
+    const vec3 wide = vec3(width * (1.0 - 0.82 * t),
                            width * 0.62 * (1.0 - pow(smoothstep(r1, side_end, r), 0.8)),
                            width * 0.45 * (1.0 - pow(smoothstep(r2, twig_end, r), 0.8)));
     const float x = fract(beats - r * 1.4);
@@ -147,7 +147,7 @@ vec4 StatusWeb(vec2 q, float reach, float beats, float g) {
     const float arc = r * (Pi * 0.5) / K;
     const float t = r / total;
     const float dt = abs(f - (StatusVeinHash(cell + 7.0 * seed) - 0.5) * 0.3) * arc;
-    vec2 web = StatusLine(dt, 0.0055 * (1.0 - t), 0.16);
+    vec2 web = StatusLine(dt, 0.0055 - 0.0040 * t, 0.16);
     const float rr = sqrt(max(r + 0.048 * sin(u * 14.0 + seed * 3.1) + 0.016 * sin(u * 43.0 + seed), 0.0));
     const float ring = floor(rr / 0.06);
     const float gd = (fract(rr / 0.06) - 0.5) * 0.06 * 2.0 * rr; // d r = 2 sqrt(r) d sqrt(r)
@@ -159,7 +159,7 @@ vec4 StatusWeb(vec2 q, float reach, float beats, float g) {
     const float a = clamp(web.x * (1.0 - smoothstep(0.75 * total, total, r)) * pulse * 1.15, 0.0, 1.0);
     const float core = clamp((0.95 - web.y) / 0.67, 0.0, 1.0);
     const vec3 rgb = mix(vec3(0.23, 0.14, 0.31), vec3(0.055, 0.030, 0.081), pow(core, 0.7));
-    const float stain = 0.35 * (1.0 - smoothstep(0.17, reach * 0.8 + 0.17, r)) * g;
+    const float stain = 0.35 * (1.0 - smoothstep(0.17, reach * 0.92 + 0.17, r)) * g;
     return StatusOver(vec4(0.036, 0.018, 0.048, stain), rgb, a * (0.6 + 0.4 * g));
 }
 
@@ -178,11 +178,11 @@ vec4 StatusBleed(vec2 q, vec2 c, float reach, float beats, float g) {
             const float len = (0.03 + reach * 0.97 * h * h + 0.018 * StatusVeinBeat(fract(beats - h))) * by_corner;
             const float xc = (lane + 0.5 + (h2 - 0.5) * 0.45) * lane_w + 0.003 * sin(c.y * 41.0 + h * 11.0);
             const float taper = clamp(c.y / max(len, 1e-3), 0.0, 1.0);
-            const float w = (0.005 + 0.007 * h2) * (1.0 - 0.45 * taper) +
+            const float w = (0.005 + 0.007 * h2) * (1.0 - 0.33 * taper) +
                             0.006 * (1.0 - smoothstep(0.0, 0.03, c.y));
             const float dx = abs(c.x - xc);
             blood = StatusLine(dx, w * (0.60 + 0.65 * g), 0.12);
-            blood.x *= 1.0 - smoothstep(0.65 * len, len, c.y);
+            blood.x *= 1.0 - smoothstep(0.76 * len, len, c.y);
         }
     } else {
         float level = reach * 0.34 * pow(clamp(1.0 - c.x / (reach * 0.9), 0.0, 1.0), 1.8);
@@ -226,7 +226,7 @@ vec4 StatusFrenzy(vec2 q, vec2 c, float reach, float beats, float g) {
     const float lane = clamp(floor(band + 0.5), -2.0, 2.0);
     const float key = seed * 9.0 + lane * 11.0;
     const float lane_reach = reach * (0.80 + 0.22 * StatusVeinHash(key + 5.0));
-    const float taper = 1.0 - smoothstep(0.53 * lane_reach, lane_reach, along);
+    const float taper = 1.0 - smoothstep(0.65 * lane_reach, lane_reach, along);
     const float bend = (StatusNoise(vec2(along * 19.0, key)) - 0.5) * 0.38 +
                        (StatusNoise(vec2(along * 57.0, key + 1.0)) - 0.5) * 0.14;
     const float u = along / max(lane_reach, 1e-3);
@@ -266,7 +266,7 @@ vec4 StatusBeast(vec2 q, vec2 c, float reach, float beats, float g) {
         const float strand = (1.0 - smoothstep(0.0012, 0.0028, d)) *
                              smoothstep(0.0, 0.15, tt) *
                              (1.0 - smoothstep(0.7, 1.0, tt));
-        const float dens = 1.0 - smoothstep(total * 0.45, total * 0.9, r + 0.1 * (g - 0.5));
+        const float dens = 1.0 - smoothstep(total * 0.54, total * 0.94, r + 0.1 * (g - 0.5));
         const float fur = (hr > 0.2 ? strand : 0.0) * dens +
                           0.45 * dens * g * (1.0 - smoothstep(total * 0.3, total * 0.8, r));
         o = vec4(mix(vec3(0.041, 0.030, 0.019), vec3(0.22, 0.16, 0.093), clamp(strand * hr, 0.0, 1.0)),
@@ -283,7 +283,7 @@ vec4 StatusBeast(vec2 q, vec2 c, float reach, float beats, float g) {
     if (along > s0 && along < s1) {
         const float tt = clamp((along - s0) / max(s1 - s0, 1e-3), 0.0, 1.0);
         const float rag = 1.0 + 0.35 * sin(along * 90.0 + hk * 13.0) * sin(along * 37.0 + hk * 5.0);
-        const float w = max(0.02 * pow(sin(Pi * pow(tt, 0.8)), 0.7) * rag, 1e-4);
+        const float w = max(0.02 * pow(max(0.0, sin(Pi * tt)), 0.7) * rag, 1e-4);
         const float d = abs(across - k * 0.07 + (g - 0.5) * 0.014);
         const float wound = 1.0 - smoothstep(0.3 * w, 0.8 * w, d);
         const float torn = 1.0 - smoothstep(0.8 * w, 1.25 * w, d);

@@ -105,9 +105,8 @@ bool Selectable(const Shader::RuntimeInfo& runtime_info, u64 hash, const Shader:
     // A permutation of the game's AO pass made with ours, in a session without it; a mask-only one
     // (ambient_occlusion.h MaskOnly) in a session that is not.
     if (const u8 ao = runtime_info.vr_ambient_occlusion; ao & Shader::RuntimeInfo::VrAmbientOcclusionBit) {
-        const bool upscaler = VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off;
         const bool ours = Shader::Optimization::AmbientOcclusion::Enabled(
-            VR::IsEnabled(), VR::GetSettings().ambient_occlusion, upscaler,
+            VR::IsEnabled(), VR::GetSettings().ambient_occlusion,
             std::getenv("VR_AMBIENT_OCCLUSION"));
         const bool mask_only = Shader::Optimization::AmbientOcclusion::MaskOnly(
             ours, VrLampShadowsOn(), Shader::Optimization::LightShadow::SceneMaps::Mask());
@@ -115,7 +114,9 @@ bool Selectable(const Shader::RuntimeInfo& runtime_info, u64 hash, const Shader:
         // in a session that is the other way.
         const bool lamps = Shader::Optimization::LightShadow::SceneMaps::Enabled() && VrLampShadowsOn();
         if (((ao & Shader::RuntimeInfo::VrAoMaskOnly) ? !mask_only : !ours) ||
-            ((ao & Shader::RuntimeInfo::VrAoLampShadows) != 0) != lamps) {
+            ((ao & Shader::RuntimeInfo::VrAoLampShadows) != 0) != lamps ||
+            (lamps && (ao & (Shader::RuntimeInfo::VrAoLampLow | Shader::RuntimeInfo::VrAoLampHigh)) !=
+                          Shader::Optimization::LightShadow::AoTierBits(VrLightShadowTier()))) {
             return false;
         }
     }
@@ -123,16 +124,16 @@ bool Selectable(const Shader::RuntimeInfo& runtime_info, u64 hash, const Shader:
     if ((runtime_info.vr_ambient_occlusion & Shader::RuntimeInfo::VrMoonShadows) &&
         !Shader::Optimization::MoonShadow::Enabled(
             VR::IsEnabled(), VR::GetSettings().moon_shadows,
-            VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
             std::getenv("VR_MOON_SHADOWS"))) {
         return false;
     }
-    // A permutation of the ambient composite with our specular occlusion, in a session without it.
-    if ((runtime_info.vr_ambient_occlusion & Shader::RuntimeInfo::VrSpecularOcclusion) &&
+    // A permutation of the ambient composite with our specular occlusion, in a session without it
+    // (not an AO program's VrAoLampHigh, the same bit).
+    if ((runtime_info.vr_ambient_occlusion & Shader::RuntimeInfo::VrAmbientOcclusionBit) == 0 &&
+        (runtime_info.vr_ambient_occlusion & Shader::RuntimeInfo::VrSpecularOcclusion) &&
         !Shader::Optimization::AmbientOcclusion::SpecEnabled(
             Shader::Optimization::AmbientOcclusion::Enabled(
                 VR::IsEnabled(), VR::GetSettings().ambient_occlusion,
-                VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
                 std::getenv("VR_AMBIENT_OCCLUSION")),
             std::getenv("VR_SPEC_OCCLUSION"))) {
         return false;
@@ -171,17 +172,14 @@ bool Selectable(const Shader::RuntimeInfo& runtime_info, u64 hash, const Shader:
         ((composite & Shader::RuntimeInfo::VrCompositeBounce) &&
          !Shader::Optimization::BounceLight::Enabled(
              VR::IsEnabled(), VR::GetSettings().bounce_light,
-             VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
              std::getenv("VR_BOUNCE_LIGHT"))) ||
         ((composite & Shader::RuntimeInfo::VrCompositeFog) &&
          !Shader::Optimization::FogLight::Enabled(
              VR::IsEnabled(), VR::GetSettings().fog_light,
-             VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
              std::getenv("VR_FOG_LIGHT"))) ||
         ((composite & Shader::RuntimeInfo::VrCompositeShafts) &&
          !Shader::Optimization::MoonShafts::Enabled(
-             VR::IsEnabled(), VR::MoonGlowOn(VR::GetSettings()),
-             VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
+             VR::IsEnabled(), VR::MoonGlowOn(),
              std::getenv("VR_MOON_SHAFTS")))) {
         return false;
     }
@@ -219,7 +217,6 @@ bool Selectable(const Shader::RuntimeInfo& runtime_info, u64 hash, const Shader:
     if ((runtime_info.vr_composite_light & Shader::RuntimeInfo::VrParticleAir) &&
         !Shader::Optimization::ParticleAir::Enabled(
             VR::IsEnabled(), VR::GetSettings().fog_light,
-            VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
             std::getenv("VR_PARTICLE_AIR"))) {
         return false;
     }
@@ -236,6 +233,60 @@ bool Selectable(const Shader::RuntimeInfo& runtime_info, u64 hash, const Shader:
     }
     return !runtime_info.vr_motion.enabled ||
            VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off;
+}
+
+// A stage's start bindings, for the id of its permutation realigned to them (PrebuildList).
+u64 StartId(const Shader::Backend::Bindings& at) {
+    return u64(at.unified) | u64(at.buffer) << 21 | u64(at.user_data) << 42 | u64{1} << 63;
+}
+
+// The VR bits Retarget may change, packed (its record's id in this session is made from them).
+u64 RetargetBits(const Shader::RuntimeInfo& ri) {
+    return u64(ri.billboard_face_eye) | u64(ri.native_asymmetric) << 1 |
+           u64(ri.vr_light_shadows) << 8 | u64(ri.vr_ambient_occlusion) << 16 |
+           u64(ri.vr_composite_light) << 24;
+}
+
+// A record made with other VR settings than this session's, given this session's (2026-11-22, the
+// user: "can we update the list and add our own?"; the lists predate most of the new graphics, and
+// each player's settings are their own): the bits the draw path would choose for its program now,
+// by BuildRuntimeInfo's own rules (VrFragmentBits; the lamp shadows' level on a light rectangle; the
+// billboards; the asymmetric eyes, with VrPushData). The stereo mode, a projection baked in without
+// VrPushData, the motion vectors and the bits the draw's registers decide stay as recorded. A wrong
+// guess costs only a permutation no draw asks for: a draw's runtime info must equal it in every VR
+// field (RuntimeInfo::operator==). Returns the new bits (0: nothing changed).
+u64 Retarget(Shader::RuntimeInfo& ri, u64 hash, u32 stage, const Shader::Profile& profile) {
+    if (ri.native_stereo != NativeStereo::Enabled()) {
+        return 0;
+    }
+    const u64 before = RetargetBits(ri);
+    static const char* const billboard_override = std::getenv("VR_BILLBOARD_FACE_EYE");
+    ri.billboard_face_eye = Shader::Optimization::BillboardFaceEye::Enabled(
+        ri.native_stereo, VR::IsEnabled(), billboard_override);
+    const auto hw = Shader::Stage(stage);
+    if (ri.native_multiview && profile.SupportsVrPushData() &&
+        (hw == Shader::Stage::Vertex || hw == Shader::Stage::Geometry) &&
+        ri.native_projection == decltype(ri.native_projection){}) {
+        ri.native_asymmetric = NativeStereo::AsymmetricProjection();
+    }
+    if (ri.native_light_scissor) {
+        ri.vr_light_shadows = VrLightShadowLevel();
+    }
+    if (hw == Shader::Stage::Fragment) {
+        VrFragmentBits(ri, hash, nullptr);
+    }
+    const u64 after = RetargetBits(ri);
+    return after == before ? 0 : after | (u64{1} << 63);
+}
+
+// VR_SHADER_RETARGET=0: a list's records only as recorded (the A/B). Never while recording: a
+// recording session names its permutations by the list's ids.
+bool RetargetOn() {
+    static const bool off = [] {
+        const char* v = std::getenv("VR_SHADER_RETARGET");
+        return v && std::string_view{v} == "0";
+    }();
+    return !off && !ShaderRecord::RecordOn();
 }
 
 // VR_SHADER_LIST=<folder>, else the recording folder, else shader_list beside the emulator;
@@ -393,6 +444,26 @@ void PipelineCache::PrebuildList(const std::filesystem::path& dir, bool dlc) {
     const auto start = std::chrono::steady_clock::now();
     auto records = ShaderRecord::LoadRecords(dir / "records.bin");
     const size_t listed = records.size();
+    // Each record as this session would draw it (Retarget). A record changed so gets an id of its
+    // own here, made from the list's and its new bits: its marker entry and its permutation are
+    // these settings', and a start with other settings builds its own. The list's keys name the
+    // list's ids (session_ids below).
+    std::unordered_map<u64, u64> session_ids;
+    std::unordered_set<u64> retargeted_ids;
+    if (RetargetOn()) {
+        for (auto& r : records) {
+            if (const u64 bits = Retarget(r.runtime_info, r.hash, r.stage, profile)) {
+                const u64 id = HashCombine(r.perm_id, bits);
+                session_ids.emplace(r.perm_id, id);
+                retargeted_ids.insert(id);
+                r.perm_id = id;
+            }
+        }
+    }
+    const auto session_id = [&](u64 listed_id) {
+        const auto it = session_ids.find(listed_id);
+        return it == session_ids.end() ? listed_id : it->second;
+    };
     // One record per permutation (a folder joined by hand may hold one twice).
     std::unordered_set<u64> seen;
     std::erase_if(records, [&](const auto& r) {
@@ -403,6 +474,9 @@ void PipelineCache::PrebuildList(const std::filesystem::path& dir, bool dlc) {
         return;
     }
     const size_t selected = records.size();
+    const size_t retargeted = std::ranges::count_if(
+        records, [&](const auto& r) { return retargeted_ids.contains(r.perm_id); });
+    retargeted_ids = {};
     Startup::Begin(dlc ? "Checking DLC shaders" : "Checking base-game shaders", selected);
     // A permutation of the player's (its program, its id) with a module, or null. Read here on
     // the start-up thread before any draw, as the warm-up reads them.
@@ -446,30 +520,30 @@ void PipelineCache::PrebuildList(const std::filesystem::path& dir, bool dlc) {
         if (to != renamed.end()) {
             renamed.erase(to);
         }
-        work.push_back(std::move(r));
+        work.push_back(r); // (the records stay: a realigned stage is built from its own)
     }
-    records = {};
     const size_t building = work.size();
     u32 added = 0, reused = 0, failed = 0, uncached = 0;
     std::string reasons;
     long long translated_ms = 0;
-    if (!work.empty()) {
+    std::map<std::string_view, u32> why; // the failures, by reason
+    const char* const preparing = dlc ? "Preparing DLC shaders" : "Preparing base-game shaders";
+    // Translates `batch` again from the game's archives and adds each permutation (`renamed`: its
+    // record's id -> the player's); false without the game's shaders.
+    const auto build = [&](const std::vector<ShaderRecord::Saved>& batch) {
         VideoCore::ShaderArchive::Programs programs;
         std::filesystem::path shader_dir;
-        ShaderRecord::LoadPrograms(work, programs, &shader_dir);
+        ShaderRecord::LoadPrograms(batch, programs, &shader_dir);
         if (programs.Count() == 0) {
             LOG_WARNING(Render_Vulkan, "{}: no game shaders found in {}; skipped", tag,
                         shader_dir.string());
-            return;
+            return false;
         }
-
-        std::map<std::string_view, u32> why; // the failures, by reason
-        Startup::Begin(dlc ? "Preparing DLC shaders" : "Preparing base-game shaders",
-                       work.size() * 2);
+        Startup::Begin(preparing, batch.size() * 2);
         // Keep only one batch's translated IR/SPIR-V alive. Install it, release the temporary
         // results and the workers' pools, then leave a short quiet interval before the next.
-        for (size_t first = 0; first < work.size(); first += Startup::BatchSize) {
-            const size_t count = std::min(Startup::BatchSize, work.size() - first);
+        for (size_t first = 0; first < batch.size(); first += Startup::BatchSize) {
+            const size_t count = std::min(Startup::BatchSize, batch.size() - first);
             std::vector<ShaderRecord::Translated> results(count);
             const auto translating = std::chrono::steady_clock::now();
             Startup::RunBatch(
@@ -477,7 +551,7 @@ void PipelineCache::PrebuildList(const std::filesystem::path& dir, bool dlc) {
                 [&](size_t i) {
                     thread_local Shader::Pools pools;
                     results[i] =
-                        ShaderRecord::Translate(work[first + i], programs, profile, pools, true);
+                        ShaderRecord::Translate(batch[first + i], programs, profile, pools, true);
                 },
                 [&](size_t done) { Startup::Update(first * 2 + done); });
             translated_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -487,7 +561,7 @@ void PipelineCache::PrebuildList(const std::filesystem::path& dir, bool dlc) {
                 std::unique_lock lock(programs_mutex);
                 for (size_t i = 0; i < count; ++i) {
                     Startup::Update(first * 2 + count + i);
-                    const auto& r = work[first + i];
+                    const auto& r = batch[first + i];
                     auto& t = results[i];
                     if (t.failure || !t.spec || t.spv.empty()) {
                         renamed[r.perm_id] = {r.hash, 0};
@@ -576,16 +650,16 @@ void PipelineCache::PrebuildList(const std::filesystem::path& dir, bool dlc) {
             }
             results.clear();
             Startup::Update((first + count) * 2);
-            if (first + count < work.size())
+            if (first + count < batch.size())
                 Startup::Pause();
         }
+        return true;
+    };
+    if (!work.empty()) {
+        if (!build(work)) {
+            return;
+        }
         work = {};
-        for (const auto& [reason, count] : why) {
-            reasons += fmt::format("{}{} {}", reasons.empty() ? " (" : ", ", count, reason);
-        }
-        if (!reasons.empty()) {
-            reasons += ')';
-        }
         SaveMarker(marker, list_id, renamed, seen);
     }
 
@@ -593,8 +667,8 @@ void PipelineCache::PrebuildList(const std::filesystem::path& dir, bool dlc) {
     if (building == 0) {
         LOG_INFO(Render_Vulkan,
                  "{}: the cache holds this list's {} permutations already ({} loaded here, {} "
-                 "could not be built); {} ms",
-                 tag, selected - unbuildable, from_cache, unbuildable,
+                 "could not be built, {} made for this session's settings); {} ms",
+                 tag, selected - unbuildable, from_cache, unbuildable, retargeted,
                  std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - start)
                      .count());
@@ -624,6 +698,103 @@ void PipelineCache::PrebuildList(const std::filesystem::path& dir, bool dlc) {
         job.modules[0] = module->module;
         jobs.push_back(std::move(job));
     }
+    // A listed pipeline's stages as this session's permutations (its key's stage ids renamed). A
+    // stage translated with other starts than the stages before it give it now (they have other
+    // resources: a VR pass's buffers added since the list was recorded, or Retarget's bits) is
+    // taken in its permutation with this pipeline's starts, the one the draw path makes (2026-11-22:
+    // 109 pipelines of the game's list were left to the draw path so): one of its program's, else
+    // built from its record below (`need`), else the pipeline is left to the draw path.
+    struct Realign {
+        u64 from;                        // the stage's record (its id here)
+        u64 id;                          // its permutation with `start` (its id here)
+        Shader::Backend::Bindings start; // the pipeline's start for it
+    };
+    enum class Resolved { Complete, Incomplete, Misaligned };
+    // Not while recording: a realigned permutation is never recorded, so a key naming it would
+    // name a permutation the list lacks.
+    const bool realign = !ShaderRecord::RecordOn();
+    const auto resolve = [&](PreloadJob& job, std::vector<Realign>* need) {
+        Shader::Backend::Bindings at{};
+        bool misaligned_stage = false;
+        std::vector<Realign> wants; // (`need`'s only once the whole key resolved)
+        for (u32 stage = 0; stage < MaxShaderStages; ++stage) {
+            auto& stage_hash = job.graphics_key.stage_hashes[stage];
+            if (stage_hash == 0) {
+                continue;
+            }
+            const u64 id = session_id(stage_hash);
+            const auto to = renamed.find(id);
+            const auto* module = to != renamed.end() ? find_module(to->second) : nullptr;
+            if (!module) {
+                return Resolved::Incomplete;
+            }
+            const u64 program_hash = to->second.first;
+            Program& program = *program_cache.find(program_hash)->second;
+            const auto info_of = [&](const Program::Module& m) -> const Shader::Info* {
+                return m.info ? m.info.get() : &program.info;
+            };
+            // (Each stage checked with its own resources, as BindingsLineUp: a permutation with
+            // resources of its own may match its program's spec at another start.)
+            const auto lines_up = [&](const Program::Module& m) {
+                return info_of(m)->MatchesBindingStart(m.spec.start, at);
+            };
+            if (!lines_up(*module)) {
+                const u64 moved_id = HashCombine(id, StartId(at));
+                const Program::Module* moved = nullptr;
+                if (!realign) {
+                } else if (const auto done = renamed.find(moved_id); done != renamed.end()) {
+                    moved = find_module(done->second); // built (or failed: id 0) here already
+                } else {
+                    auto wanted = module->spec;
+                    wanted.start = at;
+                    const auto found =
+                        std::ranges::find_if(program.modules, [&](const Program::Module& m) {
+                            return m.module && m.spec == wanted && lines_up(m);
+                        });
+                    if (found != program.modules.end()) {
+                        moved = &*found;
+                        renamed[moved_id] = {program_hash, found->id};
+                    }
+                }
+                if (moved && !lines_up(*moved)) {
+                    moved = nullptr;
+                }
+                if (!moved) {
+                    if (realign && need && !renamed.contains(moved_id)) {
+                        wants.push_back({id, moved_id, at});
+                    }
+                    misaligned_stage = true;
+                    info_of(*module)->AddBindings(at); // (the next stages' starts)
+                    continue;
+                }
+                module = moved;
+            }
+            stage_hash = module->id;
+            job.infos[stage] = info_of(*module);
+            job.runtime_infos[stage] = module->spec.runtime_info;
+            job.modules[stage] = module->module;
+            if (module->spec.fetch_shader_data) {
+                job.fetch_shader = module->spec.fetch_shader_data;
+            }
+            job.infos[stage]->AddBindings(at);
+        }
+        if (!misaligned_stage) {
+            return Resolved::Complete;
+        }
+        if (need) {
+            need->insert(need->end(), wants.begin(), wants.end());
+        }
+        return Resolved::Misaligned;
+    };
+    const auto add = [&](PreloadJob& job) {
+        if (!graphics_pipelines.try_emplace(job.graphics_key).second) {
+            ++present;
+            return;
+        }
+        jobs.push_back(std::move(job));
+    };
+    std::vector<PreloadJob> waiting; // misaligned at first, with their keys as listed
+    std::vector<Realign> need;
     std::error_code error;
     for (const auto& file : std::filesystem::directory_iterator(dir / "keys", error)) {
         const auto name = file.path().filename().string();
@@ -640,44 +811,63 @@ void PipelineCache::PrebuildList(const std::filesystem::path& dir, bool dlc) {
             continue;
         }
         ++keys;
-        bool complete = true;
-        std::array<Shader::Backend::Bindings, MaxShaderStages> starts{};
-        for (u32 stage = 0; stage < MaxShaderStages && complete; ++stage) {
-            auto& stage_hash = job.graphics_key.stage_hashes[stage];
-            if (stage_hash == 0) {
-                continue;
-            }
-            const auto to = renamed.find(stage_hash);
-            const auto* module = to != renamed.end() ? find_module(to->second) : nullptr;
-            if (!module) {
-                complete = false;
-                break;
-            }
-            stage_hash = module->id;
-            job.infos[stage] = module->info ? module->info.get()
-                                            : &program_cache.find(to->second.first)->second->info;
-            starts[stage] = module->spec.start;
-            job.runtime_infos[stage] = module->spec.runtime_info;
-            job.modules[stage] = module->module;
-            if (module->spec.fetch_shader_data) {
-                job.fetch_shader = module->spec.fetch_shader_data;
-            }
-        }
-        if (!complete) {
+        const auto listed_key = job.graphics_key;
+        const auto resolved = resolve(job, &need);
+        if (resolved == Resolved::Incomplete) {
             ++incomplete;
             continue;
         }
-        // Recorded with stages that were translated with other resources (a VR pass's buffers
-        // added since the list was made): left to the draw path.
-        if (!BindingsLineUp(job.infos, starts)) {
-            ++misaligned;
+        if (resolved == Resolved::Misaligned) {
+            job.graphics_key = listed_key;
+            waiting.push_back(std::move(job));
             continue;
         }
-        if (!graphics_pipelines.try_emplace(job.graphics_key).second) {
-            ++present;
+        add(job);
+    }
+    // The realigned permutations, each once.
+    u32 realign_built = 0, realign_failed = 0, realigned = 0;
+    if (!need.empty()) {
+        std::unordered_map<u64, const ShaderRecord::Saved*> by_id;
+        for (const auto& r : records) {
+            by_id.emplace(r.perm_id, &r);
+        }
+        std::unordered_set<u64> queued;
+        std::vector<ShaderRecord::Saved> batch;
+        for (const auto& n : need) {
+            const auto r = by_id.find(n.from);
+            if (r == by_id.end() || !queued.insert(n.id).second) {
+                continue;
+            }
+            auto& copy = batch.emplace_back(*r->second);
+            copy.perm_id = n.id;
+            copy.binding = n.start;
+        }
+        if (!batch.empty()) {
+            // (Counted apart from the list's own permutations.)
+            const u32 added_before = added, reused_before = reused, failed_before = failed;
+            build(batch);
+            realign_built = added - added_before + reused - reused_before;
+            realign_failed = failed - failed_before;
+            added = added_before;
+            reused = reused_before;
+            failed = failed_before;
+        }
+    }
+    for (auto& job : waiting) {
+        if (resolve(job, nullptr) != Resolved::Complete) {
+            ++misaligned; // left to the draw path
             continue;
         }
-        jobs.push_back(std::move(job));
+        ++realigned;
+        add(job);
+    }
+    waiting.clear();
+    records = {};
+    for (const auto& [reason, count] : why) {
+        reasons += fmt::format("{}{} {}", reasons.empty() ? " (" : ", ", count, reason);
+    }
+    if (!reasons.empty()) {
+        reasons += ')';
     }
     Startup::Begin(dlc ? "Compiling DLC pipelines" : "Compiling base-game pipelines", jobs.size());
     Startup::RunBatches(jobs.size(), [&](size_t i) {
@@ -722,14 +912,16 @@ void PipelineCache::PrebuildList(const std::filesystem::path& dir, bool dlc) {
                             std::chrono::steady_clock::now() - start)
                             .count();
     LOG_INFO(Render_Vulkan,
-             "{}: {} of {} listed permutations for this session, {} built{}: {} "
-             "added, {} already cached, {} not built{}, {} added but not cached; translated in {} "
+             "{}: {} of {} listed permutations for this session ({} made for its settings), {} "
+             "built{}: {} added, {} already cached, {} not built{}, {} added but not cached; "
+             "translated in {} "
              "ms. Pipelines: {} listed, {} created, {} already present, {} missing a stage, {} "
-             "with stages not lined up (left to the draw path), {} refused; {} ms in all",
-             tag, selected, listed, building,
+             "with stages lined up anew ({} permutations made for them, {} not), {} with stages not "
+             "lined up (left to the draw path), {} refused; {} ms in all",
+             tag, selected, listed, retargeted, building,
              building < selected ? " (the rest were in the cache)" : "", added, reused, failed,
-             reasons, uncached, translated_ms, keys, created, present, incomplete, misaligned,
-             refused, all_ms);
+             reasons, uncached, translated_ms, keys, created, present, incomplete, realigned,
+             realign_built, realign_failed, misaligned, refused, all_ms);
 }
 
 } // namespace Vulkan

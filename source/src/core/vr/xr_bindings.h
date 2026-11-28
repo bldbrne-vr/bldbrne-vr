@@ -334,6 +334,48 @@ inline constexpr std::array Profiles{
     Profile{"/interaction_profiles/khr/simple_controller", NeedsNothing, "simple", Detail::Simple},
 };
 
+// Left-handed play (core/vr/mirror_world.h): the action a control drives once the controllers trade
+// hands. Every control stays where it is on its own controller and drives the other hand's action:
+// the left trigger the weapon's, the left stick the turn, the left grip the transform, X the weapon
+// hand's A, Y its B, the left pose the weapon hand's, and the left controller vibrates for the
+// weapon. So every suggested path is one the profile already has. Menu stays Menu (the left
+// controller's own button; the right one has none a game may bind). Its own inverse.
+constexpr Act Mirror(Act a) {
+    switch (a) {
+    case Act::Move: return Act::Turn;
+    case Act::Turn: return Act::Move;
+    case Act::TriggerLeft: return Act::TriggerRight;
+    case Act::TriggerRight: return Act::TriggerLeft;
+    case Act::GripLeft: return Act::GripRight;
+    case Act::GripRight: return Act::GripLeft;
+    case Act::ButtonA: return Act::ButtonX;
+    case Act::ButtonX: return Act::ButtonA;
+    case Act::ButtonB: return Act::ButtonY;
+    case Act::ButtonY: return Act::ButtonB;
+    case Act::StickLeft: return Act::StickRight;
+    case Act::StickRight: return Act::StickLeft;
+    case Act::Menu: return Act::Menu;
+    case Act::AimLeft: return Act::AimRight;
+    case Act::AimRight: return Act::AimLeft;
+    case Act::GripPoseLeft: return Act::GripPoseRight;
+    case Act::GripPoseRight: return Act::GripPoseLeft;
+    case Act::HapticLeft: return Act::HapticRight;
+    case Act::HapticRight: return Act::HapticLeft;
+    case Act::TouchTriggerLeft: return Act::TouchTriggerRight;
+    case Act::TouchTriggerRight: return Act::TouchTriggerLeft;
+    case Act::TouchA: return Act::TouchX;
+    case Act::TouchX: return Act::TouchA;
+    case Act::TouchB: return Act::TouchY;
+    case Act::TouchY: return Act::TouchB;
+    case Act::TouchStickLeft: return Act::TouchStickRight;
+    case Act::TouchStickRight: return Act::TouchStickLeft;
+    case Act::TouchRestLeft: return Act::TouchRestRight;
+    case Act::TouchRestRight: return Act::TouchRestLeft;
+    case Act::Count: return Act::Count;
+    }
+    return a;
+}
+
 // The layout name for a bound interaction profile ("" for one not in the table). `dpad`: whether
 // the d-pad map of that profile was accepted.
 inline const char* LayoutOf(std::string_view profile, bool dpad) {

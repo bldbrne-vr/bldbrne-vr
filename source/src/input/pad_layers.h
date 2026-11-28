@@ -23,9 +23,21 @@ struct PadLayers {
     std::uint32_t inj_buttons{0};
     std::array<int, Axes> phys_axes{128, 128, 128, 128, 0, 0};
     std::array<bool, Axes> inj_axis{};
+    // Left-handed play's gameplay (the VR presenter, SetMirrorX): the gamepad's and the keyboard's
+    // own sticks reach the game mirrored left to right, as the world is; kept as pushed here.
+    bool mirror_x{false};
 
     static constexpr int Rest(int axis) {
         return axis >= 4 ? 0 : 128;
+    }
+    // A stick's sideways value mirrored about its rest (128): 0..255 to 255..1.
+    static constexpr int MirrorAxis(int value) {
+        return value <= 0 ? 255 : value >= 256 ? 0 : (256 - value > 255 ? 255 : 256 - value);
+    }
+    // What the game gets of a physical axis now: LeftX and RightX mirrored in left-handed
+    // gameplay, the rest as pushed.
+    [[nodiscard]] int Shown(int axis, int value) const {
+        return mirror_x && (axis == 0 || axis == 2) ? MirrorAxis(value) : value;
     }
 
     // The physical layer, in one read (Input::GameController::Physical).
@@ -47,7 +59,7 @@ struct PadLayers {
         if (inj_axis[axis]) {
             return std::nullopt; // the presenter drives it
         }
-        return value;
+        return Shown(axis, value);
     }
     bool InjectButton(std::uint32_t bit, bool pressed) {
         inj_buttons = pressed ? inj_buttons | bit : inj_buttons & ~bit;
@@ -55,7 +67,17 @@ struct PadLayers {
     }
     int InjectAxis(int axis, int value) {
         inj_axis[axis] = value != Rest(axis);
-        return inj_axis[axis] ? value : phys_axes[axis];
+        return inj_axis[axis] ? value : Shown(axis, phys_axes[axis]);
+    }
+    // Left-handed gameplay begins or ends (`on`): whether it changed. The game then gets each
+    // sideways stick the presenter is not driving again (Shown), so a stick held through the
+    // change is mirrored (or not) at once.
+    bool SetMirrorX(bool on) {
+        if (mirror_x == on) {
+            return false;
+        }
+        mirror_x = on;
+        return true;
     }
 };
 

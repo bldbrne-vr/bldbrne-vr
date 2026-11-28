@@ -23,10 +23,10 @@
 namespace Shader::Optimization::ParticleAir {
 
 // Startup policy: with the lights in the air (vr.ini fog_light, the New graphics page's "Light
-// in the air"; its lights are the ones this reads) and an upscaler; VR_PARTICLE_AIR=0|1
-// overrides it.
-inline bool Enabled(bool vr, bool setting, bool upscaler, const char* override_value) {
-    return override_value ? override_value[0] != '0' : vr && setting && upscaler;
+// in the air"; its lights are the ones this reads), with an upscaler or without;
+// VR_PARTICLE_AIR=0|1 overrides it.
+inline bool Enabled(bool vr, bool setting, const char* override_value) {
+    return override_value ? override_value[0] != '0' : vr && setting;
 }
 
 // The soft particle programs of the shader archive (GXFfx*Soft*, PS_VFX_SoftTexture*). The pass

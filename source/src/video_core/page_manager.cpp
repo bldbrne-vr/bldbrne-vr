@@ -179,7 +179,8 @@ struct PageManager::Impl {
 
             // Notify rasterizer about the fault.
             const VAddr addr = msg.arg.pagefault.address;
-            rasterizer->InvalidateMemory(addr, 1);
+            // UFFD_FEATURE_EXACT_ADDRESS was not requested; only the page is known.
+            rasterizer->InvalidateMemory(addr, 1, TextureMemory::Invalidation::PageFault);
         }
     }
 

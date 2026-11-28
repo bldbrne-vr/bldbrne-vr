@@ -225,6 +225,23 @@ int PS4_SYSV_ABI posix_pthread_cond_reltimedwait_np(PthreadCondT* cond, PthreadM
     return cvp->Wait(mutex, THR_RELTIME, usec);
 }
 
+// Called under the sleep-queue lock. An immediate wake finishes before the waiter can leave
+// the queue. A deferred wake keeps its thread record alive until WakeAll has used its semaphore.
+static void WakeCondWaiter(Pthread* td, void* arg) {
+    auto* curthread = static_cast<Pthread*>(arg);
+    PthreadMutex* mp = td->mutex_obj;
+    if (mp != nullptr && curthread != nullptr && mp->m_owner.load() == curthread) {
+        if (curthread->nwaiter_defer >= Pthread::MaxDeferWaiters) {
+            curthread->WakeAll();
+        }
+        td->pending_deferred_wakes.fetch_add(1, std::memory_order_relaxed);
+        curthread->defer_waiters[curthread->nwaiter_defer++] = td;
+        mp->m_flags |= PthreadMutexFlags::Deferred;
+    } else {
+        td->wake_sema.release();
+    }
+}
+
 int PthreadCond::Signal(Pthread* thread) {
     Pthread* curthread = g_curthread;
     if (thread) {
@@ -263,59 +280,13 @@ int PthreadCond::Signal(Pthread* thread) {
         td = sq->sq_blocked.front();
     }
 
-    PthreadMutex* mp = td->mutex_obj;
     has_user_waiters = SleepqRemove(sq, td);
-
-    WakeSemaphore* wake_address = &td->wake_sema;
-    if (mp != nullptr && curthread != nullptr && mp->m_owner.load() == curthread) {
-        if (curthread->nwaiter_defer >= Pthread::MaxDeferWaiters) {
-            curthread->WakeAll();
-        }
-        curthread->defer_waiters[curthread->nwaiter_defer++] = &td->wake_sema;
-        mp->m_flags |= PthreadMutexFlags::Deferred;
-        wake_address = nullptr;
-    }
-
+    WakeCondWaiter(td, curthread);
     SleepqUnlock(this);
-    if (wake_address != nullptr) {
-        wake_address->release();
-    }
     return 0;
 }
 
-struct BroadcastArg {
-    Pthread* curthread;
-    WakeSemaphore* immediate_wakes[Pthread::MaxDeferWaiters];
-    int count;
-};
-
 int PthreadCond::Broadcast() {
-    BroadcastArg ba;
-    ba.curthread = g_curthread;
-    ba.count = 0;
-
-    const auto drop_cb = [](Pthread* td, void* arg) {
-        auto* ba2 = static_cast<BroadcastArg*>(arg);
-        Pthread* curthread = ba2->curthread;
-        PthreadMutex* mp = td->mutex_obj;
-
-        if (mp != nullptr && curthread != nullptr && mp->m_owner.load() == curthread) {
-            if (curthread->nwaiter_defer >= Pthread::MaxDeferWaiters) {
-                curthread->WakeAll();
-            }
-            curthread->defer_waiters[curthread->nwaiter_defer++] = &td->wake_sema;
-            mp->m_flags |= PthreadMutexFlags::Deferred;
-        } else {
-            if (ba2->count >= Pthread::MaxDeferWaiters) {
-                for (int i = 0; i < ba2->count; i++) {
-                    ba2->immediate_wakes[i]->release();
-                }
-                ba2->count = 0;
-            }
-            ba2->immediate_wakes[ba2->count++] = &td->wake_sema;
-        }
-    };
-
     SleepqLock(this);
     SleepQueue* sq = SleepqLookup(this);
     if (sq == nullptr) {
@@ -323,13 +294,10 @@ int PthreadCond::Broadcast() {
         return 0;
     }
 
-    SleepqDrop(sq, drop_cb, &ba);
+    SleepqDrop(sq, WakeCondWaiter, g_curthread);
     has_user_waiters = false;
     SleepqUnlock(this);
 
-    for (int i = 0; i < ba.count; i++) {
-        ba.immediate_wakes[i]->release();
-    }
     return 0;
 }
 

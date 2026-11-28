@@ -9,6 +9,7 @@
 #include "controls_guide.h"
 #include "core/vr/controls_view.h"
 #include "core/vr/native_views.h"
+#include "core/vr/play_style.h"
 #include "core/vr/sky_textures.h"
 #include "core/vr/vr_page.h"
 #include "release_version.h"
@@ -265,7 +266,7 @@ int main() {
         Check(json["General"]["untouched"] == 42 && json["future"] == true,
               "unknown JSON preserved");
         Check(json["GPU"]["vblank_frequency"] == 90 &&
-                  json["General"]["extra_dmem_in_mbytes"] == 3500 &&
+                  json["General"]["extra_dmem_in_mbytes"] == 4012 &&
                   json["Vulkan"]["pipeline_cache_enabled"] == true &&
                   json["Vulkan"]["pipeline_cache_archived"] == false &&
                   json["Vulkan"]["vkvalidation_enabled"] == false,
@@ -837,6 +838,51 @@ int main() {
                 }
             }
             ini.clear();
+            // Left-handed play (core/vr/mirror_world.h): the controllers trade hands, so the words
+            // about your hands and the buttons' names are the other side's; right-handed as before.
+            {
+                const auto quest = ControlsGuide::Platform::Quest;
+                const std::string right_help =
+                    ControlsGuide::RowWords("shoulder_switch", quest, value).help;
+                const std::string right_note = ControlsGuide::PlatformNote(quest);
+                const auto titled = [&](const char *title) {
+                    for (const auto &s : ControlsGuide::Interactions(quest, value))
+                        for (const auto &l : s.lines)
+                            if (l.title == title)
+                                return true;
+                    return false;
+                };
+                const bool right_titles = titled("Left-hand attacks") && !titled("Right-hand attacks");
+                const Setting *shoulder = nullptr;
+                for (const auto &s : Settings())
+                    if (s.id && std::string_view(s.id) == "shoulder_switch")
+                        shoulder = &s;
+                Check(!ControlsGuide::LeftHanded(value) && !ControlsGuide::ConfigFrom(value, false).layout.mirror &&
+                          right_help.find("B at right shoulder / Y at left") != std::string::npos &&
+                          right_note.find("tap Y") != std::string::npos && right_titles,
+                      "right-handed: the guide's words as always");
+                ini["left_handed"] = "1";
+                const std::string left_help =
+                    ControlsGuide::RowWords("shoulder_switch", quest, value).help;
+                Check(ControlsGuide::LeftHanded(value) && ControlsGuide::ConfigFrom(value, false).layout.mirror &&
+                          left_help.find("Y at left shoulder / B at right") != std::string::npos &&
+                          ControlsGuide::PlatformNote(quest, true).find("tap B") != std::string::npos &&
+                          titled("Right-hand attacks") && !titled("Left-hand attacks") &&
+                          shoulder && LeftHandedDetails(*shoulder).find("press Y (left) or B (right)") !=
+                                          std::string::npos,
+                      "left-handed: the guide's words, notes and tooltips name the other hand");
+                ini["stereo_mode"] = "1";
+                const bool aer = ControlsGuide::LeftHanded(value);
+                ini["stereo_mode"] = "2";
+                ini["play_style"] = "1";
+                const bool pad = ControlsGuide::LeftHanded(value);
+                ini.erase("play_style");
+                ini["first_person"] = "0";
+                const bool third = ControlsGuide::LeftHanded(value);
+                Check(!aer && !pad && !third,
+                      "left-handed only with stereo eyes and motion controls in first person");
+            }
+            ini.clear();
             // BBVR_DUMP_CONTROLS=1: the page's words for every headset with the defaults, to read.
             if (std::getenv("BBVR_DUMP_CONTROLS")) {
                 ini.clear();
@@ -995,6 +1041,23 @@ int main() {
         Check(env.contains(L"VR_NATIVE_IPD=auto"), "native eye distance: the included runtime's own");
         Check(!env.contains(L"VR_TEST_LEAK=1") && !env.contains(L"FAST_TOGGLES=0"),
               "inherited renderer switches stripped");
+        Check(env.contains(L"VR_S1_DRS=1"), "dynamic resolution defaults on for older settings");
+        {
+            const auto initial_ini = Read(paths.Ini());
+            for (bool on : {false, true}) {
+                const std::string value = on ? "1" : "0";
+                const auto before = Read(paths.Ini());
+                Write(paths.Ini(), VR::Ini::ApplyEdits(before, {{"dynamic_resolution", value}}), before);
+                SetEnvironmentVariableW(L"VR_S1_DRS", on ? L"0" : L"1");
+                const auto child = environment(Prepare(profile, paths, StereoPreset::Native));
+                Check(child.contains(on ? L"VR_S1_DRS=1" : L"VR_S1_DRS=0") &&
+                          !child.contains(on ? L"VR_S1_DRS=0" : L"VR_S1_DRS=1") &&
+                          VR::Ini::ValueOf(Read(paths.Ini()), "dynamic_resolution") == value,
+                      "the saved Dynamic Resolution choice reaches the game and survives launch");
+            }
+            SetEnvironmentVariableW(L"VR_S1_DRS", nullptr);
+            Write(paths.Ini(), initial_ini, Read(paths.Ini()));
+        }
         Check(NativeViewsValue(NativeViews::Auto).empty() &&
                   NativeViewsValue(NativeViews::Multiview) == L"multiview" &&
                   NativeViewsValue(NativeViews::Layers) == L"layers",
@@ -1443,8 +1506,8 @@ int main() {
               "controls", "inject", "x_button", "laser", "grip_adjust", "seated", "body_cutaway",
               "body_mode",
               "ipd_mm", "hud_vitals", "vitals_heartbeat", "vitals_edge", "ui_counters",
-              "hit_vignette", "ui_hud_scale_deg", "player_hp_bonus_pct", "dodge_iframes_extra",
-              "melee_kill_ragdoll", "melee_ragdoll_impulse", "melee_stamina_pct", "aa_mode", "lod_bias",
+              "hit_vignette", "ui_hud_scale_deg", "player_hp_bonus_pct", "empty_vial_refill",
+              "dodge_iframes_extra", "melee_kill_ragdoll", "melee_ragdoll_impulse", "melee_stamina_pct", "aa_mode", "lod_bias",
               "ui_enemy_hp_bars", "ui_boss_bar", "body_align", "body_posture", "body_lean_side_deg",
               "body_comfort", "body_align_ms", "holster_mode", "holster_haptics",
               "shoulder_vial", "quick_arc_pick", "health_color",
@@ -1466,6 +1529,10 @@ int main() {
                     return row;
             throw std::runtime_error(std::string("no row for ") + key);
         };
+        const auto drs = row_of("dynamic_resolution");
+        Check(std::string_view(drs.category) == "Graphics" && drs.options.size() == 2 &&
+                  CodeDefault("dynamic_resolution") == "1" && VR::Page::RowIndex("dynamic_resolution") < 0,
+              "Dynamic Resolution is an on-by-default launcher-only Graphics switch");
         // Number rows write what the page writes.
         Check(!keys.contains("two_hand_hold_b_reposition"), "legacy B toggle is not offered");
         const auto two_handed = row_of("two_hand_optimized_controls");
@@ -1483,12 +1550,72 @@ int main() {
                  {"ui_boss_bar", "1"}, {"ui_enemy_hp_bars", "0"}, {"melee_ragdoll_impulse", "1"},
                  {"two_hand_trigger_hold", "1"}, {"smooth_turn_deg_per_s", "120"}})
             Check(CodeDefault(key) == value, "the game's defaults for two-key rows");
-        Check(!CodeDefault("laser"), "a key without a known default has none");
+        Check(!CodeDefault("not_a_setting"), "a key without a known default has none");
+        // The card's keys are CardDefault's alone (their default follows the card's memory).
+        for (const char *key : {"light_shadows", "light_shadow_detail", "fog_banks", "moon_shafts",
+                                "ambient_occlusion", "bounce_light", "water_reflections", "wet_streets"})
+            Check(!CodeDefault(key) && CardDefault(key, 16ull << 30), "card defaults stay the card's");
+        // Light attack stamina as the game reads the lines (melee_settings.cpp): the old switch
+        // melee_stamina on ("1" or "true", any of its lines) is the full cost without a pct line the
+        // game reads; a read pct line wins, the last one, std::stoi's number kept within 0..100.
+        using Lines = std::vector<std::string>;
+        Check(StaminaPctAsRead({}, {"1"}) == "100" && StaminaPctAsRead({}, {"true"}) == "100" &&
+                  StaminaPctAsRead({}, {"1", "0"}) == "100" && !StaminaPctAsRead({}, {"0"}) &&
+                  !StaminaPctAsRead({}, {"on"}) && !StaminaPctAsRead({}, {}),
+              "an old melee_stamina=1 still means the full cost");
+        Check(StaminaPctAsRead({"80"}, {"1"}) == "80" && StaminaPctAsRead({"50", "70"}, {}) == "70" &&
+                  StaminaPctAsRead({"50", "abc"}, {}) == "50" && StaminaPctAsRead({"abc"}, {"1"}) == "100" &&
+                  !StaminaPctAsRead({""}, {}) && StaminaPctAsRead({"80abc"}, {}) == "80" &&
+                  StaminaPctAsRead({"150"}, {}) == "100" && StaminaPctAsRead({"-5"}, {}) == "0" &&
+                  !StaminaPctAsRead({"99999999999"}, {}),
+              "a pct line as std::stoi reads it, the last read one winning");
+        // Its reset drops the old switch when on (it would undo the reset), nothing else.
+        Check(ResetAlsoRemoves("melee_stamina_pct", {"1"}) == Lines{"melee_stamina"} &&
+                  ResetAlsoRemoves("melee_stamina_pct", {"0", "true"}) == Lines{"melee_stamina"} &&
+                  ResetAlsoRemoves("melee_stamina_pct", {"0"}).empty() &&
+                  ResetAlsoRemoves("melee_stamina_pct", {}).empty() &&
+                  ResetAlsoRemoves("laser", {"1"}).empty(),
+              "a stamina reset removes the old switch only when it is on");
+        Check(VR::Ini::ValuesOf("a=1\n# a=9\nb=2\r\n a = 3 \n", "a") == Lines{"1", "3"} &&
+                  VR::Ini::ValuesOf("b=2\n", "a").empty(),
+              "every line of a key, in order");
+        // The words as the game reads them (vr_session.cpp): on is "1" or "true"; third person is
+        // std::stof's number cut to 0, a value it refuses stays first person.
+        Check(VR::Mirror::OnWord("1") && VR::Mirror::OnWord("true") && !VR::Mirror::OnWord("1.0") &&
+                  !VR::Mirror::OnWord("01") && !VR::Mirror::OnWord("on") && !VR::Mirror::OnWord(""),
+              "left_handed is on for 1 or true only");
+        Check(VR::Mirror::ThirdPersonWord("0") && VR::Mirror::ThirdPersonWord("0.0") &&
+                  VR::Mirror::ThirdPersonWord("00") && VR::Mirror::ThirdPersonWord("0.5") &&
+                  VR::Mirror::ThirdPersonWord("-0.5") && !VR::Mirror::ThirdPersonWord("1") &&
+                  !VR::Mirror::ThirdPersonWord("false") && !VR::Mirror::ThirdPersonWord("") &&
+                  !VR::Mirror::ThirdPersonWord("nan") && !VR::Mirror::ThirdPersonWord("inf") &&
+                  VR::Mirror::ThirdPersonWord("0abc"),
+              "first_person as std::stof reads it");
+        {
+            std::map<std::string, std::string> ini{{"left_handed", "1"}, {"first_person", "0.0"}};
+            const ControlsGuide::Lookup value = [&](const std::string &key) -> std::optional<std::string> {
+                const auto it = ini.find(key);
+                return it == ini.end() ? std::nullopt : std::optional<std::string>(it->second);
+            };
+            const bool third = ControlsGuide::LeftHanded(value);
+            ini["first_person"] = "false";
+            const bool refused = ControlsGuide::LeftHanded(value);
+            ini["left_handed"] = "1.0";
+            const bool off = ControlsGuide::LeftHanded(value);
+            Check(!third && refused && !off, "the guide reads left-handed play as the game does");
+        }
+        // Read from the game's own settings (2026-11-25): a few, in vr.ini's words.
+        Check(CodeDefault("laser") == "0" && CodeDefault("left_handed") == "0" &&
+                  CodeDefault("aa_mode") == "smaa" && CodeDefault("hud_vitals") == "wrist" &&
+                  CodeDefault("body_mode") == "no_head" && CodeDefault("first_person") == "1" &&
+                  CodeDefault("height_base") == "hunter" &&
+                  SameValue(*CodeDefault("ui_hud_scale_deg"), "0.042"),
+              "the game's own defaults, in vr.ini's words");
         // Use the actual option labels the launcher offers, including both keys of paired rows.
         const uint64_t tier_bytes[] = {8ull << 30, 10ull << 30, 14'817'637'171ull, 14'817'637'172ull};
         for (const auto &[key, labels] : std::initializer_list<
                  std::pair<const char *, std::array<const char *, 4>>>{
-                 {"light_shadows", {"Game's", "Game's", "Low", "Low"}},
+                 {"light_shadows", {"Game's", "Game's", "Medium", "Medium"}}, // (Medium the default since 2026-11-20)
                  {"fog_banks", {"Game's", "Game's", "On", "On"}},
                  {"moon_shafts", {"Off", "Off", "On", "On"}},
                  {"ambient_occlusion", {"Game's", "AO", "AO", "AO and bounce"}},
@@ -1527,16 +1654,21 @@ int main() {
             return std::string("Custom");
         };
         constexpr uint64_t lamp_threshold = 23ull << 29; // 11.5 GiB of dedicated memory
+        // (Low from 11.5 GiB, Medium from 13.5: the tester, 2026-11-20.)
+        constexpr uint64_t medium_threshold = 27ull << 29;
         for (const char *ini : {"", "#light_shadow_detail=low\n", "light_shadow_detail=low\n"}) {
             Check(shadow_choice(ini, lamp_threshold - 1) == "Auto (Game's)" &&
                       shadow_choice(ini, lamp_threshold) == "Auto (Low)" &&
-                      shadow_choice(ini, 16ull << 30) == "Auto (Low)",
+                      shadow_choice(ini, medium_threshold - 1) == "Auto (Low)" &&
+                      shadow_choice(ini, medium_threshold) == "Auto (Medium)" &&
+                      shadow_choice(ini, 16ull << 30) == "Auto (Medium)",
                   "fresh and legacy defaults show the card's actual shadow choice");
         }
-        Check(shadow_choice("light_shadows=1\nlight_shadow_detail=low\n", 8ull << 30) == "Low" &&
+        Check(shadow_choice("light_shadows=1\nlight_shadow_detail=low\n", 8ull << 30) == "Medium" &&
+                  shadow_choice("light_shadows=1\nlight_shadow_detail=lite\n", 8ull << 30) == "Low" &&
                   shadow_choice("light_shadows=0\nlight_shadow_detail=low\n", 16ull << 30) == "Game's" &&
                   shadow_choice("light_shadow_detail=high\n", lamp_threshold) == "High" &&
-                  shadow_choice("light_shadow_detail=0\n", lamp_threshold) == "Low" &&
+                  shadow_choice("light_shadow_detail=0\n", lamp_threshold) == "Medium" &&
                   shadow_choice("light_shadow_detail=1\n", lamp_threshold) == "High",
               "manual shadow overrides survive even when the card would pick differently");
         for (const char *off : {"0", "false", "off"})
@@ -1545,7 +1677,9 @@ int main() {
             Check(ChoiceOverride("water_reflections", on) == "1", "recognize water On spellings");
         Check(!ChoiceOverride("water_reflections", std::nullopt) && ChoiceOverride("wet_streets", "off") == "off",
               "keep Auto and scope water's spelling rules to its own setting");
-        // Each two-key row's defaults pick the option the page calls the default.
+        // Each choice row's code defaults pick the option the page calls the default: the two-key
+        // rows and the ones written by hand in CodeDefault, then the rest (none is the card's: a
+        // card default would change the label, so it is checked absent).
         for (const auto &[key, option] :
              std::initializer_list<std::pair<const char *, const char *>>{
                  {"health_color", "Medium"}, {"stamina_color", "Medium"},
@@ -1554,13 +1688,35 @@ int main() {
                  {"body_align", "Lean"}, {"snap_turn_deg", "Snap 30\xC2\xB0"},
                  {"vitals_heartbeat", "On"}, {"foveation", "Auto"},
                  {"cinematic_ladder_skip", "On"}, {"vr_interactions", "Immersive"},
-                 {"upscale_focus", "Medium"}}) {
+                 {"upscale_focus", "Medium"}, {"x_button", "Fan menu"}, {"canted_eyes", "On"},
+                 // The rest, read from the game's settings (2026-11-25), by hand: a word mapped
+                 // wrong that still lands on a real choice fails here.
+                 {"blade_sounds", "On"}, {"gun_wrist_reload", "Wrist flick"}, {"two_hand_guide", "On"},
+                 {"riposte_style", "On"}, {"weapon_wall", "On"}, {"vr_grab_attacks", "Off"},
+                 {"weighted_weapons", "On (Regular)"}, {"inject", "Stab to inject"},
+                 {"controls", "Motion"}, {"grip_adjust", "On"}, {"laser", "Off"},
+                 {"left_handed", "Off"}, {"swap_sticks", "Left stick"}, {"seated", "Standing"},
+                 {"player_hp_bonus_pct", "+10 %"}, {"melee_stamina_pct", "80%"},
+                 {"dodge_iframes_extra", "Off"}, {"first_person", "First person"},
+                 {"cinematic", "On"}, {"frame_overlap", "On"}, {"ui_counters", "Look down"},
+                 {"ui_hud_scale_deg", "Medium"}, {"hud_vitals", "Wrist gauge"},
+                 {"hit_vignette", "On"}, {"doll_respec", "On"}, {"holster_mode", "Grip + Body"},
+                 {"lamp_travel", "On"}, {"physical_levers", "On"}, {"physical_summon_bell", "On"},
+                 {"holster_haptics", "On"}, {"shoulder_vial", "On"}, {"shoulder_switch", "On"},
+                 {"aa_mode", "SMAA"}, {"lod_bias", "Performance"}, {"eye_adaptation", "On"},
+                 {"shadows_far", "Reduced"}, {"shadows_busy", "Off"}, {"raised_bricks", "On"},
+                 {"body_cutaway", "Fade"}, {"tp_view_follows_pitch", "Off"}, {"body_comfort", "Off"},
+                 {"height_base", "As the hunter"}, {"body_mode", "Full"}}) {
             const auto row = row_of(key);
             const Option *picked = nullptr;
+            for (const auto &k : row.keys)
+                Check(!CardDefault(k, 16ull << 30), "a row whose label the card would change");
             for (const auto &o : row.options) {
                 bool same = true;
-                for (size_t j = 0; j < row.keys.size(); ++j)
-                    same &= o.values[j] == Keep || SameValue(*CodeDefault(row.keys[j]), o.values[j]);
+                for (size_t j = 0; j < row.keys.size(); ++j) {
+                    const auto d = CodeDefault(row.keys[j]);
+                    same &= o.values[j] == Keep || (d && SameValue(*d, o.values[j]));
+                }
                 if (same) {
                     picked = &o;
                     break;
@@ -1568,6 +1724,37 @@ int main() {
             }
             Check(picked && std::string_view(picked->label) == option,
                   "the game's defaults pick the page's default choice");
+        }
+        // "Game default" names its value on every choice row (2026-11-25: "read the
+        // actual value the game default would have"), as main.cpp's SettingRow finds it: every
+        // key's default known (the card's, else the code's) and together they pick an option.
+        {
+            std::set<std::string> unnamed;
+            for (const uint64_t bytes : tier_bytes)
+                for (const auto &row : Settings()) {
+                    if (row.Number())
+                        continue;
+                    std::vector<std::optional<std::string>> defaults;
+                    bool known = true;
+                    for (const auto &key : row.keys) {
+                        const auto card = CardDefault(key, bytes);
+                        defaults.push_back(card ? card : CodeDefault(key));
+                        known &= bool(defaults.back());
+                    }
+                    bool named = false;
+                    for (const auto &o : row.options) {
+                        bool same = known;
+                        for (size_t j = 0; j < row.keys.size() && same; ++j)
+                            same = o.values[j] == Keep || SameValue(*defaults[j], o.values[j]);
+                        named |= same;
+                    }
+                    if (!named)
+                        unnamed.insert(std::string(row.category) + " | " + row.label + " (" +
+                                       row.keys[0] + ")");
+                }
+            for (const auto &row : unnamed)
+                std::printf("  no named default: %s\n", row.c_str());
+            Check(unnamed.empty(), "every choice row's game default names one of its choices");
         }
         Check(SearchFinds("boss bar", "health bars bosses only ui_boss_bar ui boss bar") &&
                   !SearchFinds("boss stamina", "health bars bosses only") && !SearchFinds("", "x"),
@@ -1621,10 +1808,42 @@ int main() {
         Check(damage.sign && damage.min == -60 && damage.max == 30 && damage.step == 5 &&
                   NumberValue(damage, -15) == "-15" && damage.category == std::string_view("Difficulty"),
               "damage dealt is the page's signed -60..30 % in steps of 5");
+        // Free vials when out (core/vr/vial_refill.h, 2026-11-23): 1..8, the code's 3 shown
+        // when vr.ini has no value, right after Extra health.
+        const auto vials = row_of("empty_vial_refill");
+        Check(vials.Number() && !vials.sign && vials.min == 1 && vials.max == 8 &&
+                  vials.step == 1 && vials.fallback == 3 && !vials.zero &&
+                  NumberValue(vials, 7) == "7" && NumberShown(vials, "8") == 8 &&
+                  vials.category == std::string_view("Difficulty"),
+              "free vials when out is the page's 1..8, 3 by default");
+        {
+            size_t hp = 0, vial = 0;
+            for (size_t i = 0; i < Settings().size(); ++i) {
+                if (Settings()[i].keys[0] == "player_hp_bonus_pct")
+                    hp = i;
+                if (Settings()[i].keys[0] == "empty_vial_refill")
+                    vial = i;
+            }
+            Check(vial == hp + 1, "free vials sit right after Extra health");
+        }
         Check(row_of("ui_enemy_hp_bars").options.size() == 4 &&
                   row_of("ui_enemy_hp_bars").options[3].ini_only,
               "health bars keep the page's file-only Enemies only");
         Check(NumberValue(row_of("color_saturation"), -100) == "-100", "signed colour values");
+        // Left-handed (core/vr/mirror_world.h): the launcher's own Controls row, Off or On, and
+        // a gamepad style locks it off.
+        {
+            const auto left = row_of("left_handed");
+            Check(std::string_view(left.category) == "Controls" && left.group &&
+                      std::string_view(left.group) == LauncherOnlyGroup && !left.id &&
+                      left.options.size() == 2 && left.options[0].values[0] == "0" &&
+                      left.options[1].values[0] == "1" && left.details && *left.details,
+                  "left-handed is the launcher's own Controls row, Off or On");
+            Check(VR::PlayStyle::IsForced(VR::PlayStyle::Style::PadFirst, "left_handed") &&
+                      VR::PlayStyle::IsForced(VR::PlayStyle::Style::PadThird, "left_handed") &&
+                      !VR::PlayStyle::IsForced(VR::PlayStyle::Style::Motion, "left_handed"),
+                  "a gamepad style locks left-handed off");
+        }
         Check(std::stof(NativeIpd("ipd_mm=42", false)) == 0.042f, "the page's 40..80 mm reaches renderer");
         // The page's snap turns leave the smooth speed alone.
         for (const auto &option : row_of("snap_turn_deg").options)
@@ -1669,6 +1888,9 @@ int main() {
         Check(GraphicsText(DefaultGraphics) == "1,0,0,1,1,0,1,100,80,85", "graphics text");
         const GraphicsFields dlss{1, -20, 1, 2, 1, 0, 1, 100, 80, 85};
         Check(ParseGraphics(GraphicsText(dlss)) == dlss, "graphics round trip");
+        auto panel_fit = dlss;
+        panel_fit[1] = -23;
+        Check(ParseGraphics(GraphicsText(panel_fit)) == panel_fit, "exact panel fit preserves DLSS");
         // Both launcher AA controls use this rule; match the game's DIBR support for every
         // provider and preserve AA when a saved DLSS 5 choice cannot run in DIBR.
         for (int provider = 0; provider <= 4; ++provider) {
@@ -1685,7 +1907,7 @@ int main() {
             }
         }
         // 5 is no upscaler (FSR 4.1 is 4 since 2026-10-31).
-        for (const char *bad : {"", "1,0,0", "2,0,0,1,1,0,1,100,80,85", "1,5,0,1,1,0,1,100,80,85",
+        for (const char *bad : {"", "1,0,0", "2,0,0,1,1,0,1,100,80,85", "1,-51,0,1,1,0,1,100,80,85",
                                 "1,0,5,1,1,0,1,100,80,85", "1,0,0,1,1,0,1,100,80,101",
                                 "1,0,0,1,1,0,1,100,80,85,7", "1, 0,0,1,1,0,1,100,80,85"})
             Check(ParseGraphics(std::string(bad)) == DefaultGraphics, "invalid graphics rejected");
@@ -1714,8 +1936,8 @@ int main() {
                 VR::Graphics::Config c{};
                 c.upscaler = VR::Graphics::Upscaler(provider);
                 Check(VR::Graphics::Unpack(VR::Graphics::Pack(c)).upscaler == c.upscaler &&
-                          (provider > 3 || (VR::Graphics::Pack(c) >> 37) == 0),
-                      "every upscaler packs, the first four as before FSR 4.1");
+                          ((VR::Graphics::Pack(c) >> 37) & 1u) == unsigned(provider >> 2),
+                      "every upscaler round trips with its upper provider bit at 37");
             }
         }
         // Exit codes, driver versions.

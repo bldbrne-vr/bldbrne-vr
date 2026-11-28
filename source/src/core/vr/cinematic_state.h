@@ -544,7 +544,10 @@ constexpr s32 LadderMaxHp = 100'000; // a larger maximum HP reading is not plaus
 
 struct LadderConfig {
     bool combat_exit{true};           // an attack, a blocked climb or damage returns to VR
-    s64 enter_delay_ns{500 * Millis}; // climbing this long after getting on before going flat
+    // climbing this long after getting on (from the first step) before going flat (500 until
+    // 2026-11-26, the user: the ladder fast climb to start "a tiny bit faster", "make it be 0.4s";
+    // then 400 until the user's "make the ladder kick in at 360ms" the same day)
+    s64 enter_delay_ns{360 * Millis};
     s64 min_flat_ns{1000 * Millis};   // a climb predicted to be flat for less stays in VR
     s64 exit_lead_ns{450 * Millis};   // back to VR this long before the dismount (0 = at it)
     s64 reenter_ns{1000 * Millis};    // no flat period sooner than this after the last one
@@ -797,12 +800,15 @@ public:
             Exit(out, now, false, "reset");
         }
         // Going flat: climbing (at least one step) long enough, not right after a return or a
-        // cut, and enough climb left.
+        // cut, and enough climb left. The rung counts at the start of a step, so the length check
+        // takes off the part of this step already climbed: the same ladders stay in VR whether
+        // enter_delay ends at a step's start (400 ms) or inside the first step (360 ms).
         if (!flat && armed && steps > 0 && !mounting && !suppressed && may_enter &&
             cut == nullptr && now - climb_since >= cfg.enter_delay_ns &&
             (!have_exit || now - last_exit >= cfg.reenter_ns)) {
             if (pred >= 0) {
-                if (pred - cfg.exit_lead_ns >= cfg.min_flat_ns) {
+                const s64 into_step = std::clamp<s64>(now - last_step, 0, step_ns);
+                if (pred - into_step - cfg.exit_lead_ns >= cfg.min_flat_ns) {
                     Enter(out);
                 } else if (!skip_logged) {
                     skip_logged = true;

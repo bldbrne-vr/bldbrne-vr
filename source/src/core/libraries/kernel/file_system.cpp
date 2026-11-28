@@ -7,7 +7,6 @@
 
 #include "common/assert.h"
 #include "common/slow_scope.h"
-#include "common/memory_write_trace.h"
 #include "common/error.h"
 #include "common/logging/log.h"
 #include "common/scope_exit.h"
@@ -24,7 +23,9 @@
 #include "core/file_sys/directories/normal_directory.h"
 #include "core/file_sys/directories/pfs_directory.h"
 #include "core/file_sys/fs.h"
+#include "core/file_sys/staged_read.h"
 #include "core/file_sys/backends/host_fs.h"
+#include "core/file_sys/file_override.h"
 #include "core/vr/soft_save.h"
 #include "core/libraries/kernel/file_system.h"
 #include "core/libraries/kernel/orbis_error.h"
@@ -361,26 +362,16 @@ s64 PS4_SYSV_ABI sceKernelWrite(s32 fd, const void* buf, u64 nbytes) {
     return result;
 }
 
-static thread_local std::vector<u8> file_buf{};
-
 s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
     Common::Slow::Scope slow{Common::Slow::FileRead, nbytes};
-    const auto* memory = Core::Memory::Instance();
-    // Invalidate up to the actual number of bytes that could be read.
-    const auto remaining = file->GetSize() - file->Tell();
-    memory->InvalidateMemory(reinterpret_cast<VAddr>(buf), std::min<u64>(nbytes, remaining));
-    if (file_buf.capacity() < nbytes) {
-        file_buf.reserve(nbytes);
+    const auto result = Core::FileSys::ThreadReadBuffer().Copy(buf, nbytes,
+        [file](u8* data, size_t size) { return file->Read(data, size); },
+        [](VAddr addr, u64 size) { Core::Memory::Instance()->InvalidateMemory(addr, size); });
+    if (!result) {
+        *__Error() = POSIX_ENOMEM;
+        return -1;
     }
-    s64 bytes = file->Read(file_buf.data(), nbytes);
-    if (bytes < 0) {
-        return bytes;
-    }
-    Common::MemoryWriteTrace::Event("file.copy.begin", reinterpret_cast<std::uintptr_t>(buf), bytes,
-        Common::MemoryWriteTrace::SourceWord(file_buf.data(), bytes));
-    std::memcpy(buf, file_buf.data(), bytes);
-    Common::MemoryWriteTrace::Event("file.copy.end", reinterpret_cast<std::uintptr_t>(buf), bytes);
-    return bytes;
+    return *result;
 }
 
 s64 PS4_SYSV_ABI readv(s32 fd, const OrbisKernelIovec* iov, s32 iovcnt) {
@@ -772,6 +763,9 @@ s32 PS4_SYSV_ABI posix_stat(const char* path, OrbisKernelStat* sb) {
         }
         std::unique_ptr<Core::FileSys::IFile> handle;
         if (!save_file) {
+            // (A stat's open: a switched layer decides as for the open that follows, which it
+            // keeps, and counts no load: file_override.h FileOverrideStatScope.)
+            const Core::FileSys::FileOverrideStatScope stat_scope;
             handle = mnt->Open(path, /*writable=*/false);
             if (handle) {
                 handle->Stat(fst);

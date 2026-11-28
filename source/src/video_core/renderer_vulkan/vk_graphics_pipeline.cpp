@@ -12,6 +12,8 @@
 #include "video_core/fast_render.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
+#include "shader_recompiler/ir/passes/ambient_occlusion.h"
+#include "shader_recompiler/ir/passes/reflections.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -398,19 +400,17 @@ GraphicsPipeline::GraphicsPipeline(
     // In practice, we use dynamic state for all of it.
     constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
 
-    // Fixed foveated rendering (vr_foveation.h): every pipeline may run in a pass with a shading
-    // rate attachment; the pipeline's own rate stays 1x1 and the attachment's replaces it (a pass
-    // without one shades at full rate, as before). A fragment shader writing depth/stencil or the
-    // sample mask on a card that restricts coarse shading with it keeps the attachment out
-    // (always 1x1), as the extension requires.
+    // Most pipelines take the attachment's rate, or 1x1 without an attachment.
+    // A shader that requires full rate must ignore the attachment as well.
     const bool foveated = instance.IsFoveationEnabled();
-    bool full_rate_only = false;
+    bool reflection_2x1 = false;
+    auto attachment_op = vk::FragmentShadingRateCombinerOpKHR::eReplace;
     if (foveated) {
         if (const auto* fs = infos[u32(Shader::LogicalStage::Fragment)]) {
             const bool depth = fs->stores.Get(Shader::IR::Attribute::Depth) ||
                                fs->stores.Get(Shader::IR::Attribute::StencilRef);
             const bool mask = fs->stores.Get(Shader::IR::Attribute::SampleMask) ||
-                              runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info.vr_cut != 0;
+                              runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info.CutsFragments();
             // A shader writing the lamp shadows' cubes or mask (light_shadow.h SceneMaps: the AO
             // pass) writes for its own pixel only: at a coarse rate the pixels it skips keep no
             // shadow, so it runs at full rate.
@@ -421,16 +421,34 @@ GraphicsPipeline::GraphicsPipeline(
             // (No longer: the shadow work covers a coarse fragment's block itself, and the AO the
             // pass makes stays at the eye's rate, as the game had it.)
             (void)writes_shadows;
-            full_rate_only = (depth && !instance.FoveationWithShaderDepth()) ||
-                             (mask && !instance.FoveationWithShaderSampleMask());
+            // The game's AO upsample (ambient_occlusion.h IsUpsampleProgram) divides by a tap's
+            // distance from the pixel, which is exactly 0 at a 4x4 block's centre: black
+            // stair-step wedges in the foveation's 4x4 zone (Performance and On; never Light,
+            // which has no 4x4), found 2026-11-27 in the mock's Pthumeru dungeon. Full rate for
+            // this one program. Cost: none measurable (its pass 0.024 ms a frame at 1200x1304 an
+            // eye, mock, Performance).
+            const bool ao_upsample =
+                Shader::Optimization::AmbientOcclusion::IsUpsampleProgram(fs->pgm_hash);
+            if ((depth && !instance.FoveationWithShaderDepth()) ||
+                (mask && !instance.FoveationWithShaderSampleMask()) || ao_upsample) {
+                attachment_op = vk::FragmentShadingRateCombinerOpKHR::eKeep;
+            } else if (instance.UseReflection2x1() &&
+                       Shader::Optimization::Reflections::IsTraceProgram(fs->pgm_hash) &&
+                       (runtime_infos[u32(Shader::LogicalStage::Fragment)].vr_ambient_occlusion &
+                        Shader::RuntimeInfo::VrReflections) &&
+                       sdata.multisampling.rasterizationSamples == vk::SampleCountFlagBits::e1 &&
+                       !sdata.multisampling.sampleShadingEnable) {
+                // The program ID and permutation flag survive cache warm-up. This is the
+                // wet-street trace alone; the final composite still shades at its usual rate.
+                reflection_2x1 = true;
+                attachment_op = vk::FragmentShadingRateCombinerOpKHR::eMax;
+            }
         }
     }
     const vk::PipelineFragmentShadingRateStateCreateInfoKHR foveation_rate = {
         .pNext = &pipeline_rendering_ci,
-        .fragmentSize = vk::Extent2D{1, 1},
-        .combinerOps = std::array{vk::FragmentShadingRateCombinerOpKHR::eKeep,
-                                  full_rate_only ? vk::FragmentShadingRateCombinerOpKHR::eKeep
-                                                 : vk::FragmentShadingRateCombinerOpKHR::eReplace},
+        .fragmentSize = vk::Extent2D{reflection_2x1 ? 2u : 1u, 1},
+        .combinerOps = std::array{vk::FragmentShadingRateCombinerOpKHR::eKeep, attachment_op},
     };
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = foveated ? static_cast<const void*>(&foveation_rate)

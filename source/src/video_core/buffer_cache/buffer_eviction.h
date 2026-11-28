@@ -13,7 +13,8 @@
 // added nothing). bbport's 0.6 rule, for what is safe here: under VRAM pressure a buffer unused
 // for IdleSeconds, or unused since a warp, death or new map (the passes after a transition), goes
 // when the game's memory holds all of its bytes, so that a buffer made there later uploads the
-// same ones. Never one that:
+// same ones. Once the sparse pool holds 640 MiB of pieces, the same rules also run below the
+// pressure mark (BufferCache::RunGarbageCollector). Never one that:
 // - the GPU wrote (no FAST_GPU_SETTLE: the game's copy is stale; the face glitch);
 // - has a right-eye twin (the right eye's bytes exist nowhere else): its twin alone goes
 //   instead (NativeStereo::ReleaseRight; a later per-eye write makes it again from the left),
@@ -24,8 +25,10 @@
 // (5.0 GB without the twins' release), the twins 35 MiB on each arrival, hitches as before.
 namespace VideoCore::BufferEviction {
 
-// Below the pressure mark nothing goes; under it a minute unused (an area left behind), over the
-// critical mark 5 s (bbport: the same, its BB_VRAM_IDLE_SECONDS and pressure age).
+// The idle rule: a minute unused (under pressure, and while roaming with a large sparse pool),
+// five seconds over the critical mark. Loads have their own cutoffs: the request's tick after a
+// confirmed map change; after any other load below pressure with a large sparse pool, the
+// request's tick or 5 s unused, whichever is older.
 inline std::uint64_t IdleSeconds(bool critical) {
     return critical ? 5 : 60;
 }

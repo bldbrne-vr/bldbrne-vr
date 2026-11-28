@@ -355,12 +355,9 @@ inline Vec3 AimFor(Vec3 from, Vec3 target, float speed, float gravity) {
 // A swing's return (2026-11-02: "a chance to ricochet the bullet back to the shooter
 // ... a specific angle where that happens and if it is within that range then have it be a chance
 // based on how accurate the swing was"; the odds theirs): the chance that a swing's bounce heading
-// `off_deg` from the shooter goes back at him. Within `snap_deg` 88 in 100; past it, at each fifth
-// of the way to the window's edge (`window_deg`; 25, 30, 35, 40 and 45 degrees with the defaults)
-// 7 in 10, 6 in 10, 43 in 100, now and then (15 in 100) and never, straight lines between. 0 past
-// the window. (8 in 10, 6 in 10, 1 in 2, 1 in 3, 1 in 20 until 2026-11-03, the user's "a tiny bit
-// easier to go back to the shooter"; then 85 / 67 / 57 / 40 / 12, and "a tiny tiny bit more".)
-constexpr std::array<float, 6> ReturnOdds{0.88f, 0.70f, 0.60f, 0.43f, 0.15f, 0.0f};
+// `off_deg` from the shooter goes back at him. The first value applies throughout the snap
+// angle. The remaining values are spaced evenly out to the edge of the return window.
+constexpr std::array<float, 6> ReturnOdds{0.91f, 0.73f, 0.63f, 0.46f, 0.18f, 0.0f};
 
 inline float ReturnChance(float off_deg, float snap_deg, float window_deg) {
     if (!std::isfinite(off_deg) || !(window_deg > 0.0f) || off_deg > window_deg) {

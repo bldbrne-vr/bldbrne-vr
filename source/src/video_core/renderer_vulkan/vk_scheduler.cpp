@@ -1,3 +1,4 @@
+#include "core/vr/s1_dynamic_resolution.h"
 #include "video_core/host_copies.h"
 #include "video_core/flip_order_trace.h"
 #include "video_core/native_stereo/native_stereo.h"
@@ -24,10 +25,12 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <boost/container/static_vector.hpp>
 #include <immintrin.h>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
+#include "common/scope_exit.h"
 #include "common/thread.h"
 #include "core/memory.h"
 #include "video_core/renderer_vulkan/vk_gpu_crash.h"
@@ -54,6 +57,41 @@ namespace Vulkan {
 
 bool VrSceneMaskOn(); // (vk_pipeline_cache.h: the mask's switch and the session's lamp shadows)
 
+// The draw scheduler owns its rate maps. Replaced maps retire at the recording tick,
+// after every command referencing their image has completed.
+struct FoveationResources {
+    vk::Device device;
+    VmaAllocator allocator{};
+    VkImage image{};
+    VmaAllocation image_allocation{};
+    vk::ImageView view{};
+
+    ~FoveationResources() {
+        if (view) device.destroyImageView(view);
+        if (image) vmaDestroyImage(allocator, image, image_allocation);
+    }
+};
+struct FoveationMap {
+    u32 width{}, height{};
+    bool mono{};
+    Foveation::Settings zones{};
+    u32 drop{};
+    bool from_fov{};
+    std::unique_ptr<FoveationResources> resources;
+};
+constexpr size_t MaxFoveationMaps = 64;
+struct FoveationCache {
+    boost::container::static_vector<FoveationMap, MaxFoveationMaps> maps;
+    size_t next_victim{};
+    std::chrono::steady_clock::time_point retry_after{}, last_prebuild{};
+    struct Done {
+        u32 width, height;
+        float inner, outer, ring;
+        u32 floor;
+    };
+    std::vector<Done> prebuilt;
+};
+
 std::mutex Scheduler::submit_mutex;
 
 namespace {
@@ -67,15 +105,16 @@ bool GpuTimingAsked() {
     return wanted;
 }
 // ... or the lamp shadows' trace dial, which reads LastGpuFrameMs (light_shadow.h SceneMaps::Dial),
-// only with the lamp shadows on (VrSceneMaskOn; read at the first frame mark, after the start).
+// only with the lamp shadows on (VrSceneMaskOn: live since 2026-11-21, so a session started with
+// the game's shadows times its frames from the moment ours are turned on).
 bool GpuTimingWanted() {
-    static const bool wanted = [] {
+    static const bool dials = [] {
         namespace Scene = Shader::Optimization::LightShadow::SceneMaps;
-        return GpuTimingAsked() || (VrSceneMaskOn() && Scene::TraceAll() && Scene::Dial() &&
-                                    Scene::TraceFarPinned() < 0.0f) ||
-               (VrSceneMaskOn() && Scene::StepDial());
+        return (Scene::TraceAll() && Scene::Dial() && Scene::TraceFarPinned() < 0.0f) ||
+               Scene::StepDial();
     }();
-    return wanted;
+    return GpuTimingAsked() || (dials && VrSceneMaskOn()) ||
+           (S1Drs::enabled && S1Drs::timing_wanted.load(std::memory_order_relaxed));
 }
 // LastGpuFrameMs: the last frame read back, and the frames read so far.
 std::atomic<float> g_last_gpu_ms{-1.0f};
@@ -157,11 +196,16 @@ struct GpuFrameTimer {
     std::vector<std::pair<u64, u64>> spans; // the frame being read back: each buffer's start, end
     u64 prev_end{0};
     std::vector<float> busy_ms, span_ms, gap_ms; // the window
+    std::vector<float> longest_ms; // the window: each frame's longest single command buffer
+    u64 long_buffers{0};           // the window: command buffers longer than 2 ms
     std::chrono::steady_clock::time_point window_start{}; // its first frame (VR_GPU_TIMING_WINDOW_S)
     u64 buffers{0};
     u32 skipped{0};
 };
 GpuFrameTimer gpu_timer;
+// The timer made (its query pool and target set, once, by the recording thread): read by
+// GpuFrameTimerMark on another thread.
+std::atomic<bool> g_gpu_timer_made{false};
 // VR_GPU_PASSES: the timed scheduler, read by its recording thread without the lock (the pass
 // fields below are only touched by that thread: BeginRendering, EndRendering, and
 // GpuTimerBegin / GpuTimerEnd, which it calls).
@@ -173,6 +217,9 @@ void GpuTimerBegin(const Scheduler* scheduler, vk::CommandBuffer cmdbuf) {
         return;
     }
     t.open = -1;
+    if (!GpuTimingWanted()) {
+        return; // (not wanted now: nothing stamped; GpuFrameTimerMarkNow drops what is left)
+    }
     if (t.used[t.next]) {
         ++t.skipped; // every slot still in flight
         return;
@@ -333,16 +380,30 @@ __attribute__((no_profile_instrument_function)) void GpuTimerReport(GpuFrameTime
     const double span_max = *std::max_element(t.span_ms.begin(), t.span_ms.end());
     const double busy_p50 = rank(t.busy_ms, 0.5);
     const double busy_p99 = rank(t.busy_ms, 0.99);
+    const double longest_avg = avg(t.longest_ms);
+    const double longest_max = *std::max_element(t.longest_ms.begin(), t.longest_ms.end());
+    const double longest_p50 = rank(t.longest_ms, 0.5);
+    const double longest_p99 = rank(t.longest_ms, 0.99);
     LOG_BENCHMARK_INFO(Render_Vulkan,
              "VR gpu frame: {} game frames: GPU busy per frame avg {:.2f} / p50 {:.2f} / p99 "
              "{:.2f} / max {:.2f} ms, span (first start -> last end) avg {:.2f} / max {:.2f} ms, "
              "idle before a frame avg {:.2f} ms; {:.1f} command buffers per frame, {} untimed",
              frames, busy_avg, busy_p50, busy_p99, busy_max, span_avg, span_max, gap_avg,
              static_cast<double>(t.buffers) / static_cast<double>(frames), t.skipped);
+    // How long one command buffer holds the GPU (2026-11-21, the SteamVR stutter: SteamVR's
+    // compositor over Link is an ordinary-priority client of Meta's runtime). LOG_INFO: compiled out
+    // of release builds (BBVR_NO_LOGS), benchmark children included.
+    LOG_INFO(Render_Vulkan,
+             "VR gpu frame: longest command buffer per frame avg {:.2f} / p50 {:.2f} / p99 {:.2f} / "
+             "max {:.2f} ms; {:.2f} buffers per frame over 2 ms",
+             longest_avg, longest_p50, longest_p99, longest_max,
+             static_cast<double>(t.long_buffers) / static_cast<double>(frames));
     GpuPassReport(t, frames);
     t.busy_ms.clear();
     t.span_ms.clear();
     t.gap_ms.clear();
+    t.longest_ms.clear();
+    t.long_buffers = 0;
     t.buffers = 0;
     t.skipped = 0;
 }
@@ -389,6 +450,12 @@ void GpuTimerFinishFrame(GpuFrameTimer& t) {
                            ? static_cast<float>(static_cast<double>(first - t.prev_end) * to_ms)
                            : 0.0f);
     t.prev_end = last;
+    u64 longest = 0;
+    for (const auto& [s, e] : t.spans) {
+        longest = std::max(longest, e - s);
+        t.long_buffers += static_cast<double>(e - s) * to_ms > 2.0 ? 1 : 0;
+    }
+    t.longest_ms.push_back(static_cast<float>(static_cast<double>(longest) * to_ms));
     t.buffers += t.spans.size();
     t.spans.clear();
     const auto window = GpuTimingWindow();
@@ -401,6 +468,21 @@ void GpuTimerFinishFrame(GpuFrameTimer& t) {
 
 static void GpuFrameTimerMarkNow(Scheduler& scheduler, const Instance& instance) {
     if (!GpuTimingWanted()) {
+        // Not wanted now (the lamp shadows' dial, ours switched to the game's): the frames stamped
+        // meanwhile are let go of, so the first frame read once it is wanted again is a new one
+        // (the 2026-11-21 review: the slots filled while off, and the dial's first reading after
+        // the switch back was a frame from before it). The recording thread, as GpuTimerBegin /
+        // End; a slot is stamped again only after a reset recorded later on the same queue.
+        auto& t = gpu_timer;
+        if (t.target == &scheduler) {
+            // (Under the lock before looking: GpuTimerEnd pushes under it.)
+            std::scoped_lock lk{Scheduler::submit_mutex};
+            for (const GpuFrameTimer::Pending& p : t.pending) {
+                t.used[p.slot] = false;
+            }
+            t.pending.clear();
+            t.spans.clear();
+        }
         return;
     }
     const Common::Log::DeferScope log_defer; // its log lines: once the lock is released
@@ -428,6 +510,7 @@ static void GpuFrameTimerMarkNow(Scheduler& scheduler, const Instance& instance)
         t.pool = pool;
         t.tick_ns = period;
         t.target = &scheduler; // timed from its next command buffer on
+        g_gpu_timer_made.store(true, std::memory_order_release);
         LOG_INFO(Render_Vulkan,
                  "VR gpu frame: timing the game's frames on the GPU (VR_GPU_TIMING)");
         if (const auto window = GpuTimingWindow(); window.count() > 0) {
@@ -549,7 +632,9 @@ u64 NowNs() {
 }
 } // namespace
 void GpuFrameTimerMark(Scheduler& scheduler, const Instance&) {
-    if (GpuTimingWanted())
+    // (Once the timer is made, every frame: not wanted, GpuFrameTimerMarkNow lets the frames
+    // stamped before go, so the first frame read when it is wanted again is a new one.)
+    if (GpuTimingWanted() || g_gpu_timer_made.load(std::memory_order_acquire))
         scheduler.RecordFrameMark();
 }
 float LastGpuFrameMs(unsigned* frames) {
@@ -1549,53 +1634,47 @@ void FoveationSteps() {
 
 // The zones of the next eye-sized pass: the live vr.ini foveation (the VR page sets it), or the
 // run's VR_FOVEATED. Off: no attachment, full rate.
-Foveation::Settings FoveationNow(const Instance& instance) {
-    if (instance.IsFoveationFixed())
-        return instance.GetFoveationSettings();
+int FoveationModeNow() {
     static const bool stepped = std::getenv("VR_FOVEATION_STEPS") != nullptr;
-    if (stepped)
-        FoveationSteps();
-    return Foveation::Choose(nullptr, VR::Graphics::foveation.load(std::memory_order_relaxed));
+    if (stepped) FoveationSteps();
+    return VR::Graphics::foveation.load(std::memory_order_relaxed);
 }
 
-// Fixed foveated rendering (vr_foveation.h): one rate map per eye-sized pass extent and level,
-// built on the recording thread from each eye's optical axis (the image centre until the
-// headset's angles are known, then built again once). A few KB each, kept for the process: a
-// level chosen again on the VR page finds its map. `mono`: DIBR's one view, a single layer
-// centred on the image (the mono camera's axis; both eyes are warped from it).
-struct FoveationMap {
-    u32 width{}, height{};
-    bool mono{};
-    Foveation::Settings zones{};
-    bool from_fov{};
-    vk::ImageView view{};
-};
-vk::ImageView FoveationView(const Instance& instance, CommandRecorder& recorder, u32 width,
-                            u32 height, bool mono, const Foveation::Settings& zones) {
-    static std::vector<FoveationMap> maps;
-    FoveationMap* existing = nullptr;
-    for (auto& m : maps) {
+FoveationMap* FindFoveationMap(FoveationCache& cache, u32 width, u32 height, bool mono, const Foveation::Settings& zones,
+                               u32 drop) {
+    for (auto& m : cache.maps) {
         if (m.width == width && m.height == height && m.mono == mono &&
             m.zones.inner == zones.inner && m.zones.outer == zones.outer &&
-            m.zones.ring == zones.ring) {
-            existing = &m;
-            break;
+            m.zones.ring == zones.ring && m.drop == drop) {
+            return &m;
         }
     }
+    return nullptr;
+}
+vk::ImageView FoveationView(FoveationCache& cache, Scheduler& scheduler, const Instance& instance,
+                            CommandRecorder& recorder, u32 width,
+                            u32 height, bool mono, const Foveation::Settings& zones, u32 drop) {
+    auto& maps = cache.maps;
+    FoveationMap* existing = FindFoveationMap(cache, width, height, mono, zones, drop);
     // The usual case, every eye-sized pass: the map is final. No head read (GetHead locks the
     // head state the OpenXR thread writes; read per pass, it cost the recording thread ~1 ms a
     // frame).
     if (existing && existing->from_fov) {
-        return existing->view;
+        return existing->resources->view;
+    }
+    using Clock = std::chrono::steady_clock;
+    auto& retry_after = cache.retry_after;
+    if (retry_after != Clock::time_point{}) {
+        if (Clock::now() < retry_after) {
+            return existing ? existing->resources->view : vk::ImageView{};
+        }
+        retry_after = {};
     }
     const auto head = VR::GetHead();
     const bool fov =
         mono || (VR::EyeFov::Valid(head.eye_fov[0]) && VR::EyeFov::Valid(head.eye_fov[1]));
     if (existing && !fov) {
-        return existing->view;
-    }
-    if (!existing && maps.size() >= 24) {
-        return {};
+        return existing->resources->view;
     }
     const auto texel = instance.GetFoveationTexel();
     const u32 layers = !mono && instance.IsFoveationLayered() ? 2 : 1;
@@ -1608,12 +1687,7 @@ vk::ImageView FoveationView(const Instance& instance, CommandRecorder& recorder,
         cx[0] = 0.5f * (cx[0] + cx[1]);
         cy[0] = 0.5f * (cy[0] + cy[1]);
     }
-    std::vector<u8> bytes;
-    for (u32 layer = 0; layer < layers; ++layer) {
-        const auto map = Foveation::Map(width, height, texel.width, texel.height, cx[layer],
-                                        cy[layer], zones, instance.HasFoveation4x4());
-        bytes.insert(bytes.end(), map.begin(), map.end());
-    }
+    const size_t layer_bytes = size_t(nx) * ny;
     const VmaAllocator allocator = instance.GetAllocator();
     const vk::ImageCreateInfo image_ci{
         .imageType = vk::ImageType::e2D,
@@ -1629,12 +1703,17 @@ vk::ImageView FoveationView(const Instance& instance, CommandRecorder& recorder,
     const VmaAllocationCreateInfo image_alloc{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     VkImage image{};
     VmaAllocation image_allocation{};
+    const auto failed = [&] {
+        retry_after = Clock::now() + std::chrono::seconds(1);
+        return existing ? existing->resources->view : vk::ImageView{};
+    };
     if (vmaCreateImage(allocator, reinterpret_cast<const VkImageCreateInfo*>(&image_ci),
                        &image_alloc, &image, &image_allocation, nullptr) != VK_SUCCESS) {
-        return existing ? existing->view : vk::ImageView{};
+        return failed();
     }
+    auto release_image = SCOPE_GUARD { vmaDestroyImage(allocator, image, image_allocation); };
     const VkBufferCreateInfo buffer_ci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                                       .size = bytes.size(),
+                                       .size = layer_bytes * layers,
                                        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
     const VmaAllocationCreateInfo buffer_alloc{
         .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
@@ -1645,10 +1724,24 @@ vk::ImageView FoveationView(const Instance& instance, CommandRecorder& recorder,
     VmaAllocationInfo buffer_info{};
     if (vmaCreateBuffer(allocator, &buffer_ci, &buffer_alloc, &buffer, &buffer_allocation,
                         &buffer_info) != VK_SUCCESS) {
-        return existing ? existing->view : vk::ImageView{};
+        return failed();
     }
-    std::memcpy(buffer_info.pMappedData, bytes.data(), bytes.size());
-    vmaFlushAllocation(allocator, buffer_allocation, 0, VK_WHOLE_SIZE);
+    auto upload = detail::MakeScopeGuard([allocator, buffer, buffer_allocation] {
+        vmaDestroyBuffer(allocator, buffer, buffer_allocation);
+    });
+    if (!buffer_info.pMappedData) {
+        return failed();
+    }
+    auto* mapped = static_cast<u8*>(buffer_info.pMappedData);
+    for (u32 layer = 0; layer < layers; ++layer) {
+        if (!Foveation::WriteMap({mapped + layer * layer_bytes, layer_bytes}, width, height,
+                                 texel.width, texel.height, cx[layer], cy[layer], zones,
+                                 instance.HasFoveation4x4(), float(100 - drop) / 100.0f))
+            return failed();
+    }
+    if (vmaFlushAllocation(allocator, buffer_allocation, 0, VK_WHOLE_SIZE) != VK_SUCCESS) {
+        return failed();
+    }
     auto [view_result, view] = instance.GetDevice().createImageView({
         .image = image,
         .viewType = vk::ImageViewType::e2DArray,
@@ -1656,8 +1749,19 @@ vk::ImageView FoveationView(const Instance& instance, CommandRecorder& recorder,
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, layers},
     });
     if (view_result != vk::Result::eSuccess) {
-        return existing ? existing->view : vk::ImageView{};
+        return failed();
     }
+    auto release_view = SCOPE_GUARD { instance.GetDevice().destroyImageView(view); };
+    auto resources = std::make_unique<FoveationResources>();
+    resources->device = instance.GetDevice();
+    resources->allocator = allocator;
+    resources->image = image;
+    resources->image_allocation = image_allocation;
+    resources->view = view;
+    release_view.Cancel();
+    // The staging allocation is only needed until this transfer completes.
+    scheduler.DeferOperation([upload = std::move(upload)] {});
+    release_image.Cancel();
     const vk::CommandBuffer cmd = recorder.Raw("foveation_map", std::source_location::current());
     vk::ImageMemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eNone,
@@ -1692,16 +1796,21 @@ vk::ImageView FoveationView(const Instance& instance, CommandRecorder& recorder,
                                             .pImageMemoryBarriers = &barrier});
     LOG_INFO(Render_Vulkan,
              "VR foveation: rate map {}x{} ({} layer(s)) for {}x{} {}passes, inner {:.2f}, outer "
-             "{:.2f}, axes L ({:.3f}, {:.3f}) R ({:.3f}, {:.3f}){}",
+             "{:.2f}, axes L ({:.3f}, {:.3f}) R ({:.3f}, {:.3f}), view at {}%{}",
              nx, ny, layers, width, height, mono ? "DIBR (mono) " : "", zones.inner, zones.outer,
-             cx[0], cy[0], cx[1], cy[1],
+             cx[0], cy[0], cx[1], cy[1], 100 - drop,
              fov ? "" : " (image centre until the headset's angles are known)");
-    if (existing) {
-        existing->view = view; // the old map stays alive: earlier passes may still use it
-        existing->from_fov = fov;
-        return view;
+    if (!existing && maps.size() == MaxFoveationMaps) {
+        existing = &maps[cache.next_victim];
+        cache.next_victim = (cache.next_victim + 1) % MaxFoveationMaps;
     }
-    maps.push_back({width, height, mono, zones, fov, view});
+    FoveationMap entry{width, height, mono, zones, drop, fov, std::move(resources)};
+    if (existing) {
+        scheduler.DeferOperation([old = std::move(existing->resources)] {});
+        *existing = std::move(entry);
+    } else {
+        maps.push_back(std::move(entry));
+    }
     return view;
 }
 
@@ -1711,7 +1820,65 @@ const bool g_foveated_dibr = [] {
     const char* value = std::getenv("VR_FOVEATED_DIBR");
     return !(value && value[0] == '0');
 }();
+// VR_FOVEATION_DRS ('0' off, on by default; read once): the zones follow dynamic resolution's
+// narrower view (SetFoveationDrop); off, every pass takes the full-scale map (the A/B).
+const bool g_foveation_follows_drs = [] {
+    const char* value = std::getenv("VR_FOVEATION_DRS");
+    return !(value && value[0] == '0');
+}();
+
+// Dynamic resolution's steps (core/vr/s1_dynamic_resolution.h; 2026-11-24): their maps made ahead,
+// at most one a frame, so the first frame of a step - one already late, the reason for the step -
+// makes none, and no frame makes a burst of them. Only while the governor can step (timing_wanted:
+// the last frame could be scaled) and only the steps the floor in force allows (none at 100%: no
+// map for a player whose resolution never drops), each extent and set of zones once a floor. Never
+// into the cap's last PrebuildRoom maps, which stay for the passes' own (a pass without its map
+// shades at full rate). A map that cannot be made is not tried again here (the step's own pass
+// still asks, as before).
+void PrebuildFoveationSteps(FoveationCache& cache, Scheduler& scheduler, const Instance& instance,
+                            CommandRecorder& recorder, u32 width,
+                            u32 height, const Foveation::Settings& zones) {
+    constexpr size_t PrebuildRoom = 16;
+    const u32 floor = S1Drs::floor_percent.load(std::memory_order_relaxed);
+    if (floor >= 100 || !S1Drs::timing_wanted.load(std::memory_order_relaxed)) {
+        return;
+    }
+    auto& done = cache.prebuilt;
+    for (const auto& d : done) {
+        if (d.width == width && d.height == height && d.inner == zones.inner &&
+            d.outer == zones.outer && d.ring == zones.ring && d.floor == floor) {
+            return;
+        }
+    }
+    u32 missing = 0; // the first step without its map
+    for (u32 level = 1; level <= 3 && missing == 0; ++level) {
+        const u32 drop = 100 - std::max(100 - 10 * level, floor);
+        if (drop != 0 && !FindFoveationMap(cache, width, height, false, zones, drop)) {
+            missing = drop;
+        }
+    }
+    if (missing != 0 && cache.maps.size() + PrebuildRoom < MaxFoveationMaps) {
+        // (A frame's passes begin within a few milliseconds of each other.)
+        auto& last_build = cache.last_prebuild;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_build < std::chrono::milliseconds(6)) {
+            return;
+        }
+        last_build = now;
+        if (FoveationView(cache, scheduler, instance, recorder, width, height, false, zones, missing)) {
+            return; // (the next step's at a later frame)
+        }
+        // (Out of memory: no retries from here.)
+    }
+    if (done.size() < 32) {
+        done.push_back({width, height, zones.inner, zones.outer, zones.ring, floor});
+    }
+}
 } // namespace
+
+u32 Scheduler::FoveationDrop() const {
+    return g_foveation_follows_drs ? foveation_drop : 0u;
+}
 
 void Scheduler::SetMonoFoveation(vk::Extent2D extent) {
     if (g_foveated_dibr) {
@@ -1828,9 +1995,14 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     };
     const bool stereo_pass = render_state.probe_view_mask == 3 &&
                              eye_sized(render_state.width, render_state.height);
+    int applied_mode = VR::Graphics::FfrPending;
     if (instance.IsFoveationEnabled() && !foveation_blocked && (stereo_pass || mono_pass) &&
         render_state.width >= 256 && render_state.height >= 256 && VR::IsImmersive()) {
-        auto zones = FoveationNow(instance);
+        const bool fixed = instance.IsFoveationFixed();
+        const int mode = fixed ? VR::Graphics::FfrOverride : FoveationModeNow();
+        auto zones = fixed ? instance.GetFoveationSettings() : Foveation::Choose(nullptr, mode);
+        if (zones.on && !foveation_cache)
+            foveation_cache = std::make_unique<FoveationCache>();
         // (The pass about to begin asked for a wider full-rate zone: the lamp shadows' mask,
         // light_shadow.h MaskFoveaInner. Its own map, kept like the others.)
         if (zones.on && foveation_inner_floor > zones.inner) {
@@ -1838,9 +2010,11 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
             zones.outer = std::max(zones.outer, zones.inner);
         }
         if (const vk::ImageView view =
-                zones.on ? FoveationView(instance, blob_open ? *blob : Main(), render_state.width,
+                zones.on ? FoveationView(*foveation_cache, *this, instance, blob_open ? *blob : Main(), render_state.width,
                                          render_state.height, render_state.probe_view_mask != 3,
-                                         zones)
+                                         zones,
+                                         // (DIBR never scales: its mono view is the whole image)
+                                         stereo_pass ? FoveationDrop() : 0u)
                          : vk::ImageView{}) {
             foveation = vk::RenderingFragmentShadingRateAttachmentInfoKHR{
                 .imageView = view,
@@ -1850,12 +2024,22 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
             rendering_info.pNext = &foveation;
             pass_foveated = true;
         }
+        if (!fixed)
+            applied_mode = zones.on && !pass_foveated ? VR::Graphics::FfrNoMap : mode;
+        if (zones.on && stereo_pass && g_foveation_follows_drs && S1Drs::enabled) {
+            PrebuildFoveationSteps(*foveation_cache, *this, instance, blob_open ? *blob : Main(), render_state.width,
+                                   render_state.height, zones);
+        }
     }
     if (pass_target.load(std::memory_order_acquire) == this) {
         Main().Raw("gpu_pass_profile", std::source_location::current());
         GpuPassBegin(this, current_cmdbuf, render_state);
     }
     Commands().beginRendering(rendering_info);
+    if (applied_mode != VR::Graphics::FfrPending &&
+        VR::Graphics::foveation_applied.load(std::memory_order_relaxed) != applied_mode) {
+        VR::Graphics::foveation_applied.store(applied_mode, std::memory_order_relaxed);
+    }
     if (GpuCrash::CheckpointsOn()) [[unlikely]] {
         GpuCheckpoint(static_cast<u8>(GpuCrash::Kind::RenderPass),
                       (render_state.probe_view_mask & 0xff) |

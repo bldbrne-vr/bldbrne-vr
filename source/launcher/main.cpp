@@ -6,6 +6,7 @@
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #include "core.h"
+#include "mods.h"
 #include "benchmark.h"
 #include "controls_guide.h"
 #include "controller_diagram.h"
@@ -17,10 +18,12 @@
 #include "core/vr/play_style.h"
 #include "core/vr/graphics_resolution.h"
 #include "core/vr/headset_panels.h"
+#include "core/vr/mirror_world.h"
 #include <mutex>
 #include "resource.h"
 #include <Velopack.hpp>
 #include <atomic>
+#include <cmath>
 #include <d3d11.h>
 #include <dwmapi.h>
 #include <future>
@@ -124,6 +127,8 @@ static void UninstallThisCopy() {
 #endif
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 static HWND window_handle{};
+static fs::path dropped_mod;
+static bool invalid_mod_drop{};
 static int repaint = 3;
 static bool close_requested{};
 static UINT resize_width{}, resize_height{};
@@ -224,6 +229,17 @@ static LRESULT WINAPI WindowProc(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
     if (ImGui_ImplWin32_WndProcHandler(window, msg, wp, lp))
         return 1;
     switch (msg) {
+    case WM_DROPFILES: {
+        const auto drop = reinterpret_cast<HDROP>(wp);
+        wchar_t name[32768]{};
+        invalid_mod_drop = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0) != 1 ||
+                           !DragQueryFileW(drop, 0, name, DWORD(std::size(name)));
+        if (!invalid_mod_drop)
+            dropped_mod = name;
+        else dropped_mod.clear();
+        DragFinish(drop);
+        return 0;
+    }
     case WM_SIZE:
         if (wp != SIZE_MINIMIZED) {
             resize_width = LOWORD(lp);
@@ -435,6 +451,7 @@ struct App {
     Profile profile;
     std::string ini;
     std::map<std::string, std::optional<std::string>> edits;
+    std::string close_edit_summary;
     int page{}, category{};
     std::optional<HeadsetRequest> headset_request;
     double headset_request_read{-1};
@@ -452,15 +469,42 @@ struct App {
         std::string expected_ini, expected_profile;
     };
     std::optional<PendingGameLaunch> pending_game_launch;
+    fs::path mod_game;
+    std::vector<Mods::Package> mods;
+    std::optional<Mods::Package> mod_selection;
+    bool confirm_mod_removal{};
+    Mods::Report mod_report;
+    struct ModResult {
+        std::optional<Mods::Package> selection;
+        Mods::Report report;
+        std::string note;
+    };
+    std::future<ModResult> mod_task;
+    bool mod_refresh = true;
+    bool mod_list_ok = false;
+    size_t mod_file_page = 0;
+    std::string mod_note;
     int frame_rate_draft=90;
     bool frame_rate_editing=false;
     struct PendingBenchmarkApply {
         Benchmark::Candidate candidate;
         int target_hz;
         std::string expected_ini, expected_profile;
+        fs::path folder; // the scan report's
+        Profile before;
     };
     std::optional<PendingBenchmarkApply> pending_benchmark_apply;
+    // The scan suggestion applied last (its report and candidate) and the settings before it: the
+    // scan window lists what Apply changed while the saved settings still hold it.
+    struct AppliedScan {
+        fs::path folder;
+        std::string id;
+        Profile before;
+        std::string before_ini;
+    };
+    std::optional<AppliedScan> benchmark_applied;
     std::future<Benchmark::Headset> benchmark_apply_task;
+    bool close_after_benchmark_apply{};
     std::optional<Benchmark::Headset> benchmark_headset;
     std::string headset_error;
     bool open_perf_scan = false;
@@ -686,7 +730,7 @@ struct App {
         if (moving.valid())
             return true;
 #endif
-        return task.valid() || benchmark_task.valid() || headset_task.valid() || benchmark_apply_task.valid();
+        return task.valid() || benchmark_task.valid() || headset_task.valid() || benchmark_apply_task.valid() || mod_task.valid();
     }
     // Busy, or making sharper skies or weapons (repaints for its progress; Play waits for it).
     bool Working() const {
@@ -806,19 +850,41 @@ struct App {
         });
     }
     void Tick() {
+        if (mod_task.valid() && mod_task.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            mod_note.clear();
+            mod_selection.reset();
+            mod_file_page = 0;
+            confirm_mod_removal = false;
+            Try([&] {
+                auto result = mod_task.get();
+                mod_report = std::move(result.report);
+                mod_selection = std::move(result.selection);
+                mod_note = std::move(result.note);
+            });
+            mod_refresh = true;
+            repaint = 3;
+        }
         if(benchmark_apply_task.valid() && benchmark_apply_task.wait_for(std::chrono::seconds(0))==std::future_status::ready) {
+            // WM_CLOSE can also arrive on the very frame verification completes. Only resume
+            // closing once both files are saved and reloaded. A failure stays visible for review.
+            const bool finish_close = close_after_benchmark_apply || close_requested;
+            close_after_benchmark_apply = close_requested = false;
             Try([&] {
                 const auto verified_headset=benchmark_apply_task.get();
                 if(benchmark_cancel) throw std::runtime_error("Applying the recommendation was cancelled. Settings unchanged.");
                 RequireStopped();
                 const auto& pending=*pending_benchmark_apply;
-                if(Read(paths.Profile())!=pending.expected_profile)
+                if (!edits.empty())
+                    throw std::runtime_error("VR settings changed during verification. Save or discard your edits and apply the scan again.");
+                if(profile_pending || Read(paths.Profile())!=pending.expected_profile)
                     throw std::runtime_error("Launcher settings changed during verification. Review and apply again.");
                 profile=Benchmark::ApplySettings(paths,profile,pending.candidate,pending.target_hz,pending.expected_ini);
+                benchmark_applied=AppliedScan{pending.folder,pending.candidate.id,pending.before,pending.expected_ini};
                 benchmark_headset=verified_headset;
                 Reload();
                 status="Recommendation applied. Check how it looks in VR.";
                 LogBenchmark(status);
+                close_requested = finish_close;
             });
             pending_benchmark_apply.reset();
             repaint=3;
@@ -1042,13 +1108,27 @@ struct App {
         ImGui::PushID("play_style");
         const int pick = Combo(styles[size_t(current)].first, picks);
         ImGui::PopID();
+        const float row_height = ImGui::GetFrameHeight(); // the box's, with its padding
         ImGui::PopStyleVar();
+        // Left-handed right beside it (2026-11-25), centred on the box's height.
+        ImGui::SameLine(0.f, S(18));
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (row_height - ImGui::GetFrameHeight()) * .5f);
+        LeftHandedOption(current);
         if (pick >= 0 && styles[size_t(pick)].second != current)
             Try([&] {
                 RequireStopped();
-                Edit("play_style", VR::PlayStyle::Name(styles[size_t(pick)].second));
+                SetPlayStyle(styles[size_t(pick)].second);
             });
-        Hint(current == Style::Motion
+        // (Third person as the game reads first_person: VR::Mirror::ThirdPersonWord, "0" or "0.0".)
+        const auto first_person = Value("first_person");
+        Hint(current == Style::Motion && LeftHandedTicked() && first_person &&
+                     VR::Mirror::ThirdPersonWord(*first_person)
+                 ? "Left-handed needs the first-person camera (VR settings > Extras > Camera). "
+                   "In third person you play right-handed."
+             : current == Style::Motion && LeftHandedTicked()
+                 ? "Swing, shoot and heal with the VR controllers. Left-handed: the weapon in "
+                   "your left hand, the gun in your right."
+             : current == Style::Motion
                  ? "Swing, shoot and heal with the VR controllers."
              : current == Style::PadFirst
                  ? "First person with a gamepad and the game's own buttons. Motion-only settings "
@@ -1056,6 +1136,14 @@ struct App {
                  : "Third person with a gamepad: the hunter in view, the game's own buttons. "
                    "Motion-only settings are locked.");
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + S(4));
+    }
+    void SetPlayStyle(VR::PlayStyle::Style chosen) {
+        const auto saved = VR::Ini::ValueOf(ini, "play_style");
+        // Returning to the saved style also restores its spelling (or absent default).
+        if (VR::PlayStyle::Parse(saved.value_or("motion")) == chosen)
+            Edit("play_style", saved);
+        else
+            Edit("play_style", VR::PlayStyle::Name(chosen));
     }
     // The play style the next launch uses (pending edits included).
     VR::PlayStyle::Style PlayStyleNow() {
@@ -1071,6 +1159,42 @@ struct App {
         return false;
     }
     static constexpr const char *PlayStyleLockedText = "Set by Play style";
+    // Left-handed is ticked for the next launch (pending edits included); only First Person /
+    // Motion plays it (a gamepad style sets it off: core/vr/play_style.h).
+    bool LeftHandedTicked() {
+        const auto value = Value("left_handed");
+        return PlayStyleNow() == VR::PlayStyle::Style::Motion && value && VR::Mirror::OnWord(*value);
+    }
+    // Left-handed beside Play style (2026-11-25: "right next to the Play style
+    // selection"): the Controls tab's launcher-only row (vr.ini left_handed), same switch.
+    // Unticked is the game's default (Off): the key leaves vr.ini, unless the file already holds an
+    // off value (the Controls tab's Off writes "0"), which is kept; ticked keeps the file's own on
+    // word ("true") the same way: no edit for the same thing (VR::Mirror::OnWord, as the game reads).
+    void LeftHandedOption(VR::PlayStyle::Style style) {
+        static const Setting *row = [] {
+            for (const auto &s : Settings())
+                if (s.keys.front() == "left_handed")
+                    return &s;
+            return static_cast<const Setting *>(nullptr);
+        }();
+        const bool motion = style == VR::PlayStyle::Style::Motion;
+        bool on = LeftHandedTicked();
+        ImGui::BeginDisabled(!motion);
+        if (Checkbox("Left-handed", &on))
+            Try([&] {
+                RequireStopped();
+                const auto file = VR::Ini::ValueOf(ini, "left_handed");
+                const bool file_on = file && VR::Mirror::OnWord(*file);
+                Edit("left_handed", on        ? (file_on ? file : std::optional<std::string>("1"))
+                                    : file && !file_on ? file
+                                                       : std::nullopt);
+            });
+        ImGui::EndDisabled();
+        Details(!motion ? "Gamepad play styles are right-handed. Pick First Person / Motion to "
+                          "play left-handed."
+                : row   ? row->details
+                        : nullptr);
+    }
     void LaunchOptions() {
         if (Checkbox("Fullscreen desktop mirror", &profile.fullscreen)) {
             profile.fullscreen_chosen = true; // the player's own choice from now on
@@ -1863,6 +1987,7 @@ struct App {
     }
     void Edit(const std::string &key, std::optional<std::string> value) {
         // A reset (the game default, a tab's defaults, a right-click) goes through ResetValue.
+        const bool reset = !value;
         if (!value)
             value = ResetValue(key);
         if (value == VR::Ini::ValueOf(ini, key))
@@ -1871,6 +1996,18 @@ struct App {
             edits[key] = value;
         status = edits.empty() ? "Settings match the saved file."
                                : "Unsaved settings. Save or launch to apply.";
+        // A reset also removes the keys that would undo it (ResetAlsoRemoves: Light attack stamina's
+        // old switch, when on), as the VR page's reset does.
+        if (reset)
+            for (const std::string &other : ResetAlsoRemoves(key, LinesOf("melee_stamina")))
+                Edit(other, std::nullopt);
+    }
+    // A key's lines for the next launch: a pending edit's value alone (none for a removal: the save
+    // writes it so, every line of the key replaced), else the file's, in order.
+    std::vector<std::string> LinesOf(const std::string &key) {
+        if (const auto it = edits.find(key); it != edits.end())
+            return it->second ? std::vector<std::string>{*it->second} : std::vector<std::string>{};
+        return VR::Ini::ValuesOf(ini, key);
     }
     GraphicsFields PendingGraphics() {
         return ParseGraphics(Value("graphics_config"));
@@ -1956,6 +2093,7 @@ struct App {
         }
     }
     static constexpr ImVec4 high_red{0.93f, 0.33f, 0.28f, 1};
+    static constexpr ImVec4 ready_green{141 / 255.f, 160 / 255.f, 114 / 255.f, 1}; // HuntStatus's light
     // The game's estimated graphics memory for these fields (EstimateVramMb), MB; 0 when it does
     // not apply (DIBR renders one view: the fit is for native stereo).
     double VramMb(const HeadsetRequest &h, const GraphicsFields &f) {
@@ -2005,17 +2143,21 @@ struct App {
         if (!h)
             return false;
         auto f = PendingGraphics();
-        const auto output = EyeSizes(*h, f).first;
+        const auto [output, render] = EyeSizes(*h, f);
         const double vram = VramMb(*h, f);
         const bool high = output.width > HighEyeWidth;
         if (!high && VramFits(vram))
             return false;
         BeginBanner("resolution-warning", high_red,
                     high ? "RESOLUTION TOO HIGH" : "MAY NOT FIT IN GRAPHICS MEMORY");
-        if (high)
-            ImGui::TextWrapped("Each eye renders %u x %u. This is likely to stutter, judder or "
-                               "drop frames in the headset.",
-                               output.width, output.height);
+        if (high) {
+            if (render.width != output.width || render.height != output.height)
+                ImGui::TextWrapped("Render target per eye: %u x %u, upscaled output: %u x %u.",
+                                   render.width, render.height, output.width, output.height);
+            else
+                ImGui::TextWrapped("Requested output per eye: %u x %u.", output.width, output.height);
+            ImGui::TextWrapped("At this output size, demanding scenes may drop frames.");
+        }
         if (!VramFits(vram))
             ImGui::TextWrapped("These settings need about %.1f of your card's %.0f GB of video "
                                "memory: expect stutters and missing textures.",
@@ -2080,7 +2222,9 @@ struct App {
         EndBanner();
     }
     void SetGraphics(const GraphicsFields &fields) {
-        Edit("graphics_config", GraphicsText(fields));
+        const auto saved = VR::Ini::ValueOf(ini, "graphics_config");
+        Edit("graphics_config", !saved && fields == DefaultGraphics
+                                    ? std::nullopt : std::optional<std::string>(GraphicsText(fields)));
     }
     fs::path RuntimePath() const {
         try {
@@ -2157,11 +2301,13 @@ struct App {
         if (ImGui::BeginChild("scan-body", {-1,0},
                 ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize,
                 ImGuiWindowFlags_NoBackground)) {
-            Hint(benchmark_report ? "Review the measured settings. Nothing changes until you press Apply."
-                                  : "Finds smooth settings in 3-6 minutes. Nothing changes until you press Apply.");
+            Hint(ScanSuggestionInUse() ? "These settings are saved. The game uses them the next time you play."
+                 : benchmark_report ? "Review the measured settings. Nothing changes until you press Apply."
+                                    : "Finds smooth settings in 3-6 minutes. Nothing changes until you press Apply.");
             ImGui::Separator();
             if (benchmark_apply_task.valid()) {
-                Hint("Verifying hardware and headset before applying settings...");
+                Hint(close_after_benchmark_apply ? "Applying settings. The launcher will close when they are saved."
+                                                 : "Verifying hardware and headset before applying settings...");
                 if (Button("Cancel apply")) benchmark_cancel = true;
             }
             if (!benchmark_report || Header("Headset and scan setup"))
@@ -2200,8 +2346,7 @@ struct App {
         if(running) Hint("Stop the game before detecting the headset or running a scan.");
         if (sky.task.valid() || weapons.task.valid())
             Hint("Finish or cancel the texture upgrade before running a scan.");
-        const auto package=ExecutableDirectory()/"benchmark";
-        const bool available=fs::is_regular_file(package/"manifest.json");
+        const bool available=ScanFilesPresent();
         if(!available) Hint("This build has no scan files.");
         if(!edits.empty()) Hint("Save or discard your edits first.");
         if(benchmark_task.valid()) {
@@ -2251,31 +2396,122 @@ struct App {
             if(benchmark_headset) {
                 ImGui::BeginDisabled(preview || Working() || running || !available || !edits.empty());
                 HunterTheme::PushAccent();
-                if(Button(benchmark_report ? "Re-run PERF SCAN" : "RUN PERF SCAN",{S(176),S(38)})) Try([&] {
-                    RequireStopped();
-                    Benchmark::Request request{profile,paths,package,*benchmark_headset,FullSystem(),benchmark_auto_hz?0:benchmark_hz,150};
-                    request.quick=!benchmark_thorough;
-                    benchmark_cancel=false; benchmark_report.reset();
-                    {std::lock_guard lock(benchmark_mutex);benchmark_log.clear();benchmark_run_start.reset();benchmark_log_start=std::chrono::steady_clock::now();}
-                    LogBenchmark("Checking headset settings...");
-                    benchmark_task=std::async(std::launch::async,[this,request]() mutable {
-                        try {
-                            const auto current=Benchmark::ScanHeadset(Path(request.profile.runtime),&benchmark_cancel);
-                            if(current.name!=request.headset.name || current.width!=request.headset.width || current.height!=request.headset.height ||
-                               std::abs(current.refresh_hz-request.headset.refresh_hz)>.5f)
-                                throw std::runtime_error("Headset settings changed. Detect the headset again before running the scan.");
-                            request.headset=current;
-                            {std::lock_guard lock(benchmark_mutex);benchmark_run_start=std::chrono::steady_clock::now();}
-                            return Benchmark::Run(request,benchmark_cancel,[this](const std::string& message) {
-                                LogBenchmark(message);
-                            });
-                        } catch(const std::exception& e) { Benchmark::Report r; r.cancelled=benchmark_cancel.load(); if(!r.cancelled) r.error=e.what(); return r; }
-                    });
-                });
+                if(Button(benchmark_report ? "Re-run PERF SCAN" : "RUN PERF SCAN",{S(176),S(38)})) StartScan();
                 ImGui::PopStyleColor(4);
                 ImGui::EndDisabled();
             }
         }
+    }
+    fs::path ScanPackage() const { return ExecutableDirectory()/"benchmark"; }
+    bool ScanFilesPresent() const { return fs::is_regular_file(ScanPackage()/"manifest.json"); }
+    // Why a scan cannot start now (the setup's button and the applied suggestion's), nullptr when
+    // it can.
+    const char* ScanBlocked() const {
+        if(running) return "Close the game to scan again.";
+        if(Working()) return "Wait for the current launcher task to finish.";
+        if(!edits.empty()) return "Save or discard your setting changes to scan again.";
+        if(!benchmark_headset) return "No headset detected. Open Headset and scan setup to detect it.";
+        if(!ScanFilesPresent()) return "This build has no scan files.";
+        return nullptr;
+    }
+    void StartScan() {
+        if(preview || ScanBlocked()) return;
+        Try([&] {
+            RequireStopped();
+            Benchmark::Request request{profile,paths,ScanPackage(),*benchmark_headset,FullSystem(),benchmark_auto_hz?0:benchmark_hz,150};
+            request.quick=!benchmark_thorough;
+            benchmark_cancel=false; benchmark_report.reset();
+            {std::lock_guard lock(benchmark_mutex);benchmark_log.clear();benchmark_run_start.reset();benchmark_log_start=std::chrono::steady_clock::now();}
+            LogBenchmark("Checking headset settings...");
+            benchmark_task=std::async(std::launch::async,[this,request]() mutable {
+                try {
+                    const auto current=Benchmark::ScanHeadset(Path(request.profile.runtime),&benchmark_cancel);
+                    if(current.name!=request.headset.name || current.width!=request.headset.width || current.height!=request.headset.height ||
+                       std::abs(current.refresh_hz-request.headset.refresh_hz)>.5f)
+                        throw std::runtime_error("Headset settings changed. Detect the headset again before running the scan.");
+                    request.headset=current;
+                    {std::lock_guard lock(benchmark_mutex);benchmark_run_start=std::chrono::steady_clock::now();}
+                    return Benchmark::Run(request,benchmark_cancel,[this](const std::string& message) {
+                        LogBenchmark(message);
+                    });
+                } catch(const std::exception& e) { Benchmark::Report r; r.cancelled=benchmark_cancel.load(); if(!r.cancelled) r.error=e.what(); return r; }
+            });
+        });
+    }
+    // The scan report's suggestion (recommended, else provisional); nullptr without one.
+    const Benchmark::Result* ScanSuggestion() const {
+        if(!benchmark_report || benchmark_report->cancelled || !benchmark_report->error.empty()) return nullptr;
+        const auto& r=*benchmark_report;
+        const auto at=r.recommended ? r.recommended : r.provisional;
+        return at ? &r.results[*at] : nullptr;
+    }
+    // Whether the saved settings already hold it: Apply would change nothing.
+    bool ScanSuggestionInUse() const {
+        const auto* s=ScanSuggestion();
+        return s && Benchmark::SettingsInUse(profile,ini,s->candidate,benchmark_report->target_hz);
+    }
+    // A tick in the launcher's ready green (the Play page's ready light), a line of `font` tall,
+    // before the heading on its right.
+    void Tick(ImFont* font) {
+        const float h=font->FontSize;
+        const auto p=ImGui::GetCursorScreenPos();
+        const ImVec2 points[]{{p.x+h*.12f,p.y+h*.54f},{p.x+h*.38f,p.y+h*.78f},{p.x+h*.86f,p.y+h*.24f}};
+        ImGui::GetWindowDrawList()->AddPolyline(points,3,ImGui::GetColorU32(ready_green),ImDrawFlags_None,S(2.2f));
+        ImGui::Dummy({h,h});
+        ImGui::SameLine(0,S(8));
+    }
+    // What a scan suggestion set, one setting a row: its name, what it was where that changed, and
+    // its value now, the changed ones in the tick's green. Nothing changed (already in use): the
+    // names and values alone.
+    void AppliedSettingsTable(const std::vector<Benchmark::AppliedSetting>& rows) {
+        constexpr const char* arrow="\xE2\x86\x92"; // from Segoe UI Symbol, merged into the text font
+        bool changed=false;
+        float name_width=0,before_width=0;
+        ImGui::PushFont(sidebar_tag_font);
+        const float heading_width=ImGui::CalcTextSize("BEFORE").x;
+        ImGui::PopFont();
+        for(const auto& r:rows) {
+            changed|=!r.before.empty();
+            name_width=std::max(name_width,ImGui::CalcTextSize(r.name.c_str()).x);
+            before_width=std::max(before_width,ImGui::CalcTextSize(r.before.c_str()).x);
+        }
+        const auto heading=[&](const char* text) {
+            ImGui::PushFont(sidebar_tag_font);
+            ImGui::TextColored(muted,"%s",text);
+            ImGui::PopFont();
+        };
+        ImGui::PushStyleVar(ImGuiStyleVar_CellPadding,{S(6),S(4)});
+        if(ImGui::BeginTable("scan-applied",changed?4:2,ImGuiTableFlags_BordersInnerH|ImGuiTableFlags_NoPadOuterX)) {
+            ImGui::TableSetupColumn("Setting",ImGuiTableColumnFlags_WidthFixed,name_width+S(28));
+            if(changed) {
+                ImGui::TableSetupColumn("Before",ImGuiTableColumnFlags_WidthFixed,std::max(before_width,heading_width)+S(10));
+                ImGui::TableSetupColumn("Arrow",ImGuiTableColumnFlags_WidthFixed,ImGui::CalcTextSize(arrow).x+S(10));
+            }
+            ImGui::TableSetupColumn("Now",ImGuiTableColumnFlags_WidthStretch);
+            if(changed) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(1);
+                heading("BEFORE");
+                ImGui::TableSetColumnIndex(3);
+                heading("NOW");
+            }
+            for(const auto& r:rows) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextColored(muted,"%s",r.name.c_str());
+                if(changed) {
+                    ImGui::TableNextColumn();
+                    if(!r.before.empty()) ImGui::TextColored(muted,"%s",r.before.c_str());
+                    ImGui::TableNextColumn();
+                    if(!r.before.empty()) ImGui::TextColored(muted,"%s",arrow);
+                }
+                ImGui::TableNextColumn();
+                if(r.before.empty()) ImGui::TextUnformatted(r.value.c_str());
+                else ImGui::TextColored(ready_green,"%s",r.value.c_str());
+            }
+            ImGui::EndTable();
+        }
+        ImGui::PopStyleVar();
     }
     void BenchmarkRecommendationDetails(const Benchmark::Result& winner, int target_hz) {
         const auto& candidate = winner.candidate;
@@ -2310,9 +2546,7 @@ struct App {
             break;
         }
         ImGui::Text("Target cap: %d FPS | AA: %s", target_hz,
-                    upscaler ? "temporal upscaler (SMAA bypassed)" : "SMAA");
-        if (candidate.stereo == StereoPreset::Dibr)
-            ImGui::TextUnformatted("Eye TAA (Simplified Rendering): 0.25");
+                    upscaler ? "temporal upscaler (yours is bypassed)" : "yours, from the Picture tab");
         ImGui::Text("Slower repeat: %.1f FPS | GPU: %.2f ms | FPS reserve: %+.1f%%",
                     winner.fps, winner.gpu_ms, 100.0*(winner.fps/target_hz-1.0));
     }
@@ -2322,6 +2556,9 @@ struct App {
         const auto suggestion=report.recommended ? report.recommended : report.provisional;
         const bool provisional=!report.recommended && report.provisional.has_value();
         bool apply=false; // the suggestion box's Apply button, pressed this frame
+        // The applied box's Re-run, pressed this frame: the scan starts after this report is drawn
+        // (StartScan frees the report that `report`, `winner` and `c` refer to).
+        bool rerun=false;
         if(!report.cancelled && report.error.empty())
             ImGui::ProgressBar(1.0f,{-1,S(20)},"100% - Scan complete");
         if(!report.error.empty())ImGui::TextWrapped("%s",report.error.c_str());
@@ -2330,16 +2567,29 @@ struct App {
         if(suggestion && !report.cancelled && report.error.empty()) {
             const auto& winner=report.results[*suggestion];
             const auto& c=winner.candidate;
+            // Once the saved settings hold it, the box says so and lists them (2026-11-25, the user:
+            // after Apply the window only asked to apply again). Applied from this report: what each
+            // was before; a match without that (or after a later change) is already in use.
+            const bool in_use=Benchmark::SettingsInUse(profile,ini,c,report.target_hz);
+            if(!in_use) benchmark_applied.reset();
+            const bool applied_here=in_use && benchmark_applied &&
+                                    benchmark_applied->folder==report.folder && benchmark_applied->id==c.id;
             // The suggestion in a gold box, its summary in the heading font, so it is the first thing
             // seen (2026-10-25, the user: the results easier to see, the Apply button louder).
             ImGui::Dummy({0,S(6)});
             ImGui::PushStyleColor(ImGuiCol_ChildBg,{.084f,.073f,.058f,1});
-            ImGui::PushStyleColor(ImGuiCol_Border,{.42f,.35f,.25f,1});
+            ImGui::PushStyleColor(ImGuiCol_Border,in_use?ImVec4{.36f,.42f,.29f,1}:ImVec4{.42f,.35f,.25f,1});
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,{S(14),S(12)});
             ImGui::BeginChild("scan-suggestion",{0,0},ImGuiChildFlags_Borders|ImGuiChildFlags_AutoResizeY|ImGuiChildFlags_AlwaysUseWindowPadding);
             ImGui::PopStyleVar();
             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {ImGui::GetStyle().ItemSpacing.x,S(9)});
-            ImGui::TextColored(gold,provisional?"PROVISIONAL SETTINGS - NOT YET CONFIRMED":winner.meets_target?"RECOMMENDED SETTINGS":"LIMITED HEADROOM - FALLBACK ONLY");
+            if(in_use) {
+                ImGui::PushFont(brand_font);
+                Tick(brand_font);
+                ImGui::TextColored(ready_green,"%s",applied_here?"SETTINGS APPLIED":"ALREADY IN USE");
+                ImGui::PopFont();
+            } else
+                ImGui::TextColored(gold,provisional?"PROVISIONAL SETTINGS - NOT YET CONFIRMED":winner.meets_target?"RECOMMENDED SETTINGS":"LIMITED HEADROOM - FALLBACK ONLY");
             {
                 std::string summary = StereoLabel(c.stereo);
                 if(c.graphics[2]) summary+=std::string(", ")+(c.graphics[2]==1?"DLSS":c.graphics[2]==2?"FSR 4":"FSR 3.1.5")+" "+PresetName(c.graphics[c.graphics[2]==1?3:4]);
@@ -2348,23 +2598,47 @@ struct App {
                 ImGui::TextWrapped("%s",summary.c_str());
                 ImGui::PopFont();
                 ImGui::Text("%.1f FPS on a %d FPS target (%+.1f%% reserve)",winner.fps,report.target_hz,100.0*(winner.fps/report.target_hz-1.0));
+                // The scan measured the player's own picture (Benchmark::PictureSettings).
+                Hint(report.picture==Benchmark::PictureSettings(ini)
+                         ? "Measured with your Picture settings: shadows, fog, ambient occlusion and the rest."
+                         : "Your Picture settings changed since this scan. Re-run it to match them.");
             }
-            // Apply right under the summary, crimson and larger, as the other buttons that are the one
-            // thing to press (the details follow). The preview shows the look, never applies.
-            const bool can_apply=!(preview || Working() || running || !edits.empty());
-            const bool loud=can_apply || preview;
-            ImGui::BeginDisabled(!can_apply);
-            if(loud) {
-                HunterTheme::PushAccent();
+            if(in_use) {
+                AppliedSettingsTable(Benchmark::AppliedSettings(applied_here ? benchmark_applied->before : profile,
+                                                                applied_here ? benchmark_applied->before_ini : ini,
+                                                                c,report.target_hz));
+                // What next: scan again, or see them among the launcher's settings. The preview
+                // shows the look, never scans.
+                const char* blocked=preview ? nullptr : ScanBlocked();
+                ImGui::BeginDisabled(blocked!=nullptr);
+                if(Button("Re-run PERF SCAN",{S(176),S(38)})) rerun=true;
+                ImGui::EndDisabled();
+                ImGui::SameLine(0,S(10));
+                if(Button("Open Graphics settings",{S(210),S(38)})) {
+                    page=1;
+                    OpenTab("Graphics");
+                    ImGui::CloseCurrentPopup();
+                }
+                if(blocked) Hint(blocked);
+            } else {
+                // Apply right under the summary, crimson and larger, as the other buttons that are the
+                // one thing to press (the details follow). The preview shows the look, never applies.
+                const bool can_apply=!(preview || Working() || running || !edits.empty());
+                const bool loud=can_apply || preview;
+                ImGui::BeginDisabled(!can_apply);
+                if(loud) {
+                    HunterTheme::PushAccent();
+                }
+                apply=Button(provisional?"APPLY PROVISIONAL SETTINGS":winner.meets_target?"APPLY RECOMMENDATION":"APPLY LIMITED-HEADROOM FALLBACK",
+                    loud?ImVec2{S(340),S(44)}:ImVec2{0,0});
+                if(loud) ImGui::PopStyleColor(4);
+                ImGui::EndDisabled();
+                if(!can_apply && running) Hint("Close the game to apply.");
+                else if(!can_apply && !edits.empty()) Hint("Save or discard your setting changes to apply.");
             }
-            apply=Button(provisional?"APPLY PROVISIONAL SETTINGS":winner.meets_target?"APPLY RECOMMENDATION":"APPLY LIMITED-HEADROOM FALLBACK",
-                loud?ImVec2{S(340),S(44)}:ImVec2{0,0});
-            if(loud) ImGui::PopStyleColor(4);
-            ImGui::EndDisabled();
-            if(!can_apply && running) Hint("Close the game to apply.");
-            else if(!can_apply && !edits.empty()) Hint("Save or discard your setting changes to apply.");
             if(!winner.meets_target) Hint("Not confirmed smooth. Try a longer scan or a lower refresh rate.");
-            if(provisional) Hint("One run passed. Run again to confirm, or try it now.");
+            if(provisional) Hint(in_use ? "One run passed. Re-run the scan to confirm it."
+                                        : "One run passed. Run again to confirm, or try it now.");
             if (Header("Render and timing details")) {
                 BenchmarkRecommendationDetails(winner,report.target_hz);
             }
@@ -2387,7 +2661,8 @@ struct App {
                     throw std::runtime_error("Effects protection differs from this scan or was "
                                              "not recorded. Run a fresh benchmark.");
                 const auto runtime=RuntimePath(), game=Path(profile.game);
-                PendingBenchmarkApply pending{c,hardware.at("target_hz").get<int>(),ini,Read(paths.Profile())};
+                PendingBenchmarkApply pending{c,hardware.at("target_hz").get<int>(),ini,Read(paths.Profile()),
+                                              report.folder,profile};
                 benchmark_cancel=false;
                 benchmark_apply_task=std::async(std::launch::async,[this,runtime,game,hardware] {
                     const auto current_system=ReadSystem();
@@ -2450,6 +2725,7 @@ struct App {
         Hint("Best confirmed option of the settings tested.");
         Hint("Measured in a test scene: busy areas can be slower. Check the look in VR.");
         if(!report.folder.empty() && Button("Open benchmark report"))OpenPath(report.folder);
+        if(rerun) StartScan(); // last: nothing of the old report is read after this
     }
     // A launcher-drawn row of the Graphics or Extras tab under `group`: whether the search (if
     // any) finds it by these words, its group and its tab.
@@ -2791,10 +3067,17 @@ struct App {
     void ExtrasTab() {
         if (Finds(nullptr, "free camera fly flying sightseeing photo photo mode explore spectator"))
             Row("Free camera", "Sightseeing in VR from the start of the next launch.",
-                "Left stick: fly. Right stick: turn / height. The trigger, a grip or the left stick "
-                "pressed: fast (two at once: faster). X: the view back to the hunter. Y: free camera "
-                "off. Menu: game menu. In the game: VR page > You > Free camera. Enemies ignore the "
-                "hunter while it is on; distant areas may not load. The world does not pause.", [&] {
+                LeftHandedNow() // left-handed play: the controllers trade jobs
+                    ? "Right stick: fly. Left stick: turn / height. The trigger, a grip or the right "
+                      "stick pressed: fast (two at once: faster). A: the view back to the hunter. B: "
+                      "free camera off. Menu: game menu. In the game: VR page > You > Free camera. "
+                      "Enemies ignore the hunter while it is on; distant areas may not load. The "
+                      "world does not pause."
+                    : "Left stick: fly. Right stick: turn / height. The trigger, a grip or the left "
+                      "stick pressed: fast (two at once: faster). X: the view back to the hunter. Y: "
+                      "free camera off. Menu: game menu. In the game: VR page > You > Free camera. "
+                      "Enemies ignore the hunter while it is on; distant areas may not load. The "
+                      "world does not pause.", [&] {
                     bool enabled = profile.free_camera;
                     if (Checkbox("Free camera next launch", &enabled)) Try([&] {
                         RequireStopped();
@@ -2909,6 +3192,11 @@ struct App {
         if (!job.note.empty() && !busy)
             Hint(job.note.c_str());
     }
+    // Left-handed play as the file has it (ControlsGuide::LeftHanded): the tooltips, the Move with
+    // choices and the notes for the other side.
+    bool LeftHandedNow() {
+        return ControlsGuide::LeftHanded([this](const std::string &key) { return Value(key); });
+    }
     // A row's label and help as the game words them: the buttons of the Controls page's headset
     // and of these settings ("Grip adjust (A+B)").
     ControlsGuide::RowText Words(const Setting &row) {
@@ -2950,7 +3238,8 @@ struct App {
         const bool style_locked = LockedByPlayStyle(row);
         if (style_locked)
             text = PlayStyleLockedText;
-        Row(words.label.c_str(), words.help.c_str(), row.details, [&] {
+        const std::string sided = LeftHandedNow() ? LeftHandedDetails(row) : std::string{};
+        Row(words.label.c_str(), words.help.c_str(), sided.empty() ? row.details : sided.c_str(), [&] {
             ImGui::BeginDisabled(style_locked);
             const int min = row.zero ? row.min - 1 : row.min;
             int slider = zero ? min : shown;
@@ -2964,6 +3253,19 @@ struct App {
         });
     }
     void SettingRow(const Setting &row, const ControlsGuide::RowText &words) {
+        if (row.keys.front() == "dynamic_resolution") {
+            const auto& key = row.keys.front();
+            const auto& on = row.options[0];
+            const auto& off = row.options[1];
+            const bool enabled = !SameValue(Value(key).value_or("1"), off.values[0]);
+            Row(words.label.c_str(), words.help.c_str(), row.details, [&] {
+                const int pick = Combo(enabled ? on.label : off.label,
+                                       {{on.label, enabled, true, ""}, {off.label, !enabled, true, ""}});
+                if (pick >= 0)
+                    Edit(key, row.options[size_t(pick)].values[0]);
+            });
+            return;
+        }
         if (row.Number()) {
             NumberRow(row, words);
             return;
@@ -2973,6 +3275,11 @@ struct App {
         bool any = false, defaults_known = true, by_card = false;
         for (const auto &key : row.keys) {
             values.push_back(ChoiceOverride(key, Value(key)));
+            // Light attack stamina as the game reads the lines (StaminaPctAsRead): an old
+            // melee_stamina=1 without a melee_stamina_pct line it reads is the full cost; a line it
+            // refuses is not a value.
+            if (key == "melee_stamina_pct")
+                values.back() = StaminaPctAsRead(LinesOf(key), LinesOf("melee_stamina"));
             any |= bool(values.back());
             // A key the file lacks counts as its game default where that is known (a row that
             // sets two keys, one of them set by an older launcher's separate row).
@@ -2999,9 +3306,19 @@ struct App {
         const int picked = any ? match(effective) : -1;
         const int selected = !any ? 0 : picked >= 0 ? picked + 1 : -1;
         const int default_option = defaults_known ? match(defaults) : -1;
+        // Left-handed play: Move with names your thumb (the controllers trade hands); every other
+        // row (and right-handed play) shows its own words, nothing made per frame.
+        const bool sided_names = row.id && std::string_view(row.id) == "move_with" && LeftHandedNow();
+        std::vector<std::string> sided_labels;
+        if (sided_names)
+            for (const auto &o : row.options)
+                sided_labels.push_back(VR::Mirror::SideWords(o.label));
+        const auto shown = [&](size_t i) {
+            return sided_names ? sided_labels[i].c_str() : row.options[i].label;
+        };
         std::string game_default = by_card ? "Auto" : "Game default";
         if (default_option >= 0)
-            game_default += std::string(" (") + row.options[size_t(default_option)].label + ")";
+            game_default += std::string(" (") + shown(size_t(default_option)) + ")";
         std::string custom = "Custom";
         for (const auto &v : values)
             custom += " / " + v.value_or("default");
@@ -3016,13 +3333,14 @@ struct App {
                 ? UpscalerBypassesAa(graphics, stereo)
                 : !FoveatedUpscaleAvailable(graphics, stereo);
         }
-        Row(words.label.c_str(), words.help.c_str(), row.details, [&] {
+        const std::string sided = LeftHandedNow() ? LeftHandedDetails(row) : std::string{};
+        Row(words.label.c_str(), words.help.c_str(), sided.empty() ? row.details : sided.c_str(), [&] {
             // An ini-only choice shows when the file holds it but is not offered (vr_page.h).
             std::vector<Pick> picks{{game_default.c_str(), selected == 0, true, ""}};
             std::vector<size_t> offered;
             for (size_t i = 0; i < row.options.size(); ++i)
                 if (!row.options[i].ini_only) {
-                    picks.push_back({row.options[i].label, selected == int(i) + 1, true, ""});
+                    picks.push_back({shown(i), selected == int(i) + 1, true, ""});
                     offered.push_back(i);
                 }
             ImGui::BeginDisabled(locked);
@@ -3031,7 +3349,7 @@ struct App {
                                    : selected < 0 ? custom.c_str()
                                    : selected == 0
                                        ? game_default.c_str()
-                                       : row.options[size_t(selected - 1)].label,
+                                       : shown(size_t(selected - 1)),
                                    picks);
             ImGui::EndDisabled();
             if (style_locked)
@@ -3090,6 +3408,8 @@ struct App {
              "save saves backup backups restore savedata", -1},
             {"Controls", "Every control for Quest, PSVR and Frame, and how to play.",
              "controls buttons bindings quest psvr ps vr2 frame how to play gestures", 3},
+            {"Mod library", "Import a ZIP, review conflicts or switch installed mods.",
+             "mods mod library install import zip conflict enable disable remove", 4},
             {"Updates", "New versions of Bldbrne-VR.", "updates update version download release",
              2}};
         pending_tab = nullptr;
@@ -3438,7 +3758,7 @@ struct App {
         }
         if (!controls_guide && needle.empty() && Header("Controller and runtime notes")) {
             ImGui::PushTextWrapPos(0);
-            Hint(ControlsGuide::PlatformNote(platform).c_str());
+            Hint(ControlsGuide::PlatformNote(platform, LeftHandedNow()).c_str());
             ImGui::PopTextWrapPos();
         }
         for (const auto &section : controls_guide ? ControlsGuide::Interactions(platform, value, xr_runtime)
@@ -3542,7 +3862,262 @@ struct App {
         if (HunterTheme::Link("View releases"))
             Try([&] { OpenPath(L"https://github.com/bldbrne-vr/bldbrne-vr/releases"); });
     }
+    static ModResult ReviewMod(const fs::path& game, const Mods::Package& pkg, std::string note = {}) {
+        ModResult result{pkg, {}, std::move(note)};
+        // Keep Disable and Remove reachable even if the imported data cannot be scanned.
+        try { result.report = Mods::Scan(game, pkg); }
+        catch (const std::exception& e) { result.report.conflicts.emplace_back(e.what()); }
+        return result;
+    }
+    enum class ModAccess { Read, Change };
+    template<class F> void StartModTask(std::string note, F action, ModAccess access = ModAccess::Change) {
+        if (preview) throw std::runtime_error("Open the regular launcher to change mods.");
+        if (game_folder_needed) throw std::runtime_error("On Play, choose your Bloodborne game folder, then open Mods.");
+        if (Working() || pending_game_launch)
+            throw std::runtime_error("Wait for the current launcher operation to finish, then try again.");
+        if (access == ModAccess::Change) RequireStopped();
+        mod_task = std::async(std::launch::async, std::move(action));
+        mod_note = std::move(note);
+        confirm_mod_removal = false;
+    }
+    void ImportMod(const fs::path& zip) {
+        if (game_folder_needed || build_checked.empty())
+            throw std::runtime_error("On Play, choose your Bloodborne game folder, then open Mods to import the ZIP.");
+        const auto game = Mods::GameRoot(build_checked);
+        StartModTask("Importing " + PathText(zip.filename()) + "...", [game, zip] {
+            return ReviewMod(game, Mods::Import(game, zip), "Imported and disabled. Review the files before enabling.");
+        });
+        mod_game = game;
+        mod_selection.reset();
+    }
+    void ModsPage() {
+        Title(nullptr, "Mod library");
+        if (game_folder_needed) {
+            Hint("Choose your Bloodborne game folder on Play to see its installed mods.");
+            if (Button("Open Play", {}, HunterTheme::ButtonFace::Gilt)) page = 0;
+            return;
+        }
+        const auto game = Mods::GameRoot(build_checked);
+        if (game != mod_game) {
+            mod_game = game;
+            mod_refresh = true;
+            mod_selection.reset();
+            mod_note.clear();
+        }
+        if (mod_refresh) {
+            mod_refresh = false;
+            mods.clear();
+            mod_list_ok = false;
+            Try([&] { mods = Mods::List(game); mod_list_ok = true; });
+        }
+        const bool compact = ImGui::GetIO().DisplaySize.y < S(700);
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {S(10), S(compact ? 6 : 8)});
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {S(12), S(5)});
+        const float action_height = std::max(S(36), ImGui::GetFrameHeight());
+        const float review_height = std::max(S(30), ImGui::GetFrameHeight());
+        const float cell_pad_y = S(4);
+        const float row_content = std::max(review_height, 2 * ImGui::GetTextLineHeight());
+        const float row_height = row_content + 2 * cell_pad_y;
+        Hint("Drop a mod ZIP here, or choose one to import. Imported mods start disabled.");
+        ImGui::BeginDisabled(Working() || pending_game_launch.has_value());
+        ImGui::BeginDisabled(running);
+        // Lift the label about 1.5 logical pixels to center it inside the gilt rim.
+        ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, {0.5f, 0.35f});
+        const bool import_zip = Button("Import ZIP", {S(132), action_height}, HunterTheme::ButtonFace::Gilt);
+        ImGui::PopStyleVar();
+        if (import_zip)
+            Try([&] { if (auto file = PickPath(window_handle, false, L"Bloodborne mod ZIP", L"*.zip")) ImportMod(*file); });
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (Button("Rescan", {S(96), action_height}, HunterTheme::ButtonFace::Utility)) {
+            mod_selection.reset();
+            mod_note.clear();
+            mod_refresh = true;
+        }
+        ImGui::EndDisabled();
+        if (running) Hint("You can review files now. Close the game to import, switch or remove mods.");
+        if (!mod_note.empty()) ImGui::TextWrapped("%s", mod_note.c_str());
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + S(compact ? 4 : 8));
+        ImGui::PushFont(brand_font);
+        ImGui::TextColored(gold, "Imported mods");
+        ImGui::PopFont();
+        const auto rows = std::clamp<size_t>(mods.size(), 1, 4);
+        // InsetList has a 5 px rim and 4 px of inner padding on each end.
+        const float list_padding = 2 * (S(5) + S(4));
+        InsetList("mod-library", list_padding + rows * row_height, theme_art);
+        ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, {ImGui::GetStyle().CellPadding.x, cell_pad_y});
+        if (mods.empty())
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + std::floor((row_height - ImGui::GetTextLineHeight()) * .5f));
+        if (!mod_list_ok) Hint("The list could not be read. Check your game folder and select Rescan.");
+        else if (mods.empty()) Hint("No mods imported for this game folder yet.");
+        else if (ImGui::BeginTable("packages", 3, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH)) {
+            ImGui::TableSetupColumn("Mod", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, S(132));
+            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, S(88));
+            for (const auto& pkg : mods) {
+                const auto name = PathText(pkg.path.stem());
+                const bool selected = mod_selection && mod_selection->path == pkg.path;
+                const char* state = pkg.Interrupted() ? (pkg.path.extension() == ".importing" ? "Import unfinished" : "Removal unfinished")
+                                                     : pkg.enabled ? "Enabled" : "Disabled";
+                ImGui::TableNextRow(0, row_height);
+                if (selected) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(118,88,50,44));
+                ImGui::TableSetColumnIndex(0);
+                // A long filename can wrap. Center all three cells against that actual height.
+                const float text_height = ImGui::CalcTextSize(name.c_str(), nullptr, false,
+                    std::max(1.f, ImGui::GetContentRegionAvail().x)).y;
+                const float content_height = std::max(row_content, text_height);
+                const auto center_cell = [content_height](float height) {
+                    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + std::floor((content_height - height) * .5f));
+                };
+                center_cell(text_height);
+                ImGui::TextWrapped("%s", name.c_str());
+                ImGui::TableSetColumnIndex(1);
+                center_cell(ImGui::GetTextLineHeight());
+                ImGui::TextColored(pkg.Interrupted() ? ImVec4{.96f,.70f,.50f,1} : pkg.enabled ? gold : muted, "%s", state);
+                ImGui::TableSetColumnIndex(2);
+                center_cell(review_height);
+                ImGui::PushID(PathText(pkg.path).c_str());
+                ImGui::BeginDisabled(Working() || pending_game_launch.has_value());
+                if (Button("Review", {S(82), review_height}, HunterTheme::ButtonFace::Utility, selected)) Try([&] {
+                    StartModTask("Checking " + name + "...", [game,pkg] { return ReviewMod(game,pkg); }, ModAccess::Read);
+                    mod_selection.reset();
+                });
+                ImGui::EndDisabled();
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        ImGui::PopStyleVar();
+        EndInsetList();
+        if (mod_selection) {
+            const auto pkg = *mod_selection;
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + S(compact ? 4 : 8));
+            const auto title = PathText(pkg.path.stem());
+            ImGui::PushFont(brand_font);
+            ImGui::PushStyleColor(ImGuiCol_Text, gold);
+            ImGui::TextWrapped("%s", title.c_str());
+            ImGui::PopStyleColor();
+            ImGui::PopFont();
+            if (pkg.Interrupted())
+                ImGui::TextWrapped("This unfinished copy is inactive. Remove it before importing the ZIP again.");
+            else {
+                if (mod_report.files) {
+                    if (!mod_report.has_file_list)
+                        Hint("No original file list is available. Reimport the ZIP to check for missing or incomplete files.");
+                    const auto overlaps = mod_report.overrides.size();
+                    if (overlaps)
+                        ImGui::Text("%zu game file%s  /  %zu overlap%s with existing installation files",
+                                    mod_report.files, mod_report.files == 1 ? "" : "s",
+                                    overlaps, overlaps == 1 ? "" : "s");
+                    else if (mod_report.conflicts.empty())
+                        ImGui::Text("%zu game file%s  /  No overlaps with enabled mods", mod_report.files, mod_report.files == 1 ? "" : "s");
+                    else ImGui::Text("%zu game file%s", mod_report.files, mod_report.files == 1 ? "" : "s");
+                }
+                if (!mod_report.conflicts.empty())
+                    ImGui::TextColored(ImVec4{.96f,.70f,.50f,1}, "Needs attention");
+                if (!mod_report.overrides.empty())
+                    ImGui::TextWrapped("This mod's files take priority while enabled. Disabling it restores the existing copies.");
+                if (!mod_report.shared.empty())
+                    Hint("Gameplay or item-text archives are replaced whole. Changes inside them may conflict.");
+                const size_t count = mod_report.conflicts.size() + mod_report.overrides.size();
+                constexpr size_t per_page = 12;
+                if (count > per_page) {
+                    ImGui::Text("File checks %zu-%zu of %zu", mod_file_page + 1,
+                                std::min(count, mod_file_page + per_page), count);
+                    ImGui::BeginDisabled(mod_file_page == 0);
+                    if (Button("Previous files")) mod_file_page -= per_page;
+                    ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    ImGui::BeginDisabled(mod_file_page + per_page >= count);
+                    if (Button("Next files")) mod_file_page += per_page;
+                    ImGui::EndDisabled();
+                }
+                if (mod_file_page < count) {
+                    const auto visible = std::min<size_t>(count - mod_file_page, 5);
+                    InsetList("mod-file-checks", list_padding + ImGui::GetTextLineHeight() +
+                        (visible - 1) * ImGui::GetTextLineHeightWithSpacing(), theme_art);
+                    for (size_t i = mod_file_page; i < std::min(count, mod_file_page + per_page); ++i) {
+                        if (i < mod_report.conflicts.size()) ImGui::TextWrapped("%s", mod_report.conflicts[i].c_str());
+                        else ImGui::TextWrapped("%s", mod_report.overrides[i - mod_report.conflicts.size()].c_str());
+                    }
+                    EndInsetList();
+                }
+            }
+            ImGui::BeginDisabled(running || Working() || pending_game_launch.has_value());
+            if (!pkg.Interrupted()) {
+                ImGui::BeginDisabled(!pkg.enabled && !mod_report.conflicts.empty());
+                const char* action = pkg.enabled ? "Disable" : mod_report.overrides.empty() ? "Enable" : "Enable with these overrides";
+                if (Button(action, {0, action_height}, HunterTheme::ButtonFace::Gilt))
+                    Try([&] {
+                        StartModTask(pkg.enabled ? "Disabling mod..." : "Checking files before enabling...", [game,pkg,report=mod_report,title] {
+                            const auto updated = Mods::Toggle(game, pkg, report);
+                            return ReviewMod(game, updated, title + (pkg.enabled ? " is disabled." : " is enabled for the next launch."));
+                        });
+                    });
+                ImGui::EndDisabled();
+            }
+            if (pkg.enabled) Hint("Disable the mod to remove its imported files.");
+            if (!pkg.enabled) {
+                if (!confirm_mod_removal) {
+                    if (!pkg.Interrupted()) ImGui::SameLine();
+                    if (Button(pkg.path.extension() == ".removing" ? "Retry removal" : "Remove mod",
+                               {S(120), action_height}, HunterTheme::ButtonFace::Standard))
+                        confirm_mod_removal = true;
+                } else {
+                    ImGui::TextWrapped("Delete the imported copy of %s? You can import the ZIP again.", title.c_str());
+                    if (Button("Delete imported copy", {0, action_height})) {
+                        Try([&] { StartModTask("Removing " + title + "...", [game,pkg,title] {
+                            Mods::Remove(game, pkg);
+                            return ModResult{{}, {}, "Removed the imported copy of " + title + ". Your ZIP was kept."};
+                        }); });
+                    }
+                    ImGui::SameLine();
+                    if (Button("Cancel removal", {0, action_height}, HunterTheme::ButtonFace::Utility))
+                        confirm_mod_removal = false;
+                }
+            }
+            ImGui::EndDisabled();
+        }
+        ImGui::PopStyleVar(2);
+    }
+    std::string CloseEditSummary() {
+        std::vector<std::string> names;
+        for (const auto& [key, value] : edits) {
+            std::string name = key;
+            if (key == "play_style") name = "Play style";
+            else if (key == "graphics_config") name = "Scaling and upscaling";
+            else {
+                for (const auto& row : Settings()) {
+                    if (std::find(row.keys.begin(), row.keys.end(), key) != row.keys.end()) {
+                        name = Words(row).label;
+                        break;
+                    }
+                }
+            }
+            if (std::find(names.begin(), names.end(), name) == names.end())
+                names.push_back(std::move(name));
+        }
+        std::string summary;
+        for (size_t i = 0; i < names.size() && i < 3; ++i) {
+            if (i) summary += ", ";
+            summary += names[i];
+        }
+        if (names.size() > 3)
+            summary += " and " + std::to_string(names.size() - 3) + " more";
+        return summary;
+    }
     void Draw() {
+        if (invalid_mod_drop) {
+            invalid_mod_drop = false;
+            page = 4;
+            error = "Drop one mod ZIP at a time. You can also use Import ZIP.";
+        }
+        if (!dropped_mod.empty()) {
+            const auto zip = std::move(dropped_mod);
+            dropped_mod.clear();
+            page = 4;
+            Try([&] { ImportMod(zip); });
+        }
         theme_art.Load(device.Get());
         auto size = ImGui::GetIO().DisplaySize;
         ImGui::SetNextWindowPos({0, 0});
@@ -3582,18 +4157,21 @@ struct App {
         // Controls is page 3 (Play 0, VR settings 1, Updates 2 keep their numbers), listed after
         // VR settings.
         const char *pages[]{"Play", edits.empty() ? "VR settings" : "VR settings *",
-                            available ? "Updates (NEW)" : "Updates", "Controls"};
+                            available ? "Updates (NEW)" : "Updates", "Controls", "Mods"};
         ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign,{0.f,.5f});
         const float padding_y = ImGui::GetStyle().FramePadding.y;
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,{S(21),padding_y});
         ImGui::PushFont(sidebar_nav_font);
-        for (const int i : {0, 1, 3, 2}) {
+        for (const int i : {0, 1, 3, 4, 2}) {
             ImGui::SetCursorPosX(S(33));
             const bool selected = page == i;
             if (selected) HunterTheme::PushAccent();
             const bool long_label = ImGui::CalcTextSize(pages[i]).x > S(125);
             if (long_label) ImGui::PushFont(brand_font);
-            if (Button(pages[i], {S(158), S(37)})) page = i;
+            if (Button(pages[i], {S(158), S(size.y < S(700) ? 30 : 37)})) {
+                if (i == 4 && page != 4) { mod_refresh = true; mod_selection.reset(); }
+                page = i;
+            }
             if (long_label) ImGui::PopFont();
             if (selected) ImGui::PopStyleColor(4);
         }
@@ -3683,6 +4261,8 @@ struct App {
             SettingsPage();
         else if (page == 3)
             ControlsPage();
+        else if (page == 4)
+            ModsPage();
         else
             UpdatesPage();
         ImGui::EndChild();
@@ -3728,34 +4308,61 @@ struct App {
             }
             ImGui::EndPopup();
         }
-        if (close_requested && profile_pending)
+        if (close_requested && profile_pending) {
             SaveChange(); // a folder typed into a field that was never left
+            if (profile_pending) {
+                // SaveProfile clears the flag only after writing successfully.
+                close_after_benchmark_apply = close_requested = false;
+            }
+        }
         if (close_requested) {
-            if (Busy()) {
-                status = "Updating. Please wait.";
+            if (benchmark_apply_task.valid()) {
+                close_after_benchmark_apply = true;
+                close_requested = false;
+                status = "Applying scan settings. The launcher will close when they are saved.";
+            } else if (Busy()) {
+                if (mod_task.valid()) {
+                    page = 4;
+                    mod_note = "Please wait for the mod operation to finish before closing the launcher.";
+                } else status = "Please wait for the current launcher operation to finish before closing.";
                 close_requested = false;
             } else if (edits.empty())
                 quit = true;
             else {
-                ImGui::OpenPopup("Unsaved settings");
+                close_edit_summary = CloseEditSummary();
+                ImGui::OpenPopup("Unsaved VR settings");
                 close_requested = false;
             }
         }
-        if (Modal("Unsaved settings", nullptr,
-                                   ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::TextUnformatted("Save your VR settings before closing?");
-            if (Button("Save & close"))
-                Try([&] {
-                    SaveIni();
+        if (ImGui::IsPopupOpen("Unsaved VR settings")) {
+            // The native window border follows the outer edge even as the text wraps or DPI changes.
+            ImGui::SetNextWindowSize({S(424), 0});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {S(20), S(16)});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, S(1));
+            ImGui::PushStyleColor(ImGuiCol_Border, {.42f, .36f, .28f, 1});
+            ImGui::PushFont(brand_font);
+            const bool open = ImGui::BeginPopupModal("Unsaved VR settings", nullptr,
+                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings);
+            ImGui::PopFont();
+            ImGui::PopStyleColor();
+            ImGui::PopStyleVar(2);
+            if (open) {
+                ImGui::TextUnformatted("Save your changes before closing?");
+                Hint(close_edit_summary.c_str());
+                ImGui::Separator();
+                if (Button("Save & close", {}, HunterTheme::ButtonFace::Gilt))
+                    Try([&] {
+                        SaveIni();
+                        quit = true;
+                    });
+                ImGui::SameLine();
+                if (Button("Discard & close"))
                     quit = true;
-                });
-            ImGui::SameLine();
-            if (Button("Discard & close"))
-                quit = true;
-            ImGui::SameLine();
-            if (Button("Cancel"))
-                ImGui::CloseCurrentPopup();
-            ImGui::EndPopup();
+                ImGui::SameLine();
+                if (Button("Keep editing"))
+                    ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
         }
         ImGui::End();
         HunterTheme::PaintScrollbars(theme_art, S(1));
@@ -3931,6 +4538,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                                       CW_USEDEFAULT, CW_USEDEFAULT, window_width,
                                       window_height, nullptr, nullptr, instance, nullptr);
         BOOL dark = TRUE;
+        DragAcceptFiles(window_handle, TRUE);
         DwmSetWindowAttribute(window_handle, 20, &dark, sizeof(dark));
         CreateGraphics(window_handle);
         ImGui::CreateContext();
@@ -4008,6 +4616,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         // scrolled through a page at a time (settings-<shot>-<what>-<page>.png).
         const bool settings_preview =
             preview && GetEnvironmentVariableW(L"BBVR_PREVIEW_SETTINGS", nullptr, 0) > 0;
+        // Offline capture of the Mods page using a fixture beside the preview output.
+        const bool mods_preview =
+            preview && GetEnvironmentVariableW(L"BBVR_PREVIEW_MODS", nullptr, 0) > 0;
+        if (mods_preview) {
+            app.page = 4;
+            app.mod_game = preview_dir / "game";
+            app.build_checked = app.mod_game / "eboot.bin";
+            app.game_folder_needed = false;
+            const auto packages = Mods::List(app.mod_game);
+            if (!packages.empty()) {
+                auto result = App::ReviewMod(app.mod_game, packages.front());
+                app.mod_selection = std::move(result.selection);
+                app.mod_report = std::move(result.report);
+            }
+        }
         static constexpr const char *preview_searches[]{"boss",  "dlss", "turn",   "vibration",
                                                         "left handed", "fps", "sky", "shadow"};
         int settings_shot = 0, settings_page = 0;
@@ -4104,7 +4727,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                 app.downloaded = true;
                 app.update_status = "Update downloaded. Select Install & Restart when ready.";
             }
-            if (preview && ++preview_frames % 4 == 0 && settings_preview) {
+            if (preview && ++preview_frames % 4 == 0 && mods_preview) {
+                Capture(preview_dir / "mods.png");
+                app.quit = true;
+            } else if (preview && preview_frames % 4 == 0 && settings_preview) {
                 const auto &categories = Categories();
                 const int tabs = int(categories.size());
                 const int shots = tabs + int(std::size(preview_searches));
@@ -4138,7 +4764,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                                     "controls-frame.png", "controls-index.png", "controls-vive.png",
                                     "controls-wmr.png", "controls-guide.png",
                                     "controls-guide-search.png", "controls-search-more.png",
-                                    "benchmark-results.png", "perf-scan-no-headset.png", "perf-scan-ready.png", "crash.png", "backups.png"};
+                                    "benchmark-results.png", "perf-scan-applied.png", "perf-scan-no-headset.png",
+                                    "perf-scan-ready.png", "crash.png", "backups.png"};
                 Capture(preview_dir / names[preview_step]);
                 switch (++preview_step) {
                 case 1:
@@ -4200,27 +4827,42 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                         }
                         report.recommended=Benchmark::Recommend(report.results);
                         if(!report.recommended) report.provisional=Benchmark::Recommend(report.results,true);
+                        report.picture=Benchmark::PictureSettings(app.ini); // measured as the preview's
                         app.benchmark_report=std::move(report);
                         app.benchmark_headset=Benchmark::Headset{"Quest 3 (preview)",{1840,1840},{2016,2016},3680,4032,90};
                         app.open_perf_scan=true;
                     }
                     break;
                 }
-                case 14:
+                case 14: // the suggestion applied, in memory only: the preview never writes
+                    if (const auto *s = app.ScanSuggestion()) {
+                        const int hz = app.benchmark_report->target_hz;
+                        app.benchmark_applied = App::AppliedScan{app.benchmark_report->folder,
+                                                                 s->candidate.id, app.profile, app.ini};
+                        app.ini = VR::Ini::ApplyEdits(app.ini, Benchmark::SettingEdits(s->candidate, hz));
+                        app.profile = Benchmark::AppliedProfile(app.profile, s->candidate, hz);
+                    }
+                    break;
+                case 15:
+                    if (app.benchmark_applied) {
+                        app.profile = app.benchmark_applied->before;
+                        app.ini = app.benchmark_applied->before_ini;
+                        app.benchmark_applied.reset();
+                    }
                     app.benchmark_report.reset();
                     app.benchmark_headset.reset();
                     break;
-                case 15:
+                case 16:
                     app.benchmark_headset=Benchmark::Headset{"Quest 3 (preview)",{1840,1840},{2016,2016},3680,4032,90};
                     break;
-                case 16:
+                case 17:
                     app.page = 0;
                     app.crash = App::Crash{0xC0000005, ExitReason(0xC0000005),
                                            {"[Debug] <Critical> signals.cpp:175 Unhandled "
                                             "Exception code 0xC0000005 (preview)"}};
                     app.show_crash = true;
                     break;
-                case 17:
+                case 18:
                     // Opening it at the same popup level replaces the crash window.
                     app.show_backups = true;
                     break;

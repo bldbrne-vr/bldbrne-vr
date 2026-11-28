@@ -76,7 +76,7 @@ int PS4_SYSV_ABI sceVideodecDecode(OrbisVideodecCtrl* pCtrlIn,
                                    OrbisVideodecFrameBuffer* pFrameBufferInOut,
                                    OrbisVideodecPictureInfo* pPictureInfoOut) {
     LOG_TRACE(Lib_Videodec, "called");
-    if (!pCtrlIn || !pInputDataIn || !pPictureInfoOut) {
+    if (!pCtrlIn || !pInputDataIn || !pFrameBufferInOut || !pPictureInfoOut) {
         LOG_ERROR(Lib_Videodec, "Invalid arguments");
         return ORBIS_VIDEODEC_ERROR_ARGUMENT_POINTER;
     }
@@ -111,7 +111,7 @@ int PS4_SYSV_ABI sceVideodecFlush(OrbisVideodecCtrl* pCtrlIn,
                                   OrbisVideodecPictureInfo* pPictureInfoOut) {
     LOG_INFO(Lib_Videodec, "called");
 
-    if (!pFrameBufferInOut || !pPictureInfoOut) {
+    if (!pCtrlIn || !pFrameBufferInOut || !pPictureInfoOut) {
         LOG_ERROR(Lib_Videodec, "Invalid arguments");
         return ORBIS_VIDEODEC_ERROR_ARGUMENT_POINTER;
     }

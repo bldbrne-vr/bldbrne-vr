@@ -52,6 +52,11 @@
         command.dispatch(p.x, p.y, p.z);
         break;
     }
+    case RecorderOpcode::dispatchBase: {
+        const auto& p = *reinterpret_cast<const RecorderPackets::dispatchBase*>(data);
+        command.dispatchBase(p.baseX, p.baseY, p.baseZ, p.x, p.y, p.z);
+        break;
+    }
     case RecorderOpcode::dispatchIndirect: {
         const auto& p = *reinterpret_cast<const RecorderPackets::dispatchIndirect*>(data);
         command.dispatchIndirect(p.buffer, p.offset);

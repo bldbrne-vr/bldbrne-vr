@@ -22,6 +22,7 @@
 #include "shader_recompiler/frontend/translate/translate.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/eye_spec.h"
+#include "shader_recompiler/ir/passes/light_shadow.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/runtime_info.h"
 
@@ -410,7 +411,7 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
         } else {
             ctx.AddExecutionMode(main, spv::ExecutionMode::OriginUpperLeft);
         }
-        if (info.has_discard || ctx.runtime_info.fs_info.vr_cut != 0 || ctx.runtime_info.native_light_scissor) {
+        if (info.has_discard || ctx.runtime_info.fs_info.CutsFragments() || ctx.runtime_info.native_light_scissor) {
             ctx.AddCapability(spv::Capability::DemoteToHelperInvocation);
         }
         if (info.stores.GetAny(IR::Attribute::Depth)) {
@@ -873,6 +874,10 @@ void AuditEyeDependence(const IR::Program& program) {
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
                            const IR::Program& program, Bindings& binding, bool merged_eyes) {
+    // The lamp shadows' tier this program is keyed for (light_shadow.h SceneMaps::TierScope).
+    const Shader::Optimization::LightShadow::SceneMaps::TierScope lamp_tier{
+        Shader::Optimization::LightShadow::ProgramTier(runtime_info.vr_light_shadows,
+                                               runtime_info.vr_ambient_occlusion)};
     EmitContext ctx{profile, runtime_info, program.info, binding, merged_eyes};
     if (runtime_info.native_stereo) {
         ctx.info.native_camera_buffers = 0;

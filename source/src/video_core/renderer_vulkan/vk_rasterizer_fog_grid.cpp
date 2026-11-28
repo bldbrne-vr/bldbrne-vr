@@ -18,6 +18,7 @@
 #include <mutex>
 #include "common/logging/log.h"
 #include "core/vr/c0000_skeleton.h"
+#include "core/vr/fog_impulse.h"
 #include "core/vr/game_area.h"
 #include "core/vr/live_tune.h"
 #include "core/vr/map_lights.h"
@@ -235,6 +236,7 @@ bool Rasterizer::VrFogGridParams(std::span<u32> out, bool past, bool atlas, bool
         if (map != state.patch_map) {
             state.patch_map = map;
             state.patch_share = 0.0f;
+            state.stir_built = false;
         } else {
             state.patch_share = std::min(state.patch_share + dt / Patches::EaseS, 1.0f);
         }
@@ -275,12 +277,21 @@ bool Rasterizer::VrFogGridParams(std::span<u32> out, bool past, bool atlas, bool
     }
     // The frustum: the head's, widened to hold both eyes (fog_grid.h): each eye's corners (its
     // matrix at a mid depth), moved by the eye's own shift as seen at the grid's near plane.
+    // Under a dynamic resolution step the eyes' matrices are widened about their centres
+    // (S1Drs::Expanded) and the view is their middle (100 - drop)%: the corners are the view's,
+    // so the grid's cells stay as fine at every step (2026-11-24 review: spread over the widened
+    // frustum they were 27% coarser at 70%, for the same cost). The undrawn margin past them
+    // takes the edge cells (the lookup never leaves the grid) and is never seen.
+    const float view_share = rec.s1_render_drop != 0 && rec.s1_render_drop < 100
+                                 ? static_cast<float>(100 - rec.s1_render_drop) / 100.0f
+                                 : 1.0f;
     float lo[2] = {1e9f, 1e9f}, hi[2] = {-1e9f, -1e9f};
     for (u32 eye = 0; eye < 2; ++eye) {
         const auto& m = inverse[eye];
         const float shift = eye == 0 ? -half : half;
         for (u32 corner = 0; corner < 4; ++corner) {
-            const float h[4] = {corner & 1 ? 1.0f : -1.0f, corner & 2 ? 1.0f : -1.0f, 0.5f, 1.0f};
+            const float h[4] = {corner & 1 ? view_share : -view_share,
+                                corner & 2 ? view_share : -view_share, 0.5f, 1.0f};
             float q[4];
             for (u32 r = 0; r < 4; ++r) {
                 q[r] = m[4 * r] * h[0] + m[4 * r + 1] * h[1] + m[4 * r + 2] * h[2] + m[4 * r + 3] * h[3];
@@ -619,7 +630,8 @@ bool Rasterizer::VrFogGridParams(std::span<u32> out, bool past, bool atlas, bool
             std::array<float, 2> v{};
             if (known && past && dt > 1e-4f) {
                 v = {(x - last_x) / dt, (z - last_z) / dt};
-                if (std::hypot(v[0], v[1]) > S::MaxSpeedMPerS) {
+                // Only a threshold here. The caller computes the speed for the accepted mover.
+                if (v[0] * v[0] + v[1] * v[1] > S::MaxSpeedMPerS * S::MaxSpeedMPerS) {
                     v = {};
                 }
             }
@@ -630,30 +642,119 @@ bool Rasterizer::VrFogGridParams(std::span<u32> out, bool past, bool atlas, bool
         if (std::array<float, 3> hunter{}; VR::GameArea::Hunter(hunter, 500)) {
             feet = hunter;
         }
-        {
-            const auto v = speed(feet[0], feet[2], state.stir_hunter[0], state.stir_hunter[2], state.stir_hunter_known);
-            mover(feet, Patches::Wake::BodyRadiusM, v[0], v[1], Patches::Wake::BodyStrength,
-                  S::BodyChurn * std::hypot(v[0], v[1]) / 4.0f);
-            state.stir_hunter = feet;
-            state.stir_hunter_known = true;
+        const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+        VR::FogImpulse::combat.Listen(now_ns);
+        VR::FogImpulse::Puff puff{};
+        const bool impulse = VR::FogImpulse::combat.Take(now_ns, state.patch_map << 16, state.stir_combat_seen, puff);
+        const float kick = impulse && past ? VR::FogImpulse::GroundStrength(puff, feet) : 0.0f;
+        if (!past) state.stir_gun_wake.Reset();
+        if (puff.gun && kick > 0.01f) state.stir_gun_wake.Fire(now_ns, feet, puff, kick);
+        // The blast the eye sees (fog_impulse.h Blasts): the shot's ahead of its muzzle, the
+        // enemy's swing's where it sweeps.
+        namespace FI = VR::FogImpulse;
+        if (!past) state.stir_blasts.Reset();
+        if (kick > 0.01f) {
+            // (A shot along the ground: a channel along its way, fog_impulse.h GunLane. One
+            // aimed steeply up or down: the round blast at its muzzle.)
+            const FI::Lane way = puff.gun ? FI::GunLane(puff) : FI::Lane{};
+            if (way.stretch > 1.0f) {
+                // (All of a shot's strength once it counts at all: the height's share is the lane's
+                // reason to be, not its depth.)
+                state.stir_blasts.Add(now_ns, way.x, way.z, puff.vx, puff.vz, way.radius, std::min(1.18f * kick, 1.0f),
+                                      FI::BlastLifeS, feet[1], way.stretch, FI::GunBlastForce);
+            } else {
+                const float radius = puff.gun ? FI::GunBlastRadius * puff.radius : FI::SweepBlastRadiusM;
+                state.stir_blasts.Add(now_ns, puff.at[0], puff.at[2], puff.vx, puff.vz, radius,
+                                      puff.gun ? kick : std::min(kick + 0.15f, 1.0f), FI::BlastLifeS, feet[1], 1.0f,
+                                      puff.gun ? FI::GunBlastForce : 1.0f);
+            }
         }
+        // An explosion's (fog_impulse.h Burst): where it went off, as wide as its puff says.
+        FI::bursts.Listen(now_ns);
+        if (FI::Puff burst{}; FI::bursts.Take(now_ns, state.patch_map << 16, state.stir_burst_seen, burst) && past) {
+            state.stir_blasts.Add(now_ns, burst.at[0], burst.at[2], 0.0f, 0.0f, burst.radius,
+                                  FI::BurstStrength(burst, feet), FI::BurstBlastLifeS, std::min(burst.at[1], feet[1]), 1.0f,
+                                  FI::BurstBlastForce);
+        }
+        // (Tests: VR_FOG_BLAST_TEST="seconds,dx,dz[,radius]": a blast that far from his feet
+        // every so many seconds, along that way.)
+        {
+            static const std::array<float, 4> test = [] {
+                std::array<float, 4> t{0.0f, 0.0f, 0.0f, FI::GunBlastRadius * 0.8f};
+                if (const char* const env = std::getenv("VR_FOG_BLAST_TEST")) {
+                    std::sscanf(env, "%f,%f,%f,%f", &t[0], &t[1], &t[2], &t[3]);
+                }
+                return t;
+            }();
+            if (test[0] > 0.0f && past && now_ns - state.stir_test_blast_ns > static_cast<s64>(test[0] * 1e9f)) {
+                state.stir_test_blast_ns = now_ns;
+                state.stir_blasts.Add(now_ns, feet[0] + test[1], feet[2] + test[2], test[1], test[2], test[3], 0.85f,
+                                      FI::BlastLifeS, feet[1]);
+            }
+        }
+        const auto pulse = state.stir_gun_wake.Sample(now_ns, feet);
+        const bool melee_puff = !puff.gun && kick > 0.01f && !state.stir_gun_wake.Active();
+        const auto body_v = speed(feet[0], feet[2], state.stir_hunter[0], state.stir_hunter[2], state.stir_hunter_known);
+        // (His own wake on an enemy puff's frame too: the puff is applied last, over it. Until
+        // 2026-11-20 that frame had no wake of his: the review.)
+        {
+            const auto v = body_v;
+            const float churn = S::BodyChurn * std::hypot(v[0], v[1]) / 4.0f;
+            if (pulse.pressure > 0.0f) {
+                mover({feet[0] + pulse.x, feet[1], feet[2] + pulse.z},
+                      Patches::Wake::BodyRadiusM - 0.18f * pulse.pressure,
+                      v[0] + 3.0f * pulse.x, v[1] + 3.0f * pulse.z, Patches::Wake::BodyStrength,
+                      std::max(churn, pulse.pressure));
+            } else {
+                mover(feet, Patches::Wake::BodyRadiusM, v[0], v[1], Patches::Wake::BodyStrength, churn);
+            }
+        }
+        state.stir_hunter = feet;
+        state.stir_hunter_known = true;
         // His hands (the weapon's swing): his bones this frame, where the frame has his place.
         if (std::array<VR::Vec3, VR::PlayerBoneCount> bones{};
             (S::Test() & 16) == 0 && rec.id != 0 && rec.has_player_position && VR::RecordPlayerBones(rec.id, bones)) {
             namespace C = VR::Body::C0000;
             static constexpr std::array<u32, 2> Hands{C::R_Weapon, C::L_Weapon};
+            // A snap turn swings both hands round his body in one frame (a 45 degree snap moves a
+            // hand 0.4 m out at some 9 m/s at 30 game frames a second: a swing's speed, a blast
+            // from each hand on every snap). A frame whose heading jumps over SnapTurnRad takes
+            // the hands as new: no speed, no wake, no blast (the review, 2026-11-20).
+            constexpr float SnapTurnRad = 0.17f; // 10 degrees in a frame
+            const float heading = rec.base_yaw;
+            float turned = state.stir_heading_known ? heading - state.stir_heading : 0.0f;
+            turned = std::remainder(turned, 6.2831853f);
+            state.stir_heading = heading;
+            state.stir_heading_known = true;
+            if (std::abs(turned) > SnapTurnRad) {
+                state.stir_hand_known = {};
+            }
             for (u32 h = 0; h < 2; ++h) {
                 const VR::Vec3& b = bones[Hands[h]];
+                // (A hand not known last frame has no speed: its "swing" would be his body's
+                // speed backwards, a sprint's blast.)
+                const bool hand_known = state.stir_hand_known[h];
                 const std::array<float, 3> at{rec.player_position.x + b.x, rec.player_position.y + b.y,
                                               rec.player_position.z + b.z};
                 const auto v = speed(at[0], at[2], state.stir_hand[h][0], state.stir_hand[h][2], state.stir_hand_known[h]);
                 const float strength = S::HandStrength(std::hypot(v[0], v[1]), at[1] - feet[1]);
                 mover({at[0], feet[1], at[2]}, S::HandRadiusM, v[0], v[1], strength, strength);
+                // His own swing's blast: by the hand's speed against his body's (a sprint is no
+                // swing), a little ahead of the hand along its way.
+                const std::array<float, 2> rel{v[0] - body_v[0], v[1] - body_v[1]};
+                const float fast = std::hypot(rel[0], rel[1]);
+                if (const float swing = hand_known ? S::HandStrength(fast, at[1] - feet[1]) : 0.0f;
+                    swing >= FI::SwingBlastFrom && now_ns - state.stir_hand_blast_ns[h] > FI::SwingBlastGapNs) {
+                    state.stir_hand_blast_ns[h] = now_ns;
+                    state.stir_blasts.Add(now_ns, at[0] + 0.4f * rel[0] / fast, at[2] + 0.4f * rel[1] / fast, rel[0], rel[1],
+                                          FI::SwingBlastRadiusM, FI::SwingBlastStrength * swing, FI::BlastLifeS, feet[1]);
+                }
                 state.stir_hand[h] = at;
                 state.stir_hand_known[h] = true;
             }
         } else {
             state.stir_hand_known = {};
+            state.stir_heading_known = false;
         }
         // The others near him (the lamp shadows' casters): each body's middle, its speed from the
         // nearest of the last frame's.
@@ -704,7 +805,22 @@ bool Rasterizer::VrFogGridParams(std::span<u32> out, bool past, bool atlas, bool
                       S::BodyChurn * std::hypot(ghost_speed[0], ghost_speed[1]) / 4.0f);
             }
         }
+        // Apply the impulse last so a nearby body cannot immediately fill its clearing.
+        if (melee_puff) mover(puff.at, puff.radius, puff.vx, puff.vz, kick, kick);
         put(Grid::StirVec4, 2, float(movers));
+        std::array<FI::BlastNow, FI::Blasts::Max> blasts{};
+        const int blast_count = state.stir_blasts.Sample(now_ns, blasts);
+        put(Grid::StirVec4 + 1, 3, float(blast_count)); // (0..Max: the shader's loop trusts it)
+        for (int i = 0; i < blast_count; ++i) {
+            const FI::BlastNow& b = blasts[i];
+            const u32 v = Grid::BlastVec4 + Grid::BlastVec4s * i;
+            const std::array<float, 16> words{b.x,     b.z,      b.inv_r2, b.open,   b.carry_x, b.carry_z,
+                                              b.shove, b.churn,  b.wave_x, b.wave_k, b.wave_amp, b.twist,
+                                              b.axis_x, b.axis_z, b.front_y, 0.0f};
+            for (u32 c = 0; c < 16; ++c) {
+                put(v + c / 4, c % 4, words[c]);
+            }
+        }
         state.stir_corner = {std::bit_cast<float>(out[4 * Grid::WorldVec4]), std::bit_cast<float>(out[4 * Grid::WorldVec4 + 2])};
         state.stir_built = true;
     } else {
@@ -735,6 +851,9 @@ bool Rasterizer::VrFogGridParams(std::span<u32> out, bool past, bool atlas, bool
                 }
             }
         }
+        // (The frame's lamps so far have a halo of ours, fog_grid.h Lamps::SoftHaloLimit; the map's
+        // own lamps added below have none.)
+        const u32 halo_lamps = lamp_count;
         // The map's own lamps (fog_grid.h Lamps::MapLamps; core/vr/map_lights.h): the nearest to the
         // eye within the patches' reach, in the grid's view; one the frame's list has already
         // (within MapLampSameM of it) left out.
@@ -818,6 +937,12 @@ bool Rasterizer::VrFogGridParams(std::span<u32> out, bool past, bool atlas, bool
             put(Grid::LampFarVec4, 1, fall[1] * (1.0f - reach_more[0]));
             put(Grid::LampFarVec4, 2, reach_more[1]);
             put(Grid::LampFarVec4, 3, 1.0f / (reach_more[2] - reach_more[1]));
+            const std::array<float, 2> soft = L::SoftFor(state.patch_map);
+            put(Grid::LampSoftVec4, 0, soft[0]);
+            put(Grid::LampSoftVec4, 1, soft[1]);
+            for (u32 i = 0; i < lamp_count; ++i) {
+                put(Grid::LampFreeVec4 + 2 * i + 1, 3, i < halo_lamps ? 1.0f : 0.0f);
+            }
             for (u32 i = 0; i < lamp_count; ++i) {
                 put(Grid::LampFreeVec4 + 2 * i, 3,
                     strength * L::LightAtEven(lamps[i][4], lamps[i][5], lamps[i][6], lamps[i][3], lamps[i][7]));
@@ -864,6 +989,26 @@ bool Rasterizer::VrFogGridParams(std::span<u32> out, bool past, bool atlas, bool
             LampTiles(std::span<const std::array<float, 8>>{lamps.data(), lamp_count}, frustum, octaves,
                       out.subspan(4 * Grid::LampTileVec4, L::Tiles));
         }
+    }
+    // The banks the world-fixed volume holds, a bit a bank (fog_grid.h HeldVec4): the shader's
+    // InVolume rule on the numbers just written (a fall, a box and no clear distance of its own,
+    // while the volume is on), once a build.
+    {
+        u32 held = 0;
+        if (std::bit_cast<float>(out[4 * Grid::WorldVec4 + 3]) > 0.5f) {
+            const u32 banks = std::min<u32>(static_cast<u32>(std::bit_cast<float>(out[4 * Grid::PatchVec4])),
+                                            Patches::MaxPatches);
+            for (u32 i = 0; i < banks; ++i) {
+                const auto at = [&](u32 vec, u32 c) {
+                    return std::bit_cast<float>(out[4 * (Grid::PatchVec4 + Grid::PatchHeadVec4s + 4 * i + vec) + c]);
+                };
+                if (at(3, 0) < 0.0f && at(2, 1) > 0.0f && at(3, 3) <= 0.0f) {
+                    held |= 1u << i;
+                }
+            }
+        }
+        out[4 * Grid::HeldVec4] = held;
+        out[4 * Grid::HeldVec4 + 1] = out[4 * Grid::HeldVec4 + 2] = out[4 * Grid::HeldVec4 + 3] = 0;
     }
     if constexpr (Common::Log::Enabled) {
         // (Tests: where the camera is and where it looks, to place a patch by.)
@@ -1025,7 +1170,8 @@ static_assert(Grid::MaxWake == 8 && Grid::WakeVec4 == Grid::LampTileVec4 + 480 &
                   Grid::OrganicVec4 == Grid::LampFreeVec4 + 50 && Grid::SlopeVec4 == Grid::OrganicVec4 + 1 &&
                   Grid::ClearVec4 == Grid::SlopeVec4 + 32 && Grid::LayerVec4 == Grid::ClearVec4 + 1 &&
                   Grid::WorldVec4 == Grid::LayerVec4 + 1 && Grid::LampFallVec4 == Grid::WorldVec4 + 1 && Grid::GroundVec4 == Grid::LampFallVec4 + 1 &&
-                  Grid::StirVec4 == Grid::GroundVec4 + 257 && Grid::LampFarVec4 == Grid::StirVec4 + 27 && Grid::Stir::MaxMovers == 12 && Grid::World::SizeX == 128 && Grid::World::SizeY == 48,
+                  Grid::StirVec4 == Grid::GroundVec4 + 257 && Grid::LampFarVec4 == Grid::StirVec4 + 27 && Grid::HeldVec4 == Grid::LampFarVec4 + 1 && Grid::LampSoftVec4 == Grid::HeldVec4 + 1 && Grid::BlastVec4 == Grid::LampSoftVec4 + 1 && Grid::MaxBlasts == 6 && Grid::BlastVec4s == 4 &&
+                  Grid::MaxBlasts == VR::FogImpulse::Blasts::Max && Grid::Stir::MaxMovers == 12 && Grid::World::SizeX == 128 && Grid::World::SizeY == 48,
               "host_shaders/vr_fog_grid.comp wake, patch_rect, lamp_shape, lamp_free, organic, patch_slope, clearings");
 static_assert(Grid::Lamps::MaxLights == 25 && Grid::Lamps::TilesX == 20 && Grid::Lamps::TilesY == 12 &&
                   Grid::Lamps::TilesZ == 8 && Grid::Lamps::TileLights == 4,
@@ -1040,7 +1186,7 @@ void Rasterizer::VrFogGridBeforeDraw(const GraphicsPipeline* pipeline) {
     }
     const auto* fs = pipeline->GetStages()[u32(Shader::LogicalStage::Fragment)];
     // (The game's own moon rays drawing: core/vr/moon_screen.h.)
-    if (fs != nullptr && (fs->pgm_hash == 0xe55e45eb || fs->pgm_hash == 0xd506a1)) {
+    if (fs != nullptr && VR::MoonScreen::IsGameRaysProgram(fs->pgm_hash)) {
         VR::MoonScreen::GameRaysDrawn();
     }
     if (fs == nullptr || !Air::IsApplyProgram(fs->pgm_hash) ||

@@ -1,4 +1,6 @@
 #include "sky_upscale.h"
+#include "mods.h"
+#include "core/file_sys/mod_layers.h"
 #include "core.h"
 #include "core/vr/sky_textures.h"
 #include <algorithm>
@@ -503,7 +505,7 @@ State Look(const fs::path &user, Kind kind) {
 namespace {
 std::vector<fs::path> AssetFolders(const fs::path &game, const char *asset) {
     std::error_code ec;
-    const auto base = fs::is_directory(game, ec) ? game : game.parent_path();
+    const auto base = Mods::GameRoot(fs::is_directory(game, ec) ? game / "eboot.bin" : game);
     auto overlay = [&](const wchar_t *suffix) {
         auto path = base;
         path += suffix;
@@ -513,7 +515,9 @@ std::vector<fs::path> AssetFolders(const fs::path &game, const char *asset) {
     if (!fs::is_directory(patch, ec))
         patch = overlay(L"-patch");
     std::vector<fs::path> folders;
-    for (const auto &root : {base, patch, overlay(L"-mods")}) {
+    std::vector<fs::path> roots{base, patch, overlay(L"-mods")};
+    for (const auto& package : GameMods::Active(base)) roots.push_back(package / "content");
+    for (const auto &root : roots) {
         const auto folder = root / "dvdroot_ps4" / asset;
         if (fs::is_directory(folder, ec))
             folders.push_back(folder);

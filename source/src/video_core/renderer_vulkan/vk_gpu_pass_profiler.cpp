@@ -354,6 +354,31 @@ void GpuPassProfiler::Accumulate(GpuPassDetail::Slice& slice) {
     // (A multiview timestamp's extra queries, PadKey, hold zero: skipped, the segment running
     // from the last real one.)
     u32 prev = 0;
+    static const bool submits_wanted = [] {
+        const char* v = std::getenv("FAST_GPU_PASS_PROFILE_SUBMITS");
+        return v != nullptr && v[0] == '1';
+    }();
+    u64 sub_ticks = 0, sub_first = 0, sub_top = 0, sub_top_ticks = 0;
+    const auto is_gap = [&](u64 key) {
+        const auto it = labels.find(key);
+        return key == GapKey ||
+               (it != labels.end() && it->second.group == static_cast<u8>(Group::Gap));
+    };
+    const auto close_submit = [&] {
+        if (sub_ticks == 0) {
+            return;
+        }
+        const double ms = static_cast<double>(sub_ticks) * tick_ms;
+        submit_spans.push_back(static_cast<float>(ms));
+        auto& [keys, row] = submit_rows[Mix(sub_first, sub_top)];
+        keys = {sub_first, sub_top};
+        row.ticks += sub_ticks;
+        row.max_ticks = std::max(row.max_ticks, sub_ticks);
+        ++row.count;
+        row.over_1ms += ms > 1.0 ? 1 : 0;
+        row.over_2ms += ms > 2.0 ? 1 : 0;
+        sub_ticks = sub_first = sub_top = sub_top_ticks = 0;
+    };
     for (u32 i = 1; i < count; ++i) {
         if (i + 1 < count && slice.keys[i] == PadKey) {
             continue;
@@ -369,6 +394,24 @@ void GpuPassProfiler::Accumulate(GpuPassDetail::Slice& slice) {
         total.ticks += ticks;
         total.calls += slice.calls[from];
         span += ticks;
+        if (submits_wanted) {
+            const u64 key = slice.keys[from];
+            if (is_gap(key)) {
+                close_submit();
+            } else {
+                if (sub_ticks == 0) {
+                    sub_first = key;
+                }
+                sub_ticks += ticks;
+                if (ticks > sub_top_ticks) {
+                    sub_top_ticks = ticks;
+                    sub_top = key;
+                }
+            }
+        }
+    }
+    if (submits_wanted) {
+        close_submit(); // (the frame's last submission, up to the closing timestamp)
     }
     window_span_ticks += span;
     window_stamps += count;
@@ -480,6 +523,39 @@ void GpuPassProfiler::Report() {
                      pending_count, p50, p99, worst);
         }
     }
+    if (!submit_spans.empty() && window_frames != 0) {
+        const double frames = static_cast<double>(window_frames);
+        std::vector<std::pair<std::pair<u64, u64>, SubmitRow>> v;
+        for (const auto& [k, e] : submit_rows) {
+            v.push_back(e);
+        }
+        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
+            return a.second.max_ticks > b.second.max_ticks;
+        });
+        const auto name = [&](u64 key) {
+            const auto it = labels.find(key);
+            return it != labels.end() ? it->second.name : std::string{"?"};
+        };
+        std::string top;
+        for (size_t i = 0; i < std::min<size_t>(v.size(), 8); ++i) {
+            const auto& [keys, row] = v[i];
+            top += fmt::format(" | {:.2f}/f, avg {:.3f} max {:.3f} ms, over 1/2 ms {:.2f}/{:.2f} per "
+                               "frame: from [{}], heaviest [{}]",
+                               static_cast<double>(row.count) / frames,
+                               static_cast<double>(row.ticks) * tick_ms / static_cast<double>(row.count),
+                               static_cast<double>(row.max_ticks) * tick_ms,
+                               static_cast<double>(row.over_1ms) / frames,
+                               static_cast<double>(row.over_2ms) / frames, name(keys.first),
+                               name(keys.second));
+        }
+        const size_t n = submit_spans.size();
+        std::nth_element(submit_spans.begin(), submit_spans.begin() + (n * 99) / 100, submit_spans.end());
+        const double p99 = submit_spans[std::min(n - 1, (n * 99) / 100)];
+        LOG_INFO(Render_Vulkan, "FAST gpu submissions: {:.1f} per frame, p99 {:.3f} ms; longest kinds{}",
+                 static_cast<double>(n) / frames, p99, top);
+    }
+    submit_rows.clear();
+    submit_spans.clear();
     totals.clear();
     frame_spans.clear();
     window_frames = 0;

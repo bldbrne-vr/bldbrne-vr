@@ -45,4 +45,39 @@ inline bool Take(u64& seen, std::array<float, 3>& where) {
     return true;
 }
 
+// An explosion (fog_light.h Blast*: a light the game spawns beside it lights the air at once while
+// young): where the game launched a bullet that stands with a hit radius of a metre or more
+// (bloodborne_quickitems.cpp FogBurstLaunch), world space. The renderer's lamp memory listens
+// (ListenBlasts, at every update); while nothing listens, the launch hook does not look.
+namespace Detail {
+inline std::array<float, 3> blast_where{};
+inline std::atomic<u64> blasts{0};
+inline std::atomic<s64> blast_until{0};
+} // namespace Detail
+
+inline void ListenBlasts(s64 now_ns) {
+    Detail::blast_until.store(now_ns + 500'000'000, std::memory_order_relaxed);
+}
+inline bool BlastsWanted(s64 now_ns) {
+    return now_ns <= Detail::blast_until.load(std::memory_order_relaxed);
+}
+inline void PublishBlast(float x, float y, float z) {
+    {
+        std::scoped_lock lock{Detail::mutex};
+        Detail::blast_where = {x, y, z};
+    }
+    Detail::blasts.fetch_add(1, std::memory_order_release);
+}
+// The newest explosion after `seen` (updated): true and its position, or false.
+inline bool TakeBlast(u64& seen, std::array<float, 3>& where) {
+    const u64 blasts = Detail::blasts.load(std::memory_order_acquire);
+    if (blasts == seen) {
+        return false;
+    }
+    seen = blasts;
+    std::scoped_lock lock{Detail::mutex};
+    where = Detail::blast_where;
+    return true;
+}
+
 } // namespace VR::MuzzleFlash

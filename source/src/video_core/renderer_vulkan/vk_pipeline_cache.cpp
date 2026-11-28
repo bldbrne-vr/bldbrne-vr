@@ -7,6 +7,7 @@
 
 #include "video_core/native_stereo/native_stereo.h"
 #include "video_core/native_stereo/lighting_reconstruction.h"
+#include "core/vr/honed_steel.h"
 #include "core/vr/vr_session.h"
 #include <ranges>
 
@@ -84,25 +85,63 @@ constexpr static std::array DescriptorHeapSizes = {
     vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
 };
 
-bool VrLightShadowHigh() {
-    // Startup-only (getenv locks the environment; the menu's change applies at the next start).
-    static const bool high = Shader::Optimization::LightShadow::High(
-        VR::GetSettings().light_shadow_high, std::getenv("VR_LIGHT_SHADOW_DETAIL"));
-    return high;
+// The lamp shadows live (2026-11-21, the user: "if I start the game with shadows to off (game's).
+// I still want to be able to turn on our own and see them in action. And performance should
+// adjust"): the level and the tier from the settings in force, latched once a frame
+// (VrLatchGraphics, the frame's end on the GPU thread) and at the first call; the environment's
+// overrides (tests) read once (getenv locks the environment). Every program's key carries its own
+// level or tier (RuntimeInfo::vr_light_shadows; the AO pass's mask writer VrAoLampLow / High) and
+// is made with it (light_shadow.h SceneMaps::TierScope), so a switch builds the new permutations
+// and the old ones stay for a switch back; the CPU's upkeep follows the latched level. Until
+// 2026-11-21 both were read once and the menu's row applied at the next start.
+namespace {
+std::atomic<u8> g_lamp_level{0};
+std::atomic<bool> g_lamp_latched{false};
+std::mutex g_lamp_latch_mutex;
+// Latches the settings in force; true when the level or the tier changed.
+bool LatchLampShadows() {
+    std::scoped_lock lock{g_lamp_latch_mutex};
+    namespace Shadows = Shader::Optimization::LightShadow;
+    static const char* const tier_override = std::getenv("VR_LIGHT_SHADOW_DETAIL");
+    static const char* const enabled_override = std::getenv("VR_LIGHT_SHADOWS");
+    const auto request = VR::GetLampShadowRequest();
+    const u32 tier = tier_override ? Shadows::TierOf(tier_override) : request.tier;
+    const bool enabled = Shadows::Enabled(VR::IsEnabled(), request.enabled, enabled_override);
+    const u8 level = Shadows::Level(enabled, tier);
+    namespace Scene = Shader::Optimization::LightShadow::SceneMaps;
+    const u32 old_tier = Scene::g_edge_tier.exchange(tier, std::memory_order_relaxed);
+    const u8 old_level = g_lamp_level.exchange(level, std::memory_order_relaxed);
+    const bool first = !g_lamp_latched.exchange(true, std::memory_order_release);
+    return !first && (old_level != level || old_tier != tier);
+}
+} // Anonymous namespace
+
+u32 VrLightShadowTier() {
+    if (!g_lamp_latched.load(std::memory_order_acquire)) {
+        LatchLampShadows();
+    }
+    return Shader::Optimization::LightShadow::SceneMaps::g_edge_tier.load(std::memory_order_relaxed);
 }
 
 u8 VrLightShadowLevel() {
-    // Read once, like the billboard rule (getenv locks the environment): the lamp shadows' row
-    // applies at the next start, and one rule for the whole session keeps the lamp programs, the
-    // AO pass's lamp work and the CPU's upkeep together (until 2026-11-17 the setting was read at
-    // every pipeline build).
-    static const u8 level = Shader::Optimization::LightShadow::Level(
-        Shader::Optimization::LightShadow::Enabled(VR::IsEnabled(), VR::GetSettings().light_shadows,
-                                                   VR::Graphics::Accepted().upscaler !=
-                                                       VR::Graphics::Upscaler::Off,
-                                                   std::getenv("VR_LIGHT_SHADOWS")),
-        VrLightShadowHigh());
-    return level;
+    if (!g_lamp_latched.load(std::memory_order_acquire)) {
+        LatchLampShadows();
+    }
+    return g_lamp_level.load(std::memory_order_relaxed);
+}
+
+bool VrLatchGraphics() {
+    if (!LatchLampShadows()) {
+        return false;
+    }
+    // (Every memo of a program's permutation sees the new keys anyway; this drops them at once.)
+    PerfMemo::BumpEpoch();
+    LOG_INFO(Render_Vulkan, "VR graphics: lamp shadows now {} (live: the lamp programs and the AO "
+                            "pass's mask writer of that level are made or taken again)",
+             g_lamp_level.load(std::memory_order_relaxed) == 0
+                 ? "the game's"
+                 : std::array{"Low", "Medium", "High"}[std::min<u32>(VrLightShadowTier(), 2u)]);
+    return true;
 }
 
 bool VrLampShadowsOn() {
@@ -115,6 +154,209 @@ bool VrSceneMapsOn() {
 
 bool VrSceneMaskOn() {
     return Shader::Optimization::LightShadow::SceneMaps::Mask() && VrLampShadowsOn();
+}
+
+// A fragment program's new-graphics key bits in this session (RuntimeInfo::vr_ambient_occlusion,
+// vr_composite_light): the one rule for the draw path (`regs`: the draw's registers) and the
+// start-up build's list records (null: a record made with other settings, vk_shader_prebuild.cpp
+// Retarget). Two bits are the draw's, not the program's: raised brickwork's colour targets and lit
+// smoke's blending; without registers the record's own bits say whether its draw had them.
+void VrFragmentBits(Shader::RuntimeInfo& info, u64 lighting_hash, const AmdGpu::Regs* regs) {
+    const u8 recorded_composite = info.vr_composite_light;
+    info.vr_ambient_occlusion = 0;
+    info.vr_composite_light = 0;
+    const bool lighting_program =
+        lighting_hash != 0 &&
+        (Shader::Optimization::AmbientOcclusion::IsAoProgram(lighting_hash) ||
+         Shader::Optimization::MoonShadow::IsShadowMaskProgram(lighting_hash) ||
+         Shader::Optimization::Reflections::IsTraceProgram(lighting_hash) ||
+         Shader::Optimization::Reflections::IsCompositeProgram(lighting_hash) ||
+         Shader::Optimization::BounceLight::IsCompositeProgram(lighting_hash));
+    // The game's AO pass computes ours (ambient_occlusion.h): only its programs.
+    if (lighting_program) {
+        static const char* const ao_override = std::getenv("VR_AMBIENT_OCCLUSION");
+        // ... and its moon-shadow mask ours (moon_shadow.h): only its programs too.
+        static const char* const moon_override = std::getenv("VR_MOON_SHADOWS");
+        const u64 ps_hash = lighting_hash;
+        const bool ps_upscaler =
+            VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off;
+        const bool ao_program = Shader::Optimization::AmbientOcclusion::IsAoProgram(ps_hash);
+        const bool ao_ours = ao_program && Shader::Optimization::AmbientOcclusion::Enabled(
+                                               VR::IsEnabled(), VR::GetSettings().ambient_occlusion,
+                                               ao_override);
+        // ... or, our AO off, the lamp shadows' mask alone (the game's AO kept).
+        const bool ao_mask_only =
+            ao_program && Shader::Optimization::AmbientOcclusion::MaskOnly(
+                              ao_ours, VrLampShadowsOn(),
+                              Shader::Optimization::LightShadow::SceneMaps::Mask());
+        // ... and with the lamp shadows on, their work in the same pass (RuntimeInfo::
+        // VrAoLampShadows: the scene maps, the mask).
+        const bool ao_lamps = (ao_ours || ao_mask_only) &&
+                              Shader::Optimization::LightShadow::SceneMaps::Enabled() &&
+                              VrLampShadowsOn();
+        info.vr_ambient_occlusion = u8(
+            (ao_ours ? Shader::RuntimeInfo::VrAmbientOcclusionBit
+             : ao_mask_only
+                 ? (Shader::RuntimeInfo::VrAmbientOcclusionBit | Shader::RuntimeInfo::VrAoMaskOnly)
+                 : 0) |
+            (ao_lamps ? Shader::RuntimeInfo::VrAoLampShadows |
+                            Shader::Optimization::LightShadow::AoTierBits(VrLightShadowTier())
+                      : 0) |
+            (Shader::Optimization::MoonShadow::IsShadowMaskProgram(ps_hash) &&
+                     Shader::Optimization::MoonShadow::Enabled(
+                         VR::IsEnabled(), VR::GetSettings().moon_shadows,
+                         moon_override)
+                 ? Shader::RuntimeInfo::VrMoonShadows
+                 : 0));
+        // Wet streets (reflections.h): the game's trace ours, its composite counting the
+        // reflection once; only their programs, only with wet_streets (the eboot switch is
+        // made at the start; without it the game's trace never runs).
+        static const char* const reflections_override = std::getenv("VR_REFLECTIONS_TRACE");
+        if (Shader::Optimization::Reflections::Enabled(
+                VR::IsEnabled(), VR::GetSettings().wet_streets, reflections_override)) {
+            if (Shader::Optimization::Reflections::IsTraceProgram(ps_hash)) {
+                info.vr_ambient_occlusion |=
+                    Shader::RuntimeInfo::VrReflections |
+                    (ps_upscaler ? Shader::RuntimeInfo::VrReflectionsJitter : 0);
+            } else if (Shader::Optimization::Reflections::IsCompositeProgram(ps_hash)) {
+                // Blood on glossy floors (reflections.h Blood*): its own key bit.
+                static const char* const blood_override = std::getenv("VR_BLOOD_REFLECTION");
+                info.vr_ambient_occlusion |=
+                    Shader::RuntimeInfo::VrReflectionComposite |
+                    (Shader::Optimization::Reflections::BloodEnabled(
+                         VR::IsEnabled(), VR::GetSettings().wet_streets, blood_override)
+                         ? Shader::RuntimeInfo::VrBloodFloors
+                         : 0);
+            }
+        }
+        // With our AO, the same composite's shine by the specular occlusion
+        // (ambient_occlusion.h SpecOcclusion).
+        static const char* const spec_override = std::getenv("VR_SPEC_OCCLUSION");
+        if (Shader::Optimization::Reflections::IsCompositeProgram(ps_hash) &&
+            Shader::Optimization::AmbientOcclusion::SpecEnabled(
+                Shader::Optimization::AmbientOcclusion::Enabled(
+                    VR::IsEnabled(), VR::GetSettings().ambient_occlusion,
+                    ao_override),
+                spec_override)) {
+            info.vr_ambient_occlusion |= Shader::RuntimeInfo::VrSpecularOcclusion;
+        }
+        static const char* const bounce_override = std::getenv("VR_BOUNCE_LIGHT");
+        static const char* const fog_override = std::getenv("VR_FOG_LIGHT");
+        static const char* const shafts_override = std::getenv("VR_MOON_SHAFTS");
+        const bool composite = Shader::Optimization::BounceLight::IsCompositeProgram(ps_hash);
+        info.vr_composite_light = u8(
+            (composite && Shader::Optimization::BounceLight::Enabled(
+                              VR::IsEnabled(), VR::GetSettings().bounce_light,
+                              bounce_override)
+                 ? Shader::RuntimeInfo::VrCompositeBounce
+                 : 0) |
+            (composite && Shader::Optimization::FogLight::Enabled(
+                              VR::IsEnabled(), VR::GetSettings().fog_light,
+                              fog_override)
+                 ? Shader::RuntimeInfo::VrCompositeFog
+                 : 0) |
+            (composite && Shader::Optimization::MoonShafts::Enabled(
+                              VR::IsEnabled(), VR::MoonGlowOn(),
+                              shafts_override)
+                 ? Shader::RuntimeInfo::VrCompositeShafts
+                 : 0));
+    }
+    // Less shimmer on shiny details (specular_aa.h): the light programs and the ambient
+    // composite read a widened gloss; in VR, with or without an upscaler. Wet, glistening
+    // blood (wet_blood.h): the _Bloody_ G-buffer programs. Told apart by hash first (a
+    // binary search each), then only the startup override and VR itself.
+    // The air pass (air_light.h): the shadow mask's blur computes the moonlight in the air,
+    // the scene's copy applies it (and the sky's halos). By hash first.
+    if (lighting_hash != 0 &&
+        (Shader::Optimization::AirLight::IsComputeProgram(lighting_hash) ||
+         Shader::Optimization::AirLight::IsHalfProgram(lighting_hash) ||
+         Shader::Optimization::AirLight::IsApplyProgram(lighting_hash))) {
+        static const char* const air_shafts = std::getenv("VR_MOON_SHAFTS");
+        static const char* const air_fog = std::getenv("VR_FOG_LIGHT");
+        const bool shafts = Shader::Optimization::MoonShafts::Enabled(
+            VR::IsEnabled(), VR::MoonGlowOn(), air_shafts);
+        const bool fog = Shader::Optimization::FogLight::Enabled(
+            VR::IsEnabled(), VR::GetSettings().fog_light, air_fog);
+        if (Shader::Optimization::AirLight::Pass() &&
+            (Shader::Optimization::AirLight::IsApplyProgram(lighting_hash) ? shafts || fog : shafts)) {
+            info.vr_composite_light |= Shader::RuntimeInfo::VrAirPass;
+            // The mist from the fog grid (fog_grid.h, VR_FOG_GRID=1): its own key bit.
+            if (Shader::Optimization::FogGrid::Enabled()) {
+                info.vr_composite_light |= Shader::RuntimeInfo::VrFogGrid;
+            }
+        }
+    }
+    if (lighting_hash != 0) {
+        static const char* const spec_aa_override = std::getenv("VR_SPEC_AA");
+        static const char* const wet_blood_override = std::getenv("VR_WET_BLOOD");
+        if (Shader::Optimization::SpecularAa::IsLightingProgram(lighting_hash) &&
+            Shader::Optimization::SpecularAa::Enabled(
+                VR::IsEnabled(), VR::GetSettings().ambient_occlusion, spec_aa_override)) {
+            info.vr_ambient_occlusion |= Shader::RuntimeInfo::VrSpecularAa;
+        } else if (Shader::Optimization::WetBlood::IsBloodProgram(lighting_hash) &&
+                   Shader::Optimization::WetBlood::Enabled(
+                       VR::IsEnabled(), VR::GetSettings().ambient_occlusion,
+                       wet_blood_override)) {
+            info.vr_composite_light |= Shader::RuntimeInfo::VrWetBlood;
+        }
+        // Deeper stones (parallax.h): the three parallax programs, with Shading.
+        if (Shader::Optimization::Parallax::IsParallaxProgram(lighting_hash)) {
+            static const char* const parallax_override = std::getenv("VR_PARALLAX");
+            if (Shader::Optimization::Parallax::Enabled(
+                    VR::IsEnabled(), VR::GetSettings().ambient_occlusion, parallax_override)) {
+                info.vr_composite_light |= Shader::RuntimeInfo::VrParallax;
+            }
+        } else {
+            // Raised brickwork (parallax.h BumpGaps; vr.ini raised_bricks): the map's G-buffer
+            // programs only (BumpGaps::MapPrograms: never a character's skin, hair or cloth),
+            // five or more colour targets (the pass checks the bump map's shape).
+            static const char* const gaps_override = std::getenv("VR_BUMP_GAPS");
+            if (Shader::Optimization::BumpGaps::IsMapProgram(lighting_hash) &&
+                Shader::Optimization::BumpGaps::Enabled(
+                    VR::IsEnabled(), VR::GetSettings().raised_bricks, gaps_override)) {
+                u32 targets = 0;
+                for (u32 cb = 0; regs && cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                    targets += regs->color_buffers[cb] && regs->color_target_mask.GetMask(cb);
+                }
+                if (regs ? targets >= 5 : (recorded_composite & Shader::RuntimeInfo::VrBumpGaps) != 0) {
+                    info.vr_composite_light |= Shader::RuntimeInfo::VrBumpGaps;
+                }
+            }
+        }
+        // Lit smoke (particle_air.h): the soft particle programs, alpha-blended draws only
+        // (straight or premultiplied; an additive fire is its own light), with the lights in
+        // the air (whose lights it reads).
+        if (Shader::Optimization::ParticleAir::IsParticleProgram(lighting_hash)) {
+            static const char* const air_override = std::getenv("VR_PARTICLE_AIR");
+            using Factor = AmdGpu::BlendControl::BlendFactor;
+            bool blended = (recorded_composite & Shader::RuntimeInfo::VrParticleAir) != 0;
+            bool premul = (recorded_composite & Shader::RuntimeInfo::VrParticleAirPremul) != 0;
+            if (regs) {
+                const auto& blend = regs->blend_control[0];
+                const bool straight = blend.color_src_factor == Factor::SrcAlpha;
+                premul = blend.color_src_factor == Factor::One;
+                blended = blend.enable && blend.color_dst_factor == Factor::OneMinusSrcAlpha &&
+                          (straight || premul);
+            }
+            if (blended &&
+                Shader::Optimization::ParticleAir::Enabled(
+                    VR::IsEnabled(), VR::GetSettings().fog_light,
+                    air_override)) {
+                info.vr_composite_light |=
+                    Shader::RuntimeInfo::VrParticleAir |
+                    (premul ? Shader::RuntimeInfo::VrParticleAirPremul : 0);
+            }
+        }
+    }
+    // Eye adaptation (cinematic_look.h): the tone map's exposure follows the view's brightness.
+    if (lighting_hash != 0 &&
+        Shader::Optimization::CinematicLook::IsToneMapProgram(lighting_hash)) {
+        static const char* const adapt_override = std::getenv("VR_EYE_ADAPT");
+        if (Shader::Optimization::CinematicLook::AdaptEnabled(
+                VR::IsEnabled(), VR::GetSettings().eye_adaptation, adapt_override)) {
+            info.vr_ambient_occlusion |= Shader::RuntimeInfo::VrEyeAdaptation;
+        }
+    }
 }
 
 static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsOutputControl& ctl) {
@@ -255,7 +497,13 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
     }
     case Stage::Vertex: {
         BuildCommon(regs.vs_program);
-        info.vs_info.user_clip_plane_mask = regs.clipper_control.user_clip_plane_enable;
+        info.vs_info.user_clip_plane_mask = selection.vr_fs_cut == Shader::VrCut::BladeMouth
+                                               ? Shader::VertexRuntimeInfo::BladeMouthMask
+                                               : regs.clipper_control.user_clip_plane_enable;
+        if (Shader::VrCut::IsHone(selection.vr_fs_cut))
+            info.vs_info.user_clip_plane_mask = Shader::VertexRuntimeInfo::HoneMask |
+                                                (VR::HonedSteel::ShaderRevision << 8) |
+                                                (selection.vr_fs_cut & 3u);
         info.vs_info.step_rate_0 = regs.vgt_instance_step_rate_0;
         info.vs_info.step_rate_1 = regs.vgt_instance_step_rate_1;
         info.vs_info.num_outputs = MapOutputs(info.vs_info.outputs, regs.vs_output_control);
@@ -313,201 +561,11 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
     }
     case Stage::Fragment: {
         BuildCommon(regs.ps_program);
-        // The new graphics' programs (2026-11-11: this runs twice a draw, so every other program
-        // is told apart by its hash alone, before any setting is read).
-        info.vr_ambient_occlusion = 0;
-        info.vr_composite_light = 0;
+        // The new graphics' programs (VrFragmentBits; 2026-11-11: this runs twice a draw, so every
+        // other program is told apart by its hash alone, before any setting is read).
         const auto* const ps = regs.ProgramForStage(u32(Stage::Fragment));
         const u64 lighting_hash = ps && ps->Address<u32*>() ? AmdGpu::GetParams(*ps).hash : 0;
-        const bool lighting_program =
-            lighting_hash != 0 &&
-            (Shader::Optimization::AmbientOcclusion::IsAoProgram(lighting_hash) ||
-             Shader::Optimization::MoonShadow::IsShadowMaskProgram(lighting_hash) ||
-             Shader::Optimization::Reflections::IsTraceProgram(lighting_hash) ||
-             Shader::Optimization::Reflections::IsCompositeProgram(lighting_hash) ||
-             Shader::Optimization::BounceLight::IsCompositeProgram(lighting_hash));
-        // The game's AO pass computes ours (ambient_occlusion.h): only its programs.
-        if (lighting_program) {
-            static const char* const ao_override = std::getenv("VR_AMBIENT_OCCLUSION");
-            // ... and its moon-shadow mask ours (moon_shadow.h): only its programs too.
-            static const char* const moon_override = std::getenv("VR_MOON_SHADOWS");
-            const u64 ps_hash = lighting_hash;
-            const bool ps_upscaler =
-                VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off;
-            const bool ao_program = Shader::Optimization::AmbientOcclusion::IsAoProgram(ps_hash);
-            const bool ao_ours = ao_program && Shader::Optimization::AmbientOcclusion::Enabled(
-                                                   VR::IsEnabled(), VR::GetSettings().ambient_occlusion,
-                                                   ps_upscaler, ao_override);
-            // ... or, our AO off, the lamp shadows' mask alone (the game's AO kept).
-            const bool ao_mask_only =
-                ao_program && Shader::Optimization::AmbientOcclusion::MaskOnly(
-                                  ao_ours, VrLampShadowsOn(),
-                                  Shader::Optimization::LightShadow::SceneMaps::Mask());
-            // ... and with the lamp shadows on, their work in the same pass (RuntimeInfo::
-            // VrAoLampShadows: the scene maps, the mask).
-            const bool ao_lamps = (ao_ours || ao_mask_only) &&
-                                  Shader::Optimization::LightShadow::SceneMaps::Enabled() &&
-                                  VrLampShadowsOn();
-            info.vr_ambient_occlusion = u8(
-                (ao_ours ? Shader::RuntimeInfo::VrAmbientOcclusionBit
-                 : ao_mask_only
-                     ? (Shader::RuntimeInfo::VrAmbientOcclusionBit | Shader::RuntimeInfo::VrAoMaskOnly)
-                     : 0) |
-                (ao_lamps ? Shader::RuntimeInfo::VrAoLampShadows : 0) |
-                (Shader::Optimization::MoonShadow::IsShadowMaskProgram(ps_hash) &&
-                         Shader::Optimization::MoonShadow::Enabled(
-                             VR::IsEnabled(), VR::GetSettings().moon_shadows, ps_upscaler,
-                             moon_override)
-                     ? Shader::RuntimeInfo::VrMoonShadows
-                     : 0));
-            // Wet streets (reflections.h): the game's trace ours, its composite counting the
-            // reflection once; only their programs, only with wet_streets (the eboot switch is
-            // made at the start; without it the game's trace never runs).
-            static const char* const reflections_override = std::getenv("VR_REFLECTIONS_TRACE");
-            if (Shader::Optimization::Reflections::Enabled(
-                    VR::IsEnabled(), VR::GetSettings().wet_streets, reflections_override)) {
-                if (Shader::Optimization::Reflections::IsTraceProgram(ps_hash)) {
-                    info.vr_ambient_occlusion |=
-                        Shader::RuntimeInfo::VrReflections |
-                        (ps_upscaler ? Shader::RuntimeInfo::VrReflectionsJitter : 0);
-                } else if (Shader::Optimization::Reflections::IsCompositeProgram(ps_hash)) {
-                    // Blood on glossy floors (reflections.h Blood*): its own key bit.
-                    static const char* const blood_override = std::getenv("VR_BLOOD_REFLECTION");
-                    info.vr_ambient_occlusion |=
-                        Shader::RuntimeInfo::VrReflectionComposite |
-                        (Shader::Optimization::Reflections::BloodEnabled(
-                             VR::IsEnabled(), VR::GetSettings().wet_streets, blood_override)
-                             ? Shader::RuntimeInfo::VrBloodFloors
-                             : 0);
-                }
-            }
-            // With our AO, the same composite's shine by the specular occlusion
-            // (ambient_occlusion.h SpecOcclusion).
-            static const char* const spec_override = std::getenv("VR_SPEC_OCCLUSION");
-            if (Shader::Optimization::Reflections::IsCompositeProgram(ps_hash) &&
-                Shader::Optimization::AmbientOcclusion::SpecEnabled(
-                    Shader::Optimization::AmbientOcclusion::Enabled(
-                        VR::IsEnabled(), VR::GetSettings().ambient_occlusion, ps_upscaler,
-                        ao_override),
-                    spec_override)) {
-                info.vr_ambient_occlusion |= Shader::RuntimeInfo::VrSpecularOcclusion;
-            }
-            static const char* const bounce_override = std::getenv("VR_BOUNCE_LIGHT");
-            static const char* const fog_override = std::getenv("VR_FOG_LIGHT");
-            static const char* const shafts_override = std::getenv("VR_MOON_SHAFTS");
-            const bool composite = Shader::Optimization::BounceLight::IsCompositeProgram(ps_hash);
-            const bool upscaler = ps_upscaler;
-            info.vr_composite_light = u8(
-                (composite && Shader::Optimization::BounceLight::Enabled(
-                                  VR::IsEnabled(), VR::GetSettings().bounce_light, upscaler,
-                                  bounce_override)
-                     ? Shader::RuntimeInfo::VrCompositeBounce
-                     : 0) |
-                (composite && Shader::Optimization::FogLight::Enabled(
-                                  VR::IsEnabled(), VR::GetSettings().fog_light, upscaler,
-                                  fog_override)
-                     ? Shader::RuntimeInfo::VrCompositeFog
-                     : 0) |
-                (composite && Shader::Optimization::MoonShafts::Enabled(
-                                  VR::IsEnabled(), VR::MoonGlowOn(VR::GetSettings()), upscaler,
-                                  shafts_override)
-                     ? Shader::RuntimeInfo::VrCompositeShafts
-                     : 0));
-        }
-        // Less shimmer on shiny details (specular_aa.h): the light programs and the ambient
-        // composite read a widened gloss; in VR, with or without an upscaler. Wet, glistening
-        // blood (wet_blood.h): the _Bloody_ G-buffer programs. Told apart by hash first (a
-        // binary search each), then only the startup override and VR itself.
-        // The air pass (air_light.h): the shadow mask's blur computes the moonlight in the air,
-        // the scene's copy applies it (and the sky's halos). By hash first.
-        if (lighting_hash != 0 &&
-            (Shader::Optimization::AirLight::IsComputeProgram(lighting_hash) ||
-             Shader::Optimization::AirLight::IsHalfProgram(lighting_hash) ||
-             Shader::Optimization::AirLight::IsApplyProgram(lighting_hash))) {
-            static const char* const air_shafts = std::getenv("VR_MOON_SHAFTS");
-            static const char* const air_fog = std::getenv("VR_FOG_LIGHT");
-            const bool air_upscaler =
-                VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off;
-            const bool shafts = Shader::Optimization::MoonShafts::Enabled(
-                VR::IsEnabled(), VR::MoonGlowOn(VR::GetSettings()), air_upscaler, air_shafts);
-            const bool fog = Shader::Optimization::FogLight::Enabled(
-                VR::IsEnabled(), VR::GetSettings().fog_light, air_upscaler, air_fog);
-            if (Shader::Optimization::AirLight::Pass() &&
-                (Shader::Optimization::AirLight::IsApplyProgram(lighting_hash) ? shafts || fog : shafts)) {
-                info.vr_composite_light |= Shader::RuntimeInfo::VrAirPass;
-                // The mist from the fog grid (fog_grid.h, VR_FOG_GRID=1): its own key bit.
-                if (Shader::Optimization::FogGrid::Enabled()) {
-                    info.vr_composite_light |= Shader::RuntimeInfo::VrFogGrid;
-                }
-            }
-        }
-        if (lighting_hash != 0) {
-            static const char* const spec_aa_override = std::getenv("VR_SPEC_AA");
-            static const char* const wet_blood_override = std::getenv("VR_WET_BLOOD");
-            if (Shader::Optimization::SpecularAa::IsLightingProgram(lighting_hash) &&
-                Shader::Optimization::SpecularAa::Enabled(
-                    VR::IsEnabled(), VR::GetSettings().ambient_occlusion, spec_aa_override)) {
-                info.vr_ambient_occlusion |= Shader::RuntimeInfo::VrSpecularAa;
-            } else if (Shader::Optimization::WetBlood::IsBloodProgram(lighting_hash) &&
-                       Shader::Optimization::WetBlood::Enabled(
-                           VR::IsEnabled(), VR::GetSettings().ambient_occlusion,
-                           wet_blood_override)) {
-                info.vr_composite_light |= Shader::RuntimeInfo::VrWetBlood;
-            }
-            // Deeper stones (parallax.h): the three parallax programs, with Shading.
-            if (Shader::Optimization::Parallax::IsParallaxProgram(lighting_hash)) {
-                static const char* const parallax_override = std::getenv("VR_PARALLAX");
-                if (Shader::Optimization::Parallax::Enabled(
-                        VR::IsEnabled(), VR::GetSettings().ambient_occlusion, parallax_override)) {
-                    info.vr_composite_light |= Shader::RuntimeInfo::VrParallax;
-                }
-            } else {
-                // Raised brickwork (parallax.h BumpGaps; vr.ini raised_bricks): the map's G-buffer
-                // programs only (BumpGaps::MapPrograms: never a character's skin, hair or cloth),
-                // five or more colour targets (the pass checks the bump map's shape).
-                static const char* const gaps_override = std::getenv("VR_BUMP_GAPS");
-                if (Shader::Optimization::BumpGaps::IsMapProgram(lighting_hash) &&
-                    Shader::Optimization::BumpGaps::Enabled(
-                        VR::IsEnabled(), VR::GetSettings().raised_bricks, gaps_override)) {
-                    u32 targets = 0;
-                    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
-                        targets += regs.color_buffers[cb] && regs.color_target_mask.GetMask(cb);
-                    }
-                    if (targets >= 5) {
-                        info.vr_composite_light |= Shader::RuntimeInfo::VrBumpGaps;
-                    }
-                }
-            }
-            // Lit smoke (particle_air.h): the soft particle programs, alpha-blended draws only
-            // (straight or premultiplied; an additive fire is its own light), with the lights in
-            // the air (whose lights it reads).
-            if (Shader::Optimization::ParticleAir::IsParticleProgram(lighting_hash)) {
-                static const char* const air_override = std::getenv("VR_PARTICLE_AIR");
-                using Factor = AmdGpu::BlendControl::BlendFactor;
-                const auto& blend = regs.blend_control[0];
-                const bool straight = blend.color_src_factor == Factor::SrcAlpha;
-                const bool premul = blend.color_src_factor == Factor::One;
-                if (blend.enable && blend.color_dst_factor == Factor::OneMinusSrcAlpha &&
-                    (straight || premul) &&
-                    Shader::Optimization::ParticleAir::Enabled(
-                        VR::IsEnabled(), VR::GetSettings().fog_light,
-                        VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
-                        air_override)) {
-                    info.vr_composite_light |=
-                        Shader::RuntimeInfo::VrParticleAir |
-                        (premul ? Shader::RuntimeInfo::VrParticleAirPremul : 0);
-                }
-            }
-        }
-        // Eye adaptation (cinematic_look.h): the tone map's exposure follows the view's brightness.
-        if (lighting_hash != 0 &&
-            Shader::Optimization::CinematicLook::IsToneMapProgram(lighting_hash)) {
-            static const char* const adapt_override = std::getenv("VR_EYE_ADAPT");
-            if (Shader::Optimization::CinematicLook::AdaptEnabled(
-                    VR::IsEnabled(), VR::GetSettings().eye_adaptation, adapt_override)) {
-                info.vr_ambient_occlusion |= Shader::RuntimeInfo::VrEyeAdaptation;
-            }
-        }
+        VrFragmentBits(info, lighting_hash, &regs);
         info.fs_info.en_flags = regs.ps_input_ena;
         info.fs_info.addr_flags = regs.ps_input_addr;
         info.fs_info.num_inputs = regs.num_interp;
@@ -556,6 +614,16 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
             profile.needs_clip_distance_emulation;
         // 0 except while GetVrCutPipeline builds a permutation; VrPushData: only its flag (the
         // draw pushes the radii).
+        if (Shader::VrCut::IsHone(selection.vr_fs_cut)) {
+            // The revision gives a changed material a new disk-cache key; the low bits still
+            // identify this one fragment permutation for all four blades.
+            info.fs_info.vr_cut = Shader::VrCut::Hone | (VR::HonedSteel::ShaderRevision << 16);
+            break;
+        }
+        if (selection.vr_fs_cut == Shader::VrCut::BladeMouth) {
+            info.fs_info.vr_cut = 0; // the blade is clipped entirely in the vertex stage
+            break;
+        }
         info.fs_info.vr_cut = vr_push && selection.vr_fs_cut != 0 &&
                                       Shader::VrCut::MonocularEye(selection.vr_fs_cut) < 0
                                   ? 1u : selection.vr_fs_cut;
@@ -812,7 +880,8 @@ const GraphicsPipeline* PipelineCache::GetVrCutPipeline(const GraphicsPipeline* 
         }
     }
     const GraphicsPipeline* variant = nullptr;
-    if (fs != nullptr && !fs->stores.Get(Shader::IR::Attribute::SampleMask)) {
+    if (cut == Shader::VrCut::BladeMouth || (fs && (Shader::VrCut::IsHone(cut) ||
+        !fs->stores.Get(Shader::IR::Attribute::SampleMask)))) {
         // The same registers as `base` (this draw's), with the cutaway in the fragment program's
         // runtime info: a permutation of that program, so a pipeline of its own.
         selection.vr_fs_cut = cut;
@@ -833,7 +902,9 @@ const GraphicsPipeline* PipelineCache::GetVrCutPipeline(const GraphicsPipeline* 
                                     ? "built"
                                     : "not possible (no fragment shader or it writes the sample "
                                       "mask)";
-    if (UsesVrPushData()) {
+    if (Shader::VrCut::IsHone(cut)) {
+        LOG_INFO(Render_Vulkan, "VR honed steel: native material for part {}: {}", cut & 3u, outcome);
+    } else if (UsesVrPushData()) {
         LOG_INFO(Render_Vulkan,
                  "VR cut: pipeline {:#x} with the body cutaway (every cut, its radii pushed per "
                  "draw): {}",
@@ -1394,6 +1465,25 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& selection, u32 view
         vertex_input = ScratchDraw::Inputs{vs_info, owned->user, owned->info.flattened_ud_buf,
                                            owned->info.pgm_base, owned->register_reads};
         vertex_scope.emplace(std::span<const ScratchDraw::Inputs>{&*vertex_input, 1});
+    }
+    if (vs_info && selection.fetch_shader) {
+        // A vertex buffer the game gave no table for (its table pointer is null, so its V# reads as
+        // zeros: info.h ReadUdReg): there is nothing to draw from, and drawing it lost the GPU
+        // device (the Laurence fight's shadow pass, 2026-11-18). No pipeline, so no draw, as for
+        // the other draws this function refuses.
+        const auto* snapshot = ScratchDraw::Find(vs_info);
+        for (const auto& attrib : selection.fetch_shader->attributes) {
+            if (!attrib.HasVertexBuffer(*vs_info, snapshot)) [[unlikely]] {
+                static std::atomic<u32> noted{0};
+                if (noted.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Draw left out: vertex program {:#x} has a missing vertex buffer table "
+                                "or an empty descriptor",
+                                vs_info->pgm_hash);
+                }
+                return false;
+            }
+        }
     }
     if (vs_info && selection.fetch_shader && !instance.IsVertexInputDynamicState()) {
         // Without vertex input dynamic state, the pipeline needs to specialize on format.

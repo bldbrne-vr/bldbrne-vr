@@ -47,7 +47,9 @@ public:
     VrEyeCant& operator=(const VrEyeCant&) = delete;
 
     // Compiles the pipeline. False (logged): a canted display gets the parallel eyes.
-    bool Init(vk::Device device, VmaAllocator allocator);
+    // `mirror` (left-handed play, core/vr/mirror_world.h): each turned eye written flipped left to
+    // right (the presenter's TurnCopy into the headset; the late warp flips its own at its copy).
+    bool Init(vk::Device device, VmaAllocator allocator, bool mirror = false);
     // The caller has waited for its GPU work.
     void Shutdown();
     [[nodiscard]] bool Ready() const {

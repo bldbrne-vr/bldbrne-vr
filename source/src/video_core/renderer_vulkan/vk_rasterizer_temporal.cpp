@@ -1,10 +1,11 @@
-#include "video_core/native_stereo/draw_registers.h"
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 BB-VR contributors. Part of Bldbrne-VR (https://github.com/bldbrne-vr/bldbrne-vr).
 // Licensed under the GNU Affero General Public License v3.0 or later (LICENSES/AGPL-3.0-or-later.txt).
 // You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
+#include "core/vr/s1_dynamic_resolution.h"
+#include "video_core/native_stereo/draw_registers.h"
 #include <atomic>
 #include <bit>
 #include "video_core/renderer_vulkan/vr_temporal_optimizations.h"
@@ -45,6 +46,8 @@
 #include "video_core/renderer_vulkan/vr_upscaler_fast.h"
 #include "video_core/renderer_vulkan/vr_dibr_upscale.h"
 #include "video_core/renderer_vulkan/vr_eye_axes.h"
+#include "video_core/renderer_vulkan/vk_gpu_frame_timer.h"
+#include "core/vr/bloodborne_frame_rate.h"
 namespace Vulkan {
 namespace {
 // Tonitrus' world flash in this frame's own item list, for the upscaler's history restart on
@@ -559,18 +562,17 @@ void S1RetryIdle(VrTemporalCapture& t, const VR::Graphics::Config& off,
     }
     t.active = ready;
 }
-// Foveated upscaling's rectangles for these sizes (vr.ini upscale_focus, read at start;
-// VR_DLSS_FOCUS=<fraction> for tests; vr_dlss_focus.h): around each lens
-// centre once the headset's angles are known (the image centres until then), then kept while
+// Foveated upscaling's rectangles for these sizes (vr.ini upscale_focus, read for the stereo pair;
+// VR_DLSS_FOCUS=<fraction> for tests; vr_dlss_focus.h): based on each lens axis and its distance
+// to the top and bottom (centred until the headset's angles are known), then kept while
 // the sizes stay, so the Plan (the pair's key) does not change from frame to frame. Both eyes'
 // or none; none after a failure turned focus off (DlssFocus::Off). Each change and the turning
 // off go to the render diagnostics too (play builds and headset trials keep them). Recording
 // thread only (the frame's first scene draw).
 std::array<DlssFocus::Rect,2> DlssFocusRects(u32 in_w, u32 in_h, u32 out_w, u32 out_h) {
-    static const float fraction = [] {
-        const float tested = DlssFocus::Fraction(std::getenv("VR_DLSS_FOCUS"));
-        return tested != 0.0f ? tested : DlssFocus::LevelFraction(VR::GetSettings().upscale_focus);
-    }();
+    static const float override_fraction = DlssFocus::Fraction(std::getenv("VR_DLSS_FOCUS"));
+    const float fraction = override_fraction != 0.0f ? override_fraction :
+        DlssFocus::LevelFraction(VR::Graphics::upscale_focus.load(std::memory_order_relaxed));
     if (fraction == 0.0f) return {};
     if (DlssFocus::IsOff()) {
         static bool told = false;
@@ -583,10 +585,10 @@ std::array<DlssFocus::Rect,2> DlssFocusRects(u32 in_w, u32 in_h, u32 out_w, u32 
         }
         return {};
     }
-    static std::array<u32,4> sizes{};
+    static DlssFocus::CropKey sizes{};
     static std::array<DlssFocus::Rect,2> rects{};
     static bool from_fov{}, planned{};
-    const std::array<u32,4> now{in_w,in_h,out_w,out_h};
+    const DlssFocus::CropKey now{in_w, in_h, out_w, out_h, fraction};
     if (planned && now == sizes && from_fov) return rects;
     // The head state's lock only until the headset's angles are known (or the sizes change).
     std::array<float,2> cx{}, cy{};
@@ -940,17 +942,21 @@ bool VrTemporalCapture::S1ScaleDepth(const RecorderProxy& cmd, VrDepthRescale::M
                                      vk::Image dst, vk::Extent2D dst_size, uint32_t layers,
                                      vk::Format format, vk::ImageAspectFlags aspects,
                                      std::span<vk::UniqueImageView> targets,
-                                     vk::ImageAspectFlags keep) {
+                                     vk::ImageAspectFlags keep, unsigned drop) {
     const vk::Image src = src_image.GetImage();
     if (mode == VrDepthRescale::Mode::None) {
         return false;
     }
     if (mode == VrDepthRescale::Mode::Blit) {
+        // Only the real scene depth accompanies the reconstructed colour. The HUD's
+        // separate depth/stencil surface has its own original coordinate system.
+        const int x=S1Drs::Margin(src_size.width,drop);
+        const int y=S1Drs::Margin(src_size.height,drop);
         const vk::ImageBlit region{
             .srcSubresource = {aspects, 0, 0, layers},
-            .srcOffsets = std::array<vk::Offset3D, 2>{vk::Offset3D{0, 0, 0},
-                vk::Offset3D{static_cast<int32_t>(src_size.width),
-                             static_cast<int32_t>(src_size.height), 1}},
+            .srcOffsets = std::array<vk::Offset3D, 2>{vk::Offset3D{x,y,0},
+                vk::Offset3D{static_cast<int32_t>(src_size.width)-x,
+                             static_cast<int32_t>(src_size.height)-y, 1}},
             .dstSubresource = {aspects, 0, 0, layers},
             .dstOffsets = std::array<vk::Offset3D, 2>{vk::Offset3D{0, 0, 0},
                 vk::Offset3D{static_cast<int32_t>(dst_size.width),
@@ -1229,6 +1235,20 @@ void Rasterizer::VrTemporalBeforeDraw(const GraphicsPipeline* pipeline, bool ind
     // S1 (bit 51): the guest itself renders at the input size, so no reduced-raster proxies.
     // Same recording thread as every reader of vr_temporal_scaled (draws, dispatches, VrEndFrame).
     const auto whole_frame = WholeFrameOutput();
+    if (S1Drs::enabled && !drs.started) {
+        drs.started = true;
+        drs.native = !vr_temporal && !whole_frame.width &&
+                     VR::Graphics::Accepted().upscaler == VR::Graphics::Upscaler::Off;
+        if (drs.native) {
+            const auto camera = VR::DrawFrameRecord();
+            drs.gameplay = camera.driven && !camera.menu && camera.monocular_eye < 0;
+            drs.parallel_eyes = S1Drs::ParallelEyes(camera.eye_cant);
+            drs.BeginFrame(drs_native_extent.width, drs_native_extent.height, camera.s1_render_drop);
+            // The scene's foveation follows the narrower view (vr_foveation.h Map scale).
+            scheduler.SetFoveationDrop(drs.clip_scene ? drs.drop : 0);
+        }
+    }
+    if (drs.native) return; // No temporal features or motion buffers on the spatial path.
     if (whole_frame.width && vr_temporal_scaled) {
         vr_temporal_scaled = false;
         LOG_INFO(Render_Vulkan, "VR temporal: S1 whole frame (FAST bit 51), output {}x{}; "
@@ -1292,6 +1312,15 @@ void Rasterizer::VrTemporalBeforeDraw(const GraphicsPipeline* pipeline, bool ind
             t.width=depth.info.size.width; t.height=depth.info.size.height;
         }
         t.frame=vr_temporal_frame;
+        if (S1Drs::enabled) {
+            const auto camera = VR::DrawFrameRecord();
+            drs.gameplay = camera.driven && !camera.menu && camera.monocular_eye < 0;
+            drs.parallel_eyes = S1Drs::ParallelEyes(camera.eye_cant);
+            drs.BeginFrame(t.width, t.height, t.s1.on ? camera.s1_render_drop : 0);
+            drs.clipped=0;
+            // The scene's foveation follows the narrower view (vr_foveation.h Map scale).
+            scheduler.SetFoveationDrop(drs.clip_scene ? drs.drop : 0);
+        }
         if (FastRender::On(MotionFast)) LogMotionFast();
         if (t.frame % 600 == 0) t.index_ranges.Trim(t.frame);
         t.depth_id={}; t.color_id={};
@@ -1808,6 +1837,12 @@ void Rasterizer::VrTemporalDispatch(uint64_t shader) {
 // reconstructs X into the output-size twin (VrTemporalCapture::s1.color); the game keeps X for
 // its UI, the desktop and the fallback eyes.
 void Rasterizer::VrS1Reconstruct() {
+    if (S1Drs::enabled) {
+        // Subsequent draws target the UI or fallback image in their own coordinates.
+        drs.clip_scene = false;
+        drs.scissor_key = 0;
+        scheduler.SetFoveationDrop(0);
+    }
     ScratchProfile::Cpu scratch_temporal(43, "Rasterizer::VrS1Reconstruct");
     auto& t=*vr_temporal;
     auto& s=t.s1;
@@ -1815,6 +1850,10 @@ void Rasterizer::VrS1Reconstruct() {
     s.valid=false;
     ++s.frames;
     const auto fail=[&](const char* why, bool persistent = false) {
+        if (S1Drs::enabled) {
+            drs_governor.Suspend(drs.drop != 0);
+            S1Drs::timing_wanted.store(false,std::memory_order_relaxed);
+        }
         // FAST_GPU_S1_ASYM: a streak of incomplete frames (not a provider failure) idles the
         // provider until a retry instead of turning it off for the session.
         const bool retry = g_s1_retry && !persistent;
@@ -1899,7 +1938,7 @@ void Rasterizer::VrS1Reconstruct() {
         std::clamp(std::chrono::duration<float,std::milli>(now-t.last_resolve).count(),1.f,1000.f):11.111f;
     t.last_resolve=now;
     t.scene.SetFlashLevel(FrameFlashLevel(vr_dibr.first_draw_record));
-    const auto result=t.scene.Resolve(sources,frame_ms);
+    const auto result=t.scene.Resolve(sources,frame_ms,drs.drop);
     const auto output=t.scene.Output();
     if(result!=VrTemporalPair::Result::Ready || !output) {
         fail(t.scene.Problem().empty()?"temporal resolve refused or provider failed":t.scene.Problem().c_str(),
@@ -1971,6 +2010,12 @@ void Rasterizer::VrS1Reconstruct() {
     s.x_id=x_id;
     s.x_uid=x->image_uid;
     ++s.reconstructed;
+    if (S1Drs::enabled) {
+        drs.sample_candidate=t.scene.DynamicRegionSupported() && NativeStereo::AsymmetricProjection() &&
+            VR::Graphics::Unpack(t.accepted_key).upscaler == VR::Graphics::Upscaler::Dlss && !neural &&
+            vr_ui_layer && VR::UiLayerFrameMode()==1 &&
+            VrDepthRescale::Choose(instance,*depth,vk::ImageAspectFlagBits::eDepth)==VrDepthRescale::Mode::Blit;
+    }
     t.reconstructed=true;
     UpscalerFastNote(g_upscaler_fast.resolved);
     VR::Graphics::PublishStatus(VR::Graphics::Unpack(t.accepted_key), VR::Graphics::RunState::Active,
@@ -1981,7 +2026,41 @@ void Rasterizer::VrS1Reconstruct() {
             t.last_reads[0],t.last_reads[1],t.last_reads[2],t.last_reads[3],t.last_reads[4],t.last_reads[5],
             neural ? "DLSS 5, linear in, sRGB-encoded out" : "LDR");
 }
-void Rasterizer::VrTemporalEndFrame() {
+void Rasterizer::VrTemporalEndFrame(bool used_layer_scene) {
+    if (S1Drs::enabled) {
+        const auto& settings = VR::GetSettings();
+        const bool usable = drs.sample_candidate && drs.parallel_eyes && used_layer_scene && drs.pair_captured &&
+                            S1Drs::ProjectionSettingsAllow(settings.late_warp, settings.xr_depth,
+                                                           settings.ui_layer) &&
+                            (drs.native || (vr_temporal && vr_temporal->frame == vr_temporal_frame &&
+                                            vr_temporal->s1.valid));
+        S1Drs::native_ready.store(drs.native && usable, std::memory_order_release);
+        S1Drs::timing_wanted.store(usable, std::memory_order_relaxed);
+        if (usable) {
+            unsigned sample{};
+            const float ms = LastGpuFrameMs(&sample);
+            const int hz = VR::Bloodborne::GameFrameRate();
+            bool changed = false;
+            if (S1Drs::pinned_level) { // VR_S1_DRS_LEVEL (tests): that level, whatever the load
+                changed = S1Drs::requested.exchange(S1Drs::pinned_level, std::memory_order_acq_rel) !=
+                          S1Drs::pinned_level;
+            } else {
+                changed = drs_governor.Sample(sample, ms, hz > 0 ? 1000.f / hz : 0.f,
+                    S1Drs::player_transition.load(std::memory_order_relaxed), drs.gameplay);
+            }
+            if (S1Drs::trace && (changed || vr_temporal_frame % 120 == 0))
+                LOG_WARNING(Render_Vulkan,"DRS frame {} tag {} active_pct {} requested_level {} clipped {} gpu {} hz {}",
+                    vr_temporal_frame,vr_dibr.first_draw_record,100-drs.drop,S1Drs::requested.load(std::memory_order_relaxed),drs.clipped,ms,hz);
+        } else if (S1Drs::pinned_level) {
+            // (The pin holds only frames that can be scaled: any other frame draws at full scale
+            // from the next, as the governor's Suspend makes it. 2026-11-24 review.)
+            S1Drs::requested.store(0, std::memory_order_release);
+        } else {
+            drs_governor.Suspend(drs.drop != 0);
+        }
+        drs = {};
+        scheduler.SetFoveationDrop(0);
+    }
     // S1 (bit 51): before the status below, which it does not change.
     if(vr_temporal && vr_temporal->s1.on) {
         auto& s=vr_temporal->s1;

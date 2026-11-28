@@ -255,6 +255,21 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
     if (IR::IsMrt(attr)) {
         const u32 index{u32(attr) - u32(IR::Attribute::RenderTarget0)};
         const auto& info{ctx.frag_outputs.at(index)};
+        // The game's lights use exp2(13 * gloss). Widen their highlight slightly on
+        // the honed bevel so the steel catches light over a softer wrist-angle range.
+        if (Sirit::ValidId(ctx.hone_polish) && !info.is_integer && element < 3) {
+            const Id t = ctx.F32[1];
+            if (index == 1 && element == 0) {
+                value = ctx.OpFMax(t, ctx.Constant(t, 0.f),
+                                  ctx.OpFma(t, ctx.hone_polish, ctx.Constant(t, -.11f), value));
+            } else if (index == 2) {
+                value = ctx.OpFma(t, ctx.hone_polish, ctx.Constant(t, .095f), value);
+            } else if (index == 3) {
+                const Id room = ctx.OpFMax(t, ctx.Constant(t, 0.f),
+                                           ctx.OpFSub(t, ctx.Constant(t, 1.f), value));
+                value = ctx.OpFma(t, ctx.hone_polish, room, value);
+            }
+        }
         if (info.num_components == 1) {
             return op_store(info.id);
         } else {

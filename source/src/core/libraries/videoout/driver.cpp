@@ -20,6 +20,7 @@
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "core/vr/vr_session.h"
+#include "core/vr/s1_dynamic_resolution.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -335,8 +336,10 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         // VR: the camera update of the frame being flipped, taken on the submitting thread.
         vr_flip = VR::OnFlipSubmitted();
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand(
-            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, vr_flip, submitted_ns); });
+        liverpool->SendCommand([=, this]() {
+            SubmitFlipInternal(port, index, flip_arg, is_eop, vr_flip, submitted_ns);
+            if (S1Drs::enabled) VR::LatchNextDrawResolution();
+        });
     } else {
         SubmitFlipInternal(port, index, flip_arg, is_eop, vr_flip, submitted_ns);
     }

@@ -109,6 +109,12 @@ struct VertexRuntimeInfo : protected CommonEsVsRuntimeInfo {
     u32 step_rate_1;
     /// UCP_ENA bits from PA_CL_CLIP_CNTL, lowered to clip distances in the shader.
     u32 user_clip_plane_mask{};
+    // Outside the six guest plane bits. Keeps the same on-disk runtime-info layout.
+    static constexpr u32 BladeMouthMask = 1u << 31;
+    // Honed steel: HoneMask | the shader revision << 8 | the part (core/vr/honed_steel.h).
+    static constexpr u32 HoneMask = 1u << 30;
+    bool HonesBlade() const { return (user_clip_plane_mask >> 30) == 1u; }
+    bool ClipsBlade() const { return user_clip_plane_mask == BladeMouthMask; }
 
     bool operator<=>(const VertexRuntimeInfo& other) const noexcept = default;
 };
@@ -211,6 +217,8 @@ struct FragmentRuntimeInfo {
     // VrPushData (vr_push_data.h): the draw pushes its radii and this is only 1, so one cut
     // permutation serves every radius, boost level and world scale.
     u32 vr_cut{0};
+    bool HonesBlade() const { return (vr_cut & 0xfffcu) == 0xfff0u; }
+    bool CutsFragments() const { return vr_cut != 0 && !HonesBlade(); }
 
     // The recompiler reads color_buffers[i] only for the targets the program exports
     // (Info::mrt_mask, fixed by its code; with dual source blending MRT1's export converts with
@@ -310,6 +318,13 @@ struct RuntimeInfo {
     // with the lamp shadows on (2026-11-17: the mask is the default since, a session without lamp
     // shadows must not pay for it).
     static constexpr u8 VrAoLampShadows = 16;
+    // ... and, with it, the tier that mask was made for (light_shadow.h SceneMaps::EdgeTier: its
+    // march's step shares and edge reach are compiled in): VrAoLampLow Low, VrAoLampHigh High,
+    // neither Medium. The trace's and the composite's bits (4, 32): their passes and the cache's
+    // checks act on them only for those programs (2026-11-21, a code review: a Low mask writer
+    // was taken for a Medium one and the other way round).
+    static constexpr u8 VrAoLampLow = 4;
+    static constexpr u8 VrAoLampHigh = 32;
     // The same bit again on the composite (never a trace or AO program): VrBloodFloors, the
     // reflection seen through blood on glossy floors (reflections.h Blood*). Its own key bit, so
     // turning it on retranslates this one program and no other.

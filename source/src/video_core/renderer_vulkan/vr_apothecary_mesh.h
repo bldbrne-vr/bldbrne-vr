@@ -58,7 +58,7 @@ inline MeshData ApothecaryCaseMesh() {
     return mesh;
 }
 // Open single-item leather holder; unit bounds, fitted to the item's actual dimensions.
-inline MeshData QuickHolsterMesh() {
+inline MeshData QuickHolsterMesh(bool low_lip = false) {
     MeshData mesh{};
     auto box = [&](Vec3 centre, Vec3 half, float material) {
         auto part = RoundedBox(half, .025f, 1);
@@ -69,8 +69,11 @@ inline MeshData QuickHolsterMesh() {
     box({0,0,.46f},{.5f,.5f,.04f},0);
     box({0,-.46f,0},{.5f,.04f,.5f},0);
     for (float x : {-.46f,.46f}) box({x,-.16f,0},{.04f,.34f,.5f},0);
-    box({0,-.23f,-.46f},{.5f,.27f,.04f},0);
-    for (float x : {-.35f,.35f}) box({x,-.10f,-.51f},{.045f,.045f,.015f},1);
+    const float rail_half = low_lip ? .065f : .27f;
+    box({0, -.5f + rail_half, -.46f}, {.5f, rail_half, .04f}, 0);
+    const float stud = low_lip ? .024f : .045f;
+    for (float x : {-.35f, .35f})
+        box({x, low_lip ? -.435f : -.10f, -.51f}, {stud, stud, .015f}, 1);
     // Keep local coordinates in metres so the shared leather shader has the same grain
     // scale as the vial case (the caller fits this nominal 10 cm holder to the item).
     TransformMesh(mesh, Mat4::Scale({.1f,.1f,.1f}));

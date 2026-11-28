@@ -35,6 +35,9 @@
 #include "core/vr/bloodborne_ragdoll.h"
 #include "core/vr/bloodborne_sever.h"
 #include "core/vr/bloodborne_transform.h"
+#include "core/vr/blood_blast.h"
+#include "core/vr/fog_impulse.h"
+#include "core/vr/game_area.h"
 #include "core/vr/bloodborne_tuning.h"
 #include "core/vr/bloodborne_visceral_stage.h"
 #include "core/vr/bloodborne_weapon_shape.h"
@@ -62,10 +65,12 @@
 #include "core/vr/stake_driver.h"
 #include "core/vr/transform_settings.h"
 #include "core/vr/trick_weapons.h"
+#include "core/vr/chikage.h"
 #include "core/vr/two_hand_grip.h"
 #include "core/vr/visceral_channel.h"
 #include "core/vr/visceral_intent.h"
 #include "core/vr/visceral_thrust.h"
+#include "core/vr/lever_smack.h"
 #include "core/vr/vr_session.h"
 #include "core/vr/whip_damage.h"
 #include "core/vr/whip_moves.h"
@@ -606,6 +611,9 @@ struct Attack {
     float two_hand{1.0f};  // a two-handed swing's factor (MeleeWindow::two_hand; 1 = one-handed)
     bool two_handed{false}; // latched for the attack, even when the bonus is disabled
     float support_damage{1.0f}; // frozen when the attack starts; all its hits use the same penalty
+    s64 chikage_coat{};
+    bool chikage_draw{false}; // the Chikage's quick draw (chikage.h g_draw_hit_ns)
+    bool blood_blast{false};  // the Bloodletter's blast (blood_blast.h): no speed scale, no x0.90
     float damage_scale{1.0f};   // ... the window's (split blades, honed: MeleeWindow::damage_scale)
     // A row of ours over the game's row it opens (core/vr/bowblade_moves.h DamageScale: the
     // Bowblade's charged swing 170 / 130, its arrow 60 / 100); 1 for the game's own rows.
@@ -773,6 +781,7 @@ struct TickState {
     u32 visceral_held_serial{0};
     Attack cur{};         // its attack (a copy of the ring's)
     bool cur_live{false}; // created and not finalized
+    u16 lashes_paid{0};   // the carried lashes `cur` paid for (WhipLashStamina)
     // The combo budget could not pay the window (Combat::MeleeWindow::unpaid): no attack, its
     // whoosh and trail only (cur holds its row), until it ends, the presenter pays at its commit
     // or a flick's transform attack takes the stroke over.
@@ -1500,6 +1509,17 @@ bool ArmWhipForm(s32 variation, bool form_b) {
     return variation == 2500 && form_b && VR::Whip::GetWhipSettings().physical;
 }
 
+// The Threaded Cane's and the Beast Cutter's whip forms, the chain ours (whip=physical; the user,
+// 2026-11-20: the Cane's whip "felt very easy to use, as if it can hit non stop"; "maybe their 80%
+// but to pause regen", "and for the beast cutter as well"): a lash pays melee_stamina_pct of the
+// game's cost as every physical swing (not the Arm's full cost), and pauses the regen for its
+// move's own recovery (whip_moves.h WhipRecover, the game's clip) as the game's attack does; a
+// contact-held attack carried across lashes pays for each later one (PayCarriedLashes). Spun
+// without a pause, the Cane's whip empties a 100 bar in some 3.5 s, the Cutter's in some 2.
+bool WhipLashStamina(s32 variation, bool form_b) {
+    return form_b && VR::Whip::ContactHeldWhip(variation) && VR::Whip::GetWhipSettings().physical;
+}
+
 // " (row 30, 10% of 30)" / " (row 30)" / " (row 30, free: melee_stamina_pct=0)" for the open line.
 std::string StaminaText(const M::SwingStamina& rule, s32 row_cost, s32 full) {
     if (!rule.charge) {
@@ -1793,6 +1813,12 @@ std::string BudgetText(const Combat::MeleeWindow& w, bool flick) {
                        w.budget_refill_s, w.budget_late ? ", paid at the commit" : "");
 }
 
+s32 EquippedRightId(const u8* equip) {
+    if (!Plausible(equip, 4)) return -1;
+    const s32 slot = Read<s32>(equip + OffsetEquipRightSlot);
+    return slot >= 0 && slot <= 2 ? Read<s32>(equip + OffsetEquipIds + 4 * (slot * 2 + 1)) : -1;
+}
+
 // Opens the window's attack on `row` (core/vr/melee_moves.h): InvokeAttack on our slot, the
 // game's own hit list and capsule, melee_stamina_pct of its stamina (50% by default: Invoke);
 // then the swing sound, trail and (a swing that cost the game's full stamina) the regen pause.
@@ -1800,6 +1826,53 @@ std::string BudgetText(const Combat::MeleeWindow& w, bool flick) {
 // how near the grip the row's hit dummy must be (the part in the hand). `soft`: a refusal is only
 // logged and the window stays (a flick's stroke, whose transform attack still comes). True when
 // the attack was made.
+// The Bloodletter's blast was made: its cost on the hunter for MeleeSiteA (Game:Main only) ...
+bool g_blood_blast_cost = false;
+// ... and when, for its blood (BloodBlastFfxTick).
+s64 g_blood_blast_ffx_ns = 0;
+
+// The Bloodletter's blast: its game blood, asked for each update for its times (slot effects live
+// while asked for); and, during a candidate slam, whether a live enemy's hurt capsule is at the
+// flail's head (blood_blast.h g_enemy_touch_ns). Game:Main (the pose tick).
+void BloodBlastFfxTick(u8* chr, const TickState& t, s64 now) {
+    namespace BB = VR::BloodBlast;
+    const bool flail = t.form_b && t.variation / 10 == BB::Family;
+    if (g_blood_blast_ffx_ns != 0 && !flail) {
+        g_blood_blast_ffx_ns = 0; // (the flail is gone: its dummy with it)
+    }
+    if (g_blood_blast_ffx_ns != 0) {
+        const float age = static_cast<float>(now - g_blood_blast_ffx_ns) * 1e-9f;
+        if (age >= 0.0f && age < BB::FlashS) {
+            SpawnWeaponFfx(chr, BB::FlashSlot, BB::FlashFfx, BB::FfxDummy);
+        }
+        if (age >= 0.0f && age < BB::BurstS) {
+            SpawnWeaponFfx(chr, BB::BurstSlot, BB::BurstFfx, BB::FfxDummy);
+        } else {
+            g_blood_blast_ffx_ns = 0;
+        }
+    }
+    if (!flail || !BB::g_check_enemy.load(std::memory_order_relaxed)) {
+        return;
+    }
+    B::Vec3 head{};
+    if (!DummyAt(chr, BB::BlastDummy, head)) {
+        return;
+    }
+    static EnemyCapsules nearby; // Game:Main only
+    const size_t n = GatherEnemyCapsules(head, 2.0f, 1.0f, nearby);
+    for (size_t i = 0; i < n; ++i) {
+        const auto& c = nearby.capsules[i];
+        const B::Vec3 a{c.a.x, c.a.y, c.a.z}, b{c.b.x, c.b.y, c.b.z};
+        const B::Vec3 ab = b - a;
+        const float len2 = B::Dot(ab, ab);
+        const float k = len2 > 1e-8f ? std::clamp(B::Dot(head - a, ab) / len2, 0.0f, 1.0f) : 0.0f;
+        if (B::Length(head - (a + ab * k)) <= c.radius + BB::EnemyTouchM) {
+            BB::g_enemy_touch_ns.store(now, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+
 bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, s64 now,
                 const M::MoveRow* row, M::MoveKind kind, M::MoveKind want, bool lighter,
                 const M::MoveRow* light, bool transform, float since_s,
@@ -1812,9 +1885,12 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
     // Ordinary swings may downgrade, but a charged stake must never silently become a tap.
     const bool powered_stake = w.powered && !transform && t.variation == StakeDriverVariation &&
                                t.form_b && kind == M::MoveKind::Charged;
+    // The Bloodletter's blast (core/vr/blood_blast.h): its own row, never downgraded to a tap, its
+    // radius the game's, its damage not by the swing's speed.
+    const bool blood_blast = row == &VR::BloodBlast::Row;
     const auto affordable = M::AffordableMove({row, kind, lighter}, light ? light :
         (t.moves ? M::ChooseMove(*t.moves, t.form_b, M::MoveKind::Light).row : nullptr),
-        data ? Read<s32>(data + OffsetStamina) : 0, powered_stake);
+        data ? Read<s32>(data + OffsetStamina) : 0, powered_stake || blood_blast);
     if (affordable.kind != kind) {
         LOG_INFO(Core, "VR melee: #{} {} -> light (stamina {} < strong cost {})",
                  w.serial, M::MoveKindName(kind), data ? Read<s32>(data + OffsetStamina) : 0,
@@ -1830,11 +1906,19 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
     B::Vec3 dmy{}, grip{};
     const bool have_dmy = row != nullptr && DummyAt(chr, row->dmy1, dmy);
     const bool have_grip = DummyAt(chr, RightWeaponDummy, grip);
-    const M::SwingStamina stamina_rule =
-        SwingRule(kind, !transform && ArmWhipForm(t.variation, t.form_b));
+    M::SwingStamina stamina_rule = SwingRule(kind, !transform && ArmWhipForm(t.variation, t.form_b));
+    // (The Cane's and Cutter's whip lashes: their share, and the regen paused as for a full cost.)
+    const bool whip_lash = !transform && WhipLashStamina(t.variation, t.form_b);
+    if (whip_lash) {
+        stamina_rule.regen_pause = stamina_rule.charge && VR::Melee::GetMeleeSettings().regen_pause;
+    }
     const char* refuse = nullptr;
     if (module == nullptr || data == nullptr) {
         refuse = "no behaviour module";
+    } else if (w.chikage_draw_weapon >= 0 &&
+               (transform || t.variation != 200 ||
+                EquippedRightId(Read<const u8*>(chr + OffsetEquip)) != w.chikage_draw_weapon)) {
+        refuse = "the quick draw's Chikage changed";
     } else if (row == nullptr || bid < 0) {
         refuse = "no row";
     } else if (!have_dmy) {
@@ -1901,7 +1985,7 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
     if (entry != nullptr) {
         radius_before = Read<float>(entry + OffsetEntryRadius);
         // Only the radius the row asked for (a sanity check of the offset), never twice.
-        if (!stake_native && std::abs(radius_before - row->radius) < 0.02f) {
+        if (!stake_native && !blood_blast && std::abs(radius_before - row->radius) < 0.02f) {
             float want = RowRadius(chr, *row);
             // A whip form's capsules on the chain: wider (x1.6, at least 25 cm) so a lash that
             // lands near an enemy, or slaps the ground in front of one, catches it.
@@ -1917,6 +2001,10 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
             // The Bowblade's arrow: round the arrow, not the sword's 35 cm.
             if (arrow) {
                 want = M::Bowblade::ArrowRadiusM;
+            }
+            // The Chikage's quick draw: wider than its swings (chikage.h DrawRadiusM).
+            if (w.chikage_draw_weapon >= 0 && !transform) {
+                want = std::max(want, VR::Chikage::DrawRadiusM);
             }
             if (std::abs(want - radius_before) > 0.002f) {
                 radius_after = want;
@@ -1941,6 +2029,8 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
     a.light = light;
     a.transform = transform;
     a.powered = powered_stake;
+    a.chikage_draw = w.chikage_draw_weapon >= 0 && !transform;
+    a.blood_blast = blood_blast;
     a.cost = std::max(stamina_before - stamina_after, 0);
     a.stamina_rule = stamina_rule;
     a.light_stamina_pct = VR::Melee::GetMeleeSettings().stamina_pct;
@@ -1957,6 +2047,7 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
     a.two_handed = w.two_handed;
     a.support_damage = VR::TwoHand::UnsupportedDamage(
         w.unsupported_family, t.variation / 10, t.form_b, transform);
+    a.chikage_coat = !transform && !t.form_b && t.variation == 200 ? w.chikage_coat : 0;
     a.damage_scale = transform ? 1.0f : std::clamp(w.damage_scale, 0.25f, 3.0f);
     a.row_scale = !transform && row != nullptr && t.variation == M::Bowblade::Variation
                       ? M::Bowblade::DamageScale(t.variation, *row, M::FindMoves(t.variation))
@@ -1980,20 +2071,26 @@ bool OpenAttack(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, 
     }
     t.cur = a;
     t.cur_live = ok != 0 || g_dry_run;
+    t.lashes_paid = 0;
     t.unpaid_live = false;
     t.cur_frames = 1;
     t.whoosh_done = false;
     t.last_a = {};
     SetSwingFx(t, *row);
     if (stamina_rule.regen_pause && g_regen) {
-        t.regen_left = M::RecoverSeconds(kind); // full-cost light or strong attack
+        // A full-cost light or strong attack; a whip lash for its own move's recovery.
+        const float whip_recover =
+            whip_lash ? VR::Whip::WhipRecover(t.variation, static_cast<std::size_t>(kind)) : 0.0f;
+        t.regen_left = whip_recover > 0.0f ? whip_recover : M::RecoverSeconds(kind);
     }
     if (ok == 0 && !g_dry_run) {
         t.latch.active = false;
         t.latch.done = true;
     }
+    const auto opened_event = blood_blast && ok != 0 ? Combat::MeleeEventKind::BloodBlast
+                                                     : Combat::MeleeEventKind::Opened;
     Combat::PushMeleeEvent(
-        {ok != 0 || g_dry_run ? Combat::MeleeEventKind::Opened : Combat::MeleeEventKind::Denied,
+        {ok != 0 || g_dry_run ? opened_event : Combat::MeleeEventKind::Denied,
          w.serial, static_cast<float>(a.cost), static_cast<float>(static_cast<u8>(kind)), now,
          ok != 0 || g_dry_run ? "" : "the game made no attack"});
     if (a.powered && ok != 0) {
@@ -2061,8 +2158,16 @@ void Create(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, s64 
         return;
     }
     const auto want = static_cast<M::MoveKind>(std::min<u8>(w.kind, 2));
-    const M::MoveChoice choice = M::ChooseMove(*t.moves, t.form_b, want);
+    M::MoveChoice choice = M::ChooseMove(*t.moves, t.form_b, want);
     const M::MoveRow* light = M::ChooseMove(*t.moves, t.form_b, M::MoveKind::Light).row;
+    // The Bloodletter's blast without its animation (core/vr/blood_blast.h): the game's own
+    // attack 930 round the flail's head, its cost on the hunter after.
+    const bool blast = w.blood_blast && !flick && t.form_b && t.variation / 10 == VR::BloodBlast::Family;
+    if (blast) {
+        choice.row = &VR::BloodBlast::Row;
+        choice.kind = M::MoveKind::Charged;
+        choice.lighter = false;
+    }
     if (w.unpaid) {
         // The combo budget had no charge for this swing: it does not register. A flick's stroke
         // goes straight to its transform attack (transforms never need charges).
@@ -2080,8 +2185,22 @@ void Create(u8* chr, TickState& t, const Combat::MeleeWindow& w, float arm, s64 
     const bool made =
         OpenAttack(chr, t, w, arm, now, choice.row, choice.kind, want, choice.lighter, light, false,
                    w.since_counted_s,
-                   IsWhipRow(choice.row) ? WhipNearM : flick ? FlickNearM : DummyNearM,
+                   blast || IsWhipRow(choice.row) ? WhipNearM : flick ? FlickNearM : DummyNearM,
                    flick);
+    if (blast && made && !g_dry_run) {
+        namespace BB = VR::BloodBlast;
+        g_blood_blast_cost = true; // (MeleeSiteA adds it: SpEffects are added there only)
+        g_blood_blast_ffx_ns = now; // (BloodBlastFfxTick keeps its burst alive)
+        B::Vec3 head{};
+        if (DummyAt(chr, BB::BlastDummy, head)) {
+            // (The fog parts as for any explosion: fog_impulse.h Burst.)
+            VR::FogImpulse::bursts.Publish(now, VR::GameArea::Slot().load(std::memory_order_relaxed),
+                                           VR::FogImpulse::Burst({head.x, head.y, head.z}, BB::BlastRadiusM));
+        }
+        LOG_INFO(Core, "VR bloodletter: BLAST #{} without the animation at the flail's head ({:.2f} {:.2f} "
+                       "{:.2f})",
+                 w.serial, head.x, head.y, head.z);
+    }
     if (flick && !made && t.latch.active) {
         t.flick.phase = FlickPhase::Gap; // the transform attack serves the whole stroke
     }
@@ -2363,6 +2482,43 @@ void BoomBlastTick(u8* chr, const TickState& t, s64 now) {
     }
 }
 
+// A contact-held whip attack's later lashes (melee_window.h Window::lashes, WhipLashStamina): each
+// pays the light lash's share of the game's cost (the attack's own rule) and pauses the regen for
+// the light move's recovery, as a new attack would. False: the stamina ran out before one, which
+// is not paid (the caller ends the attack: the next lash is a new swing, refused at no stamina).
+bool PayCarriedLashes(u8* chr, TickState& t, u16 lashes) {
+    const M::SwingStamina& rule = t.cur.stamina_rule;
+    const s32 variation = t.cur.weapon_variation;
+    const VR::Whip::WhipMoves* const whip = VR::Whip::FindWhip(variation);
+    u8* const data = Module(chr, L::OffsetDataModule);
+    while (t.lashes_paid < lashes) {
+        if (!rule.charge || !WhipLashStamina(variation, t.cur.form_b) || whip == nullptr ||
+            data == nullptr || g_dry_run) {
+            t.lashes_paid = lashes; // free swings (melee_stamina_pct=0), not a lash rule, or nothing to pay from
+            return true;
+        }
+        const s32 before = Read<s32>(data + OffsetStamina);
+        if (rule.refuse_empty && before <= 0) {
+            LOG_INFO(Core, "VR melee: #{} carried lash {}: no stamina ({}), the attack ends",
+                     t.cur.serial, t.lashes_paid + 1, before);
+            return false;
+        }
+        const s32 cost = M::PartialCost(whip->rows[0].stamina, rule.pct);
+        const s32 after = std::max(before - cost, M::StaminaFloor);
+        std::memcpy(data + OffsetStamina, &after, sizeof(after));
+        ++t.lashes_paid;
+        if (rule.regen_pause && g_regen) {
+            t.regen_left = std::max(t.regen_left, VR::Whip::WhipRecover(variation, 0));
+        }
+        static std::atomic<u32> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) < 40) {
+            LOG_INFO(Core, "VR melee: #{} carried lash {}: stamina {} -> {} ({}% of {})", t.cur.serial,
+                     t.lashes_paid, before, after, rule.pct, whip->rows[0].stamina);
+        }
+    }
+    return true;
+}
+
 void Refresh(u8* chr, TickState& t, const Combat::MeleeWindow& w, s64 now) {
     u8* const module = Module(chr, OffsetAttackModule);
     if (module == nullptr || (!t.cur_live && !t.unpaid_live) || t.cur.row == nullptr) {
@@ -2386,6 +2542,15 @@ void Refresh(u8* chr, TickState& t, const Combat::MeleeWindow& w, s64 now) {
             t.latch.done = true;
             return;
         }
+        // A carried whip attack's later lashes pay their stamina (PayCarriedLashes); none left:
+        // it ends, and the next lash is a new swing (refused at no stamina: the dull buzz).
+        if (t.cur.contact_hold && w.serial == t.cur.serial && w.carried_lashes > t.lashes_paid &&
+            !PayCarriedLashes(chr, t, w.carried_lashes)) {
+            Finalize(chr, t, &w, "no stamina for the carried lash", now);
+            t.latch.active = false;
+            t.latch.done = true;
+            return;
+        }
         // (A new attack here would cost the swing's share again: it must not happen, logged.)
         ok = Invoke(chr, module, t.cur.bid, slot, t.cur.row->stamina, t.cur.stamina_rule);
         const u32 handle = Read<u32>(module + OffsetAttackSlots + slot * 8);
@@ -2404,6 +2569,57 @@ void Refresh(u8* chr, TickState& t, const Combat::MeleeWindow& w, s64 now) {
     }
     ++t.cur_frames;
     (void)ok;
+    // The quick draw's capsule follows the swing, not only where the blade is (the user,
+    // 2026-11-20 night: "it needs to properly account for the swing"): the game tests it where
+    // the blade is at each update, some 30 a second, and a fast draw's tip goes 1.2-1.6 m between
+    // two. Its radius is widened by half the blade's travel since the last (chikage.h
+    // DrawSweepRadius): the capsules of two updates overlap and nothing the blade passed within
+    // DrawRadiusM of between them is skipped (a wide cut ending on the right still takes the
+    // enemy ahead it crossed); several enemies alike.
+    // VR_CHIKAGE_LOG: every frame, the nearest live enemy's hurt capsule from the swept blade (the
+    // path between the two updates, in four steps), the travel and the radius set.
+    static const bool draw_watch = std::getenv("VR_CHIKAGE_LOG") != nullptr;
+    static u32 sweep_serial = 0; // Game:Main only
+    static B::Vec3 sweep_a{}, sweep_b{};
+    if (w.serial == t.cur.serial && w.chikage_draw_weapon >= 0 && t.cur.row != nullptr && !unpaid) {
+        B::Vec3 a{}, b{};
+        if (DummyAt(chr, t.cur.row->dmy1, a) && DummyAt(chr, t.cur.row->dmy2, b)) {
+            const bool have_prev = sweep_serial == t.cur.serial;
+            const B::Vec3 pa = have_prev ? sweep_a : a, pb = have_prev ? sweep_b : b;
+            const float travel = std::max(B::Length(a - pa), B::Length(b - pb));
+            sweep_serial = t.cur.serial;
+            sweep_a = a;
+            sweep_b = b;
+            u8* const entry = HitEntry(t.cur.handle, t.cur.bid);
+            const float radius = VR::Chikage::DrawSweepRadius(travel);
+            if (entry != nullptr && !g_dry_run) {
+                std::memcpy(entry + OffsetEntryRadius, &radius, sizeof(radius));
+            }
+            if (draw_watch) {
+                static EnemyCapsules caps; // Game:Main only
+                float best = 99.0f;
+                if (GatherEnemyCapsules((a + b) * 0.5f, 4.0f, 1.0f, caps) > 0) {
+                    const auto e = [](B::Vec3 p) { return Evade::Vec3{p.x, p.y, p.z}; };
+                    for (int step = 0; step <= 4; ++step) {
+                        const float s = static_cast<float>(step) * 0.25f;
+                        const B::Vec3 sa = pa + (a - pa) * s, sb = pb + (b - pb) * s;
+                        for (size_t c = 0; c < caps.count && c < EnemyCapsules::Max; ++c) {
+                            Evade::Vec3 p{}, q{};
+                            const float d2 = Evade::SegSegClosest(e(sa), e(sb), e(caps.capsules[c].a),
+                                                                  e(caps.capsules[c].b), p, q);
+                            best = std::min(best, std::sqrt(std::max(d2, 0.0f)) - caps.capsules[c].radius);
+                        }
+                    }
+                }
+                LOG_INFO(Core,
+                         "VR chikage: draw #{} f{}: the swept blade {} from the nearest enemy, "
+                         "travel {:.0f} cm, capsule {:.0f} cm round it, tip {:.1f} m/s",
+                         t.cur.serial, t.cur_frames,
+                         best < 90.0f ? fmt::format("{:.0f} cm", best * 100.0f) : std::string{"> 4 m"},
+                         travel * 100.0f, radius * 100.0f, w.tip_speed);
+            }
+        }
+    }
     // The classifier's verdict on a heavy window (a wound-up swing judged light), and the blade's
     // speed for the damage hook.
     const bool judged_light = w.serial == t.cur.serial && w.verdict_known && w.verdict == 0 &&
@@ -4114,8 +4330,8 @@ size_t GatherEnemyCapsules(B::Vec3 centre, float reach, float scale, EnemyCapsul
         const u32 handle = Read<u32>(near_list[i].chr+0x08);
         for (size_t c=0; c<n && c<scratch.size() && out.count<EnemyCapsules::Max; ++c) {
             const auto& cap = scratch[c];
-            if (!S::Finite(cap.a) || !S::Finite(cap.b) || !std::isfinite(cap.radius) ||
-                cap.radius <= 0 || cap.radius > 2.0f*scale) continue;
+            // VictimCapsules validated the shape. This gather also limits its radius by scale.
+            if (cap.radius > 2.0f * scale) continue;
             out.capsules[out.count] = cap;
             out.handle[out.count++] = handle;
         }
@@ -4153,6 +4369,107 @@ bool SphereHitsCapsules(B::Vec3 from, B::Vec3 to, float radius, float scale,
     if (best > 1.0f) return false;
     fraction = best;
     return true;
+}
+
+namespace {
+struct ChikageDash {
+    bool active{false};
+    s64 start_ns{0};
+    B::Vec3 dir{};
+    float done{0.0f}; // m covered
+};
+ChikageDash g_dash{};                   // the player's update only
+std::atomic<s64> g_dash_request{0};
+} // namespace
+
+void RequestChikageDash(s64 now) {
+    g_dash_request.store(now, std::memory_order_release);
+}
+
+// Each player update: the dash's next stretch, warped (ChrIns vt+0x5F8, as the visceral test
+// places its target), or its end.
+void ChikageDashTick(u8* player, s64 now) {
+    namespace Ck = VR::Chikage;
+    u8* const physics = Module(player, 0x68);
+    if (const s64 asked = g_dash_request.exchange(0, std::memory_order_acq_rel); asked > 0) {
+        if (Plausible(physics) && now >= asked && now - asked < 200'000'000) {
+            const float yaw = Read<float>(physics + 0x1D4);
+            g_dash = {true, asked, B::Vec3{-std::sin(yaw), 0.0f, -std::cos(yaw)}, 0.0f};
+        }
+    }
+    if (!g_dash.active) {
+        return;
+    }
+    const auto stop = [](const char* why, float done) {
+        g_dash.active = false;
+        LOG_INFO(Core, "VR chikage: the dash {} after {:.0f} cm", why, done * 100.0f);
+    };
+    const float t = static_cast<float>(now - g_dash.start_ns) * 1e-9f;
+    const float want = Ck::DashM * Ck::DashAt(t);
+    const float step = want - g_dash.done;
+    if (!Plausible(physics) || !std::isfinite(t) || t > Ck::DashS + 0.1f) {
+        stop("ended", g_dash.done);
+        return;
+    }
+    if (!(step > 1e-4f)) {
+        if (t >= Ck::DashS) stop("ended", g_dash.done);
+        return;
+    }
+    u8* const vtable = Read<u8*>(player);
+    u8* const fn = Plausible(vtable) ? Read<u8*>(vtable + 0x5F8) : nullptr;
+    using WarpFn = void(PS4_SYSV_ABI*)(u8* chr, float* position, float* rotation, u32);
+    const B::Vec3 me = ChrPos(player);
+    if (!Plausible(fn) || fn < g_base || fn >= g_base + ChrInsVtableRva || !B::IsFinite(me) ||
+        std::abs(me.x) > 1e8f) {
+        stop("could not warp", g_dash.done);
+        return;
+    }
+    const B::Vec3 up{0.0f, 1.0f, 0.0f};
+    const B::Vec3 next = me + g_dash.dir * step;
+    // A wall (the body's sphere at the chest, a little ahead of the step), no ground under the
+    // next step (a drop), or an enemy right ahead: it stops there.
+    const B::Vec3 chest = me + up * 1.0f;
+    if (!MapSpherePathClear(chest, chest + g_dash.dir * (step + 0.25f), 0.3f)) {
+        stop("stopped at a wall", g_dash.done);
+        return;
+    }
+    if (MapSpherePathClear(next + up * 0.5f, next - up * 0.7f, 0.12f)) {
+        stop("stopped at a drop", g_dash.done);
+        return;
+    }
+    if (EnemyCloseAhead(player, Ck::DashStopM)) {
+        stop("stopped at an enemy", g_dash.done);
+        return;
+    }
+    alignas(16) std::array<float, 4> position{next.x, me.y, next.z, 1.0f};
+    alignas(16) std::array<float, 4> rotation{};
+    std::memcpy(rotation.data(), physics + 0x1D0, sizeof(rotation));
+    reinterpret_cast<WarpFn>(fn)(player, position.data(), rotation.data(), 1);
+    g_dash.done = want;
+}
+
+bool EnemyCloseAhead(const u8* player, float within_m) {
+    if (!Plausible(player)) return false;
+    u8* const physics = Module(player, 0x68);
+    if (!Plausible(physics)) return false;
+    // (Physics +0x1D4: his yaw; facing (-sin, -cos): the visceral test's placing below.)
+    const float yaw = Read<float>(physics + 0x1D4);
+    const B::Vec3 me = ChrPos(player);
+    if (!std::isfinite(yaw) || !B::IsFinite(me) || std::abs(me.x) > 1e8f) return false;
+    const B::Vec3 ahead{-std::sin(yaw), 0.0f, -std::cos(yaw)};
+    static EnemyCapsules caps; // Game:Main only
+    if (GatherEnemyCapsules(me, within_m + 1.0f, 1.0f, caps) == 0) return false;
+    const auto e = [](B::Vec3 p) { return Evade::Vec3{p.x, p.y, p.z}; };
+    for (size_t c = 0; c < caps.count && c < EnemyCapsules::Max; ++c) {
+        Evade::Vec3 p{}, q{};
+        Evade::SegSegClosest(e(me), e(me + B::Vec3{0.0f, 1.8f, 0.0f}), e(caps.capsules[c].a),
+                             e(caps.capsules[c].b), p, q);
+        const B::Vec3 off{q.x - me.x, 0.0f, q.z - me.z};
+        const float level = B::Length(off);
+        if (level - caps.capsules[c].radius > within_m) continue;
+        if (level < 1e-3f || B::Dot(off, ahead) >= 0.5f * level) return true;
+    }
+    return false;
 }
 
 bool ItemSphereEnemyHit(B::Vec3 from, B::Vec3 to, float radius, float scale, float& fraction,
@@ -4640,15 +4957,24 @@ void TrackBlade(u8* chr, TickState& t, const MeleeBody& body, s64 now) {
     const bool same = t.blade_ns != 0 && now > t.blade_ns && now - t.blade_ns <= BladeTickMaxNs &&
                       t.blade_variation == t.variation && t.blade_style == t.style &&
                       std::abs(turn) <= BladeTurnRad;
+    bool posted = false;
     if (same) {
         const float inv_dt = 1e9f / static_cast<float>(now - t.blade_ns);
         const B::Vec3 base_vel = (base - t.blade_base) * inv_dt;
         const B::Vec3 tip_vel = (tip - t.blade_tip) * inv_dt;
         if (B::IsFinite(base_vel) && B::IsFinite(tip_vel)) {
-            std::scoped_lock lock{g_attack_mutex};
-            g_blade = {true, base, tip, base_vel, tip_vel, now};
+            {
+                std::scoped_lock lock{g_attack_mutex};
+                g_blade = {true, base, tip, base_vel, tip_vel, now};
+            }
+            // A blow at a Chalice lever (core/vr/lever_smack.h; the lever side reads it; outside
+            // the Chalice Dungeons the post returns at once).
+            VR::Lever::Smack::Posted().PostBlade({base, tip, base_vel, tip_vel, now, true});
+            posted = true;
         }
     }
+    if (!posted) // a gap, a turn or a weapon change: the next sample's path starts from here
+        VR::Lever::Smack::Posted().PostBlade({base, tip, {}, {}, now, false});
     t.blade_ns = now;
     t.blade_base = base;
     t.blade_tip = tip;
@@ -4747,20 +5073,19 @@ void WeaponShapeTick(u8* chr, const TickState& t, s64 now, bool left = false) {
     const M::MoveRow* row = FormBladeRow(t);
     u8* const equip = Read<u8*>(chr + OffsetEquip);
     u8* const parts = Read<u8*>(chr + OffsetChrAsm);
-    // The solid weapons' shape (its settings), and the split blades' shine model (always: the hone
-    // works with the solid weapons off): either asks for the fit.
+    // Collision requests a fitted shape independently of the material effect.
     const bool shape = ts.weapon_wall && ts.weapon_wall_shape &&
                        // A cached rigid fit cannot follow the moving tentacle's pose.
                        !(t.variation == 2500 && t.form_b && VR::Whip::GetWhipSettings().physical);
-    const bool shine = t.form_b && VR::DualBlades::IsDualBlades(t.variation);
+    // ... and the clean Chikage's, for its scabbard's blood (core/vr/chikage.h).
+    const bool shine = !left && !t.form_b && t.variation == 200 &&
+                       VR::Tricks::GetTrickSettings().chikage_scabbard;
     if ((!shape && !shine) || g_weapon_row == nullptr || row == nullptr || IsWhipRow(row) ||
         !Plausible(equip, 4) || !Plausible(parts)) {
         clear();
         return;
     }
-    const s32 slot = Read<s32>(equip + OffsetEquipRightSlot);
-    const s32 weapon = slot >= 0 && slot <= 2 ? Read<s32>(equip + OffsetEquipIds + 4 * (slot * 2 + 1))
-                                              : -1;
+    const s32 weapon = EquippedRightId(equip);
     u64 key = 0xcbf29ce484222325ull;
     const auto mix = [&](s64 v) {
         for (int b = 0; b < 8; ++b) {
@@ -4871,7 +5196,7 @@ void WeaponShapeTick(u8* chr, const TickState& t, s64 now, bool left = false) {
     WeaponShape::Ask(std::move(r));
 }
 
-// The split blades' shine (core/vr/dual_blades.h): each blade's model and line
+// The Chikage blood coat: its overlay model and line
 // (WeaponShape::GetShine), for the in-frame list on another thread. Every update, but the worker
 // is asked only when a hand's key changes or its model is not done yet, and the channel written
 // only when what it holds changes. Game:Main only.
@@ -4926,6 +5251,7 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
     }
     auto& t = g_tick;
     const s64 now = NowNs();
+    BloodBlastFfxTick(chr, t, now); // the Bloodletter's blast: its blood, and the enemy at its head
     const float dt = StepSeconds(t, now);
     if (chr != t.chr) {
         // A new character object (a load): nothing of the old one carries over.
@@ -5014,8 +5340,10 @@ void MeleePoseTick(u8* chr, const MeleeBody& body) {
         HideRightWeaponPart(chr, static_cast<u32>(t.bow_arrow_part));
     }
     // The blade's motion for the kill ragdoll (melee_kill_ragdoll) and its reach for the solid
-    // weapons (weapon_wall, the body's): every update, swing or not.
-    if (VR::GetSettings().melee_kill_ragdoll || VR::Tricks::GetTrickSettings().weapon_wall) {
+    // weapons (weapon_wall, the body's): every update, swing or not; and in the Chalice Dungeons
+    // for their levers whatever those say (lever_smack.h; asked only when both are off).
+    if (VR::GetSettings().melee_kill_ragdoll || VR::Tricks::GetTrickSettings().weapon_wall ||
+        VR::Lever::Smack::InChalice()) {
         TrackBlade(chr, t, body, now);
     }
     TrackPartBlades(chr, t);
@@ -5827,6 +6155,13 @@ void MeleeSiteA(u8* player) {
         return;
     }
     const s64 now = NowNs();
+    if (g_blood_blast_cost) {
+        g_blood_blast_cost = false;
+        const bool added = AddPlayerEffect(player, VR::BloodBlast::SelfSpEffect);
+        LOG_INFO(Core, "VR bloodletter: the blast's cost on the hunter (SpEffect {}) {}",
+                 VR::BloodBlast::SelfSpEffect, added ? "added" : "NOT added");
+    }
+    ChikageDashTick(player, now); // the Chikage draw's dash (chikage.h DashM)
     if (g_installed) {
         TelegraphTick(player, now); // a swing the enemies may read: the game's attack notice
     }
@@ -6032,7 +6367,7 @@ bool MeleeDamage(u8* res, u8* target, float* damage) {
     const bool two_handed = a.two_handed || (have_w && w.two_handed);
     M::DamageConfig cfg = M::SwingDamageConfig(IsWhipRow(a.row), two_handed);
     cfg.speed =
-        !a.saw && !a.powered && ms.speed_damage &&
+        !a.saw && !a.powered && !a.blood_blast && ms.speed_damage &&
         (have_w || a.tip > 0.0f || (chain.applies && chain.tip > 0.0f));
     // The combo budget sets the rate instead; a whip form's own moves: their pace (whip_pace).
     const bool whip_paced = a.pace >= 0.0f;
@@ -6113,6 +6448,11 @@ bool MeleeDamage(u8* res, u8* target, float* damage) {
     if (std::isfinite(before) && before > 0.0f) {
         felt = before * factor * row_factor * plunge_factor * range_factor;
         after = felt * whip_pace;
+        if (a.chikage_coat && Combat::SpendChikageBlood(a.chikage_coat, now, after)) {
+            const float bonus = VR::Chikage::BloodScale(VR::Tricks::GetTrickSettings().chikage_blood_pct);
+            after *= bonus;
+            felt *= bonus;
+        }
         *damage = after;
     }
     const float hitstop = a.row != nullptr ? a.row->hitstop : 0.09f;
@@ -6126,6 +6466,15 @@ bool MeleeDamage(u8* res, u8* target, float* damage) {
         }
     }
     g_stats.hits.fetch_add(1, std::memory_order_relaxed);
+    // The Chikage's blood off the blade in the enemy (chikage.h NoteHit).
+    if (a.weapon_variation == 200 && !a.transform) {
+        VR::Chikage::NoteHit(now, a.kind == M::MoveKind::Charged ? 3
+                                  : a.kind == M::MoveKind::Heavy ? 2
+                                                                 : 1);
+        if (a.chikage_draw) {
+            VR::Chikage::g_draw_hit_ns.store(now, std::memory_order_release);
+        }
+    }
     g_bite_wall.store(false, std::memory_order_relaxed);
     g_bite_hold.store(std::clamp(hitstop * 0.8f, 0.05f, 0.1f), std::memory_order_relaxed);
     g_bite_ns.store(now, std::memory_order_release);
@@ -6282,6 +6631,7 @@ bool MeleeHitInfoOf(u8* res, MeleeHitInfo& out) {
     out.charged = a.kind == M::MoveKind::Charged && !a.transform && !a.verdict_light;
     out.heavy = a.kind == M::MoveKind::Heavy || a.kind == M::MoveKind::Charged;
     out.judged_light = a.verdict_light;
+    out.chikage_draw = a.chikage_draw;
     out.tip_speed = std::max(have_w ? w.tip_speed : 0.0f, a.tip);
     out.tip_peak = std::max({out.tip_speed, have_w ? w.tip_peak : 0.0f, a.tip_peak});
     out.arc_deg = std::max(have_w ? w.arc_peak : 0.0f, a.arc_peak) / M::Deg;

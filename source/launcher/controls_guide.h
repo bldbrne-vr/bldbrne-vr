@@ -66,8 +66,12 @@ std::vector<Section> Interactions(Platform platform, const Lookup &value,
                                   std::string_view runtime_name = {});
 // Whether a line has every word of `needle` (lower case) at the start of one of its words.
 bool Finds(const Line &line, const std::string &needle);
-// What the player should know about the platform first (its runtime, its button names).
-std::string PlatformNote(Platform platform);
+// What the player should know about the platform first (its runtime, its button names);
+// `left_handed`: the game menu's button is the other hand's (LeftHanded).
+std::string PlatformNote(Platform platform, bool left_handed = false);
+// Left-handed play as these settings have it (core/vr/mirror_world.h Wanted): left_handed=1 with
+// motion controls in first person and stereo eyes (stereo=1, stereo_mode=2: the defaults).
+bool LeftHanded(const Lookup &value);
 // A VR page row's label and help line as the game words them (vr_page.h RowLabel / RowHelp): the
 // platform's button names and the controls these settings bind; empty for an unknown id.
 struct RowText {

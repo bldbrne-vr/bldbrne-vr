@@ -490,8 +490,7 @@ static void ApplyBuiltInFixes(pugi::xml_document& doc, std::string_view version)
     // their cube maps' clears, blurs and computes go too.
     static const char* const light_shadows_override = std::getenv("VR_LIGHT_SHADOWS");
     const bool our_shadows = Shader::Optimization::LightShadow::Enabled(
-        VR::IsEnabled(), VR::GetSettings().light_shadows,
-        VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off, light_shadows_override);
+        VR::IsEnabled(), VR::GetLampShadowRequest().enabled, light_shadows_override);
     // (Undone the same night for the user's option B: the game's routing marks which lamps to
     // shadow; in those shaders ours shadow every lamp and the game's maps read as lit
     // (light_shadow_pass.cpp). VR_GAME_LAMP_SHADOWS_OFF=1 (tests): the switch-off as it was.)

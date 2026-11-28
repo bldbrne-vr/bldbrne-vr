@@ -328,22 +328,34 @@ bool PrepareAtlas(bool icon_wanted, Buttons buttons) {
     } else if (buttons == Buttons::Vr) {
         const auto drawing = std::chrono::steady_clock::now();
         const auto font = ReadButtonFont();
-        const std::string refused = VR::KeyGlyphs::Apply(*tpf, font.get(), written);
+        // Left-handed play: the menu layout's buttons come from the other hand's controls, so the
+        // badges name those (KeyGlyphs::MirroredGlyphs).
+        const bool mirror = VR::MirrorWorld(); // left-handed play: your hands' buttons
+        const std::string refused = VR::KeyGlyphs::Apply(
+            *tpf, font.get(), written,
+            mirror ? std::span<const VR::KeyGlyphs::Glyph>{VR::KeyGlyphs::MirroredGlyphs}
+                   : std::span<const VR::KeyGlyphs::Glyph>{VR::KeyGlyphs::Glyphs});
         // The gameplay HUD's own (the action prompts): the gameplay layout's buttons.
         const bool swap = VR::GetSettings().swap_sticks;
         int hud = 0;
-        const std::string hud_refused = VR::KeyGlyphs::ApplyHud(*tpf, font.get(), swap, hud);
+        const std::string hud_refused =
+            VR::KeyGlyphs::ApplyHud(*tpf, font.get(), swap, hud, false, mirror);
         written += hud;
         LOG_INFO(Core,
                  "VR buttons: {} of {} menu button icons are the VR controllers' (cross A, circle "
                  "B, square LG, triangle RG, L1 LT, R1 RT, L3 / R3 round LS / RS, L2 / R2 long "
-                 "LS / RS, touchpad round / long X, OPTIONS Menu){}{}; {} of {} HUD ones (the "
+                 "LS / RS, touchpad round / long X, OPTIONS Menu){}{}{}; {} of {} HUD ones (the "
                  "action prompts: cross {}, circle {}, triangle {}){}{}; in {:.1f} ms",
                  written - hud, VR::KeyGlyphs::Glyphs.size(),
-                 refused.empty() ? "" : "; kept the game's: ", refused, hud,
-                 VR::KeyGlyphs::HudGlyphs.size(), VR::Thumbs::LabelFor(VR::Thumbs::Control::B, swap),
-                 VR::Thumbs::LabelFor(VR::Thumbs::Control::A, swap),
-                 VR::Thumbs::LabelFor(VR::Thumbs::Control::X, swap),
+                 refused.empty() ? "" : "; kept the game's: ", refused,
+                 mirror ? "; left-handed: each from the other hand's control (cross X, circle Y, "
+                          "square RG, triangle LG, L1 RT, R1 LT, the clicks the other stick's, "
+                          "touchpad A)"
+                        : "",
+                 hud, VR::KeyGlyphs::HudGlyphs.size(),
+                 VR::Thumbs::LabelFor(VR::Thumbs::Control::B, swap, mirror),
+                 VR::Thumbs::LabelFor(VR::Thumbs::Control::A, swap, mirror),
+                 VR::Thumbs::LabelFor(VR::Thumbs::Control::X, swap, mirror),
                  hud_refused.empty() ? "" : "; kept the game's: ", hud_refused, ms_since(drawing));
     }
 

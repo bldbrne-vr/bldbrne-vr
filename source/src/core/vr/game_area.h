@@ -30,8 +30,20 @@ inline constexpr bool IsMapId(u32 map) {
     return (map & 0xFFFFu) == 0 && (map >> 24) >= 1 && (map >> 24) <= 99 && ((map >> 16) & 0xFFu) <= 9;
 }
 
+// The area of that map id whatever its block (the Chalice Dungeons, area 29, run to block 20 and
+// more, which IsMapId leaves out); 0: not known.
+inline std::atomic<u32>& AreaSlot() {
+    static std::atomic<u32> area{0};
+    return area;
+}
+inline constexpr u32 AreaOf(u32 map) {
+    return (map & 0xFFFFu) == 0 && (map >> 24) >= 1 && (map >> 24) <= 99 ? map >> 24 : 0u;
+}
+inline constexpr u32 ChaliceArea = 29; // m29: every Chalice Dungeon
+
 inline void Publish(u32 map) {
     Slot().store(IsMapId(map) ? map : 0u, std::memory_order_relaxed);
+    AreaSlot().store(AreaOf(map), std::memory_order_relaxed);
 }
 
 // Where the hunter stands (his feet; the game's world), as the game's loop last had it, and when

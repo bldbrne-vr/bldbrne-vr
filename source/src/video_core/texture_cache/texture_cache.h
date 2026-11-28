@@ -98,7 +98,7 @@ public:
     }
 
     /// Invalidates any image in the logical page range.
-    void InvalidateMemory(VAddr addr, size_t size);
+    void InvalidateMemory(VAddr addr, size_t size, TextureMemory::Invalidation source);
 
     /// The heights made for bump maps that have none (bump_height.h): RefreshImage uploads a
     /// ready one's bytes in place of the guest's.
@@ -163,9 +163,11 @@ public:
 
     /// Creates a new image with provided image info and copies subresources from image_id
     [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
+    [[nodiscard]] bool TryGrowMipChain(const ImageInfo& info, ImageId image_id);
 
     /// Reuploads image contents.
     void RefreshImage(Image& image);
+    void RefreshImage(Image& image, u32 first_mip);
 
     /// Retrieves the sampler that matches the provided S# descriptor.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
@@ -414,6 +416,7 @@ private:
 
     /// Create an image from the given parameters
     [[nodiscard]] ImageId InsertImage(const ImageInfo& info);
+    [[nodiscard]] ImageId InsertImage(const ImageInfo& info, u32 capacity);
 
     /// Caller holds mutex; only inactive guest-backed textures may be destroyed immediately.
     /// FreeNow (allocation recovery, which retries at once): their memory is freed before this

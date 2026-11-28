@@ -894,6 +894,7 @@ View MakeView(const Model& model, const Page::Glyphs& glyphs) {
     v.family = model.GetFamily();
     v.gestures = model.ShowsGestures();
     v.pad_xbox = model.GetConfig().gamepad_xbox;
+    v.mirror = model.GetConfig().layout.mirror;
     v.parts = model.Parts();
     v.callouts = model.Callouts();
     v.lights = model.Lights();
@@ -1065,9 +1066,16 @@ bool Render(const Page::Assets& assets, const View& v, Page::Image& page_out,
             FillPoly(page, Ellipse(to->x, to->y, 3.5f, 3.5f, 0.0f, 16), lead, lead_a);
         } else if (c.picto == Picto::Swing) {
             // The swing: a short arc beside the right controller instead of a line (the mock's).
-            const float cx = CentreX + ArtGap + 120.0f + 95.0f, cy = s.baseline - 52.0f;
+            // Left-handed play: beside the left one, the arc reflected across the centre line.
+            const float right_cx = CentreX + ArtGap + 120.0f + 95.0f, cy = s.baseline - 52.0f;
+            const float cx = v.mirror ? 2.0f * CentreX - right_cx : right_cx;
             const Rgb ink = lit == Lit::Pressed ? LeadLit : HeaderTeal;
-            const Poly arc = Arc(cx, cy, 55.0f, 35.0f, 20.0f, 150.0f);
+            Poly arc = Arc(right_cx, cy, 55.0f, 35.0f, 20.0f, 150.0f);
+            if (v.mirror) {
+                for (Pt& p : arc) {
+                    p.x = 2.0f * CentreX - p.x;
+                }
+            }
             if (lit == Lit::Pressed) {
                 GlowPoly(page, Place(RoundRect(-56, -36, 56, 36, 30), cx, cy), 10.0f, LitGlow, 0.25f);
             }
@@ -1076,8 +1084,10 @@ bool Render(const Page::Assets& assets, const View& v, Page::Image& page_out,
             const Pt before = arc[arc.size() - 3];
             ArrowHead(page, end, end.x - before.x, end.y - before.y, 11.0f, ink, 210.0f / 255.0f);
         } else if (c.picto == Picto::Pointer) {
-            // The pointer: a dashed ray from the right controller's head toward its words.
-            const Pt a{CentreX + ArtGap + 160.0f, ArtY + 60.0f};
+            // The pointer: a dashed ray from the right controller's head toward its words
+            // (left-handed play: the left one's).
+            const float head_x = CentreX + ArtGap + 160.0f;
+            const Pt a{v.mirror ? 2.0f * CentreX - head_x : head_x, ArtY + 60.0f};
             StrokeDashed(page, {a, knee}, 2.0f, 6.0f, 5.0f, Lead, lead_a);
         }
     }

@@ -258,13 +258,8 @@ struct QuickSettings {
     // grip on a card takes the item and holds it while it stays squeezed, as a body pocket's; the
     // trigger uses it (the crush is the trigger hard), a throwable flies when the grip is let go,
     // and letting go of anything else puts it back. The trigger with the fan open is the gun. An
-    // item put back unused within fan_return_ms of its take (a wrong pick) brings the fan back
-    // for the next one; one used (used up, thrown, a tool used) or held longer leaves it closed
-    // (0: never back; the tester, 2026-11-06). 0 = the trigger takes (tap_pick above).
+    // unused item goes back when the grip opens.
     bool grip_hold{true};
-    float fan_return_ms{3000.0f};
-    // The one-time 6 s -> 3 s migration ran (a vr.ini written before carries the old default).
-    bool fan_return_seen{false};
     // The grip in the air opens the fan once squeezed this long (the tester's 2026-11-01 pick: a
     // hand closing on its own opens nothing); 0 = at the squeeze. Y and X open it at once.
     float grip_open_ms{80.0f};
@@ -332,27 +327,22 @@ struct QuickSettings {
     float throw_cap_knee{0.7f};
     // Locked on: the throw's yaw (only) is turned this share toward the target when it points
     // within throw_assist_deg of it (knives throw_assist_knife_deg), fading out toward the edge.
-    // (32.5% since 2026-10-24, "2-3% more help"; the user's 30% on 10-07 morning, 0.26 the night
-    // before, 0.27 on 10-06, 0.22 before.)
-    float throw_assist{0.325f};
+    float throw_assist{0.35f};
     float throw_assist_deg{9.0f};
     float throw_assist_knife_deg{15.0f};
     // Not locked on, every throw but the knives (Molotovs, oil, pebbles, ...): the same yaw-only
     // turn, this share, toward the game's lock-on candidate whose heading is nearest the throw's
-    // (PickYawTarget: the knife assist's list), within throw_assist_deg; 0 = lock-on only. (The
-    // user's 2026-10-07 answer: "the regular throws yes"; the gun stays lock-on only. 0.285 since
-    // 2026-10-24, was 0.26.)
-    float throw_assist_unlocked{0.285f};
+    // (PickYawTarget: the knife assist's list), within throw_assist_deg; 0 = lock-on only.
+    float throw_assist_unlocked{0.31f};
     // Throwing and Poison Knives (KnifeAssist; 0 = the yaw assist above, lock-on only): the
     // throw's direction, yaw AND pitch, is turned this share of the way toward the direction that
     // drops onto the target's lock-on point at the throw's own speed (gravity compensated), at full
     // strength while it points within knife_assist_deg of that, fading to none at 4/3 of it. The
     // target: the lock-on target, else the game's lock-on candidate nearest the throw's line
-    // (locked on or not). The speed is never changed. (0.875 since 2026-10-24, "2-3% more help";
-    // 0.85 since 10-07: "much stronger just for the throwing knives"; 0.70 on 10-06 still missed
-    // a knife 14 degrees off at 7.5 m.)
-    float knife_assist{0.875f};
+    // (locked on or not). The speed is never changed.
+    float knife_assist{0.90f};
     float knife_assist_deg{15.0f};
+    bool throw_nudge_seen{false}; // upgrade the saved 0.9.7 defaults once
     // ... plus the hunter's own horizontal velocity (1 = a throw while running carries his speed)
     float throw_inherit_motion{1.0f};
     bool throw_physics{true};    // real gravity and no speed clamps for the thrown item

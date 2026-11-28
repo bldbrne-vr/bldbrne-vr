@@ -13,11 +13,9 @@ inline Page::View DeathPage(int focus, const Page::Glyphs& glyphs, Page::Hover h
     view.tabs = {"Return after death"};
     view.headers[0] = "Choose where to continue";
     view.rows[0] = {true, "Last lantern", "", Page::Widget::Action, 0, 0.f, focus == 0};
-    view.rows[1] = {true, "Soft save", "", Page::Widget::Action, 0, 0.f, focus == 1};
+    view.rows[1] = {true, "Soft save", when, Page::Widget::Action, 0, 0.f, focus == 1};
     view.help = focus == 0 ? "Return to your last lantern and clear the soft save."
-                : when.empty()
-                    ? "Return to your soft save. Loading is automatic."
-                    : "Return to your soft save from " + when + ". Loading is automatic.";
+                           : "Return to your soft save. Loading is automatic.";
     view.keys = {{Page::KeyGlyph::DpadUD, "Select"},
                  {Page::KeyGlyph::Confirm, "OK"},
                  {Page::KeyGlyph::Back, "Last lantern"}};

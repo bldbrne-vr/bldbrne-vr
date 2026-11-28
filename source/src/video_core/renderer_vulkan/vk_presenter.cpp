@@ -560,8 +560,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
                                             openxr_presenter->LateSlotsWanted());
                 }
                 rasterizer->SetVrStereoWarp(vr_warp.get());
-                // The held items' meshes, built in the background while the game loads.
-                VrInFrame::PrewarmMeshes();
+                VrInFrame::Prewarm();
                 LOG_INFO(Render_Vulkan, "VR dibr: warp pipelines created");
                 // The game's UI on its own layer: shadowed in the draw stream, resolved at the
                 // flip.
@@ -769,6 +768,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     Frame* frame = TakeRenderFrame();
     frame->vr_tag = vr_tag;
     frame->vr_stereo = false;
+    frame->vr_eye_typed = false;
     frame->vr_published = false;
     frame->vr_ui = {};
     frame->vr_scene_image = vk::Image{};
@@ -915,8 +915,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         GpuPassProfiler::MarkAt(draw_scheduler, 0xF11F'0000'0004ull,
                                 GpuPassProfiler::Group::VrHost, "VR UI layer resolve");
         RecordVrUi(cmdbuf, *frame, image_size);
+        bool used_layer_scene = false;
         if (NativeStereo::Enabled()) {
-            RecordNativeStereo(cmdbuf, *frame, image, image_size, view_info.format);
+            used_layer_scene = RecordNativeStereo(cmdbuf, *frame, image, image_size, view_info.format);
+            if (S1Drs::enabled && frame->vr_tag.immersive &&
+                rasterizer->DrsFrame().ShouldHold(used_layer_scene)) {
+                // The present-thread fallback also honours hold. Let XR retain its last
+                // complete pair until a normally projected fallback or reconstruction arrives.
+                frame->vr_tag.hold = true;
+            }
         } else {
             GpuPassProfiler::MarkAt(draw_scheduler, 0xF11F'0000'0005ull,
                                     GpuPassProfiler::Group::VrHost, "VR DIBR stereo warp");
@@ -961,24 +968,25 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         }
         vr_warp->BeginFrame(0);
         vr_ui_layer->EndFrame();
-        rasterizer->VrEndFrame();
+        rasterizer->VrEndFrame(used_layer_scene);
     }
 
     // No allocations/formatting on unchanged frames; settings are sampled every
     // 120 immersive flips and changes must survive two polls (at most eight lines).
-    static Common::RenderDiagnostic::SettingsSnapshot<std::array<int, 14>> settings_snapshot;
+    static Common::RenderDiagnostic::SettingsSnapshot<std::array<int, 15>> settings_snapshot;
     if (settings_snapshot.Poll(vr_tag.immersive)) {
         const auto& settings = VR::GetSettings();
         const auto graphics = VR::Graphics::Accepted();
         const auto stereo = VR::GetStereo();
         const int ffr = VR::Graphics::foveation.load(std::memory_order_relaxed);
         const bool restart_needed = VR::Graphics::ResolutionRestartRequired();
-        const std::array<int, 14> values{
+        const std::array<int, 15> values{
             settings.lod_bias, settings.water_reflections, settings.shadows_far_reduced,
             settings.shadows_busy, ffr, graphics.scale_percent, int(graphics.upscaler),
             int(VR::Graphics::EffectiveProfile(graphics)), graphics.dlss5,
             stereo.stereo ? stereo.mode : -1, NativeStereo::Enabled(),
-            NativeStereo::LayerDrawsMode(), restart_needed, settings.canted_eyes};
+            NativeStereo::LayerDrawsMode(), restart_needed, settings.canted_eyes,
+            settings.camera_roll};
         if (settings_snapshot.Observe(values)) {
             try {
                 const char* detail = settings.lod_bias == 0 ? "Performance" :
@@ -991,7 +999,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                     "VR settings release={} distant_detail_config={}({}) water_reflections={} "
                     "far_shadows_reduced={} busy_shadows={} ffr_config={} ffr_available={} "
                     "ffr_env_override={} scale_accepted={}% upscaler_accepted={} preset={} neural={} "
-                    "resolution_restart_needed={} stereo_mode={} native={} native_views={} angled_screens={}",
+                    "resolution_restart_needed={} stereo_mode={} native={} native_views={} "
+                    "angled_screens={} camera_roll={}",
                     Common::g_scm_desc[0] ? Common::g_scm_desc : "unknown",
                     detail, settings.lod_bias, settings.water_reflections,
                     settings.shadows_far_reduced, settings.shadows_busy,
@@ -1004,7 +1013,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                     !stereo.stereo ? "Mono" : stereo.mode == 2 ? "DIBR" :
                         stereo.mode == 1 ? "PerEye" : "ClipShift",
                     NativeStereo::Enabled(), NativeStereo::LayerDrawsMode() ? "Layers" : "Multiview",
-                    settings.canted_eyes));
+                    settings.canted_eyes, settings.camera_roll));
             } catch (...) { /* Diagnostics must not interrupt rendering. */ }
         }
     }
@@ -1064,6 +1073,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     // Request a free presentation frame (the present thread's own; the GPU thread's reserved one).
     Frame* frame = present_thread ? GetRenderFrame() : TakeRenderFrame();
     frame->vr_stereo = false;
+    frame->vr_eye_typed = false;
     frame->vr_published = false;
     frame->vr_ui = {};
     frame->vr_scene_image = vk::Image{};
@@ -1156,16 +1166,6 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
         }
     };
 
-    // Swapchain::Recreate waits for the device to be idle: with the present queue's lock
-    // (Instance::GetPresentQueueMutex; the graphics queue's is not taken here, as before) and the
-    // OpenXR runtime's own queue's (Instance::GetXrQueueMutex: its xrEndFrame submits there
-    // without the graphics queue's lock; never taken by anyone else without the runtime's own
-    // queue). No other lock is held here.
-    const auto recreate = [&] {
-        std::scoped_lock present_lock{instance.GetXrQueueMutex(), instance.GetPresentQueueMutex()};
-        swapchain.Recreate(window.GetWidth(), window.GetHeight());
-    };
-
     // vr.ini desktop_mirror (core/vr/desktop_mirror.h): of the frames that went to the headset
     // only every Nth is presented on the desktop. The others end here, freed exactly as after a
     // present (present_done signalled once the frame's GPU work is done, its image left in
@@ -1223,12 +1223,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
     }
 
     // Recreate the swapchain if the window was resized.
-    if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
-        recreate();
+    const auto size = window.GetPixelSize();
+    if (size.width != swapchain.GetWidth() || size.height != swapchain.GetHeight()) {
+        swapchain.Recreate();
     }
 
     if (!swapchain.AcquireNextImage()) {
-        recreate();
+        swapchain.Recreate();
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
             LOG_WARNING(Render_Vulkan, "Skipping frame!");
@@ -1541,16 +1542,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
         presented = swapchain.Present();
     }
     if (!presented) {
-        // Swapchain::Recreate waits for the device to be idle: every queue's lock (the OpenXR
-        // runtime's own queue's too, when it has one: Instance::GetXrQueueMutex; one std::lock,
-        // no other lock held, so its order with the frame thread's cannot deadlock).
-        const Common::Log::DeferScope log_defer; // its log lines: once the lock is released
-        const LockTrace::Start lock_start;
-        std::scoped_lock lk{Scheduler::submit_mutex, instance.GetXrQueueMutex(),
-                            instance.GetPresentQueueMutex()};
-        LockTrace::Hold trace{"desktop present", lock_start}; // VR_LOCK_TRACE only
-        LockTrace::Phase phase{"desktop swapchain recreate"};
-        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        swapchain.Recreate();
     }
 
     free_frame();
@@ -1600,7 +1592,8 @@ void Presenter::RecordMirrorEye(vk::CommandBuffer cmdbuf, const Frame& frame, vk
     const bool typed_srgb = (frame.native_eyes[e] &&
                              frame.vr_eye_image[e] == frame.native_eyes[e]->image) ||
                             (frame.native_fit_eyes[e] &&
-                             frame.vr_eye_image[e] == frame.native_fit_eyes[e]->image);
+                             frame.vr_eye_image[e] == frame.native_fit_eyes[e]->image) ||
+                            frame.vr_eye_typed; // DIBR's in left-handed play
     // Native eyes are typed sRGB images, unlike DIBR's RGBA_UNORM byte containers.
     // Blitting them decodes sRGB and already understands their channel order. Use an
     // sRGB intermediate in the window's order to encode again before the raw copy.

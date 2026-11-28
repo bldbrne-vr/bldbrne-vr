@@ -14,6 +14,8 @@
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audio_clock.h"
 #include "core/libraries/audio/audioout_backend.h"
+#include "core/vr/mirror_world.h"
+#include "core/vr/vr_session.h"
 #include "core/libraries/kernel/threads.h"
 
 // SIMD support detection
@@ -85,6 +87,15 @@ public:
         UpdateVolumeIfChanged();
         const u64 current_time = HostTimeUs();
         convert(ptr, internal_buffer, buffer_frames, nullptr);
+        if (mirror_sides && buffer_frames != 0) [[unlikely]] {
+            // Left-handed play (core/vr/mirror_world.h): left and right trade, as the world does.
+            // The buffer holds float frames: the game's channels, or stereo when downmixed.
+            const u32 frame_bytes = buffer_frames * static_cast<u32>(sizeof(float));
+            const u32 channels = internal_buffer_size / frame_bytes;
+            VR::Mirror::SwapSides(
+                std::span{static_cast<float*>(internal_buffer), internal_buffer_size / sizeof(float)},
+                channels);
+        }
         HandleTiming(current_time);
 
         if ((output_count++ & 0xF) == 0) { // Check every 16 outputs
@@ -644,6 +655,8 @@ private:
     // Buffers
     u32 internal_buffer_size{0};
     void* internal_buffer{nullptr};
+    // Left-handed play: the session's mirror, fixed when the port opens (VR::MirrorWorld).
+    const bool mirror_sides{VR::MirrorWorld()};
 
     // Converter function pointer
     ConverterFunc convert{nullptr};

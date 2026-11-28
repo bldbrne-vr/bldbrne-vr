@@ -44,19 +44,19 @@ class GuestBuffer {
 public:
     GuestBuffer(const AvPlayerMemAllocator& memory_replacement, u32 align, u32 size,
                 bool is_texture) noexcept
-        : m_memory_replacement(memory_replacement),
+        : m_memory_replacement(&memory_replacement),
           m_data(is_texture ? AllocateTexture(memory_replacement, align, size)
                             : Allocate(memory_replacement, align, size)),
-          m_is_texture(is_texture) {
+          m_size(size), m_is_texture(is_texture) {
         ASSERT_MSG(m_data, "Could not allocate frame buffer.");
     }
 
     ~GuestBuffer() {
         if (m_data != nullptr) {
             if (m_is_texture) {
-                DeallocateTexture(m_memory_replacement, m_data);
+                DeallocateTexture(*m_memory_replacement, m_data);
             } else {
-                Deallocate(m_memory_replacement, m_data);
+                Deallocate(*m_memory_replacement, m_data);
             }
             m_data = {};
         }
@@ -67,18 +67,23 @@ public:
 
     GuestBuffer(GuestBuffer&& r) noexcept
         : m_memory_replacement(r.m_memory_replacement), m_data(r.m_data),
-          m_is_texture(r.m_is_texture) {
+          m_size(r.m_size), m_is_texture(r.m_is_texture) {
         r.m_data = nullptr;
     };
 
     GuestBuffer& operator=(GuestBuffer&& r) noexcept {
+        std::swap(m_memory_replacement, r.m_memory_replacement);
         std::swap(m_data, r.m_data);
+        std::swap(m_size, r.m_size);
+        std::swap(m_is_texture, r.m_is_texture);
         return *this;
     }
 
     u8* GetBuffer() const noexcept {
         return m_data;
     }
+
+    u32 Size() const noexcept { return m_size; }
 
 private:
     static u8* Allocate(const AvPlayerMemAllocator& memory_replacement, u32 align, u32 size) {
@@ -100,8 +105,9 @@ private:
         memory_replacement.deallocate_texture(memory_replacement.object_ptr, ptr);
     }
 
-    const AvPlayerMemAllocator& m_memory_replacement;
+    const AvPlayerMemAllocator* m_memory_replacement;
     u8* m_data = nullptr;
+    u32 m_size{};
     bool m_is_texture = false;
 };
 
@@ -190,7 +196,7 @@ private:
     AVFramePtr ConvertVideoFrame(const AVFrame& frame);
 
     Frame PrepareAudioFrame(GuestBuffer buffer, const AVFrame& frame);
-    Frame PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame);
+    std::optional<Frame> PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame);
 
     AvPlayerStateCallback& m_state;
 

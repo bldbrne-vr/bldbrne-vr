@@ -31,9 +31,10 @@
 // (the hunter's own lantern) counts NearEyeScale of its colour: its haze is all round the eye.
 namespace Shader::Optimization::FogLight {
 
-// Startup policy (vr.ini fog_light, VR_FOG_LIGHT=0|1 overrides it): with an upscaler only.
-inline bool Enabled(bool vr, bool setting, bool upscaler, const char* override_value) {
-    return override_value ? override_value[0] != '0' : vr && setting && upscaler;
+// Startup policy (vr.ini fog_light, VR_FOG_LIGHT=0|1 overrides it): with an upscaler or
+// without (light_shadow.h Enabled).
+inline bool Enabled(bool vr, bool setting, const char* override_value) {
+    return override_value ? override_value[0] != '0' : vr && setting;
 }
 
 // The buffer: a header of HeaderDwords (the light count as a u32, the eyes' half shift along
@@ -43,7 +44,8 @@ inline constexpr u32 MaxLights = 24;
 inline constexpr u32 HeaderDwords = 4;
 inline constexpr u32 LightDwords = 8;
 // Then the muzzle flash's MuzzleDwords (below, MuzzleDword on): its view position xyz, its reach
-// (1 / radius^2), its colour rgb (times its envelope), 1 while it shines.
+// (1 / radius^2), its colour rgb (times its envelope), and its signed soft core in m^2.
+// Zero is off. Positive cores cast shadows (gun, torch); negative cores skip them (Tonitrus).
 inline constexpr u32 MuzzleDwords = 8;
 inline constexpr u32 MuzzleDword = HeaderDwords + MaxLights * LightDwords;
 inline constexpr u32 BufferDwords = HeaderDwords + MaxLights * LightDwords + MuzzleDwords;
@@ -387,6 +389,80 @@ inline constexpr float FlickerS = 0.5f;
 inline constexpr float FlameFlicker = 0.02f;
 inline constexpr float FlameInS = 0.25f;
 inline constexpr float FlameOutS = 3.0f;
+// Placed lights without the map's tag (2026-11-18, the Hunter's Nightmare: "stray blue
+// orbs", "if an orb is too far from a light object, then we should have no orb"). The lights the
+// game spawns count as flames without a look (a torch, a shot, a fire), and "spawned" was the
+// record's dword 7 under MapLightWord. Measured that day (VR_LIGHT_AUDIT from the Nightmare
+// Church lamp to Laurence's room, 197 lights): the Nightmare's placed lights carry 0 or 2 there,
+// the blue fill 4.4 m from everything beside the lamp (r 5 m, rgb 1.34 2.95 5.00) and the white
+// one 7.6 m over Laurence's throne as much as the room's real wall candles, so none of them was
+// ever asked for its flame. What the tag was standing for is how a light behaves: one the game
+// spawns with an effect flickers (a flame), moves (a carried torch) or is the light in your hand;
+// one that holds its place and its brightness for PlacedStillS is a placed light, and is asked
+// for its flame like the map's own (air_light.h Sources; without the votes, the steady wide
+// rule). Until a new light has shown which it is it lights no air (no orb for a moment at every
+// first sight).
+// Only the cold ones are asked (PlacedColdBlue: blue more than that many times red, the
+// moonlight's fills, every orb he named): asked of all, the wall candles of Laurence's room lost
+// their halos too (the game keeps their lights half a metre in front of the flames: the votes
+// found the flame beside each light, not at it), and he, the same day: "in general I want lights
+// to have lights ... I don't mind a stranded orb here and there, as long as it's not egregious
+// and everywhere like before". A warm placed light keeps its glow as it had it.
+// VR_FOG_PLACED=0 (tests): by the tag alone, as before; =2: every placed light is asked.
+inline constexpr float PlacedStillS = 0.3f;
+inline constexpr float PlacedMoveM = 0.1f;
+inline constexpr float PlacedColdBlue = 1.4f;
+inline int PlacedMode() {
+    static const int mode = [] {
+        const char* const env = std::getenv("VR_FOG_PLACED");
+        return env == nullptr ? 1 : env[0] == '0' ? 0 : env[0] == '2' ? 2 : 1;
+    }();
+    return mode;
+}
+inline bool PlacedByBehaviour() {
+    return PlacedMode() != 0;
+}
+inline bool PlacedAsked(float r, float b) {
+    return PlacedMode() == 2 || b > PlacedColdBlue * r;
+}
+// An explosion's light (2026-11-23, of orbs after a Molotov: "molotovs shouldn't create a
+// halo", "molotov's glow should go away it ahouldn't stay fixed. It's an explosion and poof gone";
+// before that "I still want molotovs to lighten up the scene ... up a bit the duration of the
+// molotov explosion ... by 10ms", "0.3m not 0.5m (for perf reasons)"). A Molotov's burst spawns one
+// big light (5 m, its brightness 3 falling to 0, drifting 2 m) that the game keeps about 1.5 s
+// (VR_LIGHT_AUDIT, 2026-11-23), and as a spawned light that flickers it glowed in the air all that
+// time: an orb hanging where the bottle burst. Now a light the game spawns within BlastNearM of an
+// explosion (core/vr/muzzle_flash.h Blast: a bullet that stands where it is launched with a hit
+// radius of a metre or more, bloodborne_quickitems.cpp FogBurstLaunch), born within BlastBornS of
+// it, never glows in the air (no halo, no flame fill: the game's own light lights the walls); the
+// mist round it is lit (fog_grid.h Lamps) at full for BlastGlowS of its life, BlastWidenM wider,
+// fading over BlastFadeS, then not at all, however long the game keeps it. The guns' flash is
+// their own (Muzzle*).
+inline constexpr float BlastNearM = 3.0f;
+inline constexpr float BlastBornS = 0.4f;
+inline constexpr float BlastWidenM = 0.3f;
+inline constexpr float BlastGlowS = 0.16f;
+inline constexpr float BlastFadeS = 0.12f;
+// Its mist's share at `age_s` of its life: full, fading, gone.
+inline constexpr float BlastGlow(float age_s) {
+    return age_s <= BlastGlowS               ? 1.0f
+           : age_s >= BlastGlowS + BlastFadeS ? 0.0f
+                                              : 1.0f - (age_s - BlastGlowS) / BlastFadeS;
+}
+// `age_s`: the light's age, `since_blast_s`: the explosion's, `distance_m`: between the two.
+inline constexpr bool IsBlastLight(float age_s, float since_blast_s, float distance_m) {
+    const float born_after = since_blast_s - age_s; // the light's birth after the explosion
+    return since_blast_s >= 0.0f && born_after >= -BlastBornS && born_after <= BlastBornS &&
+           distance_m <= BlastNearM;
+}
+// Its reach (1 / radius^2) BlastWidenM wider.
+inline float BlastReach(float reach) {
+    if (!(reach > 0.0f)) {
+        return reach;
+    }
+    const float radius = 1.0f / std::sqrt(reach) + BlastWidenM;
+    return 1.0f / (radius * radius);
+}
 // A light's record dword 7: 20 or more (20, 50, 1000) on the map's own lights, 1 or less on the
 // lights the game spawns (LanternEngine's finding).
 inline constexpr float MapLightWord = 5.0f;
@@ -446,7 +522,9 @@ inline bool MuzzleFromLists() {
 // lighting.muzzle, lighting.muzzle_radius, lighting.muzzle_hold, lighting.muzzle_fade.)
 // (60 ms since 2026-11-15, the user: "maybe give it 10ms more in duration"; 30 ms in v27, then
 // "give the flash 20ms more on".)
-inline constexpr float MuzzleHoldS = 0.06f;
+// (70 ms since 2026-11-23, the user: "up a bit the duration of the molotov explosion and gun muzzle
+// flash by 10ms".)
+inline constexpr float MuzzleHoldS = 0.07f;
 // (2026-11-11, the user: "increase the range ... so when we fire our surroundings light up for a
 // bit": twice the light, a softer core (1 / (d^2 + MuzzleSoftM2), was 0.09: the hand and barrel
 // no brighter than before), a 20 m reach, a longer fade; it lit some 4 m before.)
@@ -466,11 +544,15 @@ inline constexpr float MuzzleHoldS = 0.06f;
 // 1.5m or 2m more) ... and make it a tiny bit more strong", then "a tiny bit more": 48 with an
 // 8 m^2 core and a 32 m reach (were 30, 6 and 30): 20-24% more light within a metre of the gun,
 // the same light 1.6 m further where it was at 6 m, 2.0 m at 8 m, 2.4 m at 10 m.)
+// (Then, 2026-11-23, the user: "(and maybe reach by 0.5m)", then "actually 0.3m not 0.5m (for perf
+// reasons)": 52 with a 52/6 m^2 core (were 48 and 8): as bright at the gun (6 over the core), the
+// same light 0.23 m further where it was at 6 m, 0.30 m at 8 m, 0.36 m at 10 m. MuzzleRadiusM,
+// how far the composite works it out, stays: no more pixels, no more work.)
 inline constexpr float MuzzleFadeS = 0.05f;
 inline constexpr float MuzzleLifeS = 0.3f;
 inline constexpr float MuzzleRadiusM = 32.0f;
-inline constexpr float MuzzleIntensity = 48.0f;
-inline constexpr float MuzzleSoftM2 = 8.0f;
+inline constexpr float MuzzleIntensity = 52.0f;
+inline constexpr float MuzzleSoftM2 = 52.0f / 6.0f;
 // The torch held up (core/vr/torch_glow.h; the muzzle flash's slot when no flash shines): a
 // share of the game's own torch light (the listed light nearest its flame, within TorchMatchM)
 // at its colour, reaching TorchRange x as far: raised (level 1) and held high (2). The core

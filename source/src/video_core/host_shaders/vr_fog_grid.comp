@@ -21,6 +21,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 const int MAX_PATCHES = 32; // fog_grid.h MaxPatches
 const int GROUND_CELLS = 32; // core/vr/mist_ground.h Cells
 const int MAX_MOVERS = 12;   // fog_grid.h Stir::MaxMovers
+const int MAX_BLASTS = 6;    // fog_grid.h MaxBlasts
 const int MAX_LAMPS = 25;  // fog_grid.h Lamps: MaxLights, the tiles
 const ivec3 LAMP_TILES = ivec3(20, 12, 8);
 
@@ -73,15 +74,25 @@ layout(std430, binding = 0) readonly buffer FogGridParams {
     vec4 ground_head;      // the mist's ground from the map (core/vr/mist_ground.h): the lattice's low corner (x, z), 1 / a cell's width, 1 when it is on
     vec4 ground[GROUND_CELLS * GROUND_CELLS / 4]; // its cells' ground heights (the world's y), row by row
     vec4 stir0;            // the fog stirred by what moves through it (fog_grid.h Stir): the frame's seconds, 1 when it is on, how many movers, tests' bits
-    vec4 stir1;            // the last frame's volume corner (x, z), 1 when the last field is there, 0
+    vec4 stir1;            // the last frame's volume corner (x, z), 1 when the last field is there, how many blasts
     vec4 stir2;            // what a frame keeps: of the push aside, of the clearing, of the churn; the share that spreads
     vec4 mover[2 * MAX_MOVERS]; // a mover: its place (x, its low y, z), 1 / r^2 | its speed (x, z; m/s), its strength, its churn
     vec4 lamp_far;         // a lamp's light gets further in fog much darker than it (fog_grid.h Lamps::Far*): what it dies less by a metre past the even distance in the taken-over banks, in the mist; the contrast it begins at, 1 / the contrast's span
+    uvec4 held;            // x: the banks the world-fixed volume holds, a bit a bank (fog_grid.h HeldVec4)
+    vec4 lamp_soft;        // the lamps' light a ray gathers, softly limited (fog_grid.h Lamps::Soft*): the bare lamps' limit, the haloed lamps' (0: none), 0, 0
+    vec4 blast[4 * MAX_BLASTS]; // (| its long way (x, z), the height (y) its fog has come back up to, 0) (| its ring: where (x), 1 / its width, how much thicker; the wisps' turn, a metre from its middle) a shot's or a swing's blast (core/vr/fog_impulse.h Blasts): its middle (x, z), 1 / r^2, the hole's depth | the wisps' carry (x, z; m), their shove outward (a metre from its middle), their churn
 } par;
 
 layout(std430, binding = 1) writeonly restrict buffer FogGrid {
     uint words[];
 } fog;
+
+// The lamps' light a ray gathers, softly limited (fog_grid.h Lamps::SoftLimit): limit * (1 -
+// exp(-light / limit)) by its brightest part, its hue kept; 0: as it is.
+vec3 SoftLamp(vec3 light, float limit) {
+    const float most = max(max(light.r, light.g), light.b);
+    return limit > 0.0 && most > 1e-6 ? light * (limit * (1.0 - exp(-most / limit)) / most) : light;
+}
 
 // The moon's shadow atlas (the game's depth image, four cascades in tiles), the lit shares of the
 // last build (blended look-ups) and this build's.
@@ -108,6 +119,14 @@ const float STIR_MAX_M = 1.5;    // never further than this
 const float STIR_RIM = 0.9;      // what a mover displaced lies thicker round it (fog_patches.h Wake::Rim)
 const float STIR_FLOW = 0.8;     // churned fog carries the field round (m/s at full churn)
 const float STIR_SWIRL_M = 0.5;  // ... and its wisps swirl by this much
+// A blast's shape is all rational (no exp, sqrt or pow a column): with x = d^2 / r^2 and
+// q = 1 / (1 + x^3), the fog that stays is times 1 - open * (1 - BLAST_RIM * x) * q: all but gone
+// at its heart, even at 0.82 of its radius, up to three tenths thicker in a ring just past it,
+// under 1% of a difference from BLAST_FAR on, where it is cut.
+const float BLAST_RIM = 1.5;
+const float BLAST_FAR = 12.0;    // (x: three and a half radii)
+const float BLAST_BEND_M = 0.25; // its outline bent by the wisps' waves, this far a wave
+const float BLAST_FRONT_M = 1.2; // its fog comes back from the ground up, fading in over this height (core/vr/fog_impulse.h BlastFrontSoftM)
 const ivec3 WORLD_SIZE = ivec3(128, 128, 48);  // cubes along the world's x, z, y
 const vec3 WORLD_CUBE = vec3(0.5, 0.5, 0.25);  // a cube's size along x, z, y (m)
 const float WORLD_EDGE_M = 4.0;                // the box's last metres across: cross-faded with the grid's own
@@ -281,10 +300,46 @@ float LampFurther(uint i, float per_own, float away) {
     return t * t * (3.0 - 2.0 * t) * max(away - par.lamp_fall.z, 0.0);
 }
 
-// A taken-over bank the volume holds: one with a fall and no clear distance of its own.
+// The blasts (core/vr/fog_impulse.h Blasts: a shot's, a swing's, an explosion's; none most frames)
+// at a place of the ground `at`: each opens a hole (all but gone at its heart), piles its fog in a
+// ring round it and in another that runs outward, flings the wisps outward, round its middle and
+// along its way, churns them. For the world volume's columns and, the same, for the places of the
+// banks the volume does not hold (those with a clear distance of their own from the eye: until
+// 2026-11-20 nothing reached those, and a shot into a thick bank of that kind parted nothing).
+// `front`: the height (the world's y) the fog has come back up to there (the lowest of the blasts
+// that reach the place): BlastShare gives what of `stays` counts at a height.
+// `which`: the blasts to ask, a bit a blast.
+void BlastsAt(uint which, vec2 at, inout float stays, inout vec2 flung, inout float churn, inout float front) {
+    for (uint left = which; left != 0u; left &= left - 1u) {
+        const int i = findLSB(left);
+        const vec4 a = par.blast[4 * i], d = par.blast[4 * i + 3];
+        const vec2 r = at - a.xy;
+        // (Its long way counts for less: a shot's channel. None: round.)
+        const float along = dot(r, d.xy);
+        const float x = (dot(r, r) - along * along) * a.z;
+        if (x > BLAST_FAR) {
+            continue;
+        }
+        front = min(front, d.z);
+        const vec4 b = par.blast[4 * i + 1], c = par.blast[4 * i + 2];
+        const float q = 1.0 / (1.0 + x * x * x);
+        // (Its ring of piled fog running outward: one more division.)
+        const float off = c.y * (x - c.x);
+        stays *= (1.0 - a.w * (1.0 - BLAST_RIM * x) * q) * (1.0 + c.z / (1.0 + off * off));
+        flung += (r * b.z + vec2(-r.y, r.x) * c.w + b.xy) * q;
+        churn = max(churn, b.w * q);
+    }
+}
+// What stays of the fog at the height `y`, of what the blasts leave (`blast`): under their front
+// the fog is back, over it the hole still is, fading across BLAST_FRONT_M.
+float BlastShare(float blast, float front, float y) {
+    return mix(1.0, blast, clamp((y - front) / BLAST_FRONT_M, 0.0, 1.0));
+}
+
+// A taken-over bank the volume holds: one with a fall and no clear distance of its own, while the
+// volume is on. Asked once a build on the CPU (fog_grid.h HeldVec4), a bit a bank.
 bool InVolume(int i) {
-    return par.world_vol.w > 0.5 && par.fog_patch[4 * i + 3].x < 0.0 && par.fog_patch[4 * i + 2].y > 0.0 &&
-           par.fog_patch[4 * i + 3].w <= 0.0;
+    return (par.held.x >> uint(i) & 1u) != 0u;
 }
 
 // What a cube of the world-fixed volume holds at its middle `p` (the taken-over fog there, its
@@ -386,22 +441,38 @@ void main() {
     // rim of what a body moved aside, thicker); the wisps are read where the fog came from, and
     // carried round by a flow with no source where it is churned.
     vec3 stir = vec3(0.0, 0.0, -1.0);
+    float blast = 1.0, blast_front = 1e9; // (what the blasts leave of a column, and up to where it is back)
     if (par.stir0.y > 0.5 && mask != 0u) {
         const vec2 px = 1.0 / vec2(WORLD_SIZE.xy);
         const vec2 uv = (vec2(col) + 0.5) * px;
         const vec4 f = textureLod(stir_tex, uv, 0.0);
         const float t = par.mist0.x;
-        const vec2 swirl = f.w * STIR_SWIRL_M * vec2(sin(xz.y * 1.9 + t * 1.3) + 0.5 * sin(xz.y * 4.3 - t * 2.1),
-                                                     cos(xz.x * 1.9 - t * 1.1) + 0.5 * cos(xz.x * 4.3 + t * 1.7));
+        // The blasts (core/vr/fog_impulse.h Blasts: a shot's, a swing's; none most frames): each
+        // opens a hole (all but gone at its heart), piles its fog in a ring round it, flings the
+        // wisps outward and along its way, churns them; over the field's own clearing.
+        float stays = clamp(1.0 - f.z, 0.0, 1.6), churn = f.w;
+        vec2 flung = f.xy;
+        blast = 1.0;
+        blast_front = 1e9;
+        // (The wisps' waves: the swirl's own, and what bends a blast's outline out of a circle.)
+        const vec2 wave = vec2(sin(xz.y * 1.9 + t * 1.3) + 0.5 * sin(xz.y * 4.3 - t * 2.1),
+                               cos(xz.x * 1.9 - t * 1.1) + 0.5 * cos(xz.x * 4.3 + t * 1.7));
+        const vec2 bent = xz + wave * BLAST_BEND_M;
+        BlastsAt((1u << uint(min(int(par.stir1.w), MAX_BLASTS))) - 1u, bent, blast, flung, churn, blast_front);
+        const vec2 swirl = churn * STIR_SWIRL_M * wave;
         // (Tests, VR_FOG_STIR_TEST: bit 0 no clearing, bit 2 the wisps not moved.)
         const int test = int(par.stir0.w);
-        stir = vec3((test & 4) != 0 ? vec2(0.0) : swirl - f.xy, (test & 1) != 0 ? 1.0 : clamp(1.0 - f.z, 0.0, 1.6));
+        stir = vec3((test & 4) != 0 ? vec2(0.0) : swirl - flung, (test & 1) != 0 ? 1.0 : min(stays, 1.6));
     }
     for (int y = 0; y < WORLD_SIZE.z; ++y) {
         vec2 held = vec2(0.0);
         const float py = corner.y + (float(y) + 0.5) * WORLD_CUBE.z;
         if (mask != 0u && py > y_lo && py < y_hi) {
-            held = VolumeAt(vec3(xz.x, py, xz.y), mask, patch_drift, wakes, stir);
+            vec3 here = stir;
+            if (blast != 1.0) {
+                here.z = min(here.z * BlastShare(blast, blast_front, py), 1.6);
+            }
+            held = VolumeAt(vec3(xz.x, py, xz.y), mask, patch_drift, wakes, here);
         }
         imageStore(world_out, ivec3(col, y), vec4(held, 0.0, 0.0));
     }
@@ -581,11 +652,27 @@ void main() {
     // (The noise moves with the wind and changes where it stands: up through itself, so a low bank's
     // wisps form and dissolve in place as the game's own puffs do; fog_patches.h Evolve.)
     const int wakes = clamp(int(par.wake0.x), 0, 8);
-    const vec3 patch_drift = drift * par.patches1.z + vec3(0.0, par.mist0.x * par.patches1.w, 0.0);
-    uint held_mask = 0u; // (the banks the volume holds: for its check)
-    for (int i = 0; i < patches; ++i) {
-        held_mask |= InVolume(i) ? 1u << uint(i) : 0u;
+    // The blasts this column's ray can come near at all, a bit a blast: BlastsAt's own measure at
+    // the nearest place of the ray's whole line along the ground (a blast further than BLAST_FAR
+    // from that reaches no place of the column). Most columns: none, and a place asks nothing. (A
+    // live blast cost every place of every column its distance: 0.010 ms a blast, 2026-11-20.)
+    uint blast_mask = 0u;
+    if (par.stir0.y > 0.5 && patch_mask != 0u) {
+        const int live = min(int(par.stir1.w), MAX_BLASTS);
+        for (int i = 0; i < live; ++i) {
+            const vec4 a = par.blast[4 * i], d = par.blast[4 * i + 3];
+            const vec2 r0 = origin.xz - a.xy;
+            const float dr = dot(d.xy, r0), dw = dot(d.xy, world_ray.xz);
+            const float qa = dot(world_ray.xz, world_ray.xz) - dw * dw;
+            const float qb = dot(r0, world_ray.xz) - dr * dw;
+            const float qc = dot(r0, r0) - dr * dr;
+            if ((qa > 1e-8 ? qc - qb * qb / qa : qc) * a.z <= BLAST_FAR) {
+                blast_mask |= 1u << uint(i);
+            }
+        }
     }
+    const vec3 patch_drift = drift * par.patches1.z + vec3(0.0, par.mist0.x * par.patches1.w, 0.0);
+    const uint held_mask = par.held.x; // (the banks the volume holds: for its check)
     const float patch_near = 1.0 / max(par.patches0.z - par.patches0.y, 1e-3);
     const float patch_far = 1.0 / max(par.patches1.y - par.patches1.x, 1e-3);
 
@@ -598,6 +685,7 @@ void main() {
     int lamp_band = -1;
     uint lamp_word = 0xFFFFFFFFu;
     vec3 lamp_sum = vec3(0.0); // the lamps' light in the mist so far
+    vec3 lamp_bare = vec3(0.0); // ... of it, the bare lamps' (no halo: fog_grid.h Lamps::SoftLimit)
 
     const bool shadows = par.atlas.w > 0.5;
     const bool past = par.history.w > 0.5;
@@ -713,6 +801,16 @@ void main() {
                     if (z > patch_in[i] && z < patch_out[i]) {
                         if (!wave_read) {
                             wave_read = true;
+                            // (The blasts, for the banks the volume does not hold (BlastsAt): asked as
+                            // the noise is, at the first patch the place is in. A place in no bank
+                            // asks nothing: with two live a place of every column asked, 0.03 ms.)
+                            if (blast_mask != 0u) {
+                                vec2 flung = vec2(0.0);
+                                float churn = 0.0, blast = 1.0, front = 1e9;
+                                BlastsAt(blast_mask, p.xz, blast, flung, churn, front);
+                                keep *= BlastShare(blast, front, p.y);
+                                shoved.xz -= flung;
+                            }
                             noise_at = (p + shoved) * par.patches0.w + patch_drift;
                             wave = Gyroid(noise_at * 0.303 + vec3(3.1, 0.7, 5.3));
                         }
@@ -940,6 +1038,7 @@ void main() {
                 vec3 lit_by = vec3(0.0);
                 // (In the game's fog taken over a lamp's light travels: fog_grid.h Lamps::Taken*.)
                 vec3 lit_taken = vec3(0.0);
+                vec3 bare_by = vec3(0.0), bare_taken = vec3(0.0); // (of them, the bare lamps')
                 const bool taken_here = patch_share > 0.0;
                 const float shape_g = par.lamp_shape.y, shape_g2 = shape_g * shape_g;
                 // (1 / the fog's own light here for its amount: what a lamp's light stands out
@@ -960,14 +1059,19 @@ void main() {
                         // distance, the same in a wisp and in a hole of the bank.)
                         const float away = sqrt(max(d2, 1e-4));
                         const float further = LampFurther(w & 255u, per_own, away);
-                        lit_by += b.rgb * (reaches * par.lamp_fall.w * exp(par.lamp_far.y * further - par.lamp_fall.y * away));
+                        const float bare = 1.0 - par.lamp_free[2u * (w & 255u) + 1u].w;
+                        const vec3 by = b.rgb * (reaches * par.lamp_fall.w * exp(par.lamp_far.y * further - par.lamp_fall.y * away));
+                        lit_by += by;
+                        bare_by += by * bare;
                         if (taken_here) {
                             // (The turn the light makes at the fog to reach the eye: none, its cosine 1,
                             // looking at the lamp through the fog.)
                             const float turn = -dot(d, dir) / away;
                             const float lobe = max(1.0 + shape_g2 - 2.0 * shape_g * turn, 1e-3);
                             const float phase = mix(1.0, (1.0 - shape_g2) / (lobe * sqrt(lobe)), par.lamp_shape.x);
-                            lit_taken += b.rgb * (reaches * phase * exp(par.lamp_far.x * further - (par.lamp_shape.z * mist + par.lamp_fall.x) * away));
+                            const vec3 taken = b.rgb * (reaches * phase * exp(par.lamp_far.x * further - (par.lamp_shape.z * mist + par.lamp_fall.x) * away));
+                            lit_taken += taken;
+                            bare_taken += taken * bare;
                         }
                     }
                 } else {
@@ -981,22 +1085,32 @@ void main() {
                         }
                         const float away = sqrt(max(d2, 1e-4));
                         const float further = LampFurther(uint(i), per_own, away);
-                        lit_by += b.rgb * (reaches * par.lamp_fall.w * exp(par.lamp_far.y * further - par.lamp_fall.y * away));
+                        const float bare = 1.0 - par.lamp_free[2 * i + 1].w;
+                        const vec3 by = b.rgb * (reaches * par.lamp_fall.w * exp(par.lamp_far.y * further - par.lamp_fall.y * away));
+                        lit_by += by;
+                        bare_by += by * bare;
                         if (taken_here) {
                             const float turn = -dot(d, dir) / away;
                             const float lobe = max(1.0 + shape_g2 - 2.0 * shape_g * turn, 1e-3);
                             const float phase = mix(1.0, (1.0 - shape_g2) / (lobe * sqrt(lobe)), par.lamp_shape.x);
-                            lit_taken += b.rgb * (reaches * phase * exp(par.lamp_far.x * further - (par.lamp_shape.z * mist + par.lamp_fall.x) * away));
+                            const vec3 taken = b.rgb * (reaches * phase * exp(par.lamp_far.x * further - (par.lamp_shape.z * mist + par.lamp_fall.x) * away));
+                            lit_taken += taken;
+                            bare_taken += taken * bare;
                         }
                     }
                 }
                 // (On the game's fog taken over a lamp's light counts TakenGain times, shaped as above
                 // and capped: its hue kept, its brightest part at most the cap.)
-                lit_taken *= 1.0 + par.lamps0.w;
+                float taken_gain = 1.0 + par.lamps0.w;
+                lit_taken *= taken_gain;
                 if (par.lamp_shape.w > 0.0) {
-                    lit_taken *= min(1.0, par.lamp_shape.w / max(max(lit_taken.r, lit_taken.g), max(lit_taken.b, 1e-6)));
+                    const float cap = min(1.0, par.lamp_shape.w / max(max(lit_taken.r, lit_taken.g), max(lit_taken.b, 1e-6)));
+                    lit_taken *= cap;
+                    taken_gain *= cap;
                 }
-                lamp_sum += mix(lit_by, lit_taken, patch_share) * (through * mist * sent * par.lamps0.y);
+                const float carried = through * mist * sent * par.lamps0.y;
+                lamp_sum += mix(lit_by, lit_taken, patch_share) * carried;
+                lamp_bare += mix(bare_by, bare_taken * taken_gain, patch_share) * carried;
             }
         }
         glow_sum += through * glow_here * sent;
@@ -1010,8 +1124,11 @@ void main() {
         // slice is forced to one (it was: a quarter of the glow over the last slice).
         const float beyond = Smooth01((z1 * stretch - glow_far) / (glow_far * max(par.glow2.y - 1.0, 1e-3)));
         const float keep = 1.0 - (1.0 - par.glow2.x) * beyond;
+        // (The lamps' light levels off as the fog thickens: fog_grid.h Lamps::SoftLimit.)
+        // A bare lamp's (no halo) and a haloed one's, each by its own limit.
+        const vec3 lamp_seen = SoftLamp(lamp_bare, par.lamp_soft.x) + SoftLamp(max(lamp_sum - lamp_bare, vec3(0.0)), par.lamp_soft.y);
         const vec3 code =
-            sqrt(clamp((sum + lamp_sum + par.air_colour.rgb * (glow_sum * keep)) / MAX_LIGHT, 0.0, 1.0));
+            sqrt(clamp((sum + lamp_seen + par.air_colour.rgb * (glow_sum * keep)) / MAX_LIGHT, 0.0, 1.0));
         const uint at = first + 2u * uint(k);
         fog.words[at] = Code16(code.r) | (Code16(code.g) << 16);
         fog.words[at + 1u] = Code16(code.b) | (Code16(through * dimmed) << 16);

@@ -732,7 +732,6 @@ u32 Rasterizer::VrMoonUpload(std::span<u32> out, bool for_grid) {
 }
 
 void Rasterizer::VrMoonEndFrame() {
-    const bool upscaler = VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off;
     const Knobs& knobs = GetKnobs();
     int quality = VR::GetSettings().moon_shafts_quality;
     if (knobs.quality) {
@@ -750,8 +749,8 @@ void Rasterizer::VrMoonEndFrame() {
     }
     vr_moon.density = knobs.density;
     vr_moon.steps = Moon::QualitySteps[quality];
-    // The session's rule as the pipeline cache's (an upscaler turned on or off in game).
-    vr_moon.on = Moon::Enabled(VR::IsEnabled(), VR::MoonGlowOn(VR::GetSettings()), upscaler,
+    // The session's rule as the pipeline cache's.
+    vr_moon.on = Moon::Enabled(VR::IsEnabled(), VR::MoonGlowOn(),
                                knobs.shafts);
 }
 

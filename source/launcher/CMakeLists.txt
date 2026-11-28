@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(BloodborneVRLauncher VERSION 0.2.0 LANGUAGES CXX)
+project(BloodborneVRLauncher VERSION 0.2.0 LANGUAGES C CXX)
 if(NOT WIN32)
     message(FATAL_ERROR "The launcher currently targets Windows.")
 endif()
@@ -21,6 +21,7 @@ if(NOT VELOPACK_SDK)
 endif()
 set(REPO "${CMAKE_CURRENT_SOURCE_DIR}/..")
 set(IMGUI "${REPO}/externals/dear_imgui")
+add_subdirectory("${REPO}/externals/miniz" miniz EXCLUDE_FROM_ALL)
 add_library(launcher_ui STATIC
     ${IMGUI}/imgui.cpp ${IMGUI}/imgui_draw.cpp ${IMGUI}/imgui_tables.cpp
     ${IMGUI}/imgui_widgets.cpp ${IMGUI}/misc/cpp/imgui_stdlib.cpp
@@ -28,30 +29,39 @@ add_library(launcher_ui STATIC
 target_include_directories(launcher_ui PUBLIC ${IMGUI} ${IMGUI}/backends ${IMGUI}/misc/cpp)
 target_compile_definitions(launcher_ui PRIVATE IMGUI_DISABLE_DEMO_WINDOWS)
 add_library(launcher_core STATIC core.cpp benchmark.cpp benchmark_runner.cpp sky_upscale.cpp controls_guide.cpp "${REPO}/src/core/vr/dlss5_file.cpp" "${REPO}/src/core/vr/sky_textures.cpp" "${REPO}/externals/pugixml/src/pugixml.cpp")
+target_sources(launcher_core PRIVATE mods.cpp)
+target_link_libraries(launcher_core PRIVATE miniz)
 target_include_directories(launcher_core PUBLIC ${REPO}/src ${REPO}/externals/json/include ${REPO}/externals/pugixml/src ${REPO}/externals/vulkan-headers/include)
 target_sources(launcher_core PRIVATE "${REPO}/src/core/vr/card_memory.cpp")
 target_include_directories(launcher_core PRIVATE ${REPO}/externals/stb ${REPO}/externals/xxhash)
 target_compile_definitions(launcher_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(launcher_core PUBLIC shell32 ole32 dxgi bcrypt user32 advapi32 wintrust crypt32 version)
-add_executable(BloodborneVR WIN32 main.cpp launcher.rc)
+# The images are compiled in, not resources (embed_assets.cmake says why); ids from resource.h.
+set(BBVR_EMBEDDED_ASSETS
+    201=assets/controllers/quest-left.png 202=assets/controllers/quest-right.png
+    203=assets/controllers/psvr2-left.png 204=assets/controllers/psvr2-right.png
+    205=assets/controllers/frame-left.png 206=assets/controllers/frame-right.png
+    207=assets/controllers/index-left.png 208=assets/controllers/index-right.png
+    220=assets/theme/yharnam.jpg 221=assets/theme/leather.png 222=assets/theme/frame.png
+    223=assets/theme/button-frame.png 224=assets/theme/launch-plaque.png
+    225=assets/theme/cabinet-frame.png 226=assets/theme/hardware.png
+    227=assets/theme/scrollbar-eye.png)
+set(embedded_asset_files "")
+foreach(entry IN LISTS BBVR_EMBEDDED_ASSETS)
+    string(REGEX REPLACE "^[0-9]+=" "" path "${entry}")
+    list(APPEND embedded_asset_files "${CMAKE_CURRENT_SOURCE_DIR}/${path}")
+endforeach()
+string(REPLACE ";" "," embedded_assets_arg "${BBVR_EMBEDDED_ASSETS}")
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/embedded_assets.cpp"
+    COMMAND ${CMAKE_COMMAND} "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/embedded_assets.cpp"
+        "-DROOT=${CMAKE_CURRENT_SOURCE_DIR}" "-DASSETS=${embedded_assets_arg}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_assets.cmake"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/embed_assets.cmake" ${embedded_asset_files}
+    COMMENT "Embedding the launcher's images" VERBATIM)
+add_executable(BloodborneVR WIN32 main.cpp launcher.rc "${CMAKE_CURRENT_BINARY_DIR}/embedded_assets.cpp")
+target_include_directories(BloodborneVR PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 set_source_files_properties(launcher.rc PROPERTIES
     OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/app-icon.ico")
-set_property(SOURCE launcher.rc APPEND PROPERTY OBJECT_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/assets/theme/yharnam.jpg"
-    "${CMAKE_CURRENT_SOURCE_DIR}/assets/theme/leather.png"
-    "${CMAKE_CURRENT_SOURCE_DIR}/assets/theme/frame.png")
-set_property(SOURCE launcher.rc APPEND PROPERTY OBJECT_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/assets/theme/button-frame.png"
-    "${CMAKE_CURRENT_SOURCE_DIR}/assets/theme/launch-plaque.png"
-    "${CMAKE_CURRENT_SOURCE_DIR}/assets/theme/cabinet-frame.png"
-    "${CMAKE_CURRENT_SOURCE_DIR}/assets/theme/hardware.png"
-    "${CMAKE_CURRENT_SOURCE_DIR}/assets/theme/scrollbar-eye.png")
-foreach(controller quest psvr2 frame index)
-    foreach(hand left right)
-        set_property(SOURCE launcher.rc APPEND PROPERTY OBJECT_DEPENDS
-            "${CMAKE_CURRENT_SOURCE_DIR}/assets/controllers/${controller}-${hand}.png")
-    endforeach()
-endforeach()
 # The launcher ships as Bldbrne-VR.exe (2026-10-17: no game name in the product's own files).
 set_target_properties(BloodborneVR PROPERTIES OUTPUT_NAME "Bldbrne-VR")
 target_include_directories(BloodborneVR PRIVATE "${VELOPACK_SDK}/include")
@@ -76,17 +86,15 @@ if(MSVC)
     endforeach()
     target_link_options(BloodborneVR PRIVATE /OPT:REF /OPT:ICF)
 endif()
+enable_testing()
+add_executable(mod_tests mod_tests.cpp)
+target_link_libraries(mod_tests PRIVATE launcher_core miniz)
+add_test(NAME launcher_mods COMMAND mod_tests)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests.cpp")
-    enable_testing()
     add_executable(launcher_tests tests.cpp)
     target_link_libraries(launcher_tests PRIVATE launcher_core)
     if(MSVC)
         target_compile_options(launcher_tests PRIVATE /utf-8 /EHsc)
-    endif()
-    add_test(NAME launcher_core COMMAND launcher_tests)
-    # Exercise the shipped patch template in launcher regression tests.
-    add_custom_command(TARGET launcher_tests POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/bbvr_patch.xml" "$<TARGET_FILE_DIR:launcher_tests>/bbvr_patch.xml")
 endif()
 # The headset preset's game patch sits next to the launcher in development builds; packages
 # place it next to the bundled runtime.

@@ -64,6 +64,9 @@ struct Frame {
     std::array<VR::Fov, 2> vr_eye_fov{};     // ... and the FOV it is submitted with
     float vr_eye_offset_m{};                 // eye poses: head -/+ right * this
     bool vr_eye_bgra{false}; // the eye images hold B8G8R8A8 bytes (the headset swapchains')
+    // DIBR's eye images made in the headset's sRGB format (left-handed play: SetEyeFormat), not
+    // UNORM byte containers: RecordMirrorEye blits them as the typed images they are.
+    bool vr_eye_typed{false};
     // vr.ini desktop_mirror_view right / left: the window shows this published frame's eye
     // vr_desktop_eye_index (0 left, 1 right; Present); the window-only post-process pass did not
     // run, `image` holds nothing (eGeneral).
@@ -161,7 +164,7 @@ private:
     // VR DIBR stereo (vk_presenter_vr.cpp): warps both eyes of the flipped frame from the
     // rasterizer's capture into the frame's eye images; anything missing leaves it mono.
     void RecordVrStereo(vk::CommandBuffer cmdbuf, Frame& frame, vk::Extent2D game_size);
-    void RecordNativeStereo(vk::CommandBuffer, Frame&, VideoCore::Image&, vk::Extent2D, vk::Format);
+    bool RecordNativeStereo(vk::CommandBuffer, Frame&, VideoCore::Image&, vk::Extent2D, vk::Format);
     // ... eye_upscale / eye_sharpen: `eyes` (eTransferSrcOptimal, left so) enlarged to `out` and
     // sharpened into vr_eye_scaled (eTransferSrcOptimal). False: not done (copy them as they are).
     bool UpscaleVrEyes(vk::CommandBuffer cmdbuf, VrStereoWarp::EyeImages& eyes,

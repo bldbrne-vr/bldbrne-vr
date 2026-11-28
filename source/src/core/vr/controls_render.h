@@ -38,6 +38,9 @@ struct View {
     Page::Glyphs glyphs{};
     bool gestures{false}; // the pictograms' tab (Model::ShowsGestures)
     bool pad_xbox{false}; // a gamepad drawn: an Xbox pad's (else a PlayStation one)
+    // Left-handed play (Config::layout.mirror): the swing's and the pointer's marks beside the
+    // left controller, your weapon hand's.
+    bool mirror{false};
 };
 
 View MakeView(const Model& model, const Page::Glyphs& glyphs);

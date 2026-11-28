@@ -4,6 +4,7 @@
 // You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
+#include "core/vr/s1_dynamic_resolution.h"
 #include "video_core/renderer_vulkan/vr_temporal_scene.h"
 #include "video_core/renderer_vulkan/vr_fsr4_interleave.h"
 #include "video_core/renderer_vulkan/vr_dlss_direct.h"
@@ -47,7 +48,8 @@ VrTemporalScene::Result VrTemporalScene::Begin(uint64_t id, const VR::Graphics::
     recovery_probe = probe;
     cut = cut || recovery_probe;
     const bool consecutive = begun && frame != UINT64_MAX && id == frame + 1;
-    if (!consecutive || cut || next != plan || config.upscaler != accepted.upscaler ||
+    const bool provider_changed = config.upscaler != accepted.upscaler || config.dlss5 != accepted.dlss5;
+    if (!consecutive || cut || next != plan || provider_changed ||
         VR::Graphics::EffectiveProfile(config) != VR::Graphics::EffectiveProfile(accepted)) {
         have_previous = false;
         runtime.ResetHistory();
@@ -55,6 +57,9 @@ VrTemporalScene::Result VrTemporalScene::Begin(uint64_t id, const VR::Graphics::
     problem.clear();
     frame = id;
     begun = true;
+    if (plan.focus[0].On() && accepted.upscaler != VR::Graphics::Upscaler::Off &&
+        (!next.focus[0].On() || config.upscaler == VR::Graphics::Upscaler::Off))
+        focus_pass.Release();
     accepted = config;
     plan = next;
     active = false;
@@ -67,7 +72,10 @@ VrTemporalScene::Result VrTemporalScene::Begin(uint64_t id, const VR::Graphics::
     const auto result = runtime.Begin(accepted, plan);
     if (result != Result::Ready) {
         objects.Begin(accepted, false, frame, runtime.Epoch());
-        images.Release();
+        if (result == Result::Pending && !provider_changed)
+            images.Suspend(plan);
+        else
+            images.Release();
         have_previous = false;
         return begin_result = result;
     }
@@ -203,7 +211,8 @@ bool VrTemporalScene::CaptureCameraFull(const CameraPair &data, float xs, float 
     return true;
 }
 VrTemporalScene::Result
-VrTemporalScene::Resolve(const std::array<VrTemporalImages::Source, 2> &sources, float frame_ms) {
+VrTemporalScene::Resolve(const std::array<VrTemporalImages::Source, 2> &sources, float frame_ms,
+                         unsigned render_drop) {
     if (!active || attempted)
         return Result::Pending;
     attempted = true;
@@ -260,7 +269,34 @@ VrTemporalScene::Resolve(const std::array<VrTemporalImages::Source, 2> &sources,
     }
     provider_frame.fsr4_pair = FastRender::On(Fsr4Interleave);
     const bool verify_interleave = (plan.provider_flags & VrTemporalPair::Fsr4VerifyInterleave) != 0;
-    bool reset = !have_previous || last_frame == UINT64_MAX || last_frame + 1 != frame;
+
+    S1Drs::SetRegion region=nullptr;
+    if (S1Drs::enabled) {
+        // (Foveated upscaling too, 2026-11-22: DLSS's features are then the rectangles', and the
+        // cut-outs are copied so that the bridge's centred sub-rectangle holds each rectangle's
+        // part of the narrower view, vr_dlss_focus.h DrsSpan. The floor stays the whole eye's.)
+        if (dlss && !VR::Graphics::Neural(accepted))
+            region=S1Drs::dlss_region.load(std::memory_order_acquire);
+        const unsigned reported = region ? region(0) : 100;
+        const unsigned short_side = std::min(size.input_width, size.input_height);
+        if (short_side != quality_short_side) {
+            quality_short_side = short_side;
+            quality_floor = S1Drs::QualityFloor(short_side);
+        }
+        const unsigned floor = reported >= 70 && reported <= 100 ? std::max(reported, quality_floor) : 100;
+        S1Drs::floor_percent.store(floor,std::memory_order_relaxed);
+        dynamic_region_supported = floor < 100;
+        if (render_drop > 100 - floor) {
+            // The provider was reconfigured after this pair was queued. Both eyes
+            // were drawn at the old scale; do not evaluate them at a different one.
+            problem = "DLSS input region no longer supported for this pair";
+            runtime.ResetHistory();
+            have_previous = false;
+            return Result::Invalid;
+        }
+    }
+    bool reset = render_drop != last_render_drop || !have_previous || last_frame == UINT64_MAX ||
+                 last_frame + 1 != frame;
     // Tonitrus' strike: a frame where its world flash jumps (the flicker's on, its dip, its second
     // flash) starts the history afresh, or the upscaler and the TAA would average the jump away;
     // through its smooth fade the history is kept (core/vr/tonitrus_charge.h FlashJumped). The
@@ -301,7 +337,8 @@ VrTemporalScene::Resolve(const std::array<VrTemporalImages::Source, 2> &sources,
                                               t.motion.image, constants};
     }
     if (!camera_motion.Record(accepted, runtime.CanProduceMotion(), eyes,
-                              twin_motion ? &*twin_motion : nullptr)) {
+                              twin_motion ? &*twin_motion : nullptr, 2,
+                              region ? render_drop : 0)) {
         problem = "camera/object motion composition failed";
         runtime.ResetHistory();
         have_previous = false;
@@ -313,8 +350,14 @@ VrTemporalScene::Resolve(const std::array<VrTemporalImages::Source, 2> &sources,
     // and turns focus off from the next (whole-eye DLSS again).
     const bool focus = runtime.FocusOn();
     const auto whole = provider_frame.eyes;
+    // Dynamic resolution (only with the bridge's region, DLSS): each cut-out copied from its
+    // rectangle's part of the narrower view, and the whole eye composed from it (DrsWindow).
+    const unsigned focus_drop = region ? render_drop : 0;
+    const std::array<DlssFocus::DrsWindow, 2> windows{
+        DlssFocus::Window(size.input_width, size.input_height, plan.focus[0], focus_drop),
+        DlssFocus::Window(size.input_width, size.input_height, plan.focus[1], focus_drop)};
     if (focus) {
-        if (!focus_pass.Crop(provider_frame.eyes, plan.focus)) {
+        if (!focus_pass.Crop(provider_frame.eyes, plan.focus, windows)) {
             DlssFocus::Off("the rectangles could not be cut out");
             problem = "DLSS focus: the rectangles could not be cut out";
             runtime.ResetHistory();
@@ -329,15 +372,21 @@ VrTemporalScene::Resolve(const std::array<VrTemporalImages::Source, 2> &sources,
                 2 * std::atan(std::tan(provider_frame.vertical_fov[eye] / 2) *
                               float(plan.focus[eye].in_h) / float(size.input_height));
     }
+    // The bridge records both evaluations synchronously on this thread. Scope the
+    // region to this pair so a menu or later provider call always starts full. (With focus the
+    // bridge centres it in each rectangle's feature, where the cut-outs put the view.)
+    if (region && render_drop) region(render_drop);
     const auto result = runtime.Resolve(frame, provider_frame);
+    if (region && render_drop) region(0);
     if (result == Result::Ready && focus) {
         std::array<VrDlssFocusPass::Eye, 2> composed{};
         for (uint32_t eye = 0; eye < 2; ++eye)
             composed[eye] = {sources[eye].color, vk::ImageView{whole[eye].motion.view},
-                             provider_frame.eyes[eye].output, whole[eye].output, plan.focus[eye]};
+                             provider_frame.eyes[eye].output, whole[eye].output, plan.focus[eye],
+                             windows[eye]};
         std::array<BbDlssImage, 2> written{};
         if (!focus_pass.Compose(composed, size.input_width, size.input_height, jitter,
-                                reset || lockstep, frame, written)) {
+                                reset || lockstep, frame, written, focus_drop)) {
             DlssFocus::Off("the eyes could not be composed");
             problem = "DLSS focus: the eyes could not be composed";
             runtime.ResetHistory();
@@ -352,6 +401,7 @@ VrTemporalScene::Resolve(const std::array<VrTemporalImages::Source, 2> &sources,
     last_frame = frame;
     have_previous = result == Result::Ready;
     if (result == Result::Ready) {
+        last_render_drop = render_drop;
         for (uint32_t eye = 0; eye < 2; ++eye)
             output[eye] = provider_frame.eyes[eye].output;
         published = true;

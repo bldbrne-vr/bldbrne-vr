@@ -1649,7 +1649,7 @@ void RetirePieces(const S::ActorKey& key) {
 }
 
 // The models a build put (PutPiece), dropped again unless their piece is placed: an exception
-// part way (out of memory) never leaves them registered with no piece to drop them (Codex's
+// part way (out of memory) never leaves them registered with no piece to drop them (a code
 // review, 2026-11-13).
 struct Unplaced {
     std::array<const Piece*, 2> pieces{};

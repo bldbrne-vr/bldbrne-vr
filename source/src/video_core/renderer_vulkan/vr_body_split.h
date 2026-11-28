@@ -103,9 +103,11 @@ constexpr Plan PlanDraw(const KeyShape& key, const Frame& frame, bool colour, bo
     if (key.shoulder != 0 && !shoulder_cut && key.cut == 0 && key.cape == 0 && key.head == 0) {
         return p;
     }
-    // A head part's other triangles (the hat's scarf and clasp, the fc_* bare skin's arms and
-    // hands) are drawn with the draw's own pipeline, never faded: as with body_head_shadow=0,
-    // where head parts are never cut (the confirmed look: a solid scarf looking down).
+    // A head part's other triangles (the fc_* bare skin's arms and hands, the beast and Milkweed
+    // transformation heads' legs and tentacles) are drawn with the draw's own pipeline, never
+    // faded: as with body_head_shadow=0, where head parts are never cut. Kept solid since
+    // 2026-10-06 because a faded head part looked see-through; that was a fix, not a look the
+    // user chose. Hats have no other triangles: every hat is hidden whole since 2026-11-26.
     p.cut = frame.cut_on && !key.head_only;
     p.draw_cape = !frame.cape_hidden;
     p.draw_head = !drop_head;

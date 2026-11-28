@@ -27,6 +27,8 @@
 #include "core/libraries/videoout/video_out.h"
 #include "core/memory.h"
 #include "core/platform.h"
+#include "core/vr/s1_dynamic_resolution.h"
+#include "core/vr/vr_session.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
@@ -1063,8 +1065,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             Libraries::VideoOut::ExecuteEopFlip(packet);
                         };
                         if (rasterizer->QueueOrderedTask(task, this,
-                                                         std::as_bytes(std::span{&*flip, 1}), true))
+                                                         std::as_bytes(std::span{&*flip, 1}), true)) {
+                            if (S1Drs::enabled) VR::LatchNextDrawResolution();
                             break;
+                        }
                         rasterizer->DrainDrawPipe(0, static_cast<u32>(opcode));
                     }
                     if (g_flip_on_b != '3')
@@ -1084,6 +1088,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // Retain IRQ observers; the flip itself belongs to this packet, not a FIFO.
                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
                     Libraries::VideoOut::ExecuteEopFlip(*flip);
+                    if (S1Drs::enabled) VR::LatchNextDrawResolution();
                     break;
                 }
                 case PM4CmdNop::PayloadType::DebugMarkerPush: {

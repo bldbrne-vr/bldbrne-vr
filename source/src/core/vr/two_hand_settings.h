@@ -42,6 +42,8 @@ inline bool ParseTwoHandSetting(const std::string& key, const std::string& value
         s.zone_m = std::clamp(std::stof(value), 3.0f, 20.0f) * 0.01f;
     } else if (key == "two_hand_zone_seen") {
         s.zone_seen = on();
+    } else if (key == "two_hand_zone_1125_seen") {
+        s.zone_1125_seen = on();
     } else if (key == "two_hand_release_cm") {
         s.release_m = std::clamp(std::stof(value), 8.0f, 60.0f) * 0.01f;
     } else if (key == "two_hand_twist_deg") {
@@ -91,6 +93,7 @@ inline void WriteTwoHandDefaults(std::ostream& out) {
            "squeeze\n"
         << "two_hand_zone_cm=" << d.zone_m * 100.0f << "\n"
         << "two_hand_zone_seen=1\n"
+        << "two_hand_zone_1125_seen=1\n"
         << "# legacy distance setting (cm); held grips no longer release on distance\n"
         << "two_hand_release_cm=" << d.release_m * 100.0f << "\n"
         << "# legacy angle setting (deg); held grips no longer release on twist\n"

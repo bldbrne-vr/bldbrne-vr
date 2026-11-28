@@ -23,6 +23,7 @@
 #include "core/vr/bloodborne_enemy_bars.h"
 #include "core/vr/bloodborne_givekit.h"
 #include "core/vr/bloodborne_heal.h"
+#include "core/vr/game_area.h"
 #include "core/vr/bloodborne_held.h"
 #include "core/vr/bloodborne_iframes.h"
 #include "core/vr/bloodborne_melee.h"
@@ -40,6 +41,7 @@
 #include "core/vr/hook_util.h"
 #include "core/vr/pose_gestures.h"
 #include "core/vr/quick_settings.h"
+#include "core/vr/s1_dynamic_resolution.h"
 #include "core/vr/transform_settings.h"
 #include "core/vr/vr_session.h"
 
@@ -204,6 +206,7 @@ Watch g_watch{};
 // The heal vignette's signal (HealSignalUpdate).
 struct HealSignal {
     const u8* player{};
+    u32 map{};
     s32 hp{-1};
     s32 max_hp{-1};
     bool warp_effect{false};
@@ -523,15 +526,28 @@ void HealSignalUpdate(const u8* player) {
         return;
     }
     auto& h = g_signal;
-    if (player != h.player) {
+    const bool new_player = player != h.player;
+    const u32 map = Read<u32>(player + VR::GameArea::PlayerMapOffset);
+    if (new_player) {
         if (h.player != nullptr) {
-            VR::RequestTransitionTextureCleanup();
-            LOG_INFO(Core, "Texture transition: replacement player (pressure-only)");
+            // Native travel and respawn can bypass the lamp UI. Compare the actual players'
+            // maps across the load. A walk across a boundary keeps the same player. Any block
+            // counts (AreaOf): the Chalice Dungeons' maps run past the blocks IsMapId takes.
+            const bool changed = h.map != map && VR::GameArea::AreaOf(h.map) != 0 &&
+                                 VR::GameArea::AreaOf(map) != 0;
+            VR::RequestTransitionTextureCleanup(changed);
+            if (changed) {
+                LOG_INFO(Core, "Texture transition: replacement player crossed maps {:#x} -> {:#x}",
+                         h.map, map);
+            } else {
+                LOG_INFO(Core, "Texture transition: replacement player (pressure-only)");
+            }
         }
         h = {};
         h.player = player;
         g_hit.synced = false;
     }
+    h.map = map;
     const s32 hp = Read<s32>(module + OffsetHp);
     const s32 max_hp = Read<s32>(module + OffsetMaxHp);
     bool item_anim = false;
@@ -550,6 +566,12 @@ void HealSignalUpdate(const u8* player) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             now.time_since_epoch()).count());
     const bool died = h.hp > 0 && hp == 0 && max_hp > 0;
+    if (S1Drs::enabled) {
+        const bool holding = warp_effect || (max_hp > 0 && hp == 0);
+        const bool was_holding = h.warp_effect || (h.max_hp > 0 && h.hp == 0);
+        if (new_player || holding != was_holding)
+            S1Drs::NotePlayerTransition(holding);
+    }
     if (died || (warp_effect && !h.warp_effect)) {
         VR::RequestTransitionTextureCleanup();
         LOG_INFO(Core, "Texture transition: {} (pressure-only)",

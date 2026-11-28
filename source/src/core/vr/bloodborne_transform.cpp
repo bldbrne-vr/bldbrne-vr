@@ -23,6 +23,7 @@
 #include "core/vr/bloodborne_heal.h"
 #include "core/vr/bloodborne_layout.h"
 #include "core/vr/bloodborne_transform.h"
+#include "core/vr/chikage.h"
 #include "core/vr/body_channel.h"
 #include "core/vr/combat_channel.h"
 #include "core/vr/hook_util.h"
@@ -584,6 +585,7 @@ struct Run {
     u32 fired{0};
     bool switch_asked{false};
     bool switched{false};
+    bool blade_seated{false};
     s64 switch_asked_ns{0};
     float t{0.0f};
     float last_trace_t{-1.0f};
@@ -745,8 +747,8 @@ const char* StartBlock(u8* chr, const MeleeBody& body, const TickState& t, s64 n
 }
 
 void Event(Combat::TransformEventKind kind, u32 serial, float a, float b, s64 now,
-           const char* why = "") {
-    Combat::PushTransformEvent({kind, serial, a, b, now, why});
+           const char* why = "", bool saif = false) {
+    Combat::PushTransformEvent({kind, saif, serial, a, b, now, why});
 }
 
 void StartRun(u8* chr, TickState& t, u32 serial, s64 now, bool flick, u32 window,
@@ -833,6 +835,39 @@ void EndRun(u8* chr, TickState& t, const char* why, bool done, s64 now) {
              g_hook_frames.exchange(0, std::memory_order_relaxed));
 }
 
+} // namespace
+
+bool AddPlayerEffect(u8* chr, s32 id) {
+    return chr != nullptr && !g_dry_run && AddPlayerSpEffect(chr, id);
+}
+
+bool SpawnWeaponFfx(u8* chr, s32 slot, s32 ffx, s32 dummy) {
+    if (chr == nullptr || g_sfx_slot == nullptr || g_dry_run) {
+        return false;
+    }
+    u8* const ctl = chr + OffsetSfxCtl;
+    if (Read<u8*>(ctl) != g_base + SfxCtlVtableRva) {
+        return false;
+    }
+    g_sfx_slot(ctl, slot, ffx, &dummy, 0);
+    return true;
+}
+
+bool PlayWeaponSound(u8* chr, s32 id) {
+    std::array<float, 12> grip{};
+    if (chr == nullptr || !g_sound || !T::GetTransformSettings().cues || g_dry_run ||
+        !DummyMtx(chr, RightWeaponDummy, grip)) {
+        return false;
+    }
+    alignas(16) std::array<float, 4> p{grip[3], grip[7], grip[11], 1.0f};
+    const bool flip = g_sound_table != nullptr && Read<u8>(g_sound_table + 3) != 0;
+    u64 handle = 0;
+    g_play_sound(&handle, p.data(), flip ? 0xA : 1, id);
+    return true;
+}
+
+namespace {
+
 void PlayCues(u8* chr, Run& r, const T::CueStep& step, s64 now) {
     const T::Clip& c = *r.clip;
     const bool cues = T::GetTransformSettings().cues && !g_dry_run;
@@ -855,9 +890,11 @@ void PlayCues(u8* chr, Run& r, const T::CueStep& step, s64 now) {
                     const s32 type = effect_sound ? T::SoundS : (flip ? 0xA : 1);
                     g_play_sound(&handle, p.data(), type, q.a);
                 }
-                if (!effect_sound) { // (a detent is a mechanism's click, not an effect's sound)
+                // On the Saif, feel the blade move on the first sound and the actual form lock.
+                // Its remaining closely spaced sounds still play in full.
+                if (!effect_sound && (c.family != 230 || q.a == 4800)) {
                     Event(Combat::TransformEventKind::Detent, r.serial, static_cast<float>(q.a),
-                          r.t, now);
+                          r.t, now, "", c.family == 230);
                 }
             } else {
                 ++r.effects;
@@ -990,7 +1027,7 @@ void StepRun(u8* chr, TickState& t, const MeleeBody& body, s64 now) {
             r.switched = true;
             r.switched_ns = now;
             Event(Combat::TransformEventKind::Locked, r.serial, static_cast<float>(c.style), r.t,
-                  now);
+                  now, "", c.family == 230);
             if (r.flick) {
                 LOG_INFO(Core, "VR transform: #{} flick switched {:.0f} ms after the squeeze",
                          r.serial, static_cast<double>(now - r.start_ns) * 1e-6);
@@ -999,6 +1036,14 @@ void StepRun(u8* chr, TickState& t, const MeleeBody& body, s64 now) {
             EndRun(chr, t, "site A did not switch the form", false, now);
             return;
         }
+    }
+    // The Saif keeps moving after SetWeaponStyle. Use clip time so a flick or a
+    // faster return seats on the same animation frame as an ordinary squeeze.
+    if (c.family == 230 && r.switched && !r.blade_seated && !g_dry_run &&
+        r.t >= (c.to_b ? 0.700f : 0.733f)) {
+        r.blade_seated = true;
+        Event(Combat::TransformEventKind::BladeSeated, r.serial, static_cast<float>(c.style),
+              r.t, now, "", true);
     }
     if (r.t >= c.length) {
         if (r.switched) {
@@ -1417,11 +1462,50 @@ void TransformPoseTick(u8* chr, const MeleeBody& body) {
     t.weapon = RightWeapon(chr, &t.slot);
     t.style = WeaponStyle(chr);
     t.choice =
-        T::Choose(B::Weapons::FamilyOf(t.weapon), t.style, T::GetTransformSettings().untested);
+        T::Choose(B::Weapons::FamilyOf(t.weapon), t.style, T::GetTransformSettings().untested,
+                  VR::Tricks::GetTrickSettings().chikage_scabbard);
     if (t.choice.clip != nullptr && t.choice.clip->speffect > 0 && g_add_speffect == nullptr) {
         t.choice = {nullptr, "its SpEffect cannot be added (AddSpEffect's signature)"};
     }
     LogWeapon(t);
+    // The scabbard's blood on the clean Chikage (core/vr/chikage.h): the game's own effect on the
+    // blade, kept alive while it lasts.
+    // ... and every hit that lands, again for a moment (chikage.h NoteHit).
+    const bool draw_gush =
+        body.scabbard_burst_ns > 0 && now >= body.scabbard_burst_ns &&
+        now - body.scabbard_burst_ns < static_cast<s64>(VR::Chikage::BloodBurstS * 1e9f);
+    const s64 hit_ns = VR::Chikage::g_hit_ns.load(std::memory_order_acquire);
+    const int hit_level = VR::Chikage::g_hit_level.load(std::memory_order_relaxed);
+    const bool hit_gush = hit_ns > 0 && now >= hit_ns &&
+                          now - hit_ns < static_cast<s64>(VR::Chikage::HitGushFor(hit_level) * 1e9f);
+    if ((draw_gush || hit_gush) && g_ffx && body.driven &&
+        (t.style == T::StyleFormA || T::IsFormB(t.style)) &&
+        VR::Tricks::Scabbard(B::Weapons::FamilyOf(t.weapon))) {
+        u8* const ctl = chr + OffsetSfxCtl;
+        if (Read<u8*>(ctl) == g_base + SfxCtlVtableRva) {
+            const s32 form = t.style == T::StyleFormA ? 0 : 2000;
+            // The draw's red flare: two, at mid-blade and the tip (chikage.h FlareAt), for its
+            // first FlareS (chikage.h FlareS).
+            if (draw_gush && now - body.scabbard_burst_ns < static_cast<s64>(VR::Chikage::FlareS * 1e9f)) {
+                for (const std::size_t i : VR::Chikage::FlareAt) {
+                    const s32 at = VR::Chikage::BloodDummies[i] + form;
+                    g_sfx_slot(ctl, VR::Chikage::BloodSlots[i], VR::Chikage::BloodFfx, &at, 0);
+                }
+            }
+            // The flying blood (FlingFfx): off the tip, and mid-blade too for the draw's first
+            // DoubleGushS or a heavy or charged hit.
+            const bool both = (draw_gush && now - body.scabbard_burst_ns <
+                                                static_cast<s64>(VR::Chikage::DoubleGushS * 1e9f)) ||
+                              (hit_gush && hit_level >= 2);
+            // (A charged hit or the draw's own hit: the guard's end too, "a lot of blood".)
+            const bool all = hit_gush && hit_level >= 3;
+            for (std::size_t i : {std::size_t{2}, std::size_t{1}, std::size_t{0}}) {
+                if ((i == 1 && !both) || (i == 0 && !all)) continue;
+                const s32 dummy = VR::Chikage::BloodDummies[i] + form;
+                g_sfx_slot(ctl, VR::Chikage::DoubleSlots[i], VR::Chikage::FlingFfx, &dummy, 0);
+            }
+        }
+    }
 
     StepRun(chr, t, body, now);
 
@@ -1547,11 +1631,60 @@ void TransformPoseTick(u8* chr, const MeleeBody& body) {
     Combat::PublishTransformStatus(status);
 }
 
+// The hunter's SpEffect list (as bloodborne_held.cpp HasEffect walks it).
+bool HasEffect(const u8* chr, s32 id) {
+    u8* const list = Read<u8*>(chr + 0x1C8);
+    if (!Plausible(list)) {
+        return false;
+    }
+    u8* node = Read<u8*>(list + 0x08);
+    for (u32 i = 0; i < 512 && Plausible(node); ++i) {
+        if ((Read<u32>(node + 0x1C) & 0x800C0003u) == 0 && Read<s32>(node + 0x40) == id) {
+            return true;
+        }
+        node = Read<u8*>(node + 0x58);
+    }
+    return false;
+}
+
+// The Chikage's blood from the scabbard: the game's blood coating on the blade while it lasts
+// (chikage.h AuraSpEffect), the clean form only (the blooded form has its own).
+void ChikageAuraSiteA(u8* player) {
+    // ON unless VR_CHIKAGE_AURA=0 (off for one build, 2026-11-20 night, to tell it from the
+    // blade's own flash; the tester: "but I want the blood coating aura").
+    static const bool aura = [] {
+        const char* const env = std::getenv("VR_CHIKAGE_AURA");
+        return env == nullptr || env[0] != '0';
+    }();
+    if (!aura) {
+        return;
+    }
+    Combat::ChikageBlood blood{};
+    if (g_add_speffect == nullptr || !Combat::LatestChikageBlood(blood) || blood.until_ns <= 0) {
+        return;
+    }
+    const s64 now = NowNs();
+    if (now >= blood.until_ns || Hp(player) <= 0 || WeaponStyle(player) != T::StyleFormA ||
+        !VR::Tricks::Scabbard(B::Weapons::FamilyOf(RightWeapon(player))) ||
+        HasEffect(player, VR::Chikage::AuraSpEffect)) {
+        return;
+    }
+    const bool added = AddPlayerSpEffect(player, VR::Chikage::AuraSpEffect);
+    static s64 told_until = 0;
+    if (told_until != blood.until_ns) {
+        told_until = blood.until_ns;
+        LOG_INFO(Core, "VR chikage: the blood coating (SpEffect {}) {} for {:.1f} s",
+                 VR::Chikage::AuraSpEffect, added ? "on" : "NOT added",
+                 static_cast<float>(blood.until_ns - now) * 1e-9f);
+    }
+}
+
 void TransformSiteA(u8* player) {
     if (!g_installed || player == nullptr) {
         return;
     }
     WheelBuffSiteA(player);
+    ChikageAuraSiteA(player);
     const u32 due = g_switch_due.load(std::memory_order_acquire);
     if (due == 0) {
         return;

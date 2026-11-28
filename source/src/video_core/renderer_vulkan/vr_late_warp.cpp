@@ -369,16 +369,41 @@ bool VrLateWarp::CreateFrameResources() {
 }
 
 bool VrLateWarp::EnsureImage(Image& image, vk::Extent2D extent, vk::Format format,
-                             vk::ImageUsageFlags usage, std::string_view name) {
-    if (image.image && image.extent == extent && image.format == format) {
+                             vk::ImageUsageFlags usage, std::string_view name, vk::Format typed) {
+    // (Left-handed play, `typed`: only an 8-bit sRGB format over an R8G8B8A8_UNORM view.)
+    if (format != vk::Format::eR8G8B8A8Unorm ||
+        (typed != vk::Format::eR8G8B8A8Srgb && typed != vk::Format::eB8G8R8A8Srgb)) {
+        typed = vk::Format::eUndefined;
+    }
+    if (image.image && image.extent == extent && image.format == format && image.typed == typed) {
         return true;
     }
     if (!WaitIdle()) return false; // do not recreate resources on a lost device
     DestroyImage(image);
+    // Both formats listed so the driver can keep its compression; static: never dangling.
+    static const std::array<VkFormat, 2> rgba_formats{VK_FORMAT_R8G8B8A8_SRGB,
+                                                      VK_FORMAT_R8G8B8A8_UNORM};
+    static const std::array<VkFormat, 2> bgra_formats{VK_FORMAT_B8G8R8A8_SRGB,
+                                                      VK_FORMAT_R8G8B8A8_UNORM};
+    static const VkImageFormatListCreateInfo rgba_list{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+        .viewFormatCount = 2,
+        .pViewFormats = rgba_formats.data()};
+    static const VkImageFormatListCreateInfo bgra_list{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+        .viewFormatCount = 2,
+        .pViewFormats = bgra_formats.data()};
+    const bool is_typed = typed != vk::Format::eUndefined;
     const VkImageCreateInfo info{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = !is_typed                            ? nullptr
+                 : typed == vk::Format::eB8G8R8A8Srgb ? static_cast<const void*>(&bgra_list)
+                                                      : static_cast<const void*>(&rgba_list),
+        .flags = is_typed ? static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+                                                            VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)
+                          : 0u,
         .imageType = VK_IMAGE_TYPE_2D,
-        .format = static_cast<VkFormat>(format),
+        .format = static_cast<VkFormat>(is_typed ? typed : format),
         .extent = {extent.width, extent.height, 1},
         .mipLevels = 1,
         .arrayLayers = 1,
@@ -410,6 +435,7 @@ bool VrLateWarp::EnsureImage(Image& image, vk::Extent2D extent, vk::Format forma
     image.view = view;
     image.extent = extent;
     image.format = format;
+    image.typed = typed;
     q_map_cleared = false; // the next frame clears V's images (all three) once
     SetObjectName(dev.device, image.image, "VR late warp {} {}x{}", name, extent.width,
                   extent.height);
@@ -777,10 +803,10 @@ bool VrLateWarp::Render(const Source& source,
         (turn && !EnsureImage(eyes_cant, shown_both, vk::Format::eR8G8B8A8Unorm,
                               vk::ImageUsageFlagBits::eStorage |
                                   vk::ImageUsageFlagBits::eTransferSrc,
-                              "turned eyes")) ||
+                              "turned eyes", mirror ? vk_format : vk::Format::eUndefined)) ||
         !EnsureImage(eyes, both, vk::Format::eR8G8B8A8Unorm,
                      vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc,
-                     "eyes") ||
+                     "eyes", mirror ? vk_format : vk::Format::eUndefined) ||
         !EnsureImage(q_map, cap.size, vk::Format::eR32G32Sfloat,
                      vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
                          vk::ImageUsageFlagBits::eTransferDst,
@@ -1714,15 +1740,33 @@ bool VrLateWarp::Record(Slot& slot, u32 index, const Source& source, bool scalin
                 A::eTransferWrite),
     };
     cmd.pipelineBarrier2({.imageMemoryBarrierCount = 2, .pImageMemoryBarriers = to_copy.data()});
-    const vk::ImageCopy region{
-        .srcSubresource = ColorLayers,
-        .srcOffset = {0, 0, 0},
-        .dstSubresource = ColorLayers,
-        .dstOffset = {0, 0, 0},
-        .extent = {final_eyes.extent.width, final_eyes.extent.height, 1},
-    };
-    cmd.copyImage(final_eyes.image, L::eTransferSrcOptimal, target, L::eTransferDstOptimal,
-                  region);
+    if (mirror && final_eyes.typed == vk_format) {
+        // Left-handed play: each eye flipped within its own rect by one blit of the same format
+        // (exact: sRGB decoded and encoded again), at the cost of the copy it replaces.
+        for (u32 e = 0; e < 2; ++e) {
+            const s32 x0 = e == 0 ? 0 : static_cast<s32>(shown[0].width);
+            const s32 w = static_cast<s32>(shown[e].width);
+            const s32 h = static_cast<s32>(shown[e].height);
+            const vk::ImageBlit blit{
+                .srcSubresource = ColorLayers,
+                .srcOffsets = std::array{vk::Offset3D{x0, 0, 0}, vk::Offset3D{x0 + w, h, 1}},
+                .dstSubresource = ColorLayers,
+                .dstOffsets = std::array{vk::Offset3D{x0 + w, 0, 0}, vk::Offset3D{x0, h, 1}},
+            };
+            cmd.blitImage(final_eyes.image, L::eTransferSrcOptimal, target, L::eTransferDstOptimal,
+                          blit, vk::Filter::eNearest);
+        }
+    } else {
+        const vk::ImageCopy region{
+            .srcSubresource = ColorLayers,
+            .srcOffset = {0, 0, 0},
+            .dstSubresource = ColorLayers,
+            .dstOffset = {0, 0, 0},
+            .extent = {final_eyes.extent.width, final_eyes.extent.height, 1},
+        };
+        cmd.copyImage(final_eyes.image, L::eTransferSrcOptimal, target, L::eTransferDstOptimal,
+                      region);
+    }
     if (stamp_writer) {
         for (u32 e = 0; e < 2; ++e) {
             const XrRect2Di rect{

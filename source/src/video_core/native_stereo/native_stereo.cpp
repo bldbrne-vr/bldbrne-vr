@@ -7,10 +7,12 @@
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #include "core/vr/bloodborne_visceral_stage.h"
 #include "native_stereo.h"
+#include <mutex>
 #include "video_core/fast/b_handler_profile.h"
 #include "common/assert.h"
 #include "common/render_diagnostic.h"
 #include "core/vr/vr_session.h"
+#include "core/vr/s1_dynamic_resolution.h"
 #include "core/vr/eye_distance.h"
 #include "core/vr/lamp_glow.h"
 #include "core/vr/monocular.h"
@@ -453,6 +455,23 @@ static bool CameraBufferImpl(Upload& stream, const float* source, u32 alignment,
     }
     left=pair[0]; camera_pairs.push_back({pair[0],pair[1]}); return true;
 }
+// The last light pass's eye inverse projections (LightInverseProjections).
+static std::mutex g_light_inverse_mutex;
+static std::array<std::array<float, 16>, 2> g_light_inverse{};
+static bool g_light_inverse_valid = false;
+// Last frame's eye frustum over this frame's, for the game's histories (wet streets' reflection,
+// the temporal SSAO), which were drawn last frame: under dynamic resolution each eye's frustum is
+// its full one times the view's share p = (100 - drop)% in scale and offset (S1Drs::Expanded
+// widens about the tangent centre), so last frame's is this one's times p_last / p_now (2026-11-24
+// review: this frame's put the reflections up to 80 px off on a step frame). 1 when the step did
+// not change. Both steps come with the draw's record, latched once a flip (vr_session.cpp
+// LatchNextDrawResolution), so every pass of a flip and both threads that pair these buffers (A's
+// ring constants, B's other buffers) agree.
+static float PreviousFrustumScale(const VR::CameraRecord& record) {
+    const unsigned now = record.s1_render_drop, last = record.s1_previous_drop;
+    if (now == last || now >= 100 || last >= 100) return 1.0f;
+    return float(100 - last) / float(100 - now);
+}
 // Bloodborne's deferred-light variants share a camera layout even as light counts
 // and types produce new shader hashes. Recognize that layout rather than a partial
 // list of programs, so turning toward a new light cannot retain a symmetric inverse.
@@ -495,20 +514,62 @@ static bool LightingBufferImpl(Upload& stream, const float* source, u32 size,
     const bool history = g_ssao_history_eye &&
                          layout == NativeProjection::LightingLayout::Occlusion &&
                          NativeProjection::OcclusionHistoryMove(source);
+    // Their history side takes last frame's frustum (PreviousFrustumScale).
+    const float last_scale = PreviousFrustumScale(record);
+    std::array<NativeProjection::Transform, 2> previous = transforms;
+    if (last_scale != 1.0f && (history || layout == NativeProjection::LightingLayout::Reflection)) {
+        for (auto& t : previous) {
+            t.x_scale *= last_scale;
+            t.y_scale *= last_scale;
+            t.x_offset *= last_scale;
+            t.y_offset *= last_scale;
+        }
+    }
+    if constexpr (Common::Log::Enabled) {
+        // VR_TEMPORAL_TRACE (tests): once a record, the records whose step differs from the last
+        // flip's (where the history layouts take last frame's frustum), whatever the buffer.
+        static std::atomic<u64> told{~0ull};
+        if (S1Drs::trace && last_scale != 1.0f &&
+            told.exchange(record.id, std::memory_order_relaxed) != record.id)
+            LOG_WARNING(Render_Vulkan, "DRS history: record {} drop {} after {} (x{:.4f}; first {})",
+                        record.id, record.s1_render_drop, record.s1_previous_drop, last_scale,
+                        NativeProjection::Name(layout));
+    }
     const u64 stride = alignment ? ((size + alignment - 1) / alignment) * alignment : size;
     const auto [mapped, offset] = stream.Map(stride + size, alignment);
     ASSERT(mapped);
+    // (The edge pass reads the lamp shaders' matrices: a light pass's, not a mirror's; both eyes
+    // published together, never one new beside one old: a code review, 2026-11-20.)
+    // (Once a frame: the first light pass's; every lamp draw of a frame has the same.)
+    static u64 published_record = ~0ull;
+    const bool publish = layout == NativeProjection::LightingLayout::Light && !mirror && size >= 64 &&
+                         record.id != published_record;
+    std::array<std::array<float, 16>, 2> inverse{};
     for (u32 eye=0; eye<2; ++eye) {
         std::array<float,104> values{};
         std::memcpy(values.data(),source,size);
         const float e = (eye ? .5f : -.5f) * Ipd(record) * record.world_scale;
-        NativeProjection::RemapLighting(values.data(),source,layout,e,transforms[eye],history);
+        NativeProjection::RemapLighting(values.data(),source,layout,e,transforms[eye],history,
+                                        &previous[eye]);
         std::memcpy(mapped+eye*stride,values.data(),size);
+        if (publish) std::memcpy(inverse[eye].data(), values.data(), 64);
+    }
+    if (publish) {
+        published_record = record.id;
+        std::scoped_lock lock{g_light_inverse_mutex};
+        g_light_inverse = inverse;
+        g_light_inverse_valid = true;
     }
     stream.Commit();
     left = {stream.Handle(),offset,size};
     camera_pairs.push_back({left,{stream.Handle(),offset+stride,size}});
     if (world_scale) *world_scale = record.world_scale;
+    return true;
+}
+bool LightInverseProjections(std::array<std::array<float, 16>, 2>& out) {
+    std::scoped_lock lock{g_light_inverse_mutex};
+    if (!g_light_inverse_valid) return false;
+    out = g_light_inverse;
     return true;
 }
 bool EyeInverseProjections(const float* source, const VR::CameraRecord& record,

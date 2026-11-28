@@ -91,7 +91,8 @@ void* EmitHostCallStub(Xbyak::CodeGenerator& c, void* fn, const u8* original, si
 
 void* EmitHostCallStubWith(Xbyak::CodeGenerator& c, void* fn, const u8* original, size_t length,
                            u64 return_address,
-                           const std::function<void(Xbyak::CodeGenerator&)>& load_args) {
+                           const std::function<void(Xbyak::CodeGenerator&)>& load_args,
+                           bool result_in_rsi) {
     using namespace Xbyak::util;
     c.align(16);
     void* entry = const_cast<u8*>(c.getCurr());
@@ -114,6 +115,10 @@ void* EmitHostCallStubWith(Xbyak::CodeGenerator& c, void* fn, const u8* original
         c.vmovdqu(Xbyak::Ymm(i), ptr[rsp + 32 * i]);
     }
     c.mov(rsp, rbp);
+    if (result_in_rsi) {
+        // The saves from rsp up: rbp r11 r10 r9 r8 rdi rsi ...: the guest's rsi at +48.
+        c.mov(qword[rsp + 48], rax);
+    }
     for (const auto& reg : {rbp, r11, r10, r9, r8, rdi, rsi, rbx, rdx, rcx, rax}) {
         c.pop(reg);
     }

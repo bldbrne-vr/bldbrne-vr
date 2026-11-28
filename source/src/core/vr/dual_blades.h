@@ -14,13 +14,8 @@
 //    buzz in both hands, and each blade's next hit that lands deals melee_dual_sharpen_pct (30%)
 //    more. A hone unused for HonedS fades; rubbing while both are honed only renews it.
 // Joined (form A) or another weapon: nothing here applies.
-//  - the hone shows on the steel (2026-11-15: "a shine and glint on the actual blade ...
-//    that goes away after we do an attack"; "the weapon mesh/blade needs to glow, not ... a thing
-//    that runs across"): the blade's own model drawn again over it, light only. With the ring a
-//    band of light runs over each blade from the guard to the tip, then a cold sheen stays on its
-//    steel while it is honed, gone with the hit that spends it or faded over the hone's last FadeS
-//    (Shine, LookOf; drawn in-frame by bloodborne_quickitems.cpp AddBladeShine and
-//    vr_inframe.frag's blade shine; the model: bloodborne_weapon_shape.cpp ShineModel).
+// The ring sends a highlight from guard to tip. The native blade material then stays
+// polished until its own hit spends the hone or the timer fades (Shine, LookOf).
 //
 // Header-only and pure apart from the strokes' counter (the body's blade sounds, any thread) and
 // the shine's channels: tests/test_dual_blades.cpp.

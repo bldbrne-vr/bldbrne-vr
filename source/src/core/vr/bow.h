@@ -49,10 +49,10 @@ struct Settings {
     // bow_assist_deg: an arrow turns onto the target the game picked (locked on or not) only when
     // that target is within this many degrees of the drawn line, ahead and in reach, so the turn
     // makes it hit; otherwise it flies as drawn (0: never). bow_damage_pct: the bow's arrows deal
-    // this much of their damage. The user, 2026-11-10: "a tiny soft assist (like 10 degrees only
-    // if by doing the assist it would hit an enemy) and a 5% damage boost when in bow mode".
+    // this much of their native damage.
     float assist_deg{10.0f};
-    float damage_pct{105.0f};
+    float damage_pct{108.0f};
+    bool damage_108_seen{false};
 };
 
 inline Settings& GetBowSettings() {
@@ -87,6 +87,8 @@ inline bool ParseBowSetting(const std::string& key, const std::string& value) {
         s.assist_deg = std::clamp(std::stof(value), 0.0f, 20.0f);
     } else if (key == "bow_damage_pct") {
         s.damage_pct = std::clamp(std::stof(value), 50.0f, 200.0f);
+    } else if (key == "bow_damage_108_seen") {
+        s.damage_108_seen = on();
     } else if (key == "bow_twang") {
         // Retired: the release sound was learned from the sounds round a launch and could keep an
         // enemy's groan. The bow now plays its shot clips' own (bloodborne_gun.cpp BowRelease).
@@ -129,7 +131,7 @@ inline void WriteBowDefaults(std::ostream& out) {
            "degrees of\n# your aim, so the turn makes it hit (0: never)\n"
         << "bow_assist_deg=" << d.assist_deg << "\n"
         << "# the bow's arrows deal this much (%) of their damage\n"
-        << "bow_damage_pct=" << d.damage_pct << "\n";
+        << "bow_damage_pct=" << d.damage_pct << "\nbow_damage_108_seen=1\n";
 }
 
 // The quiver (bow_quiver): the string hand over a shoulder, from just behind the ears (head-
@@ -192,6 +194,14 @@ constexpr std::int32_t BowbladeVariation = 3200;
 constexpr bool IsBowbladeBehavior(std::int32_t behavior) {
     return behavior >= 100000000 && behavior < 200000000 &&
            (behavior - 100000000) / 1000 == BowbladeVariation;
+}
+// The 1.09 bow's five arrow Bullet rows. Their native speed is 30 m/s and lifetime is 0.60 s.
+constexpr bool IsArrowProjectile(std::int32_t bullet) {
+    return bullet >= 940 && bullet <= 944;
+}
+inline float ArrowFlightLife(float life) {
+    // Non-positive lives include infinite and missing rows. Preserve those and invalid values.
+    return life > 0.0f && std::isfinite(life) ? life + 0.10f : life;
 }
 inline float ArrowDamageScale(std::int32_t behavior, bool bullet, bool his, bool other,
                               const Settings& s) {

@@ -17,6 +17,7 @@ enum class RecorderOpcode : u32 { Padding, PushConstants, PushDescriptors, Barri
     drawIndirectCount,
     drawIndexedIndirectCount,
     dispatch,
+    dispatchBase,
     dispatchIndirect,
     fillBuffer,
     copyBuffer,
@@ -125,6 +126,15 @@ struct dispatch {
     u32 z;
 };
 static_assert(std::is_trivially_copyable_v<dispatch>);
+struct dispatchBase {
+    u32 baseX;
+    u32 baseY;
+    u32 baseZ;
+    u32 x;
+    u32 y;
+    u32 z;
+};
+static_assert(std::is_trivially_copyable_v<dispatchBase>);
 struct dispatchIndirect {
     vk::Buffer buffer;
     vk::DeviceSize offset;

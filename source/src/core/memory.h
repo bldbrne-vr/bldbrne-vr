@@ -5,6 +5,8 @@
 
 #include <map>
 #include <mutex>
+#include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include "common/enum.h"
@@ -259,7 +261,60 @@ public:
         return size_to_validate <= 0;
     }
 
+    // Inspect a small CPU-readable guest span while its mappings are pinned. The visitor
+    // must not retain the span or call back into the memory manager.
+    template <typename Visitor>
+    bool InspectReadableRange(VAddr address, u64 size, Visitor&& visit) {
+        std::shared_lock lock{mutex};
+        if (!size || address < vma_lower || address >= vma_upper || size > vma_upper - address)
+            return false;
+        const VAddr end = address + size;
+        auto area = FindVMA(address);
+        for (VAddr at = address; at < end; ++area) {
+            if (area == vma_map.end() || area->first > at || !area->second.IsMapped() ||
+                !True(area->second.prot & MemoryProt::CpuRead))
+                return false;
+            const VAddr next = area->first + area->second.size;
+            if (next <= at) return false;
+            at = next;
+        }
+        return visit(std::span<const u8>{reinterpret_cast<const u8*>(address), size});
+    }
+
     u64 ClampRangeSize(VAddr virtual_addr, u64 size);
+
+    // A speculative read from a page-fault handler must neither wait for a mapping
+    // writer nor fault on the guest's page protections. Visit only a pinned,
+    // contiguous slice of the physical backing. The visitor cannot retain the span.
+    template <typename Visitor>
+    bool TryInspectBacking(VAddr address, u64 size, Visitor&& visit) {
+        std::shared_lock lock{mutex, std::try_to_lock};
+        if (!lock || !size || address < vma_lower || address >= vma_upper ||
+            size > vma_upper - address) {
+            return false;
+        }
+        const auto& area = FindVMA(address)->second;
+        const auto offset = address - area.base;
+        if (!HasPhysicalBacking(area) || !True(area.prot & MemoryProt::CpuRead) ||
+            offset >= area.size || size > area.size - offset) {
+            return false;
+        }
+        auto part = area.phys_areas.upper_bound(offset);
+        if (part == area.phys_areas.begin()) {
+            return false;
+        }
+        --part;
+        const auto within = offset - part->first;
+        const auto& physical = part->second;
+        const u64 backing_size = impl.BackingSizeBytes();
+        if (within >= physical.size || size > physical.size - within ||
+            physical.base >= backing_size || within >= backing_size - physical.base ||
+            size > backing_size - physical.base - within) {
+            return false;
+        }
+        visit(std::span<const u8>{impl.BackingBase() + physical.base + within, size});
+        return true;
+    }
 
     void SetPrtArea(u32 id, VAddr address, u64 size);
 
@@ -336,7 +391,7 @@ public:
     /// The game's GPU memory allocator handed [addr, addr + size) out again: what the GPU wrote
     /// there is dead (core/vr/bloodborne_gpu_memory.cpp).
     void NoteFreshGpuRange(VAddr addr, u64 size) const;
-    /// InvalidateMemory for a protection change: no byte is written (the GPU's stay kept).
+    /// Invalidate tracking after a protection change; no texture bytes have been written.
     void InvalidateProtection(VAddr addr, u64 size) const;
 
 private:
@@ -352,7 +407,7 @@ private:
         return std::prev(fmem_map.upper_bound(target));
     }
 
-    bool HasPhysicalBacking(VirtualMemoryArea vma) {
+    static bool HasPhysicalBacking(const VirtualMemoryArea& vma) {
         return vma.type == VMAType::Direct || vma.type == VMAType::Flexible ||
                vma.type == VMAType::Pooled;
     }

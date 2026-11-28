@@ -90,6 +90,15 @@ void RecorderProxy::dispatch(u32 x, u32 y, u32 z) const {
     recorder.Commit();
 }
 
+void RecorderProxy::dispatchBase(u32 baseX, u32 baseY, u32 baseZ, u32 x, u32 y, u32 z) const {
+    if (!recorder.Enabled()) { recorder.Direct().dispatchBase(baseX, baseY, baseZ, x, y, z); return; }
+    using Packet = RecorderPackets::dispatchBase;
+    auto* data = recorder.Allocate(RecorderOpcode::dispatchBase, Aligned(sizeof(Packet)));
+    const Packet packet{baseX, baseY, baseZ, x, y, z};
+    std::memcpy(data, &packet, sizeof(packet));
+    recorder.Commit();
+}
+
 void RecorderProxy::dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
     if (!recorder.Enabled()) { recorder.Direct().dispatchIndirect(buffer, offset); return; }
     using Packet = RecorderPackets::dispatchIndirect;

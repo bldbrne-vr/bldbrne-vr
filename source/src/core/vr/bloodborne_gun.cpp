@@ -38,6 +38,8 @@
 #include "core/vr/bow.h"
 #include "core/vr/call_beyond.h"
 #include "core/vr/muzzle_flash.h"
+#include "core/vr/fog_impulse.h"
+#include "core/vr/game_area.h"
 #include "core/vr/bow_channel.h"
 #include "core/vr/combat_channel.h"
 #include "core/vr/gun_aim.h"
@@ -46,6 +48,7 @@
 #include "core/vr/melee_settings.h"
 #include "core/vr/melee_window.h"
 #include "core/vr/quick_items.h"
+#include "core/vr/lever_smack.h"
 #include "core/vr/shield_guard.h"
 #include "core/vr/seqlock.h"
 #include "core/vr/stake_driver.h"
@@ -254,6 +257,7 @@ constexpr s32 CategoryDirect = 0; // ... a tool used directly (UseGoods with no 
 constexpr u32 OffsetPPos = 0x10;
 constexpr u32 OffsetPQuat = 0x30; // its orientation (hkQuaternion x, y, z, w): what the game draws
 constexpr u32 OffsetPVel = 0x40;
+constexpr u32 OffsetPBehavior = 0x2F0; // 0x19F036D -> 0x19F6CD6: copy starts at launcher + 0x1B0
 constexpr u32 OffsetPBullet = 0x2F4;
 constexpr u32 OffsetPOwner = 0x2FC;
 constexpr u32 OffsetPAlive = 0x7F1; // bit 0
@@ -321,6 +325,7 @@ using FindItemFn = s32(PS4_SYSV_ABI*)(u8* inventory, const u32* item);
 // ---- Install state (set before anything can run) ------------------------------------------------
 
 u8* g_base = nullptr;
+bool g_world_verified = false; // IsMainPlayer's WorldChrMan reference matched the loaded eboot
 bool g_aim = false;  // the emitter detour is in
 bool g_fire = false; // the direct-fire functions matched
 bool g_regen = false;
@@ -1418,6 +1423,10 @@ void PS4_SYSV_ABI GunEmitterHook(u8* out, u8* /*saved_ymm*/, u8* launcher) {
         counter.fetch_add(1, std::memory_order_relaxed);
         if (idx == 0) {
             NoteShot(start, vanilla);
+            // A shot at a Chalice lever along the game's own aim (lever_smack.h); a flame is no
+            // shot.
+            if (info.family != G::Family::Sprayer)
+                VR::Lever::Smack::Posted().PostShot({start, vanilla, now});
         }
         if (idx == 0 && LineAllowed()) {
             LOG_INFO(Core,
@@ -1486,9 +1495,19 @@ void PS4_SYSV_ABI GunEmitterHook(u8* out, u8* /*saved_ymm*/, u8* launcher) {
         std::scoped_lock lock{g_shot_mutex};
         if (idx == 0) {
             NoteShot(start, g_dry_aim ? vanilla : a.dir);
+            // A shot at a Chalice lever (core/vr/lever_smack.h; the lever side reads it); a
+            // flame is no shot.
+            if (info.family != G::Family::Sprayer)
+                VR::Lever::Smack::Posted().PostShot({start, g_dry_aim ? vanilla : a.dir, now});
             // The muzzle flash's light (muzzle_flash.h): at the muzzle, else the shot's start.
             const B::Vec3 flash = have_muzzle ? muzzle : start;
             MuzzleFlash::Publish(flash.x, flash.y, flash.z);
+            if (info.family != G::Family::Sprayer && FogImpulse::combat.Ready(now)) {
+                const auto dir = g_dry_aim ? vanilla : a.dir;
+                const bool cannon = info.family == G::Family::Cannon || info.family == G::Family::ChurchCannon;
+                FogImpulse::combat.Publish(now, GameArea::Slot().load(std::memory_order_relaxed),
+                    FogImpulse::Gun({flash.x, flash.y, flash.z}, {dir.x, dir.y, dir.z}, cannon));
+            }
             g_last = {};
             g_last.n = ++g_stats.lines;
             g_last.bullet = bullet;
@@ -2519,27 +2538,26 @@ void InstallGun(VAddr base, u64 size) {
         g_dry_aim = true;
         g_dry_run = std::string_view{dry} != "aim";
     }
-    bool wcm_ok = Matches(module, IsMainPlayerRva, IsMainPlayerSig);
-    if (wcm_ok) {
+    if (Matches(module, IsMainPlayerRva, IsMainPlayerSig)) {
         s32 disp{};
         std::memcpy(&disp, module + IsMainPlayerRva + 13, sizeof(disp));
-        wcm_ok = IsMainPlayerRva + 17 + static_cast<s64>(disp) == WorldChrManRva;
+        g_world_verified = IsMainPlayerRva + 17 + static_cast<s64>(disp) == WorldChrManRva;
     }
     if (Matches(module, DmyPolyRva, DmyPolySig)) {
         g_dmy_poly = reinterpret_cast<DmyPolyFn>(module + DmyPolyRva);
     }
     try {
         g_code = std::make_unique<Xbyak::CodeGenerator>(1024);
-        g_aim = wcm_ok && InstallAim(module);
+        g_aim = g_world_verified && InstallAim(module);
     } catch (const Xbyak::Error& error) {
         LOG_ERROR(Core, "VR gun: code emission failed ({}); aim hook not installed", error.what());
         g_aim = false;
     }
-    if (!wcm_ok) {
+    if (!g_world_verified) {
         LOG_WARNING(Core,
                     "VR gun: the WorldChrMan proof (IsMainPlayer) differs; the gun is vanilla");
     }
-    g_fire = InstallFire(module, wcm_ok);
+    g_fire = InstallFire(module, g_world_verified);
     if (g_fire) {
         InstallMoonTurn(module); // (the moonlight wave's crescent, kept turned in flight)
     }
@@ -3284,7 +3302,23 @@ void MoonWaveTail(u8* p) {
     }
 }
 
-void GunLaunchTail(u8* p) {
+void PS4_SYSV_ABI BowRangeLaunch(u8* p, u8* saved_ymm) {
+    if (!p || !Bow::IsArrowProjectile(Read<s32>(p + OffsetPBullet)) ||
+        !Bow::IsBowbladeBehavior(Read<s32>(p + OffsetPBehavior)) ||
+        !Bow::GetBowSettings().enabled || !g_world_verified || g_dry_run) {
+        return;
+    }
+    const u32 owner = Read<u32>(p + OffsetPOwner);
+    const u8* const player = MainPlayer();
+    if (player && owner != 0 && owner != 0xFFFFFFFFu && owner == Read<u32>(player + OffsetHandle)) {
+        // The detour replays the lifetime store after this call. Adjust only xmm0's low lane.
+        const float life = Bow::ArrowFlightLife(Read<float>(saved_ymm));
+        std::memcpy(saved_ymm, &life, sizeof(life));
+    }
+}
+
+void GunLaunchTail(u8* p, u8* saved_ymm) {
+    BowRangeLaunch(p, saved_ymm);
     MoonWaveTail(p);
     // Almost always one atomic read. Only our short, owner-matched 410 -> 411
     // interval reads the projectile. Publish the real chain origin once per cast.

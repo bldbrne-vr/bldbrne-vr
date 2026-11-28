@@ -87,13 +87,7 @@ public:
             !feature.output_height)
             return Result::Failed;
         eyes[eye].last_use = ticket; // Creation failures can still record uploads.
-        // S1 (FAST bit 51, boot-time): the input is the tonemapped frame after the composite.
-        // DLSS 5 keeps HDR + auto exposure: its chain composes in linear light (compose.comp), so
-        // S1 feeds it X decoded through sRGB views (linear 0..1) and encodes its output again
-        // (vk_rasterizer_temporal.cpp VrS1Reconstruct).
-        BbDlssFeature created = feature;
-        if (VR::Graphics::S1Output().width && !neural)
-            created.hdr = 0;
+        const BbDlssFeature created = FeatureForInput(feature);
         if (!api->CreateFeature(eye, command, &created)) {
             failed = true;
             return Result::Failed;
@@ -128,7 +122,8 @@ public:
             return false;
         twin_valid = twin_synced = false;
         twin.last_use = ticket; // Creation failures can still record uploads.
-        if (!api->CreateFeature(TwinView, command, &feature))
+        const BbDlssFeature created = FeatureForInput(feature);
+        if (!api->CreateFeature(TwinView, command, &created))
             return false;
         twin = {true, ticket, ticket};
         twin_valid = true;
@@ -193,6 +188,13 @@ public:
     }
 
 private:
+    BbDlssFeature FeatureForInput(BbDlssFeature feature) const {
+        // S1 feeds tonemapped colour to plain DLSS. The comparison eye must use
+        // the same exposure mode. DLSS 5 takes linear input and retains HDR.
+        if (VR::Graphics::S1Output().width && !neural)
+            feature.hdr = 0;
+        return feature;
+    }
     struct Eye {
         bool created{};
         uint64_t creation{}, last_use{};

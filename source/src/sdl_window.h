@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <span>
 #include <string>
 
@@ -52,12 +53,18 @@ public:
                        std::string_view window_title);
     ~WindowSDL();
 
+    struct PixelSize { s32 width, height; };
+    static_assert(std::atomic<PixelSize>::is_always_lock_free);
+
+    PixelSize GetPixelSize() const {
+        return pixel_size.load(std::memory_order_relaxed);
+    }
     s32 GetWidth() const {
-        return width;
+        return GetPixelSize().width;
     }
 
     s32 GetHeight() const {
-        return height;
+        return GetPixelSize().height;
     }
 
     bool IsOpen() const {
@@ -86,8 +93,8 @@ private:
     void OnGamepadEvent(const SDL_Event* event);
 
 private:
-    s32 width;
-    s32 height;
+    void RefreshPixelSize();
+    std::atomic<PixelSize> pixel_size;
     Input::GameControllers controllers{};
     WindowSystemInfo window_info{};
     SDL_Window* window{};

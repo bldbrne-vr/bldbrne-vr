@@ -53,6 +53,11 @@ constexpr size_t RateInsnEnd = 8;
 constexpr u64 ResistDebugRva = 0x1A5C9D3;
 constexpr std::array<u8, 10> ResistDebugSig = {0x41, 0x8B, 0x54, 0x24, 0x10,
                                                0x41, 0x8B, 0x4C, 0x24, 0x24};
+// AddBuildup's threshold branch: 1 << type, OR into the module's pending status bits.
+constexpr u64 ResistProcRva = 0x1A5C649;
+constexpr std::array<u8, 13> ResistProcSig = {
+    0xB8, 0x01, 0x00, 0x00, 0x00, 0x40, 0x88, 0xF1, 0xD3, 0xE0, 0x09, 0x47, 0x4C,
+};
 // The HUD update's data block: mov rdi, rbx; lea rsi, [rip+disp]; call (0x1F62EA4).
 constexpr u64 HudDataLeaRva = 0x1F62EA4;
 constexpr std::array<u8, 11> HudDataLeaSig = {0x48, 0x89, 0xDF, 0x48, 0x8D, 0x35,
@@ -63,6 +68,9 @@ constexpr size_t HudDataInsnEnd = 10;
 constexpr u64 RowClearRva = 0x1BFBF19;
 constexpr std::array<u8, 10> RowClearSig = {0xC7, 0x80, 0xF8, 0x13, 0x00,
                                             0x00, 0xFF, 0xFF, 0xFF, 0xFF};
+// The row filler stores the icon followed by a byte indicating the active-duration gauge.
+constexpr u64 RowModeRva = 0x1BFC114;
+constexpr std::array<u8, 9> RowModeSig = {0x89, 0x4C, 0x3B, 0xE0, 0x44, 0x88, 0x54, 0x3B, 0xE4};
 // ... and its compaction (the rows' +0x18 / +0x10 qwords moved up).
 constexpr u64 RowMoveRva = 0x1BFC1B8;
 constexpr std::array<u8, 24> RowMoveSig = {
@@ -81,6 +89,10 @@ constexpr u32 OffsetRowIcon = 0x08; // s32, -1 = row off
 constexpr u32 OffsetRowLen = 0x18;  // s32, the bar's length (L %)
 
 bool g_drain_ok = false;
+bool g_proc_ok = false;
+bool g_row_mode_ok = false;
+VR::StatusCorners::Activations g_activations{};
+std::array<VR::StatusCorners::InstantGauge, 2> g_instant_gauges{}; // bleed and frenzy
 const s32* g_rate = nullptr;
 std::atomic<const u8*> g_rows{nullptr};
 D::State g_state{};
@@ -115,6 +127,9 @@ void InstallStatus(VAddr base, u64 size) {
     const bool update_ok = Matches(module, size, ResistUpdateRva, ResistUpdateSig);
     const bool debug_ok = Matches(module, size, ResistDebugRva, ResistDebugSig);
     g_drain_ok = call_ok && update_ok && debug_ok;
+    g_proc_ok = Matches(module, size, ResistProcRva, ResistProcSig);
+    g_activations = {};
+    g_instant_gauges = {};
     s32 rate = D::DefaultRate;
     if (update_ok) {
         const u8* const insn = module + ResistUpdateRva;
@@ -127,6 +142,13 @@ void InstallStatus(VAddr base, u64 size) {
     const bool lea_ok = Matches(module, size, HudDataLeaRva, HudDataLeaSig);
     const bool rows_ok = lea_ok && Matches(module, size, RowClearRva, RowClearSig) &&
                          Matches(module, size, RowMoveRva, RowMoveSig);
+    // The HUD builder indexes the first table by resistance type, then the row filler
+    // indexes the second by message ID minus 6000. Verify both layouts before using icons.
+    constexpr std::array<u8, 10> gauge_ids{0x72, 0x17, 0x71, 0x17, 0x70, 0x17, 0x73, 0x17, 0x74, 0x17};
+    constexpr std::array<u8, 20> gauge_icons{2, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 3, 0, 0, 0};
+    g_row_mode_ok = rows_ok && Matches(module, size, RowModeRva, RowModeSig) &&
+                    Matches(module, size, 0x47332D0, gauge_ids) &&
+                    Matches(module, size, 0x4734C20, gauge_icons);
     const u8* rows = nullptr;
     if (rows_ok) {
         const u8* const insn = module + HudDataLeaRva;
@@ -170,6 +192,14 @@ void StatusSiteA(u8* player) {
         cur[i] = Read<s32>(resist + OffsetResistCur + 4 * i);
         max[i] = Read<s32>(resist + OffsetResistMax + 4 * i);
     }
+    VR::StatusCorners::Reading reading{};
+    static_assert(D::Types == VR::StatusCorners::Beasthood);
+    for (u32 i = 0; i < D::Types; ++i) {
+        reading.buildup[i] = VR::StatusCorners::Buildup(cur[i], max[i]);
+    }
+    const s32 beast_cur = Read<s32>(resist + OffsetResistCur + 4 * D::Types);
+    const s32 beast_max = Read<s32>(resist + OffsetResistMax + 4 * D::Types);
+    reading.buildup.back() = VR::StatusCorners::Buildup(beast_cur, beast_max);
     // VR_TUNE_FILE (tests, core/vr/status_corners.h): status.test_type (0..4) at
     // status.test_build (0..1, 1 takes hold) once per change of the pair: the game's own build-up.
     if (VR::Tune::Active()) {
@@ -183,6 +213,7 @@ void StatusSiteA(u8* player) {
             const s32 top = Read<s32>(resist + OffsetResistMax + 4 * t);
             const s32 want = std::max<s32>(0, static_cast<s32>(std::lround(top * (1.0f - std::min(build, 1.0f)))));
             *reinterpret_cast<s32*>(resist + OffsetResistCur + 4 * t) = want;
+            reading.buildup[t] = VR::StatusCorners::Buildup(want, top);
             LOG_INFO(Core, "VR status: test build-up {} at {:.2f} ({} of {})", VR::StatusCorners::TypeName(int(t)),
                      build, top - want, top);
         }
@@ -190,34 +221,52 @@ void StatusSiteA(u8* player) {
     // The status corners (core/vr/status_corners.h): this update's five build-ups and the game's
     // meter rows (who is on the hunter now), for the presenter's overlay.
     {
-        VR::StatusCorners::Reading reading{};
         reading.steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch()).count();
         reading.valid = true;
-        for (u32 i = 0; i < VR::StatusCorners::Count; ++i) {
-            reading.cur[i] = Read<s32>(resist + OffsetResistCur + 4 * i);
-            reading.max[i] = Read<s32>(resist + OffsetResistMax + 4 * i);
-        }
-        if (const u8* const rows = g_rows.load(std::memory_order_acquire)) {
-            for (u32 i = 0; i < reading.row_icon.size(); ++i) {
-                reading.row_icon[i] = Read<s32>(rows + RowStride * i + OffsetRowIcon);
-                reading.row_len[i] = Read<s32>(rows + RowStride * i + OffsetRowLen);
+        const u8* const rows = g_rows.load(std::memory_order_acquire);
+        static const bool rows_log = std::getenv("VR_STATUS_LOG") != nullptr;
+        if (g_row_mode_ok && rows != nullptr) {
+            for (u32 i = 0; i < C::MaxRows; ++i) {
+                const u64 packed = Read<u64>(rows + RowStride * i + OffsetRowIcon);
+                reading.active_poisons |= VR::StatusCorners::PoisonCountdown(
+                    static_cast<s32>(packed), static_cast<u8>(packed >> 32));
             }
         }
+        const bool same_hunter = g_state.owner == player;
+        const u32 native = g_proc_ok ? Read<u32>(resist + 0x4C) : 0;
+        unsigned instant_resets = 0;
+        for (const auto t : {VR::StatusCorners::Bleed, VR::StatusCorners::Frenzy}) {
+            if (g_instant_gauges[t - VR::StatusCorners::Bleed].Sample(reading.buildup[t], max[t])) {
+                instant_resets |= 1u << t;
+            }
+        }
+        g_activations.Observe(same_hunter, native, reading.active_poisons, reading.steady_ns,
+                              instant_resets);
+        reading.proc_ns = g_activations.times;
         VR::StatusCorners::Channel().Store(reading);
         // VR_STATUS_LOG=1: the meter's rows as they change (which icon is which status).
-        static const bool rows_log = std::getenv("VR_STATUS_LOG") != nullptr;
-        static std::array<s32, 5> logged{-2, -2, -2, -2, -2};
-        if (rows_log && logged != reading.row_icon) {
-            logged = reading.row_icon;
-            LOG_INFO(Core, "VR status: meter rows icon {} {} {} {} {} len {} {} {} {} {} | build-ups "
-                           "{}/{} {}/{} {}/{} {}/{} {}/{}",
-                     logged[0], logged[1], logged[2], logged[3], logged[4], reading.row_len[0],
-                     reading.row_len[1], reading.row_len[2], reading.row_len[3], reading.row_len[4],
-                     reading.max[0] - reading.cur[0], reading.max[0], reading.max[1] - reading.cur[1],
-                     reading.max[1], reading.max[2] - reading.cur[2], reading.max[2],
-                     reading.max[3] - reading.cur[3], reading.max[3], reading.max[4] - reading.cur[4],
-                     reading.max[4]);
+        if (rows_log) {
+            static std::array<s32, C::MaxRows> logged{-2, -2, -2, -2, -2};
+            std::array<s32, C::MaxRows> icons{-1, -1, -1, -1, -1};
+            std::array<s32, C::MaxRows> len{};
+            if (rows != nullptr) {
+                for (u32 i = 0; i < icons.size(); ++i) {
+                    icons[i] = Read<s32>(rows + RowStride * i + OffsetRowIcon);
+                    len[i] = Read<s32>(rows + RowStride * i + OffsetRowLen);
+                }
+            }
+            if (logged != icons) {
+                logged = icons;
+                LOG_INFO(Core, "VR status: meter rows icon {} {} {} {} {} len {} {} {} {} {} | build-ups "
+                               "{}/{} {}/{} {}/{} {}/{} {}/{}",
+                         logged[0], logged[1], logged[2], logged[3], logged[4], len[0], len[1],
+                         len[2], len[3], len[4], max[0] - cur[0], max[0],
+                         max[1] - cur[1], max[1],
+                         max[2] - cur[2], max[2],
+                         max[3] - cur[3], max[3],
+                         beast_max - beast_cur, beast_max);
+            }
         }
     }
     const s32 rate = g_rate != nullptr ? Read<s32>(reinterpret_cast<const u8*>(g_rate))

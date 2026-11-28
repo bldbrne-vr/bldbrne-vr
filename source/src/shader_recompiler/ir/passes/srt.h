@@ -16,6 +16,7 @@ namespace Shader {
 
 using PFN_SrtWalker = void PS4_SYSV_ABI (*)(const u32* /*user_data*/, u32* /*flat_dst*/);
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size);
+bool HandleSrtWalkerFault(void* context, void* fault_address);
 
 struct PersistentSrtInfo {
     // Special case when fetch shader uses step rates.

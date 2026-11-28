@@ -648,7 +648,8 @@ inline bool Build(const std::array<Transform, BoneCount>& local, const FlverRig&
     };
     std::vector<Found> found;
     for (const FlverDummy& x : flver.dummies) {
-        const bool optional = x.ref == DmyIdLeftShield || x.ref == DmyIdLeftGun4 || x.ref == DmyIdRightTwoHandBig;
+        const bool optional = x.ref == DmyIdLeftShield || x.ref == DmyIdLeftGun4 ||
+                              x.ref == DmyIdRightTwoHandBig || x.ref == DmyIdKatanaCase;
         if (!IsBodyDummy(x.ref) && !optional) {
             continue;
         }
@@ -709,6 +710,9 @@ inline bool Build(const std::array<Transform, BoneCount>& local, const FlverRig&
     const auto big_grip = std::find_if(found.begin(), found.end(),
         [](const Found& f) { return f.id == DmyIdRightTwoHandBig; });
     out.right_two_hand_big = big_grip != found.end() ? make(*big_grip) : DummyPoly{};
+    const auto katana = std::find_if(found.begin(), found.end(),
+        [](const Found& f) { return f.id == DmyIdKatanaCase; });
+    out.katana_case = katana != found.end() ? make(*katana) : DummyPoly{};
     std::vector<Found> eyes;
     for (const Found& f : found) {
         if (f.id == DmyIdEye) {

@@ -521,6 +521,11 @@ struct TrackerConfig {
     float max_open{0.6f};        // s
     bool contact_hold{false};   // Cane/Cutter whip: a committed moving chain keeps its attack
     float contact_follow_s{0.25f}; // protect the same multi-enemy sweep after its first hit
+    // A carried window's later lashes (Window::lashes; each pays its stamina, bloodborne_melee.cpp
+    // PayCarriedLashes): a revolution, a crack or a new stroke it takes in, at most one this
+    // often (s). One motion can be both a revolution and a stroke; a spin's revolutions come some
+    // 0.5 s apart (2026-11-20).
+    float carried_lash_gap_s{0.3f};
     float min_interval{0.35f};   // between windows that counted (melee_budget=0 only)
     float merge_s{0.5f};         // a commit this soon after a window that hit stays that window
     float charge_heavy_s{0.36f}; // right trigger held: heavy
@@ -601,6 +606,11 @@ struct Window {
     float since_counted{10.0f}; // from the last window that counted to this one's opening (s)
     bool hit{false};            // the game reported an enemy hit by it
     bool carried{false};       // this attack has followed a contact-held chain
+    // The lashes it carried after its own (TrackerConfig::carried_lash_gap_s): the count, when the
+    // last was counted (tracker clock, s; its opening at first) and the last stroke counted.
+    std::uint16_t lashes{0};
+    float lash_t{0.0f};
+    unsigned lash_stroke{0};
     bool contact_hold{false};  // policy frozen when this window opened
     float hit_t{0.0f};         // first reported enemy contact, on the tracker clock
     const char* why{""};        // how it opened / closed
@@ -642,6 +652,16 @@ struct TrackerOutput {
     bool refunded{false};  // the window's charges came back this frame (aborted, judged light)
     bool miss_refunded{false}; // ... because the swing ended having hit nothing (miss_refund)
 };
+
+enum class PoweredMove { Discharge, CuttingDraw };
+// The Chikage's quick draw stays live at least CuttingDrawS, and on while the draw's own stroke
+// is (a wide cut carried on from the scabbard; the tester, 2026-11-20: "if I take the blade and make
+// a wide swing, then it misses"), up to CuttingDrawMaxS.
+inline constexpr float CuttingDrawS = 0.38f;
+inline constexpr float CuttingDrawMaxS = 0.8f;
+// ... and on while the tip still moves this fast (m/s): the classifier may not call the draw's
+// motion a stroke at all (the 1120j run: six draws, every window shut at 0.39 s).
+inline constexpr float CuttingDrawFollowTip = 2.5f;
 
 class WindowTracker {
 public:
@@ -781,7 +801,11 @@ public:
     TrackerOutput OpenRevolution(const TrackerInput& in, const TrackerConfig& cfg,
                                  const char* why = "a whip revolution") {
         TrackerOutput out{};
-        if (!in.swings || KeepsContactSweep(in, cfg)) {
+        if (!in.swings) {
+            return out;
+        }
+        if (KeepsContactSweep(in, cfg)) {
+            CountCarriedLash(cfg); // a revolution or a crack the carried attack takes in
             return out;
         }
         refund_misses = cfg.budget.miss_refund;
@@ -797,7 +821,8 @@ public:
 
     // A charged mechanism discharged on trigger release. The caller owns charge/cooldown
     // gating; this window still pays the ordinary charged-attack combo and stamina costs.
-    TrackerOutput OpenPowered(const TrackerInput& in, const TrackerConfig& cfg) {
+    TrackerOutput OpenPowered(const TrackerInput& in, const TrackerConfig& cfg,
+                              PoweredMove move = PoweredMove::Discharge) {
         TrackerOutput out{};
         if (!in.swings || in.top != MoveKind::Charged) {
             return out;
@@ -810,7 +835,11 @@ public:
         charge = Charge::Full;
         TrackerInput release = in;
         release.trigger = false;
+        draw_free_ = move == PoweredMove::CuttingDraw;
         Open(release, cfg, out, true, 0, "charged trigger release");
+        draw_free_ = false;
+        powered_move = move;
+        if (move == PoweredMove::CuttingDraw) draw_stroke = std::max(in.stroke, in.fired_stroke);
         w.powered = true;
         charge_used = Charge::None; // a refused discharge never arms a later ordinary swing
         return out;
@@ -836,6 +865,7 @@ public:
     // a hand transform or the bow going up does not renumber the strokes.
     void StrokesRestart() {
         contact_covered_stroke = 0;
+        draw_stroke = 0;
         onset_stroke = 0;
         refused_stroke = 0;
     }
@@ -904,8 +934,18 @@ public:
         if (w.powered) {
             // Give the stationary capsule time to reach the game thread. Motion during this
             // short impulse cannot replace it with a second attack or extend its lifetime.
-            if (w.open && t - w.open_t >= 0.20f) {
-                Close(out, "powered discharge ended");
+            const bool draw = powered_move == PoweredMove::CuttingDraw;
+            // A verdict already consumed during the draw cannot open again. A different
+            // stroke still being measured can qualify once this window has closed.
+            if (draw && w.open && in.fired)
+                draw_stroke = std::max(draw_stroke, in.fired_stroke ? in.fired_stroke : in.stroke);
+            // (The draw 0.32 s until 2026-11-20: its follow-through, the user's misses.)
+            const bool draw_follows =
+                draw && t - w.open_t < CuttingDrawMaxS &&
+                ((in.stroke_live && in.stroke != 0 && in.stroke <= draw_stroke) ||
+                 in.tip_speed >= CuttingDrawFollowTip);
+            if (w.open && t - w.open_t >= (draw ? CuttingDrawS : 0.20f) && !draw_follows) {
+                Close(out, draw ? "the draw's cut ended" : "powered discharge ended");
             }
             if (w.open || out.closed) {
                 out.charge = charge;
@@ -945,6 +985,14 @@ public:
             Close(out, "the game ended its attack");
         }
         const bool keep_contact = KeepsContactSweep(in, cfg);
+        if (keep_contact && in.fired) {
+            // A new stroke the carried attack takes in is a lash of its own (stamina).
+            const unsigned fired = in.fired_stroke != 0 ? in.fired_stroke : in.stroke;
+            if (fired > w.lash_stroke) {
+                w.lash_stroke = fired;
+                CountCarriedLash(cfg);
+            }
+        }
         if (keep_contact) {
             // These strokes belong to the continuing sweep, including a verdict delivered
             // after its grace expires. Classifier IDs increase until StrokesRestart().
@@ -958,8 +1006,8 @@ public:
             }
         }
         const auto covered = [&](unsigned stroke) {
-            return cfg.contact_hold && contact_covered_stroke != 0 &&
-                   stroke <= contact_covered_stroke;
+            return (draw_stroke != 0 && stroke != 0 && stroke <= draw_stroke) ||
+                   (cfg.contact_hold && contact_covered_stroke != 0 && stroke <= contact_covered_stroke);
         };
         // A commit with no window of its own: a new one (the previous stroke's ends). A commit
         // that follows a window which hit, in the same motion (the classifier split it into two
@@ -1052,6 +1100,14 @@ public:
     }
 
 private:
+    // A lash the carried window took in: counted when the last was at least
+    // TrackerConfig::carried_lash_gap_s before (one motion seen as a revolution and a stroke).
+    void CountCarriedLash(const TrackerConfig& cfg) {
+        if (w.open && t - w.lash_t >= cfg.carried_lash_gap_s && w.lashes < 0xFFFF) {
+            ++w.lashes;
+            w.lash_t = t;
+        }
+    }
     bool CarriesContact(const TrackerInput& in, const TrackerConfig& cfg) const {
         return cfg.contact_hold && in.swings && in.chain_motion && w.open && w.committed &&
                !w.powered && !w.flick;
@@ -1120,6 +1176,8 @@ private:
         w = {};
         w.serial = ++serial;
         w.open = true;
+        w.lash_t = t; // (its own lash is paid by its attack: CountCarriedLash counts the later)
+        w.lash_stroke = stroke;
         w.contact_hold = cfg.contact_hold;
         w.committed = committed;
         w.stroke = stroke;
@@ -1191,8 +1249,11 @@ private:
         }
         w.capacity = static_cast<std::uint8_t>(pay.Capacity());
         const int free = pay.Available(now);
-        if (w.flick) {
-            w.left = static_cast<std::uint8_t>(free); // the transform's stroke: free
+        if (w.flick || draw_free_) {
+            // The transform's stroke, and the Chikage's quick draw (its seating in the scabbard
+            // is its pace; the user's run, 2026-11-20 night: two draws within 21 cm and 3 cm of an
+            // enemy refused, "combo budget 1/3"): free.
+            w.left = static_cast<std::uint8_t>(free);
             return;
         }
         // The move the game will open (ChooseMove: no heavier row, the lighter one): its cost. A
@@ -1373,6 +1434,9 @@ private:
     bool w_counted{false};
     float w_peak{0.0f};
     float slow{0.0f};
+    PoweredMove powered_move{PoweredMove::Discharge};
+    bool draw_free_{false}; // (OpenPowered: the quick draw's window is not billed)
+    unsigned draw_stroke{}; // a late classification of the draw cannot spend a second attack
     unsigned onset_stroke{0};
     unsigned contact_covered_stroke{0};
     unsigned refused_stroke{0}; // the stroke the swing detector turned down (0: none)

@@ -18,6 +18,40 @@
 // 5f56ed6a7ca47c37049cbf737a244707a3ecc4d2 (GPL-2.0-or-later).
 namespace VideoCore::TextureMemory {
 
+// AddressFault carries the faulting byte address, but no store width. A page-only
+// fault or a protection change proves no particular byte was written.
+enum class Invalidation { HostWrite, ProtectionChange, AddressFault, PageFault };
+
+// A baseline describes guest bytes, which can differ from what is on the GPU.
+// Force a refresh on a confirmed write, including a rewrite of the same value.
+template <class Image>
+void ForgetWrittenBaselines(Image& image, VAddr addr, size_t size, Invalidation source) {
+    if (size == 0 || (source != Invalidation::HostWrite && source != Invalidation::AddressFault)) {
+        return;
+    }
+    const size_t written_bytes = source == Invalidation::AddressFault ? 1 : size;
+    const VAddr end = addr + written_bytes;
+    for (u32 m = 0; m < image.mip_hashes.size() && m < image.info.mips_layout.size(); ++m) {
+        const u32 bit = 1u << m; // at most 16 levels
+        if ((image.baseline_mips & bit) == 0) {
+            continue;
+        }
+        const auto& mip = image.info.mips_layout[m];
+        const VAddr begin = image.info.guest_address + mip.offset;
+        if (addr < begin + mip.size) {
+            if (end <= begin) {
+                return;
+            }
+            image.mip_hashes[m] = 0;
+            image.baseline_mips &= ~bit;
+            // Guest mip ranges are packed in ascending order by ImageInfo::UpdateSize.
+            if (end <= begin + mip.size) {
+                return;
+            }
+        }
+    }
+}
+
 // bbport's collector: at most 256 visits, counting only actual evictions against the deletion
 // budget. The caller moves skipped images to the back of the LRU, so each pass makes progress.
 template <class Lru, class CanEvict, class Evict>
@@ -199,7 +233,8 @@ private:
 };
 
 // A transition requests four passes, two seconds apart. Only a confirmed map change bypasses
-// the pressure threshold; death, same-map travel and unknown destinations never do.
+// the caller's pressure test; death, same-map travel and unknown destinations never do (the
+// buffer cache's test also passes once its sparse pool is large, for a gentler pass).
 // Freeze the LRU cutoff at the request: textures touched in the destination survive even if
 // briefly off screen. The normal two-second age and GPU/binding checks still apply.
 class TransitionCleanup {

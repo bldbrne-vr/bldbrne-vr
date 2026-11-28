@@ -16,4 +16,9 @@ void WoodsShadowsEbootLoaded();
 // a few casts while a cell of its lattice near him is not known yet).
 void FogLampReachTick(float x, float y, float z);
 
+// The fog's state alone (FogLampReachTick's first part): the menu's Fog row and the fog the
+// hunter's map was loaded with, for a frame without the first-person camera (the game's loop
+// thread, as FogLampReachTick).
+void FogStateFrame();
+
 } // namespace VR::Bloodborne

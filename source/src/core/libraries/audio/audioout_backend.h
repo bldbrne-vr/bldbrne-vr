@@ -13,8 +13,19 @@ public:
     virtual ~PortBackend() = default;
 
     /// Guaranteed to be called in intervals of at least port buffer time,
-    /// with size equal to port buffer size.
+    /// with size equal to port buffer size; unless PacesItself(): then it is called as soon as
+    /// the game writes each buffer, each call followed by Hold().
     virtual void Output(void* ptr) = 0;
+
+    /// True: the port's thread hands each buffer over at once and Hold() keeps the lead (OpenAL
+    /// with audio_lead_ms > 0); false: the thread paces the calls at the buffer period.
+    virtual bool PacesItself() const {
+        return false;
+    }
+
+    /// PacesItself(): after each Output, outside the port's lock (the game's calls on the port
+    /// never wait on it): returns once the queue has room under its lead.
+    virtual void Hold() {}
 
     virtual void SetVolume(const std::array<int, 8>& ch_volumes) = 0;
 };

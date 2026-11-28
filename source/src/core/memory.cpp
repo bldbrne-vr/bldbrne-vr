@@ -116,24 +116,11 @@ MemoryManager::MemoryManager() {
         vma_upper = last->first + last->second.size;
     }
 
-    // Pre-initialize direct backing
-    auto total_size = InitialDirectMemorySize();
-    s32 extra_dmem = EmulatorSettings.GetExtraDmemInMBytes();
-    if (extra_dmem != 0) {
-        total_size += extra_dmem * 1_MB;
-    }
-    s32 extra_fmem = EmulatorSettings.GetExtraFmemInMBytes();
-    if (extra_fmem != 0) {
-        total_size += extra_fmem * 1_MB;
-    }
-    total_direct_size = total_size;
-    dmem_map.clear();
+    // Flexible pages follow direct pages in the same host allocation.
+    total_direct_size = impl.BackingLayout().flexible_offset;
+    total_flexible_size = impl.BackingSizeBytes() - total_direct_size;
     dmem_map.emplace(0, PhysicalMemoryArea{0, total_direct_size});
-
-    // Pre-initialize flexible backing
-    total_flexible_size = ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE + extra_fmem;
-    fmem_map.clear();
-    fmem_map.emplace(total_size, PhysicalMemoryArea{total_size, total_flexible_size});
+    fmem_map.emplace(total_direct_size, PhysicalMemoryArea{total_direct_size, total_flexible_size});
 
     ASSERT_MSG(Libraries::Kernel::sceKernelGetCompiledSdkVersion(&sdk_version) == 0,
                "Failed to get compiled SDK version");
@@ -145,44 +132,66 @@ void MemoryManager::SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1
                                        bool use_extended_mem2) {
     // Calculate actual direct and flexible memory sizes
     const bool is_neo = ::Libraries::Kernel::sceKernelIsNeoMode();
-    auto total_size = is_neo ? ORBIS_KERNEL_TOTAL_MEM_PRO : ORBIS_KERNEL_TOTAL_MEM;
+    s64 total_size = is_neo ? ORBIS_KERNEL_TOTAL_MEM_PRO : ORBIS_KERNEL_TOTAL_MEM;
     if (EmulatorSettings.IsDevKit()) {
         total_size = is_neo ? ORBIS_KERNEL_TOTAL_MEM_DEV_PRO : ORBIS_KERNEL_TOTAL_MEM_DEV;
     }
-    s32 extra_dmem = EmulatorSettings.GetExtraDmemInMBytes();
+    constexpr s64 mib = 1_MB;
+    const s32 extra_dmem = EmulatorSettings.GetExtraDmemInMBytes();
     if (extra_dmem != 0) {
         LOG_WARNING(Kernel_Vmm,
                     "extraDmemInMbytes is {} MB! Old Direct Size: {:#x} -> New Direct Size: {:#x}",
-                    extra_dmem, total_size, total_size + extra_dmem * 1_MB);
-        total_size += extra_dmem * 1_MB;
+                    extra_dmem, total_size, total_size + extra_dmem * mib);
+        total_size += extra_dmem * mib;
     }
-    s32 extra_fmem = EmulatorSettings.GetExtraFmemInMBytes();
+    const s32 extra_fmem = EmulatorSettings.GetExtraFmemInMBytes();
     if (extra_fmem != 0) {
         LOG_WARNING(Kernel_Vmm, "extraFmemInMbytes is {} MB! Old Size: {:#x} -> New Size: {:#x}",
-                    extra_dmem, ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE,
+                    extra_fmem, ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE,
                     ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE + extra_fmem * 1_MB);
-        total_size += extra_fmem * 1_MB;
-        flexible_size += extra_fmem * 1_MB;
     }
     if (!use_extended_mem1 && is_neo) {
-        total_size -= 256_MB;
+        total_size -= 256 * mib;
     }
     if (!use_extended_mem2 && !is_neo) {
-        total_size -= 128_MB;
+        total_size -= 128 * mib;
     }
 
-    // Update stored totals
-    total_flexible_size = flexible_size - ORBIS_KERNEL_FLEXIBLE_MEMORY_BASE;
-    ASSERT_MSG(total_flexible_size >= flexible_usage, "Unable to shrink flexible memory size");
-    u64 old_direct_size = total_direct_size;
-    total_direct_size = total_size - flexible_size;
+    if (total_size < 0 || flexible_size < ORBIS_KERNEL_FLEXIBLE_MEMORY_BASE ||
+        flexible_size > static_cast<u64>(total_size)) {
+        UNREACHABLE_MSG("Invalid guest flexible memory size: {:#x}", flexible_size);
+    }
+    const u64 direct = static_cast<u64>(total_size) - flexible_size;
+    // Extra flexible memory is backed separately and does not reduce the guest direct limit.
+    const s64 adjusted_flexible =
+        static_cast<s64>(flexible_size - ORBIS_KERNEL_FLEXIBLE_MEMORY_BASE) + extra_fmem * mib;
+    if (adjusted_flexible < 0) {
+        UNREACHABLE_MSG("Configured flexible memory is below zero");
+    }
+    const auto flexible = static_cast<u64>(adjusted_flexible);
+    const auto offset = impl.BackingLayout().GuestFlexibleOffset(direct, flexible);
 
-    // Limit direct memory space to match actual limit
-    auto last_dmem_area = FindDmemArea(total_direct_size);
-    ASSERT_MSG(last_dmem_area->second.dma_type == PhysicalMemoryType::Free &&
-                   last_dmem_area->second.size >= old_direct_size - total_direct_size,
-               "Unable to shrink dmem map");
-    last_dmem_area->second.size -= (old_direct_size - total_direct_size);
+    std::scoped_lock lk{mutex, unmap_mutex};
+    if (!offset || direct > total_direct_size || flexible < flexible_usage) {
+        UNREACHABLE_MSG("Guest memory layout cannot fit backing or existing flexible allocations");
+    }
+    // Only the free tail can be returned. A free run at the new limit may have live pages after it.
+    auto& tail = dmem_map.rbegin()->second;
+    if (direct < total_direct_size && (tail.dma_type != PhysicalMemoryType::Free ||
+                                       tail.base > direct || tail.GetEnd() != total_direct_size)) {
+        UNREACHABLE_MSG("Cannot shrink direct memory across a live allocation");
+    }
+
+    const auto old_offset = fmem_map.begin()->first;
+    if (*offset < old_offset) {
+        // Prepend the newly available pages so any early flexible mappings keep their offsets.
+        auto range = fmem_map.emplace_hint(fmem_map.begin(), *offset,
+                                           PhysicalMemoryArea{*offset, old_offset - *offset});
+        MergeAdjacent(fmem_map, range);
+    }
+    tail.size = direct - tail.base;
+    total_direct_size = direct;
+    total_flexible_size = flexible;
 
     LOG_INFO(Kernel_Vmm, "Configured memory regions: flexible size = {:#x}, direct size = {:#x}",
              total_flexible_size, total_direct_size);
@@ -1749,7 +1758,7 @@ s32 MemoryManager::GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPool
 void MemoryManager::InvalidateMemory(const VAddr addr, const u64 size) const {
     Common::MemoryWriteTrace::Event("cpu.invalidate", addr, size);
     if (rasterizer) {
-        rasterizer->InvalidateMemory(addr, size, true); // the emulator's own write
+        rasterizer->InvalidateMemory(addr, size, VideoCore::TextureMemory::Invalidation::HostWrite);
     }
 }
 
@@ -1761,10 +1770,8 @@ void MemoryManager::NoteFreshGpuRange(const VAddr addr, const u64 size) const {
 
 void MemoryManager::InvalidateProtection(const VAddr addr, const u64 size) const {
     if (rasterizer) {
-        // As a write of the whole range (its pages forgotten, none kept aside): keeping the
-        // GPU's bytes of a protection change copied every GPU-written page of the range at once
-        // (the sewers' stutter suspect, 2026-10-15); no ghost-triangle loss came from here.
-        rasterizer->InvalidateMemory(addr, size, true, false);
+        rasterizer->InvalidateMemory(addr, size,
+                                    VideoCore::TextureMemory::Invalidation::ProtectionChange);
     }
 }
 

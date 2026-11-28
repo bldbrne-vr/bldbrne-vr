@@ -7,6 +7,7 @@
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 
 #include <array>
+#include <cmath>
 #include <atomic>
 #include <mutex>
 
@@ -29,6 +30,7 @@ SeqLock<MeleeStatus> g_melee_status;
 SeqLock<MeleeTelegraph> g_melee_telegraph;
 SeqLock<TransformPull> g_transform_pull;
 SeqLock<FurnaceQuench> g_furnace_quench;
+std::atomic<std::int64_t> g_chikage_blood{};
 SeqLock<TransformStatus> g_transform_status;
 SeqLock<BladeShot> g_blade_shot;
 
@@ -198,6 +200,21 @@ void PublishFurnaceQuench(const FurnaceQuench& quench) {
 
 bool LatestFurnaceQuench(FurnaceQuench& out) {
     return g_furnace_quench.Load(out);
+}
+
+void PublishChikageBlood(const ChikageBlood& blood) {
+    g_chikage_blood.store(blood.until_ns, std::memory_order_relaxed);
+}
+
+bool LatestChikageBlood(ChikageBlood& out) {
+    out.until_ns = g_chikage_blood.load(std::memory_order_relaxed);
+    return out.until_ns != 0;
+}
+
+bool SpendChikageBlood(std::int64_t coat, std::int64_t now, float damage) {
+    // An old swing cannot spend a newer coat. Exactly one damaging contact wins.
+    return damage > 0 && std::isfinite(damage) && coat > now &&
+           g_chikage_blood.compare_exchange_strong(coat, 0, std::memory_order_relaxed);
 }
 
 void PublishTransformStatus(const TransformStatus& status) {

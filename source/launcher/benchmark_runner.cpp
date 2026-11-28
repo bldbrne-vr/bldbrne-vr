@@ -428,10 +428,16 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
         bool shared_cache = cache_module && GetProcAddress(cache_module, "BbvrSharedShaderCacheV1");
         if (cache_module) FreeLibrary(cache_module);
         const auto normal_text = Read(q.paths.Config());
-        // The player's frame timing (vr.ini frame_hooks: the hooks by default, 0 = 60 FPS++) is
-        // measured as played: its runs use the same game timing.
-        const auto player_hooks = VR::Ini::ValueOf(Read(q.paths.Ini()), "frame_hooks");
+        // The player's frame timing (vr.ini frame_hooks: the hooks by default, 0 = 60 FPS++) and
+        // picture settings (PictureSettings: shadows, fog, ambient occlusion...) are measured as
+        // played: its runs use the same.
+        const auto player_ini = Read(q.paths.Ini());
+        const auto player_hooks = VR::Ini::ValueOf(player_ini, "frame_hooks");
         const std::string frame_hooks = player_hooks == "0" || player_hooks == "false" ? "0" : "1";
+        report.picture = PictureSettings(player_ini);
+        metadata["picture_settings"] = Json::object();
+        for (const auto &[key, value] : report.picture)
+            metadata["picture_settings"][key] = value;
         const auto normal_config = normal_text.empty() ? Json::object() : Json::parse(normal_text);
         if (normal_config.contains("Vulkan") &&
             normal_config["Vulkan"].value("pipeline_cache_archived", false)) shared_cache = false;
@@ -559,13 +565,17 @@ Report Run(const Request &request, std::atomic_bool &cancel, const Progress &pro
                     p.saves = PathText(isolated.User() / "home");
                     p.fullscreen = false;
                     fs::create_directories(Path(p.saves));
-                    Write(isolated.Ini(),
-                          VR::Ini::ApplyEdits("", {{"graphics_config", GraphicsText(c.graphics)},
-                                                   {"upscale_focus", std::to_string(c.upscale_focus)},
-                                                   {"dlss_model", "builtin"}, // the preset's model
-                                                   {"aa_mode", "smaa"},
-                                                   {"dibr_eye_taa", "0.25"},
-                                                   {"frame_hooks", frame_hooks}}));
+                    std::vector<VR::Ini::Edit> lines;
+                    for (const auto &[key, value] : report.picture)
+                        lines.push_back({key, value});
+                    for (auto line : std::vector<VR::Ini::Edit>{
+                             {"graphics_config", GraphicsText(c.graphics)},
+                             {"dynamic_resolution", "0"}, // measure the candidate at its requested size
+                             {"upscale_focus", std::to_string(c.upscale_focus)},
+                             {"dlss_model", "builtin"}, // the preset's model
+                             {"frame_hooks", frame_hooks}})
+                        lines.push_back(std::move(line));
+                    Write(isolated.Ini(), VR::Ini::ApplyEdits("", lines));
                     // A fresh portable user profile must never invoke migration of the
                     // player's saves.
                     Json users = Json::array();

@@ -18,9 +18,11 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "core/vr/s1_dynamic_resolution.h"
 #include "core/vr/ui_conditions.h"
 #include "core/vr/ui_lock_marker.h"
 #include "core/vr/ui_slots.h"
+#include "core/vr/vr_session.h"
 #include "video_core/host_shaders/vr_ui_resolve_comp.h"
 #include "video_core/renderer_vulkan/vk_gpu_pass_profiler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -362,6 +364,12 @@ VrUiLayer::VrUiLayer(const Instance& instance_, Scheduler& scheduler_)
             continue;
         }
         std::string code = source;
+        // Left-handed play (core/vr/mirror_world.h): the lock-on marker at its mirrored place on
+        // the world-fixed rest (MarkerCompose), as the flipped eyes show its target. Only built
+        // so in such a session: right-handed play compiles the shader as it always was.
+        if (mode == ModeAtlas && VR::MirrorWorld()) {
+            code.insert(line_end + 1, "#define MIRROR_MARKER\n");
+        }
         code.insert(line_end + 1, fmt::format("#define MODE {}\n", mode));
         const vk::ShaderModule module = Compile(code, vk::ShaderStageFlagBits::eCompute, device);
         ASSERT_MSG(module, "Failed to compile vr_ui_resolve.comp (mode {})", mode);
@@ -724,7 +732,7 @@ void VrUiLayer::SnapshotHud(vk::CommandBuffer cmdbuf, const vk::Rect2D& rows) {
 
 bool VrUiLayer::CaptureScene(const RecorderProxy& cmdbuf, vk::Image x, vk::ImageLayout layout,
                              vk::Format x_format, vk::Extent2D x_extent,
-                             const vk::ComponentMapping& comps, u32 layers) {
+                             const vk::ComponentMapping& comps, u32 layers, unsigned drop) {
     scene_valid = false;
     if (!x || x_format == vk::Format::eUndefined || x_extent.width == 0 || x_extent.height == 0) {
         return false;
@@ -835,7 +843,21 @@ bool VrUiLayer::CaptureScene(const RecorderProxy& cmdbuf, vk::Image x, vk::Image
         .dstOffset = {},
         .extent = {.width = x_extent.width, .height = x_extent.height, .depth = 1},
     };
-    cmdbuf.copyImage(x, layout, scene.image, vk::ImageLayout::eTransferDstOptimal, region);
+    if (drop) {
+        const auto w = static_cast<s32>(x_extent.width), h = static_cast<s32>(x_extent.height);
+        const auto mx = static_cast<s32>(S1Drs::Margin(x_extent.width, drop));
+        const auto my = static_cast<s32>(S1Drs::Margin(x_extent.height, drop));
+        const vk::ImageBlit blit{
+            .srcSubresource = copy_layers,
+            .srcOffsets = std::array{vk::Offset3D{mx, my, 0}, vk::Offset3D{w - mx, h - my, 1}},
+            .dstSubresource = copy_layers,
+            .dstOffsets = std::array{vk::Offset3D{}, vk::Offset3D{w, h, 1}},
+        };
+        cmdbuf.blitImage(x, layout, scene.image, vk::ImageLayout::eTransferDstOptimal, blit,
+                         vk::Filter::eLinear);
+    } else {
+        cmdbuf.copyImage(x, layout, scene.image, vk::ImageLayout::eTransferDstOptimal, region);
+    }
     ImageBarrier(cmdbuf, scene.image, vk::ImageLayout::eTransferDstOptimal,
                  vk::ImageLayout::eShaderReadOnlyOptimal, vk::PipelineStageFlagBits2::eTransfer,
                  vk::AccessFlagBits2::eTransferWrite,

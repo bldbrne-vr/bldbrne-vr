@@ -32,7 +32,7 @@
 //    bit does nothing).
 // Off: the scheduler compares RenderStates with memcmp.
 //
-// FAST_GPU_READ_BARRIERS=1 (off by default; GPU synchronization only, read once at start-up): the
+// FAST_GPU_READ_BARRIERS (enabled by default, set to 0 to disable): the
 // old part 4, reconciled with bit 44. After anything else, the first read of a buffer gets one
 // barrier from every earlier command and write to every read access at every stage, and later
 // reads of any kind need none until the next write request: the old code issued a barrier, and so
@@ -41,8 +41,7 @@
 // read excluded from it after that state (a buffer that came to hold image data, a copy's source).
 // The logic, the argument and the exclusions: buffer_cache/read_barrier_logic.h; the step:
 // Buffer::GetBarrierReads (buffer.cpp); bits 33/44 (BufferCache::ObtainSmallDirect) bind a small
-// shader read in place in that state too. Off: Buffer::GetBarrier is the old code. Check it with
-// the Khronos synchronization validation before making it a default.
+// shader read in place in that state too. Setting it to 0 restores the original barriers.
 // FAST_GPU_READ_BARRIERS_VERIFY=1 (turns the switch on): the old step runs too, on its own copy of
 // each buffer's state; the barrier recorded does what both do (merged), so the GPU gets at least
 // the old synchronization; every request is compared (ReadBarrierLogic::Check): no barrier where
@@ -106,8 +105,7 @@ inline const bool g_read_barriers_verify = [] {
 }();
 inline const bool g_read_barriers = [] {
     const char* value = std::getenv("FAST_GPU_READ_BARRIERS");
-    const char* verify = std::getenv("FAST_GPU_READ_BARRIERS_VERIFY");
-    return (value != nullptr && value[0] == '1') || (verify != nullptr && verify[0] == '1');
+    return value == nullptr || value[0] == '1' || g_read_barriers_verify;
 }();
 
 inline u64 VerifyEvery() {

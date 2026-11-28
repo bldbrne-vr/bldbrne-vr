@@ -161,6 +161,18 @@ struct Found {
     u64 effect_at; // where its id is in the file
 };
 
+// A place whose fog stays the game's own, whatever the kinds taken over (2026-11-20:
+// "in the blood starved beast arena can we disable our fog patches and let the game use its
+// default?"): the church the Blood-starved Beast waits in, Old Yharnam (m23_00, map 0x1700). Its
+// gate is at (-87.7, -126.4, 13.5) and its torches run from x -85 to -120, z 10 to 42; inside:
+// "SFX_霧_ボス部屋" ("fog, boss room", 923012, at (-115.5, -126.2, 36.9)), the one we took, and
+// two distant-view fogs under its roof. The box holds no other fog of the map (the nearest
+// outside it: a lower ground fog 12 m from the gate at x -72). `map`: its area and block
+// (0x1700 = m23_00).
+inline bool GamesOwn(u16 map, const Emitter& e) {
+    return map == 0x1700 && e.x > -125.0f && e.x < -86.0f && e.y > -131.0f && e.y < -95.0f && e.z > 4.0f && e.z < 49.0f;
+}
+
 // The lingering fog effects of the map with their places. False: not a map file it understands.
 inline bool Find(std::span<const u8> msb, std::vector<Found>& out) {
     std::vector<u64> events, points;

@@ -50,6 +50,8 @@ struct HeldGate {
     VR::Body::AnimClass owner{VR::Body::AnimClass::Unknown};
     bool held{false};
     bool blood_bullet_vial{false}; // exact 100141 clip, its native item window open
+    bool tonitrus_equipped{};
+    bool tonitrus_interrupted{};
 };
 
 // The body's pose-copy wrapper, main player only (loop thread), every update.
@@ -82,10 +84,16 @@ struct HeldGripState {
 [[nodiscard]] HeldGripState HeldGrip();
 [[nodiscard]] u8 HeldGripKind();
 
+// Last evaluated pose holding the scabbard in the left hand, or zero on release.
+void SetScabbardHand(s64 pose_ns);
+
 // One part (0-3) of the right weapon hidden for this update (the music box's byte, ChrAsm +0x26C:
 // the weapon update reads it and the ChrAsm update resets it, so it is written every update before
 // the weapon update: the pose copy). False when the hide sites did not match (core/vr/bow.h: the
 // Bowblade's own arrow on the string hand while the real bow is out).
 bool HideRightWeaponPart(u8* chr, u32 part);
+// Tests: the right weapon's four part bytes as they are now (part 0 in the low byte; 0xFE the
+// game's own choice, 0xFF hidden), 0 when unknown.
+u32 RightWeaponPartBytes(const u8* chr);
 
 } // namespace VR::Bloodborne

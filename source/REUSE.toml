@@ -144,7 +144,10 @@ path = [
     "src/resources/vr/poison_knife.dds",
     "src/resources/vr/shaman_blade.dds",
     "src/resources/vr/tool_empty.pcm",
+    "src/resources/vr/chikage_scabbard.dds",
     "launcher/assets/theme/*",
+    "assets/voice/*.mp3",
+    "assets/voice/dry/*.mp3",
 ]
 SPDX-FileCopyrightText = "2026 BB-VR contributors"
 SPDX-License-Identifier = "AGPL-3.0-or-later"

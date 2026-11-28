@@ -26,7 +26,17 @@
 // meters, radians, seconds; the stick is +x right, +y forward.
 namespace VR::Lean {
 
+// The early lean (Config::early_hold_s > 0; lean i-frames): the same speed held EarlyHoldS with
+// EarlyDistM of travel, through the same gates, is Output::early, once per lean, before the full
+// lean's fire: a short grant at once (EarlyMs), which the full lean extends (the user,
+// 2026-11-20: "register sooner ... shorter invincibility and extend it if we lean more").
+inline constexpr float EarlyHoldS = 0.030f;
+inline constexpr float EarlyDistM = 0.05f;
+inline constexpr unsigned EarlyMs = 100; // (120 for one build; the tester: "100ms")
+
 struct Config {
+    float early_hold_s{0.0f};    // the early lean (0: none)
+    float early_dist_m{EarlyDistM};
     float speed{1.3f};           // m/s, headset horizontal speed ...
     float hold_s{0.080f};        // ... held this long
     float dist_m{0.15f};         // horizontal travel ...
@@ -51,6 +61,7 @@ struct Input {
 };
 
 struct Output {
+    bool early{false}; // the early lean (Config::early_hold_s), once per lean, before `fire`
     bool fire{false};
     float stick_x{}, stick_y{}; // fire: unit stick direction (+y = view forward)
     // A lean that reached the speed for `hold_s` but ended without a dodge: the last gate that
@@ -124,7 +135,10 @@ public:
         if (fast_since < 0.0) {
             fast_since = in.t;
         }
-        if (fired || in.t - fast_since < cfg.hold_s) {
+        const bool full_time = in.t - fast_since >= cfg.hold_s;
+        const bool early_time = cfg.early_hold_s > 0.0f && !early_fired &&
+                                in.t - fast_since >= cfg.early_hold_s;
+        if (fired || (!full_time && !early_time)) {
             return out;
         }
 
@@ -157,6 +171,21 @@ public:
         out.angle_deg = angle;
         candidate = out;
 
+        // The early lean: everything but the full lean's hold and distance (its own, shorter).
+        if (early_time && !early_fired && dist >= cfg.early_dist_m && yaw_rate < cfg.max_yaw_rate &&
+            std::abs(in.look_x) < cfg.stick_dead && std::abs(in.look_y) < cfg.stick_dead &&
+            !in.swing && !in.circle_held && in.t - last_fire >= cfg.cooldown_s &&
+            std::abs(angle) >= cfg.forward_deg) {
+            early_fired = true;
+            last_fire = in.t; // (its cooldown; the full lean of the same lean still extends it)
+            out.early = true;
+            out.stick_x = sx;
+            out.stick_y = sy;
+            return out;
+        }
+        if (!full_time) {
+            return out;
+        }
         const char* refused = nullptr;
         if (dist < cfg.dist_m) {
             refused = "distance";
@@ -168,7 +197,7 @@ public:
             refused = "swing";
         } else if (in.circle_held) {
             refused = "circle";
-        } else if (in.t - last_fire < cfg.cooldown_s) {
+        } else if (in.t - last_fire < cfg.cooldown_s && !early_fired) {
             refused = "cooldown";
         } else if (std::abs(angle) < cfg.forward_deg) {
             refused = "forward";
@@ -205,6 +234,7 @@ private:
         }
         fast_since = -1.0;
         fired = false;
+        early_fired = false;
         rejected = nullptr;
     }
 
@@ -216,6 +246,7 @@ private:
     float yaw_rate{0.0f};
     double fast_since{-1.0};
     bool fired{false};
+    bool early_fired{false}; // this lean's early one (Config::early_hold_s)
     const char* rejected{nullptr};
     Output candidate{};
     double last_fire{-1e9};
@@ -229,8 +260,9 @@ private:
 // cooldown is the lean i-frames' own (lean_iframes_cooldown_ms), shared by both.
 struct DuckConfig {
     // m/s down, on average over ... (1.0 until 2026-10-27: bending to look low fired it, the
-    // user's "fires too easily"; vr.ini duck_speed)
-    float speed{1.3f};
+    // user's "fires too easily"; then 1.3 until 2026-11-20, "a tiny tiny bit easier to trigger";
+    // vr.ini duck_speed)
+    float speed{1.27f};
     float hold_s{0.060f};   // ... this long
     float dist_m{0.18f};    // below the highest point ... (15 cm until 2026-10-26: the user's 18)
     float window_s{0.250f}; // ... within this window

@@ -88,6 +88,44 @@ inline constexpr std::array<Glyph, 13> Glyphs{{
     {u"KG_Start", Shape::Menu, ""},   // OPTIONS: the Menu button (≡); stays last (the tests)
 }};
 
+// Left-handed play (core/vr/mirror_world.h): the controllers trade hands at the bindings, so each
+// of these buttons comes from the other hand's control (the game-menu branch's slots are the
+// mirror's): cross from X, circle from Y, square from the right grip, triangle from the left, L1
+// from the right trigger, R1 from the left, the stick clicks from the other stick, the touchpad
+// from A. Its own inverse; anything else (Menu's) is left as it is.
+constexpr const char* MirroredLetters(const char* text) {
+    constexpr std::array<std::array<const char*, 2>, 10> Pairs{{
+        {"A", "X"},
+        {"X", "A"},
+        {"B", "Y"},
+        {"Y", "B"},
+        {"LG", "RG"},
+        {"RG", "LG"},
+        {"LT", "RT"},
+        {"RT", "LT"},
+        {"LS", "RS"},
+        {"RS", "LS"},
+    }};
+    if (text == nullptr) {
+        return text;
+    }
+    for (const auto& pair : Pairs) {
+        if (std::string_view{text} == pair[0]) {
+            return pair[1];
+        }
+    }
+    return text;
+}
+
+// Glyphs with the letters where your hands press them in left-handed play (the same pictures).
+inline constexpr std::array<Glyph, Glyphs.size()> MirroredGlyphs = [] {
+    std::array<Glyph, Glyphs.size()> out = Glyphs;
+    for (Glyph& g : out) {
+        g.text = MirroredLetters(g.text);
+    }
+    return out;
+}();
+
 // An Xbox pad's buttons instead (a gamepad play style with an Xbox or other non-PlayStation pad
 // connected at the start: bloodborne_vrtile.cpp): the face buttons' letters in the Xbox colours, the
 // bumpers, triggers and stick clicks in the game's own gold (its L1 / L3), so they sit with its
@@ -678,7 +716,7 @@ inline Glyph XboxHudGlyph(const HudGlyph& h) {
 // those blocks keep the game's texels): the gameplay layout's buttons (`swap`: swap_sticks), or with
 // `xbox` an Xbox pad's. `written` counts them; the returned text lists what was refused ("" = all).
 inline std::string ApplyHud(std::span<u8> tpf, const GameText::GameFont* font, bool swap,
-                            int& written, bool xbox = false) {
+                            int& written, bool xbox = false, bool mirror = false) {
     written = 0;
     std::string why;
     const auto refuse = [&why](const HudGlyph& h, const char* reason) {
@@ -699,8 +737,10 @@ inline std::string ApplyHud(std::span<u8> tpf, const GameText::GameFont* font, b
             refuse(h, "not the HUD's BC7 atlas");
             continue;
         }
+        // (`mirror`: left-handed play, the button where your hand presses it.)
         const Glyph g = xbox ? XboxHudGlyph(h)
-                             : Glyph{h.texture, Shape::Disc, Thumbs::LabelFor(h.logical, swap)};
+                             : Glyph{h.texture, Shape::Disc,
+                                     Thumbs::LabelFor(h.logical, swap, mirror)};
         // The game's discs fill their cells: ours too (26 texels across in a 32-texel icon).
         const std::vector<u8> badge =
             Draw(g, font, static_cast<int>(h.size), (static_cast<float>(h.size) - 0.5f) / 26.0f);

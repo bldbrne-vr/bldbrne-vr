@@ -4,6 +4,9 @@
 #include <bit>
 #include <fstream>
 #include <vk_mem_alloc.h>
+#include <xxhash.h>
+#include "core/vr/dual_blades.h"
+#include "core/vr/honed_steel.h"
 #include "video_core/native_stereo/draw_memory.h"
 #include "video_core/native_stereo/draw_registers.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -566,6 +569,17 @@ struct CapeState {
     // his parts' draws stand exactly there. Without it the camera's column decides.
     bool has_player{};
     VR::Vec3 player{};
+    VR::Chikage::BladeClip blade_clip{};
+    VR::Vec3 blade_grip{};
+    std::array<u32, 2> honed{}; // This frame's per-hand strength and band position.
+    bool any_honed{};
+    struct BladeIndex {
+        VAddr address{};
+        u64 edge{};
+        u32 index_width{};
+        bool matches{};
+    };
+    std::array<BladeIndex, VR::Chikage::BladeFace::Count> blade_indices{};
     u64 record_id{}; // this frame's camera record (VR::RecordPlayerBones)
     // His bones this frame (VR::RecordPlayerBones, fetched by the first tilted piece near him)
     // and their bind points (C0000::Active()'s reference pose, once): a rigid piece is his only
@@ -845,6 +859,7 @@ bool VertexCentre(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs, u3
 // Once per frame: is this a first-person VR frame (the camera placed by the headset in the
 // hunter's head), and if not, why (for the switch lines).
 bool FirstPersonFrame(CapeState& cs) {
+    cs.blade_clip = {};
     if (!VR::IsFirstPerson()) {
         cs.boost.CancelLadder(VR::Body::SteadyNowNs());
         cs.reason = "third person";
@@ -876,6 +891,8 @@ bool FirstPersonFrame(CapeState& cs) {
         cs.reason = "game camera";
         return false;
     }
+    cs.blade_clip = rec.scabbard_clip;
+    cs.blade_grip = rec.scabbard_grip;
     cs.camera = rec.render_position;
     cs.units_per_m = rec.world_scale > 0.0f ? rec.world_scale : 1.0f;
     cs.has_player = rec.has_player_position;
@@ -883,6 +900,32 @@ bool FirstPersonFrame(CapeState& cs) {
     cs.record_id = rec.id;
     cs.reason = "";
     return true;
+}
+
+void LoadPlayerBones(CapeState& cs) {
+    if (cs.bones_frame != cs.frame_no) {
+        cs.bones_frame = cs.frame_no;
+        cs.has_bones = false;
+        if (!cs.has_bind) {
+            if (const auto* sk = VR::Body::C0000::Active()) {
+                for (int b = 0; b < VR::PlayerBoneCount; ++b) {
+                    for (int i = 0; i < 3; ++i) {
+                        cs.bind[b][i] = sk->model[b].t[i];
+                    }
+                }
+                cs.has_bind = true;
+            }
+        }
+        std::array<VR::Vec3, VR::PlayerBoneCount> bones;
+        if (cs.has_bind && VR::RecordPlayerBones(cs.record_id, bones)) {
+            for (int b = 0; b < VR::PlayerBoneCount; ++b) {
+                cs.bones[b][0] = bones[b].x;
+                cs.bones[b][1] = bones[b].y;
+                cs.bones[b][2] = bones[b].z;
+            }
+            cs.has_bones = true;
+        }
+    }
 }
 
 bool CapeEnabled(const CapeState& cs, const Inspector& insp) {
@@ -1010,6 +1053,21 @@ bool Rasterizer::VrCapeSkip(const GraphicsPipeline* pipeline, u32 index_offset) 
         cs.frame_checked = true;
         const bool first_person = FirstPersonFrame(cs);
         cs.monocular_eye = first_person ? VR::DrawFrameRecord().monocular_eye : -1;
+        cs.honed = {};
+        VR::DualBlades::Shine shine{};
+        if (first_person && VR::DualBlades::ShineChannel().Load(shine) &&
+            (shine.honed_ns[0] || shine.honed_ns[1])) {
+            const auto now = VR::Body::SteadyNowNs();
+            for (int hand = 0; hand < 2; ++hand) {
+                const auto look = VR::DualBlades::LookOf(shine, hand, now);
+                if (!look.Any()) continue;
+                const u32 line = u32(std::clamp(look.line, 0.f, 1.f) * 255.f + .5f);
+                const u32 band = look.glint < 0.f || look.glint > 1.f ? 255u
+                                     : u32(look.glint * 254.f + .5f);
+                cs.honed[hand] = Shader::VrCut::Hone | (line << 16) | (band << 24);
+            }
+        }
+        cs.any_honed = (cs.honed[0] | cs.honed[1]) != 0;
         cs.frame_on = first_person && CapeEnabled(cs, Insp());
         VR::Holsters::Targets pouch{};
         cs.pouch_on = first_person && VR::GetSettings().inject &&
@@ -1090,7 +1148,7 @@ bool Rasterizer::VrCapeSkip(const GraphicsPipeline* pipeline, u32 index_offset) 
                            Shader::Optimization::BodyShadow::MapsEnabled() && vr_body_maps &&
                            vr_body_maps->Ready();
     if (!cs.frame_on && cs.cut_code == 0 && !cs.head_on && !cs.hands_on && !cs.pouch_on &&
-        cs.monocular_eye < 0 && !body_maps) {
+        cs.monocular_eye < 0 && !body_maps && !cs.blade_clip.normal && !cs.any_honed) {
         return false;
     }
     // The main player: the model standing under the first-person camera (an NPC or another hunter
@@ -1105,6 +1163,110 @@ bool Rasterizer::VrCapeSkip(const GraphicsPipeline* pipeline, u32 index_offset) 
     const float dx = (object.x - cs.camera.x) / cs.units_per_m;
     const float dz = (object.z - cs.camera.z) / cs.units_per_m;
     const float up = (cs.camera.y - object.y) / cs.units_per_m;
+    // Check only the local hunter's blade, only during a latch. The weapon draw can
+    // stand at its grip or use the player's skinned root. A nearby NPC may use the same mesh.
+    if (cs.blade_clip.normal && instance.IsShaderClipDistanceSupported()) {
+        const auto& r = std::as_const(ScratchDraw::Registers(liverpool));
+        const auto near = [&](VR::Vec3 p) {
+            const float x = object.x-p.x, y = object.y-p.y, z = object.z-p.z;
+            const float tol = 0.035f * cs.units_per_m;
+            return x*x+y*y+z*z <= tol*tol;
+        };
+        const auto face = VR::Chikage::FindBladeFace(r.num_indices);
+        const u64 expected = face.hash;
+        if (expected && (near(cs.blade_grip) || (cs.has_player && upright && near(cs.player))) && !r.IsClipDisabled() &&
+            !r.vs_output_control.clip_distance_enable && !r.vs_output_control.cull_distance_enable &&
+            !r.clipper_control.user_clip_plane_enable &&
+            r.num_instances.NumInstances() == 1 &&
+            !r.stage_enable.IsStageEnabled(u32(Shader::Stage::Geometry)) &&
+            !r.stage_enable.IsStageEnabled(u32(Shader::Stage::Local))) {
+            const u32 n = r.num_indices;
+            const u32 bytes_per_index = r.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2 : 4;
+            const VAddr addr = r.index_base_address.Address<VAddr>() + VAddr(index_offset) * bytes_per_index;
+            const u64 bytes = u64(n) * bytes_per_index;
+            const bool matches = memory->InspectReadableRange(addr, bytes, [&](std::span<const u8> data) {
+                const u64 check = EdgeHash(data.data(), data.size());
+                // Keep the blade lookup separate from the armour cache's classification.
+                auto& cached = cs.blade_indices[face.slot];
+                if (cached.address != addr || cached.index_width != bytes_per_index || cached.edge != check) {
+                    cached = {addr, check, bytes_per_index, Fnv1a(data.data(), data.size()) == expected};
+                }
+                return cached.matches;
+            });
+            if (matches && pipeline->GetFetchShader()) {
+                const auto& vs = pipeline->GetStage(Shader::LogicalStage::Vertex);
+                if (vs.stores.GetAny(Shader::IR::Attribute::ClipDistance) ||
+                    vs.stores.GetAny(Shader::IR::Attribute::CullDistance)) return false;
+                for (const auto& attr : pipeline->GetFetchShader()->attributes) {
+                    if (attr.semantic != 0 || attr.GetStepRate() != Shader::Gcn::VertexAttribute::None) continue;
+                    const auto b = attr.GetSharp(vs);
+                    if ((b.GetDataFmt() == AmdGpu::DataFormat::Format32_32_32 ||
+                         b.GetDataFmt() == AmdGpu::DataFormat::Format32_32_32_32) &&
+                        b.GetNumberFmt() == AmdGpu::NumberFormat::Float) {
+                        cs.cut_request = Shader::VrCut::BladeMouth;
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    // Split weapons stand at the grip dummy. The armor test below uses a bind-pose
+    // correction and would reject the native weapon. Match the hand in this camera
+    // record and verify the index bytes before changing its material.
+    if (cs.any_honed && cs.has_player &&
+        cs.monocular_eye < 0 && (pipeline->GetGraphicsKey().mrt_mask & 0x1fu) == 0x1fu) {
+        const auto& regs = std::as_const(ScratchDraw::Registers(liverpool));
+        const auto face = VR::HonedSteel::Find(regs.num_indices);
+        if (face.hash && cs.honed[face.part & 1u] &&
+            regs.primitive_type == AmdGpu::PrimitiveType::TriangleList &&
+            regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 &&
+            regs.num_instances.NumInstances() == 1 && !regs.IsClipDisabled() &&
+            !regs.vs_output_control.clip_distance_enable && !regs.vs_output_control.cull_distance_enable &&
+            !regs.clipper_control.user_clip_plane_enable &&
+            !regs.stage_enable.IsStageEnabled(u32(Shader::Stage::Geometry)) &&
+            !regs.stage_enable.IsStageEnabled(u32(Shader::Stage::Local)) && pipeline->GetFetchShader()) {
+            LoadPlayerBones(cs);
+            const auto hand = face.part & 1u;
+            const auto bone = hand ? VR::Body::C0000::R_Weapon : VR::Body::C0000::L_Weapon;
+            const auto& grip = cs.bones[bone];
+            const float x = object.x - cs.player.x;
+            const float y = object.y - cs.player.y;
+            const float z = object.z - cs.player.z;
+            const float tolerance = .035f * cs.units_per_m;
+            const float gx = x - grip[0], gy = y - grip[1], gz = z - grip[2];
+            const float tolerance_sq = tolerance * tolerance;
+            const bool at_grip = cs.has_bones && gx * gx + gy * gy + gz * gz <= tolerance_sq;
+            const bool at_root = upright && x * x + y * y + z * z <= tolerance_sq;
+            const auto& vs = pipeline->GetStage(Shader::LogicalStage::Vertex);
+            const u32 loc = Shader::VrCut::HoneLocation;
+            bool free = !vs.stores.GetAny(Shader::IR::Attribute::Param0 + loc) &&
+                        !vs.stores.GetAny(Shader::IR::Attribute::Param0 + (loc - 1)) &&
+                        regs.num_interp <= std::size(regs.ps_inputs);
+            for (u32 i = 0; free && i < regs.num_interp; ++i) {
+                const u32 slot = regs.ps_inputs[i].input_offset;
+                free = slot != loc && slot + 1 != loc;
+            }
+            const VAddr base = regs.index_base_address.Address<VAddr>();
+            const u64 offset = u64(index_offset) * sizeof(u16);
+            const u64 bytes = u64(regs.num_indices) * sizeof(u16);
+            if ((at_grip || at_root) && free && base <= std::numeric_limits<VAddr>::max() - offset - bytes &&
+                memory->InspectReadableRange(base + offset, bytes, [&](std::span<const u8> data) {
+                    return data.size() == bytes && face.Matches(XXH3_64bits(data.data(), data.size()));
+                })) {
+                for (const auto& attr : pipeline->GetFetchShader()->attributes) {
+                    if (attr.semantic != 0 || attr.num_elements < 2 ||
+                        attr.GetStepRate() != Shader::Gcn::VertexAttribute::None) continue;
+                    const auto b = attr.GetSharp(vs);
+                    if ((b.GetDataFmt() == AmdGpu::DataFormat::Format32_32_32 ||
+                         b.GetDataFmt() == AmdGpu::DataFormat::Format32_32_32_32) &&
+                         b.GetNumberFmt() == AmdGpu::NumberFormat::Float) {
+                        cs.cut_request = cs.honed[face.part & 1u] | face.part;
+                        return false;
+                    }
+                }
+            }
+        }
+    }
     if (cs.has_player) {
         // His skinned parts stand exactly at his origin, a hunter NPC next to him at its own; a
         // rigid piece on one of his bones (a bracer, a hat) is tilted and near him
@@ -1153,29 +1315,7 @@ bool Rasterizer::VrCapeSkip(const GraphicsPipeline* pipeline, u32 index_offset) 
                     break;
                 }
             }
-            if (his && cs.bones_frame != cs.frame_no) {
-                cs.bones_frame = cs.frame_no;
-                cs.has_bones = false;
-                if (!cs.has_bind) {
-                    if (const auto* sk = VR::Body::C0000::Active()) {
-                        for (int b = 0; b < VR::PlayerBoneCount; ++b) {
-                            for (int i = 0; i < 3; ++i) {
-                                cs.bind[b][i] = sk->model[b].t[i];
-                            }
-                        }
-                        cs.has_bind = true;
-                    }
-                }
-                std::array<VR::Vec3, VR::PlayerBoneCount> bones;
-                if (cs.has_bind && VR::RecordPlayerBones(cs.record_id, bones)) {
-                    for (int b = 0; b < VR::PlayerBoneCount; ++b) {
-                        cs.bones[b][0] = bones[b].x;
-                        cs.bones[b][1] = bones[b].y;
-                        cs.bones[b][2] = bones[b].z;
-                    }
-                    cs.has_bones = true;
-                }
-            }
+            if (his) LoadPlayerBones(cs);
             if (his && cs.has_bones) {
                 const float rel[3] = {object.x - cs.player.x, object.y - cs.player.y,
                                       object.z - cs.player.z};
@@ -1824,15 +1964,17 @@ bool Rasterizer::PrepareVrDraw(const GraphicsPipeline*& pipeline, bool indexed, 
     producer_vr.hands_split = cs.hands_split;
     producer_vr.hands_split_count = cs.hands_split_count;
     producer_vr.cut_code = cut;
+    if (cut == Shader::VrCut::BladeMouth) producer_vr.blade_clip = cs.blade_clip;
     producer_vr.free_eye_cut = Shader::VrCut::MonocularEye(cut) >= 0 ? cs.monocular_free_cut : 0;
     return true;
 }
 
 const GraphicsPipeline* Rasterizer::ReselectVrCut(const GraphicsPipeline* pipeline) {
-    if (!recording_vr.cut_code || !pipeline->GetGraphicsKey().mrt_mask)
+    const bool blade = recording_vr.cut_code == Shader::VrCut::BladeMouth;
+    if (!pipeline || !recording_vr.cut_code || (!pipeline->GetGraphicsKey().mrt_mask && !blade))
         return pipeline;
-    // Bit 40: null while the cut variant of the reselected pipeline compiles (never waited for).
-    const auto* cut = pipeline_cache.GetVrCutPipeline(pipeline, recording_vr.cut_code, false);
+    // For a blade the two eyes and the depth pass must agree from the first clipped frame.
+    const auto* cut = pipeline_cache.GetVrCutPipeline(pipeline, recording_vr.cut_code, blade);
     if (recording_vr.body_split) {
         // Null: the cut ranges go uncut, never with Stage A's cut pipeline of the other view mask.
         recording_vr.body_cut_pipeline = cut;
@@ -1850,7 +1992,7 @@ const GraphicsPipeline* Rasterizer::VrCutPipeline(const GraphicsPipeline* pipeli
     cs.body_cut_pipeline = nullptr;
     // Only colour passes from the camera (the G-buffer): the shadow cascades and other
     // depth-only passes keep the whole body (an invisible coat would cast no shadow).
-    if (cut == 0 || pipeline == nullptr || pipeline->GetGraphicsKey().mrt_mask == 0) {
+    if (cut == 0 || pipeline == nullptr || (pipeline->GetGraphicsKey().mrt_mask == 0 && cut != Shader::VrCut::BladeMouth)) {
         // Fast bit 40 with VrPushData: the body's one cut variant compiles in the background
         // from its first colour draw, before the cutaway first asks for it.
         if (cut == 0 && ahead != 0 && pipeline != nullptr &&
@@ -1862,7 +2004,7 @@ const GraphicsPipeline* Rasterizer::VrCutPipeline(const GraphicsPipeline* pipeli
     }
     // Bit 40: null while it compiles in the background; the body is drawn uncut meanwhile (and
     // VrDrawCapeSplit draws its cut ranges with the draw's own pipeline).
-    const GraphicsPipeline* cut_pipeline = pipeline_cache.GetVrCutPipeline(pipeline, cut, false);
+    const GraphicsPipeline* cut_pipeline = pipeline_cache.GetVrCutPipeline(pipeline, cut, cut == Shader::VrCut::BladeMouth);
     if (cut_pipeline == nullptr) {
         return pipeline;
     }
@@ -1871,7 +2013,7 @@ const GraphicsPipeline* Rasterizer::VrCutPipeline(const GraphicsPipeline* pipeli
     // Each is built once (a map lookup after that). Fast bit 40: their pipelines compile in the
     // background (their shader permutations still here); GetVrCutPipeline installs them.
     // VrPushData: there are no others (every cut is this variant, the draw pushes its radii).
-    if (!pipeline_cache.UsesVrPushData()) {
+    if (cut != Shader::VrCut::BladeMouth && !Shader::VrCut::IsHone(cut) && !pipeline_cache.UsesVrPushData()) {
         const bool background = FastRender::On(AsyncPipelinesBit);
         for (const u32 other : cs.cut_codes) {
             if (other != 0 && other != cut) {

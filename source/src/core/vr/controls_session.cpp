@@ -28,6 +28,7 @@ Config CurrentConfig() {
     c.layout.left_scheme = s.left_scheme;
     c.layout.classic = s.controls_classic;
     c.layout.swap = s.swap_sticks;
+    c.layout.mirror = VR::MirrorWorld(); // left-handed play: the controllers trade hands
     c.layout.inject = s.inject;
     // The presenter resolves y_menu=auto by the runtime (SteamVR: its dashboard owns Menu).
     c.layout.y_menu = VR::YMenuActive();

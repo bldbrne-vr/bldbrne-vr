@@ -50,6 +50,7 @@ static void ExitThread() {
         /* Run the thread-specific data destructors: */
         _thread_cleanupspecific();
     }
+    curthread->WakeAll();
 
     auto* thread_state = ThrState::Instance();
     ASSERT(thread_state->active_threads.fetch_sub(1) != 1);
@@ -89,10 +90,11 @@ void PS4_SYSV_ABI posix_pthread_exit(void* status) {
                fmt::ptr(curthread));
 
     /* Flag this thread as exiting. */
-    curthread->cancelling = true;
     curthread->no_cancel = true;
+    curthread->cancelling = true;
     curthread->cancel_async = false;
     curthread->cancel_point = false;
+    DebugState.RemoveCurrentThreadFromGuestList();
 
     /* Save the return value: */
     curthread->ret = status;
@@ -182,28 +184,27 @@ static int JoinThread(PthreadT pthread, void** thread_return, const OrbisKernelT
     }
     wait_lock.unlock();
 
-    curthread->cancel_point = false;
-    {
-        std::scoped_lock lock{*curthread->lock};
-        curthread->join_target = nullptr;
-    }
-    curthread->cleanup.pop_front();
-
     if (ret == POSIX_ETIMEDOUT) {
         backout_join(pthread);
-        return ret;
+    } else {
+        pthread->native_thr->WaitForExit();
+        {
+            std::scoped_lock lock{*curthread->lock};
+            curthread->join_target = nullptr;
+        }
+        void* tmp = pthread->ret;
+        pthread->lock->lock();
+        pthread->flags |= ThreadFlags::Detached;
+        pthread->joiner = nullptr;
+        thread_state->TryCollect(pthread); /* thread lock released */
+        if (thread_return != nullptr) {
+            *thread_return = tmp;
+        }
     }
-
-    void* tmp = pthread->ret;
-    pthread->lock->lock();
-    pthread->flags |= ThreadFlags::Detached;
-    pthread->joiner = nullptr;
-    thread_state->TryCollect(pthread); /* thread lock released */
-    if (thread_return != nullptr) {
-        *thread_return = tmp;
-    }
-
-    return 0;
+    curthread->cleanup.pop_front();
+    curthread->cancel_point = false;
+    PthreadCancelInterrupt();
+    return ret;
 }
 
 int PS4_SYSV_ABI posix_pthread_join(PthreadT pthread, void** thread_return) {
@@ -255,7 +256,11 @@ static DWORD RunThread(void* arg) {
 static void* RunThread(void* arg) {
 #endif
     auto* curthread = static_cast<Pthread*>(arg);
-    g_curthread = curthread;
+    {
+        // Creation publishes the native handle and guest record before guest code can run.
+        std::scoped_lock lk{*curthread->lock};
+        g_curthread = curthread;
+    }
     Common::SetCurrentThreadName(curthread->name.c_str());
     DebugState.AddCurrentThreadToGuestList();
     Core::InitializeTLS();
@@ -275,8 +280,6 @@ static void* RunThread(void* arg) {
         (void*)(((size_t)curthread->attr.stackaddr_attr + curthread->attr.stacksize_attr) & (~15));
     void* ret = _runOnAnotherStack(curthread->arg, (void*)curthread->start_routine, stack);
 
-    /* Remove thread from tracking */
-    DebugState.RemoveCurrentThreadFromGuestList();
     posix_pthread_exit(ret);
 #ifdef WIN32
     return 0;
@@ -352,24 +355,26 @@ int PS4_SYSV_ABI posix_pthread_create_name_np(PthreadT* thread, const PthreadAtt
 
     /* Add the new thread. */
     new_thread->refcount = 1;
-    thread_state->Link(curthread, new_thread);
-
-    /* Return thread pointer eariler so that new thread can use it. */
-    (*thread) = new_thread;
-
-    /* Create thread */
-    new_thread->native_thr = std::make_unique<Core::NativeThread>(Core::NativeThread());
+    new_thread->native_thr = std::make_unique<Core::NativeThread>();
+    std::unique_lock start_lock{*new_thread->lock};
     int ret = new_thread->native_thr->Create(RunThread, new_thread);
-
-    ASSERT_MSG(ret == 0, "Failed to create thread with error {}", ret);
+    if (ret != 0) {
+        start_lock.unlock();
+        {
+            std::scoped_lock lk{thread_state->thread_list_lock};
+            thread_state->FreeStack(&new_thread->attr);
+        }
+        thread_state->Free(curthread, new_thread);
+        *thread = nullptr;
+        return POSIX_EAGAIN;
+    }
 
     if (attr != nullptr && *attr != nullptr && (*attr)->cpuset != nullptr) {
         new_thread->SetAffinity((*attr)->cpuset);
     }
-    if (ret) {
-        *thread = nullptr;
-    }
-    return ret;
+    thread_state->Link(curthread, new_thread);
+    *thread = new_thread;
+    return 0;
 }
 
 int PS4_SYSV_ABI posix_pthread_create(PthreadT* thread, const PthreadAttrT* attr,

@@ -26,13 +26,8 @@ struct Stack {
 struct ThreadState {
     static constexpr size_t GcThreshold = 5;
     static constexpr size_t MaxThreads = 100000;
-    static constexpr size_t MaxCachedThreads = 100;
 
     explicit ThreadState();
-
-    bool GcNeeded() const noexcept {
-        return gc_list.size() >= GcThreshold;
-    }
 
     void Collect(Pthread* curthread);
 
@@ -70,12 +65,9 @@ struct ThreadState {
 
     Common::SlabHeap<Pthread> thread_heap;
     std::set<Pthread*> threads;
-    std::list<Pthread*> free_threads;
     std::list<Pthread*> gc_list;
-    std::mutex free_thread_lock;
     std::mutex tcb_lock;
     std::mutex thread_list_lock;
-    std::atomic<s32> total_threads{};
     std::atomic<s32> active_threads{};
     std::stack<Stack*> dstackq;
     std::list<Stack*> mstackq;

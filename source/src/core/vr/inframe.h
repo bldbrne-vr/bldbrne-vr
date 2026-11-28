@@ -88,6 +88,7 @@ enum class MeshId : std::uint16_t {
     BlackskyEye, BlackskyCornea,
     Cylinder, // a unit cylinder along +Y, radius 1, y 0 .. 1 (debug: the solid weapons' capsules)
     Cigarette, CigarettePacket,
+    QuickHolsterLow, // shallow front rail for small stored items
     Count,
 };
 

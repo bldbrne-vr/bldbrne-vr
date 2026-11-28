@@ -7,18 +7,16 @@
 #include <cmath>
 #include <thread>
 #include <vector>
-#include <AL/al.h>
-#include <AL/alc.h>
-#include <alext.h>
-#include <efx.h>
 #include <magic_enum/magic_enum.hpp>
 #include "common/assert.h"
+#include "common/scope_exit.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audio_clock.h"
 #include "core/libraries/audio/audioout_error.h"
 #include "core/libraries/audio/openal_manager.h"
+#include <efx.h>
 #include "core/libraries/audio3d/audio3d_error.h"
 #include "core/libraries/audio3d/audio3d_openal.h"
 #include "core/libraries/error_codes.h"
@@ -129,6 +127,9 @@ static void SpatialReclaimSource(SpatialSource& src) {
     ALint processed = 0;
     alGetSourcei(src.source, AL_BUFFERS_PROCESSED, &processed);
 
+    if (processed > 0) {
+        alGetError(); // isolate the first unqueue from earlier source-property errors
+    }
     while (processed-- > 0) {
         ALuint buffer_id = 0;
         alSourceUnqueueBuffers(src.source, 1, &buffer_id);
@@ -282,8 +283,11 @@ static void CreateSpatialReverbLocked(Port& port) {
 }
 
 static void SpatialApplyReverbLevelLocked(Port& port) {
-    if (!port.reverb_supported || !port.spatial_ready ||
-        !AudioOut::OpenALDevice::GetInstance().MakeCurrent(port.device_name)) {
+    if (!port.reverb_supported || !port.spatial_ready) {
+        return;
+    }
+    const auto context = AudioOut::OpenALDevice::GetInstance().Bind(port.device_name);
+    if (!context) {
         return;
     }
     p_alAuxiliaryEffectSlotf(port.reverb_slot, AL_EFFECTSLOT_GAIN,
@@ -291,8 +295,11 @@ static void SpatialApplyReverbLevelLocked(Port& port) {
 }
 
 static void ResetObjectSpatialLocked(Port& port, ObjectState& obj) {
-    if (obj.al.source == 0 || !port.spatial_ready ||
-        !AudioOut::OpenALDevice::GetInstance().MakeCurrent(port.device_name)) {
+    if (obj.al.source == 0 || !port.spatial_ready) {
+        return;
+    }
+    const auto context = AudioOut::OpenALDevice::GetInstance().Bind(port.device_name);
+    if (!context) {
         return;
     }
     alSourceStop(obj.al.source);
@@ -340,7 +347,7 @@ static void DestroySpatial(Port& port) {
     port.spatial_ready = false;
 
     auto& device = AudioOut::OpenALDevice::GetInstance();
-    if (device.MakeCurrent(port.device_name)) {
+    if (const auto context = device.Bind(port.device_name)) {
         DestroySpatialSourceLocked(port.bed);
         for (auto& [object_id, obj] : port.objects) {
             DestroySpatialSourceLocked(obj.al);
@@ -386,9 +393,15 @@ static bool EnsureSpatial(Port& port) {
         return false;
     }
 
-    if (!device.MakeCurrent(port.device_name)) {
+    // Release the registration after the context guard on any initialization failure.
+    SCOPE_EXIT {
+        if (!port.spatial_ready) {
+            device.UnregisterPort(port.device_name);
+        }
+    };
+    const auto context = device.Bind(port.device_name);
+    if (!context) {
         LOG_ERROR(Lib_Audio3d, "Failed to make OpenAL context current for spatial output");
-        device.UnregisterPort(port.device_name);
         return false;
     }
 
@@ -425,7 +438,6 @@ static bool EnsureSpatial(Port& port) {
     }
 
     if (!CreateSpatialSource(port, port.bed)) {
-        device.UnregisterPort(port.device_name);
         return false;
     }
 
@@ -585,28 +597,32 @@ static ALenum BedALFormat(const u32 channels) {
 
 static bool SpatialUploadLocked(SpatialSource& src, const void* samples, const u32 bytes,
                                 const ALenum format) {
+    ALint state = 0;
+    alGetSourcei(src.source, AL_SOURCE_STATE, &state);
     SpatialReclaimSource(src);
+    if (state == AL_STOPPED) {
+        alSourceRewind(src.source);
+    }
     if (src.available.empty()) {
         return false;
     }
 
     const ALuint buffer_id = src.available.back();
-    src.available.pop_back();
-
     alGetError();
     alBufferData(buffer_id, format, samples, static_cast<ALsizei>(bytes), AUDIO3D_SAMPLE_RATE);
-    ALuint queue_id = buffer_id;
-    alSourceQueueBuffers(src.source, 1, &queue_id);
-
-    if (const ALenum err = alGetError(); err != AL_NO_ERROR) {
-        LOG_ERROR(Lib_Audio3d, "Failed to queue spatial buffer: {}", ALErrorString(err));
-        src.available.push_back(buffer_id);
-        return true;
+    ALenum error = alGetError();
+    if (error == AL_NO_ERROR) {
+        alSourceQueueBuffers(src.source, 1, &buffer_id);
+        error = alGetError();
     }
+    if (error != AL_NO_ERROR) {
+        LOG_ERROR(Lib_Audio3d, "Failed to submit spatial buffer: {}", ALErrorString(error));
+        return true; // drop this frame and leave the buffer available for the next one
+    }
+    src.available.pop_back();
 
-    ALint al_state = 0;
-    alGetSourcei(src.source, AL_SOURCE_STATE, &al_state);
-    if (al_state != AL_PLAYING) {
+    // Only start a fresh queue. A source that drained mid-submit is recovered next time.
+    if (state == AL_INITIAL || state == AL_STOPPED) {
         alSourcePlay(src.source);
     }
 
@@ -617,7 +633,6 @@ static s32 SpatialSubmitBundle(Port& port, SpatialFrameBundle& bundle,
                                const bool nonblocking = false) {
     const u32 bed_channels = bundle.bed.num_channels;
     const u32 bed_bytes = bundle.bed.num_samples * bed_channels * sizeof(s16);
-    const ALenum bed_format = BedALFormat(bed_channels);
     const u32 granularity = port.parameters.granularity;
     u64 waited_us = 0;
 
@@ -625,8 +640,8 @@ static s32 SpatialSubmitBundle(Port& port, SpatialFrameBundle& bundle,
         {
             std::scoped_lock lock{port.mutex};
 
-            if (!port.spatial_ready ||
-                !AudioOut::OpenALDevice::GetInstance().MakeCurrent(port.device_name)) {
+            const auto context = AudioOut::OpenALDevice::GetInstance().Bind(port.device_name);
+            if (!port.spatial_ready || !context) {
                 LOG_ERROR(Lib_Audio3d, "Spatial output lost, dropping frame");
                 FreeBundle(bundle);
                 return ORBIS_OK;
@@ -634,6 +649,7 @@ static s32 SpatialSubmitBundle(Port& port, SpatialFrameBundle& bundle,
 
             SpatialUpdateVolumeLocked(port);
 
+            const ALenum bed_format = BedALFormat(bed_channels);
             if (SpatialUploadLocked(port.bed, bundle.bed.sample_buffer, bed_bytes, bed_format)) {
                 for (auto& frame : bundle.objects) {
                     const auto it = port.objects.find(frame.object_id);
@@ -1307,9 +1323,10 @@ s32 PS4_SYSV_ABI sceAudio3dObjectUnreserve(const OrbisAudio3dPortId port_id,
         return ORBIS_OK;
     }
 
-    if (obj.al.source != 0 && port.spatial_ready &&
-        AudioOut::OpenALDevice::GetInstance().MakeCurrent(port.device_name)) {
-        DestroySpatialSourceLocked(obj.al);
+    if (obj.al.source != 0 && port.spatial_ready) {
+        if (const auto context = AudioOut::OpenALDevice::GetInstance().Bind(port.device_name)) {
+            DestroySpatialSourceLocked(obj.al);
+        }
     }
 
     port.objects.erase(object_id);
@@ -1334,9 +1351,10 @@ static void RetireDrainedObjectsLocked(Port& port) {
     }
     for (const auto obj_id : retired) {
         auto& obj = port.objects[obj_id];
-        if (obj.al.source != 0 &&
-            AudioOut::OpenALDevice::GetInstance().MakeCurrent(port.device_name)) {
-            DestroySpatialSourceLocked(obj.al);
+        if (obj.al.source != 0) {
+            if (const auto context = AudioOut::OpenALDevice::GetInstance().Bind(port.device_name)) {
+                DestroySpatialSourceLocked(obj.al);
+            }
         }
         port.objects.erase(obj_id);
     }

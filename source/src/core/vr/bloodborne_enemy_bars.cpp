@@ -133,8 +133,10 @@ std::atomic<s64> g_boss_seen_ns{0}; // the last update of a raised boss bar (Bos
 // Scaleform value and sets its position through the value's object interface (GetDisplayInfo /
 // SetDisplayInfo, Scaleform 4's DisplayInfo: XScale at +0x18, YScale at +0x20, VarsSet at +0xD4,
 // V_xscale | V_yscale = 0x18). A stub at its entry runs OnSetPosition first: for the HUD's
-// EnemyTags only, the same value gets the scale for where it goes. The site is verified by a hash of
-// its bytes (none are kept here); the prologue it replays is copied from the running game.
+// EnemyTags only, the same value gets the scale for where it goes; in left-handed play an enemy's
+// or a co-op player's tag gets its mirrored x (the stub hands OnSetPosition's result to the game
+// as the x). The site is verified by a hash of its bytes (none are kept here); the prologue it
+// replays is copied from the running game.
 constexpr u64 PositionFnRva = 0x1ACB8C0;
 constexpr u32 PositionPrologue = 16;
 constexpr u64 PositionPrologueHash = 0x592354d3585e3ac0ull; // FNV-1a 64
@@ -145,6 +147,12 @@ std::atomic<bool> g_scale_on{false};
 std::atomic<float> g_scale_half_w{0.0f};
 std::atomic<float> g_scale_half_h{0.0f};
 std::atomic<u64> g_scaled{0};
+// The co-op players' tags (the HUD's 7 RemotePCTag%d pointers after the enemies'), the HUD
+// stage's width (px: x 0..1920 across, its middle 960) and the tags placed mirrored.
+constexpr u32 HudRemoteTags = 0xA8;
+constexpr int RemoteTagCount = 7;
+constexpr s32 StageWidth = 1920;
+std::atomic<u64> g_tags_mirrored{0};
 
 u64 Fnv1a(const u8* data, size_t size) {
     u64 h = 0xCBF29CE484222325ull;
@@ -158,27 +166,55 @@ using GetValueFn = void(PS4_SYSV_ABI*)(u8* out, u8* self);
 using DisplayInfoFn = void(PS4_SYSV_ABI*)(u8* iface, u64 data, u8* info);
 using ReleaseFn = void(PS4_SYSV_ABI*)(u8* iface, u8* value, u64 data);
 
-void PS4_SYSV_ABI OnSetPosition(u8* element, u64 x_arg, u64 y_arg) {
-    if (!g_scale_on.load(std::memory_order_relaxed) || element == nullptr) {
-        return;
+// Returns the x 0x1ACB8C0 places `element` at (the stub hands it to the game as rsi): its own,
+// or in left-handed play (VR::MirrorWorld) for an enemy's or a co-op player's tag the mirrored one
+// across the stage's middle, where the flipped eyes show its target (the tag keeps its pixels:
+// readable). With the scale on, an EnemyTag also gets the scale for where it goes.
+u64 PS4_SYSV_ABI OnSetPosition(u8* element, u64 x_arg, u64 y_arg) {
+    const bool scale = g_scale_on.load(std::memory_order_relaxed);
+    const bool mirror = VR::MirrorWorld();
+    if ((!scale && !mirror) || element == nullptr) {
+        return x_arg;
     }
     const u64 hud = Load(g_hud);
     if (hud == 0) {
-        return;
+        return x_arg;
     }
-    bool enemy = false;
-    for (int i = 0; i < EnemyTagCount && !enemy; ++i) {
-        enemy = Hook::Read<u64>(reinterpret_cast<const u8*>(hud + HudEnemyTags + 8 * i)) ==
-                reinterpret_cast<u64>(element);
+    const auto among = [&](u32 offset, int count) {
+        for (int i = 0; i < count; ++i) {
+            if (Hook::Read<u64>(reinterpret_cast<const u8*>(hud + offset + 8 * i)) ==
+                reinterpret_cast<u64>(element)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const bool enemy = among(HudEnemyTags, EnemyTagCount);
+    const bool remote = !enemy && mirror && among(HudRemoteTags, RemoteTagCount);
+    if (!enemy && !remote) {
+        return x_arg;
     }
-    if (!enemy) {
-        return;
+    s32 x = static_cast<s32>(x_arg);
+    u64 placed = x_arg;
+    if (mirror) {
+        x = StageWidth - x;
+        placed = (x_arg & 0xFFFFFFFF00000000ull) | static_cast<u32>(x);
+        const u64 n = g_tags_mirrored.fetch_add(1, std::memory_order_relaxed);
+        if (n == 0 || (g_diag && n < 40)) {
+            LOG_INFO(Core, "VR ui: left-handed: {} tag at stage x {} placed at x {} (mirrored "
+                           "across the middle; y {})",
+                     enemy ? "an enemy's" : "a co-op player's", static_cast<s32>(x_arg), x,
+                     static_cast<s32>(y_arg));
+        }
+    }
+    if (!scale || !enemy) {
+        return placed;
     }
     // Stage px -> the flat picture's tangents; its squeeze there, undone (the curved panel keeps
     // the flat picture's directions: across 1 / (1 + tx^2), and cos(elevation) on the cylinder).
     const float half_w = g_scale_half_w.load(std::memory_order_relaxed);
     const float half_h = g_scale_half_h.load(std::memory_order_relaxed);
-    const float tx = (static_cast<float>(static_cast<s32>(x_arg)) / 960.0f - 1.0f) * half_w;
+    const float tx = (static_cast<float>(x) / 960.0f - 1.0f) * half_w;
     const float ty = (1.0f - static_cast<float>(static_cast<s32>(y_arg)) / 540.0f) * half_h;
     const float a = 1.0f + tx * tx;
     const float b = 1.0f + ty * ty / a;
@@ -189,7 +225,7 @@ void PS4_SYSV_ABI OnSetPosition(u8* element, u64 x_arg, u64 y_arg) {
     const auto get = Hook::Read<GetValueFn>(Hook::Read<u8*>(element));
     get(value, element);
     if ((value[0x20] & 0x8F) == 0) {
-        return;
+        return placed;
     }
     u8* const iface = Hook::Read<u8*>(value + 0x18);
     const u64 data = Hook::Read<u64>(value + 0x28);
@@ -207,6 +243,7 @@ void PS4_SYSV_ABI OnSetPosition(u8* element, u64 x_arg, u64 y_arg) {
         release(iface, value + 8, data);
     }
     g_scaled.fetch_add(1, std::memory_order_relaxed);
+    return placed;
 }
 
 // The tag update's stub, for a boss tag the game shows while ui_boss_bar is 1 (rdi: the tag).
@@ -318,7 +355,8 @@ void InstallTagScale(u8* module, u64 size) {
         void* const stub = Hook::EmitHostCallStubWith(
             *g_scale_code, reinterpret_cast<void*>(&OnSetPosition), g_position_prologue.data(),
             PositionPrologue, reinterpret_cast<u64>(site + PositionPrologue),
-            [](Xbyak::CodeGenerator&) {}); // rdi element, esi x, edx y: already in place
+            [](Xbyak::CodeGenerator&) {}, // rdi element, esi x, edx y: already in place
+            true); // its result is the x the game places the element at
         g_scale_code->ready();
         Hook::WriteJump(site, PositionPrologue, stub);
     } catch (const Xbyak::Error& error) {

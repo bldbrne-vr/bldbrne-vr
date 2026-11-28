@@ -157,9 +157,13 @@ struct MeleeWindow {
     std::int32_t unsupported_family{-1};
     bool powered{false}; // released Stake Driver charge; the mechanism supplies the impact
     bool contact_hold{false}; // Cane/Cutter whip sweep: pace from first damaging contact
+    std::uint16_t carried_lashes{0}; // ... the lashes it carried after its own (each pays stamina)
     // Its hits x this (core/vr/dual_blades.h DamageScale: the split blades', a honed one's), taken
     // when its attack starts; 1: untouched.
     float damage_scale{1.0f};
+    std::int32_t chikage_draw_weapon{-1}; // exact equipped right weapon at the draw
+    bool blood_blast{false}; // the Bloodletter's blast without its animation (core/vr/blood_blast.h)
+    std::int64_t chikage_coat{}; // expiry identifying the clean blade coat this window may spend
 };
 
 struct MeleeStatus {
@@ -246,6 +250,7 @@ enum class MeleeEventKind : std::uint8_t {
     // The game confirmed an object broke. serial = matched attack; a = hand (0 left / 1
     // right), b = the right attack's shared-grip flag. Feedback only, never an enemy hit.
     ObjectBreak,
+    BloodBlast, // Bloodletter: the game created the physical slam's attack and started its blood FX.
 };
 
 // A shot refused for want of stamina (Shot's why): no arrow, and no game shot in its place.
@@ -367,6 +372,7 @@ enum class TransformEventKind : std::uint8_t {
     Started, // a = the clip id, b = seconds to the switch
     Detent,  // a mechanical sound of the clip (a = its id)
     Locked,  // the form switched (a = the new style)
+    BladeSeated, // the Saif reached its mechanical stop (a = the new style)
     Done,    // the clip ended
     Denied,  // a squeeze refused (why)
     Aborted, // a running transform stopped (why; a = 1 after the switch)
@@ -374,6 +380,7 @@ enum class TransformEventKind : std::uint8_t {
 
 struct TransformEvent {
     TransformEventKind kind{TransformEventKind::Started};
+    bool saif{false}; // detent/lock from the Saif's own clip, even if the weapon changes on delivery
     std::uint32_t serial{0};
     float a{0.0f};
     float b{0.0f};
@@ -388,6 +395,15 @@ bool LatestTransformPull(TransformPull& out);
 // Presenter (one writer); any thread. False before the first.
 void PublishFurnaceQuench(const FurnaceQuench& quench);
 bool LatestFurnaceQuench(FurnaceQuench& out);
+
+// The Chikage's scabbard left blood on the clean blade (the presenter, core/vr/chikage.h): the
+// game shows it until then (steady clock; 0: none), core/vr/bloodborne_transform.cpp.
+struct ChikageBlood {
+    std::int64_t until_ns{0};
+};
+void PublishChikageBlood(const ChikageBlood& blood);
+bool LatestChikageBlood(ChikageBlood& out);
+bool SpendChikageBlood(std::int64_t coat, std::int64_t now, float damage);
 
 // The pose-copy wrapper (one writer).
 void PublishTransformStatus(const TransformStatus& status);

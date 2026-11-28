@@ -116,7 +116,7 @@ VrTemporalPair::Result VrTemporalRuntime::Begin(const VR::Graphics::Config& acce
         try {
             auto done = initialization.get();
             problem = std::move(done.problem);
-            retry_whole_eyes = done.result == Result::FocusFailed;
+            retry_whole_eyes = pair.NeedsWholeEyeFallback(done.result, accepted, plan);
             initialization_failed = done.result == Result::Failed || done.result == Result::Unavailable ||
                                     done.result == Result::Invalid;
         } catch (const std::exception& e) {
@@ -132,8 +132,7 @@ VrTemporalPair::Result VrTemporalRuntime::Begin(const VR::Graphics::Config& acce
             DlssFocus::Off("the provider could not initialize the cropped eyes");
             // This frame already has a cropped plan. The next whole-eye plan retires the
             // failed pair through the normal timeline before starting another initialization.
-            if (accepted.upscaler != VR::Graphics::Upscaler::Off)
-                return Result::Pending;
+            return Result::Pending;
         }
     }
     if (accepted.upscaler == VR::Graphics::Upscaler::Off) {
@@ -144,9 +143,8 @@ VrTemporalPair::Result VrTemporalRuntime::Begin(const VR::Graphics::Config& acce
     touched = true;
     scheduler.GetMasterSemaphore()->Refresh();
     const auto completed = scheduler.GetMasterSemaphore()->KnownGpuTick();
-    const bool same_attempt = VR::Graphics::Pack(accepted) == VR::Graphics::Pack(initialization_config) &&
-                              plan == initialization_plan;
-    if (initialization_failed && same_attempt) return Result::Failed;
+    if (initialization_failed && VR::Graphics::Pack(accepted) == VR::Graphics::Pack(initialization_config) &&
+        plan == initialization_plan) return Result::Failed;
     if (accepted.upscaler != VR::Graphics::Upscaler::Off && pair.NeedsConfiguration(accepted, plan)) {
         if (!pair.Retire(completed)) return Result::Pending;
         epoch = pair.Epoch();
@@ -171,9 +169,7 @@ VrTemporalPair::Result VrTemporalRuntime::Begin(const VR::Graphics::Config& acce
     // rest of that command buffer on this thread. Configuration always goes through the
     // asynchronous path above; OFF only retires.
     VkCommandBuffer command = VK_NULL_HANDLE;
-    if (!UpscalerFastOn(UpscalerFastPart::Recording) ||
-        (accepted.upscaler != VR::Graphics::Upscaler::Off &&
-         pair.NeedsConfiguration(accepted, plan)))
+    if (!UpscalerFastOn(UpscalerFastPart::Recording))
         command = scheduler.CommandBuffer();
     else
         UpscalerFastNote(g_upscaler_fast.raw_avoided);

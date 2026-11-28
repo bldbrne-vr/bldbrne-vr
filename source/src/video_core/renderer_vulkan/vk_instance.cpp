@@ -465,21 +465,36 @@ bool Instance::CreateDevice() {
                                std::clamp(16u, lo.height, hi.height)};
             foveation_layered = rate_props.layeredShadingRateAttachments;
             const auto [rates_result, rates] = physical_device.getFragmentShadingRatesKHR();
-            if (rates_result == vk::Result::eSuccess)
-                for (const auto& rate : rates)
+            if (rates_result == vk::Result::eSuccess) {
+                // The reflection pipeline and device must agree. Check once, alongside
+                // the attachment rates, including whether MAX can preserve coarser rings.
+                // Off unless VR_TEST_SSR_2X1=1 since 2026-11-24 (the user, after mock captures
+                // showed the wet-street puddles blockier at 2x1 while the trace pass costs only
+                // 0.05-0.09 ms: "the 2x1 wet street reflection I want it off").
+                const char* ssr_override = std::getenv("VR_TEST_SSR_2X1");
+                const bool allow_2x1 = ssr_override && ssr_override[0] == '1' &&
+                                       rate_features.pipelineFragmentShadingRate &&
+                                       rate_props.fragmentShadingRateNonTrivialCombinerOps;
+                for (const auto& rate : rates) {
                     foveation_4x4 |= rate.fragmentSize == vk::Extent2D{4, 4};
+                    reflection_2x1 |= allow_2x1 && rate.fragmentSize == vk::Extent2D{2, 1} &&
+                                      bool(rate.sampleCounts & vk::SampleCountFlagBits::e1);
+                }
+            }
         }
         LOG_INFO(Render_Vulkan,
                  "VR foveation: {} (attachment rates {}, texel {}x{}, layered {}, 4x4 {}, coarse "
-                 "with shader depth/stencil {}, with shader sample mask {}); at the start {} "
+                 "with shader depth/stencil {}, with shader sample mask {}, SSR 2x1 {}); at the start {} "
                  "(inner {:.2f}, outer {:.2f}){}",
                  foveation ? "available" : "unavailable",
                  bool(rate_features.attachmentFragmentShadingRate), foveation_texel.width,
                  foveation_texel.height, foveation_layered, foveation_4x4, foveation_shader_depth,
-                 foveation_shader_mask, foveation_settings.on ? "on" : "off",
+                 foveation_shader_mask, reflection_2x1, foveation_settings.on ? "on" : "off",
                  foveation_settings.inner, foveation_settings.outer,
                  foveation_fixed ? ", fixed by VR_FOVEATED" : ", live (vr.ini foveation)");
     }
+    VR::Graphics::foveation_applied.store(foveation_fixed ? VR::Graphics::FfrOverride :
+        foveation ? VR::Graphics::FfrPending : VR::Graphics::FfrUnavailable, std::memory_order_relaxed);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     // GPU crash reports (vk_gpu_crash.h): the driver's own fault report (a query made only after
     // a lost device) wherever the device has it, the checkpoint markers when wanted (NVIDIA).
@@ -872,7 +887,7 @@ bool Instance::CreateDevice() {
             .dynamicRenderingUnusedAttachments = true,
         },
         vk::PhysicalDeviceFragmentShadingRateFeaturesKHR{
-            // Only the attachment rate: the pipelines keep a 1x1 fragment size (vr_foveation.h).
+            .pipelineFragmentShadingRate = reflection_2x1,
             .attachmentFragmentShadingRate = true,
         },
         vk::PhysicalDeviceFaultFeaturesEXT{

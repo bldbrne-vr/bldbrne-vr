@@ -356,16 +356,22 @@ const PreparedDraw* NextPreparedDraw(GraphicsSubmission& submission, size_t offs
 class GraphicsPreparation;
 struct PipelinePreparation;
 
-// A light rectangle's light-shadow level this session (RuntimeInfo::vr_light_shadows,
-// light_shadow.h Level: 0, 1, 2 High): the one rule for compiling, loading cached permutations
-// and the start-up build. High is read once, at the first call (a change in the game's menu
-// applies at the next start: no lamp program is compiled again mid-session for it).
+// A light rectangle's light-shadow level (RuntimeInfo::vr_light_shadows, light_shadow.h Level: 0
+// none, 3 Low, 1 Medium, 4 High): the one rule for compiling, loading cached permutations and the
+// start-up build. Live since 2026-11-21: latched once a frame (VrLatchGraphics) and at the first
+// call.
 u8 VrLightShadowLevel();
-// High lamp shadows this session (the hero lamps' march: the CPU's pick, SlotHero), read once.
-bool VrLightShadowHigh();
+u32 VrLightShadowTier(); // light_shadow.h SceneMaps::EdgeTier: 0 Low, 1 Medium, 2 High (latched)
+// The frame's end (the GPU thread): the graphics settings in force latched for the next frame's
+// keys and upkeep; true when the lamp shadows changed.
+bool VrLatchGraphics();
 // The lamp shadows on this session (VrLightShadowLevel above 0): the AO pass's lamp work
 // (RuntimeInfo::VrAoLampShadows) and the CPU's scene maps, mask, grid and body maps only then.
 bool VrLampShadowsOn();
+// A fragment program's new-graphics key bits (RuntimeInfo::vr_ambient_occlusion,
+// vr_composite_light) in this session, for the draw path (`regs`: its draw's) and the start-up
+// build (null: the record's own bits stand in for the two that are its draw's).
+void VrFragmentBits(Shader::RuntimeInfo& info, u64 lighting_hash, const AmdGpu::Regs* regs);
 // The CPU's side of the scene maps and the mask (light_shadow.h SceneMaps Enabled, Mask): their
 // switches and the session's lamp shadows.
 bool VrSceneMapsOn();
@@ -512,7 +518,8 @@ public:
     // The vr_cut value a cut variant is built and kept with: the cut itself, or with VrPushData
     // only its flag (one variant serves every radius).
     u32 VrCutVariant(u32 cut) const {
-        if (Shader::VrCut::MonocularEye(cut) >= 0) return cut;
+        if (Shader::VrCut::IsHone(cut)) return cut & 0xffffu;
+        if (cut == Shader::VrCut::BladeMouth || Shader::VrCut::MonocularEye(cut) >= 0) return cut;
         return cut != 0 && UsesVrPushData() ? 1u : cut;
     }
     // The vr_motion a motion variant is built and kept with: the motion buffers' addresses too,

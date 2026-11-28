@@ -32,13 +32,18 @@ class VrDlssFocusPass {
 public:
     VrDlssFocusPass(const Instance& instance, Scheduler& scheduler);
     ~VrDlssFocusPass();
+    // Retire crop and history images at their GPU tick when focus is switched off.
+    void Release();
     VrDlssFocusPass(const VrDlssFocusPass&) = delete;
     VrDlssFocusPass& operator=(const VrDlssFocusPass&) = delete;
 
     // `eyes`: the provider frame's whole-eye images (colour, depth, motion sampled, GENERAL;
     // output: its format names the cut-out output's). On true they name this pass's cut-outs
     // (GENERAL), jitter and the rest unchanged; on false nothing was recorded or changed.
-    bool Crop(std::array<BbDlssEvaluate, 2>& eyes, const std::array<DlssFocus::Rect, 2>& rects);
+    // `windows`: where each cut-out is copied from (vr_dlss_focus.h DrsWindow: the rectangle
+    // itself at full scale, its part of the narrower view under dynamic resolution).
+    bool Crop(std::array<BbDlssEvaluate, 2>& eyes, const std::array<DlssFocus::Rect, 2>& rects,
+              const std::array<DlssFocus::DrsWindow, 2>& windows);
 
     struct Eye {
         vk::ImageView render; // the render (the upscaler's colour input), sampled, GENERAL
@@ -46,14 +51,17 @@ public:
         BbDlssImage dlss;     // the upscaler's output of the rectangle (Crop's), GENERAL
         BbDlssImage output;   // the whole eye output (RGBA8 or RGBA16F storage), GENERAL
         DlssFocus::Rect rect;
+        DlssFocus::DrsWindow window; // Crop's for this eye
     };
     // `render_w/h`: the render's size; `jitter`: the frame's jitter (render pixels); `reset`: no
     // history this frame (the upscaler's own reset); `frame`: the frame's number (the history
-    // only from the frame before). On true `written` names each eye's composed image (its output
-    // or this pass's twin of it, GENERAL): the eye's output for this frame.
+    // only from the frame before); `drop`: dynamic resolution's (0: full scale; else the eye's
+    // view is the render's middle and the whole eye follows the upscaler's sub-rectangle, its
+    // window). On true `written` names each eye's composed image (its output or this pass's twin
+    // of it, GENERAL): the eye's output for this frame.
     bool Compose(const std::array<Eye, 2>& eyes, u32 render_w, u32 render_h,
                  std::array<float, 2> jitter, bool reset, u64 frame,
-                 std::array<BbDlssImage, 2>& written);
+                 std::array<BbDlssImage, 2>& written, u32 drop = 0);
 
 private:
     struct Target {
@@ -70,8 +78,6 @@ private:
         u64 latest_frame{}; // its frame
     };
     bool Init();
-    // The images, freed once the GPU is done with them (the destructor, a failure).
-    void Release();
     // A failure: refuse from now on (the owner turns focus off), the images freed.
     void Fail();
     bool Ensure(Target& t, vk::Format format, u32 width, u32 height, const char* name);

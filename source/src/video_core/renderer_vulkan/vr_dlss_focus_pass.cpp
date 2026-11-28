@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/logging/log.h"
+#include "core/vr/s1_dynamic_resolution.h"
 #include "video_core/host_shaders/vr_dlss_focus_comp.h"
 #include "video_core/host_shaders/vr_dlss_focus_crop_comp.h"
 #include "video_core/renderer_vulkan/vk_gpu_pass_profiler.h"
@@ -34,8 +35,10 @@ struct FocusPush {
     s32 size[4];
     s32 origin[4];
     s32 frame[4];
+    s32 bounds[4];
 };
-static_assert(sizeof(CropPush) == 16 && sizeof(FocusPush) == 96);
+// (112 bytes: within the 128 every Vulkan device guarantees.)
+static_assert(sizeof(CropPush) == 16 && sizeof(FocusPush) == 112);
 
 constexpr u32 Group = 8; // both shaders' local size
 constexpr vk::ImageSubresourceRange ColorRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
@@ -308,7 +311,8 @@ BbDlssImage VrDlssFocusPass::Image(const Target& t) {
 }
 
 bool VrDlssFocusPass::Crop(std::array<BbDlssEvaluate, 2>& eyes,
-                           const std::array<DlssFocus::Rect, 2>& rects) {
+                           const std::array<DlssFocus::Rect, 2>& rects,
+                           const std::array<DlssFocus::DrsWindow, 2>& windows) {
     if (failed || (!tried && !Init()))
         return false;
     const auto refuse = [&](u32 eye, std::string_view why) {
@@ -319,11 +323,12 @@ bool VrDlssFocusPass::Crop(std::array<BbDlssEvaluate, 2>& eyes,
     for (u32 eye = 0; eye < 2; ++eye) {
         const auto& e = eyes[eye];
         const auto& r = rects[eye];
+        // The cut-out's source: the rectangle, or its part of the narrower view (its size).
+        const u64 x1 = u64(windows[eye].x.src) + r.in_w, y1 = u64(windows[eye].y.src) + r.in_h;
         if (!r.On() || !e.color.view || !e.depth.view || !e.motion.view || !e.output.image)
             return refuse(eye, "missing input");
-        if (r.in_x + r.in_w > e.color.width || r.in_y + r.in_h > e.color.height ||
-            r.in_x + r.in_w > e.depth.width || r.in_y + r.in_h > e.depth.height ||
-            r.in_x + r.in_w > e.motion.width || r.in_y + r.in_h > e.motion.height ||
+        if (x1 > e.color.width || y1 > e.color.height || x1 > e.depth.width ||
+            y1 > e.depth.height || x1 > e.motion.width || y1 > e.motion.height ||
             r.out_x + r.out_w > e.output.width || r.out_y + r.out_h > e.output.height)
             return refuse(eye, "rectangle outside the images");
         if (e.output.format != VK_FORMAT_R8G8B8A8_UNORM &&
@@ -399,7 +404,8 @@ bool VrDlssFocusPass::Crop(std::array<BbDlssEvaluate, 2>& eyes,
                          .descriptorType = i < 3 ? vk::DescriptorType::eSampledImage
                                                  : vk::DescriptorType::eStorageImage,
                          .pImageInfo = &infos[i]};
-        const CropPush push{{s32(r.in_x), s32(r.in_y), s32(r.in_w), s32(r.in_h)}};
+        const CropPush push{
+            {s32(windows[eye].x.src), s32(windows[eye].y.src), s32(r.in_w), s32(r.in_h)}};
         cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *crop_layout, 0, writes);
         ScratchPush::Invalidate();
         cmd.pushConstants(*crop_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
@@ -425,19 +431,29 @@ bool VrDlssFocusPass::Crop(std::array<BbDlssEvaluate, 2>& eyes,
 
 bool VrDlssFocusPass::Compose(const std::array<Eye, 2>& eyes, u32 render_w, u32 render_h,
                               std::array<float, 2> jitter, bool reset, u64 frame,
-                              std::array<BbDlssImage, 2>& written) {
-    if (failed || !tried || !render_w || !render_h)
+                              std::array<BbDlssImage, 2>& written, u32 drop) {
+    if (failed || !tried || !render_w || !render_h || drop > 30)
         return false;
     const auto pipeline_for = [&](VkFormat format) -> vk::Pipeline {
         return format == VK_FORMAT_R8G8B8A8_UNORM        ? *compose_rgba8
                : format == VK_FORMAT_R16G16B16A16_SFLOAT ? *compose_rgba16f
                                                          : vk::Pipeline{};
     };
+    // Under dynamic resolution each eye follows its upscaler's sub-rectangle (its window), which
+    // must lie in the render.
+    const auto window_fits = [&](const Eye& e) {
+        const auto& w = e.window;
+        return drop == 0 ||
+               (w.x.count != 0 && w.y.count != 0 && w.x.base + w.x.count <= e.rect.in_w &&
+                w.y.base + w.y.count <= e.rect.in_h &&
+                u64(w.x.src) + w.x.base + w.x.count <= render_w &&
+                u64(w.y.src) + w.y.base + w.y.count <= render_h);
+    };
     for (const auto& e : eyes) {
         if (!e.render || !e.motion || !e.dlss.view || !e.output.view || !e.rect.On() ||
             !pipeline_for(e.output.format) || e.dlss.width != e.rect.out_w ||
             e.dlss.height != e.rect.out_h || e.rect.out_x + e.rect.out_w > e.output.width ||
-            e.rect.out_y + e.rect.out_h > e.output.height) {
+            e.rect.out_y + e.rect.out_h > e.output.height || !window_fits(e)) {
             LOG_ERROR(Render_Vulkan, "VR DLSS focus: cannot compose an output {}x{} format {} "
                       "from {}x{} at ({}, {})", e.output.width, e.output.height,
                       int(e.output.format), e.dlss.width, e.dlss.height, e.rect.out_x,
@@ -547,6 +563,31 @@ bool VrDlssFocusPass::Compose(const std::array<Eye, 2>& eyes, u32 render_w, u32 
         push.map[1] = float(render_h) / float(e.output.height);
         push.map[2] = sign * jitter[0];
         push.map[3] = sign * jitter[1];
+        // The render texels the TAA reads (its 3x3, the motion vectors): the whole render, or
+        // under dynamic resolution the view's part of it (the rest is a margin outside the view).
+        push.bounds[0] = 0;
+        push.bounds[1] = 0;
+        push.bounds[2] = s32(render_w) - 1;
+        push.bounds[3] = s32(render_h) - 1;
+        if (drop != 0) {
+            // The upscaler's sub-rectangle (`count` render pixels from `src + base`) fills the
+            // rectangle (out_w eye pixels from out_x); the whole eye follows that one map, so
+            // the band joins the two parts without a seam (the eye's edges stay within a render
+            // pixel or two of where dynamic resolution drew them).
+            const auto& w = e.window;
+            const double mx = double(w.x.count) / double(e.rect.out_w);
+            const double my = double(w.y.count) / double(e.rect.out_h);
+            push.map[0] = float(mx);
+            push.map[1] = float(my);
+            push.map[2] = float(double(w.x.src + w.x.base) - double(e.rect.out_x) * mx) +
+                          sign * jitter[0];
+            push.map[3] = float(double(w.y.src + w.y.base) - double(e.rect.out_y) * my) +
+                          sign * jitter[1];
+            push.bounds[0] = s32(S1Drs::Margin(render_w, drop));
+            push.bounds[1] = s32(S1Drs::Margin(render_h, drop));
+            push.bounds[2] = s32(render_w - S1Drs::Margin(render_w, drop)) - 1;
+            push.bounds[3] = s32(render_h - S1Drs::Margin(render_h, drop)) - 1;
+        }
         push.inv[0] = 1.0f / float(render_w);
         push.inv[1] = 1.0f / float(render_h);
         push.inv[2] = Band();
@@ -558,6 +599,7 @@ bool VrDlssFocusPass::Compose(const std::array<Eye, 2>& eyes, u32 render_w, u32 
         push.frame[0] = s32(frame & 0x7fffffff);
         push.frame[1] = s32(Soft() * 1000.0f + 0.5f);
         push.frame[2] = s32(Floor() * 100.0f + 0.5f);
+        push.frame[3] = drop != 0 ? 1 : 0; // (the render's taps on the view's texels: ViewTexels)
         push.origin[0] = s32(e.rect.out_x);
         push.origin[1] = s32(e.rect.out_y);
         push.origin[2] = s32(e.rect.out_w);

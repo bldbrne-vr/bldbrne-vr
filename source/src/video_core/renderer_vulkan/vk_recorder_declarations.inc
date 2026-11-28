@@ -16,6 +16,7 @@
     void drawIndirectCount(vk::Buffer buffer, vk::DeviceSize offset, vk::Buffer countBuffer, vk::DeviceSize countOffset, u32 maxDrawCount, u32 stride) const;
     void drawIndexedIndirectCount(vk::Buffer buffer, vk::DeviceSize offset, vk::Buffer countBuffer, vk::DeviceSize countOffset, u32 maxDrawCount, u32 stride) const;
     void dispatch(u32 x, u32 y, u32 z) const;
+    void dispatchBase(u32 baseX, u32 baseY, u32 baseZ, u32 x, u32 y, u32 z) const;
     void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const;
     void fillBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size, u32 value) const;
     void copyBuffer(vk::Buffer srcBuffer, vk::Buffer dstBuffer, const vk::ArrayProxy<const vk::BufferCopy>& regions) const;

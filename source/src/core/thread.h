@@ -20,8 +20,11 @@ class NativeThread {
 public:
     NativeThread();
     ~NativeThread();
+    NativeThread(const NativeThread&) = delete;
+    NativeThread& operator=(const NativeThread&) = delete;
 
     int Create(ThreadFunc func, void* arg);
+    void WaitForExit();
     void Exit();
 
     void Initialize();
@@ -39,6 +42,7 @@ private:
     void* native_handle;
 #else
     uintptr_t native_handle;
+    bool joined{};
     void* sig_stack_ptr = nullptr;
 #endif
     u64 tid;

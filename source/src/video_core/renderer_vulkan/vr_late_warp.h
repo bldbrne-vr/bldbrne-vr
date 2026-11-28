@@ -180,6 +180,13 @@ public:
     }
     void Disable(std::string_view reason);
 
+    // Left-handed play (core/vr/mirror_world.h): the finished eyes made in the swapchain's own
+    // format and put into it by mirrored blits, each eye flipped within its own rect (the
+    // presenter trades the two views and reflects their poses back). Before the first frame.
+    void SetMirror(bool on) {
+        mirror = on;
+    }
+
     // VR_STAMP: writes the frame stamp into the copied image (the presenter's WriteStamp).
     using StampWriter =
         std::function<void(vk::CommandBuffer, vk::Image, const XrRect2Di&, const std::array<u64, 4>&)>;
@@ -252,7 +259,10 @@ private:
         VmaAllocation allocation{};
         vk::ImageView view;
         vk::Extent2D extent{};
-        vk::Format format{vk::Format::eUndefined};
+        vk::Format format{vk::Format::eUndefined}; // its view's (what every pass reads and writes)
+        // Left-handed play: the image made in this format (the headset's 8-bit sRGB), mutable to
+        // `format`; eUndefined: made in `format`, as always.
+        vk::Format typed{vk::Format::eUndefined};
     };
     struct Buffer {
         vk::Buffer buffer;
@@ -264,7 +274,8 @@ private:
     bool CreatePipelines();
     bool CreateFrameResources();
     bool EnsureImage(Image& image, vk::Extent2D extent, vk::Format format,
-                     vk::ImageUsageFlags usage, std::string_view name);
+                     vk::ImageUsageFlags usage, std::string_view name,
+                     vk::Format typed = vk::Format::eUndefined);
     void DestroyImage(Image& image);
     bool EnsureSwapchain(vk::Extent2D extent);
     void DestroySwapchain();
@@ -284,6 +295,7 @@ private:
     s64 xr_format{0};
     vk::Format vk_format{vk::Format::eUndefined};
     bool bgra{true};
+    bool mirror{false}; // SetMirror
     bool initialized{false};
     bool failed{false};
 

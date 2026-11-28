@@ -3,6 +3,7 @@
 #include <d3d11.h>
 #include <wincodec.h>
 #include <wrl/client.h>
+#include "embedded_assets.h"
 
 namespace Launcher {
 struct EmbeddedImage {
@@ -13,12 +14,10 @@ struct EmbeddedImage {
 inline EmbeddedImage LoadEmbeddedImage(ID3D11Device* device, int id) {
     using Microsoft::WRL::ComPtr;
     EmbeddedImage out;
-    const auto module = GetModuleHandleW(nullptr);
-    const auto resource = FindResourceW(module, MAKEINTRESOURCEW(id), RT_RCDATA);
-    if (!resource) return out;
-    const DWORD length = SizeofResource(module, resource);
-    const auto loaded = LoadResource(module, resource);
-    auto* data = static_cast<BYTE*>(LockResource(loaded));
+    const EmbeddedAsset asset = FindEmbeddedAsset(id);
+    // WIC only reads a memory stream it decodes from; the cast is for its non-const signature.
+    auto* data = const_cast<BYTE*>(asset.data);
+    const DWORD length = DWORD(asset.size);
     if (!data || length == 0) return out;
     ComPtr<IWICImagingFactory> factory;
     ComPtr<IWICStream> stream;

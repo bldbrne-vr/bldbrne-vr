@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <bit>
 #include <cstdio>
 #include <cstring>
 #include <optional>
@@ -35,6 +36,79 @@ static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
 
 namespace {
+// Zero means that we could not establish a baseline. A real zero digest simply
+// takes the regular refresh path. Called only for ambiguous page invalidations.
+u64 SmallImageFingerprint(const ImageInfo& info, std::span<u64> baseline_mips = {},
+                          u32* seeded = nullptr) {
+    u64 hash{};
+    if (info.guest_size <= 2 * TRACKER_BYTES_PER_PAGE) {
+        Core::Memory::Instance()->TryInspectBacking(info.guest_address, info.guest_size,
+            [&](std::span<const u8> bytes) {
+                hash = XXH3_64bits(bytes.data(), bytes.size());
+                // RefreshImage compares guest bytes per mip for GPU-written images. Capture
+                // the same baselines before releasing the pages so a CPU edit to one mip
+                // cannot upload stale guest bytes over an untouched GPU-written sibling.
+                ASSERT(baseline_mips.size() <= info.mips_layout.size());
+                for (size_t m = 0; m < baseline_mips.size(); ++m) {
+                    const auto& mip = info.mips_layout[m];
+                    if (mip.offset <= bytes.size() && mip.size <= bytes.size() - mip.offset) {
+                        baseline_mips[m] = mip.size == bytes.size() ? hash
+                            : XXH3_64bits(bytes.data() + mip.offset, mip.size);
+                        if (seeded != nullptr) {
+                            *seeded |= 1u << m;
+                        }
+                    }
+                }
+            });
+    }
+    return hash;
+}
+
+// A square texture that gains one mip level at a time keeps its image: the image is made with
+// room for the whole chain where the driver asks no more memory for it, and each new level is
+// uploaded into it (no new image, no copy). On since 2026-11-18 (the user's call; eight mock runs
+// with it on, 8 GB pressure among them: 14 to 164 images kept a run, no fault).
+// VR_TEST_MIP_REUSE=0: off, a new image at every level as before.
+const bool test_mip_reuse = [] {
+    const auto* value = std::getenv("VR_TEST_MIP_REUSE");
+    return !value || value[0] != '0';
+}();
+
+bool IsGrowingMipChain(const ImageInfo& old, const ImageInfo& next) {
+    const auto plain = [](const ImageInfo& i) {
+        return i.type == AmdGpu::ImageType::Color2D && i.resources.layers == 1 &&
+               i.num_samples == 1 && i.num_bits == 32 && i.size.depth == 1 &&
+               !i.props.is_block && !i.props.is_depth && !i.props.is_volume &&
+               !i.props.has_stencil && !i.meta_info.cmask_addr && !i.meta_info.fmask_addr &&
+               !i.meta_info.htile_addr && !i.stencil_addr;
+    };
+    if (!plain(next) || !plain(old) || old.guest_address != next.guest_address ||
+        old.guest_size >= next.guest_size || next.guest_address > UINT64_MAX - next.guest_size ||
+        old.size != next.size || next.size.width != next.size.height ||
+        (next.size.width != 256 && next.size.width != 512 && next.size.width != 1024) ||
+        old.resources.levels == 0 || next.resources.levels != old.resources.levels + 1 ||
+        next.resources.levels > std::bit_width(next.size.width) ||
+        (next.pixel_format != vk::Format::eR8G8B8A8Unorm &&
+         next.pixel_format != vk::Format::eR8G8B8A8Uint) ||
+        old.pixel_format != next.pixel_format || old.pitch != next.pitch ||
+        old.tile_mode != next.tile_mode || old.array_mode != next.array_mode ||
+        old.bank_swizzle != next.bank_swizzle || old.alt_tile != next.alt_tile ||
+        old.props.is_pow2 != next.props.is_pow2 || old.props.is_tiled != next.props.is_tiled) {
+        return false;
+    }
+    for (u32 m = 0; m < old.resources.levels; ++m) {
+        const auto& a = old.mips_layout[m];
+        const auto& b = next.mips_layout[m];
+        if (a.offset != b.offset || a.size != b.size || a.pitch != b.pitch ||
+            a.height != b.height || u64{a.offset} + a.size > old.guest_size) {
+            return false;
+        }
+    }
+    const auto& tail = next.mips_layout[old.resources.levels];
+    return tail.size && tail.offset >= old.guest_size &&
+           u64{tail.offset} + tail.size <= next.guest_size;
+}
+
 // FAST_CPU_LRU_TICK (on unless '0'; read once at start-up, a plain load per GetImage): GetImage
 // touches an image's LRU entry at most once per GC period, as TouchImageOnce does (bbport
 // TextureCache::TouchImage, texture_cache.cpp:1396-1402). It touched it on every call: an
@@ -214,16 +288,26 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     image.InvalidateFastUpdate();
-    if (image.hash == 0) {
-        // Initialize hash
-        const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
-        image.hash = XXH3_64bits(addr, image.info.guest_size);
+    if (False(image.flags & ImageFlagBits::MaybeCpuDirty)) {
+        // A second fault on this shared page may occur after the guest has written
+        // some bytes. Only the first fault on a fully watched, clean image is a baseline.
+        const bool can_snapshot = image.IsTracked() && False(image.flags & ImageFlagBits::Dirty) &&
+                                  image.track_addr == image.info.guest_address &&
+                                  image.track_addr_end - image.track_addr == image.info.guest_size;
+        const std::span<u64> baseline_mips = True(image.flags & ImageFlagBits::GpuModified)
+            ? std::span<u64>{image.mip_hashes.data(), image.mip_hashes.size()} : std::span<u64>{};
+        u32 seeded = 0;
+        image.hash = can_snapshot ? SmallImageFingerprint(image.info, baseline_mips, &seeded) : 0;
+        image.baseline_mips |= seeded;
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
     UntrackImage(image_id);
 }
 
-void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
+void TextureCache::InvalidateMemory(VAddr addr, size_t size, TextureMemory::Invalidation source) {
+    if (size == 0) {
+        return;
+    }
     std::scoped_lock lock{mutex};
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
@@ -231,11 +315,19 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
         if (image.Overlaps(addr, size)) {
-            // Modified region overlaps image, so the image was definitely accessed by this fault.
-            // Untrack the image, so that the range is unprotected and the guest can write freely.
+            // Untrack the entire notification range as before. Only confirmed writes may
+            // discard mip baselines; RefreshImage compares the others on their next use.
+            if (image.baseline_mips != 0) {
+                TextureMemory::ForgetWrittenBaselines(image, addr, size, source);
+            }
             image.InvalidateFastUpdate();
             image.flags |= ImageFlagBits::CpuDirty;
             UntrackImage(image_id);
+        } else if (image.info.guest_size <= 2 * TRACKER_BYTES_PER_PAGE -
+                                           (image_begin - PageManager::GetPageAddr(image_begin))) {
+            // At most two pages. Capture the baseline before either page is released:
+            // writes on the first released page can precede a fault on the second.
+            MarkAsMaybeDirty(image_id, image);
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
             // We should not mark it as dirty now. If it really was modified
@@ -589,7 +681,12 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
-    const auto new_image_id = InsertImage(info);
+    const auto& old = slot_images[image_id];
+    const u32 reserve = test_mip_reuse && info.resources.levels == 2 && old.native_stereo &&
+                                IsGrowingMipChain(old.info, info)
+                            ? std::bit_width(info.size.width)
+                            : 0;
+    const auto new_image_id = InsertImage(info, reserve);
     RegisterImage(new_image_id);
 
     auto& src_image = slot_images[image_id];
@@ -607,6 +704,63 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     TrackImage(new_image_id);
     new_image.flags &= ~ImageFlagBits::Dirty;
     return new_image_id;
+}
+
+bool TextureCache::TryGrowMipChain(const ImageInfo& info, ImageId id) {
+    auto& image = slot_images[id];
+    if (!image.native_stereo || !image.backing ||
+        image.backing->image.image_ci.mipLevels < info.resources.levels ||
+        image.backing_images.size() != 1 || image.backing->num_samples != 1 ||
+        image.binding.is_bound || image.binding.is_target || image.binding.needs_rebind ||
+        image.binding.force_general || image.scene_proxy || image.sky_twin || image.depth_id ||
+        image.usage.vo_surface || True(image.flags & ImageFlagBits::Dirty) ||
+        image.track_addr != image.info.guest_address ||
+        image.track_addr_end != image.info.guest_address + image.info.guest_size ||
+        !IsGrowingMipChain(image.info, info) || buffer_cache.IsRetileSource(id)) {
+        return false;
+    }
+    if (readback_linear_images) {
+        std::scoped_lock lock{download_images_mutex};
+        if (download_images.contains(id)) {
+            return false;
+        }
+    }
+
+    const auto old_levels = image.info.resources.levels;
+    auto& states = image.backing->subresource_states;
+    if (states.empty()) {
+        states.resize(old_levels, image.backing->state);
+    }
+    // The spare physical levels have never been transitioned or exposed through a view.
+    states.resize(info.resources.levels);
+    image.InvalidateFastUpdate();
+    image.RenewIdentity();
+    ++registry_epoch;
+
+    const auto old_end = image.track_addr_end;
+    const auto new_end = info.guest_address + info.guest_size;
+    // Several small mips can share one CPU page. Add a watcher only when the image
+    // crosses into a new page, so its eventual UntrackImage balances every increment.
+    if (tracker.GetPageAddr(old_end - 1) != tracker.GetPageAddr(new_end - 1)) {
+        const auto first_new_page = tracker.GetNextPageAddr(old_end - 1);
+        tracker.UpdatePageWatchers<true>(first_new_page, new_end - first_new_page);
+    }
+    image.track_addr_end = new_end;
+    const u64 old_last_bucket = (old_end - 1) >> Traits::PageBits;
+    const u64 new_last_bucket = (new_end - 1) >> Traits::PageBits;
+    for (u64 bucket = old_last_bucket + 1; bucket <= new_last_bucket; ++bucket) {
+        page_table[bucket].push_back(id);
+    }
+    total_used_memory += Common::AlignUp(info.guest_size, 1024) -
+                         Common::AlignUp(image.info.guest_size, 1024);
+    image.info.mips_layout[old_levels] = info.mips_layout[old_levels];
+    image.info.resources.levels = info.resources.levels;
+    image.info.guest_size = info.guest_size;
+    image.mip_hashes.assign(info.resources.levels, 0);
+    image.baseline_mips = 0;
+    image.flags = ImageFlagBits::Registered | ImageFlagBits::GpuDirty;
+    RefreshImage(image, old_levels);
+    return true;
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
@@ -668,6 +822,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // Try to resolve overlaps (if any)
     int view_mip{-1};
     int view_slice{-1};
+    if (!image_id && test_mip_reuse && image_ids.size() == 1 &&
+        info.resources.levels > slot_images[image_ids.front()].info.resources.levels &&
+        TryGrowMipChain(info, image_ids.front())) {
+        image_id = image_ids.front();
+    }
     if (!image_id) {
         for (const auto& cache_id : image_ids) {
             view_mip = -1;
@@ -856,6 +1015,10 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 }
 
 void TextureCache::RefreshImage(Image& image) {
+    RefreshImage(image, 0);
+}
+
+void TextureCache::RefreshImage(Image& image, u32 first_mip) {
     // Timed after the clean return: the "texture upload" totals count real refreshes only
     // (VR_DS_AB=a's off windows: timed before it, as before).
     std::optional<Common::Slow::Scope> slow;
@@ -868,38 +1031,23 @@ void TextureCache::RefreshImage(Image& image) {
     if (!slow) {
         slow.emplace(Common::Slow::RefreshImage, image.info.guest_size);
     }
-    ++image.write_serial; // the guest memory's bytes replace the image's
-
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
 
-    if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
-        False(image.flags & ImageFlagBits::CpuDirty)) {
-        // The image size should be less than page size to be considered MaybeCpuDirty
-        // So this calculation should be very uncommon and reasonably fast
-        // For now we'll just check up to 64 first pixels
-        const auto addr = std::bit_cast<u8*>(image.info.guest_address);
-        const u32 w = std::min(image.info.size.width, u32(8));
-        const u32 h = std::min(image.info.size.height, u32(8));
-
-        const u32 s_w = image.info.props.is_block ? Common::DivCeil(w, 4u) : w;
-        const u32 s_h = image.info.props.is_block ? Common::DivCeil(h, 4u) : h;
-        const u32 size = s_w * s_h * (image.info.num_bits / 8);
-        const u64 hash = XXH3_64bits(addr, size);
-        if (image.hash == hash) {
-            image.flags &= ~ImageFlagBits::MaybeCpuDirty;
-            return;
-        }
-        image.hash = hash;
+    if ((image.flags & ImageFlagBits::Dirty) == ImageFlagBits::MaybeCpuDirty &&
+        image.hash != 0 && image.hash == SmallImageFingerprint(image.info)) {
+        image.flags &= ~ImageFlagBits::MaybeCpuDirty;
+        return;
     }
 
+    ++image.write_serial; // the normal refresh path can replace the image's contents
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
     const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
 
     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
-    for (u32 m = 0; m < num_mips; m++) {
+    for (u32 m = first_mip; m < num_mips; m++) {
         const u32 width = std::max(image.info.size.width >> m, 1u);
         const u32 height = std::max(image.info.size.height >> m, 1u);
         const u32 depth =
@@ -914,6 +1062,7 @@ void TextureCache::RefreshImage(Image& image) {
                 continue;
             }
             image.mip_hashes[m] = hash;
+            image.baseline_mips &= ~(1u << m); // uploaded from these bytes now
         }
 
         const u32 extent_width = mip_pitch ? std::min(mip_pitch, width) : width;
@@ -1564,9 +1713,13 @@ void TextureCache::NoteTargetFreed(ImageId image_id, u32 line) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+    return InsertImage(info, 0);
+}
+
+ImageId TextureCache::InsertImage(const ImageInfo& info, u32 capacity) {
     critical_backoff.Created(info.guest_address); // under FindImage's lock, as the GC's
     const auto image_id =
-        slot_images.insert(instance, scheduler, blit_helper, slot_image_views, info);
+        slot_images.insert(instance, scheduler, blit_helper, slot_image_views, info, capacity);
     if (!slot_images[image_id].allocation_failed) {
         return image_id;
     }

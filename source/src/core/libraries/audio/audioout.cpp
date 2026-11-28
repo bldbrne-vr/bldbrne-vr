@@ -36,6 +36,7 @@
 #include "core/vr/charge_audio.h"
 #include "core/vr/thunder_audio.h"
 #include "core/vr/vr_session.h"
+#include "core/vr/weapon_voice.h"
 
 namespace Libraries::AudioOut {
 
@@ -184,8 +185,22 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
         Common::SetCurrentThreadName(thread_name.c_str());
     }
 
-    Common::AccurateTimer timer(
-        std::chrono::nanoseconds(1000000000ULL * port->buffer_frames / port->sample_rate));
+    const auto period =
+        std::chrono::nanoseconds(1000000000ULL * port->buffer_frames / port->sample_rate);
+    Common::AccurateTimer timer(period);
+    // audio_lead_ms (core/vr/audio_settings.h; OpenAL): the backend holds the lead and paces the
+    // game by its queue, so this thread takes each buffer the moment the game writes it, never a
+    // tick later (the fixed clock lost a buffer of lead for every buffer the game was late with,
+    // till the queue ran dry: a pop), and runs at the highest priority, ahead of the renderer's
+    // above-normal threads (bbport, 2026-10-18: crackling on 6-core CPUs, its worst gap 36 -> 6 ms).
+    bool self_paced = false;
+    {
+        std::unique_lock lock{port->mutex};
+        self_paced = port->impl && port->impl->PacesItself();
+    }
+    if (self_paced) {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
+    }
 
     // The Beast Cutter: close_old looped while reeling, the game's lock + ring once it is in (the
     // old clink until that decodes, core/vr/whip_audio.h).
@@ -215,6 +230,9 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
     VR::FurnaceAudio::Mixer snap_audio(VR::FurnaceAudio::Snap);
     VR::FurnaceAudio::Mixer whoomph_audio(VR::FurnaceAudio::Whoomph);
     VR::Grind::GrindMixer growl_audio;
+    // A weapon's voice line, the first time it comes to hand (core/vr/weapon_voice.h; untracked
+    // below: a line plays longer than the 3 s stuck-loop warning).
+    VR::WeaponVoice::Mixer voice_audio;
     // Audio hunt (2026-10-18, logs-on builds): which of our mixers added sound to each buffer; one
     // that keeps adding for 3 s is logged (a stuck loop: "gr gr gr" after poison), and its end.
     std::vector<u8> before;
@@ -251,10 +269,20 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
     };
 
     while (true) {
-        timer.Start();
+        if (!self_paced) {
+            timer.Start();
+        }
+        bool sent = false;
 
         {
             std::unique_lock lock{port->mutex};
+            if (self_paced) {
+                // The game's next buffer (sceAudioOutOutput(s) notify); a period at most, so a
+                // stop request (a closing port: the stop follows) is seen.
+                port->output_cv.wait_for(lock, period, [&] {
+                    return port->output_ready || !port->impl || stop.stop_requested();
+                });
+            }
             if (!port->impl || stop.stop_requested()) {
                 break;
             }
@@ -373,11 +401,15 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
                                         port->format_info.is_float,
                                         VR::FurnaceAudio::LatestGrowl(), now);
                     });
+                    VR::WeaponVoice::Mix(voice_audio, port->output_buffer, port->buffer_frames,
+                                         port->format_info.num_channels, port->sample_rate,
+                                         port->format_info.is_float, now);
                 }
                 port->impl->Output(port->output_buffer);
                 port->output_ready = false;
                 port->last_output_time =
                     Kernel::sceKernelGetProcessTime(); // moved from sceAudioOutOutput TOOD recheck
+                sent = true;
             }
         }
 
@@ -387,9 +419,20 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
             break;
         }
 
-        timer.End();
+        if (self_paced) {
+            // The lead held, the port free meanwhile: the game writes its next buffer into it and
+            // waits for this thread to take it, so it runs no further ahead than that one.
+            if (sent) {
+                port->impl->Hold();
+            }
+        } else {
+            timer.End();
+        }
     }
 
+    if (main_mix) {
+        VR::WeaponVoice::Close(voice_audio);
+    }
     {
         std::unique_lock lock{port->mutex};
         port->closing = true;
@@ -784,6 +827,9 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
             samples_sent = port->buffer_frames * port->format_info.num_channels;
         }
     }
+    if (samples_sent > 0) {
+        port->output_cv.notify_all(); // the port's thread, when it waits for it (audio_lead_ms)
+    }
 
     return samples_sent;
 }
@@ -887,6 +933,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
         if (param[i].ptr != nullptr) {
             std::memcpy(ports[i]->output_buffer, param[i].ptr, ports[i]->BufferSize());
             ports[i]->output_ready = true;
+            ports[i]->output_cv.notify_all(); // its thread, when it waits for it (audio_lead_ms)
         }
     }
 

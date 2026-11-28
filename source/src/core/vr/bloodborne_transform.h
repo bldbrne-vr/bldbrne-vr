@@ -62,6 +62,19 @@ bool SetSawWeaponPose(u8* chr, float time, bool active);
 // The main player's update (site A): the form switch of a running transform.
 void TransformSiteA(u8* player);
 
+// One of the weapon's own clip sounds (a c<id>, as its transform clips' cues play them) at the
+// right weapon, now. Game:Main (a pose tick or the body's pose copy). False: not played (the
+// sound function's signature, no grip dummy, transform_cues=0).
+bool PlayWeaponSound(u8* chr, s32 id);
+
+// The game's SpEffect `id` on the player `chr`, as a clip's TAE adds it. Game:Main. False: not
+// added (the function's signature, not the player).
+bool AddPlayerEffect(u8* chr, s32 id);
+
+// A weapon effect: FFX `ffx` at dummy `dummy` in effect slot `slot` (SpawnFFX). Game:Main. False:
+// not spawned.
+bool SpawnWeaponFfx(u8* chr, s32 slot, s32 ffx, s32 dummy);
+
 // Physical melee's gate: why a swing must not open now (transform_flick=0: a transform before its
 // switch has settled); nullptr: it may (with the flick on, a swing during a transform joins it).
 [[nodiscard]] const char* TransformSwingBlock();

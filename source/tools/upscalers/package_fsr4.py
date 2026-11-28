@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 from fetch_temporal_dependencies import FSR, fsr_files
+from prepare_fsr4_assets import RECIPE as PASS11_RECIPE
 
 HERE = Path(__file__).resolve().parent
 
@@ -37,7 +38,7 @@ def validated_files(assets, bridge):
     guards = json.loads((assets / "opt/pass11-guard.json").read_text())
     expected = {name for name in required if name.endswith("_pass11.spv")}
     fixed = {entry["name"]: entry for entry in guards["files"]}
-    if guards["recipe"] != "bbport-pass11-guard-v1" or set(fixed) != expected or len(fixed) != len(guards["files"]):
+    if guards["recipe"] != PASS11_RECIPE or set(fixed) != expected or len(fixed) != len(guards["files"]):
         raise ValueError("Incomplete guarded pass-11 shaders")
     if guards["rewrite_sha256"] != digest(HERE / "prepare_fsr4_assets.py"):
         raise ValueError("Guarded shaders were made with a different recipe; regenerate them")

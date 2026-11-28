@@ -34,9 +34,10 @@
 // space: the moon's direction comes from the cascades.)
 namespace Shader::Optimization::MoonShafts {
 
-// Startup policy (vr.ini moon_shafts, VR_MOON_SHAFTS=0|1 overrides it): with an upscaler only.
-inline bool Enabled(bool vr, bool setting, bool upscaler, const char* override_value) {
-    return override_value ? override_value[0] != '0' : vr && setting && upscaler;
+// Startup policy (vr.ini moon_shafts, VR_MOON_SHAFTS=0|1 overrides it): with an upscaler or
+// without (light_shadow.h Enabled).
+inline bool Enabled(bool vr, bool setting, const char* override_value) {
+    return override_value ? override_value[0] != '0' : vr && setting;
 }
 
 // The game's screen-space cascaded shadow pass (GXScreenSpaceCascadedShadow_PCF9 and its unused
@@ -54,6 +55,8 @@ inline constexpr u32 TableSets = 256;  // the table's sets at most (the id is a 
 
 // Quality (vr.ini moon_shafts_quality, VR_MOON_SHAFTS_QUALITY=0|1|2): points per ray. Read at
 // run time from the buffer: no recompile.
+// (Low: 6 as in 0.9.6; 8 for a day, 2026-11-18. The user that evening: "for 12gb cards lets do 6
+// rays... like we had it on 0.9.6".)
 inline constexpr u32 QualitySteps[3] = {6, 10, 16};
 
 // The air: Density per metre (scattering and extinction; VR_MOON_SHAFTS_DENSITY), lit up to FarM

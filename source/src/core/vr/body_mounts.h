@@ -9,6 +9,7 @@
 #include "core/vr/arm_ik.h"
 #include "core/vr/body_frame.h"
 #include "core/vr/pouch_armor_fits.h"
+#include "core/vr/quick_slot_armor_fits.h"
 
 namespace VR::BodyMounts {
 using Body::Vec3;
@@ -61,6 +62,11 @@ inline Frame WorldSurface(const Pose& pose, int slot, float height, float width,
 }
 inline Frame FitVialPouch(Frame surface, std::int32_t chest_armor, float scale) {
     surface.origin = surface.origin - surface.back * (PouchOutwardM(chest_armor) * scale);
+    return surface;
+}
+inline Frame FitQuickSlot(Frame surface, int slot, QuickSlotArmorFit fit, float scale) {
+    const auto mm = slot == 2 ? fit.chest_mm : (slot == 1 ? fit.waist_mm : 0);
+    surface.origin = surface.origin - surface.back * (mm * .001f * scale);
     return surface;
 }
 // The model's back face meets the body, with 2 mm of overlap hiding a floating seam.

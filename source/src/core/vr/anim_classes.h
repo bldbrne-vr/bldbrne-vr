@@ -474,6 +474,31 @@ struct GateOut {
     bool items_ok{true};
 };
 
+// A hit, get-up or other takeover can interrupt a physical gesture that sends a native L1.
+// A standing hit can take another gesture once the right arm's cancel window opens.
+constexpr bool PhysicalTransformInterrupted(const GateOut& g) {
+    if (g.reason != GateReason::None && g.reason != GateReason::Anim) {
+        return true;
+    }
+    if (!g.held) {
+        return false;
+    }
+    switch (g.owner) {
+    case AnimClass::Damage:
+        return KeepKindOf(g.owner_id) != KeepKind::Hit || !g.cancelled[1];
+    case AnimClass::Dodge: {
+        const auto clip = g.owner_id % 1'000'000;
+        return clip == 7300 || clip == 7350 || (clip >= 7400 && clip <= 7457);
+    }
+    case AnimClass::Grabbed:
+    case AnimClass::Death:
+    case AnimClass::Event:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // The native blood-bullet clip may allow a vial before attacks/movement. This
 // exception is presentation/item access only; the animation still owns combat.
 constexpr bool BloodBulletVialWindow(const GateOut& g) {

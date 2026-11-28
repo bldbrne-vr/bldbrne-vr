@@ -25,6 +25,7 @@ set(SHADER_FILES
     vr_depth_rescale.comp
     vr_body_maps.comp
     vr_depth_pyramid.comp
+    vr_shadow_edges.comp
     vr_fog_grid.comp
     vr_stencil_copy.frag
     vr_dibr_prep.comp

@@ -107,6 +107,10 @@ public:
     // The gamepad's and the keyboard's own buttons and sticks, without the presenter's, in one
     // read (any thread).
     PadLayers::Physical Physical();
+    // Left-handed play's gameplay (the VR presenter): the gamepad's and the keyboard's (and the
+    // mouse's) sideways stick values reach the game mirrored, as the world is (PadLayers::Shown);
+    // off on menus and pages, which are never flipped. Any thread.
+    void SetPhysicalMirrorX(bool on);
     void UpdateGyro(const float gyro[3]);
     void UpdateAcceleration(const float acceleration[3]);
     void PollState();

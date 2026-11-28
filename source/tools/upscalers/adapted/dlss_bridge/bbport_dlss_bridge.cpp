@@ -6,9 +6,11 @@
 // (the SDK's Windows libraries are MSVC only), see CMakeLists.txt.
 // Adapted from IFreemz/shadPS4-Bloodborne-DLSS-FSR (dlss_bridge).
 
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <string>
 
@@ -26,6 +28,7 @@ namespace {
 #ifndef VR_DLSS_PROJECT_ID
 #error "Supply VR_DLSS_PROJECT_ID for your NGX project when building the standalone bridge"
 #endif
+std::atomic<unsigned> region_floor[3]={100u,100u,100u};
 constexpr char ProjectId[] = VR_DLSS_PROJECT_ID;
 #ifdef _WIN32
 constexpr char EngineVersion[] = "bloodborne-vr-staged-windows";
@@ -179,6 +182,7 @@ int32_t Initialize(VkInstance instance, VkPhysicalDevice physical, VkDevice devi
 
 void ReleaseFeature(uint32_t view) {
     if (view >= state.views.size()) return;
+    region_floor[view] = 100;
     auto& eye = state.views[view];
 #ifdef VR_DLSSNR_CHAIN
     if (view < 2) // the neural chain has the two eyes only
@@ -249,6 +253,25 @@ int32_t CreateFeature(uint32_t view, VkCommandBuffer command, const BbDlssFeatur
         // and its parameters alive until its completion-gated ReleaseFeature call.
         return 0;
     }
+    static const bool dynamic_resolution = [] {
+        const char* value = std::getenv("VR_S1_DRS");
+        return !value || *value != '0';
+    }();
+    if (dynamic_resolution && view < 2) {
+        unsigned ow{}, oh{}, maxw{}, maxh{}, minw{}, minh{};
+        float sharp{};
+        if (NVSDK_NGX_SUCCEED(NGX_DLSS_GET_OPTIMAL_SETTINGS(state.capabilities,
+                desc->output_width, desc->output_height, settings.Feature.InPerfQualityValue,
+                &ow, &oh, &maxw, &maxh, &minw, &minh, &sharp)) && minw && minh) {
+            const auto percent = [](unsigned minimum, unsigned extent) {
+                return (uint64_t(minimum) * 100 + extent - 1) / extent;
+            };
+            region_floor[view] = static_cast<unsigned>(std::clamp<uint64_t>(
+                std::max(percent(minw, desc->input_width), percent(minh, desc->input_height)), 70, 100));
+        }
+        Log(0, "DRS eye %u input %ux%u, NGX minimum %ux%u, floor %u%%", view, desc->input_width,
+            desc->input_height, minw, minh, region_floor[view].load(std::memory_order_relaxed));
+    }
     eye.feature_desc = *desc;
 #ifdef VR_DLSSNR_CHAIN
     // Retire any recorded uploads first.
@@ -274,6 +297,7 @@ bool ValidImage(const BbDlssImage& image, uint32_t width, uint32_t height) {
 }
 
 // One eye's Super Resolution from `input` (the host's colour, or the neural chain's).
+static thread_local unsigned region_drop{};
 bool Upscale(uint32_t view, VkCommandBuffer command, const BbDlssEvaluate& evaluate,
              const BbDlssImage& input) {
     auto& eye = state.views[view];
@@ -294,6 +318,12 @@ bool Upscale(uint32_t view, VkCommandBuffer command, const BbDlssEvaluate& evalu
     parameters.pInMotionVectors = &motion;
     parameters.InRenderSubrectDimensions = {eye.feature_desc.input_width,
                                             eye.feature_desc.input_height};
+    if (region_drop) {
+        auto& dims = parameters.InRenderSubrectDimensions;
+        const unsigned x=dims.Width*region_drop/200, y=dims.Height*region_drop/200;
+        parameters.InColorSubrectBase = parameters.InDepthSubrectBase = parameters.InMVSubrectBase = {x,y};
+        dims.Width -= 2*x; dims.Height -= 2*y;
+    }
     parameters.InJitterOffsetX = evaluate.jitter_x;
     parameters.InJitterOffsetY = evaluate.jitter_y;
     parameters.InReset = evaluate.reset;
@@ -395,4 +425,11 @@ extern "C" BBPORT_DLSS_EXPORT int32_t VrDlssSetSrPreset(uint32_t selection) {
     if (VR_DLSS_SR_PRESET != 0) return VR_DLSS_SR_PRESET;
 #endif
     return 0; // the host's BbDlssFeature.preset, 0 from this project's hosts
+}
+
+extern "C" BBPORT_DLSS_EXPORT unsigned VrDlssSetInputReductionPercent(unsigned drop) {
+    const unsigned floor = std::max(region_floor[0].load(std::memory_order_relaxed),
+                                    region_floor[1].load(std::memory_order_relaxed));
+    region_drop = std::min(drop, 100u - floor);
+    return floor;
 }

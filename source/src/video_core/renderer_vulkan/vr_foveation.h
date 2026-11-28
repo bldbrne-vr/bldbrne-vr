@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <span>
 #include <vector>
 
 // Fixed foveated rendering (vr.ini foveation, VR_FOVEATED for tests): the eye-sized multiview scene passes
@@ -116,17 +117,29 @@ inline float AxisV(float angle_up, float angle_down) {
 // down (the axis 40% from the top): in half heights the bottom edge was 1.19 away, a wide 2x2 band
 // and a 4x4 strip where the hands and the weapon are, the top edge 0.81, barely any (the user,
 // 2026-10-26: "very strong towards the bottom, weak towards the top"). A centred axis: unchanged.
-inline std::vector<std::uint8_t> Map(std::uint32_t width, std::uint32_t height,
+// `scale` (dynamic resolution, core/vr/s1_dynamic_resolution.h): the view drawn into the middle
+// `scale` of each side, about the image's centre (the rest a margin outside the view). The zones
+// follow the view, each covering the part of the view it covers at full scale (the axis (cx, cy)
+// is the view's): the full-rate pixels shrink with the resolution as every other zone's do,
+// instead of the cut falling only on the cheapest pixels at the edges (2026-11-22). 1: as before.
+inline bool WriteMap(std::span<std::uint8_t> map, std::uint32_t width, std::uint32_t height,
                                      std::uint32_t texel_w, std::uint32_t texel_h, float cx,
-                                     float cy, const Settings& s, bool four_by_four) {
-    const std::uint32_t nx = (width + texel_w - 1) / texel_w;
-    const std::uint32_t ny = (height + texel_h - 1) / texel_h;
+                                     float cy, const Settings& s, bool four_by_four,
+                                     float scale = 1.0f) {
+    if (!width || !height || !texel_w || !texel_h) return false;
+    const auto nx = 1u + (width - 1) / texel_w;
+    const auto ny = 1u + (height - 1) / texel_h;
+    if (map.size() / nx < ny) return false;
     const float above = std::max(cy, 1e-3f), below = std::max(1.0f - cy, 1e-3f);
-    std::vector<std::uint8_t> map(std::size_t(nx) * ny);
+    const bool scaled = scale > 0.0f && scale < 1.0f;
     for (std::uint32_t y = 0; y < ny; ++y) {
         for (std::uint32_t x = 0; x < nx; ++x) {
-            const float u = (float(x) + 0.5f) * float(texel_w) / float(width);
-            const float v = (float(y) + 0.5f) * float(texel_h) / float(height);
+            float u = (float(x) + 0.5f) * float(texel_w) / float(width);
+            float v = (float(y) + 0.5f) * float(texel_h) / float(height);
+            if (scaled) { // the texel's place in the view
+                u = 0.5f + (u - 0.5f) / scale;
+                v = 0.5f + (v - 0.5f) / scale;
+            }
             const float dx = (u - cx) / 0.5f, dy = (v - cy) / (v < cy ? above : below);
             const float d = std::sqrt(dx * dx + dy * dy);
             map[std::size_t(y) * nx + x] = d < s.inner                    ? Rate(1, 1)
@@ -135,6 +148,18 @@ inline std::vector<std::uint8_t> Map(std::uint32_t width, std::uint32_t height,
                                                                           : Rate(4, 4);
         }
     }
+    return true;
+}
+
+inline std::vector<std::uint8_t> Map(std::uint32_t width, std::uint32_t height,
+                                     std::uint32_t texel_w, std::uint32_t texel_h, float cx,
+                                     float cy, const Settings& s, bool four_by_four,
+                                     float scale = 1.0f) {
+    if (!width || !height || !texel_w || !texel_h) return {};
+    const auto nx = 1u + (width - 1) / texel_w;
+    const auto ny = 1u + (height - 1) / texel_h;
+    std::vector<std::uint8_t> map(std::size_t(nx) * ny);
+    WriteMap(map, width, height, texel_w, texel_h, cx, cy, s, four_by_four, scale);
     return map;
 }
 

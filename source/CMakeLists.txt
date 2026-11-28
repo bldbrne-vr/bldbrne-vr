@@ -242,7 +242,7 @@ set(APP_IS_RELEASE false)
 # A public release (launcher/make_release.ps1): the public repository and a neutral branch in the
 # window title and the log, instead of the remote and branch the build came from.
 set(BBVR_RELEASE_VERSION "" CACHE STRING "Public release version (empty: a development build)")
-set(BBVR_DISPLAY_VERSION "0.9.61") # Current mod version for development builds.
+set(BBVR_DISPLAY_VERSION "0.9.79") # Current mod version for development builds.
 if (NOT "${BBVR_RELEASE_VERSION}" STREQUAL "")
   set(BBVR_DISPLAY_VERSION "${BBVR_RELEASE_VERSION}")
   set(GIT_BRANCH "release")
@@ -920,6 +920,7 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/file_format/npbind.h
          src/core/file_sys/file_override.cpp
          src/core/file_sys/file_override.h
+         src/core/file_sys/file_override_decide.h
          src/core/file_sys/fs.cpp
          src/core/file_sys/fs.h
          src/core/file_sys/ifile.cpp
@@ -1161,6 +1162,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/vr/tool_empty_audio.cpp
          src/core/vr/item_audio.h
          src/core/vr/item_audio.cpp
+         src/core/vr/weapon_voice.h
+         src/core/vr/weapon_voice.cpp
          src/core/vr/charge_audio.h
          src/core/vr/charge_audio.cpp
          src/core/vr/thunder_audio.h
@@ -1543,6 +1546,7 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_resource_pool.cpp
                src/video_core/renderer_vulkan/vk_resource_pool.h
                src/video_core/renderer_vulkan/vk_recorder.cpp
+               src/video_core/renderer_vulkan/vr_render_core_placement.cpp
                src/video_core/renderer_vulkan/vk_scheduler.cpp
                src/video_core/renderer_vulkan/vk_scheduler.h
                src/video_core/renderer_vulkan/vk_pass_breaks.h
@@ -1603,6 +1607,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
     src/video_core/renderer_vulkan/vr_body_maps.cpp
     src/video_core/renderer_vulkan/vr_depth_pyramid.h
     src/video_core/renderer_vulkan/vr_depth_pyramid.cpp
+    src/video_core/renderer_vulkan/vr_shadow_edges.h
+    src/video_core/renderer_vulkan/vr_shadow_edges.cpp
     src/video_core/renderer_vulkan/vr_fog_grid.h
     src/video_core/renderer_vulkan/vr_fog_grid.cpp
     src/video_core/renderer_vulkan/vr_shadow_hold.h
@@ -1817,6 +1823,7 @@ cmrc_add_resource_library(embedded-resources
         src/resources/vr/executioner_glove.brb
         src/resources/vr/augur_creature.brb
         src/resources/vr/music_box_regal.dds
+        src/resources/vr/chikage_scabbard.dds
         src/resources/vr/poison_knife.dds
         src/resources/vr/shaman_blade.dds
         src/resources/vr/sangiran17.bin

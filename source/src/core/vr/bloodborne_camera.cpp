@@ -487,7 +487,8 @@ void PS4_SYSV_ABI CameraHook(u8* camera, u8* /*saved_ymm*/) {
         }
         g_fov_override.store(result.vfov, std::memory_order_relaxed);
         g_view_active = result.decoupled;
-        g_view_yaw = result.view_yaw;
+        // Locked on with lockon_follow: the game's camera faces the target (game_view_yaw).
+        g_view_yaw = std::isfinite(result.game_view_yaw) ? result.game_view_yaw : result.view_yaw;
         // The manager's camera keeps your head's pitch: render_pitch_bias_deg is the render
         // camera's alone (like camera_roll).
         g_view_pitch = result.view_pitch;

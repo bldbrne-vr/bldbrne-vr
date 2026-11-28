@@ -500,7 +500,7 @@ void EmitContext::DefineInputs() {
     }
     case LogicalStage::Fragment: {
         if (runtime_info.native_light_scissor || FragmentMotion() || info.loads.GetAny(IR::Attribute::FragCoord) ||
-            runtime_info.fs_info.vr_cut != 0) {
+            runtime_info.fs_info.CutsFragments()) {
             frag_coord = DefineVariable(F32[4], spv::BuiltIn::FragCoord, spv::StorageClass::Input);
         }
         // The lamp shadows' AO pass (it writes the shadow mask): its fragment's size, for the
@@ -519,7 +519,7 @@ void EmitContext::DefineInputs() {
         // A cut permutation of VrPushData learns per draw whether back faces are cut.
         if (info.loads.Get(IR::Attribute::IsFrontFace) ||
             (runtime_info.fs_info.vr_cut >> 31) != 0 ||
-            (runtime_info.fs_info.vr_cut != 0 && UsesVrPushData())) {
+            (runtime_info.fs_info.CutsFragments() && UsesVrPushData())) {
             front_facing =
                 DefineVariable(U1[1], spv::BuiltIn::FrontFacing, spv::StorageClass::Input);
         }
@@ -732,6 +732,13 @@ void EmitContext::DefineVertexBlock() {
     const bool needs_clip_distance_emulation = l_stage == LogicalStage::Vertex &&
                                                stage == Stage::Vertex &&
                                                profile.needs_clip_distance_emulation;
+    if (stage == Stage::Vertex && l_stage == LogicalStage::Vertex && runtime_info.vs_info.HonesBlade())
+        hone_span = DefineOutput(F32[1], VrCut::HoneLocation);
+    if (stage == Stage::Vertex && l_stage == LogicalStage::Vertex && runtime_info.vs_info.ClipsBlade()) {
+        AddCapability(spv::Capability::ClipDistance);
+        blade_mouth_distance = DefineVariable(TypeArray(F32[1], ConstU32(1u)), spv::BuiltIn::ClipDistance,
+                                              spv::StorageClass::Output);
+    }
     const auto has_clip_distance_outputs = info.stores.GetAny(IR::Attribute::ClipDistance);
     if (has_clip_distance_outputs && !needs_clip_distance_emulation) {
         const Id type{TypeArray(F32[1], ConstU32(8U))};
@@ -875,7 +882,9 @@ void EmitContext::DefineOutputs() {
         }
         // The VR body cutaway (EmitVrCutaway) clears the coverage through SampleMask, unless the
         // shader writes the mask itself (such draws are never given a cutaway permutation).
-        if (info.stores.Get(IR::Attribute::SampleMask) || runtime_info.fs_info.vr_cut != 0) {
+        if (runtime_info.fs_info.HonesBlade())
+            hone_span = DefineInput(F32[1], VrCut::HoneLocation);
+        if (info.stores.Get(IR::Attribute::SampleMask) || runtime_info.fs_info.CutsFragments()) {
             sample_mask = DefineVariable(TypeArray(U32[1], u32_one_value), spv::BuiltIn::SampleMask,
                                          spv::StorageClass::Output);
         }
@@ -1079,6 +1088,9 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, u32 elem_shift
         break;
     case BufferType::VrDepthPyramid:
         Name(id, "vr_depth_pyramid");
+        break;
+    case BufferType::VrShadowEdges:
+        Name(id, "vr_shadow_edges");
         break;
     case BufferType::VrFogGrid:
         Name(id, "vr_fog_grid");

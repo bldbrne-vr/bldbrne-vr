@@ -133,6 +133,13 @@ public:
     std::int64_t BulletsAt() const { return bullets_ns_; }
     std::int64_t StabAt() const { return stab_ns_; } // the last accepted stab
 
+    // Site A can read the baseline even when the active HUD did not sample ammo.
+    [[nodiscard]] bool BeginFallback(std::int32_t bullets) {
+        if (phase_ != Phase::Drawing || made_ || bullets < 0) return false;
+        bullets_before_ = bullets;
+        return true;
+    }
+
     Output Update(const Input& in) {
         Output out{};
         const bool grip = grip_ ? in.grip > GripRelease : in.grip >= GripPress;

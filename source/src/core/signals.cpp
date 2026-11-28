@@ -13,6 +13,9 @@
 #include "core/patch_fault.h"
 #include "core/signals.h"
 #include "emulator.h"
+#ifdef ARCH_X86_64
+#include "shader_recompiler/ir/passes/srt.h"
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -348,6 +351,11 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
 #endif
 
 SignalDispatch::SignalDispatch() {
+#ifdef ARCH_X86_64
+    // A cached walker can run before the first shader translation. Install before OS dispatch
+    // starts, with the existing ordering after the guest memory invalidation handler.
+    RegisterAccessViolationHandler(Shader::HandleSrtWalkerFault, 1);
+#endif
 #if defined(_WIN32)
     ASSERT_MSG(handle = AddVectoredExceptionHandler(0, SignalHandler),
                "Failed to register exception handler.");

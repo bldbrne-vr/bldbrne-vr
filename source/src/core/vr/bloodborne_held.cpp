@@ -407,29 +407,32 @@ constexpr u32 OffsetEffectId = 0x40;
 constexpr u32 OffsetEffectNext = 0x58;
 constexpr u32 EffectSkipMask = 0x800C0003;
 
-bool HasEffect(const u8* chr, s32 id) {
+VR::TonitrusCharge::Observation ObserveCharge(const u8* chr) {
+    using VR::TonitrusCharge::Observation;
     u8* const list = Read<u8*>(chr + OffsetSpEffects);
     if (!Plausible(list)) {
-        return false;
+        return Observation::Unknown;
     }
     u8* node = Read<u8*>(list + OffsetEffectHead);
     for (u32 i = 0; i < 512 && Plausible(node); ++i) {
         if ((Read<u32>(node + OffsetEffectFlags) & EffectSkipMask) == 0 &&
-            Read<s32>(node + OffsetEffectId) == id) {
-            return true;
+            Read<s32>(node + OffsetEffectId) == VR::TonitrusCharge::ChargeEffect) {
+            return Observation::Present;
         }
         node = Read<u8*>(node + OffsetEffectNext);
     }
-    return false;
+    return node == nullptr ? Observation::Absent : Observation::Unknown;
 }
 
 // Tonitrus' charge (core/vr/tonitrus_charge.h): the game's SpEffect 6032 on the hunter, however it
 // began. Published every update that changes it (its start: the bolt, the world's flash, the
-// thunder); while it holds, the light on the mace's head and, for the strike, a burst of the game's
-// lightning, asked every update like the lantern's (they end with the charge). VR_TONITRUS_FFX /
-// VR_TONITRUS_DUMMY override the light and where it sits. It needs the effect sites alone (the
-// torch's), whatever the vial's settings, and ticks from both of the hunter's update sites.
+// thunder); while it holds, the mace's head for the renderer's blue light (HeadGlow) and, for the
+// strike, a burst of the game's lightning, asked every update like the lantern's (they end with
+// the charge). VR_TONITRUS_FFX (a game effect on the head, as before 2026-11-23) / VR_TONITRUS_DUMMY
+// override the light and where it sits. It needs the effect sites alone (the torch's), whatever
+// the vial's settings, and ticks from both of the hunter's update sites.
 VR::TonitrusCharge::Tracker g_tonitrus{};
+bool TorchDummyAt(u8* chr, s32 id, std::array<float, 3>& at); // (the torch's, below)
 
 // The charge's own crackle once it is over. With the idle crackle blanked (core/vr/
 // tonitrus_charge.h: SpEffectVfxParam row 33), the game's state node for the Tonitrus asks for no
@@ -469,25 +472,31 @@ void EndChargedCrackle(u8* chr) {
     }
 }
 
-void TonitrusTick(u8* chr, s64 now) {
+void TonitrusTick(u8* chr, s64 now, const HeldGate& gate) {
     namespace T = VR::TonitrusCharge;
     if (g_torch_sfx == nullptr || !Plausible(chr)) {
         return; // the effect sites did not match (and the idle crackle is kept: PrepareHeldEffects)
     }
-    const bool charged = HasEffect(chr, T::ChargeEffect);
+    const auto effect = ObserveCharge(chr);
+    const bool absent = effect == T::Observation::Absent;
     const bool was = g_tonitrus.state.active;
-    if (g_tonitrus.Step(charged, now)) {
+    if (g_tonitrus.Step(effect, now)) {
         LOG_INFO(Core, "VR Tonitrus: charged (effect {}): the strike, then its light",
                  T::ChargeEffect);
-    } else if (was && !charged) {
+    } else if (was && absent) {
         LOG_INFO(Core, "VR Tonitrus: the charge is over after {:.1f} s",
                  static_cast<double>(now - g_tonitrus.state.start_ns) * 1e-9);
     }
-    if (charged != was) {
+    const bool retry_changed = g_tonitrus.ObserveLift(gate.tonitrus_equipped && absent,
+                                                     gate.tonitrus_interrupted, now);
+    if (g_tonitrus.state.active != was || retry_changed) {
         T::Publish(g_tonitrus.state);
     }
-    if (!charged) {
-        EndChargedCrackle(chr); // a walk of a few nodes; only a match ever writes
+    if (effect != T::Observation::Present) {
+        if (absent) {
+            EndChargedCrackle(chr); // only a complete walk can confirm that the charge ended
+        }
+        return;
     }
     static const s32 ffx = [] {
         const char* const env = std::getenv("VR_TONITRUS_FFX");
@@ -498,12 +507,26 @@ void TonitrusTick(u8* chr, s64 now) {
         return env != nullptr ? std::atoi(env) : T::HeadDummy;
     }();
     u8* const ctl = chr + OffsetSfxCtl;
-    if (!charged || Read<u8*>(ctl) != g_torch_base + SfxCtlVtableRva) {
+    if (Read<u8*>(ctl) != g_torch_base + SfxCtlVtableRva) {
         return;
     }
     const s32 at = dummy;
     if (ffx > 0) {
         g_torch_sfx(ctl, T::LightSlot, ffx, &at, 0);
+    } else {
+        // The renderer's blue light there (tonitrus_charge.h GlowLit: the charge's 7 s at most,
+        // the hunter alive, no lamp travel, no arrival since it began; GlowFade: weaker from 5 s,
+        // gone by 7).
+        const float age = T::StrikeAgeS(now, g_tonitrus.state.start_ns);
+        const float fade = T::GlowFade(age);
+        const u8* const data = DataModule(chr);
+        std::array<float, 3> head{};
+        if (fade > 0.0f &&
+            T::GlowLit(age, data != nullptr && Read<s32>(data + OffsetHp) > 0,
+                       VR::LampWarpDeparting(), VR::PlayerArrivedWithin(age)) &&
+            TorchDummyAt(chr, dummy, head)) {
+            T::HeadGlow.Publish(head, 1, fade);
+        }
     }
     // The strike's burst: its own light and arcs for the first FlashNs (VR_TONITRUS_FLASH=0, tests:
     // none).
@@ -849,22 +872,25 @@ bool g_right_hidden = false;
 u64 g_right_hides = 0;
 
 std::atomic_bool g_lever_left_hidden{false};
+std::atomic<s64> g_scabbard_hand_ns{};
 void LeverHideTick(u8* chr) {
     VR::Lever::HandPresentation held{};
+    const s64 scabbard_ns = g_scabbard_hand_ns.load(std::memory_order_relaxed);
+    const bool scabbard = scabbard_ns && SteadyNs() - scabbard_ns < 250'000'000;
     const bool active = g_hide_module && chr &&
         VR::Lever::Channel().PresentedHand(held) && VR::Lever::Fresh(held.ns, SteadyNs()) &&
         held.hand >= 0 && held.hand <= 1;
     bool hidden = false;
-    if (active) {
+    if (g_hide_module && chr && (active || scabbard)) {
         auto* chr_asm = Read<u8*>(chr + OffsetChrAsm);
         if (Plausible(chr_asm)) {
-            auto* parts = chr_asm + OffsetAsmOverride + held.hand * 4;
-            for (int i = 0; i < 4; ++i)
-                parts[i] = 0xFF;
+            if (scabbard) std::memset(chr_asm + OffsetAsmOverride, 0xFF, 4);
+            if (active && (!scabbard || held.hand != 0))
+                std::memset(chr_asm + OffsetAsmOverride + held.hand * 4, 0xFF, 4);
             hidden = true;
         }
     }
-    g_lever_left_hidden.store(hidden && held.hand == 0, std::memory_order_relaxed);
+    g_lever_left_hidden.store(hidden && (scabbard || held.hand == 0), std::memory_order_relaxed);
 }
 
 void MusicBoxHideTick(u8* chr) {
@@ -1255,6 +1281,24 @@ void InstallTorch(u8* module, u64 size) {
 
 } // Anonymous namespace
 
+void SetScabbardHand(s64 pose_ns) {
+    if (pose_ns || g_scabbard_hand_ns.load(std::memory_order_relaxed))
+        g_scabbard_hand_ns.store(pose_ns, std::memory_order_relaxed);
+}
+
+u32 RightWeaponPartBytes(const u8* chr) {
+    if (chr == nullptr) {
+        return 0;
+    }
+    const u8* const chr_asm = Read<u8*>(chr + OffsetChrAsm);
+    if (!Plausible(chr_asm)) {
+        return 0;
+    }
+    u32 out = 0;
+    std::memcpy(&out, chr_asm + OffsetAsmOverride + 4, sizeof(out));
+    return out;
+}
+
 bool HideRightWeaponPart(u8* chr, u32 part) {
     if (g_hide_module == nullptr || chr == nullptr || part > 3) {
         return false;
@@ -1370,7 +1414,7 @@ void InstallHeld(VAddr base, u64 size) {
 
 void HeldPoseTick(u8* chr, const HeldGate& gate) {
     MusicBoxHideTick(chr);
-    TonitrusTick(chr, SteadyNs()); // whatever the vial's settings (not under its g_ready gate)
+    TonitrusTick(chr, SteadyNs(), gate); // independent of the vial's settings
     if (g_ready && chr != nullptr) {
         Tick(chr, gate, "pose copy");
     }
@@ -1381,7 +1425,7 @@ void HeldPoseTick(u8* chr, const HeldGate& gate) {
 
 void HeldSiteATick(u8* player) {
     if (player != nullptr && !PoseHookInstalled()) {
-        TonitrusTick(player, SteadyNs());
+        TonitrusTick(player, SteadyNs(), {});
     }
     if (g_ready && player != nullptr && !PoseHookInstalled()) {
         Tick(player, HeldGate{}, "player update");

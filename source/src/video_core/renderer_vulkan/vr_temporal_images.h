@@ -65,6 +65,7 @@ class VrTemporalImages {
                 uint32_t eye, bool interleaved = false);
     bool Merge(const std::array<vk::ImageView, 2>& scene);
     void DebugCapture(uint64_t frame, std::string_view metadata);
+    void Suspend(const VrTemporalPair::Plan& next);
     void Release();
 
   private:

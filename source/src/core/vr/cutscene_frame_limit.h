@@ -15,6 +15,8 @@ constexpr std::uint32_t Rom = 32000000, Ludwig = 34000030;
 constexpr std::uint32_t PlayingFlag = 9180;
 constexpr std::uint64_t FlagManagerRva = 0x553B100;
 constexpr std::int64_t MaxHoldNs = 120'000'000'000;
+constexpr std::int64_t RomWarpTimeoutNs = 45'000'000'000;
+constexpr std::uint32_t RomDestinationMap = 28u << 24; // m28_00, respawn point 2802958
 
 constexpr std::uint32_t SceneOf(std::string_view path) {
     if (path == "/app0/dvdroot_ps4/remo/s32_00_0000.remobnd.dcx") return Rom;
@@ -25,21 +27,51 @@ constexpr std::uint32_t SceneOf(std::string_view path) {
 struct Hold {
     std::uint32_t scene = 0;
     std::int64_t began_ns = 0;
+    bool awaiting_rom_arrival = false;
+    bool saw_other_map = false;
 
-    void Open(std::uint32_t id, bool playing, std::int64_t now) {
-        // An unrelated asset open can be a preload, not a scene transition.
-        // Only the event's flag (or watchdog) ends an existing hold.
+    void Open(std::uint32_t id, bool playing, std::int64_t now, std::uint32_t hunter_map = 0) {
         if (id != Rom && id != Ludwig) return;
+        // A preload or repeat open cannot cancel an armed Rom warp or extend its deadline.
+        if (scene == Rom && (!playing || id == Rom)) return;
         if (!playing) {
             scene = 0;
         } else if (scene != id) {
             scene = id;
-            began_ns = now; // repeated opens cannot extend the watchdog
+            began_ns = now;
+            awaiting_rom_arrival = false;
+            saw_other_map = id == Rom && hunter_map != RomDestinationMap;
         }
     }
-    void Tick(std::optional<bool> playing, std::int64_t now) {
-        if (!playing.value_or(false) || now < began_ns || now - began_ns >= MaxHoldNs)
+
+    // Returns a reason only when releasing an active cap.
+    const char* Tick(std::optional<bool> playing, std::int64_t now, std::uint32_t hunter_map = 0) {
+        if (!scene) return nullptr;
+        const char* reason = nullptr;
+        const auto timeout = awaiting_rom_arrival ? RomWarpTimeoutNs : MaxHoldNs;
+        if (now < began_ns || now - began_ns >= timeout) {
+            reason = awaiting_rom_arrival ? "Rom warp timeout" : "safety timeout";
+        } else if (scene == Rom) {
+            // The published id comes from the hunter. Observing it change rules out
+            // a stale destination id left over from an earlier visit.
+            saw_other_map |= hunter_map != RomDestinationMap;
+            if (!playing.value_or(false) && saw_other_map && hunter_map == RomDestinationMap) {
+                reason = "hunter arrived in Yahar'gul";
+            } else if (!awaiting_rom_arrival && playing == false) {
+                // Event 13201803 clears 9180 before requesting the warp. From here
+                // only the hunter's map and a separate wall-clock deadline matter.
+                awaiting_rom_arrival = true;
+                began_ns = now;
+            }
+            // An unreadable flag can be transient. Keep the current deadline.
+        } else if (!playing.value_or(false)) {
+            reason = playing.has_value() ? "event ended/skipped" : "event state unavailable";
+        }
+        if (reason) {
             scene = 0;
+            awaiting_rom_arrival = false;
+        }
+        return reason;
     }
     [[nodiscard]] int Rate(int requested) const { return scene ? std::min(requested, 30) : requested; }
 };

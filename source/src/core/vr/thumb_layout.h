@@ -101,6 +101,49 @@ constexpr Control Physical(Control logical, bool swap) {
     }
 }
 
+// Left-handed play (core/vr/mirror_world.h): the controllers trade hands at the bindings
+// (core/vr/xr_bindings.h Mirror), so the control your hand presses for a logical one is the other
+// hand's: A <-> X, B <-> Y, the sticks, their clicks, the triggers and the grips; Menu stays.
+// Names, callouts, lights and icons follow it (Layout::mirror); reading the actions does not (the
+// bindings did it). Its own inverse.
+constexpr Control Mirrored(Control c) {
+    switch (c) {
+    case Control::A:
+        return Control::X;
+    case Control::X:
+        return Control::A;
+    case Control::B:
+        return Control::Y;
+    case Control::Y:
+        return Control::B;
+    case Control::StickL:
+        return Control::StickR;
+    case Control::StickR:
+        return Control::StickL;
+    case Control::ClickL:
+        return Control::ClickR;
+    case Control::ClickR:
+        return Control::ClickL;
+    case Control::TriggerL:
+        return Control::TriggerR;
+    case Control::TriggerR:
+        return Control::TriggerL;
+    case Control::GripL:
+        return Control::GripR;
+    case Control::GripR:
+        return Control::GripL;
+    default:
+        return c; // Menu (the left controller's own)
+    }
+}
+
+// The control your hand presses for `logical`: the stick swap, then the controllers' trade
+// (left-handed play). Physical(logical, swap) with mirror false.
+constexpr Control Pressed(Control logical, bool swap, bool mirror) {
+    const Control c = Physical(logical, swap);
+    return mirror ? Mirrored(c) : c;
+}
+
 // The haptic hand of a logical control (a tick for a button goes to the hand that pressed it).
 constexpr Hand HandFor(Control logical, bool swap) {
     return HandOf(Physical(logical, swap));
@@ -141,9 +184,9 @@ constexpr const char* Label(Control c) {
     }
 }
 
-// The name of the control carrying `logical`.
-constexpr const char* LabelFor(Control logical, bool swap) {
-    return Label(Physical(logical, swap));
+// The name of the control carrying `logical` (`mirror`: left-handed play, Mirrored).
+constexpr const char* LabelFor(Control logical, bool swap, bool mirror = false) {
+    return Label(Pressed(logical, swap, mirror));
 }
 
 // ---- The scheme tables ----------------------------------------------------------------------
@@ -160,6 +203,10 @@ struct Layout {
     // The runtime owns the left Menu button (SteamVR: its dashboard): none of Menu's jobs reach
     // the game (one entry, "runtime_menu", says so).
     bool menu_runtime{false};
+    // Left-handed play (Mirrored): every control named, called out and lit where your hand
+    // presses it, the controllers having traded hands (core/vr/mirror_world.h). Last, so the
+    // positional initialisers before it stay as they were.
+    bool mirror{false};
     bool operator==(const Layout&) const = default;
 };
 
@@ -229,7 +276,10 @@ inline std::vector<Entry> Entries(const Layout& l) {
             e.push_back({"sprint", "Sprint (latched until the stick is centred)", C::ClickL});
             e.push_back({"leap", "Leap (clicked again while sprinting)", C::ClickL});
             e.push_back({"gun", "Fire gun / parry; on a card: take or use the item", C::TriggerL});
-            e.push_back({"take", "Quick-item arc; at the left hip: a Blood Vial", C::GripL});
+            e.push_back({"take",
+                         l.mirror ? "Quick-item arc; at the right hip: a Blood Vial"
+                                  : "Quick-item arc; at the left hip: a Blood Vial",
+                         C::GripL});
         } else {
             e.push_back({"arc", "Quick-item arc", C::Y});
             e.push_back({"arc_tap", "Quick-item arc (tap); held: the modifier", C::ClickL});
@@ -280,8 +330,9 @@ struct Bound {
 inline std::vector<Bound> Resolve(const Layout& l) {
     std::vector<Bound> out;
     for (const Entry& e : Entries(l)) {
-        out.push_back({e, Physical(e.first, l.swap),
-                       e.second == Control::None ? Control::None : Physical(e.second, l.swap)});
+        out.push_back({e, Pressed(e.first, l.swap, l.mirror),
+                       e.second == Control::None ? Control::None
+                                                 : Pressed(e.second, l.swap, l.mirror)});
     }
     return out;
 }
@@ -346,7 +397,7 @@ inline std::string Chord(const std::string& a, const std::string& b) {
 // the {turn} turns you.", "Grip adjust ({A}+{B})"), {button:B} and the like a physical one whatever
 // the swap (the summon bell's B). Unknown braces stay as they are.
 template <typename Labeler>
-inline std::string Expand(std::string_view text, bool swap, Labeler label) {
+inline std::string Expand(std::string_view text, bool swap, Labeler label, bool mirror = false) {
     struct Token {
         std::string_view name;
         Control logical;
@@ -372,7 +423,10 @@ inline std::string Expand(std::string_view text, bool swap, Labeler label) {
         if (text[i] == '{') {
             for (const Token& t : tokens) {
                 if (text.substr(i, t.name.size()) == t.name) {
-                    out += label(t.physical ? t.logical : Physical(t.logical, swap));
+                    // (Left-handed play: a physical one too, its action being the other
+                    // hand's control: {button:B}, the interact button, is your left Y.)
+                    out += label(t.physical ? (mirror ? Mirrored(t.logical) : t.logical)
+                                            : Pressed(t.logical, swap, mirror));
                     i += t.name.size();
                     matched = true;
                     break;
@@ -386,8 +440,8 @@ inline std::string Expand(std::string_view text, bool swap, Labeler label) {
     return out;
 }
 
-inline std::string Expand(std::string_view text, bool swap) {
-    return Expand(text, swap, Label);
+inline std::string Expand(std::string_view text, bool swap, bool mirror = false) {
+    return Expand(text, swap, Label, mirror);
 }
 
 } // namespace VR::Thumbs

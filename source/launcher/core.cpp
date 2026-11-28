@@ -6,10 +6,21 @@
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
 #include "core.h"
+#include "mods.h"
 #include "core/vr/game_reflections.h"
 #include "common/addon_content.h"
+#include "core/vr/aa_mode.h"
+#include "core/vr/blade_sounds.h"
+#include "core/vr/body_settings.h"
+#include "core/vr/gun_settings.h"
+#include "core/vr/melee_settings.h"
+#include "core/vr/mirror_world.h"
 #include "core/vr/native_views.h"
+#include "core/vr/quick_settings.h"
+#include "core/vr/trick_weapons.h"
+#include "core/vr/two_hand_grip.h"
 #include "core/vr/vr_page.h"
+#include "core/vr/vr_session.h"
 #include <algorithm>
 #include <array>
 #include <bcrypt.h>
@@ -320,8 +331,10 @@ std::string LaunchConfig(const std::string &text, const fs::path &home, int refr
     if (addons) general["addon_install_dir"] = PathText(*addons);
     // The VR resolution template allocates its eye targets from this. Its graphics heaps
     // (4080 + 2304 MiB) and the game's other startup allocations (1416 MiB) take 7800 of the
-    // 8108 MiB this gives.
-    general["extra_dmem_in_mbytes"] = 3500;
+    // 8620 MiB this gives; 512 MiB more are the render resource cache's
+    // (core/vr/bloodborne_render_jobs.cpp: with less free it keeps the game's 160 MiB, which
+    // Laurence's opening cinematic overflows).
+    general["extra_dmem_in_mbytes"] = 4012;
     general["show_splash"] = false;
     general["discord_rpc_enabled"] = false;
     auto &gpu = json["GPU"];
@@ -1105,7 +1118,7 @@ GraphicsFields ParseGraphics(const std::optional<std::string> &value) {
         at = end + 1;
     }
     // The game's own limits (graphics_settings.h Parse).
-    const bool valid = out[0] == 1 && out[1] >= -50 && out[1] <= 50 && out[1] % 10 == 0 &&
+    const bool valid = out[0] == 1 && out[1] >= -50 && out[1] <= 50 &&
                        out[2] >= 0 && out[2] <= 4 && out[3] >= 0 && out[3] <= 5 && out[4] >= 0 &&
                        out[4] <= 5 && out[5] >= 0 && out[5] <= 1 && out[6] >= 0 && out[6] <= 2 &&
                        std::all_of(out.begin() + 7, out.end(),
@@ -1751,6 +1764,7 @@ LaunchPlan Prepare(const Profile &profile, const Paths &paths, StereoPreset pres
     ValidateSetup(profile);
     const auto game = GameExecutable(Path(profile.game));
     const auto runtime = Path(profile.runtime);
+    Mods::CheckForLaunch(Mods::GameRoot(game), runtime);
     const auto home = NormalizeSaveHome(Path(profile.saves));
     const auto patch = PatchFile(runtime);
     const auto version = CheckGameBuild(game);
@@ -1811,6 +1825,9 @@ LaunchPlan Prepare(const Profile &profile, const Paths &paths, StereoPreset pres
     }
     FreeEnvironmentStringsW(environment);
     entries.push_back(L"VR_INI=" + ArgumentPath(paths.Ini()));
+    const auto dynamic_resolution = VR::Ini::ValueOf(ini, "dynamic_resolution");
+    entries.emplace_back(dynamic_resolution && SameValue(*dynamic_resolution, "0")
+                             ? L"VR_S1_DRS=0" : L"VR_S1_DRS=1");
     // Soft save for every player (2026-10-30, the user): the game turns it on only when this
     // backup is a byte-for-byte copy of the save it starts with (core/vr/soft_save_backup.h).
     if (!save_backup.empty())
@@ -1940,10 +1957,12 @@ const std::vector<const char *> &Categories() {
 }
 std::optional<std::string> ChoiceOverride(std::string_view key, std::optional<std::string> value) {
     if (value && key == "light_shadow_detail") {
-        // Older generated files wrote "low" even when the card still chose shadow enablement.
-        // An explicit Game's or Low selection also sets light_shadows, which remains an override.
+        // Older generated files wrote "low" even when the card still chose shadow enablement, and
+        // the old Low (four sharp lamps) is today's Medium: both read as the default. An explicit
+        // Game's or Low selection also sets light_shadows, which remains an override. (2026-11-20:
+        // Low is "lite", Medium "medium", High "high": light_shadow.h TierOf.)
         if (*value == "low") return std::nullopt;
-        if (*value == "0") return "low";
+        if (*value == "0") return "medium";
         if (*value == "1") return "high";
     }
     if (value && key == "water_reflections")
@@ -1954,7 +1973,7 @@ std::optional<std::string> ChoiceOverride(std::string_view key, std::optional<st
 std::optional<std::string> CardDefault(std::string_view key, uint64_t dedicated_bytes) {
     const auto card = VR::CardTier::For(VR::CardTier::Of(dedicated_bytes));
     if (key == "light_shadows") return card.lamp_shadows ? "1" : "0";
-    if (key == "light_shadow_detail") return "low";
+    if (key == "light_shadow_detail") return VR::CardTier::LampShadowDetail(dedicated_bytes);
     if (key == "fog_banks") return card.fog_banks ? "1" : "0";
     if (key == "moon_shafts") return card.moon_glow ? "1" : "0";
     if (key == "ambient_occlusion") return card.ambient_occlusion ? "1" : "0";
@@ -1973,22 +1992,132 @@ bool FogEnabled(const std::optional<std::string> &choice, uint64_t dedicated_byt
 std::optional<std::string> CodeDefault(const std::string &key) {
     // core/vr/vr_session.h, two_hand_grip.h, body_settings.h and quick_settings.h (2026-10-31);
     // foveation: core/vr/graphics_settings.h (-1, Auto: on where the card supports it).
-    static const std::map<std::string, std::string, std::less<>> defaults{
-        {"foveation", "-1"},             {"upscale_focus", "2"},
-        {"snap_turn_deg", "30"},         {"smooth_turn_deg_per_s", "120"},
-        {"vitals_heartbeat", "1"},       {"vitals_edge", "1"},
-        {"health_color", "1"},           {"health_color_strength", "0.5"},
-        {"stamina_color", "1"},          {"stamina_color_strength", "0.7"},
-        {"ui_enemy_hp_bars", "0"},       {"ui_boss_bar", "1"},
-        {"melee_kill_ragdoll", "1"},     {"melee_ragdoll_impulse", "1"},
-        {"two_hand_optimized_controls", "0"}, {"two_hand_trigger_hold", "1"},
-        {"body_align", "1"},             {"body_posture", "lean"},
-        {"quick_arc_pick", "fan"},       {"quick_fan_style", "lancet"},
-        {"x_button", "fan"},
-        {"canted_eyes", "1"},            {"cinematic_ladder_skip", "1"},
-        {"vr_interactions", "1"}};
+    static const std::map<std::string, std::string, std::less<>> defaults = [] {
+        std::map<std::string, std::string, std::less<>> d{
+            {"foveation", "-1"},             {"upscale_focus", "2"},
+            {"dynamic_resolution", "1"},
+            {"snap_turn_deg", "30"},         {"smooth_turn_deg_per_s", "120"},
+            {"vitals_heartbeat", "1"},       {"vitals_edge", "1"},
+            {"health_color", "1"},           {"health_color_strength", "0.5"},
+            {"stamina_color", "1"},          {"stamina_color_strength", "0.7"},
+            {"ui_enemy_hp_bars", "0"},       {"ui_boss_bar", "1"},
+            {"melee_kill_ragdoll", "1"},     {"melee_ragdoll_impulse", "1"},
+            {"two_hand_optimized_controls", "0"}, {"two_hand_trigger_hold", "1"},
+            {"body_align", "1"},             {"body_posture", "lean"},
+            {"quick_arc_pick", "fan"},       {"quick_fan_style", "lancet"},
+            {"x_button", "fan"},
+            {"canted_eyes", "1"},            {"cinematic_ladder_skip", "1"},
+            {"vr_interactions", "1"}};
+        // Every other choice row's (2026-11-25: "Game default" names the value it
+        // stands for): read from the game's own settings, in vr.ini's words as the VR page's
+        // Defaults write them (vr_page_runtime.cpp ValueIn on default settings), so the name
+        // follows the code.
+        const VR::Settings s{};
+        const VR::Body::BodySettings b{};
+        const VR::Quick::QuickSettings q{};
+        const VR::Tricks::Settings t{};
+        const auto flag = [](bool on) { return std::string(on ? "1" : "0"); };
+        const auto number = [](double v) {
+            char text[32];
+            snprintf(text, sizeof(text), "%g", v);
+            return std::string(text);
+        };
+        using Mode = VR::Body::BodyMode;
+        const std::pair<const char *, std::string> read[]{
+            // Combat
+            {"blade_sounds", flag(VR::BladeSound::Settings{}.on)},
+            {"gun_wrist_reload", flag(VR::Gun::GunSettings{}.wrist_reload)},
+            {"two_hand_guide", flag(VR::TwoHand::Settings{}.guide)},
+            {"riposte_style", flag(s.riposte_style)},
+            {"weapon_wall", !t.weapon_wall ? "0" : t.weapon_wall_map ? "1" : "2"},
+            {"vr_grab_attacks", flag(s.vr_grab_attacks)},
+            {"lockon_follow", std::to_string(s.lockon_follow)},
+            {"weighted_weapons",
+             s.weighted_weapons == 2 ? "2" : flag(s.WeaponWeightStrength() > 0.0f)},
+            // Controls
+            {"inject", flag(s.inject)},
+            {"controls", s.controls_classic ? "classic" : "motion"},
+            {"grip_adjust", flag(b.grip_adjust)},
+            {"laser", flag(s.laser)},
+            {"left_handed", flag(s.left_handed)},
+            {"swap_sticks", flag(s.swap_sticks)},
+            {"seated", flag(s.seated)},
+            // Difficulty
+            {"player_hp_bonus_pct", std::to_string(s.player_hp_bonus_pct)},
+            {"melee_stamina_pct", std::to_string(VR::Melee::MeleeSettings{}.stamina_pct)},
+            {"dodge_iframes_extra", std::to_string(s.dodge_iframes_extra)},
+            // Extras
+            {"first_person", std::to_string(s.first_person)},
+            {"cinematic", flag(s.cinematic)},
+            // HUD & feedback
+            {"ui_counters", s.ui_counters == 1   ? "always"
+                            : s.ui_counters == 2 ? "hidden"
+                                                 : "look_down"},
+            {"ui_hud_scale_deg", number(s.ui_hud_scale_deg)},
+            {"hud_vitals", s.hud_vitals == 1 ? "wrist" : "classic"},
+            {"hit_vignette", flag(s.hit_vignette)},
+            // Items & world (the lamp page, the summon bell and the levers are on in code: ValueIn)
+            {"doll_respec", flag(s.doll_respec)},
+            {"holster_mode", std::to_string(q.holster_mode)},
+            {"lamp_travel", "1"},
+            {"physical_levers", "1"},
+            {"physical_summon_bell", "1"},
+            {"holster_haptics", flag(q.holster_haptics)},
+            {"shoulder_vial", flag(q.shoulder_vial)},
+            {"shoulder_switch", flag(s.shoulder_switch)},
+            // Picture and Graphics
+            {"aa_mode", VR::Aa::Name(VR::Aa::DefaultMode)},
+            {"lod_bias", std::to_string(s.lod_bias)},
+            {"eye_adaptation", flag(s.eye_adaptation)},
+            {"shadows_far", s.shadows_far_reduced ? "reduced" : "full"},
+            {"shadows_busy", flag(s.shadows_busy)},
+            {"raised_bricks", flag(s.raised_bricks)},
+            {"frame_overlap", flag(s.frame_overlap)},
+            // You
+            {"body_cutaway", flag(b.body_cutaway)},
+            {"tp_view_follows_pitch", number(s.tp_view_follows_pitch)},
+            {"body_comfort", flag(b.body_comfort)},
+            {"height_base", s.height_player ? "player" : "hunter"},
+            {"body_mode", b.mode == Mode::ArmsOnly    ? "arms_only"
+                          : b.mode == Mode::HandsOnly ? "hands_only"
+                          : b.mode == Mode::Full      ? "full"
+                                                      : "no_head"},
+        };
+        for (const auto &[k, v] : read)
+            d.emplace(k, v);
+        return d;
+    }();
     const auto it = defaults.find(key);
     return it == defaults.end() ? std::nullopt : std::optional<std::string>(it->second);
+}
+// melee_settings.cpp Flag: "1" or "true" only.
+static bool StaminaSwitchOn(const std::vector<std::string> &lines) {
+    return std::ranges::any_of(lines, [](const std::string &v) { return v == "1" || v == "true"; });
+}
+std::optional<std::string> StaminaPctAsRead(const std::vector<std::string> &pct_lines,
+                                            const std::vector<std::string> &old_switch_lines) {
+    // Each pct line as the game's std::stoi reads it (a sign, then digits; anything after them is
+    // left; nothing to read, or out of range, refuses the line), the last read one winning. A read
+    // one wins over the old switch in either order: before it, the switch is ignored; after it, it
+    // sets the value again.
+    std::optional<int> pct;
+    for (const std::string &line : pct_lines) {
+        try {
+            pct = std::clamp(std::stoi(line), 0, 100);
+        } catch (const std::exception &) {
+        }
+    }
+    if (pct)
+        return std::to_string(*pct);
+    if (StaminaSwitchOn(old_switch_lines))
+        return "100";
+    return std::nullopt;
+}
+std::vector<std::string> ResetAlsoRemoves(std::string_view key,
+                                          const std::vector<std::string> &old_switch_lines) {
+    if (key == "melee_stamina_pct" && StaminaSwitchOn(old_switch_lines))
+        return {"melee_stamina"};
+    return {};
 }
 bool SearchFinds(const std::string &needle, const std::string &text) {
     // A word counts where a word of the text starts with it: "turn" finds turning, not return.
@@ -2199,6 +2328,12 @@ const RowNote Notes[]{
      "On: enemy grab attacks stay in VR, with the view following the hunter. Off (the default): "
      "the existing behaviour.",
      "grab enemy grab camera cutscene"},
+    {"lockon_follow",
+     "On: in first person, locked on, the view smoothly keeps your target in the middle (a big "
+     "jump, like rolling past it, is one quick snap), and the left stick moves you round it as "
+     "the flat game's lock-on does. Your own head never turns the view. Look away from the target "
+     "for a moment to release the lock. Off (the default): the view stays yours.",
+     "lock on lock-on target targeting follow camera turn"},
     {"two_hand_swing_hum", "Vibration strength during fast two-handed swings.",
      "vibration haptics two hand swing", 100},
     // Items & world
@@ -2228,7 +2363,7 @@ const RowNote Notes[]{
      "game's image enlarged and smoothed by a TAA, where the lenses blur anyway. Performance is "
      "the fastest. Off: DLSS or FSR reconstructs the whole of each eye. Requires native stereo "
      "and regular DLSS or FSR (DLSS 5 keeps its own neural centre). Perf Scan uses Medium "
-     "for supported configurations. Applies after restarting the game.",
+     "for supported configurations. The in-game setting applies while playing.",
      "foveated upscale dlss fsr taa performance middle centre lens"},
     {"vr_interactions",
      "Immersive (the default): in first person, doors, gates, chests and coffins open in front of "
@@ -2316,6 +2451,12 @@ const RowNote Notes[]{
     {"hp_bonus",
      "Raises the hunter's maximum health (+10 % by default). Your save file is not changed.",
      "easy health hp difficulty"},
+    {"empty_vial_refill",
+     "When you die or rest at a lamp with no Blood Vials on you and none in storage, the game "
+     "gives you this many (3 by default), so you never have to farm vials to keep going. If you "
+     "have any left, on you or stored, you get none. Offline only.",
+     "blood vials free refill death respawn heal empty farm difficulty",
+     VR::Lamps::DefaultVialsWhenOut},
     {"iframes",
      "Extra invincibility after a quickstep or roll, in 1/30 s frames (off by default). "
      "Backsteps get none.",
@@ -2369,38 +2510,44 @@ const RowNote Notes[]{
      "next-farthest shadows are left out too, and they come back once the frame rate recovers. "
      "Helps a graphics card that is close to its limit.",
      "shadow shadows busy performance fps"},
-    // New graphics (2026-11-10): the lighting the mod adds; each needs DLSS or FSR.
+    // New graphics (2026-11-10): the lighting the mod adds; with DLSS or FSR or without (since
+    // 2026-11-19, the user: "we need to make these work with upscaling off as well").
     {"new_shadows",
-     "Game's: only the game's own shadows. Low: the lights near you (your lantern, a torch, a "
-     "gun's flash, the lamps of the street) cast real shadows, from the mod's half-resolution "
-     "shadow mask, which is cheap. High: the lamps that matter most (a torch or lantern in your "
-     "hand, and the lamps lighting the most of what you see, three at most) cast sharp, detailed "
-     "shadows worked out at full resolution; it costs some GPU time near such lamps. Needs DLSS "
-     "or FSR; applies at the next start. Not set: by your graphics card's memory (Low from 12 GB).",
+     "Game's: only the game's own shadows. Low, Medium and High: the lights near you (your "
+     "lantern, a torch, a gun's flash, the lamps of the street) cast real shadows, and the lamps "
+     "that matter most get sharp, detailed shadow edges near you. Low: 2 lamps sharp up to about "
+     "2 m, and lighter shadows from a torch in your hand; the cheapest. Medium: 3 lamps sharp up "
+     "to about 4 m. High: 5 lamps sharp up to about 5 m. A torch or lantern in your hand costs "
+     "the most, since it lights nearly everything you see. In the game's VR menu it applies at "
+     "once (the first time in a session it takes a moment to show). Not set: by your graphics "
+     "card's memory (Low on a 12 GB card, Medium on 16 GB and up).",
      "shadow shadows lantern torch lamp lamps detail sharp high low dynamic lighting performance fps"},
     {"new_fog",
      "On: the fog banks that linger over the ground, and the ground mist of the Forbidden Woods, "
      "are drawn by the mod's own fog: it stays where it is in the world, lamps and the moon light "
      "it, and it has its own color. Game's: the game's fog as it draws it. The fog needs the "
-     "moon's glow, so Moon glow is on while Fog is on. Needs DLSS or FSR; applies at the next "
-     "start. Not set: by your graphics card's memory (on from 12 GB).",
+     "moon's glow, so Moon glow is on while Fog is on. In the game's VR menu it changes when you "
+     "travel to another area (the area you are in keeps its fog until then; a death does not "
+     "change it). Not set: by your graphics card's memory (on from 12 GB).",
      "fog mist banks volumetric volumetrics ground haze performance fps"},
     {"moon_glow",
      "On: moonlight in the air: a soft glow towards the moon, haze, and rays through trees and "
-     "windows. It is always on while Fog is on. Needs DLSS or FSR; applies at the next start. "
+     "windows. It is always on while Fog is on. In the game's VR menu it applies at once. "
      "Not set: by your graphics card's memory (on from 12 GB).",
      "moon glow haze god rays godrays shafts beams moonlight air performance fps"},
     {"new_ambient",
      "AO: deeper, more grounded shading in corners, under ledges and where things meet, in place "
      "of the game's; with it blood looks wet and fine detail shimmers less. AO and bounce: also "
      "light reflected off lit walls and floors onto what is near them, the most expensive of the "
-     "new graphics. Needs DLSS or FSR; applies at the next start. Not set: by your graphics card's "
-     "memory (AO from 10 GB, bounce from 13.8 GiB).",
+     "new graphics. In the game's VR menu it applies at once (the first time in a session it "
+     "takes a moment to show). Not set: by your graphics card's memory (AO from 10 GB, bounce "
+     "from 13.8 GiB).",
      "ambient occlusion ao gtao bounce gi global illumination lighting"},
     {"raised_bricks",
      "On: brick walls, big stone blocks and roof tiles get real depth. Their joints sink and "
      "darken, and each eye sees them from its own side, so they look built rather than painted. "
-     "Every other surface is drawn exactly as the game draws it. Applies at the next start.",
+     "Every other surface is drawn exactly as the game draws it. In the game's VR menu it applies "
+     "at once.",
      "parallax bricks brick stones walls tiles roof depth relief bump raised joints"},
     {"cinematic_look",
      "A film-like color curve on the game's final image: deeper blacks and calmer shadows. 0 is "
@@ -2471,6 +2618,62 @@ Setting FromPage(const VR::Page::Row &row, const char *category, const char *gro
     return s;
 }
 } // namespace
+// Left-handed (2026-11-22: "it needs to be a setting in Launcher", "only for first
+// person + motion controls"): the world mirrored, so the trick weapon is in your left hand.
+static Setting LeftHandedRow() {
+    Setting row = Choice(
+        "Controls", "Left-handed", "The weapon in your left hand, the gun in your right.",
+        {"left_handed"}, {{"Off", {"0"}}, {"On", {"1"}}},
+        "On: the whole game is mirrored, so you hold the trick weapon in your left hand and the "
+        "gun in your right. The controllers trade jobs (your left trigger and grip are the "
+        "weapon's, your right stick walks), and the world, the hunter and the sound are mirrored "
+        "to match. Text and menus stay readable. Only with motion controls in first person; a "
+        "gamepad or third person stays right-handed. Applies at the next start. Off (the "
+        "default): right-handed, as the game was made.");
+    row.group = LauncherOnlyGroup;
+    row.words = "left handed lefty mirror mirrored swap hands weapon hand off hand";
+    return row;
+}
+// Left-handed play: the tooltips that name your hands, for the other side. Those with bare button
+// letters have their own words ("A" is also a word); the rest trade left and right (SideWords).
+std::string LeftHandedDetails(const Setting &row) {
+    if (row.id == nullptr || row.details == nullptr) {
+        return {};
+    }
+    const std::string_view id = row.id;
+    if (id == "inject") {
+        return "Stab: take a vial from the pouch at your hip or over your left shoulder (or with A "
+               "button: Vial, press A), then touch it to your wrist or body to inject it. Button: A "
+               "uses a vial, as in the original game.";
+    }
+    if (id == "x_button") {
+        return "Fan menu: A opens and closes the quick-item fan, the Blood Vial comes from the pouch "
+               "at your hip or over your left shoulder. Vial: A readies a vial to stab, as before; "
+               "the pouch and the shoulder still work. With Blood Vial: Button, A always uses a "
+               "vial.";
+    }
+    if (id == "two_handed") {
+        return "Original (the default): the left grip transforms and Y / B slide your hands. "
+               "Optimized: tap the left stick to transform instead of lock-on; the right trigger "
+               "near a transformed handle attaches your right hand (Hold: while squeezed, Toggle: "
+               "press to grab, press again to let go); hold either grip to slide that hand. Motion "
+               "controls only.";
+    }
+    if (id == "shoulder_switch") {
+        return "On: reach over a shoulder and press Y (left) or B (right) to switch that hand's "
+               "weapon; hold for about 0.4 seconds to go unarmed.";
+    }
+    if (id == "physical_summon_bell") {
+        return "On (the default): in first person, Y draws the summon bell into your hand; shake it "
+               "to summon. Y again cancels. Off: the game's own bell.";
+    }
+    if (id == "move_with" || id == "two_hand_guide" || id == "quick_arc_pick" ||
+        id == "shoulder_vial" || id == "hud_vitals") {
+        return VR::Mirror::SideWords(row.details);
+    }
+    return {};
+}
+
 // Built from the in-game VR page (vr_page.h Tabs and Rows). Not offered: Smooth motion
 // (late_warp_motion), which needs late_warp=1 while the headset preset runs late_warp=0, and the
 // Upscaling tab's rows (the Graphics tab draws graphics_config itself).
@@ -2494,10 +2697,24 @@ const std::vector<Setting> &Settings() {
             for (const auto &[in, id] : LauncherOnly)
                 if (std::string_view(in) == tab.name)
                     add(id, tab.name, LauncherOnlyGroup);
+            // Left-handed play (core/vr/mirror_world.h): launcher only, read at the start (the
+            // controllers' bindings are made then); the page has no row for it.
+            if (std::string_view(tab.name) == "Controls")
+                out.push_back(LeftHandedRow());
         }
         // The performance choice that needs a restart; the live ones (foveated rendering among
         // them since 2026-11-01) are on the page's Picture tab (its Performance page).
         add("frame_overlap", "Graphics", "Performance");
+        auto dynamic_resolution = Choice(
+            "Graphics", "Dynamic Resolution", "Lower scene resolution when the GPU is under sustained load.",
+            {"dynamic_resolution"}, {{"On", {"1"}}, {"Off", {"0"}}},
+            "On (default) lets both eyes drop up to 30% per dimension and return to full resolution "
+            "when GPU time allows. The shorter side stays at or above 1,160 pixels. Smaller inputs "
+            "keep their chosen size. Applies next launch in native stereo with the upscaler off or "
+            "with regular DLSS, Foveated upscale included.");
+        dynamic_resolution.group = "Performance";
+        dynamic_resolution.words = "adaptive resolution scale gpu frame time fps performance";
+        out.push_back(std::move(dynamic_resolution));
         add("upscale_focus", "Graphics", "Upscaling"); // the in-game Upscaling tab's own row
         add("canted_eyes", "Graphics", "Headset");
         // Launcher only: the page has no row for them.

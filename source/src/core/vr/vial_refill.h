@@ -10,12 +10,25 @@
 #include <optional>
 
 namespace VR::Lamps {
+// Free vials when out (vr.ini empty_vial_refill; the tester, 2026-11-23: "configurable. From 1 ->
+// 10", then "make "8" be the max, not 10"): how many Blood Vials the game's own refill (a death,
+// a lamp) adds when it leaves none carried and none stored. 3 since 2026-10-17, still the default
+// (the user's pick).
+inline constexpr int MinVialsWhenOut = 1;
+inline constexpr int MaxVialsWhenOut = 8;
+inline constexpr int DefaultVialsWhenOut = 3;
+constexpr int ClampVialsWhenOut(int count) {
+    return std::clamp(count, MinVialsWhenOut, MaxVialsWhenOut);
+}
+
 // Called only after native storage replenishment, never on vial consumption.
 // A partial refill (even one vial) is left alone. Unknown counts are not empty.
+// All `count` vials (clamped to 1..8) or none: they must all fit in the room.
 constexpr int EmptyVialRefillGrant(std::optional<int> carried, std::optional<int> stored,
-                                  int room) {
-    return carried && stored && *carried == 0 && *stored == 0 && room >= 3 && room <= 99
-               ? 3
+                                  int room, int count) {
+    const int grant = ClampVialsWhenOut(count);
+    return carried && stored && *carried == 0 && *stored == 0 && room >= grant && room <= 99
+               ? grant
                : 0;
 }
 struct VialRestPlan {
@@ -28,13 +41,13 @@ struct VialRestPlan {
 // Disabling the bonus grant must not disable ordinary storage replenishment or rest.
 constexpr std::optional<VialRestPlan> PlanVialRest(std::optional<int> carried,
                                                   std::optional<int> stored, int room,
-                                                  bool bonus_enabled) {
+                                                  bool bonus_enabled, int count) {
     if (!carried || !stored || *carried < 0 || *carried > 999 || *stored < 0 || *stored > 999 ||
         room < 0 || room > 99)
         return {};
     const int take = std::min(room, *stored);
     const int grant = bonus_enabled ? EmptyVialRefillGrant(*carried + take, *stored - take,
-                                                         room - take) : 0;
+                                                         room - take, count) : 0;
     return VialRestPlan{take, grant, *carried + take + grant, *stored - take};
 }
 } // namespace VR::Lamps

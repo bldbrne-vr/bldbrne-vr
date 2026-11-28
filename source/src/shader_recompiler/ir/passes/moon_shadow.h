@@ -24,10 +24,10 @@
 // The moon's direction comes from the cascade matrices (the direction they do not move along).
 namespace Shader::Optimization::MoonShadow {
 
-// Startup policy (vr.ini moon_shadows, VR_MOON_SHADOWS=0|1 overrides it): with an upscaler only,
-// like the light shadows (the mask then is the upscaler's input size and its noise is averaged).
-inline bool Enabled(bool vr, bool setting, bool upscaler, const char* override_value) {
-    return override_value ? override_value[0] != '0' : vr && setting && upscaler;
+// Startup policy (vr.ini moon_shadows, VR_MOON_SHADOWS=0|1 overrides it): with an upscaler or
+// without, like the light shadows (with one the mask is its input size and its noise averaged).
+inline bool Enabled(bool vr, bool setting, const char* override_value) {
+    return override_value ? override_value[0] != '0' : vr && setting;
 }
 
 // The game's screen-space cascaded shadow programs (the flag is set only for them; the pass

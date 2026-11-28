@@ -33,10 +33,17 @@ namespace VR::Sever {
 
 inline constexpr std::int32_t BeastClawVariation = 900;
 inline constexpr std::int32_t BurialBladeVariation = 510;
+// The Chikage's quick draw out of its scabbard (core/vr/chikage.h), either form: a kill cuts
+// ChikageDrawChance of the time (2026-11-20: "if it kills an enemy if it has a 50%
+// chance to dismember"; 2026-11-26: "can we up its dismemberment for the sheath attack change to
+// 58%?"). Its other swings never cut.
+inline constexpr std::int32_t ChikageVariation = 200;
+inline constexpr float ChikageDrawChance = 0.58f;
 
-// The hit policy: the folded Burial Blade never cuts.
-constexpr bool CanSever(std::int32_t variation, bool form_b) {
-    return variation == BeastClawVariation || (variation == BurialBladeVariation && form_b);
+// The hit policy: the folded Burial Blade never cuts; the Chikage only with its quick draw.
+constexpr bool CanSever(std::int32_t variation, bool form_b, bool chikage_draw = false) {
+    return variation == BeastClawVariation || (variation == BurialBladeVariation && form_b) ||
+           (variation == ChikageVariation && chikage_draw);
 }
 
 // The equipment wake-up: the weapon in either form. The Burial Blade folds and unfolds all fight
@@ -44,7 +51,8 @@ constexpr bool CanSever(std::int32_t variation, bool form_b) {
 // read its model from disk again and the game thread started a new thread at every unfold (the
 // review, 2026-11-16). Each hit still checks CanSever.
 constexpr bool CanWake(std::int32_t variation) {
-    return variation == BeastClawVariation || variation == BurialBladeVariation;
+    return variation == BeastClawVariation || variation == BurialBladeVariation ||
+           variation == ChikageVariation;
 }
 inline constexpr float MaxTiltDeg = 30.0f;  // a long bone's (upper arm, forearm, thigh, calf)
 inline constexpr float NeckTiltDeg = 12.0f; // the neck: short and thick
@@ -299,6 +307,7 @@ struct Hit {
     bool supported{false};  // this enemy's skeleton and mesh are verified for cutting
     bool severed{false};    // this corpse was cut (or tried) before
     bool charged{false};    // a genuine charged attack, not a light-judged wind-up
+    bool chikage_draw{false}; // the Chikage's quick draw (CanSever, ChikageDrawChance)
 };
 
 // A heavy or charged kill cuts by chance, the stronger the swing the surer (the user,
@@ -356,6 +365,9 @@ inline float SeverChance(float tip_mps, float arc_deg) {
 
 // This hit's chance: a heavy's or charged's, or (form B) a light's.
 inline float HitChance(const Hit& h) {
+    if (h.weapon_variation == ChikageVariation && h.chikage_draw) {
+        return ChikageDrawChance;
+    }
     if (h.weapon_variation == BurialBladeVariation) {
         const bool light = LightHit(h);
         const float lo = light ? ScytheLightChanceMin
@@ -380,7 +392,7 @@ enum class Verdict : std::uint8_t {
 };
 
 inline Verdict Decide(const Hit& h) {
-    if (!CanSever(h.weapon_variation, h.form_b)) {
+    if (!CanSever(h.weapon_variation, h.form_b, h.chikage_draw)) {
         return Verdict::NotWeapon;
     }
     if (!h.swing) {

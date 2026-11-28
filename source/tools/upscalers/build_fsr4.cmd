@@ -1,13 +1,11 @@
 @echo off
 setlocal
 pushd "%~dp0\..\.."
-if not exist "tools\upscalers\local\dependencies\fsr4_shaders\opt\pass11-guard.json" (
-    echo FSR assets missing. Run fetch_temporal_dependencies.py --provider fsr4, then prepare_fsr4_assets.py.
-    goto failed
-)
 call "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 >nul
 if errorlevel 1 goto failed
 if not defined VULKAN_SDK set "VULKAN_SDK=C:\VulkanSDK\1.4.357.0"
+python tools/upscalers/prepare_fsr4_assets.py
+if errorlevel 1 goto failed
 rem Optional bbport post-pass rewrite (FAST bit 37) and fenced SPD; a failure keeps the original
 rem passes. The script returns at once when its manifest is current (same recipe and hashes).
 python tools/upscalers/prepare_fsr4_post_lds.py

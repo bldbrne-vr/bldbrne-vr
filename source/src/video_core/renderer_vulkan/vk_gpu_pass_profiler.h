@@ -291,6 +291,13 @@ private:
     std::array<GpuPassDetail::Slice, NumSlices> slices{};
     std::unordered_map<u64, GpuPassDetail::Label> labels;
     std::unordered_map<u64, GpuPassDetail::Total> totals; // the report window
+    // FAST_GPU_PASS_PROFILE_SUBMITS=1 (2026-11-21, the SteamVR stutter): each submission's GPU
+    // span by (its first label, its heaviest label), for the `FAST gpu submissions:` line.
+    struct SubmitRow {
+        u64 ticks = 0, max_ticks = 0, count = 0, over_1ms = 0, over_2ms = 0;
+    };
+    std::unordered_map<u64, std::pair<std::pair<u64, u64>, SubmitRow>> submit_rows;
+    std::vector<float> submit_spans; // the window: every submission's span (ms)
     std::vector<u64> results;
     std::vector<float> frame_spans; // VERIFY: the window's frame spans (ms)
     u64 window_frames = 0;

@@ -37,14 +37,29 @@ struct VertexAttribute {
         return static_cast<InstanceIdType>(instance_data);
     }
 
-    constexpr AmdGpu::Buffer GetSharp(const Shader::Info& info) const noexcept {
-        auto buffer = info.ReadUdReg<AmdGpu::Buffer>(sgpr_base, dword_offset);
+    constexpr AmdGpu::Buffer ApplyOverrides(AmdGpu::Buffer buffer) const noexcept {
         buffer.base_address += inst_offset;
         if (data_format) {
             buffer.data_format = data_format;
             buffer.num_format = num_format;
         }
         return buffer;
+    }
+
+    constexpr AmdGpu::Buffer GetSharp(const Shader::Info& info) const noexcept {
+        return ApplyOverrides(info.ReadUdReg<AmdGpu::Buffer>(sgpr_base, dword_offset));
+    }
+
+    bool HasVertexBuffer(const Shader::Info& info,
+                         const ScratchDraw::Inputs* snapshot) const noexcept {
+        // An offset or typed format can turn a missing table's zero descriptor
+        // into a nonzero one. Check its source before applying those overrides.
+        bool source_valid;
+        const auto raw =
+            info.ReadUdReg<AmdGpu::Buffer>(sgpr_base, dword_offset, snapshot, &source_valid);
+        const auto buffer = ApplyOverrides(raw);
+        constexpr std::array<u8, sizeof(buffer)> empty{};
+        return source_valid && std::memcmp(&buffer, empty.data(), sizeof(buffer)) != 0;
     }
 
     bool operator==(const VertexAttribute& other) const {

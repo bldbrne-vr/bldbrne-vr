@@ -42,6 +42,9 @@ public:
         return used;
     }
     static uint64_t BytesFor(uint32_t width, uint32_t height);
+    // The buffer given back (the lamp shadows off a while: Rasterizer::VrLampShadowsRelease),
+    // freed once the GPU is past this frame; the next Record makes it again. The recording thread.
+    void Release();
 
 private:
     bool Init();

@@ -127,6 +127,8 @@ struct Image {
     std::shared_ptr<Vulkan::VrSceneProxy> scene_proxy;
     Image(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler, BlitHelper& blit_helper,
           Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info);
+    Image(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler, BlitHelper& blit_helper,
+          Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info, u32 capacity);
     ~Image();
 
     Image(const Image&) = delete;
@@ -224,7 +226,13 @@ public:
     std::deque<BackingImage> backing_images;
     BackingImage* backing{};
     boost::container::static_vector<u64, 16> mip_hashes{};
+    // Mips whose mip_hashes are a small image's snapshot baseline (MarkAsMaybeDirty), not the
+    // hash of bytes uploaded into them: a bit each.
+    u32 baseline_mips{};
     u64 image_uid{};
+    void RenewIdentity() {
+        image_uid = global_image_uid.Next();
+    }
     // VR_RETILE_DEFER: bumped by every draw, storage, copy, resolve or upload write (whether a
     // deferred re-tile was recorded before the image changed).
     u64 write_serial{};

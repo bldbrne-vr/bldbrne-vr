@@ -307,6 +307,16 @@ void LightShadowPass(IR::Program& program, const RuntimeInfo& runtime_info) {
             if (!runtime_info.vr_light_shadows) {
                 return;
             }
+            // ... and the edge pass's bits (light_shadow.h EdgePass), which they read.
+            if (LightShadow::SceneMaps::EdgePass() &&
+                std::ranges::find(info.buffers, BufferType::VrShadowEdges,
+                                  &BufferResource::buffer_type) == info.buffers.end()) {
+                info.buffers.push_back({
+                    .used_types = IR::Type::U32,
+                    .inline_cbuf = AmdGpu::Buffer::Placeholder(1024 * sizeof(u32)),
+                    .buffer_type = BufferType::VrShadowEdges,
+                });
+            }
             // After the last of them.
             auto at = entry->Instructions().begin();
             for (auto it = entry->Instructions().begin(); it != entry->Instructions().end();

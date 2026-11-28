@@ -290,8 +290,14 @@ public:
         Id edge_a{}, edge_b{};           // coordinates = a * ndc + b (vec2)
         Id edge_pixel{};                 // a pixel's size in coordinates (vec2)
         Id edge_ok{};                    // a and b are defined (bool)
-        Id edge_budget{};                // Private u32: the marches this pixel may still take
-        Id mask_unsure{};                // the blend had little to go by (bool; unset: never)
+        Id edge_seen{};                  // invocation-local bits for slots already traced in this draw
+        Id edge_visibility{};            // per-invocation results of the multi-light loop
+        Id edge_slots{};                 // frame-wide CPU selection, shared between eyes
+        Id edge_set{};                   // ... the same bits for the mask's march (PlainStepShare)
+        Id edge_code{};                  // the edge pass's byte at this pixel (light_shadow.h EdgePass)
+        Id edge_packed{};                // ... with the corner set: bits 0..3 the corners, 4..11 the byte
+        Id edge_near{};                  // ... and the pixel's nearness (EdgeFar)
+        std::array<Id, 4> edge_corner{}; // neighbours that bound each lamp's edge on this pixel
         Id scene_shift{};
         Id scene_voxel{};                // the grid's voxel (its entries' bias), f32
         // This shader's earlier lights, for grouping small ones (light_shadow.h GroupM): place
@@ -435,6 +441,9 @@ public:
     Id sample_mask{};
     Id sample_index{};
     Id clip_distances{};
+    Id blade_mouth_distance{};
+    Id hone_span{};
+    Id hone_polish{}; // fragment prologue value shared by gloss and the three reflectance channels
     Id cull_distances{};
 
     Id patch_vertices{};

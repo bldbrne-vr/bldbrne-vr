@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <cstring>
 #include <span>
 #include <vector>
 #include <boost/container/static_vector.hpp>
@@ -260,11 +261,38 @@ struct Info : InfoPersistent {
         return *reinterpret_cast<const T*>(&FlatUserData()[sharp_idx]);
     }
 
+    // Inline descriptors live in the registers themselves. Indirect tables use a
+    // 48-bit guest address; the first 64 KiB cannot contain a guest allocation.
+    static const u32* UserDataTable(std::span<const u32> words, u32 ptr_index) noexcept {
+        if (ptr_index == IR::NumScalarRegs)
+            return words.data();
+        if (size_t(ptr_index) + 2 > words.size())
+            return nullptr;
+        u64 address;
+        std::memcpy(&address, words.data() + ptr_index, sizeof(address));
+        address &= 0xFFFFFFFFFFFFULL;
+        return address < 0x10000 ? nullptr : reinterpret_cast<const u32*>(address);
+    }
+
     template <typename T>
     T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
+        return ReadUdReg<T>(ptr_index, dword_offset, ScratchDraw::Find(this), nullptr);
+    }
+
+    template <typename T>
+    T ReadUdReg(u32 ptr_index, u32 dword_offset, const ScratchDraw::Inputs* snapshot,
+                bool* source_valid) const noexcept {
         T data;
+        const auto words = snapshot ? snapshot->user : user_data;
+        const u32* base = UserDataTable(words, ptr_index);
+        if (ptr_index == IR::NumScalarRegs &&
+            u64(dword_offset) * sizeof(u32) + sizeof(T) > words.size_bytes()) {
+            base = nullptr;
+        }
+        if (source_valid)
+            *source_valid = base != nullptr;
         if constexpr (sizeof(T) == sizeof(ScratchDraw::RegisterRead::words)) {
-            if (const auto* snapshot = ScratchDraw::Find(this)) {
+            if (snapshot) {
                 for (const auto& read : snapshot->register_reads) {
                     if (read.pointer_index == ptr_index && read.dword_offset == dword_offset) {
                         std::memcpy(&data, read.words.data(), sizeof(T));
@@ -276,13 +304,16 @@ struct Info : InfoPersistent {
                 }
             }
         }
-        const auto data_view = UserData();
-        const u32* base = data_view.data();
-        if (ptr_index != IR::NumScalarRegs) {
-            std::memcpy(&base, &data_view[ptr_index], sizeof(base));
-            base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
+        // A table pointer the game left empty (the Laurence fight, 2026-11-18: a shadow draw of
+        // vertex program 0x7aeaa7a7 whose vertex buffer table, user data register 2, is null; the
+        // SRT walker's fault handler had just zeroed the same pointer's reads): zeros, as that
+        // handler gives, not a read of address 0, which ended the process. A draw with such a
+        // vertex buffer is then left out (vk_pipeline_cache.cpp RefreshGraphicsKey).
+        if (base == nullptr) [[unlikely]] {
+            std::memset(static_cast<void*>(&data), 0, sizeof(T));
+        } else {
+            std::memcpy(&data, base + dword_offset, sizeof(T));
         }
-        std::memcpy(&data, base + dword_offset, sizeof(T));
         if constexpr (sizeof(T) == sizeof(TranslationCapture::Read::words)) {
             if (g_translation_capture) [[unlikely]] {
                 g_translation_capture->NoteRead(ptr_index, dword_offset, &data);

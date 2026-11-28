@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 
@@ -115,12 +116,18 @@ inline constexpr float FarM = 64.0f;
 // its "distant-view" banks are meant to be seen from further than 64 m). VR_FOG_GRID_FAR=<m>
 // (64..256) puts the last slice there: the same 64 slices, each a little deeper (160 m: 9.4% a
 // slice, not 7.9%). The fog patches' far fade and reach go with it (fog_patches.h).
-// With the game's fog taken over: TakenFarM (set once at start, before the first frame, by
-// core/vr/bloodborne_woods_shadows.cpp).
+// With the game's fog taken over: TakenFarM.
 inline constexpr float TakenFarM = 128.0f;
-inline bool& FogTaken() {
-    static bool taken = false;
+// The game's fog taken over in the hunter's map: set by core/vr/bloodborne_woods_shadows.cpp, at
+// the start (before the first frame) as the menu's Fog row is, then once a frame as his map's file
+// was loaded (since 2026-11-21 the row switches the fog at the next load of an area). Everything
+// that follows it reads it each time (a change comes with a load of an area).
+inline std::atomic<bool>& FogTakenNow() {
+    static std::atomic<bool> taken{false};
     return taken;
+}
+inline bool FogTaken() {
+    return FogTakenNow().load(std::memory_order_relaxed);
 }
 // The moonlit thin air's far fade (moon_shafts.h FarFade: a surface beyond the air's reach keeps
 // less of the glow, down to FarKeep at `fade` times the reach) ends no further than the grid: the
@@ -141,12 +148,11 @@ inline float GlowBeyond(float z_m, float reach_m, float fade) {
     return t * t * (3.0f - 2.0f * t);
 }
 inline float FarNow() {
-    static const float v = [] {
+    static const float asked = [] {
         const char* const env = std::getenv("VR_FOG_GRID_FAR");
-        return env != nullptr ? std::clamp(static_cast<float>(std::atof(env)), FarM, 256.0f)
-                              : FogTaken() ? TakenFarM : FarM;
+        return env != nullptr ? std::clamp(static_cast<float>(std::atof(env)), FarM, 256.0f) : 0.0f;
     }();
-    return v;
+    return asked > 0.0f ? asked : FogTaken() ? TakenFarM : FarM;
 }
 
 // The frustum: the head's, widened to hold both eyes. An eye sits `shift` to the side of the head
@@ -261,11 +267,11 @@ inline constexpr u32 SizeX = 128, SizeZ = 128, SizeY = 48; // host_shaders/vr_fo
 inline constexpr float CubeM = 0.5f, TallM = 0.25f;
 inline constexpr float BelowM = 4.0f; // of the box under the hunter's feet (the rest, 8 m, over them)
 inline bool On() {
-    static const bool on = [] {
+    static const bool off = [] {
         const char* const env = std::getenv("VR_FOG_VOLUME");
-        return FogTaken() && !(env != nullptr && env[0] == '0');
+        return env != nullptr && env[0] == '0';
     }();
-    return on;
+    return FogTaken() && !off;
 }
 } // namespace World
 inline constexpr u32 WorldVec4 = LayerVec4 + 1;
@@ -330,11 +336,11 @@ inline int Test() {
     return bits;
 }
 inline bool On() {
-    static const bool on = [] {
+    static const bool off = [] {
         const char* const env = std::getenv("VR_FOG_STIR");
-        return World::On() && !(env != nullptr && env[0] == '0');
+        return env != nullptr && env[0] == '0';
     }();
-    return on;
+    return World::On() && !off;
 }
 } // namespace Stir
 inline constexpr u32 StirVec4 = GroundVec4 + 1 + GroundCells * GroundCells / 4;
@@ -343,7 +349,24 @@ inline constexpr u32 StirVec4s = 3 + 2 * Stir::MaxMovers;
 // dies less by a metre past the even distance in the taken-over banks, in the mist; the contrast
 // it begins at, 1 / the contrast's span to all of it.
 inline constexpr u32 LampFarVec4 = StirVec4 + StirVec4s;
-inline constexpr u32 ParamVec4s = LampFarVec4 + 1;
+// The banks the world-fixed volume holds, a bit a bank in its first word: vr_fog_grid.comp's
+// InVolume asked once a build here (HeldMask), where every column of both passes and every bank of
+// every slice asked the same three numbers again (a code review, 2026-11-19).
+inline constexpr u32 HeldVec4 = LampFarVec4 + 1;
+// The lamps' light the fog gathers along a ray, softly limited (Lamps::Soft* below): the limit of
+// the bare lamps' light, of the lamps' with a halo (in the grid's light, MAX_LIGHT = 64 white; 0:
+// none), 0, 0. (A lamp's kind: LampFreeVec4's second vec4's w, 1 with a halo.)
+inline constexpr u32 LampSoftVec4 = HeldVec4 + 1;
+// The blasts of the frame (core/vr/fog_impulse.h Blasts; how many: the stir block's second vec4,
+// w): two vec4 a blast: its middle (x, z), 1 / r^2, the hole's depth | the wisps' carry (x, z; m),
+// their shove outward (a metre from its middle), their churn.
+inline constexpr u32 MaxBlasts = 6;
+inline constexpr u32 BlastVec4 = LampSoftVec4 + 1;
+// (A third vec4 a blast: its ring of piled fog (where in x = d^2 / r^2, 1 / its width, how much
+// thicker) and the wisps' turn round its middle, a metre from it.)
+// (A fourth: its long way (x, z; none: round), the height the fog has come back up to, 0.)
+inline constexpr u32 BlastVec4s = 4;
+inline constexpr u32 ParamVec4s = BlastVec4 + BlastVec4s * MaxBlasts;
 inline constexpr u32 ParamDwords = ParamVec4s * 4;
 
 // The moon's shadow in the mist (live keys lighting.grid_contrast, lighting.grid_lit): the mist's
@@ -482,11 +505,11 @@ inline constexpr float HeldCoreM2 = 4.0f; // (flatter near the hand: the warm li
 inline constexpr float MapLampShare = 1.0f;
 inline constexpr float MapLampSameM = 1.0f;
 inline bool MapLamps() {
-    static const bool on = [] {
+    static const bool off = [] {
         const char* const env = std::getenv("VR_FOG_MAP_LAMPS");
-        return FogTaken() && !(env != nullptr && env[0] == '0');
+        return env != nullptr && env[0] == '0';
     }();
-    return on;
+    return FogTaken() && !off;
 }
 // On the game's fog taken over a lamp's light counts this many times (the bank is knee-high and
 // thin: at the mist's own strength a lantern 2 m off barely showed in it; the game's own fog by a
@@ -575,6 +598,43 @@ inline std::array<float, 3> FarNow() {
         return f;
     }();
     return v;
+}
+// The lamps' light in the fog levels off as the fog thickens (2026-11-20, of a lamp by
+// the Oedon Chapel urns whose glow grew to a bright ball each time its bank swelled, Breath: "I do
+// want lights to light up fog though... just to not pile up"). A place of fog gives the lamp light
+// it scatters times its density, so a bank swelled to three times its thin self made the glow three
+// times as bright, a ball with no flame in it. The light a ray gathers from the lamps is SoftLimit
+// * (1 - exp(-light / SoftLimit)): thin fog by a lamp as before (the curve starts at the light
+// itself), a thick bank's glow towards SoftLimit, never past it; its hue kept.
+// Two limits (the user, the same day: "if there is an actual lamp (like if there is a halo there)
+// it's ok if the limit goes higher up. But if there is no halo and it's just atmospheric, then it
+// needs to have a cap"): SoftLimit for a bare lamp's light (the map's lamps the frame's list does
+// not hold: no halo of ours), SoftHaloLimit for the lamps the frame's list gives the grid (each
+// with its halo: air_light.h Sources), the light in your hand and a shot's flash. Set by the
+// user at the Oedon Chapel urn lamp: "HALOED should be uncapped, bare should be max 1.6".
+// VR_FOG_LAMP_SOFT="bare,halo" (0: no limit; "0,0": as before).
+inline constexpr float SoftLimit = 1.6f;
+inline constexpr float SoftHaloLimit = 0.0f;
+// The Forbidden Woods' bare lamps (the user, the same day: "make forbidden woods always be at ...
+// max, and everywhere else at 1.6", then "capped to 4"): its mist under the trees is dark and its
+// lamps and lanterns light it as a glow the woods are known by. Area 0x1B (core/vr/game_area.h).
+inline constexpr float SoftWoodsLimit = 4.0f;
+inline constexpr u32 SoftWoodsArea = 0x1B;
+// The two limits where the hunter is (`map`: (area << 8) | block, the fog patches' map).
+// VR_FOG_LAMP_SOFT="bare,halo" (tests) for every area.
+inline std::array<float, 2> SoftFor(u32 map) {
+    static const std::array<float, 2> pinned = [] {
+        std::array<float, 2> s{-1.0f, -1.0f};
+        if (const char* const env = std::getenv("VR_FOG_LAMP_SOFT")) {
+            std::sscanf(env, "%f,%f", &s[0], &s[1]);
+            s = {std::clamp(s[0], 0.0f, 64.0f), std::clamp(s[1], 0.0f, 64.0f)};
+        }
+        return s;
+    }();
+    if (pinned[0] >= 0.0f) {
+        return pinned;
+    }
+    return {(map >> 8) == SoftWoodsArea ? SoftWoodsLimit : SoftLimit, SoftHaloLimit};
 }
 // How much of the further reach a place of fog gets by the contrast (the shader's LampFurther).
 inline float FarOf(float contrast, float lo, float hi) {

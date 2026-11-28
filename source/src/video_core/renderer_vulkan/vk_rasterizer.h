@@ -20,7 +20,10 @@
 #include "common/logging/log.h"
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
+#include "core/vr/chikage_clip.h"
+#include "core/vr/fog_impulse.h"
 #include "core/vr/render_taa.h"
+#include "core/vr/s1_dynamic_resolution.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_dispatch_eye_overlap.h"
@@ -30,6 +33,7 @@
 #include "video_core/renderer_vulkan/vk_recorder.h"
 #include "video_core/renderer_vulkan/vr_body_maps.h"
 #include "video_core/renderer_vulkan/vr_depth_pyramid.h"
+#include "video_core/renderer_vulkan/vr_shadow_edges.h"
 #include "video_core/renderer_vulkan/vr_fog_grid.h"
 #include "video_core/texture_cache/download_log.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -172,13 +176,9 @@ public:
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
-    /// `emulator_write`: the emulator's own write of exactly these bytes (MemoryManager::
-    /// InvalidateMemory: a file read, a video frame, a protection change), not a guest fault.
-    /// `protection_only`: a protection change (sceKernelMprotect), which writes no byte.
     /// The game handed [addr, addr + size) of GPU memory out again (any thread).
     void NoteFreshRange(VAddr addr, u64 size);
-    bool InvalidateMemory(VAddr addr, u64 size, bool emulator_write = false,
-                          bool protection_only = false);
+    bool InvalidateMemory(VAddr addr, u64 size, VideoCore::TextureMemory::Invalidation source);
     /// Fast renderer (FastRender::FaultWindow): after a guest write fault at `addr`.
     void UnprotectFaultWindow(VAddr addr);
     /// InvalidateMemory(addr, 8) for a guest write fault there (FAST_GPU_PAGE_KEEP).
@@ -224,7 +224,8 @@ public:
         return vr_dibr.composite_record;
     }
     // PrepareFrame / PrepareBlankFrame: the frame is over, nothing of it is captured any more.
-    void VrEndFrame();
+    void VrEndFrame(bool used_layer_scene = false);
+    const S1Drs::FrameState& DrsFrame() const { return drs; }
     // The DIBR centre was reconstructed by the upscaler (vr_dibr_upscale.h) at its output size.
     bool VrDibrUpscaledFrame() const { return vr_dibr.upscaled; }
 
@@ -386,6 +387,7 @@ private:
         const VrHandsTable::Range* hands_split{};
         u32 hands_split_count{}, cut_code{};
         // cut_code a Monocular code (native stereo): the body cut the free eye keeps (0: none).
+        VR::Chikage::BladeClip blade_clip{};
         u32 free_eye_cut{};
         bool probe_selected{};
         // A draw of the hunter's in the moon's nearest cascade (vr_body_maps.h): captured (its
@@ -446,6 +448,7 @@ private:
         std::array<float, 3> world{}; // with the frame's view (VrFogState::view)
         bool map{};                   // the map's own light (FogLight::IsMapLight)
         bool on_lantern{};            // verified flame in the merged list
+        bool no_halo{};               // hung where no flame is (map_objects.h NoHalo): no glow
     };
     struct VrFogCluster {
         VrFogLight light; // combined colour and reach at the weighted centre
@@ -479,8 +482,17 @@ private:
         // own lantern, kept like its lamps; or one seen off every object (a carried light).
         bool fixture{};
         bool strayed{};
+        // A light without the map's tag by how it behaves (FogLight::PlacedStillS): where it
+        // last rested and for how long; lively (it has flickered or moved, or is the held
+        // light: a flame without a look), or placed (still and steady: asked for its flame).
+        std::array<float, 3> rest{};
+        float still{};
+        bool lively{};
+        bool placed{};
         bool seen{};   // listed this frame
         bool chosen{}; // drawn last frame (FogLight::KeepChosen)
+        bool blast{}; // an explosion's light (FogLight::IsBlastLight): no glow, a moment's lit mist
+        bool no_halo{}; // hung where no flame is (map_objects.h NoHalo): no glow of its own
     };
     // A lamp memory light where this frame's camera sees it, as VrFogUpload ranks them.
     struct VrFogCandidate {
@@ -529,6 +541,11 @@ private:
         std::chrono::steady_clock::time_point muzzle_t0{};
         bool muzzle_on{};
         u64 muzzle_seen{}; // the gun's shots taken (muzzle_flash.h)
+        // The newest explosion (muzzle_flash.h Blast): where and when (FogLight::IsBlastLight).
+        std::array<float, 3> blast_world{};
+        std::chrono::steady_clock::time_point blast_t0{};
+        bool blast_on{};
+        u64 blast_seen{};
         // The memory's last step (seconds) and the frame the shadowed air's shares last moved.
         float memory_dt{};
         u64 shadow_frame{};
@@ -637,6 +654,12 @@ private:
     std::unique_ptr<VrDepthPyramid> vr_pyramid;
     u64 vr_pyramid_frame{~0ull}; // the frame whose pyramid was recorded (or tried)
     bool vr_pyramid_ready{};     // ... and was
+    // The lamp shadows' edge pass (vr_shadow_edges.h): before the frame's first lamp draw.
+    void VrEdgesBeforeDraw(const GraphicsPipeline* pipeline);
+    std::unique_ptr<VrShadowEdges> vr_edges;
+    u64 vr_edges_frame{~0ull}; // the frame whose pass was recorded (or tried)
+    u32 vr_edges_live{};       // ... its serial when it was (0: not; the lamps keep the blend)
+    u32 vr_edges_counter{};
     // The fog grid (vr_fog_grid.h, shader_recompiler/ir/passes/fog_grid.h; VR_FOG_GRID=1): built
     // before the frame's scene copy from the mist's numbers of that frame's air pass
     // (vk_rasterizer_fog_grid.cpp).
@@ -669,12 +692,20 @@ private:
         // corner, when); the movers' last places, for their speeds.
         bool stir{};
         bool stir_built{};
+        s64 stir_combat_seen{};
+        s64 stir_burst_seen{};                    // the explosions' channel (fog_impulse.h bursts)
+        VR::FogImpulse::GunWake stir_gun_wake;
+        VR::FogImpulse::Blasts stir_blasts;       // the shots' and swings' blasts (fog_impulse.h)
+        std::array<s64, 2> stir_hand_blast_ns{};  // when each hand's swing last blew one
+        s64 stir_test_blast_ns{};                 // (tests: VR_FOG_BLAST_TEST's last)
         std::array<float, 2> stir_corner{};
         std::chrono::steady_clock::time_point stir_time{};
         std::array<float, 3> stir_hunter{};
         bool stir_hunter_known{};
         std::array<std::array<float, 3>, 2> stir_hand{};
         std::array<bool, 2> stir_hand_known{};
+        float stir_heading{};        // the last frame's game heading (rad; a snap turn's jump)
+        bool stir_heading_known{};
         std::array<std::array<float, 2>, 8> stir_others{};
         u32 stir_other_count{};
         float game_rays{1.0f};
@@ -734,6 +765,10 @@ private:
         std::array<float, 12> view{};
     } vr_attached;
     bool vr_grid_ready{};
+    // Frames the lamp shadows have been off (VrLampShadowsRelease: their buffers given back after
+    // a while; 0 while they are on).
+    u32 vr_lamps_off_frames{};
+    void VrLampShadowsRelease();
     u32 vr_grid_counter{};
     u64 vr_grid_header{~0ull}; // the frame whose header was written
     void VrShadowGridBeforeDraw(const GraphicsPipeline* pipeline);
@@ -775,6 +810,7 @@ private:
             float strength{};             // its shadow's strength (the lamp shaders' rule)
             float clear{};                // its fixture's clearance (the march's rule), game units
             bool held{};                  // in a hand (it moves: kept within SlotKeepM, not KeepFixedM)
+            float eye_m{};                // its distance from the eye when listed (view metres)
         };
         std::vector<Lamp> building;       // this frame's lamps (VrFogCapture)
         static constexpr size_t SlotCount = 16; // light_shadow.h SceneMaps::Slots
@@ -783,6 +819,7 @@ private:
         std::array<std::array<float, 3>, SlotCount> prev{}; // where each slot's lamp was last frame
         std::array<u32, SlotCount> unseen{};     // frames since each slot's lamp was last listed
         std::array<u32, SlotCount> age{};        // frames since each slot's lamp took it
+        u32 out_of_range{}; // slots whose lamp a draw listed past its range this frame (a bit each)
         // The trace's reach from the eye by the GPU's time (light_shadow.h TraceFarLevels).
         struct TraceDial {
             float reach_m{12.0f}; // this frame's reach (view metres)
@@ -819,6 +856,7 @@ private:
         // SlotHero a slot (High lamp shadows, light_shadow.h High): the frame's hero lamps, picked
         // with the slots (the last pick's, kept for its hysteresis).
         u32 hero_mask{};
+        u32 edge_mask{};
     } vr_scene;
     bool VrCameraFillKept() const;
     u32 VrBodyUpload(std::span<u32> out, u64 pgm_hash = 0);
@@ -1659,6 +1697,11 @@ private:
     u8 vr_aa_action{};
     std::unique_ptr<VrSmaa> vr_smaa;
     bool vr_temporal_enabled{}, vr_temporal_scaled{};
+    S1Drs::FrameState drs;
+    S1Drs::Governor drs_governor;
+    vk::Extent2D drs_native_extent{};
+    vk::Format drs_native_format{vk::Format::eUndefined};
+    bool drs_native_blit{};
     std::array<float,2> vr_scene_inverse{1.f,1.f};
     std::optional<RenderState> VrTemporalRenderState(const GraphicsPipeline* pipeline);
     u64 vr_temporal_frame{};
@@ -1673,7 +1716,7 @@ private:
                              u32 index_offset, u32 vertex_offset, u32 first_instance);
     void VrTemporalDispatch(u64 shader);
     void VrS1Reconstruct(); // S1 (FAST bit 51): the provider after the composite
-    void VrTemporalEndFrame();
+    void VrTemporalEndFrame(bool used_layer_scene);
     // DIBR upscaler object motion (vr_dibr_upscale.h): the native hooks' single-view twins,
     // called by them outside native stereo.
     void VrDibrMotionBeforeDraw(const GraphicsPipeline* pipeline, bool indirect, bool indexed,

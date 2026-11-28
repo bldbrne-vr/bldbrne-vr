@@ -22,6 +22,7 @@
 #include "core/vr/body_channel.h"
 #include "core/vr/hook_util.h"
 #include "core/vr/motion_camera.h"
+#include "core/vr/s1_dynamic_resolution.h"
 #include "core/vr/vr_session.h"
 
 namespace VR::Bloodborne {
@@ -854,8 +855,10 @@ VR::Vec3 ComfortEye(const EyeTick& tick, const char* reset) {
                     Pos(tick.target), c.rejected, shown, Pos(out.position));
     }
     if (out.reset) {
-        const bool jump = std::strcmp(out.reset_reason, "teleport") == 0 ||
-                          std::strcmp(out.reset_reason, "lag") == 0;
+        const bool teleport = std::strcmp(out.reset_reason, "teleport") == 0;
+        if (teleport && S1Drs::enabled)
+            S1Drs::NoteTeleport();
+        const bool jump = teleport || std::strcmp(out.reset_reason, "lag") == 0;
         // Teleports and lag resets are rare (lamps, respawns) and always logged.
         if (jump || DodgeLog() >= 1) {
             LOG_INFO(Core, "VR dodge: RESET reason={}{} target={} mode={}{}", out.reset_reason,

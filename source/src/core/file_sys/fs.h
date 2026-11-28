@@ -50,6 +50,7 @@ public:
         std::string mount; // e.g /app0
         bool read_only;
         std::vector<std::shared_ptr<IBackend>> backends;
+        size_t first_game_backend{}; // skip all mod overlays
     };
 
     enum class HostPathType {
@@ -96,6 +97,9 @@ public:
     /// open + read the whole file as bytes. Returns nullopt
     /// when the file does not exist or is unreadable.
     std::optional<std::vector<u8>> ReadFile(std::string_view guest_path);
+
+    // Bounded read from the mounted patch/base, bypassing the mod overlay.
+    std::optional<std::vector<u8>> ReadGameAsset(std::string_view relative, u64 max_size);
 
     const MntPair* GetMountFromHostPath(const std::string& host_path) {
         std::scoped_lock lock{m_mutex};

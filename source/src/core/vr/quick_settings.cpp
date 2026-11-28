@@ -80,8 +80,6 @@ bool ParseQuickSetting(const std::string& key, const std::string& value) {
         s.fan_style = value == "brass" || value == "1" ? 1 : 0;
     } else if (key == "quick_fan_seen") {
         s.fan_seen = Flag(value);
-    } else if (key == "quick_fan_return_seen") {
-        s.fan_return_seen = Flag(value);
     } else if (key == "quick_arc_grace_ms") {
         s.grace_ms = std::clamp(f(), 0.0f, 500.0f);
     } else if (key == "quick_arc_nearest") {
@@ -204,8 +202,6 @@ bool ParseQuickSetting(const std::string& key, const std::string& value) {
         s.tap_use_ms = std::clamp(f(), 0.0f, 2000.0f);
     } else if (key == "quick_grip_hold") {
         s.grip_hold = Flag(value);
-    } else if (key == "quick_fan_return_ms") {
-        s.fan_return_ms = std::clamp(f(), 0.0f, 30000.0f);
     } else if (key == "quick_grip_open_ms") {
         s.grip_open_ms = std::clamp(f(), 0.0f, 1000.0f);
     } else if (key == "quick_tool_keep") {
@@ -286,12 +282,17 @@ bool ParseQuickSetting(const std::string& key, const std::string& value) {
         s.knife_assist = std::clamp(f(), 0.0f, 1.0f);
     } else if (key == "knife_assist_deg") {
         s.knife_assist_deg = std::clamp(f(), 0.0f, 30.0f);
+    } else if (key == "throw_nudge_seen") {
+        s.throw_nudge_seen = Flag(value);
     } else if (key == "inframe") {
         s.inframe = Flag(value);
     } else if (key == "inframe_exposure") {
         s.inframe_exposure = std::clamp(f(), 0.2f, 4.0f);
     } else if (key == "inframe_hand_sync") {
         s.inframe_hand_sync = Flag(value);
+    } else if (key == "quick_fan_return_ms" || key == "quick_fan_return_seen") {
+        // Retired 2026-11-26 (the fan stays closed until it is opened again): an old vr.ini line
+        // is accepted and ignored, not reported as an unknown setting at every start.
     } else {
         return false;
     }
@@ -477,11 +478,8 @@ void WriteQuickDefaults(std::ostream& out) {
         << "# the grip holds: the grip on a card takes the item and holds it while squeezed (as a "
            "pocket's), the\n# trigger uses it, let go of the grip it is thrown or put back; "
            "the trigger with the fan open is the\n# gun; 0 = the trigger takes (quick_tap_pick). "
-           "An item put back unused within this long of its take\n# brings the fan back; "
-           "one used or thrown never does (ms; 0 = never)\n"
+           "Putting an item back, using it or\n# throwing it closes the fan\n"
         << "quick_grip_hold=" << (d.grip_hold ? 1 : 0) << "\n"
-        << "quick_fan_return_ms=" << d.fan_return_ms << "\n"
-        << "quick_fan_return_seen=1\n"
         << "# the grip in the air opens the fan once squeezed this long (ms; 0 = at the squeeze; "
            "Y and X at once)\n"
         << "quick_grip_open_ms=" << d.grip_open_ms << "\n"
@@ -551,6 +549,7 @@ void WriteQuickDefaults(std::ostream& out) {
            "0 = the yaw assist above\n"
         << "knife_assist=" << d.knife_assist << "\n"
         << "knife_assist_deg=" << d.knife_assist_deg << "\n"
+        << "throw_nudge_seen=1\n"
         << "# the hunter's own horizontal velocity carried by a throw (0 = none)\n"
         << "throw_inherit_motion=" << d.throw_inherit_motion << "\n"
         << "# real gravity and no speed clamps for thrown items / gravity (m/s^2)\n"

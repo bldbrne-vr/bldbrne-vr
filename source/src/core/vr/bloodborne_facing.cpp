@@ -352,6 +352,7 @@ void PS4_SYSV_ABI OnLockUpdated() {
     u8* const chr = MainPlayer();
     u8* const ctrl = chr != nullptr ? Read<u8*>(chr + OffsetChrCtrl) : nullptr;
     if (chr == nullptr || !Plausible(ctrl) || Read<const u8*>(ctrl + OffsetCtrlOwner) != chr) {
+        VR::NoteLockTarget(false, false, 0.0f);
         g_active.store(false, std::memory_order_relaxed);
         s.was_active = false;
         g_busy.clear(std::memory_order_release);
@@ -366,6 +367,27 @@ void PS4_SYSV_ABI OnLockUpdated() {
     const bool locked = Read<u8>(chr + OffsetLockChosen) != 0;
     B::Anchor anchor{};
     const bool have_anchor = B::LatestAnchor(anchor);
+    // Lock-on follow (core/vr/lock_follow.h): the bearing from the hunter to the game's lock
+    // point, read before the facing below writes its own. From his body, not the eye: a lean or a
+    // duck moves the eye (2026-11-27: "if I lean to the right then I just lean to the
+    // right"), and the eye's bearing would turn the view against it.
+    {
+        bool have_yaw = false;
+        float target_yaw = 0.0f;
+        float distance = 0.0f;
+        if (locked && w_ok) {
+            std::array<float, 4> point{};
+            std::memcpy(point.data(), chr + OffsetLockPoint, sizeof(point));
+            const float dx = point[0] - frame.t.x;
+            const float dz = point[2] - frame.t.z;
+            if (std::isfinite(dx) && std::isfinite(dz) && dx * dx + dz * dz > 1e-4f) {
+                target_yaw = std::atan2(dx, dz); // FacingAim's convention
+                distance = std::sqrt(dx * dx + dz * dz);
+                have_yaw = true;
+            }
+        }
+        VR::NoteLockTarget(locked, have_yaw, target_yaw, distance);
+    }
     const char* why = nullptr;
     if (!B::GetBodySettings().body_facing) {
         why = "body_facing=0";
@@ -440,7 +462,8 @@ void PS4_SYSV_ABI OnLockUpdated() {
         g_reading.valid = view_ok;
         g_reading.heading = active;
         g_reading.hunter_yaw = active ? want : chr_yaw;
-        g_reading.stick_yaw = anchor.view_yaw;
+        float aim_yaw = 0.0f;
+        g_reading.stick_yaw = VR::LockAimYaw(aim_yaw) ? aim_yaw : anchor.view_yaw;
         g_reading.steady_ns = now;
     }
     if (active && !s.was_active) {

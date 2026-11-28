@@ -361,7 +361,7 @@ void PS4_SYSV_ABI OffhandDamageHook(u8* res, u8* saved_ymm, u8* attacker) {
     *damage = OutgoingDamage::Scale(*damage,
         OutgoingDamage::live_percent.load(std::memory_order_relaxed),
         attacker == player, Plausible(target) && target != player);
-    // The Bowblade's arrows (bow_damage_pct, core/vr/bow.h ArrowDamageScale: 105%).
+    // The hunter's Bowblade arrows (bow_damage_pct).
     if (std::isfinite(*damage) && *damage > 0.0f) {
         *damage *= VR::Bow::ArrowDamageScale(Read<s32>(res + ResBehaviorId),
                                              Read<s32>(res + ResBullet) != -1, attacker == player,

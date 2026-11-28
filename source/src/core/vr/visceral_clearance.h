@@ -67,7 +67,8 @@ inline std::optional<float> RayCapsule(Body::Vec3 eye, Body::Vec3 dir,
         const auto dp = dir - u * du, vp = v - u * vu;
         const float a = Body::LengthSq(dp), b = Body::Dot(dp, vp);
         const float disc = b * b - a * (Body::LengthSq(vp) - c.radius * c.radius);
-        if (a > 1e-8f && disc >= 0.0f) {
+        // Even a nearly axial ray can enter through the side before reaching either cap.
+        if (a > 0.0f && disc >= 0.0f) {
             const float h = std::sqrt(disc);
             for (float t : {(-b - h) / a, (-b + h) / a}) {
                 const float axial = vu + t * du;

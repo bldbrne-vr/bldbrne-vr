@@ -100,7 +100,7 @@ static Uint32 SDLCALL PollControllerLightColour(void* userdata, SDL_TimerID time
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controllers_,
                      std::string_view window_title)
-    : width{width_}, height{height_}, controllers{*controllers_} {
+    : pixel_size{PixelSize{width_, height_}}, controllers{*controllers_} {
     if (!SDL_SetHint(SDL_HINT_APP_NAME, Common::g_application_name)) {
         UNREACHABLE_MSG("Failed to set SDL window hint: {}", SDL_GetError());
     }
@@ -121,8 +121,8 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
                           std::string(window_title).c_str());
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width_);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height_);
     SDL_SetNumberProperty(props, "flags", SDL_WINDOW_VULKAN);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
     // Creating the window directly in fullscreen avoids a visible windowed -> fullscreen
@@ -164,7 +164,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     SDL_SyncWindow(window);
     // The window geometry is only final once the fullscreen transition has settled; refresh
     // the cached size so the first swapchain and the splashscreen use the real drawable size.
-    SDL_GetWindowSizeInPixels(window, &width, &height);
+    RefreshPixelSize();
 
     SDL_InitSubSystem(SDL_INIT_GAMEPAD);
 
@@ -391,8 +391,15 @@ void WindowSDL::ReleaseKeyboard() {
     }
 }
 
+void WindowSDL::RefreshPixelSize() {
+    PixelSize size{};
+    if (SDL_GetWindowSizeInPixels(window, &size.width, &size.height)) {
+        pixel_size.store(size, std::memory_order_relaxed);
+    }
+}
+
 void WindowSDL::OnResize() {
-    SDL_GetWindowSizeInPixels(window, &width, &height);
+    RefreshPixelSize();
     ImGui::Core::OnResize();
 }
 

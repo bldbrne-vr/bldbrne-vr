@@ -153,11 +153,16 @@ s32 GoodsCount(const u8* player, s32 goods) {
         return -1;
     }
     u8* const inv = pgd + OffsetInventory;
+    if (Read<u32>(inv + OffsetInvCapacity) == 0) {
+        return -1;
+    }
     const u32 item = GoodsCategory | static_cast<u32>(goods);
     const s32 index = g.find(inv, &item);
-    if (index < 0 || Read<u32>(inv + OffsetInvCapacity) == 0 ||
-        static_cast<u32>(index) > Read<u32>(inv + OffsetInvHighest)) {
+    if (index < 0) {
         return 0;
+    }
+    if (static_cast<u32>(index) > Read<u32>(inv + OffsetInvHighest)) {
+        return -1;
     }
     const u32 key_cap = Read<u32>(inv + OffsetInvKeyCap);
     const u32 i = static_cast<u32>(index);
@@ -166,7 +171,7 @@ s32 GoodsCount(const u8* player, s32 goods) {
         return -1;
     }
     const u8* e = list + static_cast<size_t>(i < key_cap ? i : i - key_cap) * 16;
-    return Read<u32>(e) != 0 && Read<u32>(e + 4) == item ? Read<s32>(e + 8) : 0;
+    return Read<u32>(e) != 0 && Read<u32>(e + 4) == item ? Read<s32>(e + 8) : -1;
 }
 
 void Check(u8* module) {
@@ -308,9 +313,8 @@ void VitalsSiteA(u8* module, u8* player) {
         Check(module);
     }
     const auto& settings = VR::GetSettings();
-    if ((settings.hud_vitals == static_cast<s32>(V::Mode::Classic) && !settings.health_color &&
-         !settings.stamina_color) ||
-        player == nullptr) {
+    const bool wrist = settings.hud_vitals != static_cast<s32>(V::Mode::Classic);
+    if ((!wrist && !settings.health_color && !settings.stamina_color) || player == nullptr) {
         return;
     }
     V::Status s{};
@@ -325,14 +329,14 @@ void VitalsSiteA(u8* module, u8* player) {
         s.stamina = Read<s32>(data + OffsetStamina);
         s.max_stamina = Read<s32>(data + OffsetMaxStamina);
         s.rally_hp = V::RallyEnd(s.hp, s.max_hp, pool);
-        if (settings.hud_vitals != static_cast<s32>(V::Mode::Classic)) {
+        if (wrist) {
             s.qs_bullets = GoodsCount(player, QuicksilverBullets);
             s.blood_bullets = GoodsCount(player, BloodBullets);
             g.seen_max_bullets = std::max(g.seen_max_bullets, s.qs_bullets);
             s.bullet_cap = V::BulletCap(g.seen_max_bullets);
         }
         s.ok = s.max_hp > 0 && s.hp >= 0 && s.hp <= s.max_hp && s.max_stamina > 0 &&
-               s.qs_bullets >= 0 && s.blood_bullets >= 0;
+               (!wrist || s.HasBulletCounts());
     }
     // VR_VITALS_TEST_FAIL=<s> (tests only): every read fails from <s> seconds after the first one
     // (the fallback to the classic HUD).

@@ -86,7 +86,7 @@ public:
     };
     const StageWrites& Writes() const;
 
-    /// The VR buffers the fragment stage binds, worked out once (recording thread): the
+    /// The VR buffers and effect passes the fragment stage uses, worked out once: the
     /// rasterizer's per-draw VR hooks test a bit instead of scanning its buffer list at every
     /// draw. ShadowMaskRead: its first VrShadowMask buffer is read, not written.
     enum VrFsBuffer : u32 {
@@ -94,6 +94,9 @@ public:
         VrFsSceneMaps = 1u << 1,
         VrFsShadowMaskRead = 1u << 2,
         VrFsDepthPyramid = 1u << 3,
+        VrFsShadowEdges = 1u << 4,
+        VrFsAirOrMoonPass = 1u << 5,
+        VrFsShadowGrid = 1u << 6,
     };
     u32 VrFsBuffers() const;
 

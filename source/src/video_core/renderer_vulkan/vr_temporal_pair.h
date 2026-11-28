@@ -53,6 +53,11 @@ public:
         // feature or context is its rectangle's size, fed the rectangle cut out of the eye
         // (VrTemporalScene). Zero: the whole eye.
         std::array<DlssFocus::Rect, 2> focus{};
+        // Canonical eye images use whole-eye extents. Only the provider uses the focus rects.
+        bool SameWholeEyeLayout(const Plan& other) const {
+            return eyes == other.eyes && views == other.views && provider_flags == other.provider_flags &&
+                   inverted == other.inverted && dlss_preset == other.dlss_preset;
+        }
         bool operator==(const Plan&) const = default;
     };
     struct Device { VkDevice logical{}; VkPhysicalDevice physical{}; };
@@ -212,6 +217,10 @@ public:
     bool NeedsConfiguration(const VR::Graphics::Config& c, const Plan& p) const {
         return !configured || MakeKey(c, p) != key;
     }
+    // The worker can finish an earlier preset after the player has selected another.
+    bool NeedsWholeEyeFallback(Result completed, const VR::Graphics::Config& requested, const Plan& plan) const {
+        return completed == Result::FocusFailed && !NeedsConfiguration(requested, plan);
+    }
     bool CanProduceMotion() const { return ready && !failed; }
     uint64_t Epoch() const { return epoch; }
     // The caller publishes output only on Ready. A failure/pending right eye cannot expose
@@ -353,7 +362,7 @@ private:
     static Key MakeKey(const VR::Graphics::Config& c, const Plan& p) {
         Key next{c.upscaler, VR::Graphics::EffectiveProfile(c), p};
         if (c.upscaler == VR::Graphics::Upscaler::Dlss && c.dlss5)
-            next.neural = VR::Graphics::Pack(c) & ~uint64_t(1023);
+            next.neural = VR::Graphics::Pack(c) & ~(VR::Graphics::PackedScaleMask | uint64_t{1023});
         return c.upscaler == VR::Graphics::Upscaler::Off ? Key{} : next;
     }
     static bool Valid(const Plan& plan) {

@@ -499,6 +499,26 @@ u64 CommandRecorder::AppendBlob(CommandRecorder& from) {
     from.committed_packets = from.control_packets = 0;
     return controls;
 }
+#ifdef _WIN32
+void CommandRecorder::SetStageBThread(void* thread) {
+    if (stage_b_thread == thread)
+        return;
+    if (stage_b_thread)
+        core_placement.Reset();
+    stage_b_thread = thread;
+    if (thread)
+        UpdateCorePlacement();
+}
+void CommandRecorder::UpdateCorePlacement() {
+    if (threaded && stage_b_thread) {
+        if (core_placement.Apply(stage_b_thread, worker.native_handle()))
+            LOG_INFO(Render_Vulkan,
+                     "Reserved a physical core for Stage B; recorder on a separate core");
+    } else {
+        core_placement.Reset();
+    }
+}
+#endif
 void CommandRecorder::Configure() {
     const bool next = allowed && FastRender::On(FastRender::RecorderInline);
     // A or B may be the producer, never both: DrawPipe's completion acquire
@@ -515,6 +535,9 @@ void CommandRecorder::Configure() {
         threaded = next_threaded;
         if (threaded && !worker.joinable())
             worker = std::jthread([this] { Run(); });
+#ifdef _WIN32
+        UpdateCorePlacement();
+#endif
         FlipOrderTrace::Event("mode_end", reinterpret_cast<uintptr_t>(this), enabled, threaded);
     }
     // A new producer command buffer starts here. In R2 its physical allocation may
@@ -534,6 +557,9 @@ void CommandRecorder::Configure() {
 }
 void CommandRecorder::Stop() {
     Drain("shutdown");
+#ifdef _WIN32
+    SetStageBThread(nullptr);
+#endif
     if (!worker.joinable())
         return;
     stopping.store(true, std::memory_order_release);

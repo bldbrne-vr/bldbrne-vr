@@ -75,11 +75,11 @@ namespace World {
 inline constexpr float LensStartM = 0.25f;
 inline constexpr float LensFullM = 0.7f;
 inline bool Anchored() {
-    static const bool on = [] {
+    static const bool off = [] {
         const char* const env = std::getenv("VR_FOG_WORLD");
-        return FogGrid::FogTaken() && !(env != nullptr && env[0] == '0');
+        return env != nullptr && env[0] == '0';
     }();
-    return on;
+    return FogGrid::FogTaken() && !off;
 }
 inline float NearStart() {
     return Anchored() ? LensStartM : NearStartM;
@@ -185,12 +185,11 @@ inline constexpr float NoiseScale = 0.75f;
 inline constexpr float TakenNoiseScale = 2.0f;
 // (Tests: VR_FOG_PATCH_NOISE_SCALE=<1 / m>.)
 inline float NoiseScaleNow() {
-    static const float v = [] {
+    static const float asked = [] {
         const char* const env = std::getenv("VR_FOG_PATCH_NOISE_SCALE");
-        return env != nullptr ? std::clamp(static_cast<float>(std::atof(env)), 0.05f, 8.0f)
-                              : FogGrid::FogTaken() ? TakenNoiseScale : NoiseScale;
+        return env != nullptr ? std::clamp(static_cast<float>(std::atof(env)), 0.05f, 8.0f) : 0.0f;
     }();
-    return v;
+    return asked > 0.0f ? asked : FogGrid::FogTaken() ? TakenNoiseScale : NoiseScale;
 }
 inline constexpr float DriftShare = 0.35f;
 // How fast the noise changes in place (its own units a second: the wisps form and dissolve where
@@ -198,12 +197,11 @@ inline constexpr float DriftShare = 0.35f;
 inline constexpr float Evolve = 0.0f;
 inline constexpr float TakenEvolve = 0.25f; // with the game's fog taken over: a wisp lasts some 20 s
 inline float EvolveNow() {
-    static const float v = [] {
+    static const float asked = [] {
         const char* const env = std::getenv("VR_FOG_PATCH_EVOLVE");
-        return env != nullptr ? std::clamp(static_cast<float>(std::atof(env)), 0.0f, 4.0f)
-                              : FogGrid::FogTaken() ? TakenEvolve : Evolve;
+        return env != nullptr ? std::clamp(static_cast<float>(std::atof(env)), 0.0f, 4.0f) : -1.0f;
     }();
-    return v;
+    return asked >= 0.0f ? asked : FogGrid::FogTaken() ? TakenEvolve : Evolve;
 }
 // A map's patches fade in over this after the hunter's map changes (a warp, a door, a boundary).
 inline constexpr float EaseS = 3.0f;
@@ -652,20 +650,20 @@ inline constexpr float WarpM = 25.0f;  // further than this in one frame: a warp
 // first... only kept if it's truly better otherwise not worth the hassle"): the hunter's own push
 // (VR_FOG_WAKE=1) and the enemies' and NPCs' near him (VR_FOG_WAKE_ENEMIES=1).
 inline bool On() {
-    static const bool on = [] {
-        // (With the fog anchored in the world the hunter's body is what clears it round him: on,
-        // unless VR_FOG_WAKE=0. Without: only where asked, as before.)
+    // (With the fog anchored in the world the hunter's body is what clears it round him: on,
+    // unless VR_FOG_WAKE=0. Without: only where asked, as before.)
+    static const int asked = [] {
         const char* const env = std::getenv("VR_FOG_WAKE");
-        return FogGrid::FogTaken() && (env != nullptr ? env[0] == '1' : World::Anchored());
+        return env != nullptr ? (env[0] == '1' ? 1 : 0) : -1;
     }();
-    return on;
+    return FogGrid::FogTaken() && (asked >= 0 ? asked == 1 : World::Anchored());
 }
 inline bool Enemies() {
-    static const bool on = [] {
+    static const bool asked = [] {
         const char* const env = std::getenv("VR_FOG_WAKE_ENEMIES");
-        return FogGrid::FogTaken() && env != nullptr && env[0] == '1';
+        return env != nullptr && env[0] == '1';
     }();
-    return on;
+    return FogGrid::FogTaken() && asked;
 }
 // (Tests: VR_FOG_WAKE_GHOST="x0,y,z0,x1,z1,m/s": a walker going to and fro between two places,
 // one of the others: the fog's reaction to a body seen from a still camera.) Its place and speed
@@ -896,7 +894,10 @@ inline u32 Pick(u32 map, const std::array<float, 3>& camera, float strength, flo
     {
         // (Each one fitted to its floor once measured: FitFrom.)
         std::scoped_lock lock{FitMutex()};
-        const auto& emitters = EmitterPatches();
+        // (Only where the hunter's map was loaded with the game's fog taken over: else the game's
+        // own fog is there, FogGrid::FogTaken.)
+        static const std::vector<Patch> none;
+        const auto& emitters = FogGrid::FogTaken() ? EmitterPatches() : none;
         const auto& fits = Fits();
         const bool fit = FitOn() && fits.size() == emitters.size();
         const bool slope = SlopeOn() && fits.size() == emitters.size();

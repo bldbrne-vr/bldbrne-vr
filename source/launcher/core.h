@@ -203,9 +203,21 @@ struct Setting {
 const std::vector<const char *> &Categories();
 // The heading of the page's rows the game's VR page does not show (vr.ini and the launcher).
 inline constexpr const char *LauncherOnlyGroup = "Only in the launcher";
-// A key's value in the game when vr.ini lacks it, for the keys of the rows that set two keys and
-// foveation (each from the game's own settings); nullopt: not known here.
+// A key's value in the game when vr.ini lacks it, in vr.ini's words, for every choice row's keys
+// but the card's (CardDefault): the game's own defaults, most read from its settings structs, the
+// rest (the two-key rows', x_button, canted_eyes, the lamp page, the bell, the levers) written here
+// from them; nullopt: not known here.
 std::optional<std::string> CodeDefault(const std::string &key);
+// Light attack stamina as the game reads vr.ini's lines in turn (core/vr/melee_settings.cpp): the
+// last melee_stamina_pct line std::stoi reads, kept within 0..100; else, when a line of the old
+// switch melee_stamina (until 2026-10-08) is on ("1" or "true"), the full cost "100"; else nullopt
+// (the default).
+std::optional<std::string> StaminaPctAsRead(const std::vector<std::string> &pct_lines,
+                                            const std::vector<std::string> &old_switch_lines);
+// The other keys a reset of `key` (its game default) removes too: Light attack stamina's old switch
+// when a line of it is on (it would bring the full cost back), as the VR page's reset does.
+std::vector<std::string> ResetAlsoRemoves(std::string_view key,
+                                          const std::vector<std::string> &old_switch_lines);
 // Display interpretation only. Keep the original file spelling until the player makes a choice.
 std::optional<std::string> ChoiceOverride(std::string_view key, std::optional<std::string> value);
 std::optional<std::string> CardDefault(std::string_view key, uint64_t dedicated_bytes);
@@ -251,6 +263,9 @@ inline bool VramFitsCard(double estimate_mb, uint64_t card_bytes) {
            estimate_mb <= (double(card_bytes >> 20) - VramReserveMb) * 0.9;
 }
 const std::vector<Setting> &Settings();
+// Left-handed play (ControlsGuide::LeftHanded): a row's tooltip for the other side; empty: the
+// tooltip as it is.
+std::string LeftHandedDetails(const Setting &row);
 // A number row's file value for a shown value, and the shown value for a file value (clamped,
 // 0 kept when the row has a zero text; nullopt for text that is not a number).
 std::string NumberValue(const Setting &row, int shown);

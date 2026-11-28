@@ -1428,7 +1428,7 @@ void SeverOnPlayerHit(u8* res, u8* player, float damage) {
         SeverPrefetch(target);
     }
     // The eligible right-hand swing, or the transformed Beast Claw's own left claw.
-    if (!VR::Sever::CanSever(info.weapon_variation, info.form_b) ||
+    if (!VR::Sever::CanSever(info.weapon_variation, info.form_b, info.chikage_draw) ||
         (info.left && info.weapon_variation != VR::Sever::BeastClawVariation)) {
         return;
     }
@@ -1458,6 +1458,7 @@ void SeverOnPlayerHit(u8* res, u8* player, float damage) {
     h.arc_deg = info.arc_deg;
     h.form_b = info.form_b;
     h.charged = info.charged;
+    h.chikage_draw = info.chikage_draw;
     // Only a kill matters (and, logged, a heavy too).
     if (!h.kill && !(log && h.heavy)) {
         return;
@@ -1520,7 +1521,9 @@ void SeverOnPlayerHit(u8* res, u8* player, float damage) {
              "{:.1f}{}): {}{}; contact ({:.2f}, {:.2f}, {:.2f}), tip {:.1f} m/s (peak {:.1f}), "
              "arc {:.0f} deg: chance {:.0f}%, rolled {:.0f}{}",
              Read<s32>(target + OffsetChrId), Read<s32>(target + OffsetNpcParam),
-             info.weapon_variation == VR::Sever::BurialBladeVariation ? "Burial Blade" : "Beast Claw",
+             info.weapon_variation == VR::Sever::BurialBladeVariation ? "Burial Blade"
+             : info.weapon_variation == VR::Sever::ChikageVariation   ? "Chikage's quick draw"
+                                                                      : "Beast Claw",
              info.form_b ? "form B" : "form A",
              info.left ? fmt::format(" left claw (the game's hand {}, category {})",
                                      Read<s32>(res + ResHand), Read<u8>(res + ResCategory))

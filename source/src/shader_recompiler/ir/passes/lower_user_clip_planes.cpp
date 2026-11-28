@@ -40,7 +40,7 @@ void LowerUserClipPlanes(IR::Program& program, const RuntimeInfo& runtime_info) 
     const u32 binding = static_cast<u32>(std::distance(program.info.buffers.begin(), it));
 
     const u32 enabled_mask = runtime_info.vs_info.user_clip_plane_mask;
-    if (enabled_mask == 0) {
+    if (enabled_mask == 0 || runtime_info.vs_info.ClipsBlade() || runtime_info.vs_info.HonesBlade()) {
         return;
     }
 

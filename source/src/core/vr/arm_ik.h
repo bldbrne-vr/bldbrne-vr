@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <optional>
 
 #include "core/vr/c0000_skeleton.h"
@@ -866,7 +867,8 @@ struct ArmResult {
 template <typename Index>
 inline ArmResult SolveArm(QsTransform* pose, const Index* parents, int count, const ArmRig& rig,
                           const ArmTarget& target, const ArmParams& params, ArmState& state,
-                          float dt = 0.0f) {
+                          float dt = 0.0f,
+                          float max_effector_error = std::numeric_limits<float>::infinity()) {
     ArmResult r;
     const auto fail = [&](ArmStatus status) {
         r.status = status;
@@ -1329,6 +1331,10 @@ inline ArmResult SolveArm(QsTransform* pose, const Index* parents, int count, co
     }
     if (!finite) {
         return fail(ArmStatus::NumericFailure);
+    }
+    // A constrained second solve can decline the pose, preserving the tracked arm exactly.
+    if (r.error > max_effector_error) {
+        return fail(ArmStatus::TooFar);
     }
     const auto write = [&](int bone, const QsTransform& anim, const QsTransform& ik) {
         pose[bone] = Blend(params.blendFrom ? params.blendFrom[bone] : anim, ik, weight);

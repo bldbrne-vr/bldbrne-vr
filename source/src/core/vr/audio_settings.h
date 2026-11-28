@@ -8,7 +8,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <ostream>
 #include <string>
 
@@ -29,13 +31,38 @@ namespace VR::Sound {
 
 inline std::atomic<bool> g_binaural{true};
 
+// audio_lead_ms (the OpenAL output, binaural or not): how much of the game's sound waits in the
+// queue ahead of the speakers. OpenAL mixes ~20 ms at a time, so a queue of 2-3 of the game's
+// 5.3 ms buffers ran dry many times a minute on a busy CPU, each gap a pop (the user's report,
+// 2026-11-26; bbport fixed the same crackle on Windows with an 80 ms lead and its audio threads at
+// the highest priority). The output then takes each buffer as soon as the game writes it until
+// the queue holds this much, and its thread runs at the highest priority. 0 = the old timing (a
+// 5.3 ms clock, about 10-16 ms queued, normal priority). Sound plays the difference later than
+// before (40: about 25-30 ms).
+constexpr int DefaultLeadMs = 40;
+constexpr int MaxLeadMs = 200;
+inline std::atomic<int> g_lead_ms{DefaultLeadMs};
+
 [[nodiscard]] inline bool Binaural() {
     return g_binaural.load(std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline int LeadMs() {
+    return g_lead_ms.load(std::memory_order_relaxed);
 }
 
 inline bool ParseAudioSetting(const std::string& key, const std::string& value) {
     if (key == "audio_binaural") {
         g_binaural.store(value == "1" || value == "true", std::memory_order_relaxed);
+        return true;
+    }
+    if (key == "audio_lead_ms") {
+        char* end = nullptr;
+        const long ms = std::strtol(value.c_str(), &end, 10);
+        if (end != value.c_str()) {
+            g_lead_ms.store(static_cast<int>(std::clamp<long>(ms, 0, MaxLeadMs)),
+                            std::memory_order_relaxed);
+        }
         return true;
     }
     return false;
@@ -46,7 +73,10 @@ inline void WriteAudioDefaults(std::ostream& out) {
            "behind you;\n"
         << "# for the headset's speakers or headphones), 0 = the emulator's audio settings "
            "(stereo fold)\n"
-        << "audio_binaural=1\n";
+        << "audio_binaural=1\n"
+        << "# sound queued ahead of the speakers, ms: more stops pops on a busy CPU, less plays "
+           "sooner\n# (0 = the old timing; 0-200)\n"
+        << "audio_lead_ms=" << DefaultLeadMs << "\n";
 }
 
 } // namespace VR::Sound

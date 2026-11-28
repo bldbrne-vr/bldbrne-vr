@@ -46,6 +46,11 @@
 #include "core/vr/bloodborne_evasion.h"
 #include "core/vr/bow.h"
 #include "core/vr/bow_pose.h"
+#include "core/vr/chikage.h"
+#include "core/vr/weapon_voice.h"
+#include "core/vr/bloodborne_weapon_shape.h"
+#include "core/vr/holsters.h"
+#include "core/vr/quick_channel.h"
 #include "core/vr/combat_channel.h"
 #include "core/vr/bloodborne_gun.h"
 #include "core/vr/bloodborne_held.h"
@@ -56,6 +61,7 @@
 #include "core/vr/bloodborne_layout.h"
 #include "core/vr/bloodborne_facing.h"
 #include "core/vr/bloodborne_melee.h"
+#include "core/vr/bloodborne_transform.h"
 #include "core/vr/bloodborne_motion.h"
 #include "core/vr/bloodborne_skeleton.h"
 #include "core/vr/body_channel.h"
@@ -75,6 +81,7 @@
 #include "core/vr/hand_rig.h"
 #include "core/vr/lever_channel.h"
 #include "core/vr/lever_grip.h"
+#include "core/vr/lever_smack.h"
 #include "core/vr/music_box_grip.h"
 #include "core/vr/head_room.h"
 #include "core/vr/hit_stun.h"
@@ -86,6 +93,7 @@
 #include "core/vr/pose_refresh.h"
 #include "core/vr/quick_settings.h"
 #include "core/vr/solid_weapon.h"
+#include "core/vr/blood_blast.h"
 #include "core/vr/torch_collision.h"
 #include "core/vr/left_clash_data.h"
 #include "core/vr/bloodborne_sever.h"
@@ -1408,8 +1416,11 @@ G::Shape TunedShape(G::Kind kind, s32 goods = -1) {
 // The left fingers closed round the held item (the vial, a quick item: the held tick's grip of
 // the last update), eased in and out over GripBlendS, over whatever the animation does with them
 // (vr.ini held_grip). Written after the arms, into the same pose; RestoreGame puts the game's back.
-void ApplyGrip(PoseSide& s, B::HkQsTransform* local, float dt, const u8* player) {
-    const auto held = HeldGrip();
+void ApplyGrip(PoseSide& s, B::HkQsTransform* local, float dt, const u8* player,
+               bool holding_scabbard) {
+    // The decorated case is about 6 cm across here, wider than a knife handle.
+    const auto held = holding_scabbard ? HeldGripState{static_cast<u8>(G::Kind::Flask), -1}
+                                       : HeldGrip();
     const u8 want = held.kind;
     const bool on = want != 0 && want < static_cast<u8>(G::Kind::Count) &&
                     VR::Quick::GetQuickSettings().held_grip;
@@ -2102,6 +2113,10 @@ void SolidWeapons(PoseSide& s, const u8* chr, B::BodyInput& in, bool driven, int
         WW::Sample sample{};
         sample.dt = dt;
         if (r.contact.any && had[i] && dt > 0.0f) {
+            if (i == C::Right && s.weapon_family == VR::BloodBlast::Family && r.contact.line &&
+                !r.replaced && !r.through) {
+                VR::BloodBlast::g_map_touch_ns.store(now, std::memory_order_relaxed);
+            }
             const B::Vec3 local = B::Rotate(B::Conjugate(r.pose.q), r.contact.point - r.pose.p);
             const B::Vec3 v =
                 (S::At(target[i], local) - S::At(prev[i], local)) * (1.0f / (dt * scale));
@@ -2126,6 +2141,10 @@ void SolidWeapons(PoseSide& s, const u8* chr, B::BodyInput& in, bool driven, int
         if (o.strike) {
             ++out.strike_serial;
             out.strike_speed = o.strike_speed;
+            // A weapon (not a bare hand) driven into a Chalice lever's own body is a blow
+            // (lever_smack.h Contact; only the Chalice Dungeons wake the lever side for it).
+            if (sample.contact && r.contact.line)
+                VR::Lever::Smack::Posted().PostContact({r.contact.point, o.strike_speed, now});
         }
         out.scraping = o.scraping;
         out.scrape_speed = o.scrape_speed;
@@ -2505,6 +2524,477 @@ void ApplyNativeBow(PoseSide& s, const u8* chr) {
     }
 }
 
+// The Chikage's scabbard (vr.ini chikage_scabbard, core/vr/chikage.h). The game hangs it on dummy
+// 412 (on B_Weapon_Case_spine) in every form, and its model shares the sword's frame, so both are
+// judged here, on the pose about to be drawn: the sword's frame (its attach dummy on R_Weapon)
+// against the scabbard's (412) in the hunter's model space. While the blade is in, the scabbard
+// eases onto its curve at entry and back to its anchor on exit; only B_Weapon_Case_spine moves.
+// What happened goes to the presenter (BodyEvent, BodyStatus), which
+// owns the haptics, the form and the quick draw. Game:Main (the body's pose copy) only.
+bool DummyAt(u8* chr, s32 id, B::Vec3& out);
+
+struct ScabbardState {
+    s32 weapon_id{-1};
+    u32 space{};
+    s64 burst_ns{}, clip_release_ns{};
+    bool form_b{};
+    VR::Chikage::Sheath sheath;
+    VR::Chikage::Out out{};
+    s64 last_ns{0};
+    float follow{0.0f};     // 0 on the hip .. 1 along the blade
+    B::QsTransform along{}; // where it last lay along the blade (model space)
+    // The scabbard's fixed grip in the left weapon bone's frame, and its carry blend.
+    VR::Chikage::Grab grab;
+    s64 taken_ns{}; // when the left hand took it (a landed draw after this puts it away)
+    VR::Chikage::HeldSwordGuide blade_guide;
+    // The two hands held together while seated (Ck::TandemPose): the case's move last applied,
+    // and its release back to the controller.
+    B::QsTransform tandem_move{};
+    B::QsTransform tandem_rel{}; // the shown sword in the live sword's frame, last seated
+    float tandem_w{0.0f};        // the tandem's weight now (eased)
+    B::QsTransform in_hand{};
+    float carry{0.0f};
+    bool at_hand{false};
+    bool logged{false};
+};
+ScabbardState g_scabbard{};
+s32 g_scabbard_request_weapon{-1};
+
+void ApplyScabbard(PoseSide& s, const u8* chr, s64 now, bool left_available) {
+    namespace Ck = VR::Chikage;
+    constexpr float FollowOutS = 0.16f;
+    auto& g = g_scabbard;
+    // Nothing to judge it by (another weapon, no solved pose or no write in this copy, no dummy
+    // 412, none of the bones): a blade that was in it has slipped out (ScabbardSlip, once: the
+    // state is cleared with it, so the next frame has nothing left to send) and nothing of the
+    // last sheathing is kept. (Only when there is something to clear: not every frame of every
+    // other weapon.)
+    const auto drop = [&g] {
+        if (g.sheath.In()) {
+            B::PushBodyEvent({B::BodyEventKind::ScabbardSlip});
+        }
+        if (g.last_ns != 0 || g.sheath.In() || g.grab.held) {
+            g = {};
+        }
+    };
+    if (!VR::Tricks::Scabbard(s.weapon_family) || !s.solved || !s.out.ok) {
+        drop();
+        return;
+    }
+    const auto* sk = C::Active();
+    if (!sk || sk->katana_case.id != C::DmyIdKatanaCase) {
+        drop();
+        return;
+    }
+    const auto model = [&](int bone) {
+        return B::ModelOf(s.locals.data(), C::Parents.data(), C::BoneCount, bone);
+    };
+    // Our own model of it only draws it (bloodborne_quickitems.cpp AddScabbard): its mouth, line
+    // and length are the dummy's and Ck::SeatY / Ck::BladeM, never the model's. Without it (the
+    // weapon's file could not be read or held no scabbard: logged where it is built) sheathing,
+    // the coat of blood and the quick draw still work, and the game's own part is left to draw.
+    const bool drawn_by_us = WeaponShape::ScabbardModel() != 0;
+    if (!drawn_by_us && g_scabbard_request_weapon != s.weapon_id) {
+        WeaponShape::AskScabbard();
+        g_scabbard_request_weapon = s.weapon_id;
+    }
+    if (g.last_ns && (now < g.last_ns || now - g.last_ns >= Ck::DrawFreshNs ||
+                      g.weapon_id != s.weapon_id || g.space != s.used.space_serial)) {
+        g = {};
+    }
+    const float dt = g.last_ns && now > g.last_ns
+                         ? std::min(static_cast<float>(now - g.last_ns) * 1e-9f, 0.1f) : 0.0f;
+    g.weapon_id = s.weapon_id;
+    g.space = s.used.space_serial;
+    g.last_ns = now;
+    const auto weapon = model(C::R_Weapon);
+    const auto hang = model(C::B_Weapon_Case_spine);
+    const auto parent = model(C::Parents[C::B_Weapon_Case_spine]);
+    if (!weapon || !hang || !parent) {
+        drop();
+        return;
+    }
+    // The scabbard is ours to draw (bloodborne_quickitems.cpp AddScabbard: the game's own does
+    // not show where the bone puts it): the game's part 1 never beside it. (Without our model the
+    // game's part stays: a scabbard where the bone puts it rather than none.)
+    if (drawn_by_us) {
+        HideRightWeaponPart(const_cast<u8*>(chr), 1);
+    }
+    const s32 style = ReadArmStyle(chr);
+    const bool form_b = style >= 3 && style <= 5;
+    g.form_b = form_b;
+    const auto sword_attach = VR::Bow::Attachment(form_b ? sk->right_two_hand : sk->right_weapon_base);
+    const B::QsTransform sword = B::Compose(*weapon, sword_attach);
+    B::QsTransform hip = B::Compose(*hang, VR::Bow::Attachment(sk->katana_case));
+    // The weapon's own metres (a scaled hunter's sword and scabbard are scaled alike).
+    const float k = std::max(std::abs(sword.s.y), 1e-3f);
+    const B::Vec3 blade{0.0f, -1.0f, 0.0f}; // both frames: the blade runs down -Y
+    // It stays where the game hangs it (beside the left hip, running back and down): the coat
+    // hides every place on that side from the hunter's eyes, so it is shown through the coat
+    // instead (bloodborne_quickitems.cpp AddScabbard), and from there a blade put to its mouth
+    // from the stretched sword arm comes in 62 degrees off its line (within the entry angle), where a
+    // mouth at the belt's front would need the hand a metre ahead of it. VR_CHIKAGE_WORN=1
+    // (tests): at the belt's front instead (Ck::WornMouth), from the pelvis, in the hunter's own
+    // frame, turned by the shortest way (its curve keeps its side).
+    static const bool worn = [] {
+        const char* const env = std::getenv("VR_CHIKAGE_WORN");
+        return env != nullptr && env[0] == '1';
+    }();
+    if (const auto pelvis = worn ? model(C::Pelvis) : std::nullopt) {
+        const B::Vec3 hung = B::Normalize(B::Rotate(hip.q, blade));
+        hip.q = B::Normalize(B::FromTo(hung, Ck::WornInto) * hip.q);
+        // (The frame's origin is SeatY up the line from the mouth.)
+        hip.t = pelvis->t + (Ck::WornMouth - Ck::WornInto * Ck::SeatY) * k;
+    }
+    // The left hand (its weapon bone: the fist's middle) takes the scabbard by its upper part
+    // and settles into a repeatable grip regardless of how the wrist approached the belt.
+    const auto fist = model(C::L_Weapon);
+    s32 goods = -1, ffx = -1;
+    VR::Quick::LatestHeldItem(goods, ffx);
+    // (May hold it at all, and follows its controller now: a hit or a dodge loses the second a
+    // moment, which keeps a hold already made: Ck::Grab, HoldThroughS.)
+    const bool left_may = goods < 0 && !form_b && fist.has_value();
+    const bool left_tracked = left_available && s.arm_weight[C::Left] >= 0.999f &&
+                              B::IsTracked(s.used.hand[C::Left]) &&
+                              s.out.arm[C::Left].status == B::ArmStatus::Solved;
+    const bool left_ok = left_may && left_tracked;
+    {
+        const B::Vec3 into = B::Normalize(B::Rotate(hip.q, blade));
+        Ck::Reach reach = left_ok ? Ck::ReachOf(fist->t * (1.0f / k),
+                                                hip.t * (1.0f / k) + into * Ck::SeatY, into)
+                                  : Ck::Reach{};
+        // A pocket the fist is right on (Ck::PocketFirstM, holding an item, much nearer than the
+        // scabbard): that squeeze is the pocket's. Only while the scabbard is not already held.
+        if (reach.close && !g.grab.held) {
+            VR::Holsters::Targets pockets{};
+            if (VR::Quick::LatestHolsterTargets(pockets) &&
+                VR::Holsters::Fresh(pockets, now, s.used.space_serial)) {
+                const B::Vec3 fist_t = B::ModelToTracking(s.anchor, s.frame, fist->t);
+                const B::Vec3 mouth_m = hip.t + into * (Ck::SeatY * k);
+                const B::Vec3 to_fist = fist->t - mouth_m;
+                const float along = std::clamp(B::Dot(to_fist, into), 0.0f, Ck::GrabAlongM * k);
+                const float to_case = B::Length(to_fist - into * along);
+                for (int slot = 0; slot < VR::Holsters::ShoulderSlot; ++slot) {
+                    if (pockets.layout.assignment[slot] <= 0) {
+                        continue;
+                    }
+                    const auto& c = pockets.layout.centre[slot];
+                    const float to_pocket = B::Length(B::Vec3{c.x, c.y, c.z} - fist_t);
+                    if (to_pocket <= Ck::PocketFirstM && to_pocket <= Ck::PocketFirstShare * to_case) {
+                        reach.close = false;
+                        break;
+                    }
+                }
+            }
+        }
+        g.at_hand = reach.close && !g.grab.held;
+        if (g.grab.Step(reach.close, s.used.hand[C::Left].grip, left_may, left_tracked, dt)) {
+            g.in_hand = Ck::HeldGrip(VR::Bow::Attachment(sk->left_weapon_base).q, k);
+            LOG_INFO(Core, "VR chikage: the left hand took the scabbard");
+            g.taken_ns = now;
+            B::PushBodyEvent({B::BodyEventKind::ScabbardTaken, C::Left, 0, 0, now, s.weapon_id});
+        }
+    }
+    // A landed quick draw: the scabbard back to the hip (the squeeze must open and close again
+    // to take it once more).
+    if (g.grab.held && g.taken_ns > 0 &&
+        Ck::g_draw_hit_ns.load(std::memory_order_acquire) > g.taken_ns && !g.sheath.In()) {
+        g.grab.held = false;
+        LOG_INFO(Core, "VR chikage: the draw landed: the scabbard goes back to the hip");
+    }
+    constexpr float CarryInS = 0.06f, CarryOutS = 0.16f;
+    g.carry = g.grab.held ? std::min(1.0f, g.carry + dt / CarryInS)
+                          : std::max(0.0f, g.carry - dt / CarryOutS);
+    B::QsTransform rest = hip;
+    if (g.carry > 0.0f && fist) {
+        const B::QsTransform held = B::Compose(*fist, g.in_hand);
+        const float w = g.carry * g.carry * (3.0f - 2.0f * g.carry);
+        rest.t = B::Lerp(hip.t, held.t, w);
+        rest.q = B::Slerp(hip.q, held.q, w);
+    }
+    Ck::Frame f{};
+    f.dt = dt;
+    // A lost or rejected controller sample can still pose the model at its last location.
+    // It must not arm a draw against the other hand's live movement.
+    f.blade = s.arm_weight[C::Right] >= 0.999f && s.use[C::Right] == B::HandUse::Tracked &&
+              s.out.arm[C::Right].status == B::ArmStatus::Solved &&
+              (!g.grab.held || (g.carry >= 1.0f && s.use[C::Left] == B::HandUse::Tracked));
+    f.scabbard = true;
+    f.axis = B::Normalize(B::Rotate(sword.q, blade));
+    f.side = B::Rotate(sword.q, {1, 0, 0});
+    f.rest_axis = B::Normalize(B::Rotate(rest.q, blade));
+    f.grip = sword.t * (1.0f / k);
+    f.held = g.grab.held && fist;
+    // The held case is fixed to the fist. Follow the visible rim through the pickup blend.
+    f.anchor = rest.t * (1.0f / k) + f.rest_axis * (Ck::SeatY + (f.held ? f.hold : 0.0f));
+    // (A copy in the same instant as the last steps nothing and keeps what that one found.)
+    Ck::Out o = g.out;
+    o.event = Ck::Event::None;
+    if (dt > 0.0f) {
+        o = g.sheath.Step(f, VR::Tricks::GetTrickSettings().chikage_draw_speed);
+    }
+    if (f.held) {
+        // Keep the case on the fist. Fit the sword hand to it only in the capture region,
+        // during the slide, and briefly on release. The detector above saw the tracked pose.
+        g.follow = 0.0f;
+        B::QsTransform fitted{};
+        const bool guide_fit = g.blade_guide.Pose(f, o, g.sheath.AimWeight(), rest, sword, k, fitted);
+        // Seated: the two hands in tandem (Ck::TandemPose), the left arm re-aimed to carry the case
+        // by the shared move. Eased both ways, in TandemInS and out TandemReleaseS (a fast draw
+        // leaves the depth's ramp within a frame: the tester, 2026-11-20, "when I pull the blade out
+        // sometimes it jumps positions"); on the way out the sword keeps its last offset from the
+        // live hand, fading, so it follows the swing at once.
+        const float depth_in = guide_fit && o.in && g.carry >= 1.0f && g.blade_guide.capture >= 1.0f
+                                   ? std::clamp((o.depth - Ck::TandemDepthM) / Ck::TandemRampM, 0.0f, 1.0f)
+                                   : 0.0f;
+        Ck::Tandem tandem{};
+        if (depth_in > 0.0f) {
+            tandem = Ck::TandemPose(sword, Ck::SwordInHeldCase(rest, o.depth, k), k);
+        }
+        const float want = tandem.active ? depth_in * depth_in * (3.0f - 2.0f * depth_in) : 0.0f;
+        g.tandem_w = want > g.tandem_w ? std::min(want, g.tandem_w + dt / Ck::TandemInS)
+                                       : std::max(want, g.tandem_w - dt / Ck::TandemReleaseS);
+        if (tandem.active) {
+            g.tandem_move = tandem.move;
+            g.tandem_rel = B::LocalFromModel(sword, tandem.sword);
+        }
+        const bool moved = g.tandem_w > 0.0f && fist.has_value();
+        if (!guide_fit) {
+            fitted = sword; // (only the fading tandem moves it)
+        }
+        const B::QsTransform guided = fitted;
+        if (moved) {
+            B::ArmParams lp{};
+            lp.pole = s.out.arm[C::Left].bendDir;
+            lp.rollToPole = lp.swingToPole = lp.clavicleReach = 0.0f;
+            lp.limits.maxStretch = 0.0f;
+            // (A target the arm cannot reach writes nothing, and the arm would snap back to its
+            // controller for that frame: the tester, 2026-11-20, "it still jumps a tiny bit". Half
+            // and a quarter of the move are tried before giving up; the case and the sword follow
+            // wherever the fist ends.)
+            B::ArmResult larm{};
+            for (const float part : {1.0f, 0.5f, 0.25f}) {
+                const B::QsTransform move = B::Blend({}, g.tandem_move, g.tandem_w * part);
+                const B::QsTransform left_target = B::Compose(move, *fist);
+                B::ArmState ls{};
+                larm = B::SolveArm(s.locals.data(), C::Parents.data(), C::BoneCount,
+                                   B::HunterLeftArm(*sk), {left_target.t, left_target.q, 1.0f},
+                                   lp, ls, 0.0f, 0.05f * k);
+                if (larm.status == B::ArmStatus::Solved || larm.status != B::ArmStatus::TooFar) break;
+            }
+            for (int i = 0; i < larm.writtenCount; ++i) {
+                s.out.written.set(larm.written[i]);
+            }
+            if (larm.status == B::ArmStatus::Solved) {
+                // The case goes with the fist where the arm put it.
+                if (const auto moved_fist = model(C::L_Weapon)) {
+                    const B::QsTransform shift = B::Compose(*moved_fist, B::LocalFromModel(*fist, rest));
+                    rest.t = shift.t;
+                    rest.q = shift.q;
+                }
+                // Seated: the sword in the case where it now is; on the way out its last offset
+                // from the live hand, fading.
+                fitted = B::Blend(guided,
+                                  tandem.active ? Ck::SwordInHeldCase(rest, o.depth, k)
+                                                : B::Compose(sword, g.tandem_rel),
+                                  g.tandem_w);
+                fitted.s = sword.s;
+            } // (else the left arm could not follow: the sword hand alone, as the guide put it)
+        }
+        if (guide_fit || moved) {
+            // Re-aim the already solved arm, keeping its elbow plane and current bone lengths.
+            // The ordinary IK has already applied the player's arm scale and shoulder reach.
+            B::ArmParams params{};
+            params.pole = s.out.arm[C::Right].bendDir;
+            params.rollToPole = params.swingToPole = params.clavicleReach = 0.0f;
+            params.limits.maxStretch = 0.0f;
+            // In the case, and while its fit is still easing off (the guide's release, the
+            // tandem's), the wider tolerance; a fit out of reach is tried again at half and a
+            // quarter of its correction rather than dropped (a dropped fit snaps the arm back to
+            // its controller for that frame).
+            const bool easing = o.in || g.tandem_w > 0.0f || g.blade_guide.release > 0.0f;
+            B::ArmResult arm{};
+            B::QsTransform target{};
+            for (const float part : {1.0f, 0.5f, 0.25f}) {
+                target = B::ParentFromChild(part >= 1.0f ? fitted : B::Blend(sword, fitted, part),
+                                            sword_attach);
+                B::ArmState state{};
+                arm = B::SolveArm(s.locals.data(), C::Parents.data(), C::BoneCount,
+                                  B::HunterRightArm(*sk), {target.t, target.q, 1.0f},
+                                  params, state, 0.0f, (easing ? 0.035f : 0.012f) * k);
+                if (arm.status != B::ArmStatus::TooFar) break;
+            }
+            for (int i = 0; i < arm.writtenCount; ++i) {
+                s.out.written.set(arm.written[i]);
+            }
+            // A missed cosmetic fit writes no arm bones. With live hands the latch
+            // still follows their physical separation; the next pose can fit again.
+            // An invalid rig/pose must still invalidate the interaction.
+            if (arm.status != B::ArmStatus::Solved) {
+                g.blade_guide.release = 0.0f;
+                if (o.in && arm.status != B::ArmStatus::TooFar) {
+                    g.sheath.CancelHeld();
+                    g.blade_guide = {};
+                    o = {};
+                    o.event = Ck::Event::Slipped;
+                }
+            } else if (easing && arm.error > 1e-5f * k) {
+                // Near the reach limit keep the best arm pose. The final wrist correction
+                // remains capped even when the latched guide accepts a slightly shorter reach.
+                if (const auto forearm = model(C::Parents[C::R_Hand])) {
+                    const auto offset = (target.t - arm.effector) * std::min(1.0f, 0.012f * k / arm.error);
+                    s.locals[C::R_Hand].t += B::Rotate(B::Conjugate(forearm->q), offset);
+                }
+            }
+        }
+    }
+    if (dt > 0.0f && o.burst) g.burst_ns = now;
+    if (dt > 0.0f && o.lunge) {
+        const bool close = EnemyCloseAhead(chr, Ck::LungeClearM);
+        if (!close) {
+            RequestChikageDash(now); // (bloodborne_melee.cpp ChikageDashTick)
+        }
+        B::PushBodyEvent({B::BodyEventKind::ScabbardLunge, close ? 1 : 0, o.depth, 0, now, s.weapon_id});
+        LOG_INFO(Core, "VR chikage: the pull's lunge at {:.0f} cm in: {}", o.depth * 100.0f,
+                 close ? "an enemy right ahead, no step" : "the step forward");
+    }
+    if (o.in) g.clip_release_ns = 0;
+    else if (o.event == Ck::Event::Left || o.event == Ck::Event::Slipped) g.clip_release_ns = now;
+    g.out = o;
+    if (!g.logged) {
+        g.logged = true;
+        const B::Vec3 mouth = f.anchor * k;
+        LOG_INFO(Core,
+                 "VR chikage: the scabbard hangs with its mouth at model ({:.3f} {:.3f} {:.3f}), "
+                 "pointing ({:.2f} {:.2f} {:.2f}); the sword's grip at ({:.3f} {:.3f} {:.3f}), "
+                 "scale {:.3f}",
+                 mouth.x, mouth.y, mouth.z, f.rest_axis.x, f.rest_axis.y, f.rest_axis.z, sword.t.x,
+                 sword.t.y, sword.t.z, k);
+    }
+    // VR_CHIKAGE_LOG=1 (tests): twice a second, both in tracking space (where a scripted hand is
+    // put) with the sword hand's controller.
+    static const bool watch = std::getenv("VR_CHIKAGE_LOG") != nullptr;
+    static s64 watched_ns = 0;
+    if (watch && now - watched_ns >= 500'000'000) {
+        watched_ns = now;
+        const auto local = [&](B::Vec3 m) { return B::ModelToTracking(s.anchor, s.frame, m); };
+        const B::Vec3 mouth_m = Ck::RestMouth(f) * k;
+        const B::Vec3 tip_m = sword.t + (f.axis * (Ck::SeatY + Ck::BladeM) + f.side * Ck::Bend(Ck::BladeM)) * k;
+        const B::Vec3 mouth = local(mouth_m), grip = local(sword.t), tip = local(tip_m);
+        const B::Vec3 into = B::Normalize(local(mouth_m + f.rest_axis) - mouth);
+        const B::Vec3 axis = B::Normalize(tip - grip);
+        const auto& hand = s.used.hand[C::Right];
+        // The left hip's pocket (the quick items' mount, tracking space) against the part of the
+        // scabbard the left hand takes: both want the left grip there.
+        float pocket_cm = -1.0f;
+        if (VR::Holsters::Targets pockets{};
+            VR::Quick::LatestHolsterTargets(pockets) && pockets.layout.valid) {
+            // (The nearest of the mounted pockets: the left hand picks from each of them.)
+            for (int slot = 0; slot < VR::Holsters::ShoulderSlot; ++slot) {
+                if (pockets.layout.assignment[slot] <= 0) {
+                    continue;
+                }
+                const auto& c = pockets.layout.centre[slot];
+                const B::Vec3 to = B::Vec3{c.x, c.y, c.z} - mouth;
+                const float along = std::clamp(B::Dot(to, into), 0.0f, Ck::GrabAlongM);
+                const float cm = B::Length(to - into * along) * 100.0f;
+                pocket_cm = pocket_cm < 0.0f ? cm : std::min(pocket_cm, cm);
+            }
+        }
+        // Where the game has the scabbard's dummy now (the pose before this one).
+        B::Vec3 drawn_world{};
+        const B::Vec3 drawn = DummyAt(const_cast<u8*>(chr), C::DmyIdKatanaCase, drawn_world)
+                                  ? local(B::ToModel(s.frame, drawn_world))
+                                  : B::Vec3{};
+        LOG_INFO(Core,
+                 "VR chikage: WATCH mouth {:.3f} {:.3f} {:.3f} into {:.3f} {:.3f} {:.3f} | grip "
+                 "{:.3f} {:.3f} {:.3f} axis {:.3f} {:.3f} {:.3f} tip {:.3f} {:.3f} {:.3f} | "
+                 "controller p {:.3f} {:.3f} {:.3f} q {:.4f} {:.4f} {:.4f} {:.4f} | tip to mouth "
+                 "{:.1f} cm, blade vs scabbard {:.0f} deg | {} depth {:.0f} cm follow {:.2f} form "
+                 "{} | left fist {:.3f} {:.3f} {:.3f} {}{} | the game's 412 at {:.3f} {:.3f} {:.3f} | "
+                 "the nearest pocket {:.0f} cm from its upper part | part bytes {:#010x}",
+                 mouth.x, mouth.y, mouth.z, into.x, into.y, into.z, grip.x, grip.y, grip.z, axis.x,
+                 axis.y, axis.z, tip.x, tip.y, tip.z, hand.p.x, hand.p.y, hand.p.z, hand.q.x,
+                 hand.q.y, hand.q.z, hand.q.w, B::Length(tip_m - mouth_m) / k * 100.0f,
+                 B::Angle(f.axis, f.rest_axis) / B::Deg, o.in ? "IN" : "out", o.depth * 100.0f,
+                 g.follow, form_b ? "B" : "A", fist ? local(fist->t).x : 0.0f,
+                 fist ? local(fist->t).y : 0.0f, fist ? local(fist->t).z : 0.0f,
+                 g.grab.held ? "HOLDS it" : g.at_hand ? "at it" : "away",
+                 left_ok ? "" : " (not yours)", drawn.x, drawn.y, drawn.z, pocket_cm,
+                 RightWeaponPartBytes(chr));
+    }
+    using K = B::BodyEventKind;
+    switch (o.event) {
+    case Ck::Event::Entered:
+        B::PushBodyEvent({K::ScabbardIn, -1, 0, 0, now, s.weapon_id});
+        break;
+    case Ck::Event::Seated:
+        B::PushBodyEvent({K::ScabbardSeated, form_b ? 0 : 1, 0, 0, now, s.weapon_id});
+        PlayWeaponSound(const_cast<u8*>(chr), Ck::SheatheSound);
+        break;
+    case Ck::Event::Bottomed:
+        B::PushBodyEvent({K::ScabbardHome, -1, 0, 0, now, s.weapon_id});
+        break;
+    case Ck::Event::Left:
+        B::PushBodyEvent({o.draw ? K::ScabbardDraw : K::ScabbardOut, o.loaded ? 1 : 0, o.speed,
+                          o.power, now, s.weapon_id});
+        if (o.loaded) {
+            PlayWeaponSound(const_cast<u8*>(chr), Ck::DrawSound);
+        }
+        break;
+    case Ck::Event::Slipped:
+        B::PushBodyEvent({K::ScabbardSlip});
+        break;
+    case Ck::Event::None:
+        break;
+    }
+    if (o.event != Ck::Event::None) {
+        LOG_INFO(Core, "VR chikage: {} (depth {:.0f} cm{}; form {}; out at {:.2f} m/s, power {:.2f})",
+                 o.event == Ck::Event::Entered    ? "the blade went into the scabbard"
+                 : o.event == Ck::Event::Seated   ? "seated"
+                 : o.event == Ck::Event::Bottomed ? "pushed home"
+                 : o.event == Ck::Event::Left     ? (o.draw ? "the QUICK DRAW" : "drawn")
+                                                  : "slipped off the blade's line",
+                 o.depth * 100.0f, o.loaded ? ", seated" : "", form_b ? "B" : "A", o.speed,
+                 o.power);
+    }
+    if (!f.held) {
+        g.blade_guide = {};
+        g.tandem_w = 0.0f; // (the case on the hip: nothing held together)
+        if (o.in) {
+            g.along = Ck::SlidingPose(sword, o.depth, k);
+            g.follow = Ck::CaptureFollow(g.follow, dt, o.depth);
+        } else {
+            g.follow = std::max(0.0f, g.follow - dt / FollowOutS);
+        }
+    }
+    // VR_CHIKAGE_SHOW=1 (tests): the scabbard always on the blade, as sheathed, wherever the sword
+    // is: a picture of the sword hand then shows whether the game draws it where the bone puts it.
+    static const bool show = std::getenv("VR_CHIKAGE_SHOW") != nullptr;
+    if (show) {
+        g.along = sword;
+        g.follow = 1.0f;
+    }
+    // (Always posed: at rest it is worn where the eyes find it, not where the game hangs it.)
+    // (Never a blend with a blade's line that was not set: carried before the first sheathing.)
+    const float w = g.follow * g.follow * (3.0f - 2.0f * g.follow);
+    const B::Vec3 at = w > 0.0f ? B::Lerp(rest.t, g.along.t, w) : rest.t;
+    const B::Quat turn = w == 1.0f ? g.along.q : w > 0.0f ? B::Slerp(rest.q, g.along.q, w) : rest.q;
+    // The bone that puts dummy 412 there: bone * attachment = the scabbard's frame.
+    const B::QsTransform attach = VR::Bow::Attachment(sk->katana_case);
+    B::QsTransform bone = *hang;
+    bone.q = B::Normalize(turn * B::Conjugate(attach.q));
+    bone.t = at - B::Rotate(bone.q, attach.t);
+    const B::QsTransform local = B::LocalFromModel(*parent, bone);
+    if (!B::IsFinite(local)) {
+        return;
+    }
+    auto& out = s.locals[C::B_Weapon_Case_spine];
+    out.t = local.t;
+    out.q = local.q;
+    s.out.written.set(C::B_Weapon_Case_spine);
+}
+
 void SolveBody(PoseSide& s, const u8* chr, const u8* pose, B::HkQsTransform* local, s64 now) {
     const auto& settings = B::GetBodySettings();
     s.solved = false;
@@ -2876,6 +3366,7 @@ void SolveBody(PoseSide& s, const u8* chr, const u8* pose, B::HkQsTransform* loc
     }
     ApplyNativeBow(s, chr);
     ApplyTwoHandShift(s);
+    ApplyScabbard(s, chr, now, hands_fresh && g.items_ok && !(lever_present && lever_hand.hand == C::Left));
     // t.xyz, q and s.xyz of the written bones; the w lanes keep what the game left there. The
     // game's own locals of those bones are kept for RestoreGame.
     for (int i = 0; i < C::BoneCount; ++i) {
@@ -2887,7 +3378,7 @@ void SolveBody(PoseSide& s, const u8* chr, const u8* pose, B::HkQsTransform* loc
     s.edited = s.out.written;
     LogFingers(s, local, now);
     ApplyFingerRig(s, local, now);
-    ApplyGrip(s, local, dt, chr);
+    ApplyGrip(s, local, dt, chr, g_scabbard.grab.held && g_scabbard.last_ns == now);
     ApplyLeverGrip(s, local, now);
     ApplyMusicBoxGrip(s, local, now);
     std::memcpy(s.written_locals.data(), local, sizeof(s.written_locals));
@@ -3181,11 +3672,31 @@ void PublishStatus(PoseSide& s, s64 now, bool driven) {
         status.tracked[i] = s.use[i] != B::HandUse::Lost;
     }
     status.items_ok = s.gate_out.items_ok;
+    status.transform_interrupted = B::PhysicalTransformInterrupted(s.gate_out);
     status.weapon_id = s.weapon_id >= 0 ? s.weapon_id : -1;
     status.weapon_slot = s.weapon_slot;
     status.left_weapon_slot = s.left_weapon_slot;
     status.weapon_family = s.weapon_id >= 0 ? s.weapon_family : -1;
+    const bool scabbard_enabled = VR::Tricks::Scabbard(status.weapon_family);
+    if (!scabbard_enabled) g_scabbard_request_weapon = -1;
+    if (g_scabbard.last_ns && (!scabbard_enabled || !status.driven || status.weapon_id != g_scabbard.weapon_id ||
+                               now - g_scabbard.last_ns >= VR::Chikage::DrawFreshNs)) {
+        g_scabbard = {};
+    }
+    status.scabbard_form_b = g_scabbard.form_b;
+    status.scabbard_clip_release_ns = g_scabbard.clip_release_ns;
+    status.scabbard_pose_ns = g_scabbard.last_ns;
+    status.scabbard_in = g_scabbard.out.in;
+    status.scabbard_loaded = g_scabbard.out.loaded;
+    status.scabbard_build = g_scabbard.out.build;
+    status.scabbard_depth = g_scabbard.out.depth;
+    status.scabbard_near = g_scabbard.at_hand;
+    status.scabbard_held = g_scabbard.grab.held;
+    SetScabbardHand(status.scabbard_held ? status.scabbard_pose_ns : 0);
     status.left_weapon_family = s.left_weapon_id >= 0 ? B::Weapons::FamilyOf(s.left_weapon_id) : -1;
+    // A right-hand weapon's voice line the first time it comes to hand (core/vr/weapon_voice.h):
+    // one compare while that weapon is unchanged.
+    VR::WeaponVoice::Tick(status.weapon_family, now);
     status.guard_serial = s.guard_serial;
     status.guard_clip = s.guard_clip;
     // Physical evasion: leaning counts in idle, locomotion, your attacks, guard and items; never
@@ -3756,11 +4267,17 @@ void PS4_SYSV_ABI OnPoseWritten(u8* chr) {
     if (body) {
         MainPoseWritten(chr);
     }
-    const B::GateOut& g = Pose().gate_out;
-    HeldPoseTick(chr, {body, g.reason, g.owner, g.held, B::BloodBulletVialWindow(g)});
+    const PoseSide& s = Pose();
+    const B::GateOut& g = s.gate_out;
+    const bool tonitrus = body && s.weapon_family == 130 && s.weapon_id >= 0;
+    // Only a hit or its get-up can refund a lift that already sent L1.
+    const bool hit = tonitrus && g.reason == B::GateReason::Anim &&
+                     (g.owner == B::AnimClass::Damage || g.owner == B::AnimClass::Dodge) &&
+                     B::PhysicalTransformInterrupted(g);
+    HeldPoseTick(chr, {body, g.reason, g.owner, g.held, B::BloodBulletVialWindow(g), tonitrus,
+                       hit});
     // The gun after the held item (a vial stepping aside for a pull is seen this update): its
     // shot, flash and status (core/vr/bloodborne_gun.h).
-    const PoseSide& s = Pose();
     // A weapon switch keeps both arms yours, but the game takes no shot or swing until it takes
     // R1 again (AnimGate's swing lock): the gun and the melee see the arm as the game's.
     // A kept dodge with dodge_attack takes the swing and the shot at once (GateOut::dodge_attack).
@@ -3778,7 +4295,8 @@ void PS4_SYSV_ABI OnPoseWritten(u8* chr) {
                         g.ik[C::Left] && g.attack_ok[C::Left],
                         body ? s.arm_weight[C::Left] : 0.0f, s.reused, s.anchor.base_yaw,
                         s.edits_in_pose ? s.locals.data() : nullptr,
-                        s.edits_in_pose && s.frame.valid ? &s.frame : nullptr, s.last_solve_ns});
+                        s.edits_in_pose && s.frame.valid ? &s.frame : nullptr, s.last_solve_ns,
+                        g_scabbard.weapon_id == s.weapon_id ? g_scabbard.burst_ns : 0});
     // The right hand's shots, after the melee update named the weapon and its form.
     BladeShotTick(chr, {body && s.inactive == nullptr && !DryRun(),
                         body && g.ik[C::Right] && g.attack_ok[C::Right] &&
@@ -4902,6 +5420,15 @@ void BodyRenderTick(const VR::CameraOverride* result, const float* position, boo
                      B::ChrYaw(frame) / B::Deg, result->base_yaw / B::Deg, result->eye,
                      result->aer ? 1 : 0);
         }
+    } else if (chr != nullptr) {
+        // A frame without the first-person camera (a cutscene, the aim camera, the virtual screen,
+        // flat play): the map he stands in and the fog it was loaded with all the same (the
+        // 2026-11-21 review: the Fog row switched there, then a travel, left the new area's fog
+        // undrawn until the first-person camera came back). Not the lamps' walls or the banks'
+        // floors: those measure round his place, the active camera's work.
+        VR::GameArea::Publish(Read<u32>(chr + VR::GameArea::PlayerMapOffset));
+        StrangeMoonTick();
+        FogStateFrame();
     }
     if (!anchor.valid) throw_rig.Reset();
     B::PublishAnchor(anchor);

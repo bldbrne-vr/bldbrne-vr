@@ -221,18 +221,47 @@ char OverlapMode() {
     return mode;
 }
 
-bool DestinationsOverlapPacked(std::span<const vk::BufferCopy> copies) {
-    static std::vector<u64> keys; // recording owner only
-    keys.clear();
-    keys.reserve(copies.size());
-    for (const auto& copy : copies) {
+// Build sorting keys for the overlap test. Adjacent regions can share one key because their
+// union has no gap. The Vulkan copy regions themselves stay in their original order.
+template <bool JoinAdjacent>
+bool PackCopyRanges(std::span<const vk::BufferCopy> copies, std::vector<u64>& keys) {
+    for (auto it = copies.begin(); it != copies.end();) {
+        const auto& copy = *it++;
         if (copy.size == 0) {
             continue;
         }
         if ((copy.dstOffset | copy.size) >> 32) {
-            return DestinationsOverlapSorted(copies);
+            return false;
         }
-        keys.push_back(copy.dstOffset << 32 | copy.size);
+        const u64 begin = copy.dstOffset;
+        u64 size = copy.size;
+        if constexpr (JoinAdjacent) {
+            while (it != copies.end() && it->dstOffset == begin + size &&
+                   it->size <= 0xFFFF'FFFFull - size) {
+                size += (it++)->size;
+            }
+        }
+        keys.push_back(begin << 32 | size);
+    }
+    return true;
+}
+
+bool DestinationsOverlapPacked(std::span<const vk::BufferCopy> copies) {
+    static std::vector<u64> keys; // recording owner only
+    keys.clear();
+    keys.reserve(copies.size());
+    // Large scatter/gather jobs often start or end with a long run of adjacent writes.
+    // Sample the ends once so short and scattered jobs use the simple packing loop.
+    const auto touch = [](const auto& first, const auto& next) {
+        return first.dstOffset + first.size == next.dstOffset;
+    };
+    const size_t n = copies.size();
+    const bool join = n >= 32 &&
+                      (touch(copies[0], copies[1]) || touch(copies[n - 2], copies[n - 1]));
+    const bool keys_fit =
+        join ? PackCopyRanges<true>(copies, keys) : PackCopyRanges<false>(copies, keys);
+    if (!keys_fit) {
+        return DestinationsOverlapSorted(copies);
     }
     if (!std::is_sorted(keys.begin(), keys.end())) {
         std::sort(keys.begin(), keys.end());
@@ -902,6 +931,10 @@ const bool g_enabled = [] {
     const char* value = std::getenv("FAST_HLE_COPY_SINK");
     return !(value && value[0] == '0');
 }();
+const bool g_skip_overwritten = [] {
+    const char* value = std::getenv("FAST_HLE_SKIP_OVERWRITTEN");
+    return !(value && value[0] == '0');
+}();
 constexpr unsigned AbSwitch = 13; // FastRender::AbOn
 
 /// One bit per 4 KiB page of the 40-bit guest address space, in 1 GiB chunks made on first use and
@@ -1103,6 +1136,36 @@ void Report(State& st) {
     }
 }
 
+/// A later copy in this flush replaces the same bytes before a transfer reads them.
+/// A source with a right-eye twin can also privatize blocks in the destination: keep that copy.
+bool OverwrittenBeforeRead(std::span<const Group> groups, std::span<const vk::BufferCopy> regions,
+                           size_t index) {
+    const auto& write = groups[index];
+    constexpr size_t LookAhead = 8;
+    constexpr u32 MaxRegions = 128;
+    if (write.count > MaxRegions) {
+        return false;
+    }
+    const size_t following = std::min(LookAhead, groups.size() - index - 1);
+    for (const auto& next : groups.subspan(index + 1, following)) {
+        if (next.src == write.dst) {
+            break;
+        }
+        if (next.dst != write.dst) {
+            continue;
+        }
+        if (next.count != write.count) {
+            break;
+        }
+        const auto a = regions.subspan(write.first, write.count);
+        const auto b = regions.subspan(next.first, next.count);
+        return std::equal(a.begin(), a.end(), b.begin(), [](const auto& x, const auto& y) {
+                   return x.dstOffset == y.dstOffset && x.size == y.size;
+               }) && !NativeStereo::ExistingRight(write.src);
+    }
+    return false;
+}
+
 /// Scheduler::EndRenderingNow's hook (armed while calls wait): the pass has just ended.
 void Flush(Scheduler& scheduler) {
     State& st = Get();
@@ -1128,6 +1191,9 @@ void Flush(Scheduler& scheduler) {
             cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                                    vk::PipelineStageFlagBits::eTransfer,
                                    vk::DependencyFlagBits::eByRegion, BeforeCopies, {}, {});
+        }
+        if (g_skip_overwritten && OverwrittenBeforeRead(st.groups, st.regions, i)) {
+            continue;
         }
         NativeStereo::Copy(scheduler, group.src, group.dst,
                            std::span{st.regions}.subspan(group.first, group.count), true);

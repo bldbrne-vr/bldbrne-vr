@@ -56,7 +56,10 @@ struct Choice {
 
 // The clip a squeeze plays now for the right weapon `family` (EquipParamWeapon id / 100000) in arm
 // style `style`. `untested`: rows not yet seen working may be used (transform_untested).
-inline Choice Choose(std::int32_t family, std::int32_t style, bool untested) {
+// `scabbard`: the Chikage's rows too (kept on L1 otherwise: chikage_scabbard, core/vr/chikage.h;
+// the blooded form's drain is its resident SpEffect 6740, valid in that form by itself).
+inline Choice Choose(std::int32_t family, std::int32_t style, bool untested,
+                     bool scabbard = false) {
     if (family < 0) {
         return {nullptr, "no right weapon"};
     }
@@ -76,7 +79,7 @@ inline Choice Choose(std::int32_t family, std::int32_t style, bool untested) {
         if (c.to_b != to_b) {
             continue;
         }
-        if (c.support == Support::Vanilla) {
+        if (c.support == Support::Vanilla && !(scabbard && family == 20)) {
             return {nullptr, c.why != nullptr ? c.why : "kept on L1"};
         }
         if (c.style == style || c.length <= 0.0f || c.t_style <= 0.0f || c.t_style >= c.length) {

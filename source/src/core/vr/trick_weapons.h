@@ -118,6 +118,22 @@ struct Settings {
     // two-handed form still sends the left trigger to the game as L2 (its canned special, with
     // the animation); in every other two-handed form the left trigger does nothing.
     std::string l2_canned{"bloodletter,kos_parasite"};
+    // chikage_scabbard (core/vr/chikage.h; the tester, 2026-11-19): the Chikage's scabbard on the
+    // hip, or taken in the left hand. The blade slid into it comes out bloodied (the same blade:
+    // its next hit that lands deals chikage_blood_pct more); a seated blade drawn faster than
+    // chikage_draw_speed (m/s) is the quick draw, the charged attack at once with a step forward
+    // (the left stick ahead for chikage_draw_step_ms; 0: none). Its blooded form is both hands on
+    // the handle, as the other grab weapons, now without the hunter's animation. 0: no scabbard
+    // play, and the form through L1 as before.
+    bool chikage_scabbard{true};
+    float chikage_draw_speed{1.8f};
+    // (320 until 2026-11-20 night, the user: "it moves us a little forward ... a bit more (like
+    // 50-70cm)"; 450 for one build, then "a little sooner and a little faster and a little
+    // further")
+    // (0 from that night: the dash, chikage.h DashM, is the draw's movement; the stick's step
+    // after it felt like "a slow one after which feels bad".)
+    float chikage_draw_step_ms{0.0f};
+    float chikage_blood_pct{30.0f};
 };
 
 inline Settings& GetTrickSettings() {
@@ -142,6 +158,21 @@ inline bool ParseTrickSetting(const std::string& key, const std::string& value) 
         s.stake_blast = on;
     } else if (key == "weapon_hum") {
         s.weapon_hum = on;
+    } else if (key == "chikage_scabbard") {
+        s.chikage_scabbard = on;
+    } else if (key == "chikage_draw_speed") {
+        float v = s.chikage_draw_speed;
+        std::from_chars(value.data(), value.data() + value.size(), v);
+        s.chikage_draw_speed = std::isfinite(v) ? std::clamp(v, 0.8f, 5.0f) : s.chikage_draw_speed;
+    } else if (key == "chikage_draw_step_ms") {
+        float v = s.chikage_draw_step_ms;
+        std::from_chars(value.data(), value.data() + value.size(), v);
+        s.chikage_draw_step_ms =
+            std::isfinite(v) ? std::clamp(v, 0.0f, 600.0f) : s.chikage_draw_step_ms;
+    } else if (key == "chikage_blood_pct") {
+        float v = s.chikage_blood_pct;
+        std::from_chars(value.data(), value.data() + value.size(), v);
+        s.chikage_blood_pct = std::isfinite(v) ? std::clamp(v, 0.0f, 100.0f) : s.chikage_blood_pct;
     } else if (key == "saw_spin") {
         s.saw_spin = on;
     } else if (key == "kos_visions") {
@@ -264,6 +295,15 @@ inline void WriteTrickDefaults(std::ostream& out) {
         << "# 1 = the transformed Whirligig Saw and Boom Hammer hum faintly in your hand and rev "
            "up as you swing\n"
         << "weapon_hum=" << b(d.weapon_hum) << "\n"
+        << "# 1 = the Chikage's scabbard: slide the blade into the scabbard on your left hip (or "
+           "take the\n# scabbard in your left hand) and it comes out bloodied: its next hit that "
+           "lands deals this\n# much more (%); a seated blade pulled out fast (m/s) is the quick "
+           "draw, a charged attack\n# with a step forward (the left stick ahead this long, ms; 0: "
+           "none). Both hands on the handle:\n# its blooded form. (0: no scabbard play)\n"
+        << "chikage_scabbard=" << b(d.chikage_scabbard) << "\n"
+        << "chikage_draw_speed=" << d.chikage_draw_speed << "\n"
+        << "chikage_draw_step_ms=" << d.chikage_draw_step_ms << "\n"
+        << "chikage_blood_pct=" << d.chikage_blood_pct << "\n"
         << "# 1 = the transformed Whirligig Saw held with both hands (the left grip on its "
            "handle): left trigger\n# (right in the optimized scheme) held spins it up, let go it "
            "spins down (never the "
@@ -333,6 +373,13 @@ constexpr bool UsesL1(std::int32_t family) {
 constexpr bool GrabFamily(std::int32_t family) {
     return family == 20 || family == 50 || family == 51 || family == 80 || family == 81 ||
            family == 100 || family == 120 || family == 310;
+}
+
+// The Chikage played with its scabbard (Settings::chikage_scabbard, core/vr/chikage.h): its
+// blooded form (both hands on the handle, as the grab group's) comes and goes without the
+// hunter's animation.
+inline bool Scabbard(std::int32_t family) {
+    return family == 20 && GetTrickSettings().chikage_scabbard;
 }
 
 // What a right-grip squeeze does (RightGrip).
@@ -1312,6 +1359,7 @@ public:
         bool holding{false};   // the hilt is held ...
         float progress{0.0f};  // ... its way to the split (0 .. 1)
         bool missed{false};    // a squeeze for the split or the join that never took (a soft no)
+        bool show_split_hilt{false};
     };
 
     // Back to idle, the left grip as it is now (a grip already held is no squeeze).
@@ -1346,6 +1394,8 @@ public:
                 Join(f, grip, edge, hands, out);
             } else if (ready || held) {
                 Split(f, s, grip, edge, hands, out);
+                out.show_split_hilt = ready && hands && !held && cooldown <= 0.0f &&
+                                      (!grip || hands_near) && out.gesture == Gesture::None;
             }
             break;
         case Kind::Bloodletter:
@@ -1581,8 +1631,9 @@ public:
     };
 
     // Every gameplay frame: `f.right.grip` the right grip (latched), `use` the weapon's
-    // (GripUseOf), `family` it.
-    Out Step(const Frame& f, GripUse use, std::int32_t family, const Settings& s) {
+    // (GripUseOf), `family` it. An interrupted lift requires another squeeze.
+    Out Step(const Frame& f, GripUse use, std::int32_t family, const Settings& s,
+             bool lift_interrupted = false) {
         Out out{};
         const bool grip = f.right.grip;
         const bool edge = grip && !prev_grip;
@@ -1629,6 +1680,12 @@ public:
             }
             break;
         case GripUse::Lift:
+            if (lift_interrupted) {
+                // The held grip is still sampled, so it must open before it can start again.
+                charging = false;
+                break;
+            }
+            [[fallthrough]];
         case GripUse::Hold: {
             // (Followed every frame, the grip held or not: a strike comes in from outside.)
             const bool struck = use == GripUse::Hold && StrikeLights(family) && Struck(f);

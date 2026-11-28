@@ -1,3 +1,4 @@
+#include "core/vr/s1_dynamic_resolution.h"
 #include <unordered_map>
 #include <utility>
 #include "video_core/fast_render.h"
@@ -1107,11 +1108,17 @@ bool Rasterizer::VrInjectInFrame(bool upscaled) {
     if (stereo && !vr_inframe_right->Active()) {
         return false;
     }
+    if (S1Drs::enabled && drs.drop && !rec.s1_render_drop) {
+        // GetRecord can return the original pose, without the draw copy's wider FOV.
+        for (u32 eye = 0; eye < 2; ++eye)
+            rec.eye_fov[eye] = S1Drs::Expanded(rec.eye_fov[eye], drs.drop, eye);
+    }
     VR::InFrame::RenderList list{};
     const float aspect = rec.proj_aspect > 0.0f ? rec.proj_aspect
                              : static_cast<float>(depth_extent.width) / depth_extent.height;
-    std::array<NativeProjection::Transform, 2> projections{};
-    if (stereo && NativeStereo::AsymmetricProjection()) {
+    const auto item_projections = [&] {
+        std::array<NativeProjection::Transform, 2> projections{};
+        if (!stereo || !NativeStereo::AsymmetricProjection()) return projections;
         const float tan_y = std::tan(rec.proj_vfov * 0.5f);
         for (u32 eye = 0; eye < 2; ++eye) {
             const auto fov = NativeStereo::SceneEyeFov(rec, eye);
@@ -1122,7 +1129,9 @@ bool Rasterizer::VrInjectInFrame(bool upscaled) {
         if (!projections[0].valid || !projections[1].valid) {
             projections = {}; // same all-or-neither fallback as the scene camera
         }
-    }
+        return projections;
+    };
+    auto projections = item_projections();
     const float eye_half_width = stereo ? 0.5f * NativeStereo::Ipd(rec) * rec.world_scale : 0.0f;
     float horizontal_extent = 1.0f, vertical_extent = 1.0f;
     for (const auto& projection : projections) {
@@ -1175,22 +1184,9 @@ bool Rasterizer::VrInjectInFrame(bool upscaled) {
     GpuPassProfiler::MarkAt(scheduler, 0x1F4A'0000'0001ull, GpuPassProfiler::Group::VrHost,
                             "VR in-frame items: transits and scene probes");
     depth->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
-    // The scene's light around our items (a box-filtered copy of X), then X as the target.
+    // The scene's light around our items (a box-filtered copy of X, made below once the items'
+    // target is known), then X as the target.
     x->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
-    // Both eyes' mip chains level by level (one barrier per level for both). In-run A/B switch 8
-    // cleared: each eye's chain on its own, as before (twice the barriers).
-    const std::array<VrInFrame::ProbeSource, 2> probe_eyes{{{vr_inframe.get(), 0},
-                                                            {vr_inframe_right.get(), 1}}};
-    const std::span<const VrInFrame::ProbeSource> probe_list{probe_eyes.data(), stereo ? 2u : 1u};
-    if (FastRender::AbOn(8)) {
-        VrInFrame::ProbeScenes(scheduler.Commands(), probe_list, x->GetImage(), x_format,
-                               depth_extent);
-    } else {
-        for (const auto& eye : probe_list) {
-            VrInFrame::ProbeScenes(scheduler.Commands(), {&eye, 1}, x->GetImage(), x_format,
-                                   depth_extent);
-        }
-    }
     // S1 (FAST bit 51): the eyes are made from the reconstructed output-size twin of X, so our
     // items go into it, against the scene depth blitted to its size (nearest, depth aspect).
     // Only when the UI layer (mode 1, VrUiArm) takes the eyes from that twin: otherwise the eyes
@@ -1258,7 +1254,7 @@ bool Rasterizer::VrInjectInFrame(bool upscaled) {
         const bool scaled = vr_temporal->S1ScaleDepth(
             cmd, mode, *depth, depth_extent, whole->depth.image, {whole->width, whole->height}, 2,
             depth->backing->image.image_ci.format, vk::ImageAspectFlagBits::eDepth,
-            whole->depth_targets, {});
+            whole->depth_targets, {}, drs.drop);
         if (draw) {
             // As the copies below and the game's next use expect it.
             depth->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
@@ -1281,6 +1277,33 @@ bool Rasterizer::VrInjectInFrame(bool upscaled) {
                                        vk::AccessFlagBits2::eColorAttachmentWrite);
         } else {
             whole = nullptr; // nothing was recorded: the items go into X as without S1
+        }
+    }
+    // The scene's light: both eyes' mip chains level by level (one barrier per level for both).
+    // In-run A/B switch 8 cleared: each eye's chain on its own, as before (twice the barriers).
+    // Items drawn into S1's output under dynamic resolution have the headset's projection (below),
+    // while X holds that view only in its middle (100 - drop)%: the copy is then made from that
+    // part alone, the part S1ScaleDepth takes of the depth, so A Call Beyond's gray world, the
+    // Tonitrus strike's flash, the items' light and the vial's glass read the scene they are drawn
+    // over, not a shrunken one with the undrawn margin (2026-11-24 review). Same size: nothing
+    // allocated by a step.
+    GpuPassProfiler::MarkAt(scheduler, 0x1F4A'0000'0001ull, GpuPassProfiler::Group::VrHost,
+                            "VR in-frame items: transits and scene probes");
+    const vk::Offset2D probe_inset =
+        whole && S1Drs::enabled && drs.drop
+            ? vk::Offset2D{static_cast<s32>(S1Drs::Margin(depth_extent.width, drs.drop)),
+                           static_cast<s32>(S1Drs::Margin(depth_extent.height, drs.drop))}
+            : vk::Offset2D{};
+    const std::array<VrInFrame::ProbeSource, 2> probe_eyes{{{vr_inframe.get(), 0},
+                                                            {vr_inframe_right.get(), 1}}};
+    const std::span<const VrInFrame::ProbeSource> probe_list{probe_eyes.data(), stereo ? 2u : 1u};
+    if (FastRender::AbOn(8)) {
+        VrInFrame::ProbeScenes(scheduler.Commands(), probe_list, x->GetImage(), x_format,
+                               depth_extent, probe_inset);
+    } else {
+        for (const auto& eye : probe_list) {
+            VrInFrame::ProbeScenes(scheduler.Commands(), {&eye, 1}, x->GetImage(), x_format,
+                                   depth_extent, probe_inset);
         }
     }
     if (!whole && !up) {
@@ -1306,6 +1329,11 @@ bool Rasterizer::VrInjectInFrame(bool upscaled) {
     if (whole) {
         target.extent = target.depth_extent = {whole->width, whole->height};
         target.depth_image = whole->depth.image;
+        if (S1Drs::enabled && drs.drop) {
+            // Only the successfully reconstructed target has the headset projection.
+            rec.eye_fov = rec.eye_located_fov;
+            projections = item_projections();
+        }
     }
     if (up) {
         // True RGBA (the provider read X through its component swap); the probe stays X's.
@@ -1382,6 +1410,11 @@ static constexpr auto S1HudOutput = static_cast<FastRender::Bit>(59);
 
 void Rasterizer::VrUiArm(s32 mode) {
     vr_ui.mode = static_cast<u8>(mode);
+    if (drs.native) {
+        drs.clip_scene = false;
+        drs.scissor_key = 0;
+        scheduler.SetFoveationDrop(0);
+    }
     const auto refuse = [&](u32 bit, const char* why) {
         vr_ui.refused = why;
         UiWarnOnce(bit, fmt::format("{}; such frames keep the HUD in the eye images", why));
@@ -1455,12 +1488,31 @@ void Rasterizer::VrUiArm(s32 mode) {
                                                  vk::ImageLayout::eTransferSrcOptimal, format,
                                                  {whole->width, whole->height}, components, 2);
             whole->ui_scene += captured ? 1 : 0;
+            if (S1Drs::enabled) drs.pair_captured = captured;
         } else {
             x->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
                        {});
-            captured = vr_ui_layer->CaptureScene(scheduler.Commands(), x->GetImage(),
-                                                 vk::ImageLayout::eTransferSrcOptimal, format,
-                                                 extent, components, x->native_stereo ? 2 : 1);
+            if (drs.native && mode == 1 && x->native_stereo && NativeStereo::AsymmetricProjection()) {
+                if (drs_native_format != format) {
+                    drs_native_format = format;
+                    drs_native_blit = instance.IsFormatSupported(format,
+                        vk::FormatFeatureFlagBits2::eBlitSrc | vk::FormatFeatureFlagBits2::eBlitDst |
+                        vk::FormatFeatureFlagBits2::eSampledImageFilterLinear);
+                }
+                const bool same_size = drs_native_extent == extent;
+                const unsigned floor = S1Drs::QualityFloor(std::min(extent.width, extent.height));
+                drs_native_extent = extent;
+                S1Drs::floor_percent.store(floor, std::memory_order_relaxed);
+                drs.sample_candidate = drs_native_blit && floor < 100 && same_size &&
+                                       drs.drop <= 100 - floor;
+            }
+            // A reduced pair is usable only when both layers can be expanded together.
+            if (!drs.native || !drs.drop || drs.sample_candidate) {
+                captured = vr_ui_layer->CaptureScene(scheduler.Commands(), x->GetImage(),
+                    vk::ImageLayout::eTransferSrcOptimal, format, extent, components,
+                    x->native_stereo ? 2 : 1, drs.native ? drs.drop : 0);
+            }
+            if (drs.native) drs.pair_captured = captured && drs.sample_candidate;
         }
         if (!captured) {
             vr_ui_layer->EndFrame();
@@ -2360,7 +2412,7 @@ std::string Rasterizer::VrUiLogTag() const {
                        vr_ui.backdrop);
 }
 
-void Rasterizer::VrEndFrame() {
+void Rasterizer::VrEndFrame(bool used_layer_scene) {
     if (g_draw_breakdown) [[unlikely]] {
         ReportBreakdown();
     }
@@ -2464,12 +2516,17 @@ void Rasterizer::VrEndFrame() {
                 }
             }
             // A lamp not listed this frame (looked away from) keeps its slot LingerFrames: its cube
-            // stays warm, no blink when it comes back.
+            // stays warm, no blink when it comes back. One a draw listed past its range (a live
+            // switch to a shorter tier, a warp) keeps it too, with no shadow (its fade there).
             std::array<u32, SlotN> next_unseen{};
             std::array<bool, SlotN> lingering{};
+            const u32 out_of_range = std::exchange(vr_scene.out_of_range, 0u);
             for (u32 j = 0; j < vr_scene.count; ++j) {
                 if (!taken[j] && (vr_scene.flags[j] & Scene::SlotUsed) && vr_scene.unseen[j] < Scene::LingerFrames) {
                     next[j] = vr_scene.chosen[j];
+                    if ((out_of_range >> j) & 1u) {
+                        next[j].strength = 0.0f;
+                    }
                     next_flags[j] = Scene::SlotUsed;
                     next_age[j] = std::min(vr_scene.age[j] + 1, 1u << 30);
                     next_unseen[j] = vr_scene.unseen[j] + 1;
@@ -2527,44 +2584,64 @@ void Rasterizer::VrEndFrame() {
             vr_scene.flags = next_flags;
             vr_scene.age = next_age;
             vr_scene.count = extent;
-            // High lamp shadows (light_shadow.h High, SlotHero): the slots whose lamps march at full
-            // resolution in the lamp shaders. Among the lamps listed this frame that cast, the ones
-            // lighting the most of the view (a lamp in a hand scores the most: the torch, the
-            // lantern), at most HeroLamps; a hero's score counts 1 / HeroKeepShare against the
-            // others', so two lamps lighting about as much never trade the sharp shadows back and
-            // forth. (A kept lamp keeps its slot: last pick's bit is the same lamp's.)
-            {
-                const u32 was = vr_scene.hero_mask;
-                u32 heroes = 0;
-                if (VrLightShadowHigh()) {
-                    std::array<float, SlotN> rank{};
-                    u32 eligible = 0;
-                    for (u32 j = 0; j < extent; ++j) {
-                        const auto& lamp = vr_scene.chosen[j];
-                        if (!taken[j] || lingering[j] || !(next_flags[j] & Scene::SlotUsed) ||
-                            !(lamp.strength > 0.0f) || !(lamp.score > 0.0f)) {
-                            continue;
-                        }
-                        const bool kept = ((was >> j) & 1u) != 0 && !(next_flags[j] & Scene::SlotFresh);
-                        rank[j] = kept ? lamp.score / Scene::HeroKeepShare : lamp.score;
-                        eligible |= 1u << j;
+            // Retain visible lamps by score; reused slots never inherit the former occupant's priority.
+            // (zone_m > 0: only lamps whose light reaches within zone_m of the eye.)
+            const auto pick_lamps = [&](u32 was, u32 limit, u32 skip = 0, float zone_m = 0.0f) {
+                u32 selected = 0;
+                std::array<float, SlotN> rank{};
+                u32 eligible = 0;
+                for (u32 j = 0; j < extent; ++j) {
+                    const auto& lamp = vr_scene.chosen[j];
+                    if (!taken[j] || lingering[j] || !(next_flags[j] & Scene::SlotUsed) || ((skip >> j) & 1u) ||
+                        !(lamp.strength > 0.0f) || !(lamp.score > 0.0f) ||
+                        (zone_m > 0.0f && lamp.k > 0.0f &&
+                         !Scene::LightsEdgeZone(lamp.eye_m, 1.0f / std::sqrt(lamp.k), zone_m))) {
+                        continue;
                     }
-                    for (u32 n = 0; n < Scene::HeroLamps; ++n) {
-                        s32 best = -1;
-                        for (u32 j = 0; j < extent; ++j) {
-                            if (((eligible >> j) & 1u) != 0 && ((heroes >> j) & 1u) == 0 &&
-                                (best < 0 || rank[j] > rank[best])) {
-                                best = s32(j);
-                            }
-                        }
-                        if (best < 0) {
-                            break;
-                        }
-                        heroes |= 1u << best;
-                    }
+                    const bool kept = ((was >> j) & 1u) != 0 && !(next_flags[j] & Scene::SlotFresh);
+                    rank[j] = kept ? lamp.score / Scene::HeroKeepShare : lamp.score;
+                    eligible |= 1u << j;
                 }
-                vr_scene.hero_mask = heroes;
-            }
+                for (u32 n = 0; n < limit; ++n) {
+                    s32 best = -1;
+                    for (u32 j = 0; j < extent; ++j) {
+                        if (((eligible >> j) & 1u) != 0 && ((selected >> j) & 1u) == 0 &&
+                            (best < 0 || rank[j] > rank[best])) {
+                            best = s32(j);
+                        }
+                    }
+                    if (best < 0) {
+                        break;
+                    }
+                    selected |= 1u << best;
+                }
+                return selected;
+            };
+            // (No hero lamps since 2026-11-20: the old High's full-resolution march is gone.)
+            vr_scene.hero_mask = 0;
+            // The tier's edge lamps (light_shadow.h EdgeTierLamps). TEST (2026-11-19):
+            // VR_EDGE_LAMPS=0..16 the edge lamps a frame (the pass holds EdgeMaxLamps);
+            // VR_EDGE_SKIP_HEROES=1: none to hero lamps.
+            // (The tier's count each frame: the lamp shadows switch live, Low 2, Medium 3, High 5;
+            // only the test switch is read once. The 2026-11-21 review: a static kept the first
+            // frame's tier, so a switch to High still sharpened 3 and one to Low still 3.)
+            static const int edge_lamps_asked = [] {
+                const char* const e = std::getenv("VR_EDGE_LAMPS");
+                return e != nullptr ? std::max(std::atoi(e), 0) : -1;
+            }();
+            (void)VrLightShadowTier(); // (latched before the first frame end too)
+            const u32 edge_most = Scene::EdgePass() ? Scene::EdgeMaxLamps : Scene::Slots;
+            const u32 edge_lamps = std::min<u32>(
+                edge_lamps_asked >= 0 ? u32(edge_lamps_asked) : Scene::EdgeLampsNow(), edge_most);
+            static const bool edge_skip_heroes = [] {
+                const char* const e = std::getenv("VR_EDGE_SKIP_HEROES");
+                return e != nullptr && e[0] == '1';
+            }();
+            vr_scene.edge_mask = Scene::Edges() && VrSceneMaskOn()
+                                     ? pick_lamps(vr_scene.edge_mask, edge_lamps,
+                                                  edge_skip_heroes ? vr_scene.hero_mask : 0u,
+                                                  Scene::EdgeFar().second)
+                                     : 0;
             // The trace's reach by the GPU's time (light_shadow.h TraceFarLevels, Dial): one level
             // nearer after DialDownFrames frames running over DialDownShare of the game's frame
             // time, one level back after DialUpSeconds under DialUpShare.
@@ -2694,7 +2771,6 @@ void Rasterizer::VrEndFrame() {
         ++vr_fog.frame; // the lamp memory's frame (its camera, its once-a-frame update)
         vr_fog.density = density;
         vr_fog.on = Fog::Enabled(VR::IsEnabled(), VR::GetSettings().fog_light,
-                                 VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
                                  fog_override);
     }
     VrMoonEndFrame(); // the moonlight in the air's frame (vk_rasterizer_moon.cpp)
@@ -2708,7 +2784,7 @@ void Rasterizer::VrEndFrame() {
         vr_inframe_right->SweepDropped();
     }
     CompileTrace::EndFrame();
-    if (vr_temporal_enabled) VrTemporalEndFrame();
+    if (vr_temporal_enabled) VrTemporalEndFrame(used_layer_scene);
     VrNativeAuditEnd();
     VrProbeEndFrame();
     vr_dibr = {};

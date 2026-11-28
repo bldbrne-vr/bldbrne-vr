@@ -4,11 +4,18 @@
 #pragma once
 
 #include <span>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Vulkan {
+
+/// Compiles host GLSL into device-independent words using the same options as Compile().
+std::vector<u32> CompileGlsl(std::string_view code, vk::ShaderStageFlagBits stage,
+                             std::vector<std::string> defines = {});
 
 /**
  * @brief Creates a vulkan shader module from GLSL by converting it to SPIR-V using glslang.

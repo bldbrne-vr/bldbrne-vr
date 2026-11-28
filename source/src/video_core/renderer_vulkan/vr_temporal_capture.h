@@ -126,7 +126,8 @@ struct VrTemporalCapture {
     bool S1ScaleDepth(const RecorderProxy& cmd, VrDepthRescale::Mode mode, VideoCore::Image& src,
                       vk::Extent2D src_size, vk::Image dst, vk::Extent2D dst_size,
                       uint32_t layers, vk::Format format, vk::ImageAspectFlags aspects,
-                      std::span<vk::UniqueImageView> targets, vk::ImageAspectFlags keep);
+                      std::span<vk::UniqueImageView> targets, vk::ImageAspectFlags keep,
+                      unsigned drop = 0);
     std::unique_ptr<VrDepthRescale> depth_rescale; // made at the first unblittable copy
     bool S1Encode(vk::Format srgb);
     void S1ColorTo(vk::ImageLayout layout, vk::PipelineStageFlags2 stage, vk::AccessFlags2 access);

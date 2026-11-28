@@ -33,6 +33,7 @@
 #include <array>
 #include <cstddef>
 #include <initializer_list>
+#include <limits>
 #include <string_view>
 
 #include "common/types.h"
@@ -70,6 +71,65 @@ constexpr std::string_view Name(Runtime runtime) {
     }
 }
 
+// A +2/+0 prediction sequence may leave a usable slot between the predictions. Target it on
+// the +2 so the +0 can use its original slot. A duplicate (+0) of the refresh the previous
+// frame already claimed moves one refresh later, so the two do not share it (SteamVR would show
+// only the later one). Over Link SteamVR predicts 53-63 ms ahead, so the duplicate's refresh is
+// always well in the future here; requiring it to have started (2e38f7ddd) left every unpaired
+// +0 sharing its slot. Normal predictions never inherit a one-refresh delay, and a duplicate
+// moves at most one refresh past its prediction.
+struct SteamVrTargetHistory {
+    s64 prediction{};
+    s64 target{};
+    s64 period{};
+
+    constexpr s64 Next(s64 predicted, s64 current_period, s64 now) const {
+        if (target <= 0 || prediction <= 0 || period <= 0 || predicted <= 0 ||
+            current_period < 2 || now <= 0) {
+            return predicted;
+        }
+        const s64 period_change = current_period - period;
+        if (period_change > period / 100 || period_change < -period / 100) {
+            return predicted; // A new refresh rate needs a fresh target history.
+        }
+        const s64 half_period = current_period / 2;
+        const s64 prediction_step = predicted - prediction;
+        // OpenXR's target is the middle of the refresh. Leave 2 ms around its start for clock
+        // conversion and submit overhead. The caller only supplies a calibrated XR clock.
+        constexpr s64 margin = 2'000'000;
+        const s64 lead = half_period + margin;
+        // Real predictions drift by microseconds: an ordinary one right after a moved duplicate
+        // can land just before that duplicate's target, in the same refresh. Ask for that same
+        // time rather than one stepping back; a whole refresh or more back is a new timeline.
+        const auto in_order = [this, half_period](s64 result) {
+            return result < target && target - result < half_period ? target : result;
+        };
+        if (predicted > current_period && prediction_step >= current_period &&
+            prediction_step - current_period >= half_period) {
+            const s64 earlier = predicted - current_period;
+            if (earlier - target >= half_period && earlier - now >= lead) {
+                return earlier;
+            }
+        }
+        if (prediction_step <= -half_period || prediction_step >= half_period ||
+            predicted - target >= half_period ||
+            predicted > std::numeric_limits<s64>::max() - current_period) {
+            return in_order(predicted);
+        }
+        const s64 later = predicted + current_period;
+        if (later - now >= lead) {
+            return in_order(later); // (a period a few us shorter must not step back either)
+        }
+        // Too late even for the next refresh (a stall): the previous request, while still ahead,
+        // rather than a prediction already behind it (measured 2026-11-21: T+0.002 ms asked at
+        // T+6 ms while T+11.001 ms was still to come).
+        if (target > predicted && target > now) {
+            return target;
+        }
+        return in_order(predicted);
+    }
+};
+
 // An environment switch's value (`env`; nullptr: unset) is one of `words` (ASCII, lower case),
 // in any case.
 constexpr bool EnvIsWord(const char* env, std::initializer_list<std::string_view> words) {
@@ -87,6 +147,36 @@ constexpr bool EnvIsWord(const char* env, std::initializer_list<std::string_view
         }
     }
     return false;
+}
+
+// SteamVR's system name ends with its headset driver after " : ": "SteamVR/OpenXR : oculus" is a
+// Quest through Meta's Link or Air Link (SteamVR stacked on Meta's compositor, 2026-11-21 logs);
+// native SteamVR headsets name their own driver ("lighthouse" for Index and Vive...). The
+// display-time retarget answers the double takes of that stack, so it is for it only.
+constexpr bool SteamVrOverMetaLink(std::string_view system_name) {
+    const std::size_t colon = system_name.rfind(':');
+    if (colon == std::string_view::npos) {
+        return false;
+    }
+    std::string_view driver = system_name.substr(colon + 1);
+    while (!driver.empty() && (driver.front() == ' ' || driver.front() == '\t')) {
+        driver.remove_prefix(1);
+    }
+    while (!driver.empty() && (driver.back() == ' ' || driver.back() == '\t')) {
+        driver.remove_suffix(1);
+    }
+    constexpr std::string_view oculus = "oculus";
+    if (driver.size() != oculus.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < oculus.size(); ++i) {
+        const char c = driver[i] >= 'A' && driver[i] <= 'Z' ? static_cast<char>(driver[i] + 32)
+                                                            : driver[i];
+        if (c != oculus[i]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // A switch turned off: a value starting with '0' (as before), or "off", "false" or "no".

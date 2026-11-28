@@ -58,6 +58,10 @@ std::string Bool(bool b) {
     return b ? "1" : "0";
 }
 
+const char* LampShadowTierName(u8 tier) {
+    return tier == 0 ? "lite" : tier == 2 ? "high" : "medium";
+}
+
 // An upscaler's files beside the runtime (its folder there, or the VR_*_DIR override): a release
 // without FSR 4 or DLSS 5 greys their rows instead of offering a choice that cannot start.
 bool ProviderInstalled(const char* env, const char* folder, const char* file);
@@ -105,6 +109,8 @@ std::string ValueIn(const Settings &s, const Body::BodySettings &b, const Quick:
                     const std::string &key) {
     if (key == "play_style")
         return PlayStyle::Name(static_cast<PlayStyle::Style>(s.play_style));
+    if (key == "left_handed")
+        return Bool(s.left_handed);
     if (key == "tp_distance_pct")
         return std::to_string(std::lround(s.tp_distance_scale * 100.0f));
     if (key == "tp_view_follows_pitch")
@@ -183,6 +189,8 @@ std::string ValueIn(const Settings &s, const Body::BodySettings &b, const Quick:
         return FormatIni(s.snap_turn_deg);
     } else if (key == "smooth_turn_deg_per_s") {
         return FormatIni(s.smooth_turn_deg_per_s);
+    } else if (key == "lockon_follow") {
+        return std::to_string(s.lockon_follow);
     } else if (key == "haptic_gain") {
         return FormatIni(s.haptic_gain);
     } else if (key == "controls") {
@@ -234,6 +242,8 @@ std::string ValueIn(const Settings &s, const Body::BodySettings &b, const Quick:
         return std::to_string(s.outgoing_damage_pct);
     } else if (key == "player_hp_bonus_pct") {
         return std::to_string(s.player_hp_bonus_pct);
+    } else if (key == "empty_vial_refill") {
+        return std::to_string(s.empty_vial_refill);
     } else if (key == "dodge_iframes_extra") {
         return std::to_string(s.dodge_iframes_extra);
     } else if (key == "melee_kill_ragdoll") {
@@ -242,6 +252,9 @@ std::string ValueIn(const Settings &s, const Body::BodySettings &b, const Quick:
         return FormatIni(s.melee_ragdoll_impulse);
     } else if (key == "foveation") {
         return std::to_string(Graphics::foveation.load(std::memory_order_relaxed));
+    } else if (key == "foveation_feedback") {
+        return Graphics::FoveationFeedback(Graphics::foveation.load(std::memory_order_relaxed),
+                                           Graphics::foveation_applied.load(std::memory_order_relaxed));
     } else if (key == "dlss_model") {
         // The built-in model is M in this runtime (dlss_model.h): the page shows it as Best.
         const auto model = Graphics::dlss_model.load(std::memory_order_relaxed);
@@ -297,7 +310,7 @@ std::string ValueIn(const Settings &s, const Body::BodySettings &b, const Quick:
     } else if (key == "light_shadows") {
         return Bool(s.light_shadows);
     } else if (key == "light_shadow_detail") {
-        return s.light_shadow_high ? "high" : "low";
+        return LampShadowTierName(s.light_shadow_tier);
     } else if (key == "moon_shadows") {
         return Bool(s.moon_shadows);
     } else if (key == "ambient_occlusion") {
@@ -310,6 +323,9 @@ std::string ValueIn(const Settings &s, const Body::BodySettings &b, const Quick:
         return Bool(s.moon_shafts); // The page shows the Fog override separately.
     } else if (key == "fog_banks") {
         return Bool(s.fog_banks);
+    } else if (key == "fog_banks_loaded") {
+        // (The area was loaded with the fog banks: vr_session.h FogBanksLoaded. Not a setting.)
+        return Bool(FogBanksLoaded().load(std::memory_order_relaxed));
     } else if (key == "ground_mist") {
         return Bool(s.ground_mist);
     } else if (key == "cinematic_look") {
@@ -336,6 +352,16 @@ public:
         return ControlsView::NameOf(controller_parts, physical);
     }
     std::string Get(const std::string& key) override {
+        // Left-handed play: this session's, fixed at its start (VR::MirrorWorld, which also needs
+        // motion controls, first person and stereo eyes): the page's names and words follow it
+        // (vr_page.h PageMirror).
+        if (key == "left_handed")
+            return Bool(VR::MirrorWorld());
+        if (key == "upscale_focus_live_path") {
+            const auto c = Graphics::Accepted();
+            return Bool(std::getenv("VR_NATIVE_STEREO") && Graphics::S1Output().width &&
+                        ((c.upscaler == Graphics::Upscaler::Dlss && !c.dlss5) || Graphics::IsFsr(c.upscaler)));
+        }
         if (key == "gun_wrist_reload")
             return Bool(Gun::GetGunSettings().wrist_reload);
         const auto color = Color::Get();
@@ -363,6 +389,12 @@ public:
             return Bool(SummonBell::enabled.load());
         if (key == "physical_levers")
             return Bool(Lever::Enabled());
+        if (key == "empty_vial_refill")
+            return std::to_string(EmptyVialRefillCount());
+        if (key == "light_shadows")
+            return Bool(GetLampShadowRequest().enabled);
+        if (key == "light_shadow_detail")
+            return LampShadowTierName(GetLampShadowRequest().tier);
         if (key == "graphics_config")
             return Graphics::Serialize(Graphics::Saved());
         if (key == "graphics_native_stereo")
@@ -390,6 +422,26 @@ public:
             SaveSetting(key, value);
         }
     }
+    void SetChoice(const Row& row, const Option& option) override {
+        if (std::string_view(row.id) == "new_shadows") {
+            ApplyLampShadowChoice(option.values[0], option.values[1]);
+            SaveSetting(row.keys[0], option.values[0]);
+            SaveSetting(row.keys[1], option.values[1]);
+        } else {
+            Store::SetChoice(row, option);
+        }
+    }
+    void ResetRow(const Row& row) override {
+        if (std::string_view(row.id) != "new_shadows") {
+            Store::ResetRow(row);
+            return;
+        }
+        const auto& defaults = DefaultSettings();
+        ApplyLampShadowChoice(defaults.light_shadows ? "1" : "0",
+                              LampShadowTierName(defaults.light_shadow_tier));
+        RemoveSetting(row.keys[0]);
+        RemoveSetting(row.keys[1]);
+    }
     void Remove(const std::string& key) override {
         if (key == "weighted_weapons") {
             Set(key, "1"); // the default: on
@@ -402,14 +454,8 @@ public:
             RemoveSetting(key);
             return;
         }
-        // (The new graphics' by the card's memory: core/vr/card_tier.h.)
-        static const Settings defaults = [] {
-            Settings d{};
-            ApplyCardDefaults(d);
-            return d;
-        }();
         static const Body::BodySettings body_defaults{};
-        const std::string value = ValueIn(defaults, body_defaults, Quick::QuickSettings{},
+        const std::string value = ValueIn(DefaultSettings(), body_defaults, Quick::QuickSettings{},
                                           Melee::MeleeSettings{}, Tricks::Settings{}, key);
         if (!value.empty()) {
             ApplySetting(key, value);
@@ -418,6 +464,16 @@ public:
         if (key == "melee_stamina_pct")
             RemoveSetting("melee_stamina");
         RemoveSetting(key);
+    }
+
+private:
+    static const Settings& DefaultSettings() {
+        static const Settings defaults = [] {
+            Settings settings{};
+            ApplyCardDefaults(settings);
+            return settings;
+        }();
+        return defaults;
     }
 };
 

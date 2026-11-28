@@ -8,9 +8,8 @@
 #include <memory>
 #include <thread>
 #include <vector>
-#include <AL/al.h>
-#include <AL/alc.h>
-#include <alext.h>
+
+#include "core/libraries/audio/openal_manager.h"
 
 // Fallbacks in case the alext.h in use predates these extensions.
 #ifndef ALC_SOFT_output_mode
@@ -27,14 +26,18 @@
 #ifndef AL_SOFT_direct_channels_remix
 #define AL_REMIX_UNMATCHED_SOFT 0x0002
 #endif
+#include <chrono>
 #include <queue>
 #include "common/logging/log.h"
+#include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audio_clock.h"
 #include "core/libraries/audio/audioout_backend.h"
-#include "core/libraries/audio/openal_manager.h"
 #include "core/libraries/kernel/threads.h"
+#include "core/vr/audio_settings.h"
+#include "core/vr/mirror_world.h"
+#include "core/vr/vr_session.h"
 
 // SIMD support detection
 #if defined(__x86_64__) || defined(_M_X64)
@@ -88,11 +91,10 @@ public:
     }
 
     ~OpenALPortBackend() override {
-        // Unregister port before cleanup
+        Cleanup();
         if (device_registered) {
             OpenALDevice::GetInstance().UnregisterPort(device_name);
         }
-        Cleanup();
     }
 
     void Output(void* ptr) override {
@@ -102,11 +104,22 @@ public:
         if (ptr == nullptr) [[unlikely]] {
             return;
         }
-        if (!device_context->MakeCurrent(device_name)) {
+        u32 generation = 0;
+        const auto context = device_context->Bind(device_name, &generation);
+        if (!context) {
+            pace_by_period = true;
             return;
         }
-        if (const u32 reopens = device_context->Reopens(); reopens != seen_reopen) [[unlikely]] {
-            seen_reopen = reopens;
+        if (lead_buffers > 0) {
+            ALCint connected = ALC_TRUE;
+            alcGetIntegerv(alcGetContextsDevice(alcGetCurrentContext()), ALC_CONNECTED, 1, &connected);
+            if (!connected) {
+                pace_by_period = true;
+                return;
+            }
+        }
+        if (generation != seen_reopen) [[unlikely]] {
+            seen_reopen = generation;
             FlushQueue();
         }
 
@@ -123,50 +136,54 @@ public:
         if (fold_lfe) {
             FoldLfeIntoFronts();
         }
-
-        // Reclaim processed buffers
-        ALint processed = 0;
-        alGetSourcei(source, AL_BUFFERS_PROCESSED, &processed);
-
-        while (processed > 0) {
-            ALuint buffer_id;
-            alSourceUnqueueBuffers(source, 1, &buffer_id);
-            if (alGetError() == AL_NO_ERROR) {
-                available_buffers.push_back(buffer_id);
-                processed--;
+        if (mirror_sides) [[unlikely]] {
+            // Left-handed play (core/vr/mirror_world.h): left and right trade, as the world does.
+            const u32 out_channels = downmix_to_stereo ? 2u : num_channels;
+            if (use_native_float) {
+                VR::Mirror::SwapSides(std::span{al_buffer_float}, out_channels);
             } else {
-                break;
+                VR::Mirror::SwapSides(std::span{al_buffer_s16}, out_channels);
             }
         }
 
-        // Queue buffer
-        if (!available_buffers.empty()) {
-            ALuint buffer_id = available_buffers.back();
-            available_buffers.pop_back();
+        // A stopped streaming source starts again at the head of its old queue.
+        // Reclaim it before adding fresh PCM, for both timing modes.
+        ALint state = 0;
+        alGetSourcei(source, AL_SOURCE_STATE, &state);
+        ReclaimProcessed();
+        if (state == AL_STOPPED) [[unlikely]] {
+            alSourceRewind(source);
+            ++ran_dry;
+        }
 
-            if (use_native_float) {
-                alBufferData(buffer_id, format, al_buffer_float.data(), buffer_size_bytes,
-                             sample_rate);
-            } else {
-                alBufferData(buffer_id, format, al_buffer_s16.data(), buffer_size_bytes,
-                             sample_rate);
+        if (!available_buffers.empty()) {
+            if (!QueueConvertedBuffer()) {
+                pace_by_period = true;
+                return;
             }
-            alSourceQueueBuffers(source, 1, &buffer_id);
         } else {
             ++dropped_full; // the queue is full: this buffer is lost (a click)
         }
 
-        // Check state and queue health
-        ALint state = 0;
+        // If the mixer stopped during submission, recover on the next call.
         ALint queued = 0;
         alGetSourcei(source, AL_SOURCE_STATE, &state);
         alGetSourcei(source, AL_BUFFERS_QUEUED, &queued);
 
-        if (state != AL_PLAYING && queued > 0) {
+        if (lead_buffers > 0) {
+            // Rewound after running dry (or a flushed queue): plays again once the lead is back,
+            // one gap instead of a run of them.
+            if (state == AL_INITIAL && queued >= static_cast<ALint>(lead_buffers)) {
+                alSourcePlay(source);
+                alGetSourcei(source, AL_SOURCE_STATE, &state);
+                pace_by_period = state != AL_PLAYING;
+            } else if (state == AL_PLAYING) {
+                pace_by_period = false;
+            }
+        } else if (state == AL_INITIAL && queued > 0) {
             LOG_DEBUG(Lib_AudioOut, "Audio underrun detected (queued: {}), restarting source",
                       queued);
             alSourcePlay(source);
-            ++ran_dry; // the device played everything queued: a gap
         }
         // Every 10 s, only when something went wrong: what the listener would hear as clicks.
         if (current_time - glitch_log_us >= 10'000'000) {
@@ -182,8 +199,9 @@ public:
             glitch_log_us = current_time;
         }
 
-        // Only sleep if we have healthy buffer queue
-        if (queued >= 2) {
+        if (lead_buffers > 0) {
+            // Hold(), called by the port's thread once it lets go of the port's lock.
+        } else if (queued >= 2) { // Only sleep if we have healthy buffer queue
             HandleTiming(current_time);
         } else {
             next_output_time = current_time + period_us;
@@ -192,12 +210,30 @@ public:
         last_output_time.store(Kernel::sceKernelGetProcessTime(), std::memory_order_release);
         output_count++;
     }
+
+    bool PacesItself() const override {
+        return lead_buffers > 0 && source != 0 && convert != nullptr;
+    }
+
+    void Hold() override {
+        if (!pace_by_period) {
+            if (const auto context = device_context->Bind(device_name)) {
+                HoldLead();
+                return;
+            }
+        }
+        // No working playback clock. Throttle each submitted buffer outside the port lock,
+        // including retries until a disconnected or failed source actually plays again.
+        Common::PreciseSleepUntil(std::chrono::steady_clock::now() +
+                                      std::chrono::microseconds(period_us),
+                                  std::chrono::nanoseconds{0});
+    }
     void SetVolume(const std::array<int, 8>& ch_volumes) override {
-        if (!device_context->MakeCurrent(device_name)) {
+        if (!source) [[unlikely]] {
             return;
         }
-
-        if (!source) [[unlikely]] {
+        const auto context = device_context->Bind(device_name);
+        if (!context) {
             return;
         }
 
@@ -251,10 +287,10 @@ private:
 
         device_registered = true;
         device_context = &OpenALDevice::GetInstance();
-        seen_reopen = device_context->Reopens();
 
         // Make this device's context current
-        if (!device_context->MakeCurrent(device_name)) {
+        const auto context = device_context->Bind(device_name, &seen_reopen);
+        if (!context) {
             LOG_ERROR(Lib_AudioOut, "Failed to make OpenAL context current for device '{}'",
                       device_name);
             return false;
@@ -266,6 +302,25 @@ private:
 
         // Calculate timing parameters
         period_us = (1000000ULL * buffer_frames + sample_rate / 2) / sample_rate;
+        // audio_lead_ms (core/vr/audio_settings.h): that much of the game's sound kept queued,
+        // and room for twice it (OpenAL takes ~20 ms at a time); 0: the old 6 buffers.
+        if (const int lead_ms = VR::Sound::LeadMs(); lead_ms > 0 && period_us > 0) {
+            lead_buffers = static_cast<u32>(std::clamp<u64>(
+                (static_cast<u64>(lead_ms) * 1000 + period_us - 1) / period_us, 2, 64));
+            pool_buffers = lead_buffers * 2 + 4;
+        }
+        if (lead_buffers > 0) {
+            LOG_INFO(Lib_AudioOut,
+                     "Audio port timing: {} ms queued ahead ({} buffers of {} frames, room for "
+                     "{}), the output at the highest priority (audio_lead_ms={})",
+                     (lead_buffers * period_us + 500) / 1000, lead_buffers, buffer_frames,
+                     pool_buffers, VR::Sound::LeadMs());
+        } else {
+            LOG_INFO(Lib_AudioOut,
+                     "Audio port timing: the old {}-buffer queue on a {} us clock "
+                     "(audio_lead_ms=0)",
+                     pool_buffers, period_us);
+        }
 
         // Check for AL_EXT_FLOAT32 extension
         has_float_ext = alIsExtensionPresent("AL_EXT_FLOAT32");
@@ -337,26 +392,19 @@ private:
         current_gain.store(EmulatorSettings.GetVolumeSlider() * 0.01f, std::memory_order_relaxed);
         alSourcef(source, AL_GAIN, current_gain.load(std::memory_order_relaxed));
 
-        // Prime buffers with silence
-        if (use_native_float) {
-            std::vector<float> silence(buffer_frames * num_channels, 0.0f);
-            for (size_t i = 0; i < buffers.size() - 1; i++) {
-                ALuint buffer_id = available_buffers.back();
-                available_buffers.pop_back();
-                alBufferData(buffer_id, format, silence.data(), buffer_size_bytes, sample_rate);
-                alSourceQueueBuffers(source, 1, &buffer_id);
-            }
-        } else {
-            std::vector<s16> silence(buffer_frames * num_channels, 0);
-            for (size_t i = 0; i < buffers.size() - 1; i++) {
-                ALuint buffer_id = available_buffers.back();
-                available_buffers.pop_back();
-                alBufferData(buffer_id, format, silence.data(), buffer_size_bytes, sample_rate);
-                alSourceQueueBuffers(source, 1, &buffer_id);
-            }
+        // Prime buffers with silence (with a lead: the lead, the rest is room)
+        const size_t primed = lead_buffers > 0 ? lead_buffers : buffers.size() - 1;
+        // The conversion buffer is still zero-filled. Keep even a failed priming
+        // buffer available for the first real submission.
+        size_t queued = 0;
+        while (queued < primed && QueueConvertedBuffer()) {
+            ++queued;
         }
-
-        alSourcePlay(source);
+        if (queued == primed) {
+            alSourcePlay(source);
+        } else {
+            pace_by_period = true;
+        }
 
         LOG_INFO(Lib_AudioOut,
                  "Initialized OpenAL backend ({} Hz, {} ch, {} format, {}) for device '{}'",
@@ -366,20 +414,16 @@ private:
     }
 
     void Cleanup() {
-        if (!device_context || !device_context->MakeCurrent(device_name)) {
+        if (!device_context) {
+            return;
+        }
+        const auto context = device_context->Bind(device_name);
+        if (!context) {
             return;
         }
 
         if (source) {
-            alSourceStop(source);
-
-            ALint queued = 0;
-            alGetSourcei(source, AL_BUFFERS_QUEUED, &queued);
-            while (queued-- > 0) {
-                ALuint buf;
-                alSourceUnqueueBuffers(source, 1, &buf);
-            }
-
+            // Deleting the source releases its queue, including any unplayed priming buffers.
             alDeleteSources(1, &source);
             source = 0;
         }
@@ -428,13 +472,56 @@ private:
         }
     }
 
+    // A buffer belongs to the free list until OpenAL accepts it. An upload failure
+    // must never enqueue the previous contents of that buffer.
+    bool QueueConvertedBuffer() {
+        const ALuint buffer_id = available_buffers.back();
+        const void* samples = use_native_float ? static_cast<const void*>(al_buffer_float.data())
+                                               : static_cast<const void*>(al_buffer_s16.data());
+        alGetError(); // isolate these operations from earlier errors on this context
+        alBufferData(buffer_id, format, samples, buffer_size_bytes, sample_rate);
+        ALenum error = alGetError();
+        if (error == AL_NO_ERROR) {
+            alSourceQueueBuffers(source, 1, &buffer_id);
+            error = alGetError();
+        }
+        if (error != AL_NO_ERROR) {
+            if (!submission_failed) {
+                LOG_WARNING(Lib_AudioOut, "OpenAL buffer submission failed: {}", GetALErrorString(error));
+            }
+            submission_failed = true;
+            return false;
+        }
+        submission_failed = false;
+        available_buffers.pop_back();
+        return true;
+    }
+
     // After the device moved to another output (OpenALDevice::FollowOutputLocked): the queue
     // filled up while the device was stopped and would stay full, every timing wobble then
     // dropping a buffer (clicks). Start it over: stop, take every buffer back, re-time.
     void FlushQueue() {
         alSourceStop(source);
+        // Detach also clears unplayed buffers when the source was still priming.
+        alGetError();
+        alSourcei(source, AL_BUFFER, 0);
+        if (alGetError() == AL_NO_ERROR) {
+            available_buffers = buffers;
+        } else {
+            ReclaimProcessed();
+        }
+        alSourceRewind(source);
+        next_output_time = 0;
+        LOG_INFO(Lib_AudioOut, "Audio port queue restarted after an output change");
+    }
+
+    // Every buffer the device has played back into the pool.
+    void ReclaimProcessed() {
         ALint processed = 0;
         alGetSourcei(source, AL_BUFFERS_PROCESSED, &processed);
+        if (processed > 0) {
+            alGetError(); // a stale error must not hide a successful unqueue
+        }
         while (processed-- > 0) {
             ALuint buffer_id;
             alSourceUnqueueBuffers(source, 1, &buffer_id);
@@ -443,8 +530,36 @@ private:
             }
             available_buffers.push_back(buffer_id);
         }
-        next_output_time = 0;
-        LOG_INFO(Lib_AudioOut, "Audio port queue restarted after an output change");
+    }
+
+    // audio_lead_ms: wait while the lead is queued. The game's thread waits with this (its next
+    // buffer is taken once it returns), so the game's sound runs at the device's own rate, the
+    // queue never drifting full or empty; below the lead (filling, or rewound after running dry)
+    // it returns at once and the next buffer comes straight away. OpenAL takes ~20 ms at a time,
+    // so a wait is up to that long; MaxHold bounds it should the device stop taking any. It looks
+    // every half buffer (~2.7 ms): OpenAL's next take is ~20 ms off once it took some, so a
+    // finer look only adds wake-ups at the highest priority.
+    void HoldLead() {
+        const auto poll = std::chrono::microseconds(std::max<u64>(period_us / 2, 1000));
+        constexpr auto MaxHold = std::chrono::microseconds(50'000);
+        const auto give_up = std::chrono::steady_clock::now() + MaxHold;
+        while (true) {
+            ALint state = 0, queued = 0, processed = 0;
+            alGetSourcei(source, AL_SOURCE_STATE, &state);
+            if (state != AL_PLAYING) {
+                return; // building the lead: the next buffer now
+            }
+            alGetSourcei(source, AL_BUFFERS_QUEUED, &queued);
+            alGetSourcei(source, AL_BUFFERS_PROCESSED, &processed);
+            if (queued - processed < static_cast<ALint>(lead_buffers)) {
+                return;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= give_up) {
+                return;
+            }
+            Common::PreciseSleepUntil(std::min(now + poll, give_up), std::chrono::nanoseconds{0});
+        }
     }
 
     void HandleTiming(u64 current_time) {
@@ -588,7 +703,7 @@ private:
             return false;
         }
 
-        buffers.resize(NUM_BUFFERS);
+        buffers.resize(pool_buffers);
         alGenBuffers(static_cast<ALsizei>(buffers.size()), buffers.data());
         if (alGetError() != AL_NO_ERROR) {
             LOG_ERROR(Lib_AudioOut, "Failed to generate OpenAL buffers");
@@ -1082,6 +1197,11 @@ private:
     const std::array<int, 8> channel_layout;
 
     alignas(64) u64 period_us{0};
+    bool submission_failed{false}; // report the first failure in a run
+    bool pace_by_period{false}; // output thread only
+    // audio_lead_ms: the buffers kept queued (0: the old timing) and the pool's size.
+    u32 lead_buffers{0};
+    u32 pool_buffers{NUM_BUFFERS};
     alignas(64) std::atomic<u64> last_output_time{0};
     u64 next_output_time{0};
     u64 last_volume_check_time{0};
@@ -1091,7 +1211,7 @@ private:
 
     // OpenAL objects
     OpenALDevice* device_context{nullptr};
-    u32 seen_reopen{0}; // OpenALDevice::Reopens() last seen
+    u32 seen_reopen{0};
     ALuint source{0};
     std::vector<ALuint> buffers;
     std::vector<ALuint> available_buffers;
@@ -1107,6 +1227,8 @@ private:
     bool use_native_float{false};
     bool downmix_to_stereo{false};
     bool fold_lfe{false};
+    // Left-handed play: the session's mirror, fixed when the port opens (VR::MirrorWorld).
+    const bool mirror_sides{VR::MirrorWorld()};
     bool hrtf_active{false};
 
     // Converter function pointer

@@ -12,6 +12,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 // Immersive vitals (vr.ini hud_vitals): the hunter's HP, stamina and bullets as a brass-and-glass
 // Blood Gauge strapped to his left wrist (drawn into the game's frame, core/vr/
@@ -39,10 +40,22 @@ struct Status {
     std::int32_t rally_hp{0};
     std::int32_t stamina{0};
     std::int32_t max_stamina{0};
-    std::int32_t qs_bullets{0};    // Quicksilver Bullets (goods 900) carried
-    std::int32_t blood_bullets{0}; // Blood Bullets (goods 901): spent first, shown in red
+    std::int32_t qs_bullets{-1};    // Quicksilver Bullets (goods 900), -1 when unread
+    std::int32_t blood_bullets{-1}; // Blood Bullets (goods 901), -1 when unread
     std::int32_t bullet_cap{20};   // the quicksilver tube's full scale
-    bool ok{false};                // every read above succeeded
+    bool ok{false};                // required readings for the active HUD mode succeeded
+
+    [[nodiscard]] constexpr bool HasBulletCounts() const {
+        return qs_bullets >= 0 && blood_bullets >= 0;
+    }
+
+    [[nodiscard]] constexpr std::int32_t BulletTotal() const {
+        if (!HasBulletCounts()) {
+            return -1;
+        }
+        return static_cast<std::int32_t>(std::min<std::int64_t>(
+            std::int64_t{qs_bullets} + blood_bullets, std::numeric_limits<std::int32_t>::max()));
+    }
 };
 
 // The orange segment's end from the rally pool (ChrDataModule +0x108): HP + (int)pool, never past
@@ -204,12 +217,14 @@ struct ChangeTracker {
                 bits |= ChangeStaminaEmpty;
             }
         }
-        const std::int32_t before = BulletsShown(last);
-        const std::int32_t now = BulletsShown(s);
-        if (now < before) {
-            bits |= ChangeShot;
-        } else if (now > before) {
-            bits |= ChangeRestock;
+        if (s.HasBulletCounts() && last.HasBulletCounts()) {
+            const std::int32_t before = BulletsShown(last);
+            const std::int32_t now = BulletsShown(s);
+            if (now < before) {
+                bits |= ChangeShot;
+            } else if (now > before) {
+                bits |= ChangeRestock;
+            }
         }
         last = s;
         return bits;

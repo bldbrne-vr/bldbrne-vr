@@ -39,12 +39,70 @@ inline constexpr std::array<std::array<float, 3>, Count> Colors{{
 // What Site A read this update.
 struct Reading {
     std::int64_t steady_ns{0};
+    std::array<std::int64_t, Beasthood> proc_ns{}; // beasthood has a continuous gauge
+    std::array<float, Count> buildup{};
+    std::uint8_t active_poisons{}; // bits for the two active-duration HUD icons
     bool valid{false};
-    std::array<std::int32_t, Count> cur{}; // the remaining resistance
-    std::array<std::int32_t, Count> max{};
-    std::array<std::int32_t, 5> row_icon{-1, -1, -1, -1, -1}; // the game's meter (-1 = off)
-    std::array<std::int32_t, 5> row_len{};
 };
+
+static_assert(sizeof(Reading) <= 64); // keep the existing game-to-XR snapshot budget
+
+constexpr float Buildup(int current, int maximum) {
+    if (maximum <= 0 || current >= maximum) return 0.0f;
+    if (current <= 0) return 1.0f;
+    return float(maximum - current) / float(maximum);
+}
+
+// In the 1.09 HUD's two verified tables, slow poison is 6002 -> icon 1, rapid is
+// 6001 -> icon 4. Only an active-duration row confirms poison. Buildup uses the same icon.
+constexpr std::uint8_t PoisonCountdown(std::int32_t icon, std::uint8_t countdown) {
+    if (countdown != 1) return 0;
+    return icon == 1 ? 1u << SlowPoison : icon == 4 ? 1u << RapidPoison : 0;
+}
+
+inline constexpr std::int64_t FlareNs = 1'200'000'000;
+
+// Carry short activations across XR samples. A bit held for multiple game updates
+// represents one event. A delayed HUD countdown corroborates the same poisoning.
+struct Activations {
+    std::array<std::int64_t, Beasthood> times{};
+    unsigned previous_native{}, previous_poisons{}, older_poisons{};
+
+    void Observe(bool same_hunter, unsigned native, unsigned poisons, std::int64_t now,
+                 unsigned instant_resets = 0) {
+        if (!same_hunter) times = {};
+        const unsigned started = native & ~previous_native & 0xfu;
+        // Bleed and frenzy have no countdown. Retain their existing sudden-reset
+        // indication when the game's pending bit was consumed between samples.
+        // The HUD can briefly drop a row during a refresh.
+        const unsigned new_rows = poisons & ~(previous_poisons | older_poisons);
+        const unsigned corroboration = new_rows | instant_resets;
+        if (same_hunter && (started | corroboration)) {
+            for (unsigned t = 0; t < times.size(); ++t) {
+                const unsigned bit = 1u << t;
+                if ((started & bit) ||
+                    ((corroboration & bit) && (times[t] == 0 || now - times[t] >= FlareNs))) {
+                    times[t] = now;
+                }
+            }
+        }
+        older_poisons = same_hunter ? previous_poisons : 0;
+        previous_native = native;
+        previous_poisons = poisons;
+    }
+};
+// Save the gauge's capacity only when it is at least half built. Changing resistance
+// capacity (for example by changing attire) cannot count as an instant-damage event.
+struct InstantGauge {
+    int armed_capacity{};
+
+    bool Sample(float buildup, int capacity) {
+        const bool reset = armed_capacity > 0 && armed_capacity == capacity && buildup <= 0.02f;
+        armed_capacity = buildup >= 0.5f ? capacity : 0;
+        return reset;
+    }
+};
+
 inline SeqLock<Reading>& Channel() {
     static SeqLock<Reading> channel;
     return channel;
@@ -53,8 +111,12 @@ inline constexpr std::int64_t StaleNs = 500'000'000;
 
 inline constexpr float StartBuild = 0.04f;   // below this much build-up: nothing
 inline constexpr float BuildAlpha = 0.42f;    // the glow at a full build-up
+// The glow's rise with the build-up (BuildAlpha x its fraction to this power): the lower, the
+// sooner it darkens (2026-11-27: "make them appear sooner", darker faster, then halfway
+// back from 0.75; 1.25 before, when a fifth of a build-up showed at about a sixth of the
+// strength). It also drives the reach.
+inline constexpr float BuildCurve = 0.95f;
 inline constexpr float FlareAlpha = 0.80f;    // as it takes hold
-inline constexpr std::int64_t FlareNs = 1'200'000'000;
 inline constexpr float LastAlpha = 0.30f;     // breathing while it lasts
 inline constexpr float LastPeriodS = 1.6f;
 inline constexpr std::int64_t FadeNs = 250'000'000; // the colour's and the level's easing
@@ -73,52 +135,22 @@ struct Glow {
 
 class Tracker {
 public:
-    // Every frame with the latest reading. A poison that took hold lasts while the game's meter
-    // shows more rows than the build-ups under way explain (its row stays while it lasts; the
-    // newest poisons take those rows first).
     Glow Update(std::int64_t now, const Reading& r) {
         const bool fresh = r.valid && now >= r.steady_ns && now - r.steady_ns < StaleNs;
-        std::array<float, Count> build{};
-        int building = 0, rows = 0;
-        for (int t = 0; t < Count; ++t) {
-            if (fresh && r.max[t] > 0)
-                build[t] = std::clamp(float(r.max[t] - r.cur[t]) / float(r.max[t]), 0.0f, 1.0f);
-            building += build[t] > 0.0f ? 1 : 0; // any build-up has its row (shown or not)
-            // Taking hold: a build-up past half gone back to none in one reading (the game resets
-            // it to max as the status triggers; beasthood stays at 0 instead: full).
-            if (fresh && r.steady_ns != seen_ns_) {
-                if (last_build_[t] >= 0.5f && build[t] <= 0.02f) flare_ns_[t] = r.steady_ns;
-                last_build_[t] = build[t];
-            }
-        }
-        for (const auto icon : r.row_icon) rows += fresh && icon >= 0 ? 1 : 0;
-        if (fresh) seen_ns_ = r.steady_ns;
-        std::array<bool, Count> lasting{};
-        // A poison's row gone (cured): neither flare nor lasting poison. This also rejects
-        // a buildup reset caused by an antidote, which otherwise looks like activation.
-        // Instantaneous statuses keep their flare: their row need not survive the proc.
-        if (fresh && rows <= building)
-            for (int t : {SlowPoison, RapidPoison})
-                flare_ns_[t] = 0;
-        for (int extra = rows - building; extra > 0; --extra) {
-            int newest = -1;
-            for (int t : {SlowPoison, RapidPoison})
-                if (flare_ns_[t] > 0 && !lasting[t] && (newest < 0 || flare_ns_[t] > flare_ns_[newest]))
-                    newest = t;
-            if (newest < 0) break;
-            lasting[newest] = true;
-        }
         std::array<float, Count> want{};
         for (int t = 0; t < Count; ++t) {
-            float a = build[t] > StartBuild
-                          ? BuildAlpha * std::pow((build[t] - StartBuild) / (1.0f - StartBuild), 1.25f)
+            const float build = fresh ? r.buildup[t] : 0.0f;
+            float a = build > StartBuild
+                          ? BuildAlpha * std::pow((build - StartBuild) / (1.0f - StartBuild),
+                                                  BuildCurve)
                           : 0.0f;
-            if (lasting[t]) {
+            if (fresh && (r.active_poisons & (1u << t))) {
                 const float s = float(now % 60'000'000'000LL) * 1e-9f;
                 a = std::max(a, LastAlpha * (0.65f + 0.35f * std::sin(s * 6.2831853f / LastPeriodS)));
             }
-            if (flare_ns_[t] > 0 && now >= flare_ns_[t] && now - flare_ns_[t] < FlareNs) {
-                const float f = float(now - flare_ns_[t]) / float(FlareNs);
+            if (fresh && t < Beasthood && r.proc_ns[t] > 0 && now >= r.proc_ns[t] &&
+                now - r.proc_ns[t] < FlareNs) {
+                const float f = float(now - r.proc_ns[t]) / float(FlareNs);
                 a = std::max(a, FlareAlpha * (1.0f - f) * (1.0f - f));
             }
             want[t] = a;
@@ -154,9 +186,8 @@ public:
     void Reset() { *this = {}; }
 
 private:
-    std::array<float, Count> last_build_{}, level_{};
-    std::array<std::int64_t, Count> flare_ns_{};
-    std::int64_t seen_ns_{0}, last_now_{0};
+    std::array<float, Count> level_{};
+    std::int64_t last_now_{0};
 };
 
 // The corners' looks (the tester's 2026-11-04 "more visceral ... not gradients (but be VERY
@@ -168,8 +199,8 @@ private:
 // warp's vr_eye_upscale.comp. The presenter grows the reach with the build-up (they creep in).
 inline constexpr float VeinReach = 0.62f;  // at a full build-up (fractions of the half-field)
 inline constexpr float VeinWidth = 0.021f; // a trunk's width at the corner (the same fractions)
-// A vein's opacity per unit of the glow's (2026-11-10, "make them bolder": 2.2 before).
-inline constexpr float VeinGain = 3.2f;
+// Opacity of markings already inside the lens; reach and full-strength alpha are capped separately.
+inline constexpr float VeinGain = 3.8f;
 // The heartbeat (beats per second): calm at the first build-up, racing as it takes hold.
 inline constexpr float VeinBeatHz = 0.85f, VeinBeatHzFull = 1.6f;
 inline constexpr float VeinSwayBeats = 6.0f; // the slow sway's period, in beats
@@ -249,7 +280,7 @@ inline Vein Veins(float qx, float qy, float reach, float beats, float width) {
     const float b_main = jit - sd * (0.04f + 0.08f * h2) * s1;
     const float at[3] = {b_main, jit + sd * (0.17f + 0.08f * h) * s1,
                          b_main + sd * (0.09f + 0.04f * h) * s2};
-    const float wide[3] = {width * std::pow(std::max(1.0f - t, 0.0f), 1.1f),
+    const float wide[3] = {width * (1.0f - 0.82f * t),
                            width * 0.62f * (1.0f - std::pow(VeinSmooth(r1, side_end, r), 0.8f)),
                            width * 0.45f * (1.0f - std::pow(VeinSmooth(r2, twig_end, r), 0.8f))};
     // The heartbeat runs out from the corner (lub, then a softer dub): they swell and brighten
@@ -362,7 +393,7 @@ inline Corner StatusWeb(float qx, float qy, float reach, float beats, float g) {
     const float arc = r * (Pi * 0.5f) / K;
     const float t = r / total;
     const float dt = std::abs(f - (VeinHash(cell + 7.0f * seed) - 0.5f) * 0.3f) * arc;
-    Vein web = VeinLine(dt, 0.0055f * (1.0f - t), 0.16f);
+    Vein web = VeinLine(dt, 0.0055f - 0.0040f * t, 0.16f);
     const float rr = std::sqrt(std::max(r + 0.048f * std::sin(u * 14.0f + seed * 3.1f) +
                                             0.016f * std::sin(u * 43.0f + seed), 0.0f));
     const float ring = std::floor(rr / 0.06f);
@@ -375,7 +406,7 @@ inline Corner StatusWeb(float qx, float qy, float reach, float beats, float g) {
     const float a = std::clamp(web.alpha * (1.0f - VeinSmooth(0.75f * total, total, r)) * pulse * 1.15f,
                                0.0f, 1.0f);
     const auto rgb = VeinMix({0.23f, 0.14f, 0.31f}, {0.055f, 0.030f, 0.081f}, std::pow(VeinCore(web.shade), 0.7f));
-    const float stain = 0.35f * (1.0f - VeinSmooth(0.17f, reach * 0.8f + 0.17f, r)) * g;
+    const float stain = 0.35f * (1.0f - VeinSmooth(0.17f, reach * 0.92f + 0.17f, r)) * g;
     return VeinOver({{0.036f, 0.018f, 0.048f}, stain}, rgb, a * (0.6f + 0.4f * g));
 }
 
@@ -394,11 +425,11 @@ inline Corner StatusBleed(float qx, float qy, float cx, float cy, float reach, f
             const float len = (0.03f + reach * 0.97f * h * h + 0.018f * VeinBeat(VeinFract(beats - h))) * by_corner;
             const float xc = (lane + 0.5f + (h2 - 0.5f) * 0.45f) * lane_w + 0.003f * std::sin(cy * 41.0f + h * 11.0f);
             const float taper = std::clamp(cy / std::max(len, 1e-3f), 0.0f, 1.0f);
-            const float w = (0.005f + 0.007f * h2) * (1.0f - 0.45f * taper) +
+            const float w = (0.005f + 0.007f * h2) * (1.0f - 0.33f * taper) +
                             0.006f * (1.0f - VeinSmooth(0.0f, 0.03f, cy));
             const float dx = std::abs(cx - xc);
             blood = VeinLine(dx, w * (0.60f + 0.65f * g), 0.12f);
-            blood.alpha *= 1.0f - VeinSmooth(0.65f * len, len, cy);
+            blood.alpha *= 1.0f - VeinSmooth(0.76f * len, len, cy);
         }
     } else {
         float level = reach * 0.34f * std::pow(std::clamp(1.0f - cx / (reach * 0.9f), 0.0f, 1.0f), 1.8f);
@@ -444,7 +475,7 @@ inline Corner StatusFrenzy(float qx, float qy, float cx, float cy, float reach, 
     const float lane = std::clamp(std::floor(band + 0.5f), -2.0f, 2.0f);
     const float key = seed * 9.0f + lane * 11.0f;
     const float lane_reach = reach * (0.80f + 0.22f * VeinHash(key + 5.0f));
-    const float taper = 1.0f - VeinSmooth(0.53f * lane_reach, lane_reach, along);
+    const float taper = 1.0f - VeinSmooth(0.65f * lane_reach, lane_reach, along);
     const float bend = (VeinNoise(along * 19.0f, key) - 0.5f) * 0.38f +
                        (VeinNoise(along * 57.0f, key + 1.0f) - 0.5f) * 0.14f;
     const float u = along / std::max(lane_reach, 1e-3f);
@@ -484,7 +515,7 @@ inline Corner StatusBeast(float qx, float qy, float cx, float cy, float reach, f
         const float strand = (1.0f - VeinSmooth(0.0012f, 0.0028f, d)) *
                              VeinSmooth(0.0f, 0.15f, tt) *
                              (1.0f - VeinSmooth(0.7f, 1.0f, tt));
-        const float dens = 1.0f - VeinSmooth(total * 0.45f, total * 0.9f, r + 0.1f * (g - 0.5f));
+        const float dens = 1.0f - VeinSmooth(total * 0.54f, total * 0.94f, r + 0.1f * (g - 0.5f));
         const float fur = (hr > 0.2f ? strand : 0.0f) * dens +
                           0.45f * dens * g * (1.0f - VeinSmooth(total * 0.3f, total * 0.8f, r));
         o = {VeinMix({0.041f, 0.030f, 0.019f}, {0.22f, 0.16f, 0.093f}, std::clamp(strand * hr, 0.0f, 1.0f)),
@@ -501,7 +532,7 @@ inline Corner StatusBeast(float qx, float qy, float cx, float cy, float reach, f
     if (along > s0 && along < s1) {
         const float tt = std::clamp((along - s0) / std::max(s1 - s0, 1e-3f), 0.0f, 1.0f);
         const float rag = 1.0f + 0.35f * std::sin(along * 90.0f + hk * 13.0f) * std::sin(along * 37.0f + hk * 5.0f);
-        const float w = std::max(0.02f * std::pow(std::sin(Pi * std::pow(tt, 0.8f)), 0.7f) * rag, 1e-4f);
+        const float w = std::max(0.02f * std::pow(std::max(0.0f, std::sin(Pi * tt)), 0.7f) * rag, 1e-4f);
         const float d = std::abs(across - k * 0.07f + (g - 0.5f) * 0.014f);
         const float wound = 1.0f - VeinSmooth(0.3f * w, 0.8f * w, d);
         const float torn = 1.0f - VeinSmooth(0.8f * w, 1.25f * w, d);
@@ -555,10 +586,13 @@ inline float HiddenBand(float diagonal) {
 inline float ZoomFor(float hidden) {
     return std::clamp(hidden / ZoomHidden, 1.0f, ZoomMax);
 }
-// A look's own reach at a build-up `grow` (0..1): on screen past the hidden band a third of
-// `span` at once, creeping in to all of it; over the zoom.
+// A look's own reach at a build-up `grow` (0..1): on screen past the hidden band ReachStart of
+// `span` at once (0.35 until the tester's 2026-11-27 "make them appear sooner", then halfway back
+// from 0.5), creeping in to all of it; over the zoom.
+inline constexpr float ReachStart = 0.425f;
 inline float ReachFor(float hidden, float zoom, float grow, float span = VisibleSpan) {
-    return (hidden + span * (0.35f + 0.65f * std::sqrt(std::clamp(grow, 0.0f, 1.0f)))) /
+    return (hidden + span * (ReachStart + (1.0f - ReachStart) *
+                                              std::sqrt(std::clamp(grow, 0.0f, 1.0f)))) /
            std::clamp(zoom, 1.0f, ZoomMax);
 }
 

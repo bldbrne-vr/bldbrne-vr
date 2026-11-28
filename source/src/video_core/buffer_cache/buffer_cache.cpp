@@ -1574,6 +1574,18 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         buffer_id = FindBuffer(device_addr, size);
     }
     Buffer& buffer = slot_buffers[NoteUsed(buffer_id)];
+    // The normal read-only path leaves a tracked, CPU-clean range untouched. Drain fresh
+    // ranges before testing it, and preserve the image-alias check for formatted reads.
+    if (small_read && small_read->shader_read && !is_written && size != 0 &&
+        FastRender::On(UploadEarlyExit) && !FastRender::On(FastRender::CopyThreads)) {
+        TakeFresh();
+        if (memory_tracker->IsRegionCpuCleanRelaxed(device_addr, size)) {
+            if (is_texel_buffer) {
+                SynchronizeBufferFromImage(buffer, device_addr, size);
+            }
+            return {&buffer, buffer.Offset(device_addr)};
+        }
+    }
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
         gpu_modified_ranges.AddIfNew(device_addr, size);
@@ -3236,19 +3248,45 @@ void BufferCache::RunGarbageCollector(u64 transition_request) {
     } else if (live_budget.Due(second)) {
         ReviseMemoryMarks(true); // during play too (TextureMemory::LiveBudget)
     }
-    // A warp, a death or a new map: the textures' rule (four passes 2 s apart, under pressure or
-    // after a confirmed map change) and their cutoff, the tick of the request: what the area left
-    // behind used and the new one has not touched since.
+    // Trim before Windows needs to page. A typical first visit already uses about 600 MiB of
+    // sparse backing. Once 640 MiB of sparse pieces are in use (twenty 32 MiB slabs' worth), a
+    // reload can reclaim CPU-backed buffers left behind, even on a card whose overall memory use
+    // is still below its pressure mark.
+    constexpr u64 sparse_trim_start = 640_MB;
+    const bool pressured = total_used_memory >= trigger_gc_memory;
     if (g_buffer_evict && !DmaTable::allocated.load(std::memory_order_relaxed)) {
+        bool gentle = false;
         if (const auto cutoff = transition_cleanup.Step(second, transition_request, gc_tick, [&] {
-                return total_used_memory >= trigger_gc_memory;
+                gentle = !pressured && sparse_pool.Enabled() &&
+                         sparse_pool.ResidentBytes() >= sparse_trim_start;
+                return pressured || gentle;
             })) {
-            evict_second = second; // this second's pass
-            EvictUnusedSince(*cutoff, BufferEviction::MaxPerTransitionPass,
-                             BufferEviction::MaxBytesPerTransitionPass, true);
+            evict_second = second;
+            if (gentle) {
+                // A reload can still reuse the right eye's GPU-written data. Keep the ordinary
+                // in-play eligibility rules and give recently bound resources a grace period.
+                const u64 aged = gc_seconds.Before(second, 5);
+                if (aged != 0) {
+                    EvictUnusedSince(std::min(*cutoff, aged), BufferEviction::MaxPerCriticalPass,
+                                     BufferEviction::MaxBytesPerPass, false);
+                }
+            } else {
+                EvictUnusedSince(*cutoff, BufferEviction::MaxPerTransitionPass,
+                                 BufferEviction::MaxBytesPerTransitionPass, true);
+            }
         }
     }
-    if (total_used_memory < trigger_gc_memory) {
+    if (!pressured) {
+        // While roaming, apply the existing one-minute idle rule once every five seconds. The
+        // common frame does no scan. Small pools do no work beyond this occasional size check.
+        if (sparse_pool.Enabled() && g_buffer_evict && second % 5 == 0 &&
+            second != evict_second && !DmaTable::allocated.load(std::memory_order_relaxed)) {
+            if (sparse_pool.ResidentBytes() >= sparse_trim_start) {
+                EvictIdleBuffers(false, second);
+            } else {
+                evict_second = second;
+            }
+        }
         return;
     }
     // Over the critical mark the 5 s rule, never resting: a rest let memory climb over the budget

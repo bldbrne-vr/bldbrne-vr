@@ -5,6 +5,7 @@
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/structured_control_flow.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
+#include "shader_recompiler/ir/passes/light_shadow.h"
 #include "shader_recompiler/ir/passes/srt.h"
 #include "shader_recompiler/ir/post_order.h"
 #include "shader_recompiler/profile.h"
@@ -32,6 +33,10 @@ IR::BlockList GenerateBlocks(const IR::AbstractSyntaxList& syntax_list) {
 IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
                              RuntimeInfo& runtime_info, const Profile& profile,
                              SrtSnapshot* srt_snapshot) {
+    // The lamp shadows' tier this program is keyed for (light_shadow.h SceneMaps::TierScope).
+    const Optimization::LightShadow::SceneMaps::TierScope lamp_tier{
+        Optimization::LightShadow::ProgramTier(runtime_info.vr_light_shadows,
+                                               runtime_info.vr_ambient_occlusion)};
     // Ensure first instruction is expected.
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
     if (code[0] != token_mov_vcchi) {

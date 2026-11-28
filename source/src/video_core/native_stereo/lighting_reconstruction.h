@@ -144,17 +144,23 @@ inline bool OcclusionHistoryMove(const float* f) {
 // flat camera's `inverse_projection` (dwords 0..15): E M inverse(E). E takes a flat (u, v, raw
 // depth, 1) to the same point's in this eye. The eye sits at `eye` along view x (dword 23's
 // shift): with block 0's rows above, view x - eye moves clip x by -eye / a times W = c depth + w.
-// Then the eye's frustum `t` (Forward); depth stays. The eye drew its history with the same E
-// last frame (same frustum and IPD), so E M inverse(E) takes the eye's pixel to its own history
-// for any move R. A still camera's identity stays the identity (to float rounding).
+// Then the eye's frustum `t` (Forward); depth stays. The eye drew its history with the same IPD
+// last frame and with `last`, last frame's frustum (`t` itself unless dynamic resolution changed
+// step in between), so E(last) M inverse(E(t)) takes the eye's pixel to its own history for any
+// move R. A still camera's identity stays the identity (to float rounding).
 inline void EyeOcclusionHistory(float* m, const float* inverse_projection, float eye,
-                                const Transform& t) {
+                                const Transform& t, const Transform& last) {
     const double a=inverse_projection[0], c=inverse_projection[14], w=inverse_projection[15];
-    const double sx=t.x_scale, sy=t.y_scale, s=eye/a;
-    const double u_depth=-.5*sx*s*c, u_one=.5-.5*sx+.5*t.x_offset-.5*sx*s*w;
-    const double v_one=.5-.5*sy-.5*t.y_offset;
-    const Matrix4d e{sx,0,u_depth,u_one, 0,sy,0,v_one, 0,0,1,0, 0,0,0,1};
-    const Matrix4d e_inverse{1/sx,0,-u_depth/sx,-u_one/sx, 0,1/sy,0,-v_one/sy, 0,0,1,0, 0,0,0,1};
+    const double s=eye/a;
+    struct Frustum { double sx, sy, u_depth, u_one, v_one; };
+    const auto frustum=[&](const Transform& f) {
+        const double sx=f.x_scale, sy=f.y_scale;
+        return Frustum{sx,sy,-.5*sx*s*c,.5-.5*sx+.5*f.x_offset-.5*sx*s*w,.5-.5*sy-.5*f.y_offset};
+    };
+    const Frustum l=frustum(last), n=frustum(t);
+    const Matrix4d e{l.sx,0,l.u_depth,l.u_one, 0,l.sy,0,l.v_one, 0,0,1,0, 0,0,0,1};
+    const Matrix4d e_inverse{1/n.sx,0,-n.u_depth/n.sx,-n.u_one/n.sx, 0,1/n.sy,0,-n.v_one/n.sy,
+                             0,0,1,0, 0,0,0,1};
     Matrix4d history{};
     for (int i=0; i<16; ++i) history[i]=m[i];
     const Matrix4d result=MatrixProduct(MatrixProduct(e,history),e_inverse);
@@ -162,8 +168,12 @@ inline void EyeOcclusionHistory(float* m, const float* inverse_projection, float
 }
 // `history` (FAST_GPU_SSAO_HISTORY_EYE; only for Occlusion): the caller found
 // OcclusionHistoryMove(source), and dwords 44..59 follow the eye too (EyeOcclusionHistory).
+// `previous`: the eye's frustum last frame, which the game's histories (the temporal SSAO's,
+// wet streets' reflection) were drawn with; null: `transform` (no dynamic resolution step since).
 inline void RemapLighting(float* values, const float* source, LightingLayout layout,
-                          float eye, const Transform& transform, bool history = false) {
+                          float eye, const Transform& transform, bool history = false,
+                          const Transform* previous = nullptr) {
+    const Transform& last = previous ? *previous : transform;
     if (layout==LightingLayout::Decal) {
         EyeReconstruction(values,source+16,eye,transform);
         Inverse(values+16,transform);
@@ -175,16 +185,18 @@ inline void RemapLighting(float* values, const float* source, LightingLayout lay
         for (unsigned r=0;r<3;++r) values[35+4*r]+=source[32+4*r]*eye;
     } else if (layout==LightingLayout::Occlusion) {
         values[23]-=eye;
-        if (history) EyeOcclusionHistory(values+44,source,eye,transform);
+        if (history) EyeOcclusionHistory(values+44,source,eye,transform,last);
     } else if (layout==LightingLayout::Cascades) {
         for (unsigned block=16;block<80;block+=16)
             EyeReconstruction(values+block,source,eye,transform);
     } else if (layout==LightingLayout::Reflection) {
         // All in the eye's own view (its depth, its normals): P and the reprojection follow its
         // frustum, x' = sx x + ox w on both sides (the eye's shift within a frame's head move is
-        // well under a millimetre of the reprojection, left out).
+        // well under a millimetre of the reprojection, left out). The reprojection's result is
+        // last frame's clip: last frame's frustum (2026-11-24 review: under a dynamic
+        // resolution step, this frame's put every reflection up to 80 px off for that frame).
         Forward(values+16,transform);
-        Forward(values+48,transform);
+        Forward(values+48,last);
         Inverse(values+48,transform);
     } else return;
     Inverse(values,transform);

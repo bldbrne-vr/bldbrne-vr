@@ -50,18 +50,24 @@ inline Profile AuthoredWeapon(int family, bool form_b) {
     case 100: return form_b ? Profile{2.2f, 1.35f, .60f} : Profile{1.6f, .90f, .40f};
     case 101: return form_b ? Profile{} : Profile{1.1f, .9f, .30f}; // firing form stays exact
     case 120: return {4.5f, .65f, .40f};
-    case 130: return {1.6f, .65f, .43f};
+    // The Tonitrus: 2.2 kg, its balance 0.49 m out toward the iron ball (1.6 kg and 0.43 m until
+    // 2026-11-25, the user: "a little bit heavier (especially near its head/the front) ... so that
+    // it feels a bit stronger, like more weight"; then 2.0 kg and 0.48 m, the same evening: "maybe
+    // weight 2.2kg and balance point 49cm?").
+    case 130: return {2.2f, .65f, .49f};
     case 220: return form_b ? Profile{} : Profile{.8f, .8f, .28f};
     case 230: return form_b ? Profile{1.3f, .6f, .28f} : Profile{1.3f, .95f, .48f};
     case 240: return form_b ? Profile{} : Profile{2.8f, .9f, .55f, .95f, .16f, .05f, .120f}; // Beast Cutter; B uses its chain solver
-    // The Amygdalan Arm: 5.0 kg (3.5 until 2026-11-09, the user: "very light given how massive
-    // it is"); its form B is the lash's (core/vr/amygdalan_arm.h).
-    case 250: return form_b ? Profile{} : Profile{5.0f, 1.0f, .65f};
+    // The Amygdalan Arm: 5.5 kg (3.5 until 2026-11-09, the user: "very light given how massive
+    // it is"; 5.0 until 2026-11-21, the user: "a tiny bit heavier too"); its form B is the lash's
+    // (core/vr/amygdalan_arm.h).
+    case 250: return form_b ? Profile{} : Profile{5.5f, 1.0f, .65f};
     case 260: return form_b ? Profile{3.0f, 1.4f, .65f} : Profile{2.0f, 1.1f, .45f};
     case 280: return {3.5f, .9f, .65f};
-    // The Bloodletter: its transformed flail 4.0 kg (3.5 until 2026-11-09, the user: heavier, "a bit
-    // more sway").
-    case 290: return form_b ? Profile{4.0f, 1.25f, .80f} : Profile{1.6f, .65f, .43f};
+    // The Bloodletter: its transformed flail 6.8 kg (3.5 until 2026-11-09, the user: heavier, "a bit
+    // more sway"; 4.0 until 2026-11-21, the user: "heavier ... about 6.8 kg", held in one hand; the
+    // left hand on its hilt takes much of it, Body's support).
+    case 290: return form_b ? Profile{6.8f, 1.25f, .80f} : Profile{1.6f, .65f, .43f};
     case 300: return form_b ? Profile{2.0f, 1.25f, .65f} : Profile{1.2f, .85f, .32f};
     case 310: return form_b ? Profile{4.0f, 1.35f, .85f} : Profile{1.8f, .7f, .43f};
     case 320: return form_b ? Profile{} : Profile{1.1f, .85f, .30f};
@@ -87,6 +93,7 @@ inline float Heft(int family, bool form_b) {
     case 240: return form_b ? 1.0f : 1.12f; // Beast Cutter
     case 51: return form_b ? 1.05f : 1.0f;  // Burial Blade: the scythe sweeps
     case 300: return form_b ? 1.05f : 1.0f; // Church Pick
+    case 130: return 1.18f;                 // Tonitrus: the iron ball (1.0, then 1.15, until 2026-11-25)
     default: return 1.0f;
     }
 }

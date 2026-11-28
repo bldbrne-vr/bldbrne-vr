@@ -18,10 +18,12 @@
 #include <string_view>
 #include <vector>
 #include "core/vr/card_tier.h"
+#include "core/vr/mirror_world.h"
 #include "core/vr/play_style.h"
 #include "core/vr/graphics_settings.h"
 
 #include "core/vr/thumb_layout.h"
+#include "core/vr/vial_refill.h"
 
 // The VR settings page (Options > VR, vr.ini vr_menu=1): its tabs, rows and navigation, header-only
 // and pure (unit tested in tests/test_vr_page.cpp). The values live behind a Store: the emulator's
@@ -73,6 +75,7 @@ struct Row {
     // Number without a `zero_text`: a value above 0 shows its sign ("+3 cm", "0 cm", "-4 cm":
     // Adjust height).
     bool signed_value{false};
+    bool next_load{false};          // applies at the next load of an area (the help line says so)
 };
 
 enum class ButtonAction : unsigned char { None, ShowControls, Defaults, AcceptGraphics, RestartGraphics, SoftSave, ClearSoftSave, FreeCamera };
@@ -182,6 +185,15 @@ inline const std::vector<Row>& Rows() {
                       {"Smooth", {"0", "120"}},
                       {"Smooth, fast", {"0", "180"}},
                       {"Smooth, very fast", {"0", "240"}}}});
+        // Lock-on follow (core/vr/lock_follow.h; the tester, 2026-11-27: "making the targeting
+        // work again ... it could be behind an option in settings", then "put it in settings
+        // under ON/OFF (on = this new smooth/follow target lock)"): On is Centred (3); Snap (1)
+        // and Smooth (2) are vr.ini only (the page shows them as Custom). Live.
+        r.push_back({"lockon_follow", "Lock-on follow",
+                     "Locked on, the view smoothly keeps the target in the middle and you circle "
+                     "it. Look away to let go.",
+                     Widget::Choice, {"lockon_follow", nullptr},
+                     {{"Off", {"0", nullptr}}, {"On", {"3", nullptr}}}});
         r.push_back({"vibration", "Vibration", "Strength of every vibration. 0 turns it off.",
                      Widget::Slider, {"haptic_gain", nullptr}, {}, 0, 10, 1, nullptr, "", 0,
                      1.0f / 7.0f});
@@ -334,6 +346,14 @@ inline const std::vector<Row>& Rows() {
                       {"+30 %", {"30", nullptr}},
                       {"+50 %", {"50", nullptr}}},
                      0, 10, 1, nullptr, "", 0, 1.0f, false});
+        // Free vials when out (core/vr/vial_refill.h; the tester, 2026-11-23: "configurable", 1..8,
+        // 3 the default): the game's own refill at a death or a lamp adds this many when it
+        // leaves none carried and none stored. Read at each refill.
+        r.push_back({"empty_vial_refill", "Free vials when out",
+                     "Blood Vials you get when you die or rest at a lamp with none carried or "
+                     "stored.",
+                     Widget::Number, {"empty_vial_refill", nullptr}, {},
+                     Lamps::MinVialsWhenOut, Lamps::MaxVialsWhenOut, 1});
         r.push_back({"iframes", "Longer dodge invincibility",
                      "Extra frames of invincibility in a dodge. Changes apply to your next dodge.",
                      Widget::Choice, {"dodge_iframes_extra", nullptr},
@@ -483,10 +503,15 @@ inline const std::vector<Row>& Rows() {
                      {{"On", {"1", nullptr}}, {"Off", {"0", nullptr}}}});
         // Picture > Performance > Shadows (2026-11-17, the user: "I want to add a high setting
         // available in settings"): the lamp shadows' detail (light_shadow.h High), in the light
-        // shaders: at the next start.
+        // shaders.
         // New graphics (2026-11-10: "a new tab in in game vr settings called 'new
-        // graphics' under picture"): the lighting this mod adds to the game's, each with DLSS or
-        // FSR only. The shader rows build the game's shaders anew: they apply at the next start.
+        // graphics' under picture"): the lighting this mod adds to the game's, with DLSS or FSR
+        // or without (since 2026-11-19). The shader rows build the game's shaders anew: since
+        // 2026-11-21 they apply at once (the tester: "change the graphics and see and feel the
+        // difference without requiring to reboot the game"; the shaders of the new choice are
+        // made at the switch, a moment before they show the first time in a session: the draws
+        // keep the game's own meanwhile, nothing waits). The Fog row at the next load of an
+        // area: the game's fog is in each area's map file, read as it loads.
         {
             // (0.9.6, the tester, 2026-11-17: the rows regrouped: "Dynamic shadows: game's / low /
             // high; fog: game's / on; Moon glow: off / on (has moon glow/haze/godrays); Lighting:
@@ -497,19 +522,30 @@ inline const std::vector<Row>& Rows() {
             // by the graphics card's memory: core/vr/card_tier.h.)
             Row shadows{"new_shadows",
                         "Lamp & torch shadows",
-                        "Your lantern, torches and lamps cast shadows. High: sharp near you. Costs FPS.",
+                        "Your lantern, torches and lamps cast shadows, sharp near you: Low 2 lamps, "
+                        "Medium 3, High 5 and further. Costs FPS.",
                         Widget::Choice,
                         {"light_shadows", "light_shadow_detail"},
-                        {{"Game's", {"0", "low"}}, {"Low", {"1", "low"}}, {"High", {"1", "high"}}}};
-            shadows.restart = true;
+                        {{"Game's", {"0", "medium"}},
+                         {"Low", {"1", "lite"}},
+                         {"Medium", {"1", "medium"}},
+                         {"High", {"1", "high"}}}};
+            // (Live since 2026-11-21: the lamp programs of the new level are made at the switch,
+            // a moment before they show the first time in a session: the draws keep the game's
+            // own meanwhile, nothing waits.)
             r.push_back(shadows);
+            // (At the next load of an area since 2026-11-21: bloodborne_woods_shadows.cpp
+            // FogStateTick. Until then the area keeps the fog it was loaded with: never the game's
+            // and ours at once, nor neither. A lamp's travel within the same area and a death there
+            // reload nothing: only another area, the mock showed.)
             Row fog{"new_fog",
                     "Fog",
-                    "On: the mod's own fog banks and ground mist, lit by lamps and the moon. Costs FPS.",
+                    "On: the mod's fog banks and ground mist, lit by lamps and the moon. Costs FPS. "
+                    "Changes when you travel to another area.",
                     Widget::Choice,
                     {"fog_banks", nullptr},
                     {{"Game's", {"0", nullptr}}, {"On", {"1", nullptr}}}};
-            fog.restart = true;
+            fog.next_load = true;
             r.push_back(fog);
             Row glow{"moon_glow",
                      "Moon glow",
@@ -517,7 +553,6 @@ inline const std::vector<Row>& Rows() {
                      Widget::Choice,
                      {"moon_shafts", nullptr},
                      {{"Off", {"0", nullptr}}, {"On", {"1", nullptr}}}};
-            glow.restart = true;
             r.push_back(glow);
             Row ambient{"new_ambient",
                         "Lighting",
@@ -525,7 +560,6 @@ inline const std::vector<Row>& Rows() {
                         Widget::Choice,
                         {"ambient_occlusion", "bounce_light"},
                         {{"Game's", {"0", "0"}}, {"AO", {"1", "0"}}, {"AO and bounce", {"1", "1"}}}};
-            ambient.restart = true;
             r.push_back(ambient);
             // Parallax (parallax.h BumpGaps; its own setting since 2026-11-12, the user: parallax
             // "is changing how textures are applied and looks wrong": now only on the textures
@@ -536,7 +570,6 @@ inline const std::vector<Row>& Rows() {
                        Widget::Choice,
                        {"raised_bricks", nullptr},
                        {{"Off", {"0", nullptr}}, {"On", {"1", nullptr}}}};
-            bricks.restart = true;
             r.push_back(bricks);
         }
         r.push_back({"cinematic_look", "Tone mapping",
@@ -564,25 +597,16 @@ inline const std::vector<Row>& Rows() {
                       {"FSR 4.1.2", {"5"}},
                       {"FSR 3.1.5", {"3"}},
                       {"DLSS 5", {"4"}}}});
-        // upscale_focus (renderer_vulkan/vr_dlss_focus.h; the tester, 2026-11-06: "apply dlss/fsr
-        // only in the foveated area ... and do strong TAA in the rest"): read at start, so with
-        // this tab's SAVE AND RESTART. Marked restart (the first headset check, 11-06: switched
-        // Off and back as if live, it showed no change and said nothing). Medium by default
-        // (2026-11-07).
-        {
-            Row focus{"upscale_focus",
-                      "Foveated upscale",
-                      "DLSS or FSR on the middle of each eye only; a TAA smooths the rest. "
-                      "Performance: fastest.",
-                      Widget::Choice,
-                      {"upscale_focus", nullptr},
-                      {{"Off", {"0", nullptr}},
-                       {"Quality", {"1", nullptr}},
-                       {"Medium", {"2", nullptr}},
-                       {"Performance", {"3", nullptr}}}};
-            focus.restart = true;
-            r.push_back(focus);
-        }
+        r.push_back({"upscale_focus",
+                     "Foveated upscale",
+                     "Change live with DLSS or FSR active. Quality upscales the widest centre; "
+                     "Performance the smallest.",
+                     Widget::Choice,
+                     {"upscale_focus", nullptr},
+                     {{"Off", {"0", nullptr}},
+                      {"Quality", {"1", nullptr}},
+                      {"Medium", {"2", nullptr}},
+                      {"Performance", {"3", nullptr}}}});
         r.push_back({"graphics_fsr4",
                      "FSR",
                      "Choose FSR 4 or FSR 3.1.5 to reconstruct both eyes. Turns DLSS off.",
@@ -910,7 +934,8 @@ inline const std::vector<Tab>& Tabs() {
                      defaults,
                      {{{"Two hands", "Guns & enemies"},
                        {RowIndex("two_handed"), RowIndex("two_hand_guide"),
-                        RowIndex("gun_wrist_reload"), RowIndex("vr_grab_attacks"), -1}}},
+                        RowIndex("gun_wrist_reload"), RowIndex("vr_grab_attacks"),
+                        RowIndex("lockon_follow")}}},
                      {"Weapons & feel", "Two hands & guns"}});
         t.push_back({"Items & world",
                      {"Items", "Quick draws"},
@@ -963,10 +988,11 @@ inline const std::vector<Tab>& Tabs() {
                       RowIndex("upscale_focus")},
                      restart,
                      accept});
+        // (2026-11-23: Free vials when out joined Survival, so the dodge moved down to the attacks.)
         t.push_back({"Difficulty",
-                     {"Survival", "Attacks"},
-                     {RowIndex("hp_bonus"), RowIndex("iframes"), RowIndex("attack_stamina"),
-                      RowIndex("outgoing_damage"), -1},
+                     {"Survival", "Dodge & attacks"},
+                     {RowIndex("hp_bonus"), RowIndex("empty_vial_refill"), RowIndex("iframes"),
+                      RowIndex("attack_stamina"), RowIndex("outgoing_damage")},
                      {},
                      defaults});
         t.push_back({"Save", {"Soft save", nullptr}, {-1, -1, -1, -1, -1},
@@ -989,7 +1015,21 @@ public:
     }
     virtual std::string Get(const std::string& key) = 0;
     virtual void Set(const std::string& key, const std::string& value) = 0;
+    virtual void SetChoice(const Row& row, const Option& option) {
+        for (size_t i = 0; i < row.keys.size(); ++i) {
+            if (row.keys[i] != nullptr && option.values[i] != nullptr) {
+                Set(row.keys[i], option.values[i]);
+            }
+        }
+    }
     virtual void Remove(const std::string& key) = 0;
+    virtual void ResetRow(const Row& row) {
+        for (const char* key : row.keys) {
+            if (key != nullptr) {
+                Remove(key);
+            }
+        }
+    }
 };
 
 // Only graphics edits are staged. Existing gameplay/Display settings retain their behavior.
@@ -1073,7 +1113,7 @@ public:
         auto c = Current();
         const int n = std::atoi(value.c_str());
         if (key == "graphics_scale")
-            c.scale_percent = std::clamp(n, -50, 50) / 10 * 10;
+            c.scale_percent = std::clamp(n, -50, 50);
         else if (key == "graphics_dlss") {
             if (n) {
                 c.upscaler = Graphics::Upscaler::Dlss;
@@ -1148,6 +1188,20 @@ public:
             return;
         pending = c;
     }
+    void SetChoice(const Row& row, const Option& option) override {
+        if (std::string_view(row.id) == "new_shadows") {
+            source.SetChoice(row, option);
+        } else {
+            Store::SetChoice(row, option);
+        }
+    }
+    void ResetRow(const Row& row) override {
+        if (std::string_view(row.id) == "new_shadows") {
+            source.ResetRow(row);
+        } else {
+            Store::ResetRow(row);
+        }
+    }
     void Remove(const std::string& key) override {
         if (!key.starts_with("graphics_")) {
             source.Remove(key);
@@ -1173,6 +1227,14 @@ public:
 };
 inline bool FogRequiresMoonGlow(const Row& row, Store& store) {
     return std::string_view(row.id) == "moon_glow" && store.Get("fog_banks") == "1";
+}
+// The Fog row switched off while the area keeps the fog it was loaded with (until you travel to
+// another area: core/vr/bloodborne_woods_shadows.cpp FogStateTick), and with it the moon glow,
+// whatever this row says: shown so where the row says Off (the 2026-11-21 review). The row stays
+// open; the store's fog_banks_loaded is the area's fog, not a setting (a store without it: off).
+inline bool AreaFogKeepsMoonGlow(const Row& row, Store& store) {
+    return std::string_view(row.id) == "moon_glow" && store.Get("fog_banks") != "1" &&
+           store.Get("moon_shafts") != "1" && store.Get("fog_banks_loaded") == "1";
 }
 
 inline bool Enabled(const Row& row, Store& store) {
@@ -1255,6 +1317,39 @@ inline bool SticksSwapped(Store& store) {
     return v == "1" || v == "true";
 }
 
+// Left-handed play as the store has it (core/vr/mirror_world.h Wanted): left_handed=1 with motion
+// controls in first person (play_style and first_person unset: motion, first person). The game's
+// session decides it once at its start; the words follow the file (the launcher's too).
+inline bool PageMirror(Store& store) {
+    const std::string left = store.Get("left_handed");
+    if (!Mirror::OnWord(left)) {
+        return false;
+    }
+    const std::string style = store.Get("play_style");
+    const std::string first = store.Get("first_person");
+    // (Stereo: stereo=1 and stereo_mode=2, the defaults; mono and AER are never mirrored.)
+    const std::string stereo = store.Get("stereo");
+    const std::string mode = store.Get("stereo_mode");
+    const std::string ui = store.Get("ui_layer"); // the UI on its own layer (the default)
+    return (style.empty() || style == "motion" || style == "0") && !Mirror::ThirdPersonWord(first) &&
+           stereo != "0" && stereo != "false" && (mode.empty() || mode == "2") &&
+           (ui.empty() || ui == "1");
+}
+
+// The rows whose help speaks of your hands and body ("{B} at right shoulder"): left-handed play
+// trades their left and right (core/vr/mirror_world.h SideWords; their buttons' names come mirrored
+// from Expand). Every other row keeps its words (a gamepad's, the game's own).
+inline bool SidedRow(const Row& row) {
+    constexpr std::array<std::string_view, 7> Ids{
+        "move_with",      "shoulder_vial",
+        "shoulder_switch", "two_handed",
+        "two_hand_guide", "two_hand_optimized_controls",
+        "two_hand_trigger_hold",
+    };
+    return row.id != nullptr &&
+           std::find(Ids.begin(), Ids.end(), std::string_view{row.id}) != Ids.end();
+}
+
 // The layout the store has now (left_scheme, the control style, Move with, the vial), for the
 // scheme table (core/vr/thumb_layout.h Entries).
 inline VR::Thumbs::Layout PageLayout(Store& store) {
@@ -1263,6 +1358,7 @@ inline VR::Thumbs::Layout PageLayout(Store& store) {
     l.left_scheme = ParseNumber(store.Get("left_scheme"), scheme) ? static_cast<int>(scheme) : 2;
     l.classic = store.Get("controls") == "classic";
     l.swap = SticksSwapped(store);
+    l.mirror = PageMirror(store);
     const std::string inject = store.Get("inject");
     l.inject = inject != "0" && inject != "false";
     return l;
@@ -1303,23 +1399,30 @@ inline std::string ExpandEntries(std::string text, Store& store) {
 // the stick and buttons the player presses (core/vr/thumb_layout.h Expand), "{entry:<id>}" the
 // controls of a scheme-table entry, so Move with and the scheme rename them at once.
 inline std::string RowLabel(const Row& row, Store& store) {
-    return VR::Thumbs::Expand(ExpandEntries(row.label != nullptr ? row.label : "", store),
-                              SticksSwapped(store), [&](Thumbs::Control physical) {
-                                  return store.ControlName(physical);
-                              });
+    return VR::Thumbs::Expand(
+        ExpandEntries(row.label != nullptr ? row.label : "", store), SticksSwapped(store),
+        [&](Thumbs::Control physical) { return store.ControlName(physical); }, PageMirror(store));
 }
 inline std::string RowHelp(const Row& row, Store& store) {
     std::string help = row.help != nullptr ? row.help : "";
+    if (std::string_view(row.id) == "upscale_focus" && store.Get("upscale_focus_live_path") == "0")
+        help = "Your choice is saved. Live preview needs native stereo with whole-frame DLSS or FSR active.";
+    if (std::string_view(row.id) == "foveation") {
+        const auto feedback = store.Get("foveation_feedback");
+        if (!feedback.empty()) help += " " + feedback;
+    }
     // Distant detail: live when the LOD patch reads its bias from a slot (memory_patcher), else
     // saved for the next start (store key lod_bias_live: "0" only when it cannot be live).
     if (const auto at = help.find("{lod_apply}"); at != std::string::npos) {
         help.replace(at, 11, store.Get("lod_bias_live") == "0" ? "Applies at the next start."
                                                                 : "Applies at once.");
     }
-    return VR::Thumbs::Expand(ExpandEntries(help, store),
-                              SticksSwapped(store), [&](Thumbs::Control physical) {
-                                  return store.ControlName(physical);
-                              });
+    if (SidedRow(row) && PageMirror(store)) {
+        help = Mirror::SideWords(help); // left-handed play: your sides
+    }
+    return VR::Thumbs::Expand(
+        ExpandEntries(help, store), SticksSwapped(store),
+        [&](Thumbs::Control physical) { return store.ControlName(physical); }, PageMirror(store));
 }
 
 // A Choice row's current option (-1: a value the page does not offer, "Custom").
@@ -1376,6 +1479,8 @@ inline std::string NumberText(const Row& row, int n) {
 inline std::string ValueText(const Row& row, Store& store) {
     if (FogRequiresMoonGlow(row, store))
         return CardTier::MoonGlowRequired;
+    if (AreaFogKeepsMoonGlow(row, store))
+        return CardTier::MoonGlowUntilTravel;
     switch (row.widget) {
     case Widget::Action:
         return {};
@@ -1383,7 +1488,14 @@ inline std::string ValueText(const Row& row, Store& store) {
         return store.Get(row.keys[0]);
     case Widget::Choice: {
         const int o = CurrentOption(row, store);
-        return o >= 0 ? row.options[static_cast<size_t>(o)].text : "Custom";
+        if (o < 0) {
+            return "Custom";
+        }
+        // Left-handed play: Move with names your thumb, the controllers having traded hands.
+        if (row.id != nullptr && std::string_view{row.id} == "move_with" && PageMirror(store)) {
+            return Mirror::SideWords(row.options[static_cast<size_t>(o)].text);
+        }
+        return row.options[static_cast<size_t>(o)].text;
     }
     case Widget::Slider:
         return std::to_string(CurrentNumber(row, store));
@@ -1401,6 +1513,7 @@ struct Change {
     std::vector<std::string> removed;
     bool restart{false};
     bool placeholder{false};
+    bool next_load{false}; // at the next load of an area (Row::next_load)
 };
 
 // Steps `row` by `delta` (Choice: the next / previous option, wrapping like the game's combo boxes;
@@ -1422,7 +1535,7 @@ inline bool UpscalerChoiceMissing(const Row& row, const Option& option, Store& s
 }
 
 inline Change Step(const Row& row, Store& store, int delta) {
-    Change c{row.id, {}, {}, {}, row.restart, row.placeholder};
+    Change c{row.id, {}, {}, {}, row.restart, row.placeholder, row.next_load};
     if (delta == 0 || !Enabled(row, store)) {
         c.text = ValueText(row, store);
         return c;
@@ -1460,9 +1573,9 @@ inline Change Step(const Row& row, Store& store, int delta) {
         // Water applies live. Only changing the wet-streets half of Wetness needs a restart.
         if (std::string_view(row.id) == "reflections")
             c.restart = !SameValue(store.Get("wet_streets"), opt.values[1]);
+        store.SetChoice(row, opt);
         for (int k = 0; k < 2; ++k) {
             if (row.keys[k] != nullptr && opt.values[k] != nullptr) {
-                store.Set(row.keys[k], opt.values[k]);
                 c.set.emplace_back(row.keys[k], opt.values[k]);
             }
         }
@@ -1481,6 +1594,13 @@ inline Change Step(const Row& row, Store& store, int delta) {
     case Widget::Number: {
         const int now = CurrentNumber(row, store);
         int next = now + delta * row.step;
+        // A value off the row's grid (an exact one from vr.ini or the launcher's panel fit, e.g.
+        // Scaling -23%): the first step lands on the grid in its direction (-23: right -20, left
+        // -30), the next ones along it.
+        if (const int step = std::max(row.step, 1), off = ((now - row.min) % step + step) % step;
+            off != 0 && delta != 0) {
+            next = now - off + (delta > 0 ? delta : delta + 1) * step;
+        }
         if (row.zero_text == nullptr) {
             // 0 is a value like any other (Adjust height): the range clamps.
             next = std::clamp(next, row.min, row.max);
@@ -1503,7 +1623,7 @@ inline Change Step(const Row& row, Store& store, int delta) {
 
 // Slider: set by a fraction 0..1 of the bar (pointer drag).
 inline Change SetFraction(const Row& row, Store& store, float fraction) {
-    Change c{row.id, {}, {}, {}, row.restart, row.placeholder};
+    Change c{row.id, {}, {}, {}, row.restart, row.placeholder, row.next_load};
     const int value = std::clamp(
         static_cast<int>(std::lround(row.min + std::clamp(fraction, 0.0f, 1.0f) * (row.max - row.min))),
         row.min, row.max);
@@ -1532,9 +1652,9 @@ inline Change Defaults(const Tab& tab, Store& store) {
     }
     for (const int r : enabled) {
         const Row& row = Rows()[static_cast<size_t>(r)];
+        store.ResetRow(row);
         for (const char* key : row.keys) {
             if (key != nullptr) {
-                store.Remove(key);
                 c.removed.emplace_back(key);
                 c.restart = c.restart || row.restart;
             }
@@ -2040,6 +2160,7 @@ private:
                      ? " [pending ACCEPT]"
                  : c.placeholder ? " [stored; applied by a later build]"
                  : c.restart     ? " [after a restart]"
+                 : c.next_load   ? " [when an area next loads]"
                                  : " [live]"));
         }
         changes.push_back(std::move(c));

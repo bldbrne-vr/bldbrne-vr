@@ -33,19 +33,36 @@ layout(push_constant) uniform FocusPush {
     ivec4 rect;   // the upscaler's rectangle in the eye: x0, y0, x1, y1 (exclusive), for the band
                   // only: a side on the eye's own edge is pushed far outside, so no band softens
                   // the upscaler there (no seam to hide)
-    vec4 map;     // render pixels per eye pixel (x, y); the jitter's texel shift (x, y)
+    vec4 map;     // render pixels per eye pixel (x, y); the render position of the eye's corner,
+                  // the jitter's texel shift included (x, y): eye pixel p is render (p + 0.5) *
+                  // map.xy + map.zw
     vec4 inv;     // 1 / render size (x, y); the band's width in eye pixels; this frame's weight
                   // in the TAA (1: no history)
     ivec4 size;   // the eye's size (x, y); the render's size (z, w)
     ivec4 origin; // the upscaler's rectangle in the eye: x, y, width, height (its texel 0, 0)
     ivec4 frame;  // the frame's number (x: the dither's pattern changes with it); y: the share of
                   // this frame's sample taken from its 3x3's mean, in thousandths; z: the history
-                  // box's least half-width in hundredths of an 8-bit step
+                  // box's least half-width in hundredths of an 8-bit step; w: 1 under dynamic
+                  // resolution (the render's taps then stay on the view's texels, ViewTexels)
+    ivec4 bounds; // the render texels the TAA reads (x0, y0, x1, y1 inclusive): the whole render,
+                  // or under dynamic resolution the view's part of it
 } pc;
 
+// Under dynamic resolution (frame.w 1) the render's bilinear taps stay on the view's texels
+// (bounds), as the TAA's texel fetches do, on the frames without history too (2026-11-24: a
+// step's reset frame read a few texels past the view at the eye's edge, then the next frames did
+// not). `pos` in texels (centres at i + 0.5). At full scale: `pos` itself (the old taps exactly).
+vec2 ViewTexels(vec2 pos) {
+    return pc.frame.w != 0 ? clamp(pos, vec2(pc.bounds.xy) + 0.5, vec2(pc.bounds.zw) + 0.5) : pos;
+}
+vec2 ViewUv(vec2 uv) {
+    return pc.frame.w != 0 ? ViewTexels(uv / pc.inv.xy) * pc.inv.xy : uv;
+}
+
 // Catmull-Rom through 5 bilinear taps (MJP's SampleTextureCatmullRom), at pixel position `pos`
-// of `tex` (texel centres at i + 0.5; `inv`: 1 / its size). Unclamped: callers bound it.
-vec3 CatmullRom5(sampler2D tex, vec2 pos, vec2 inv) {
+// of `tex` (texel centres at i + 0.5; `inv`: 1 / its size). `view`: the render's (its taps kept
+// on the view's texels, ViewTexels); the history's are not.
+vec3 CatmullRom5(sampler2D tex, vec2 pos, vec2 inv, bool view) {
     const vec2 centre = floor(pos - 0.5) + 0.5;
     const vec2 f = pos - centre;
     const vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
@@ -54,9 +71,9 @@ vec3 CatmullRom5(sampler2D tex, vec2 pos, vec2 inv) {
     const vec2 w3 = f * f * (-0.5 + 0.5 * f);
     const vec2 w12 = w1 + w2;
     const vec2 off12 = w2 / w12;
-    const vec2 t0 = (centre - 1.0) * inv;
-    const vec2 t3 = (centre + 2.0) * inv;
-    const vec2 t12 = (centre + off12) * inv;
+    const vec2 t0 = (view ? ViewTexels(centre - 1.0) : centre - 1.0) * inv;
+    const vec2 t3 = (view ? ViewTexels(centre + 2.0) : centre + 2.0) * inv;
+    const vec2 t12 = (view ? ViewTexels(centre + off12) : centre + off12) * inv;
     vec3 c = textureLod(tex, vec2(t12.x, t0.y), 0.0).rgb * w12.x * w0.y;
     c += textureLod(tex, vec2(t0.x, t12.y), 0.0).rgb * w0.x * w12.y;
     c += textureLod(tex, t12, 0.0).rgb * w12.x * w12.y;
@@ -66,7 +83,8 @@ vec3 CatmullRom5(sampler2D tex, vec2 pos, vec2 inv) {
     return c / total;
 }
 
-// CatmullRom5 clamped to its 2x2 neighbourhood's range against ringing (4 more taps).
+// CatmullRom5 on the render clamped to its 2x2 neighbourhood's range against ringing (4 more
+// taps), its taps on the view's texels (ViewTexels).
 vec3 CatmullRom(sampler2D tex, vec2 pos, vec2 inv) {
     const vec2 centre = floor(pos - 0.5) + 0.5;
     const vec2 f = pos - centre;
@@ -76,9 +94,9 @@ vec3 CatmullRom(sampler2D tex, vec2 pos, vec2 inv) {
     const vec2 w3 = f * f * (-0.5 + 0.5 * f);
     const vec2 w12 = w1 + w2;
     const vec2 off12 = w2 / w12;
-    const vec2 t0 = (centre - 1.0) * inv;
-    const vec2 t3 = (centre + 2.0) * inv;
-    const vec2 t12 = (centre + off12) * inv;
+    const vec2 t0 = ViewTexels(centre - 1.0) * inv;
+    const vec2 t3 = ViewTexels(centre + 2.0) * inv;
+    const vec2 t12 = ViewTexels(centre + off12) * inv;
     vec3 c = textureLod(tex, vec2(t12.x, t0.y), 0.0).rgb * w12.x * w0.y;
     c += textureLod(tex, vec2(t0.x, t12.y), 0.0).rgb * w0.x * w12.y;
     c += textureLod(tex, t12, 0.0).rgb * w12.x * w12.y;
@@ -87,10 +105,10 @@ vec3 CatmullRom(sampler2D tex, vec2 pos, vec2 inv) {
     const float total = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
     c /= total;
     // Anti-ringing: within the 2x2 the centre tap's bilinear footprint covers.
-    const vec3 a = textureLod(tex, (centre + vec2(0.0, 0.0)) * inv, 0.0).rgb;
-    const vec3 b = textureLod(tex, (centre + vec2(1.0, 0.0)) * inv, 0.0).rgb;
-    const vec3 d = textureLod(tex, (centre + vec2(0.0, 1.0)) * inv, 0.0).rgb;
-    const vec3 e = textureLod(tex, (centre + vec2(1.0, 1.0)) * inv, 0.0).rgb;
+    const vec3 a = textureLod(tex, ViewTexels(centre + vec2(0.0, 0.0)) * inv, 0.0).rgb;
+    const vec3 b = textureLod(tex, ViewTexels(centre + vec2(1.0, 0.0)) * inv, 0.0).rgb;
+    const vec3 d = textureLod(tex, ViewTexels(centre + vec2(0.0, 1.0)) * inv, 0.0).rgb;
+    const vec3 e = textureLod(tex, ViewTexels(centre + vec2(1.0, 1.0)) * inv, 0.0).rgb;
     return clamp(c, min(min(a, b), min(d, e)), max(max(a, b), max(d, e)));
 }
 
@@ -104,10 +122,10 @@ float Luma(vec3 c) {
 vec3 Fxaa(vec2 pos, vec3 sharp) {
     const vec2 uv = pos * pc.inv.xy;
     const vec2 texel = pc.inv.xy;
-    const float nw = Luma(textureLod(render_tex, uv + vec2(-0.5, -0.5) * texel, 0.0).rgb);
-    const float ne = Luma(textureLod(render_tex, uv + vec2(0.5, -0.5) * texel, 0.0).rgb);
-    const float sw = Luma(textureLod(render_tex, uv + vec2(-0.5, 0.5) * texel, 0.0).rgb);
-    const float se = Luma(textureLod(render_tex, uv + vec2(0.5, 0.5) * texel, 0.0).rgb);
+    const float nw = Luma(textureLod(render_tex, ViewUv(uv + vec2(-0.5, -0.5) * texel), 0.0).rgb);
+    const float ne = Luma(textureLod(render_tex, ViewUv(uv + vec2(0.5, -0.5) * texel), 0.0).rgb);
+    const float sw = Luma(textureLod(render_tex, ViewUv(uv + vec2(-0.5, 0.5) * texel), 0.0).rgb);
+    const float se = Luma(textureLod(render_tex, ViewUv(uv + vec2(0.5, 0.5) * texel), 0.0).rgb);
     const float m = Luma(sharp);
     const float lo = min(m, min(min(nw, ne), min(sw, se)));
     const float hi = max(m, max(max(nw, ne), max(sw, se)));
@@ -116,10 +134,10 @@ vec3 Fxaa(vec2 pos, vec3 sharp) {
     vec2 dir = vec2(-((nw + ne) - (sw + se)), (nw + sw) - (ne + se));
     const float reduce = max((nw + ne + sw + se) * (0.25 / 8.0), 1.0 / 128.0);
     dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + reduce), vec2(-8.0), vec2(8.0)) * texel;
-    const vec3 a = 0.5 * (textureLod(render_tex, uv + dir * (1.0 / 3.0 - 0.5), 0.0).rgb +
-                          textureLod(render_tex, uv + dir * (2.0 / 3.0 - 0.5), 0.0).rgb);
-    const vec3 b = 0.5 * a + 0.25 * (textureLod(render_tex, uv - dir * 0.5, 0.0).rgb +
-                                     textureLod(render_tex, uv + dir * 0.5, 0.0).rgb);
+    const vec3 a = 0.5 * (textureLod(render_tex, ViewUv(uv + dir * (1.0 / 3.0 - 0.5)), 0.0).rgb +
+                          textureLod(render_tex, ViewUv(uv + dir * (2.0 / 3.0 - 0.5)), 0.0).rgb);
+    const vec3 b = 0.5 * a + 0.25 * (textureLod(render_tex, ViewUv(uv - dir * 0.5), 0.0).rgb +
+                                     textureLod(render_tex, ViewUv(uv + dir * 0.5), 0.0).rgb);
     const float lb = Luma(b);
     return lb < lo || lb > hi ? a : b;
 }
@@ -147,7 +165,7 @@ vec3 Enlarged(vec2 pos, ivec2 p) {
     const float base = pc.inv.w;
     if (base >= 1.0)
         return Fxaa(pos, CatmullRom(render_tex, pos, pc.inv.xy));
-    const ivec2 texel = clamp(ivec2(floor(pos)), ivec2(0), pc.size.zw - 1);
+    const ivec2 texel = clamp(ivec2(floor(pos)), pc.bounds.xy, pc.bounds.zw);
     // The 2x2 the Catmull-Rom's centre covers, as offsets in the 3x3: (o.x or o.x + 1, ...).
     const ivec2 o = ivec2(floor(pos - 0.5)) - ivec2(floor(pos));
     vec3 near_lo = vec3(1e9), near_hi = vec3(-1e9);
@@ -155,7 +173,7 @@ vec3 Enlarged(vec2 pos, ivec2 p) {
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
             const vec3 rgb =
-                texelFetch(render_tex, clamp(texel + ivec2(x, y), ivec2(0), pc.size.zw - 1), 0).rgb;
+                texelFetch(render_tex, clamp(texel + ivec2(x, y), pc.bounds.xy, pc.bounds.zw), 0).rgb;
             if (x - o.x >= 0 && x - o.x <= 1 && y - o.y >= 0 && y - o.y <= 1) {
                 near_lo = min(near_lo, rgb);
                 near_hi = max(near_hi, rgb);
@@ -171,7 +189,7 @@ vec3 Enlarged(vec2 pos, ivec2 p) {
     // Outside the upscaler the lenses blur anyway: part of this frame's sample is its 3x3's mean,
     // which the jitter barely moves, so the coarse shading out here (foveation's 2x2 / 4x4) and
     // thin edges do not sparkle from frame to frame.
-    const vec3 sharp = mix(clamp(CatmullRom5(render_tex, pos, pc.inv.xy), near_lo, near_hi),
+    const vec3 sharp = mix(clamp(CatmullRom5(render_tex, pos, pc.inv.xy, true), near_lo, near_hi),
                            FromYCoCg(mean), float(pc.frame.y) * 0.001);
     const vec2 was = vec2(p) + 0.5 + texelFetch(motion_tex, texel, 0).rg / pc.map.xy;
     const vec2 uv = was / vec2(pc.size.xy);
@@ -186,7 +204,8 @@ vec3 Enlarged(vec2 pos, ivec2 p) {
     const vec3 box_lo = min(max(lo, mean - spread), mean - vec3(least, 0.5 * least, 0.5 * least));
     const vec3 box_hi = max(min(hi, mean + spread), mean + vec3(least, 0.5 * least, 0.5 * least));
     const vec3 history = FromYCoCg(
-        clamp(ToYCoCg(CatmullRom5(history_tex, was, 1.0 / vec2(pc.size.xy))), box_lo, box_hi));
+        clamp(ToYCoCg(CatmullRom5(history_tex, was, 1.0 / vec2(pc.size.xy), false)), box_lo,
+              box_hi));
     // How near this frame's nearest render sample is (render pixels; 1 on it, 0.29 at a corner):
     // averages 0.66 over the jitter, so the weight averages `base`.
     const vec2 d = pos - (floor(pos) + 0.5);

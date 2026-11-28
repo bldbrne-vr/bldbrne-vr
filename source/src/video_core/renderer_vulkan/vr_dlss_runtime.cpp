@@ -4,6 +4,7 @@
 // You may copy, modify and redistribute this file, in source or compiled form, ONLY under that licence:
 // keep every copyright notice, credit Bldbrne-VR, and publish your complete source under the same
 // licence. Any other use is copyright infringement and terminates your rights under it (AGPL-3.0 s. 8).
+#include "core/vr/s1_dynamic_resolution.h"
 #include <algorithm>
 #include "video_core/renderer_vulkan/vr_dibr_upscale.h"
 #include <cstdlib>
@@ -237,6 +238,10 @@ bool VrDlssRuntime::Load() {
     if (error || !candidate->Configure(directory.wstring().c_str(), data.wstring().c_str(), Log)) {
         Fail("cannot configure NGX paths/cache");
         return false;
+    }
+    if (S1Drs::enabled) {
+        S1Drs::dlss_region.store(reinterpret_cast<S1Drs::SetRegion>(GetProcAddress(
+            static_cast<HMODULE>(module), "VrDlssSetInputReductionPercent")), std::memory_order_release);
     }
     api = candidate;
     session = std::make_unique<VrDlssSession>(api);

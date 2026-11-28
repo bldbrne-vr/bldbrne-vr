@@ -49,6 +49,16 @@ struct BodyStatus {
     std::int64_t kos_ritual_start_ns{0}; // confirmed game animation, never a trigger prediction
     std::int64_t kos_ritual_sample_ns{0}; // last fresh animation-ring read
     bool driven{false}; // the body is written into the hunter's pose (first-person VR view)
+    // The Chikage's blade in its scabbard (core/vr/chikage.h): no swing is an attack meanwhile.
+    bool scabbard_form_b{};
+    s64 scabbard_pose_ns{}; // last evaluated pose, unchanged on a skipped copy
+    bool scabbard_in{false};
+    std::int64_t scabbard_clip_release_ns{}; // a cutting draw can exit with its tip still at the rim
+    bool scabbard_loaded{false}; // ... seated: ready for the quick draw
+    float scabbard_build{0.0f};  // 0 .. 1 on the way to seated
+    float scabbard_depth{0.0f};  // m of blade inside
+    bool scabbard_near{false};   // the left hand is at the scabbard (a squeeze now takes it)
+    bool scabbard_held{false};   // ... and holds it
     // C0000::Left, C0000::Right: 1 = your hand, 0 = the game's. For using the hand (items, the
     // crank, the grip adjust): 0 while a kept hit or dodge (arm_keep_on_hit / arm_keep_on_dodge)
     // has not opened that hand's attack window, as if the game had the arm.
@@ -60,6 +70,7 @@ struct BodyStatus {
     // window): a hunter tool used with no animation waits for it (not mid-attack, mid-roll or in
     // a stagger).
     bool items_ok{true};
+    bool transform_interrupted{false}; // the pose gate holds a hit, get-up or forced action
     std::array<bool, 2> detached{};    // the hand is off the controller (out of the arm's reach)
     std::array<bool, 2> tracked{};     // tracked or held (not lost)
     std::int32_t weapon_id{-1};        // right hand's EquipParamWeapon id, -1 unknown
@@ -108,11 +119,25 @@ struct BodyStatus {
 enum class BodyEventKind : std::uint8_t {
     Detached, // `side`'s hand just left the arm's reach (at most one per 0.5 s per hand)
     Disabled, // the body turned itself off (the log says why)
+    // The Chikage's scabbard (core/vr/chikage.h; the pose copy runs it on the drawn models):
+    ScabbardIn,     // the tip went into the mouth
+    ScabbardSeated, // deep enough (it takes blood): `side` 1 = the clean blade, 0 = the blooded form
+    ScabbardHome,   // pushed all the way in
+    ScabbardOut,    // drawn: `a` m/s; `side` 1 = it had been seated (it comes out bloodied)
+    ScabbardDraw,   // the quick draw (seated, and out fast): `a` m/s, `b` its power 0..1
+    ScabbardSlip,   // pulled off the blade's line
+    ScabbardTaken,  // the left hand took the scabbard
+    ScabbardLunge,  // a seated blade pulled out fast (chikage.h LungeShare): `side` 1 = an enemy
+                    // close ahead (no step)
 };
 
 struct BodyEvent {
     BodyEventKind kind{BodyEventKind::Detached};
     std::int32_t side{-1}; // C0000::Left / Right, -1 = both
+    float a{0.0f};
+    float b{0.0f};
+    s64 pose_ns{}; // originating scabbard pose
+    s32 weapon_id{-1};
 };
 
 [[nodiscard]] s64 SteadyNowNs();

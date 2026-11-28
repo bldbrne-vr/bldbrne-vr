@@ -82,7 +82,7 @@ VrEyeCant::~VrEyeCant() {
     Shutdown();
 }
 
-bool VrEyeCant::Init(vk::Device dev, VmaAllocator alloc) {
+bool VrEyeCant::Init(vk::Device dev, VmaAllocator alloc, bool mirror) {
     Shutdown();
     device = dev;
     allocator = alloc;
@@ -126,8 +126,10 @@ bool VrEyeCant::Init(vk::Device dev, VmaAllocator alloc) {
         return fail("pipeline layout");
     }
     layout = pl;
+    // (Left-handed play only: the MIRROR build; right-handed play compiles it as always.)
     const vk::ShaderModule module =
-        Compile(HostShaders::VR_EYE_CANT_COMP, vk::ShaderStageFlagBits::eCompute, device, {});
+        Compile(HostShaders::VR_EYE_CANT_COMP, vk::ShaderStageFlagBits::eCompute, device,
+                mirror ? std::vector<std::string>{"MIRROR"} : std::vector<std::string>{});
     if (!module) {
         return fail("shader");
     }
@@ -146,6 +148,8 @@ bool VrEyeCant::Init(vk::Device dev, VmaAllocator alloc) {
     }
     pipeline = p;
     SetObjectName(device, pipeline, std::string_view{"vr_eye_cant.comp"});
+    LOG_INFO(Render_Vulkan, "VR canted eyes: each eye turned into its own view{}",
+             mirror ? " (left-handed: written flipped)" : "");
     return true;
 }
 

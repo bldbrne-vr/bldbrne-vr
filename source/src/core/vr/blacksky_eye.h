@@ -39,11 +39,96 @@ inline std::uint32_t Hash(std::uint32_t x) {
 }
 inline float Smooth(float s) { s = std::clamp(s, 0.0f, 1.0f); return s * s * (3.0f - 2.0f * s); }
 
+// The easter egg (2026-11-25: "if we shake our hand while holding the blacksky eye, it
+// gets dizzy ... a little comical ... extremely lightweight"): a shake (the hand's acceleration
+// past ShakeAccel, kept up for about a second; a quick flick fades before it shows) makes it
+// dizzy, 0 .. 1. Motion then rolls the eye round in lazy circles, sagging, its pupil swimming,
+// slowing as it wears off (DizzyDecay a second).
+inline constexpr float ShakeAccel = 12.0f; // m/s^2: a hand's ordinary moves stay under it
+inline constexpr float DizzyGain = .15f;   // a second, per m/s^2 past it
+inline constexpr float DizzyDecay = .40f;  // a second
+inline constexpr float DizzyShows = .20f;  // below this nothing shows (a flick, a bump)
+using Vec = std::array<float, 3>;
+class Dizzy {
+public:
+    // The held hand's position (tracking space, m) sampled at `ns` (its clock): its velocity from
+    // the last three samples (a centred difference, quiet against tracking jitter; every runtime
+    // has positions, not all report velocities: the mock's are zero), its acceleration from two
+    // velocities. The same sample twice changes nothing. A new take (`session`) starts calm.
+    // A tracking jump (faster than a hand moves: past MaxHandSpeed, or JumpM in one sample; a
+    // recenter, a new `space`) restarts the history: never counted as a shake.
+    static constexpr float MaxHandSpeed = 10.0f; // m/s
+    static constexpr float JumpM = .25f;
+    // `now`: the render clock. It wears off by that, held or untracked alike (held to your eye
+    // the controller often loses its tracking: it still comes round); the hand's samples only add.
+    float Update(std::int64_t session, std::int64_t now, std::int64_t ns, const Vec& p, bool valid,
+                 std::uint32_t space = 0) {
+        if (session != session_) *this = {}, session_ = session;
+        if (worn_ns_ != 0 && now > worn_ns_)
+            level_ = std::max(level_ - DizzyDecay * std::min(float(now - worn_ns_) * 1e-9f, .5f), 0.0f);
+        worn_ns_ = std::max(worn_ns_, now);
+        if (!valid || space != space_) {
+            space_ = space;
+            count_ = 0;
+            has_v_ = false;
+            if (!valid) return std::min(level_, 1.0f);
+        }
+        if (count_ > 0 && ns <= ns1_) return std::min(level_, 1.0f);
+        if (count_ > 0) {
+            const float dx = p[0] - p1_[0], dy = p[1] - p1_[1], dz = p[2] - p1_[2];
+            const float step = std::sqrt(dx * dx + dy * dy + dz * dz);
+            const float gap = float(ns - ns1_) * 1e-9f;
+            if (!std::isfinite(step) || step > JumpM || step > MaxHandSpeed * std::max(gap, 1e-3f)) {
+                count_ = 0; // from here afresh
+                has_v_ = false;
+            }
+        }
+        if (count_ > 0) {
+            // The acceleration over the real time between the samples (a stall reads no larger);
+            // what it adds over at most a tenth of a second of it.
+            const float gap = std::max(float(ns - ns1_) * 1e-9f, 1e-3f);
+            float grow = 0.0f;
+            if (count_ >= 2) {
+                const float span = std::max(float(ns - ns0_) * 1e-9f, 1e-3f);
+                const Vec v{(p[0] - p0_[0]) / span, (p[1] - p0_[1]) / span, (p[2] - p0_[2]) / span};
+                if (has_v_) {
+                    const float dx = v[0] - v_[0], dy = v[1] - v_[1], dz = v[2] - v_[2];
+                    const float accel = std::sqrt(dx * dx + dy * dy + dz * dz) / gap;
+                    if (std::isfinite(accel)) grow = std::max(accel - ShakeAccel, 0.0f) * DizzyGain;
+                }
+                v_ = v;
+                has_v_ = true;
+            }
+            level_ = std::clamp(level_ + std::min(grow, 6.0f) * std::min(gap, .1f), 0.0f, 1.3f);
+        }
+        p0_ = p1_, ns0_ = ns1_;
+        p1_ = p, ns1_ = ns;
+        count_ = std::min(count_ + 1, 2);
+        return std::min(level_, 1.0f);
+    }
+    // How clear-headed it is for its aim's mark (blacksky_mark.h): 1 calm .. 0 dizzy; the mark
+    // fades out as the dizziness shows and back as it wears off (2026-11-25: "if it is
+    // dizzy it shouldn't have the aim help/dot until it is not dizzy anymore").
+    float Calm() const {
+        const float x = std::clamp((level_ - DizzyShows) / .30f, 0.0f, 1.0f);
+        return 1.0f - x * x * (3.0f - 2.0f * x);
+    }
+
+private:
+    std::int64_t session_{}, ns0_{}, ns1_{}, worn_ns_{};
+    Vec p0_{}, p1_{}, v_{};
+    float level_{};
+    std::uint32_t space_{0};
+    int count_{0};
+    bool has_v_{false};
+};
+
 class Motion {
 public:
     // `session`: the take (a new one starts it afresh); `fired_ns`: the game's yes to its last
-    // shot (0: none). The same `now` twice (the second eye of a frame) gives the same look.
-    Look Update(std::int64_t now, std::int64_t session, std::int64_t fired_ns) {
+    // shot (0: none); `dizzy`: Dizzy's level. The same `now` twice (the second eye of a frame)
+    // gives the same look.
+    Look Update(std::int64_t now, std::int64_t session, std::int64_t fired_ns, float dizzy = 0.0f) {
         if (session != session_ || now < move_ns_ - 2'000'000'000LL || now - next_ns_ > 2'000'000'000LL) {
             session_ = session;
             seed_ = Hash(static_cast<std::uint32_t>(session) ^ 0x9e3779b9U);
@@ -76,6 +161,19 @@ public:
         look.pitch += .30f * DegToRad * (std::sin(s * 6.2831853f * 59.0f + .7f) * .6f + std::sin(s * 6.2831853f * 37.0f + 2.1f) * .4f);
         // Its pupil breathes a little (hippus).
         look.pupil = PupilRest + .025f * std::sin(s * 6.2831853f * .43f) + .012f * std::sin(s * 6.2831853f * 1.1f);
+        // Dizzy: round and round, a little faster the dizzier, sagging, its pupil swimming.
+        const float dt = now > spun_ns_ ? std::min(float(now - spun_ns_) * 1e-9f, .1f) : 0.0f;
+        spun_ns_ = std::max(spun_ns_, now);
+        const float d = Smooth((dizzy - DizzyShows) / (1.0f - DizzyShows));
+        if (d > 0.0f) {
+            spin_ = std::fmod(spin_ + dt * (2.5f + 6.5f * d), 6.2831853f);
+            const float r = .42f * d; // ~24 degrees round its line
+            look.yaw += (r * std::cos(spin_) - look.yaw) * d;
+            look.pitch += (r * .75f * std::sin(spin_) - .12f * d - look.pitch) * d;
+            // Swollen and swimming, nearly as wide as a shot's (2026-11-25: "We can
+            // make the pupil swell more!"): .48 .. .76 of the iris, resting .30.
+            look.pupil += (.62f + .14f * std::sin(spin_ * 1.7f) - look.pupil) * d;
+        }
         if (fired_ns > 0 && now >= fired_ns && now - fired_ns < HoldNs + CalmNs) {
             const std::int64_t age = now - fired_ns;
             const float on = age < HoldNs ? Smooth(float(age) / float(SnapNs))
@@ -102,8 +200,8 @@ private:
         yaw = (Random() * 2.0f - 1.0f) * reach;
         pitch = (Random() * 2.0f - 1.0f) * reach * .7f;
     }
-    std::int64_t session_{}, move_ns_{}, next_ns_{};
-    float from_yaw_{}, from_pitch_{}, to_yaw_{}, to_pitch_{};
+    std::int64_t session_{}, move_ns_{}, next_ns_{}, spun_ns_{};
+    float from_yaw_{}, from_pitch_{}, to_yaw_{}, to_pitch_{}, spin_{};
     std::uint32_t seed_{1};
 };
 

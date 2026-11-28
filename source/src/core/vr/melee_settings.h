@@ -148,7 +148,7 @@ struct MeleeSettings {
     // Bullet deflection (core/vr/bullet_deflect.h, bloodborne_deflect.cpp; 2026-10-31, not yet
     // tried in the game): an enemy's bullet meeting the right weapon bounces off it (the swing
     // turns it its way) and becomes the hunter's. Only a swat sends it back at the shooter
-    // (2026-11-02, bullet_deflect.h ReturnChance): 8 in 10 when its bounce heads within
+    // (bullet_deflect.h ReturnChance): the highest chance when its bounce heads within
     // deflect_snap_deg of him, less and less to none at deflect_return_deg (0 = never). A bullet
     // sent back is steered at him on its way; any other is drawn a little back toward the line
     // it came in on (BackPull) and kept deflect_snap_deg clear of him. deflect_margin_cm

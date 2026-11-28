@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <array>
 #include <cmath>
 #include <cstdint>
+
+#include "core/vr/torch_glow.h"
 
 // Tonitrus' charge (2026-11-09: lifted up to charge it, a quick blue and white flash
 // like "a thunder hit next to us" as a custom shader (A Call Beyond's kind, no overlay), the Tiny
@@ -22,12 +25,55 @@ namespace VR::TonitrusCharge {
 inline constexpr std::int32_t ChargeEffect = 6032;
 // The mace's tip: the model's dummy 100 (0.78 m out from the grip), as the right weapon's part 0.
 inline constexpr std::int32_t HeadDummy = 10100;
-// The light while it lasts: a game effect with a light of its own, on the head (asked every
-// update, so it ends with the charge), in a private slot (the lantern's is 30030). 202010 (a
-// lightning bullet's): a soft blue light with next to nothing drawn of its own (the 2026-11-09
-// probe of 250 effects at the hand in a dark hall: +12 on the floor, blue over red).
-inline constexpr std::int32_t LightFfx = 202010;
+// The light while it lasts. Until 2026-11-23 a game effect with a light of its own on the head,
+// asked every update in a private slot (the lantern's is 30030): 202010 (the Augur's projectile:
+// its tentacles too), then 200007 (a dark octagonal model with it: the user, "tonitrus sprouts a
+// second head"). Now no game effect (the tester: "if we can make a faint blue light that doesn't
+// tank performance I would be cool with that"): the head is published every update while the
+// charge holds (HeadGlow) and the renderer lights it in the muzzle flash's slot (vk_rasterizer.cpp
+// VrFogUpload, when no flash shines; before the torch's glow): GlowColour times GlowIntensity over
+// (d^2 + GlowSoftM2), nothing past GlowRadiusM. This atmospheric spill is unshadowed. VR_TUNE_FILE
+// lighting.tonitrus (scales it; 0: none), lighting.tonitrus_radius. It needs the VR lighting (the
+// composite's lamp memory). VR_TONITRUS_FFX=<id>: a game effect there as before (tests).
+inline constexpr std::int32_t LightFfx = 0;
 inline constexpr std::int32_t LightSlot = 30033;
+// (Seen in the mock facing a dark wall in Pthumeru, with the user's graphics (DLSS: without an
+// upscaler the lamp glow that carries it is off by the card's defaults): 7 lit the wall a pale
+// grey and 70 turned the room white; 1, a deep blue, is a faint tint on what is near. Then the
+// user, 2026-11-24: "a tiny bit more faint and less reach", then "3m is good": 0.8 to 3 m,
+// were 1 to 6 m.)
+inline constexpr std::array<float, 3> GlowColour{0.3f, 0.5f, 1.0f};
+inline constexpr float GlowIntensity = 0.8f;
+inline constexpr float GlowSoftM2 = 1.0f;
+inline constexpr float GlowRadiusM = 3.0f;
+// Keep the tuned lighting origin slightly towards the eye from the centre of the iron head.
+inline constexpr float GlowTowardEyeM = 0.25f;
+inline constexpr float GlowFreshS = 0.25f; // published every update: gone this soon after the charge
+inline VR::TorchGlow::Spot HeadGlow;
+// When it shines (2026-11-23: "the faint blue light needs to go off once the charge is
+// done (7 seconds). teleporting or resting or dying should also remove it"): while the game's
+// charge holds (6032 on the hunter, gone after its 7 s), and never past ChargeS after the strike
+// whatever the game keeps, nor while the hunter is dead, nor once a lamp's travel has begun (a
+// rest at a lamp is the trip to the Dream), nor after any arrival since the strike (a warp, a
+// respawn, a load: the next charge lights it again).
+inline constexpr float ChargeS = 7.5f; // SpEffectParam 6032: 7 s (7.3 by the updates in the mock)
+inline bool GlowLit(float age_s, bool alive, bool travelling, bool arrived_since) {
+    return age_s >= 0.0f && age_s < ChargeS && alive && !travelling && !arrived_since;
+}
+// Its strength (2026-11-23: "make it weaken at second 5 and off by second 7"): full
+// until FadeFromS after the strike, then down smoothly to nothing at FadeOutS.
+inline constexpr float FadeFromS = 5.0f;
+inline constexpr float FadeOutS = 7.0f;
+inline float GlowFade(float age_s) {
+    if (!(age_s < FadeOutS)) {
+        return 0.0f;
+    }
+    if (age_s <= FadeFromS) {
+        return 1.0f;
+    }
+    const float t = (age_s - FadeFromS) / (FadeOutS - FadeFromS);
+    return 1.0f - t * t * (3.0f - 2.0f * t);
+}
 // The bolt: from this high above the head, the Tiny Tonitrus bridge's strike and two restrikes
 // (HunterRelics::BridgeStrikeAt), a little wider than the tool's.
 inline constexpr float SkyM = 6.5f;
@@ -53,19 +99,58 @@ inline constexpr std::int64_t FlashNs = 400'000'000;
 inline constexpr std::int32_t IdleCrackleVfxRow = 33;
 inline constexpr std::int32_t IdleCrackleFfx = 7211;
 
-// The game thread's view of the charge (Publish every hunter update; any thread reads it).
+// The game thread publishes charge edges and changes in retry eligibility.
 struct State {
     std::uint64_t serial{0};  // charges begun this session
     std::int64_t start_ns{0}; // the last one's start (steady clock)
     bool active{false};       // the charge holds now
+    // A verified stretch without the buff, ending in an interrupted Tonitrus pose.
+    std::int64_t retry_from_ns{};
+    std::int64_t interrupted_ns{};
+
+    bool MayRetryLift(std::int64_t request_ns) const {
+        return !active && retry_from_ns > 0 && request_ns >= retry_from_ns &&
+               request_ns < interrupted_ns;
+    }
 };
 void Publish(const State& state);
 bool Latest(State& out);
 
+enum class Observation { Unknown, Absent, Present };
+
 // One per hunter update: the charge's edges. True on the update it begins.
 struct Tracker {
     State state{};
-    bool Step(bool charged, std::int64_t now) {
+    std::int64_t uncharged_since_ns{};
+    bool was_interrupted{};
+
+    // Called with the same effect-list observation as Step. Publish only an interruption
+    // edge or withdrawal of an earlier retry. An unreadable list proves nothing.
+    bool ObserveLift(bool verified_uncharged, bool interrupted, std::int64_t now) {
+        if (!verified_uncharged && !uncharged_since_ns) {
+            return false;
+        }
+        const auto previous = state.interrupted_ns;
+        if (!verified_uncharged) {
+            uncharged_since_ns = state.retry_from_ns = state.interrupted_ns = 0;
+        } else {
+            if (uncharged_since_ns == 0) {
+                uncharged_since_ns = now;
+            }
+            if (interrupted && !was_interrupted) {
+                state.retry_from_ns = uncharged_since_ns;
+                state.interrupted_ns = now;
+            }
+        }
+        was_interrupted = verified_uncharged && interrupted;
+        return state.interrupted_ns != previous;
+    }
+
+    bool Step(Observation effect, std::int64_t now) {
+        if (effect == Observation::Unknown) {
+            return false;
+        }
+        const bool charged = effect == Observation::Present;
         const bool began = charged && !state.active;
         if (began) {
             ++state.serial;

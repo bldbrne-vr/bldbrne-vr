@@ -14,7 +14,8 @@ namespace VR::TwoHand {
 // Strictly opt in: separate dual weapons and a shared weapon used one-handed keep the
 // original controller-based combat path. Native form alone does not attach a second hand.
 inline bool SharedMotion(int family, int style, bool seated) {
-    return seated && family > 0 && TwoHandedForm(family, style);
+    // (The Bloodletter's flail, OneHandAlso, keeps the one-handed path seated as before.)
+    return seated && family > 0 && TwoHandedForm(family, style) && !OneHandAlso(family);
 }
 
 // The two points combat samples on the steered weapon, along its blade from the right fist:

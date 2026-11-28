@@ -47,6 +47,10 @@ inline bool Take(float& u, float& v, s64 max_age_ms) {
 // FS 0xe55e45eb: the blood moon after Rom, the Hunter's Dream's moon); -1: never. The fog grid's
 // moonlit thin air steps back while they draw (fog_grid.h GameRaysShare).
 inline std::atomic<s64> g_rays_ms{-1};
+inline constexpr bool IsGameRaysProgram(u64 hash) {
+    return hash == 0xe55e45eb || hash == 0xd506a1;
+}
+
 inline void GameRaysDrawn() {
     g_rays_ms.store(NowMs(), std::memory_order_release);
 }

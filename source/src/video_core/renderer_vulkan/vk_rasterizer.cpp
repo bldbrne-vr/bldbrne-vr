@@ -1,3 +1,4 @@
+#include "core/vr/s1_dynamic_resolution.h"
 #include "video_core/native_stereo/draw_registers.h"
 #include "video_core/native_stereo/profile_scopes.h"
 #include "video_core/native_stereo/push_state_memo.h"
@@ -54,10 +55,13 @@
 #include "core/vr/game_area.h"
 #include "core/vr/map_objects.h"
 #include "core/vr/muzzle_flash.h"
+#include "core/vr/tonitrus_charge.h"
 #include "core/vr/torch_glow.h"
 #include "video_core/renderer_vulkan/vr_bump_class.h"
 #include "shader_recompiler/ir/passes/body_shadow.h"
 #include "shader_recompiler/ir/passes/light_shadow.h"
+#include "core/vr/graphics_settings.h"
+#include "video_core/renderer_vulkan/vr_eye_axes.h"
 #include "shader_recompiler/ir/passes/ambient_occlusion.h"
 #include "core/vr/lamp_glow.h"
 #include "core/vr/c0000_skeleton.h"
@@ -2012,6 +2016,7 @@ struct Rasterizer::DrawPacket {
             v.body_cape_hidden != w.body_cape_hidden || v.body_head_hidden != w.body_head_hidden ||
             v.body_shoulder_cut != w.body_shoulder_cut || v.hands_split != w.hands_split ||
             v.hands_split_count != w.hands_split_count || v.cut_code != w.cut_code ||
+            v.blade_clip.normal != w.blade_clip.normal || v.blade_clip.offset != w.blade_clip.offset ||
             v.free_eye_cut != w.free_eye_cut || v.probe_selected != w.probe_selected)
             return "vr";
         if (packet_views != full.packet_views || selected != full.selected ||
@@ -2287,6 +2292,7 @@ struct Rasterizer::DynSkip {
     struct ViewportInputs {
         u32 primitive_type{};
         std::array<u32, 2> jitter{}, inverse{};
+        uint64_t clip_key{};
         bool operator==(const ViewportInputs&) const = default;
     };
     struct PrimitiveInputs {
@@ -2498,6 +2504,7 @@ struct Rasterizer::DynSkip {
                 .jitter = {std::bit_cast<u32>(jitter[0]), std::bit_cast<u32>(jitter[1])},
                 .inverse = {std::bit_cast<u32>(r.vr_scene_inverse[0]),
                             std::bit_cast<u32>(r.vr_scene_inverse[1])},
+                .clip_key=r.drs.scissor_key,
             };
             if (!Lookup(0, viewport, inputs, owned, regs, DynSkipViewportRanges)) {
                 r.UpdateViewportScissorState(pipeline, jitter);
@@ -2832,9 +2839,11 @@ void Rasterizer::PrepareConstants(DrawPacket& packet, bool enabled) {
                                               VrMirrorFlip() ? 2 : 1) | 1;
         return camera_key;
     };
+    // (Every size LightingBuffer pairs below: wet streets' 320 too, whose pair follows the frame's
+    // dynamic resolution step and the last one's, 2026-11-24.)
     const auto Paired = [](const auto& c) {
-        return !c.flat && (c.bytes == 864 || c.bytes == 208 || c.bytes == 272 || c.bytes == 336 ||
-                           c.bytes == 416);
+        return !c.flat && (c.bytes == 864 || c.bytes == 208 || c.bytes == 272 || c.bytes == 320 ||
+                           c.bytes == 336 || c.bytes == 416);
     };
     const auto SlotKey = [](const auto& c, const u8* bytes) {
         const u64 address = c.flat ? 0 : c.sharp.base_address;
@@ -3422,6 +3431,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     pipeline_cache.SetVrSkipVeto([this](const Shader::Info* vs) { return VrSkipVeto(vs); });
     vr_body_maps = std::make_unique<VrBodyMaps>(instance, scheduler); // no buffers until used
     vr_pyramid = std::make_unique<VrDepthPyramid>(instance, scheduler); // no buffer until used
+    vr_edges = std::make_unique<VrShadowEdges>(instance, scheduler);    // no buffer until used
     vr_fog_grid = std::make_unique<VrFogGrid>(instance, scheduler);     // nothing until used
     dyn_skip = std::make_unique<DynSkip>();
     const char* temporal_check = std::getenv("VR_TEMPORAL_NATIVE_CHECK");
@@ -3442,6 +3452,12 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
 
 Rasterizer::~Rasterizer() {
     published_pipe.store(nullptr, std::memory_order_release);
+#ifdef _WIN32
+    if (draw_pipe) {
+        draw_pipe->Drain(DrawPipe::Shutdown);
+        scheduler.SetStageBThread(nullptr);
+    }
+#endif
     draw_pipe.reset(); // Drain and join before destroying caches, packets or scheduler users.
     scheduler.SplitSync("shutdown"); // fast:StageB2 done with this rasterizer's jobs
     if (buffer_cache.SparseEnabled()) {
@@ -3703,6 +3719,11 @@ bool Rasterizer::UpdateDrawWorker() {
     constant_mode = false;
     constant_writes = {};
     pending_writes = {};
+#ifdef _WIN32
+    // Producer handoff is drained here. Hand back the borrowed handle before pipe teardown.
+    scheduler.SetStageBThread(requested && NativeStereo::Enabled() && !split_jobs
+                                  ? draw_pipe->NativeThread() : nullptr);
+#endif
     worker_active = requested;
     LOG_INFO(Render_Vulkan, "FAST recording worker {} (owned packet pipeline)", requested);
     return requested;
@@ -4567,7 +4588,8 @@ const GraphicsPipeline* Rasterizer::VrViewPredicted(const GraphicsPipeline* pipe
         const GraphicsPipeline* base = pipeline_cache.GetGraphicsPipeline(0);
         bool same = base != nullptr && base == pipeline;
         const u32 cut = recording_vr.cut_code;
-        if (base != nullptr && vr_warp && cut != 0 && base->GetGraphicsKey().mrt_mask != 0) {
+        if (base != nullptr && vr_warp && cut != 0 &&
+            (base->GetGraphicsKey().mrt_mask != 0 || cut == Shader::VrCut::BladeMouth)) {
             const GraphicsPipeline* variant = pipeline_cache.GetVrCutPipeline(base, cut, false);
             if (recording_vr.body_split) {
                 same = same && (recording_vr.body_cut_pipeline == nullptr ||
@@ -4624,7 +4646,9 @@ void Rasterizer::VrBumpClassify(const Shader::Info& stage, const Shader::ImageRe
         vr_bump.ready.clear();
         heights.Poll(vr_bump.ready);
         for (const auto& [address, size] : vr_bump.ready) {
-            texture_cache.InvalidateMemory(address, size);
+            // The derived bytes now replace this range on upload.
+            texture_cache.InvalidateMemory(address, size,
+                                           VideoCore::TextureMemory::Invalidation::HostWrite);
         }
     }
     const u32 fmt = static_cast<u32>(tsharp.data_format);
@@ -4849,7 +4873,9 @@ void Rasterizer::VrFogCapture(u64 pgm_hash, const float* source, u32 size, bool 
     const auto& list_view = *paired;
     // This draw's lights' map slots (light_shadow.h SceneMaps::DrawSlotsAt), for its lamp shader:
     // each light's world place against the slots' lamps (within 5 cm, reach within 2%).
-    if (VrSceneMaskOn()) {
+    const bool scene_maps = VrSceneMapsOn();
+    const bool shadow_mask = scene_maps && LightTune::SceneMaps::Mask();
+    if (shadow_mask) {
         const VrShadowCpuScope timed{0};
         namespace Scene = LightTune::SceneMaps;
         vr_scene.draw_slots.fill(0u);
@@ -4962,6 +4988,8 @@ void Rasterizer::VrFogCapture(u64 pgm_hash, const float* source, u32 size, bool 
                close(l[3], c.reach) && close(l[4], c.colour[0]) && close(l[5], c.colour[1]) &&
                close(l[6], c.colour[2]);
     };
+    const bool collect_shadow_lamps = scene_maps && list.kind != NativeProjection::LightKind::Spot;
+    const u32 shadow_tier = collect_shadow_lamps && shadow_mask ? VrLightShadowTier() : 0u;
     for (u32 k = 0; k < list.count; ++k) {
         const float* l = lights.data() + list.Stride() * k;
         if (!std::all_of(l, l + 7, [](float v) { return std::isfinite(v); }) || !(l[3] > 0.0f) ||
@@ -4979,9 +5007,8 @@ void Rasterizer::VrFogCapture(u64 pgm_hash, const float* source, u32 size, bool 
                 w[r] = m[4 * r] * l[0] + m[4 * r + 1] * l[1] + m[4 * r + 2] * l[2] + m[4 * r + 3];
             }
             // The scene maps' candidates (light_shadow.h SceneMaps): a lamp our rules let cast,
-            // within NearLightM, not held (the torch, the Hand Lantern march), scored by the
-            // share of the view its light ball covers; once per lamp a frame.
-            if (VrSceneMapsOn() && list.kind != NativeProjection::LightKind::Spot) {
+            // within the preset's range, scored by the share of the view its light covers.
+            if (collect_shadow_lamps) {
                 const VrShadowCpuScope timed{1};
                 const float dist = std::sqrt(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
                 const float reach = 1.0f / std::sqrt(l[3]);
@@ -5001,13 +5028,21 @@ void Rasterizer::VrFogCapture(u64 pgm_hash, const float* source, u32 size, bool 
                     return same_light(c, l);
                 });
                 // (Held lights too with the mask: nothing else gives them shadows now.)
-                const bool held_ok = dist > LightTune::HeldOutM || LightTune::SceneMaps::Mask();
-                // (With the mask: out to its own range by its reach, never past NearLightM, fading over
-                // the last RangeFadeShare of it: light_shadow.h RangePerReach.)
+                const bool held_ok = dist > LightTune::HeldOutM || shadow_mask;
                 namespace SceneTune = LightTune::SceneMaps;
-                const float near_m = SceneTune::Mask() ? std::clamp(reach * SceneTune::RangePerReach, SceneTune::RangeMinM, LightTune::NearLightM)
-                                                       : LightTune::NearLightM;
-                const float fade_m = SceneTune::Mask() ? near_m * SceneTune::RangeFadeShare : LightTune::NearFadeM;
+                const float near_m = shadow_mask ? SceneTune::MaskedLightRangeM(reach, shadow_tier)
+                                                 : LightTune::NearLightM;
+                const float fade_m = shadow_mask ? near_m * SceneTune::RangeFadeShare
+                                                 : LightTune::NearFadeM;
+                // Listed past its range while a slot holds it (a live switch to a shorter tier,
+                // a warp): VrEndFrame gives that lingering slot no shadow, as the fade does at
+                // the range, instead of its last strength until the slot ages out.
+                if (shadow_mask && dist > near_m && k < SceneTune::DrawLights) {
+                    const u32 slot = (vr_scene.draw_slots[k / 4] >> (8 * (k % 4))) & 255u;
+                    if (slot >= 1u && slot <= VrScene::SlotCount) {
+                        vr_scene.out_of_range |= 1u << (slot - 1u);
+                    }
+                }
                 if (casts && dist <= near_m && held_ok &&
                     std::ranges::none_of(LightTune::NoCastLights, near_pick) && !kept_on_camera &&
                     std::ranges::none_of(vr_scene.building, [&](const VrScene::Lamp& o) {
@@ -5017,7 +5052,7 @@ void Rasterizer::VrFogCapture(u64 pgm_hash, const float* source, u32 size, bool 
                     const float at = std::max(dist, 0.5f);
                     // Its shadow's strength: the lamp shaders' rule (a game-shadowed lamp in full; a
                     // warm one in over DimFadeLuminance; a grey or blue one over BrightFadeLuminance),
-                    // fading in over NearFadeM as you come within NearLightM.
+                    // fading in over the outer part of its range.
                     const auto ramp = [](float x, float from, float to) {
                         return std::clamp((x - from) / (to - from), 0.0f, 1.0f);
                     };
@@ -5050,7 +5085,8 @@ void Rasterizer::VrFogCapture(u64 pgm_hash, const float* source, u32 size, bool 
                     const float score = held_out < 1.0f ? 2.0f
                                                         : std::min(1.0f, reach * reach / (at * at)) *
                                                               std::max(strength * fade, 0.01f);
-                    vr_scene.building.push_back({{w[0], w[1], w[2]}, l[3], score, strength * fade, clear, held_out < 1.0f});
+                    vr_scene.building.push_back({{w[0], w[1], w[2]}, l[3], score, strength * fade, clear,
+                                                 held_out < 1.0f, dist});
                 }
             }
             const auto close = [](float x, float want) {
@@ -5910,7 +5946,7 @@ u32 Rasterizer::VrBodyUpload(std::span<u32> out, u64 pgm_hash) {
             Shader::Optimization::AirLight::FrameNear(vr_scene.cleared_frame, VR::DrawFrameRecord().id) &&
             VR::Tune::Get("lighting.scene_maps", 1.0f) >= 0.5f) {
             vr_body.data[sa + 1] = VR::Tune::Get("lighting.scene_grid", 1.0f) >= 0.5f ? 1u : 0u;
-            vr_body.data[sa + 2] = u32(vr_scene.cleared_frame & 1u);
+            vr_body.data[sa + 2] = u32(vr_scene.cleared_frame & 1u) | (vr_scene.edge_mask << Scene::EdgeSlotShift);
             vr_body.data[sa + 3] = vr_scene.mask ? vr_scene.mask_pixels : 0u;
             const auto& m = vr_fog.view;
             for (u32 r = 0; r < 3; ++r) {
@@ -6064,6 +6100,16 @@ u32 Rasterizer::VrBodyUpload(std::span<u32> out, u64 pgm_hash) {
             out[Body::SlotsAt + Scene::DrawSlotsAt + j] = valid ? vr_scene.draw_slots[j] : 0u;
         }
         vr_scene.draw_slots_valid = false;
+        // The edge pass's serial (light_shadow.h EdgeSerialShift: dword 2's top bits): this frame's
+        // (or a neighbour's, air_light.h FrameSlack), else 0: the lamps keep the blend.
+        {
+            const u32 serial =
+                vr_edges_live != 0 && Shader::Optimization::AirLight::FrameNear(vr_edges_frame, VR::DrawFrameRecord().id)
+                    ? vr_edges_live & Scene::EdgeSerialMask
+                    : 0u;
+            u32& word = out[Body::SlotsAt + 2];
+            word = (word & ~(Scene::EdgeSerialMask << Scene::EdgeSerialShift)) | (serial << Scene::EdgeSerialShift);
+        }
         if constexpr (Common::Log::Enabled) {
             // (How many draws had their lights' slots from the CPU, how many match on the GPU.)
             static u32 with = 0, without = 0, frames = 0;
@@ -6104,10 +6150,13 @@ u32 Rasterizer::VrFogUpload(std::span<u32> out) {
         return Fog::BufferDwords * sizeof(u32);
     }
     const bool update_memory = memory && vr_fog.memory_frame != vr_fog.frame;
+    const u16 map_id = static_cast<u16>(VR::GameArea::Slot().load(std::memory_order_relaxed) >> 16);
     const VR::MapObjects::Table* const objects =
-        update_memory && Fog::Fixtures()
-            ? VR::MapObjects::Of(static_cast<u16>(VR::GameArea::Slot().load(std::memory_order_relaxed) >> 16))
-            : nullptr;
+        update_memory && Fog::Fixtures() ? VR::MapObjects::Of(map_id) : nullptr;
+    // The lights this map hangs where no flame is (map_objects.h NoHalo: the Fishing Hamlet's
+    // pole lights): no glow of their own.
+    const std::vector<VR::MapObjects::NoHaloAnchor>* const no_halo_list =
+        update_memory || !memory ? VR::MapObjects::NoHaloOf(map_id) : nullptr;
     // Lights within MergeM of each other as one (a candle cluster): colours summed, at their
     // light-weighted centre, the widest reach.
     auto& merged = vr_fog.merged;
@@ -6121,6 +6170,8 @@ u32 Rasterizer::VrFogUpload(std::span<u32> out) {
             const float lum = 0.3f * f.colour[0] + 0.6f * f.colour[1] + 0.1f * f.colour[2];
             const bool on_lantern = objects && !f.map && VR::MapObjects::HasLanternReach(f.reach) &&
                                     objects->On(f.world[0], f.world[1], f.world[2]);
+            const bool no_halo = no_halo_list && !f.map &&
+                                 VR::MapObjects::NoHalo(*no_halo_list, f.world[0], f.world[1], f.world[2], f.reach);
             u32 index;
             if constexpr (Packed) {
                 index = centers.Find(merged, f.position, on_lantern);
@@ -6137,6 +6188,7 @@ u32 Rasterizer::VrFogUpload(std::span<u32> out) {
                 previous_member[i] = Fog::EndMember;
                 merged.push_back({f, std::max(lum, 1e-4f), static_cast<u8>(i)});
                 merged.back().light.on_lantern = on_lantern;
+                merged.back().light.no_halo = no_halo;
                 if constexpr (Packed) {
                     centers.Set(index, f.position);
                 }
@@ -6155,6 +6207,7 @@ u32 Rasterizer::VrFogUpload(std::span<u32> out) {
             }
             group.reach = std::min(group.reach, f.reach);
             group.map = group.map || f.map;
+            group.no_halo = group.no_halo && no_halo; // (a cluster without a halo: all its members)
             if constexpr (Packed) {
                 centers.Set(index, group.position);
             }
@@ -6195,6 +6248,23 @@ u32 Rasterizer::VrFogUpload(std::span<u32> out) {
         vr_fog.memory_camera = camera;
         for (VrFogRemembered& m : vr_fog.memory) {
             m.seen = false;
+        }
+        // The newest explosion (muzzle_flash.h Blast): its light never glows in the air, the mist
+        // round it lights up for a moment (FogLight::IsBlastLight, BlastGlow).
+        float since_blast = -1.0f;
+        VR::MuzzleFlash::ListenBlasts(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+        if (std::array<float, 3> where{}; VR::MuzzleFlash::TakeBlast(vr_fog.blast_seen, where)) {
+            vr_fog.blast_world = where;
+            vr_fog.blast_t0 = now;
+            vr_fog.blast_on = true;
+        }
+        if (vr_fog.blast_on) {
+            since_blast = std::chrono::duration<float>(now - vr_fog.blast_t0).count();
+            if (since_blast > 2.0f * Fog::BlastBornS) {
+                vr_fog.blast_on = false; // (no light born from now on can be its)
+                since_blast = -1.0f;
+            }
         }
         for (const VrFogCluster& group : merged) {
             const VrFogLight& f = group.light;
@@ -6264,11 +6334,56 @@ u32 Rasterizer::VrFogUpload(std::span<u32> out) {
                 same->radius = radius;
                 same->colour = f.colour;
                 same->map = f.map;
+                same->no_halo = f.no_halo;
                 {
                     const Fog::Fixture next = Fog::FixtureNext(
                         {same->fixture, same->strayed}, f.map, objects != nullptr, f.on_lantern);
                     same->fixture = next.is;
                     same->strayed = next.strayed;
+                }
+                // Placed or lively (FogLight::PlacedStillS), for a light without the map's tag.
+                if (created) {
+                    same->rest = f.world;
+                    same->still = 0.0f;
+                    same->lively = false;
+                    same->placed = false;
+                }
+                if (!f.map) {
+                    const bool flickers = same->lum_dev > Fog::FlameFlicker * std::max(same->lum_mean, 1e-3f);
+                    const bool in_hand = vr_fog.held_frame == vr_fog.frame &&
+                                         distance2(f.world, vr_fog.held_world) < Fog::SameM * Fog::SameM;
+                    // An explosion's light (FogLight::IsBlastLight): born beside it, near its time.
+                    if (!same->blast && since_blast >= 0.0f &&
+                        Fog::IsBlastLight(created ? 0.0f : same->age, since_blast,
+                                          std::sqrt(distance2(f.world, vr_fog.blast_world)))) {
+                        same->blast = true;
+                        if constexpr (Common::Log::Enabled) {
+                            static u32 logs = 0;
+                            if (logs < 24) {
+                                ++logs;
+                                LOG_INFO(Render_Vulkan,
+                                         "VR fog light: an explosion's light at ({:.1f} {:.1f} {:.1f}) r {:.1f} m, "
+                                         "{:.2f} m from it, born {:.2f} s after it: no glow, its mist lit a moment",
+                                         f.world[0], f.world[1], f.world[2], radius,
+                                         std::sqrt(distance2(f.world, vr_fog.blast_world)),
+                                         since_blast - (created ? 0.0f : same->age));
+                            }
+                        }
+                    }
+                    const bool moved = distance2(f.world, same->rest) > Fog::PlacedMoveM * Fog::PlacedMoveM;
+                    if (moved) {
+                        same->rest = f.world;
+                        same->still = 0.0f;
+                    } else {
+                        same->still += dt;
+                    }
+                    if (moved || flickers || in_hand || same->fixture) {
+                        same->lively = true;
+                        same->placed = false;
+                    } else if (same->still >= Fog::PlacedStillS) {
+                        same->placed = true;
+                        same->lively = false;
+                    }
                 }
                 same->seen = true;
                 // A light the game spawned, born beside the eye: a shot. The muzzle flash is lit
@@ -6303,8 +6418,19 @@ u32 Rasterizer::VrFogUpload(std::span<u32> out) {
             // A flame (it flickers) or a light the game spawned lights the air; a map light
             // that holds steady (a mood light) fades out of it (FogLight::FlameFlicker).
             // (A spawned light at once: a shot's flash must not wait.)
-            if (!flames_only || VR::Tune::Get("lighting.flames_only", 1.0f) < 0.5f || !m.map) {
+            // (A light without the map's tag: lively, a flame at once; placed, the map's rule;
+            // not yet known which, no air lit: FogLight::PlacedStillS.)
+            // (An explosion's light never: FogLight::IsBlastLight; its mist below, BlastGlow. Nor a
+            // light the map hangs where no flame is: map_objects.h NoHalo.)
+            const bool by_behaviour = Fog::PlacedByBehaviour() && !m.map;
+            if (m.blast || m.no_halo) {
+                m.flame = 0.0f;
+            } else if (!flames_only || VR::Tune::Get("lighting.flames_only", 1.0f) < 0.5f ||
+                       (!m.map && (!by_behaviour || m.lively ||
+                                   (m.placed && !Fog::PlacedAsked(m.colour[0], m.colour[2]))))) {
                 m.flame = 1.0f;
+            } else if (by_behaviour && !m.placed) {
+                m.flame = 0.0f;
             } else if (air_sources ? m.sourced
                                    : (m.lum_dev > Fog::FlameFlicker * std::max(m.lum_mean, 1e-3f) ||
                                       !Fog::IsMoodLight(m.reach, m.colour[0], m.colour[2]))) {
@@ -6322,7 +6448,8 @@ u32 Rasterizer::VrFogUpload(std::span<u32> out) {
                 continue;
             }
             m.unseen += dt;
-            const bool held = (m.map || m.fixture) &&
+            // (A placed light is kept like the map's: its flame's votes with it.)
+            const bool held = (m.map || m.fixture || (by_behaviour && m.placed)) &&
                               (m.unseen < Fog::HoldS ||
                                distance2(camera, m.world) < Fog::HoldNearM * Fog::HoldNearM);
             if (!held) {
@@ -6368,7 +6495,8 @@ u32 Rasterizer::VrFogUpload(std::span<u32> out) {
         for (const VrFogCluster& group : merged) {
             const VrFogLight& f = group.light;
             const u8 owner = Fog::HaloMember(vr_fog.ready, previous_member, group.last_member, f.world);
-            candidates.push_back({f.position, f.reach, f.colour, 1.0f, 0.0f, nullptr, 0.0f,
+            // (A light the map hangs where no flame is: no glow, map_objects.h NoHalo.)
+            candidates.push_back({f.position, f.reach, f.colour, f.no_halo ? 0.0f : 1.0f, 0.0f, nullptr, 0.0f,
                                   vr_fog.ready[owner].position});
         }
     }
@@ -6542,6 +6670,27 @@ u32 Rasterizer::VrFogUpload(std::span<u32> out) {
                      vr_fog.density, lights);
         }
     }
+    // An explosion's light: no glow of its own in the air, the mist round it lit for a moment
+    // (FogLight::BlastGlow), BlastWidenM wider. (Room kept for the torch in his hand and a shot.)
+    if (grid_lamps && memory) {
+        for (const VrFogRemembered& m : vr_fog.memory) {
+            const float glow = m.blast ? Fog::BlastGlow(m.age) * m.weight : 0.0f;
+            if (glow <= 0.0f || vr_fog.grid_light_count + 2 >= vr_fog.grid_lights.size()) {
+                continue;
+            }
+            const std::array<float, 3> d{m.world[0] - view[3], m.world[1] - view[7], m.world[2] - view[11]};
+            std::array<float, 3> p{};
+            for (u32 c = 0; c < 3; ++c) {
+                p[c] = view[c] * d[0] + view[4 + c] * d[1] + view[8 + c] * d[2];
+            }
+            const float reach = Fog::BlastReach(m.reach);
+            const float small = std::min(1.0f, 1.0f / std::max(reach * Fog::SmallLightM * Fog::SmallLightM, 1e-6f));
+            const auto air = Fog::AirColour(m.colour);
+            vr_fog.grid_lights[vr_fog.grid_light_count++] = {
+                p, reach, {glow * small * air[0], glow * small * air[1], glow * small * air[2]},
+                Shader::Optimization::FogGrid::Lamps::CoreM2};
+        }
+    }
     // The torch in his hand lights the mist too (fog_grid.h Lamps::Held*; the capture kept it).
     if (grid_lamps && memory && vr_fog.held_frame == vr_fog.frame &&
         vr_fog.grid_light_count + 1 < vr_fog.grid_lights.size()) {
@@ -6619,11 +6768,50 @@ u32 Rasterizer::VrFogUpload(std::span<u32> out) {
             }
         }
     }
+    // The slot's light at `world`. A negative signed core requests unshadowed surface lighting.
+    const auto light_slot = [&](const std::array<float, 3>& world, const std::array<float, 3>& colour,
+                                float radius, float signed_core) {
+        const std::array<float, 3> d{world[0] - view[3], world[1] - view[7], world[2] - view[11]};
+        u32* const mz = out.data() + Fog::MuzzleDword;
+        for (u32 c = 0; c < 3; ++c) {
+            mz[c] = std::bit_cast<u32>(view[c] * d[0] + view[4 + c] * d[1] + view[8 + c] * d[2]);
+            mz[4 + c] = std::bit_cast<u32>(colour[c]);
+        }
+        mz[3] = std::bit_cast<u32>(1.0f / (radius * radius));
+        mz[7] = std::bit_cast<u32>(signed_core);
+    };
+    // The Tonitrus charged (tonitrus_charge.h HeadGlow): when no flash shines, a faint blue light
+    // at its head, before the torch's glow (the charge's 7 s at most).
+    bool slot_lit = vr_fog.muzzle_on;
+    std::array<float, 3> head{};
+    int head_lit = 0;
+    float head_fade = 1.0f;
+    if (memory && !slot_lit &&
+        VR::TonitrusCharge::HeadGlow.Take(VR::TonitrusCharge::GlowFreshS, head, head_lit, &head_fade)) {
+        namespace T = VR::TonitrusCharge;
+        const float intensity =
+            T::GlowIntensity * std::clamp(head_fade, 0.0f, 1.0f) * VR::Tune::Get("lighting.tonitrus", 1.0f);
+        if (intensity > 0.0f) {
+            // (Out of the ball, towards the eye: GlowTowardEyeM.)
+            const std::array<float, 3> to_eye{view[3] - head[0], view[7] - head[1], view[11] - head[2]};
+            const float apart = std::sqrt(to_eye[0] * to_eye[0] + to_eye[1] * to_eye[1] + to_eye[2] * to_eye[2]);
+            const float move = std::min(T::GlowTowardEyeM, 0.5f * apart) / std::max(apart, 1e-3f);
+            for (u32 c = 0; c < 3; ++c) {
+                head[c] += to_eye[c] * move;
+            }
+            light_slot(head,
+                       {T::GlowColour[0] * intensity, T::GlowColour[1] * intensity,
+                        T::GlowColour[2] * intensity},
+                       std::max(VR::Tune::Get("lighting.tonitrus_radius", T::GlowRadiusM), 0.5f),
+                       -T::GlowSoftM2);
+            slot_lit = true;
+        }
+    }
     // The torch held up (torch_glow.h): when no flash shines, a gentle glow at its flame, a share
     // of the game's own torch light (the remembered light nearest the flame) reaching further.
     std::array<float, 3> flame{};
     int flame_level = 0;
-    if (memory && !vr_fog.muzzle_on && VR::TorchGlow::Take(Fog::TorchFreshS, flame, flame_level)) {
+    if (memory && !slot_lit && VR::TorchGlow::Take(Fog::TorchFreshS, flame, flame_level)) {
         const VrFogRemembered* torch = nullptr;
         float nearest = Fog::TorchMatchM * Fog::TorchMatchM;
         for (const VrFogRemembered& m : vr_fog.memory) {
@@ -6640,14 +6828,8 @@ u32 Rasterizer::VrFogUpload(std::span<u32> out) {
             const float grow = (high ? Fog::TorchRangeHigh : Fog::TorchRangeRaised) - 1.0f;
             const float range = 1.0f + grow * VR::Tune::Get("lighting.torch_range", 1.0f);
             const float radius = std::max(torch->radius * range, 0.5f);
-            const std::array<float, 3> d{flame[0] - view[3], flame[1] - view[7], flame[2] - view[11]};
-            u32* const mz = out.data() + Fog::MuzzleDword;
-            for (u32 c = 0; c < 3; ++c) {
-                mz[c] = std::bit_cast<u32>(view[c] * d[0] + view[4 + c] * d[1] + view[8 + c] * d[2]);
-                mz[4 + c] = std::bit_cast<u32>(torch->colour[c] * share);
-            }
-            mz[3] = std::bit_cast<u32>(1.0f / (radius * radius));
-            mz[7] = std::bit_cast<u32>(Fog::TorchSoftM2);
+            light_slot(flame, {torch->colour[0] * share, torch->colour[1] * share, torch->colour[2] * share},
+                       radius, Fog::TorchSoftM2);
         }
     }
     // Lit smoke (particle_air.h): this frame's strongest lights and the camera's world-to-view
@@ -6949,10 +7131,19 @@ void Rasterizer::VrSceneMapsBeforeDraw(const GraphicsPipeline* pipeline) {
         scheduler.EndRendering();
         NativeStereo::Barrier(scheduler);
         // (The old march in the mask reads no cubes: none cleared.)
-        if (used != 0 && !(Scene::Mask() && Scene::MarchMode() && Scene::TraceAll())) {
+        const bool clear = used != 0 && !(Scene::Mask() && Scene::MarchMode() && Scene::TraceAll());
+        if (clear) {
             scheduler.Commands().fillBuffer(vr_scene.buffer->Handle(), (frame & 1u) * bytes, used, Scene::Empty);
         }
-        NativeStereo::Barrier(scheduler);
+        // (The second barrier is the clear's: with no clear the two stood back to back with no GPU
+        // work between them. VR_OPT_SHADOW_BARRIER=0: both, as before (tests).)
+        static const bool one_barrier = [] {
+            const char* const env = std::getenv("VR_OPT_SHADOW_BARRIER");
+            return env == nullptr || env[0] != '0';
+        }();
+        if (clear || !one_barrier) {
+            NativeStereo::Barrier(scheduler);
+        }
         vr_scene.cleared_frame = frame;
 
     } else {
@@ -7013,6 +7204,261 @@ void Rasterizer::VrPyramidBeforeDraw(const GraphicsPipeline* pipeline) {
             LOG_INFO(Render_Vulkan, "VR depth pyramid: frame {}: {}x{} (format {}), both eyes {}, {}",
                      frame, tsharp.width + 1, tsharp.height + 1, u32(tsharp.GetDataFmt()),
                      view.native_right ? "apart" : "one view", vr_pyramid_ready ? "built" : "not built");
+        }
+    }
+}
+
+// The lamp shadows' edge pass (vr_shadow_edges.h, light_shadow.h SceneMaps::EdgePass): before the
+// frame's first lamp draw whose program reads its bits, the depth that draw samples (both eyes),
+// the mask, each eye's inverse projection (the lamp shaders' own matrix, as LightingBuffer last
+// remapped it) and the frame's edge lamps as the slot header has them, outside the render pass.
+// Anything missing: no pass, serial 0 (VrBodyUpload), the lamps keep the mask's blend.
+void Rasterizer::VrEdgesBeforeDraw(const GraphicsPipeline* pipeline) {
+    namespace LS = Shader::Optimization::LightShadow;
+    namespace Scene = LS::SceneMaps;
+    namespace Body = Shader::Optimization::BodyShadow;
+    if (!(pipeline->VrFsBuffers() & Pipeline::VrFsShadowEdges) || !vr_edges || !Scene::EdgePass() ||
+        !VrSceneMaskOn() || !VR::IsEnabled() || VrInMirrorPass()) {
+        return;
+    }
+    const auto* fs = pipeline->GetStages()[u32(Shader::LogicalStage::Fragment)];
+    const u64 frame = VR::DrawFrameRecord().id;
+    if (frame == 0 || vr_edges_frame == frame) {
+        return;
+    }
+    // Tried once a frame, before its first lamp draw. A frame whose inputs are not there yet keeps
+    // the blend: a later try would split the lamps' pass (the dispatch ends the rendering), and the
+    // last pass's bits are up to air_light.h FrameSlack frames old, edges where the head was.
+    // (a code review, 2026-11-20, asked for a retry; this is why there is none.)
+    vr_edges_frame = frame;
+    vr_edges_live = 0;
+    // The frame's slots and edge lamps, as the lamp draws' body buffer carries them.
+    if (vr_body.frame != frame || !vr_scene.mask) {
+        return;
+    }
+    const u32 sa = Body::SlotsAt;
+    const u32 edge_bits = (vr_body.data[sa + 2] >> Scene::EdgeSlotShift) & ((1u << Scene::Slots) - 1u);
+    const u32 count = std::min<u32>(vr_body.data[sa], Scene::Slots);
+    if (edge_bits == 0 || count == 0) {
+        return;
+    }
+    std::array<std::array<float, 16>, 2> inverse;
+    if (!NativeStereo::LightInverseProjections(inverse)) {
+        return;
+    }
+    std::array<std::array<float, 16>, 2> forward;
+    for (u32 eye = 0; eye < 2; ++eye) {
+        // Gauss-Jordan with partial pivoting: the inverse's inverse (view -> ndc x w, raw depth x w, w).
+        std::array<double, 32> m{};
+        for (u32 r = 0; r < 4; ++r) {
+            for (u32 c = 0; c < 4; ++c) {
+                if (!std::isfinite(inverse[eye][4 * r + c])) {
+                    return;
+                }
+                m[8 * r + c] = inverse[eye][4 * r + c];
+            }
+            m[8 * r + 4 + r] = 1.0;
+        }
+        for (u32 c = 0; c < 4; ++c) {
+            u32 pivot = c;
+            for (u32 r = c + 1; r < 4; ++r) {
+                if (std::abs(m[8 * r + c]) > std::abs(m[8 * pivot + c])) {
+                    pivot = r;
+                }
+            }
+            if (std::abs(m[8 * pivot + c]) < 1e-20) {
+                return;
+            }
+            for (u32 k = 0; k < 8; ++k) {
+                std::swap(m[8 * c + k], m[8 * pivot + k]);
+            }
+            const double d = m[8 * c + c];
+            for (u32 k = 0; k < 8; ++k) {
+                m[8 * c + k] /= d;
+            }
+            for (u32 r = 0; r < 4; ++r) {
+                if (r != c) {
+                    const double f = m[8 * r + c];
+                    for (u32 k = 0; k < 8; ++k) {
+                        m[8 * r + k] -= f * m[8 * c + k];
+                    }
+                }
+            }
+        }
+        for (u32 r = 0; r < 4; ++r) {
+            for (u32 c = 0; c < 4; ++c) {
+                forward[eye][4 * r + c] = static_cast<float>(m[8 * r + 4 + c]);
+            }
+        }
+    }
+    // The depth the lamp draw samples (its image as the draw binds it).
+    const u32 index = fs->vr_light_shadow.depth_image & 0xFFFFu;
+    if (index >= fs->images.size()) {
+        return;
+    }
+    const auto& res = fs->images[index];
+    const AmdGpu::Image tsharp = res.GetSharp(*fs);
+    if (tsharp.Address() == 0 || tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid ||
+        !memory->IsValidGpuMapping(tsharp.Address(), 0)) {
+        return;
+    }
+    const u32 width = tsharp.width + 1, height = tsharp.height + 1;
+    // ndc from the pixel: the draw's viewport, backwards (the air pass's way); a viewport not the
+    // picture's size: the plain one.
+    const auto& vp = ScratchDraw::Registers(liverpool).viewports[0];
+    float ax = 2.0f / float(width), bx = -1.0f, ay = 2.0f / float(height), by = -1.0f;
+    if (std::abs(vp.xscale) > 0.5f && std::abs(vp.yscale) > 0.5f &&
+        std::abs(2.0f * std::abs(vp.xscale) - float(width)) < 2.0f &&
+        std::abs(2.0f * std::abs(vp.yscale) - float(height)) < 2.0f) {
+        ax = 1.0f / vp.xscale;
+        bx = -vp.xoffset / vp.xscale;
+        ay = 1.0f / vp.yscale;
+        by = -vp.yoffset / vp.yscale;
+    }
+    std::array<u32, VrShadowEdges::ParamWords> params{};
+    const auto put = [&](u32 at, float v) { params[at] = std::bit_cast<u32>(v); };
+    for (u32 eye = 0; eye < 2; ++eye) {
+        for (u32 d = 0; d < 16; ++d) {
+            put(16 * eye + d, inverse[eye][d]);
+            put(32 + 16 * eye + d, forward[eye][d]);
+        }
+    }
+    put(64, ax);
+    put(65, bx);
+    put(66, ay);
+    put(67, by);
+    // The edge lamps in slot order (a lamp shader's rank among them), each eye's view of each:
+    // its flat view place (the slot's world axes turned back) less the eye's half shift.
+    std::array<float, 9> rot;
+    for (u32 d = 0; d < 9; ++d) {
+        rot[d] = std::bit_cast<float>(vr_body.data[sa + 4 + d]);
+    }
+    const float half = std::bit_cast<float>(vr_body.data[Body::AttachedAt + 1]);
+    u32 lamps = 0;
+    const u32 lamp_room = Scene::EdgePassLampCapacity(Scene::EdgeBits());
+    for (u32 j = 0; j < count && lamps < lamp_room; ++j) {
+        if (((edge_bits >> j) & 1u) == 0) {
+            continue;
+        }
+        const u32 e = sa + Scene::SlotHeader + Scene::SlotDwords * j;
+        const float w[3] = {std::bit_cast<float>(vr_body.data[e]), std::bit_cast<float>(vr_body.data[e + 1]),
+                            std::bit_cast<float>(vr_body.data[e + 2])};
+        float flat[3];
+        for (u32 c = 0; c < 3; ++c) {
+            flat[c] = rot[c] * w[0] + rot[3 + c] * w[1] + rot[6 + c] * w[2];
+        }
+        const u32 at = 76 + 12 * lamps;
+        put(at + 0, flat[0] + half); // the left eye sits at -half in the flat view
+        put(at + 1, flat[1]);
+        put(at + 2, flat[2]);
+        put(at + 3, flat[0] - half);
+        put(at + 4, flat[1]);
+        put(at + 5, flat[2]);
+        params[at + 6] = vr_body.data[e + 3]; // k: the falloff
+        params[at + 7] = vr_body.data[e + 6]; // its fixture's clearance
+        params[at + 8] = (vr_body.data[e + 5] & Scene::SlotHis) != 0 ? 1u : 0u;
+        params[at + 9] = j;
+        ++lamps;
+    }
+    params[68] = lamps;
+    params[69] = Scene::EdgePassSteps();
+    put(70, float(Scene::EdgeRange()) - 0.5f);
+    put(71, Scene::EdgeFar().first);
+    put(72, Scene::EdgeFar().second);
+    put(73, Scene::EdgeMinContrast);
+    params[74] = Scene::EdgeNoise() == 1 ? 1u : 0u;
+    params[75] = vr_scene.mask_pixels;
+    put(136, LS::StartM); // (vr_shadow_edges.comp TuneAt: after EdgeMaxLamps lamps)
+    put(137, LS::MaxM);
+    put(138, LS::BiasM);
+    put(139, LS::BiasPerEyeM);
+    put(140, LS::BiasPerM);
+    put(141, LS::ThickM);
+    put(142, LS::ThickPerM);
+    params[150] = Scene::EdgeBits(); // (BitsAt: a pixel's bits, 8 or 16)
+    // The centre it sharpens (vr_shadow_edges.comp FoveaAt): where the mask pass shades at its full
+    // rate, the foveation's inner zone or the mask's own (light_shadow.h MaskFoveaInner), a little
+    // inside its border; the eyes' axes as the rate map has them (vk_scheduler.cpp). Foveation off:
+    // everywhere (0). The user, 2026-11-20: "sharpen edges only in the centre".
+    {
+        float radius = 0.0f;
+        std::array<float, 2> cx{0.5f, 0.5f}, cy{0.5f, 0.5f};
+        if (instance.IsFoveationEnabled() && VR::IsImmersive()) {
+            const Foveation::Settings zones =
+                instance.IsFoveationFixed()
+                    ? instance.GetFoveationSettings()
+                    : Foveation::Choose(nullptr, VR::Graphics::foveation.load(std::memory_order_relaxed));
+            if (zones.on) {
+                radius = std::max(zones.inner, Scene::MaskFoveaInner()) - Scene::EdgeFoveaMargin;
+                radius = std::max(radius, 0.05f);
+                EyeAxes(VR::GetHead(), cx, cy);
+                if (!instance.IsFoveationLayered()) {
+                    cx = {0.5f * (cx[0] + cx[1]), 0.5f * (cx[0] + cx[1])};
+                    cy = {0.5f * (cy[0] + cy[1]), 0.5f * (cy[0] + cy[1])};
+                }
+            }
+        }
+        put(144, cx[0]); // (vr_shadow_edges.comp FoveaAt)
+        put(145, cy[0]);
+        put(146, cx[1]);
+        put(147, cy[1]);
+        put(148, radius);
+        // Under dynamic resolution the mask's rate map follows the narrower view (vr_foveation.h
+        // Map scale, Scheduler::FoveationDrop): the same view share here, so the pass sharpens
+        // exactly where the mask was shaded at its full rate (2026-11-24 review).
+        const u32 drop = scheduler.FoveationDrop();
+        put(149, drop != 0 ? float(100 - drop) / 100.0f : 1.0f);
+    }
+    VideoCore::TextureCache::ImageDesc desc = TextureDescFor(tsharp, res);
+    VideoCore::ImageId image_id = texture_cache.FindImage(desc);
+    auto* image = &texture_cache.GetImage(image_id);
+    if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
+        image_id = depth_image_id;
+        image = &texture_cache.GetImage(image_id);
+    }
+    auto& view = texture_cache.FindTexture(image_id, desc);
+    scheduler.EndRendering();
+    TransitTexture(*image, false, desc.view_info.range);
+    const vk::ImageView left = *view.image_view;
+    const vk::ImageView right = view.native_right ? *view.native_right : left;
+    const u64 mask_bytes = (u64(Scene::MaskHeader) + u64(vr_scene.mask_pixels) * Scene::MaskWords) * sizeof(u32);
+    // (A serial that fits the slot header's bits, never 0.)
+    u32 serial = ++vr_edges_counter & Scene::EdgeSerialMask;
+    if (serial == 0) {
+        serial = ++vr_edges_counter & Scene::EdgeSerialMask;
+    }
+    // (The parameters and header through the stream buffer: VrShadowEdges::Record.)
+    std::array<u32, VrShadowEdges::DataAt> head{};
+    VrShadowEdges::FillHead(head, std::span<const u32, VrShadowEdges::ParamWords>{params}, serial, width, height,
+                            Scene::EdgeBits());
+    auto& stream = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+    const u64 head_offset = stream.Copy(head.data(), sizeof(head), instance.StorageMinAlignment());
+    const bool ok = vr_edges->Record(scheduler.Commands(), left, right, image->backing->state.layout, width,
+                                     height, vr_scene.mask->Handle(), mask_bytes, stream.Handle(), head_offset,
+                                     Scene::EdgeBits());
+    vr_edges_live = ok ? serial : 0u;
+    if constexpr (Common::Log::Enabled) {
+        static u32 logged = 0;
+        if (logged++ < 3 || frame % 600 == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "VR shadow edges: frame {}: {}x{}, {} lamps (bits {:#x}), viewport {} {} {} {}, eyes {}, {}",
+                     frame, width, height, lamps, edge_bits, vp.xscale, vp.xoffset, vp.yscale, vp.yoffset,
+                     view.native_right ? "apart" : "one view", ok ? "recorded" : "not recorded");
+            // (Each edge lamp where the left eye sees it, by the pass's own mapping: tests.)
+            for (u32 i = 0; i < lamps; ++i) {
+                const u32 at = 76 + 12 * i;
+                const float q[4] = {std::bit_cast<float>(params[at]), std::bit_cast<float>(params[at + 1]),
+                                    std::bit_cast<float>(params[at + 2]), 1.0f};
+                float c[4];
+                for (u32 r = 0; r < 4; ++r) {
+                    c[r] = forward[0][4 * r] * q[0] + forward[0][4 * r + 1] * q[1] +
+                           forward[0][4 * r + 2] * q[2] + forward[0][4 * r + 3] * q[3];
+                }
+                const float nx = c[0] / c[3], ny = c[1] / c[3];
+                LOG_INFO(Render_Vulkan,
+                         "VR shadow edges: lamp {} (slot {}) view {:.2f} {:.2f} {:.2f}: left eye pixel {:.0f} {:.0f}, w {:.3f}",
+                         i, params[at + 9], q[0], q[1], q[2], (nx - bx) / ax - 0.5f, (ny - by) / ay - 0.5f, c[3]);
+            }
         }
     }
 }
@@ -7629,13 +8075,14 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
                 bind_memo.Prefetch(prepared.key, prepared.key_hash);
         }
     }
-    if (vr_warp) {
+    if (vr_warp && pipeline->VrFsBuffers() != 0) {
         VrBodyMapsBeforeDraw(pipeline);
         VrShadowGridBeforeDraw(pipeline);
         VrSceneMapsBeforeDraw(pipeline);
         VrFogGridBeforeDraw(pipeline);
         VrAirBeforeDraw(pipeline);
         VrPyramidBeforeDraw(pipeline);
+        VrEdgesBeforeDraw(pipeline);
     }
     // FAST_CPU_STAGEB_SPLIT stage 1: what this draw resolves (targets, resources,
     // barriers, uploads) records into a blob, appended to the ring before the submit check below.
@@ -7697,6 +8144,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
         return;
     }
     auto state = BeginRendering(pipeline);
+    if (S1Drs::enabled) drs.Target(state.width,state.height,state.probe_view_mask);
     if (DrawCensus::Enabled()) [[unlikely]] {
         // The shadow atlas cell as ShadowCellSkipped finds it (a square 2048..8192 depth target).
         int cell = -1;
@@ -7875,6 +8323,17 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
         const u32 motion = VrTemporalPrepareDraw(pipeline, motion_geometry, is_indexed,
                                                  index_offset, vertex_offset, instance_offset);
         push_data.vr_hud = Shader::VrMotion::PackPush(u32(push_data.vr_hud), motion);
+    }
+    if (Shader::VrCut::IsHone(recording_vr.cut_code)) {
+        const u32 code = recording_vr.cut_code;
+        // HonedSteel parts 2 and 3 are the two Rakuyo blades.
+        const float polish_per_step = (code & 2u) ? (.60f / 255.f) : (.52f / 255.f);
+        push_data.xoffset = float((code >> 16) & 255u) * polish_per_step;
+        const u32 band = code >> 24;
+        push_data.yoffset = band == 255 ? -2.f : float(band) / 254.f;
+    } else if (recording_vr.cut_code == Shader::VrCut::BladeMouth) {
+        push_data.xoffset = recording_vr.blade_clip.offset;
+        push_data.yoffset = std::bit_cast<float>(recording_vr.blade_clip.normal);
     }
     vr_push.scene_inverse = vr_scene_inverse;
     if (job) {
@@ -8221,6 +8680,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         VrFogGridBeforeDraw(pipeline);
         VrAirBeforeDraw(pipeline);
         VrPyramidBeforeDraw(pipeline);
+        VrEdgesBeforeDraw(pipeline);
     }
     // FAST_CPU_STAGEB_SPLIT stage 1: what this draw resolves (targets, resources,
     // barriers, uploads) records into a blob, appended to the ring before the submit check below.
@@ -8272,6 +8732,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         return;
     }
     const auto state = BeginRendering(pipeline);
+    if (S1Drs::enabled) drs.Target(state.width,state.height,state.probe_view_mask);
     VrNativeAudit(pipeline, &state);
     resolve_blob.Close(); // FAST_CPU_STAGEB_SPLIT: the resolve part ends here
     MaybeSubmitMidFrame(state);
@@ -9092,7 +9553,60 @@ u64 Rasterizer::Flush() {
     return current_tick;
 }
 
+// The lamp shadows' buffers given back while they are off (the 2026-11-21 review: switched to
+// the game's, their 40 to 50 MB stayed until a restart): once they have been off ReleaseFrames
+// frames (a quick switch back keeps them), the scene maps, the mask, the blocker grid, the depth
+// pyramid and the edges, each freed once the GPU is past the frames that used them (Scheduler::
+// DeferOperation); made again at their first use, as on the first switch. The body maps stay (some
+// 1.5 MB, and their mesh pool is shared by the draws that filled it). The recording thread, where
+// they are made.
+void Rasterizer::VrLampShadowsRelease() {
+    constexpr u32 ReleaseFrames = 300; // some 3 s at 90 frames a second
+    if (VrLampShadowsOn()) {
+        vr_lamps_off_frames = 0;
+        return;
+    }
+    if (vr_lamps_off_frames > ReleaseFrames || ++vr_lamps_off_frames <= ReleaseFrames) {
+        return;
+    }
+    u64 freed = 0;
+    if (vr_scene.buffer) {
+        freed += vr_scene.buffer->SizeBytes();
+        scheduler.DeferOperation([old = std::move(vr_scene.buffer)]() mutable { old.reset(); });
+    }
+    if (vr_scene.mask) {
+        freed += vr_scene.mask->SizeBytes();
+        scheduler.DeferOperation([old = std::move(vr_scene.mask)]() mutable { old.reset(); });
+        vr_scene.mask_pixels = 0;
+    }
+    if (vr_grid_buffer) {
+        freed += vr_grid_buffer->SizeBytes();
+        scheduler.DeferOperation([old = std::move(vr_grid_buffer)]() mutable { old.reset(); });
+        vr_grid_ready = false;
+        vr_grid_header = ~0ull;
+    }
+    if (vr_pyramid) {
+        freed += vr_pyramid->Bytes();
+        vr_pyramid->Release();
+        vr_pyramid_ready = false; // (its binding takes the stand-in)
+    }
+    if (vr_edges) {
+        freed += vr_edges->Bytes();
+        vr_edges->Release();
+    }
+    vr_scene.cleared_frame = ~0ull;
+    vr_scene.barrier_frame = ~0ull;
+    if (freed != 0) {
+        LOG_INFO(Render_Vulkan, "VR lamp shadows: off for {} frames, their buffers given back ({} KiB)",
+                 ReleaseFrames, freed >> 10);
+    }
+}
+
 void Rasterizer::FlushFrameEnd() {
+    // The graphics settings in force for the next frame (vk_pipeline_cache.h VrLatchGraphics: the
+    // lamp shadows switch live, the menu's row or a draw-inspector `set`).
+    VrLatchGraphics();
+    VrLampShadowsRelease();
     if (FrameMatch::Enabled())
         FrameMatch::Get().FrameEnd();
     if (DrawCensus::Enabled())
@@ -11246,10 +11760,48 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     float light_view_scale = 0.f;
     float light_view_ipd = 0.f;
     Shader::Optimization::FogLight::ListView fog_draw_view;
+    const auto write_descriptor = [&](const VideoCore::Buffer* owner,
+                                      vk::DescriptorBufferInfo camera_right) {
+        auto& set_write = set_writes[set_write_index++];
+        set_write.dstSet = VK_NULL_HANDLE;
+        set_write.dstBinding = binding.unified++;
+        set_write.dstArrayElement = 0;
+        set_write.descriptorCount = 1;
+        set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
+        set_write.pBufferInfo = &buffer_infos.back();
+        ++binding.buffer;
+        if (stereo_handles) {
+            // Bit 25: the registry entry of this descriptor's buffer. Camera, ring and utility
+            // descriptors name the stream buffer or the constant ring (both registered).
+            const vk::Buffer left = buffer_infos.back().buffer;
+            if (!owner && left) {
+                auto& stream = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+                if (left == stream.Handle())
+                    owner = &stream;
+                else if (constant_ring && left == constant_ring->Handle())
+                    owner = constant_ring.get();
+            }
+            buffer_hints.resize(buffer_infos.size() - 1);
+            buffer_hints.push_back({left, owner ? owner->NativeEntry() : nullptr, camera_right});
+        }
+    };
     // Second pass to re-bind buffers that were updated after binding
     for (u32 i = 0; i < buffer_bindings.size(); i++) {
         const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
         const auto& desc = stage.buffers[i];
+        const auto* constant = prepared[i];
+        // Flat user data is bound verbatim. A vertex constant can carry an eye-specific
+        // camera only in the 864-byte scene layout. Keep the audit and verification paths.
+        const bool plain_constant = constant && size != 864 && !desc.is_written &&
+            (stage.l_stage == Shader::LogicalStage::Vertex ||
+             desc.buffer_type == Shader::BufferType::Flatbuf) &&
+            !cb_verify && !g_camera_audit;
+        if (plain_constant) {
+            ++constant_bind_hits;
+            buffer_infos.push_back(constant->raw);
+            write_descriptor(nullptr, {});
+            continue;
+        }
         bool shared_shadow = cb_memo ? shared_shadow_memo : shared_shadow_test();
         if (cb_verify) {
             const bool full = shared_shadow_test();
@@ -11283,7 +11835,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         const bool capture_temporal = vr_temporal && vr_temporal->gbuffer &&
                                       stage.l_stage == Shader::LogicalStage::Vertex &&
                                       vr_temporal->scene.Active();
-        const auto* constant = prepared[i];
         constant_bind_hits += constant != nullptr;
         bool projection_paired = false, mirrored = false;
         vk::DescriptorBufferInfo native_camera;
@@ -11657,6 +12208,17 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 } else {
                     buffer_infos.push_back(VrWrittenStandIn(1, 4 * sizeof(u32)));
                 }
+            } else if (desc.buffer_type == Shader::BufferType::VrShadowEdges) {
+                // The edge pass's bits (vr_shadow_edges.h) once made; else zeros the size of its
+                // header (its serial 0: no lamp reads a bit; the index stays in the header).
+                if (vr_edges && vr_edges->Buffer() && vr_edges->Bytes() != 0) {
+                    buffer_infos.emplace_back(vr_edges->Buffer(), 0, vr_edges->Bytes());
+                } else {
+                    auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+                    static const std::array<u32, VrShadowEdges::DataAt> none{};
+                    const u64 offset = vk_buffer.Copy(none.data(), sizeof(none), alignment);
+                    buffer_infos.emplace_back(vk_buffer.Handle(), offset, sizeof(none));
+                }
             } else if (desc.buffer_type == Shader::BufferType::VrDepthPyramid) {
                 // The depth pyramid (vr_depth_pyramid.h) recorded for this frame; else a stand-in
                 // of zeros (its header's size 0: the march reads no pyramid).
@@ -11817,40 +12379,20 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
         }
 
-        auto& set_write = set_writes[set_write_index++];
-        set_write.dstSet = VK_NULL_HANDLE;
-        set_write.dstBinding = binding.unified++;
-        set_write.dstArrayElement = 0;
-        set_write.descriptorCount = 1;
-        set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
-        set_write.pBufferInfo = &buffer_infos.back();
-        ++binding.buffer;
-        if (stereo_handles) {
-            // Bit 25: the registry entry of this descriptor's buffer. Camera, ring and utility
-            // descriptors name the stream buffer or the constant ring (both registered).
-            const vk::Buffer left = buffer_infos.back().buffer;
-            if (!owner && left) {
-                auto& stream = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
-                if (left == stream.Handle())
-                    owner = &stream;
-                else if (constant_ring && left == constant_ring->Handle())
-                    owner = constant_ring.get();
-            }
-            // FAST_CPU_FUSED_PAIR: a camera, lighting, screen point, screen rect or light list
-            // descriptor's own pair, registered just above (the constant's, else the last one):
-            // what the pairing scan finds for this left half, every pair's left being an allocation
-            // of its own. A reflection pass's light paired here has its own (mirror_light); a light
-            // list always has (LightListBuffer), also from a prepared constant.
-            vk::DescriptorBufferInfo camera_right{};
-            if (native_handles.fused &&
-                (camera || lighting || screen_point || screen_rect || light_list)) {
-                camera_right = constant && (camera || (lighting && ring_light))
-                                   ? constant->right
-                                   : NativeStereo::LastCameraRight();
-            }
-            buffer_hints.resize(buffer_infos.size() - 1);
-            buffer_hints.push_back({left, owner ? owner->NativeEntry() : nullptr, camera_right});
+        // FAST_CPU_FUSED_PAIR: a camera, lighting, screen point, screen rect or light list
+        // descriptor's own pair, registered just above (the constant's, else the last one):
+        // what the pairing scan finds for this left half, every pair's left being an allocation
+        // of its own. A reflection pass's light paired here has its own (mirror_light); a light
+        // list always has (LightListBuffer), also from a prepared constant.
+        vk::DescriptorBufferInfo camera_right{};
+        if (stereo_handles && native_handles.fused &&
+            (camera || lighting || screen_point || screen_rect || light_list)) {
+            camera_right = constant && (camera || (lighting && ring_light))
+                               ? constant->right
+                               : NativeStereo::LastCameraRight();
         }
+
+        write_descriptor(owner, camera_right);
     }
     // The final position comes from the hardware vertex stage, or from the geometry stage, which
     // may build it from what its export stage computed. Either may have read a paired camera:
@@ -13217,8 +13759,8 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     return value;
 }
 
-bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool emulator_write,
-                                  bool protection_only) {
+bool Rasterizer::InvalidateMemory(VAddr addr, u64 size,
+                                 VideoCore::TextureMemory::Invalidation source) {
     Common::Slow::Scope slow{Common::Slow::GuestInvalidate, size};
     if (DA::Enabled() && !liverpool->IsRecordingThread())
         DA::Get().Write({{addr, size}, DA::Kind::CpuFault});
@@ -13226,8 +13768,12 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool emulator_write,
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
-    buffer_cache.InvalidateMemory(addr, size, emulator_write, protection_only);
-    texture_cache.InvalidateMemory(addr, size);
+    using VideoCore::TextureMemory::Invalidation;
+    // Buffer page retirement includes protection changes; its coverage is independent
+    // of which image bytes this notification can prove were written.
+    const bool host = source == Invalidation::HostWrite || source == Invalidation::ProtectionChange;
+    buffer_cache.InvalidateMemory(addr, size, host);
+    texture_cache.InvalidateMemory(addr, size, source);
     return true;
 }
 
@@ -13244,7 +13790,7 @@ bool Rasterizer::InvalidateWriteFaultPage(VAddr addr) {
         return false;
     }
     buffer_cache.InvalidateWriteFault(addr, 8);
-    texture_cache.InvalidateMemory(addr, 8);
+    texture_cache.InvalidateMemory(addr, 8, VideoCore::TextureMemory::Invalidation::AddressFault);
     return true;
 }
 
@@ -13296,7 +13842,7 @@ bool Rasterizer::InvalidateWriteFault(VAddr addr) {
         buffer_cache.MarkFaultWindow(start, window);
     }
     buffer_cache.InvalidateWriteFault(addr, 8);
-    texture_cache.InvalidateMemory(addr, 8);
+    texture_cache.InvalidateMemory(addr, 8, VideoCore::TextureMemory::Invalidation::AddressFault);
     if (window_mapped && !first) {
         buffer_cache.MarkFaultWindow(start, window);
     }
@@ -13324,7 +13870,7 @@ void Rasterizer::VerifyWriteFault(VAddr addr, VAddr start, u64 window, bool wind
     const u64 updates = VideoCore::PageManager::WatcherUpdates();
     buffer_cache.InvalidateWriteFault(addr, 8);
     const u64 own_changes = VideoCore::PageManager::WatcherUpdates() - updates; // this thread's
-    texture_cache.InvalidateMemory(addr, 8);
+    texture_cache.InvalidateMemory(addr, 8, VideoCore::TextureMemory::Invalidation::AddressFault);
     if (window_mapped && !first) {
         buffer_cache.MarkFaultWindow(start, window, &counts);
     }
@@ -13653,6 +14199,10 @@ void Rasterizer::UpdateViewportScissorState(const GraphicsPipeline* pipeline,
                                 {u32(std::max(0, s32(std::ceil(r / vr_scene_inverse[0])) - left)),
                                  u32(std::max(0, s32(std::ceil(b / vr_scene_inverse[1])) - top))}});
             continue;
+        }
+        if (drs.scissor_key) {
+            S1Drs::ClipAxis(vp_scsr.top_left_x, vp_scsr.bottom_right_x, drs.width, drs.inset_x);
+            S1Drs::ClipAxis(vp_scsr.top_left_y, vp_scsr.bottom_right_y, drs.height, drs.inset_y);
         }
         const s32 left = s32(std::floor(vp_scsr.top_left_x / vr_scene_inverse[0]));
         const s32 top = s32(std::floor(vp_scsr.top_left_y / vr_scene_inverse[1]));

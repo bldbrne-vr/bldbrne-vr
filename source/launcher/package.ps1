@@ -53,6 +53,8 @@ Copy-Item -LiteralPath $launcher -Destination (Join-Path $payload 'Bldbrne-VR.ex
 Copy-Item -LiteralPath (Join-Path $runtime 'shadps4.exe') -Destination (Join-Path $payload 'runtime/shadps4.exe')
 Get-ChildItem -LiteralPath $runtime -Filter '*.dll' -File | Copy-Item -Destination (Join-Path $payload 'runtime')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'bbvr_patch.xml') -Destination (Join-Path $payload 'runtime/bbvr_patch.xml')
+. (Join-Path $PSScriptRoot 'weapon_voice_package.ps1')
+$voiceRecordings = @(Copy-WeaponVoiceRecordings (Join-Path $repo 'assets/voice') (Join-Path $payload 'runtime/voice'))
 # The startup shader build's lists, when the runtime has them:
 # shader_list (the game's) and shader_list_dlc (The Old Hunters', read only when the add-on is
 # installed), each records.bin and keys/<g|c>_0x<hash>.key, nothing else. They hold no game code;
@@ -160,6 +162,9 @@ if (Test-Path -LiteralPath $dlssPayload) {
     if (!(Select-String -LiteralPath (Join-Path $dlssPayload 'vr_dlss_stereo.dll') -Pattern 'VrDlssSetNeuralRuntime' -SimpleMatch -Quiet)) {
         throw 'The DLSS bridge cannot take the player''s DLSS 5 file (no VrDlssSetNeuralRuntime): build it with VR_DLSSNR_CHAIN=ON.'
     }
+    if (!(Select-String -LiteralPath (Join-Path $dlssPayload 'vr_dlss_stereo.dll') -Pattern 'VrDlssSetInputReductionPercent' -SimpleMatch -Quiet)) {
+        throw 'Rebuild vr_dlss_stereo.dll from this checkout to include dynamic input resolution.'
+    }
     if (Test-Path -LiteralPath (Join-Path $runtime 'dlss/nvngx_dlssnr.dll')) {
         Write-Warning 'nvngx_dlssnr.dll (DLSS 5) is in the source folder; it is not packaged.'
     }
@@ -180,6 +185,7 @@ foreach ($file in @('LICENSE','NOTICE.md','CREDITS.md')) {
 }
 Copy-Item -LiteralPath (Join-Path $repo 'LICENSES') -Destination $payload -Recurse
 $licenses = Join-Path $payload 'LICENSES'
+Copy-Item -LiteralPath (Join-Path $repo 'externals/miniz/LICENSE') -Destination (Join-Path $licenses 'miniz.txt')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'assets/controllers/README.md') `
     -Destination (Join-Path $licenses 'Launcher-controller-art.md')
 if ($BenchmarkDirectory) {
@@ -245,6 +251,9 @@ if ($ReleaseNotes) { $arguments += @('--releaseNotes',(Resolve-Path -LiteralPath
 if ($SignParameters) { $arguments += @('--signParams',$SignParameters) }
 & $vpk @arguments
 if ($LASTEXITCODE) { throw "Packaging failed with exit code $LASTEXITCODE" }
+$fullPackage = @(Get-ChildItem -LiteralPath $output -File -Filter '*-full.nupkg')
+if ($fullPackage.Count -ne 1) { throw 'Expected one full package to verify the weapon recordings.' }
+Assert-PackagedWeaponVoices $fullPackage[0].FullName $voiceRecordings
 Remove-Item -LiteralPath $work -Recurse -Force # the staging copy (it used to stay behind)
 Get-ChildItem -LiteralPath $output -File | Select-Object Name,Length
 

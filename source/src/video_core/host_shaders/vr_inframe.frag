@@ -2015,6 +2015,25 @@ void ShadeItem() {
         out_cover = vec4(0); // celestial background, never part of the DIBR hand mask
         return;
     }
+    // The Blacksky Eye's mark (core/vr/blacksky_mark.h): a faint cold mote where its meteor would
+    // land, on a Quad facing the eye; uv.y its strength (its flicker in it), uv.z its brightness
+    // after the core's cap (BlackskyMark::Brightness; 0: full). Light only: added to the scene,
+    // covering almost nothing, never part of the hand mask; a faint dark rim round it (the only
+    // cover) so it reads on pale things too (the Messengers' skin, fog, lit stone). The glow and
+    // the rim 16% tighter than the core's quad since 2026-11-26 (were .50, and .42 / .10; the user,
+    // of the pale-ground picture: "kinda big, can we make those a tiny bit smaller").
+    if(shade==ShadeUnlit && dd.uv.x==-2120.0) {
+        const vec2 q=in_local.xy*2.0;
+        const float r2=dot(q,q),r=sqrt(r2);
+        const float edge=1.0-smoothstep(.75,1.0,r); // round to nothing before the quad's sides
+        const float lit=dd.uv.z>0.0?dd.uv.z:1.0;
+        const float core=exp(-r2/(.18*.18)),halo=exp(-r2/(.42*.42))*.30;
+        const float a=clamp((core+halo)*dd.uv.y,0.,1.)*edge*lit;
+        const float rim=exp(-(r-.36)*(r-.36)/(.085*.085))*.32*clamp(dd.uv.y,0.,1.)*edge*lit;
+        if(a+rim<.004)discard;
+        const vec3 rgb=mix(vec3(.50,.40,1.),vec3(.93,.90,1.),core/(core+halo+1e-4));
+        out_color=vec4(rgb*a+vec3(.03,.01,.06)*rim,a*.2+rim);out_cover=vec4(0);return;
+    }
     if(shade==ShadeUnlit && dd.uv.x==-2070.0) {
         vec4 bolt=BoltShade(in_local,dd.uv.y,dd.uv.w);
         if(bolt.a<.03)discard;
@@ -2030,11 +2049,19 @@ void ShadeItem() {
     // .. 1 the tip (< 0 none), the sheen's strength, the band's); color.xyz / emissive.xyz = the
     // blade's guard and tip in the model's frame (in_local's); color.w 1: tests
     // (VR_BLADE_SHINE_DEBUG), the whole model magenta. A wet glint on steel, never a glow round it.
-    if(shade==ShadeUnlit && dd.uv.x==-2091.0) {
+    if(shade==ShadeUnlit && dd.uv.x<=-2091.0 && dd.uv.x>=-2094.0) {
+        const bool clipped = dd.uv.x <= -2093.0;
+        if (clipped) {
+            const int bits = floatBitsToInt(dd.color.z);
+            const vec3 normal = vec3(bitfieldExtract(bits,0,10),bitfieldExtract(bits,10,10),
+                                     bitfieldExtract(bits,20,10));
+            if (dot(normal,in_local)+dd.color.x < 0.) discard;
+        }
         if(dd.color.w>.5){out_color=vec4(.5,0.,.5,.5);out_cover=vec4(.5);return;}
-        const vec3 base=dd.color.xyz,ax=dd.emissive.xyz-base;
-        const float len2=max(dot(ax,ax),1e-6);
-        const float u=dot(in_local-base,ax)/len2;          // 0 the guard .. 1 the tip
+        const vec3 ax=clipped?dd.emissive.xyz:dd.emissive.xyz-dd.color.xyz;
+        const float axis2=max(dot(ax,ax),1e-6);
+        const float len2=clipped?1./axis2:axis2;
+        const float u=clipped?dot(in_local,ax)+dd.color.y:dot(in_local-dd.color.xyz,ax)/len2;          // 0 the guard .. 1 the tip
         // Only the steel's span, and only its faces toward the eye (the normals point out,
         // core/vr/blade_shine_mesh.h): the far side, within the depth pull where the steel is thin,
         // would add its light through the edge.
@@ -2051,6 +2078,33 @@ void ShadeItem() {
         const float spec=pow(nh,48.)*1.1+pow(nh,8.)*.12;
         const float rim=pow(1.-max(dot(n,v),0.),3.)*.22;
         const float steel=smoothstep(-.03,.06,u)*(1.-smoothstep(1.02,1.08,u));
+        // uv.x -2092: the Chikage's scabbard left blood on it (core/vr/chikage.h BloodCoat, its
+        // strength in uv.z): a wet, dark coat over the steel, in streaks along it, catching the
+        // same light. A coat on the blade's own surface, never a glow.
+        if(dd.uv.x==-2092.0 || dd.uv.x==-2093.0) {
+            // (uv.w: where the blade begins along the line; the guard and the hilt stay clean.)
+            const float streak=.72+.28*sin(u*41.+sin(u*13.)*2.5);
+            // The draw's glint (emissive.w its strength, uv.y its place, chikage.h BloodFlash):
+            // fresh blood catching the light, never a light of its own (2026-11-20:
+            // "too blinding"; "dimmer and a little smaller"): a thin wet highlight on the steel's
+            // edges as the eye sees them, running from mid-blade to the tip, and a small bead
+            // there as it ends; as bright as the scene's light lets it be.
+            const float flash=clamp(dd.emissive.w,0.,1.);
+            const float rel=clamp((u-dd.uv.w)/max(1.-dd.uv.w,1e-3),0.,1.);
+            const float front=mix(.5,1.,clamp(dd.uv.y,0.,1.));
+            const float sweep=flash>0.?exp(-(rel-front)*(rel-front)/(.05*.05)):0.;
+            const float edge=pow(1.-max(dot(n,v),0.),6.);
+            const float bead=flash*smoothstep(.85,1.,dd.uv.y)*exp(-(rel-1.)*(rel-1.)/(.025*.025));
+            const float glint=flash*sweep*(edge*.8+pow(nh,96.)*.6)+bead*.5;
+            const float cover=clamp(dd.uv.z*steel*streak*.9,0.,.88)*smoothstep(dd.uv.w,dd.uv.w+.02,u);
+            if(cover<.01)discard;
+            float blood_luma;
+            SceneLight(blood_luma);
+            const float lit=mix(.4,1.,clamp(blood_luma*4.,0.,1.))*dd.extra.y;
+            const vec3 wet=vec3(.12,.005,.009)*(.30+.70*max(dot(n,l),0.))+vec3(1.,.45,.40)*spec*.24+
+                           vec3(1.,.55,.50)*glint*.35;
+            out_color=vec4(wet*lit*cover,cover);out_cover=vec4(cover);return;
+        }
         float light=(spec+rim+.05)*dd.uv.z*steel;
         if(dd.uv.y>-.5) {
             const float d=(u-dd.uv.y)*sqrt(len2);           // metres along from the band

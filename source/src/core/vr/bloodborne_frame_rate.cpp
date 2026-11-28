@@ -174,7 +174,9 @@ void CutsceneFileOpened(std::string_view path) {
         LOG_WARNING(Core, "Cutscene FPS: scene {} requested but event state unavailable; "
                           "leaving requested FPS unchanged", id);
     }
-    g_cutscene_hold.Open(id, playing.value_or(false), CutsceneNowNs());
+    const u32 map = id == CutsceneFrameLimit::Rom
+                        ? GameArea::Slot().load(std::memory_order_relaxed) : 0;
+    g_cutscene_hold.Open(id, playing.value_or(false), CutsceneNowNs(), map);
     PublishCutsceneHold(previous, "inactive or unavailable event");
 }
 
@@ -188,11 +190,11 @@ void CutsceneFrameTick() {
         return;
     }
     const u32 previous = g_cutscene_hold.scene;
-    const auto playing = CutsceneFlag();
-    const s64 now = CutsceneNowNs();
-    g_cutscene_hold.Tick(playing, now);
-    PublishCutsceneHold(previous, !playing ? "event state unavailable" :
-        !*playing ? "event ended/skipped" : "safety timeout");
+    const auto playing = g_cutscene_hold.awaiting_rom_arrival ? std::nullopt : CutsceneFlag();
+    const u32 map = previous == CutsceneFrameLimit::Rom
+                        ? GameArea::Slot().load(std::memory_order_relaxed) : 0;
+    const char* reason = g_cutscene_hold.Tick(playing, CutsceneNowNs(), map);
+    PublishCutsceneHold(previous, reason);
 }
 
 void InstallCutsceneFrameLimit() {

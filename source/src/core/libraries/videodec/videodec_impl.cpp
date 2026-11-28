@@ -95,7 +95,12 @@ s32 VdecDecoder::Decode(const OrbisVideodecInputData& pInputDataIn,
         frame = nv12_frame;
     }
 
-    CopyNV12Data((u8*)pFrameBufferInOut.pFrameBuffer, *frame);
+    if (!CopyNV12Data(static_cast<u8*>(pFrameBufferInOut.pFrameBuffer),
+                      pFrameBufferInOut.frameBufferSize, *frame)) {
+        av_packet_free(&packet);
+        av_frame_free(&frame);
+        return ORBIS_VIDEODEC_ERROR_FRAME_BUFFER_SIZE;
+    }
 
     const auto width = Common::AlignUp<u32>(frame->width, 16);
     const auto pitch = Common::AlignUp<u32>(frame->width, 64);
@@ -164,7 +169,11 @@ s32 VdecDecoder::Flush(OrbisVideodecFrameBuffer& pFrameBufferInOut,
         frame = nv12_frame;
     }
 
-    CopyNV12Data((u8*)pFrameBufferInOut.pFrameBuffer, *frame);
+    if (!CopyNV12Data(static_cast<u8*>(pFrameBufferInOut.pFrameBuffer),
+                      pFrameBufferInOut.frameBufferSize, *frame)) {
+        av_frame_free(&frame);
+        return ORBIS_VIDEODEC_ERROR_FRAME_BUFFER_SIZE;
+    }
 
     const auto width = Common::AlignUp<u32>(frame->width, 16);
     const auto pitch = Common::AlignUp<u32>(frame->width, 64);

@@ -63,6 +63,9 @@ public:
         ready.notify_one();
         thread.join(); // All atomics/ring storage must outlive the worker.
     }
+#ifdef _WIN32
+    auto NativeThread() { return thread.native_handle(); }
+#endif
     enum Reason : u32 {
         Opcode = 0,
         Selection,

@@ -725,7 +725,7 @@ int main(int argc, char **argv) {
             original_profile.saves = "untouched-saves";
             original_profile.Save(apply_paths);
             const std::string original_ini =
-                "custom_setting=keep\nrefresh_hz=90\ndibr_eye_taa=0\nupscale_focus=3\n";
+                "custom_setting=keep\nrefresh_hz=90\ndibr_eye_taa=0\nupscale_focus=3\ndynamic_resolution=1\n";
             Write(apply_paths.Ini(), original_ini);
             auto focused = candidates[1];
             focused.upscale_focus = ScanFoveatedUpscale;
@@ -737,21 +737,145 @@ int main(int argc, char **argv) {
                           GraphicsText(focused.graphics) &&
                       VR::Ini::ValueOf(applied_ini, "dlss_model") == "builtin" &&
                       VR::Ini::ValueOf(applied_ini, "refresh_hz") == "120" &&
-                      VR::Ini::ValueOf(applied_ini, "aa_mode") == "smaa",
-                  "apply persists measured DLSS, 120 Hz and SMAA (the AA the scan measured)");
+                      !VR::Ini::ValueOf(applied_ini, "aa_mode"),
+                  "apply persists measured DLSS and 120 Hz, and leaves the player's anti-aliasing");
             Check(VR::Ini::ValueOf(applied_ini, "upscale_focus") == "2" &&
                       ToJson(Summarize(focused, {}, 120)).at("upscale_focus") == 2,
                   "native recommendations record and apply the measured Medium preset");
             Check(applied.game == original_profile.game &&
                       applied.saves == original_profile.saves &&
                       VR::Ini::ValueOf(applied_ini, "custom_setting") == "keep" &&
+                      VR::Ini::ValueOf(applied_ini, "dynamic_resolution") == "1" &&
                       VR::Ini::ValueOf(applied_ini, "dibr_eye_taa") == "0",
                   "native apply preserves unrelated settings and DIBR TAA");
+            // The scan window (2026-11-25, the user: after Apply it only asked to apply again): a
+            // suggestion is in use once the saved settings hold it, and its list names each setting
+            // as the launcher does, with what it was before.
+            Check(!SettingsInUse(original_profile, original_ini, focused, 120) &&
+                      SettingsInUse(applied, applied_ini, focused, 120) &&
+                      SettingsInUse(applied, applied_ini + "custom_other=1\n", focused, 120) &&
+                      SettingsInUse(applied,
+                                    VR::Ini::ApplyEdits(applied_ini, {{"aa_mode", "fxaa"},
+                                                                      {"light_shadow_detail", "high"},
+                                                                      {"dibr_eye_taa", "0.5"}}),
+                                    focused, 120),
+                  "a suggestion is in use once applied, whatever unrelated or picture lines say");
+            for (const VR::Ini::Edit &change :
+                 {VR::Ini::Edit{"upscale_focus", "1"}, VR::Ini::Edit{"dlss_model", "K"},
+                  VR::Ini::Edit{"refresh_hz", "90"},
+                  VR::Ini::Edit{"graphics_config", GraphicsText(candidates[0].graphics)}})
+                Check(!SettingsInUse(applied, VR::Ini::ApplyEdits(applied_ini, {change}), focused, 120),
+                      "a setting the scan set, changed again, is no longer in use");
+            {
+                auto following = applied;
+                following.follow_headset = true;
+                auto simplified = applied;
+                simplified.stereo = StereoChoice::Dibr;
+                Check(!SettingsInUse(following, applied_ini, focused, 120) &&
+                          !SettingsInUse(simplified, applied_ini, focused, 120) &&
+                          !SettingsInUse(applied, applied_ini, focused, 90),
+                      "another stereo or frame-rate cap is no longer in use");
+            }
+            Check(SettingsInUse(applied,
+                                VR::Ini::ApplyEdits(applied_ini, {{"upscale_focus", std::nullopt},
+                                                                  {"dlss_model", std::nullopt},
+                                                                  {"aa_mode", std::nullopt},
+                                                                  {"refresh_hz", "120.0"}}),
+                                focused, 120),
+                  "lines the file lacks are the game's defaults, and numbers match as numbers");
+            const auto row = [](const std::vector<AppliedSetting> &rows, std::string_view name) {
+                for (const auto &r : rows)
+                    if (r.name == name)
+                        return r;
+                return AppliedSetting{"", "absent", "absent"};
+            };
+            const auto listed = AppliedSettings(original_profile, original_ini, focused, 120);
+            Check(row(listed, "Stereo rendering").value == "Native stereo" &&
+                      row(listed, "Stereo rendering").before == "Auto" &&
+                      row(listed, "Upscaler").value == "DLSS Quality" &&
+                      row(listed, "Upscaler").before == "Off" &&
+                      row(listed, "Output scale").value == "100%" &&
+                      row(listed, "Output scale").before.empty() &&
+                      row(listed, "Foveated upscale").value == "Medium" &&
+                      row(listed, "Foveated upscale").before == "Performance" &&
+                      row(listed, "Game frame-rate cap").value == "120 FPS" &&
+                      row(listed, "Game frame-rate cap").before == "Follow headset",
+                  "the applied list names each setting, its value, and what changed");
+            Check(listed.size() == 5 && row(listed, "DLSS model").name.empty() &&
+                      row(listed, "DLSS 5").name.empty(),
+                  "an unpinned model and an unused DLSS 5 are not listed, nor any picture setting");
+            bool unchanged = true;
+            for (const auto &r : AppliedSettings(applied, applied_ini, focused, 120))
+                unchanged &= r.before.empty();
+            Check(unchanged, "settings that already hold the suggestion list nothing as changed");
+            {
+                auto dlss5 = focused.graphics;
+                dlss5[5] = 1;
+                const auto was = VR::Ini::ApplyEdits(applied_ini, {{"graphics_config", GraphicsText(dlss5)},
+                                                                   {"dlss_model", "K"}});
+                const auto rows = AppliedSettings(applied, was, focused, 120);
+                Check(row(rows, "DLSS 5").value == "Off" && row(rows, "DLSS 5").before == "On" &&
+                          row(rows, "Upscaler").before.empty() &&
+                          row(rows, "DLSS model").value == "The preset's own" &&
+                          row(rows, "DLSS model").before == "K",
+                      "turning DLSS 5 off and a pinned model's replacement are listed");
+                const auto native = AppliedSettings(applied, applied_ini, candidates[0], 120);
+                Check(row(native, "Upscaler").value == "Off" &&
+                          row(native, "Upscaler").before == "DLSS Quality" &&
+                          row(native, "Anti-aliasing").name.empty(),
+                      "without an upscaler, the player's own anti-aliasing stays theirs, unlisted");
+            }
+            const auto to_dibr = AppliedSettings(applied, applied_ini, candidates[7], 90);
+            Check(row(to_dibr, "Stereo rendering").value == "Simplified Rendering" &&
+                      row(to_dibr, "Stereo rendering").before == "Native stereo" &&
+                      row(to_dibr, "Foveated upscale").name.empty() &&
+                      row(to_dibr, "Eye TAA").name.empty() &&
+                      row(to_dibr, "Game frame-rate cap").before == "120 FPS",
+                  "a Simplified Rendering suggestion lists neither the native-only upscale nor eye TAA");
             const auto dibr = ApplySettings(apply_paths, applied, candidates[7], 90, applied_ini);
             Check(dibr.stereo == StereoChoice::Dibr && dibr.refresh_hz == 90 &&
-                      VR::Ini::ValueOf(Read(apply_paths.Ini()), "dibr_eye_taa") == "0.25" &&
+                      VR::Ini::ValueOf(Read(apply_paths.Ini()), "dibr_eye_taa") == "0" &&
                       VR::Ini::ValueOf(Read(apply_paths.Ini()), "upscale_focus") == "2",
-                  "DIBR apply persists measured TAA and keeps the native-only preset");
+                  "DIBR apply keeps the player's eye TAA and the native-only preset");
+            // A scan measures with the player's own picture settings (2026-11-25, the user: "for
+            // smaller settings like shadows, ao, etc - we should use what the launcher already
+            // has"): the Picture tab's, the launcher's Graphics rows' and the new graphics' without
+            // a row; never what the scan sets or holds still, nor the player's other settings.
+            {
+                const std::string player =
+                    "light_shadows=1\nlight_shadow_detail=high\nfog_banks=0\nmoon_shafts=1\n"
+                    "ambient_occlusion=1\nbounce_light=0\nwater_reflections=1\nwet_streets=0\n"
+                    "fog_light=0\nmoon_shafts_quality=0\naa_mode=fxaa\nlod_bias=-1\nfoveation=2\n"
+                    "shadows_far=reduced\ncanted_eyes=0\ndibr_eye_taa=0\n"
+                    "graphics_config=1,10,1,2,2,0,1,100,80,85\nupscale_focus=3\ndynamic_resolution=1\n"
+                    "dlss_model=K\nrefresh_hz=120\nframe_cap=auto\ngame_fps=120\nframe_hooks=0\n"
+                    "body_mode=no_head\nsnap_turn_deg=45\nleft_handed=1\nmove_with=right\n";
+                const auto picture = PictureSettings(player);
+                const auto has = [&](const char *key, const char *value) {
+                    return std::find(picture.begin(), picture.end(),
+                                     std::pair<std::string, std::string>{key, value}) != picture.end();
+                };
+                const auto mentions = [&](const char *key) {
+                    return std::any_of(picture.begin(), picture.end(),
+                                       [&](const auto &line) { return line.first == key; });
+                };
+                Check(has("light_shadows", "1") && has("light_shadow_detail", "high") &&
+                          has("fog_banks", "0") && has("moon_shafts", "1") &&
+                          has("ambient_occlusion", "1") && has("bounce_light", "0") &&
+                          has("water_reflections", "1") && has("wet_streets", "0") &&
+                          has("fog_light", "0") && has("moon_shafts_quality", "0") &&
+                          has("aa_mode", "fxaa") && has("lod_bias", "-1") && has("foveation", "2") &&
+                          has("shadows_far", "reduced") && has("canted_eyes", "0") &&
+                          has("dibr_eye_taa", "0"),
+                      "a scan carries the player's shadows, fog, AO, reflections, AA, detail and foveation");
+                for (const char *key : {"graphics_config", "upscale_focus", "dynamic_resolution",
+                                        "dlss_model", "refresh_hz", "frame_cap", "game_fps",
+                                        "frame_hooks", "body_mode", "snap_turn_deg", "left_handed",
+                                        "move_with"})
+                    Check(!mentions(key), "never what the scan sets or holds still, nor play settings");
+                Check(PictureSettings("").empty() && PictureSettings("custom_setting=keep\n").empty(),
+                      "a picture line the file lacks stays the game's default");
+            }
             const auto before_conflict = Read(apply_paths.Profile());
             const auto actual_ini = Read(apply_paths.Ini());
             Throws([&] { ApplySettings(apply_paths, dibr, candidates[0], 120, original_ini); },

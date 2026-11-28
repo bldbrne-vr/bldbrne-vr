@@ -24,6 +24,8 @@
 #include "core/vr/combat_channel.h"
 #include "core/vr/evasion.h"
 #include "core/vr/evasion_hitgeom.h"
+#include "core/vr/fog_impulse.h"
+#include "core/vr/game_area.h"
 #include "core/vr/head_room.h"
 #include "core/vr/visceral_clearance.h"
 #include "core/vr/hook_util.h"
@@ -1230,6 +1232,14 @@ void PS4_SYSV_ABI OnAttackCast(u8* frame, u8* owner_ragdoll, u8* wrapper) {
     c.r = r;
     c.len = std::sqrt(E::Dot(b - a, b - a));
     c.travel = std::sqrt(E::Dot(sweep, sweep));
+    // Reuse this existing near-player cast only. Spheres include projectiles.
+    if (vtable == g_base + CapsuleVtableRva && c.len >= 0.22f && FogImpulse::combat.Ready(now)) {
+        const auto puff = FogImpulse::Sweep({a.x, a.y, a.z}, {b.x, b.y, b.z},
+                                           {sweep.x, sweep.y, sweep.z});
+        if (FogImpulse::GroundStrength(puff, {root[0], root[1], root[2]}) > 0.01f) {
+            FogImpulse::combat.Publish(now, GameArea::Slot().load(std::memory_order_relaxed), puff);
+        }
+    }
     c.v_known = have_base;
     c.history_age = have_base ? now - base.ns : 0;
     c.head = base.head;

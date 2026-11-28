@@ -520,6 +520,9 @@ public:
     bool HasFoveation4x4() const {
         return foveation_4x4;
     }
+    bool UseReflection2x1() const {
+        return reflection_2x1;
+    }
     /// Coarse shading is allowed for fragment shaders that write depth/stencil (else such
     /// pipelines ignore the rate map).
     bool FoveationWithShaderDepth() const {
@@ -659,6 +662,7 @@ private:
     vk::Extent2D foveation_texel{};
     bool foveation_layered{};
     bool foveation_4x4{};
+    bool reflection_2x1{};
     bool foveation_shader_depth{};
     bool foveation_shader_mask{};
     bool supports_memory_budget{};

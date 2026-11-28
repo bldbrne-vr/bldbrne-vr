@@ -238,6 +238,11 @@ bool UniqueImage::TryCreate(const vk::ImageCreateInfo& image_ci, std::source_loc
 Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
              BlitHelper& blit_helper_, Common::SlotVector<ImageView>& slot_image_views_,
              const ImageInfo& info_)
+    : Image(instance_, scheduler_, blit_helper_, slot_image_views_, info_, 0) {}
+
+Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
+             BlitHelper& blit_helper_, Common::SlotVector<ImageView>& slot_image_views_,
+             const ImageInfo& info_, u32 capacity)
     : instance{&instance_}, scheduler{&scheduler_}, blit_helper{&blit_helper_},
       slot_image_views{&slot_image_views_}, info{info_} {
     if (info.pixel_format == vk::Format::eUndefined) {
@@ -313,6 +318,19 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
     backing->num_samples = info.num_samples;
     backing->image = UniqueImage{instance->GetDevice(), instance->GetAllocator()};
     backing->image.image_ci = image_ci;
+    if (capacity > image_ci.mipLevels && native_stereo &&
+        image_format_properties.result == vk::Result::eSuccess &&
+        capacity <= image_format_properties.value.imageFormatProperties.maxMipLevels) {
+        auto reserved = image_ci;
+        reserved.mipLevels = capacity;
+        const auto requirements = [&](const vk::ImageCreateInfo& ci) {
+            return instance->GetDevice().getImageMemoryRequirements(
+                vk::DeviceImageMemoryRequirements{.pCreateInfo = &ci}).memoryRequirements;
+        };
+        if (requirements(reserved) == requirements(image_ci)) {
+            backing->image.image_ci = reserved;
+        }
+    }
     // Failure injection is cache-only and happens once per image, never on its retry.
     static const u32 fail_every = [] {
         const char* value = std::getenv("VR_TEST_IMAGE_OOM_EVERY");
@@ -328,6 +346,10 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
 
 bool Image::RetryAllocation() {
     allocation_failed = !backing->image.TryCreate(backing->image.image_ci);
+    if (allocation_failed && backing->image.image_ci.mipLevels > info.resources.levels) {
+        backing->image.image_ci.mipLevels = info.resources.levels;
+        allocation_failed = !backing->image.TryCreate(backing->image.image_ci);
+    }
     if (allocation_failed) {
         return false;
     }
@@ -497,7 +519,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
             .subresourceRange{
                 .aspectMask = aspect_mask,
                 .baseMipLevel = 0,
-                .levelCount = VK_REMAINING_MIP_LEVELS,
+                .levelCount = info.resources.levels,
                 .baseArrayLayer = 0,
                 .layerCount = VK_REMAINING_ARRAY_LAYERS,
             },

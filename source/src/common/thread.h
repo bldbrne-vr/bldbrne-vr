@@ -42,6 +42,12 @@ void SetThreadName(void* thread, const char* name);
 bool AccurateSleep(std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    bool interruptible);
 
+/// Sleeps until `deadline` with sub-millisecond accuracy whatever the process's timer resolution:
+/// on Windows a high-resolution waitable timer (one per thread) to `spin` before it, then a spin;
+/// elsewhere sleep_until. (2026-11-21: a plain sleep here can overshoot by a 15.6 ms timer tick.)
+void PreciseSleepUntil(std::chrono::steady_clock::time_point deadline,
+                       std::chrono::nanoseconds spin = std::chrono::microseconds(300));
+
 class AccurateTimer {
     std::chrono::nanoseconds target_interval{};
     std::chrono::nanoseconds total_wait{};

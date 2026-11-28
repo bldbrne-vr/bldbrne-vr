@@ -180,6 +180,8 @@ public:
         std::array<vk::Extent2D, 2> extent{};
         std::array<vk::ImageLayout, 2> layout{vk::ImageLayout::eUndefined,
                                               vk::ImageLayout::eUndefined};
+        // The images' own format: R8G8B8A8_UNORM, or the headset's (SetEyeFormat).
+        std::array<vk::Format, 2> format{vk::Format::eUndefined, vk::Format::eUndefined};
     };
 
     /// The late warp's source: one frame's capture in its slot (valid until the slot is written
@@ -323,6 +325,14 @@ public:
     /// (Re)creates `images` with the given per-eye extents (no-op when unchanged).
     void EnsureEyeImages(EyeImages& images, vk::Extent2D left, vk::Extent2D right);
 
+    /// Left-handed play (core/vr/mirror_world.h): the eye images made in the headset's own
+    /// format (`typed`, an 8-bit sRGB swapchain format), read and written through their
+    /// R8G8B8A8_UNORM views as always, so the copy into the headset can be one exact mirrored blit
+    /// of the same format. vk::Format::eUndefined (right-handed play): R8G8B8A8_UNORM, as always.
+    void SetEyeFormat(vk::Format typed) {
+        eye_format = typed;
+    }
+
     /// The depth the last Warp() wrote with Settings::depth: one float per eye pixel, rows of the
     /// eye's crop width, eye `e` from DepthOffset(e) bytes. Written in the draw stream; read it in
     /// the same command stream after the warp (it is overwritten by the next frame's).
@@ -348,6 +358,8 @@ public:
     GpuTimes TakeGpuTimes();
 
 private:
+    vk::Format eye_format{vk::Format::eUndefined}; // SetEyeFormat (left-handed play)
+
     struct OwnedImage {
         OwnedImage() = default;
 

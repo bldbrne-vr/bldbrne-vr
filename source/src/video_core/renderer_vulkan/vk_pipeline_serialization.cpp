@@ -80,10 +80,33 @@ static u32 ShaderBinaryVersionOf(const Shader::RuntimeInfo& runtime_info) {
     // without them (correct, but no variant could share anything) nor the other way round.
     const bool eye_spec = Shader::EyeSpec::Enabled() && runtime_info.native_stereo &&
                           runtime_info.stage != Shader::Stage::Compute;
+    // Both sides of the mask change together. AO bit 16 also denotes a reflection
+    // composite, so require the AO bit as well before treating it as a mask writer.
+    constexpr u8 lamp_mask = Shader::RuntimeInfo::VrAmbientOcclusionBit |
+                             Shader::RuntimeInfo::VrAoLampShadows;
+    const bool adaptive_lamp = fragment &&
+        (runtime_info.vr_light_shadows != 0 ||
+         (runtime_info.vr_ambient_occlusion & lamp_mask) == lamp_mask) &&
+        Shader::Optimization::LightShadow::SceneMaps::Edges();
+    // VR_SHADOW_EDGE_PASS=0 (tests): the lamp shaders march their edges themselves, another
+    // program with other buffers; kept apart from the edge pass's (the default's word unchanged:
+    // a code review, 2026-11-20).
+    const bool edges_in_shader = adaptive_lamp && !Shader::Optimization::LightShadow::SceneMaps::EdgePass();
+    LampBinary lamp = LampBinary::None;
+    if (adaptive_lamp) {
+        constexpr u8 high = Shader::Optimization::LightShadow::Level(true, 2);
+        lamp = LampBinary::Adaptive;
+        if (!edges_in_shader && runtime_info.vr_light_shadows != 0) {
+            lamp = runtime_info.vr_light_shadows == high ? LampBinary::FiveLampPass
+                                                         : LampBinary::MaskConsumer;
+        }
+    }
+    const bool fog_composite = fragment && (runtime_info.vr_composite_light & Shader::RuntimeInfo::VrCompositeFog);
     // VR_EXP_EYE_INDEX / VR_EXP_CULL: every module of such a session is kept apart.
     return ShaderBinaryVersion(
-               ScopeOf(epilogue, fragment, fragment ? runtime_info.fs_info.vr_cut : 0u)) ^
-           (eye_spec ? 0x8000'0000u : 0u) ^ Shader::EyeSpec::ExperimentWord();
+               ScopeOf(epilogue, fragment, fragment ? runtime_info.fs_info.vr_cut : 0u), lamp, fog_composite) ^
+           (eye_spec ? 0x8000'0000u : 0u) ^ (edges_in_shader ? 0x2000'0000u : 0u) ^
+           Shader::EyeSpec::ExperimentWord();
 }
 
 // A permutation index past this is a corrupted meta (a program has a handful of permutations).
@@ -664,9 +687,8 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
     // A permutation of the game's AO pass made with ours, in a session without it; a mask-only one
     // (ambient_occlusion.h MaskOnly) in a session that is not.
     if (const u8 ao = spec.runtime_info.vr_ambient_occlusion; ao & Shader::RuntimeInfo::VrAmbientOcclusionBit) {
-        const bool upscaler = VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off;
         const bool ours = Shader::Optimization::AmbientOcclusion::Enabled(
-            VR::IsEnabled(), VR::GetSettings().ambient_occlusion, upscaler,
+            VR::IsEnabled(), VR::GetSettings().ambient_occlusion,
             std::getenv("VR_AMBIENT_OCCLUSION"));
         const bool mask_only = Shader::Optimization::AmbientOcclusion::MaskOnly(
             ours, VrLampShadowsOn(), Shader::Optimization::LightShadow::SceneMaps::Mask());
@@ -674,7 +696,9 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
         // in a session that is the other way.
         const bool lamps = Shader::Optimization::LightShadow::SceneMaps::Enabled() && VrLampShadowsOn();
         if (((ao & Shader::RuntimeInfo::VrAoMaskOnly) ? !mask_only : !ours) ||
-            ((ao & Shader::RuntimeInfo::VrAoLampShadows) != 0) != lamps) {
+            ((ao & Shader::RuntimeInfo::VrAoLampShadows) != 0) != lamps ||
+            (lamps && (ao & (Shader::RuntimeInfo::VrAoLampLow | Shader::RuntimeInfo::VrAoLampHigh)) !=
+                          Shader::Optimization::LightShadow::AoTierBits(VrLightShadowTier()))) {
             load_other_mode = true;
         }
     }
@@ -682,16 +706,16 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
     if ((spec.runtime_info.vr_ambient_occlusion & Shader::RuntimeInfo::VrMoonShadows) &&
         !Shader::Optimization::MoonShadow::Enabled(
             VR::IsEnabled(), VR::GetSettings().moon_shadows,
-            VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
             std::getenv("VR_MOON_SHADOWS"))) {
         load_other_mode = true;
     }
-    // A permutation of the ambient composite with our specular occlusion, in a session without it.
-    if ((spec.runtime_info.vr_ambient_occlusion & Shader::RuntimeInfo::VrSpecularOcclusion) &&
+    // A permutation of the ambient composite with our specular occlusion, in a session without it
+    // (not an AO program's VrAoLampHigh, the same bit).
+    if ((spec.runtime_info.vr_ambient_occlusion & Shader::RuntimeInfo::VrAmbientOcclusionBit) == 0 &&
+        (spec.runtime_info.vr_ambient_occlusion & Shader::RuntimeInfo::VrSpecularOcclusion) &&
         !Shader::Optimization::AmbientOcclusion::SpecEnabled(
             Shader::Optimization::AmbientOcclusion::Enabled(
                 VR::IsEnabled(), VR::GetSettings().ambient_occlusion,
-                VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
                 std::getenv("VR_AMBIENT_OCCLUSION")),
             std::getenv("VR_SPEC_OCCLUSION"))) {
         load_other_mode = true;
@@ -732,17 +756,14 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
         ((composite & Shader::RuntimeInfo::VrCompositeBounce) &&
          !Shader::Optimization::BounceLight::Enabled(
              VR::IsEnabled(), VR::GetSettings().bounce_light,
-             VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
              std::getenv("VR_BOUNCE_LIGHT"))) ||
         ((composite & Shader::RuntimeInfo::VrCompositeFog) &&
          !Shader::Optimization::FogLight::Enabled(
              VR::IsEnabled(), VR::GetSettings().fog_light,
-             VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
              std::getenv("VR_FOG_LIGHT"))) ||
         ((composite & Shader::RuntimeInfo::VrCompositeShafts) &&
          !Shader::Optimization::MoonShafts::Enabled(
-             VR::IsEnabled(), VR::MoonGlowOn(VR::GetSettings()),
-             VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
+             VR::IsEnabled(), VR::MoonGlowOn(),
              std::getenv("VR_MOON_SHAFTS")))) {
         load_other_mode = true;
     }
@@ -791,7 +812,6 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
     if ((spec.runtime_info.vr_composite_light & Shader::RuntimeInfo::VrParticleAir) &&
         !Shader::Optimization::ParticleAir::Enabled(
             VR::IsEnabled(), VR::GetSettings().fog_light,
-            VR::Graphics::Accepted().upscaler != VR::Graphics::Upscaler::Off,
             std::getenv("VR_PARTICLE_AIR"))) {
         load_other_mode = true;
     }

@@ -276,10 +276,16 @@ void Presenter::RecordVrStereo(vk::CommandBuffer cmdbuf, Frame& frame, vk::Exten
     settings.debug_holes = s.dibr_debug_holes >= 1;
     settings.debug_hud = s.dibr_debug_holes >= 2;
     // The eyes' depth for the compositor's positional timewarp (submitted by RecordStereoCopy).
-    settings.depth = !tag.hold && openxr_presenter->DepthWanted();
+    // Left-handed play: the eyes' depth would go up unflipped: none (the headset reprojects the
+    // eyes by rotation alone).
+    settings.depth = !tag.hold && openxr_presenter->DepthWanted() && !VR::MirrorWorld();
     settings.depth_debug_m = s.xr_depth_debug_m;
     auto& eyes = vr_eye_images[frame.id];
     const bool bgra = swapchain_format == vk::Format::eB8G8R8A8Srgb;
+    // Left-handed play: the eyes in the headset's own format, flipped by RecordStereoCopy's blit
+    // (VrStereoWarp::SetEyeFormat). Right-handed: R8G8B8A8_UNORM, as always.
+    const bool mirror = VR::MirrorWorld();
+    vr_warp->SetEyeFormat(mirror ? swapchain_format : vk::Format::eUndefined);
     if (!vr_warp->WarpToEyeImages(cmdbuf, eyes, {crops[0].rect, crops[1].rect}, settings,
                                   vk::ImageLayout::eTransferSrcOptimal, bgra, {})) {
         ++stats.warp_failed;
@@ -293,6 +299,8 @@ void Presenter::RecordVrStereo(vk::CommandBuffer cmdbuf, Frame& frame, vk::Exten
     }
     frame.vr_eye_offset_m = VrStereo::EyeOffsetMetres(info.camera);
     frame.vr_eye_bgra = bgra;
+    frame.vr_eye_typed = mirror && eyes.format[0] == swapchain_format &&
+                         eyes.format[1] == swapchain_format;
     frame.vr_stereo = true;
     ++stats.stereo;
     if (!tag.hold) {
@@ -304,6 +312,9 @@ void Presenter::RecordVrStereo(vk::CommandBuffer cmdbuf, Frame& frame, vk::Exten
             stereo.view[i] = *eyes.view[i];
             stereo.extent[i] = frame.vr_eye_extent[i];
             stereo.crop[i] = {frame.vr_eye_fov[i], frame.vr_eye_rect[i]};
+        }
+        if (mirror && eyes.format[0] == swapchain_format && eyes.format[1] == swapchain_format) {
+            stereo.image_format = swapchain_format; // the blit's same format (MirrorBlitReady)
         }
         // vr.ini eye_upscale / eye_sharpen: the eyes enlarged (FSR 1) before the headset; not
         // with their depth (it stays at the render's pixels), and not while the late warp shows
@@ -324,6 +335,11 @@ void Presenter::RecordVrStereo(vk::CommandBuffer cmdbuf, Frame& frame, vk::Exten
                     stereo.view[i] = *vr_eye_scaled.view[i];
                     stereo.extent[i] = out[i];
                 }
+                // (Made by the same EnsureEyeImages: the headset's format in left-handed play.)
+                stereo.image_format = mirror && vr_eye_scaled.format[0] == swapchain_format &&
+                                              vr_eye_scaled.format[1] == swapchain_format
+                                          ? swapchain_format
+                                          : vk::Format::eUndefined;
             }
         }
         stereo.eye_offset_m = frame.vr_eye_offset_m;

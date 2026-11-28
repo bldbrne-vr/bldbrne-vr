@@ -1,0 +1,216 @@
+// SPDX-FileCopyrightText: 2026 BB-VR contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+#version 450
+
+// VrShadowEdges (vr_shadow_edges.h; shader_recompiler/ir/passes/light_shadow.h SceneMaps::EdgePass):
+// the lamp shadows' edges marched once a frame at the lamp draws' own size, both eyes, before the
+// first lamp draw. A thread takes four pixels of a row (one output word). For each of the frame's
+// edge lamps (up to four, in slot order: a lamp shader's rank among them), where the lamp's four
+// half-res mask neighbours differ by the edge range or more and the pixel is near enough, a short
+// ray from the pixel toward the lamp on this eye's depth picture says:
+//   1 a hit (something on the picture, thin enough to be the caster, between), 2 clear (every step
+//   on the picture and in front of what it shows; never for a lamp of his shadow), 0 neither.
+// The buffer (words): the host's parameters (ParamWords, below), the header (serial, width,
+// height, words a row), then a byte a pixel, four to a word, the left eye's rows, then the right's.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D depth_left;
+layout(binding = 1) uniform sampler2D depth_right;
+layout(std430, binding = 2) readonly buffer Mask {
+    uint mask[];
+};
+layout(std430, binding = 3) buffer Edges {
+    uint edges[];
+};
+
+// light_shadow.h SceneMaps: EdgeParamWords, EdgeHeaderAt, EdgeDataAt, MaskHeader, MaskWords.
+const uint ParamWords = 160u;
+const uint HeaderAt = ParamWords;
+const uint DataAt = HeaderAt + 4u;
+const uint MaskHeader = 4u;
+const uint MaskWords = 3u;
+// The parameters (vr_shadow_edges.cpp Params): each eye's inverse projection (ndc x, ndc y, raw
+// depth, 1 -> its view, 4 rows), its forward one (the inverse's inverse), ndc from the pixel.
+const uint InvAt = 0u, FwdAt = 32u, NdcAt = 64u;
+const uint LampsAt = 68u, StepsAt = 69u, RangeAt = 70u, FarInAt = 71u, FarOutAt = 72u;
+const uint ContrastAt = 73u, NoiseAt = 74u, CapacityAt = 75u;
+const uint LampAt = 76u, LampWords = 12u; // eye 0's place (3), eye 1's (3), k, clear, his, slot
+const uint MaxLamps = 5u;  // light_shadow.h SceneMaps::EdgeMaxLamps
+const uint TuneAt = 136u; // start, max, bias, bias a metre of the eye, bias a metre, thick, thick a metre
+// The centre the pass sharpens (the mask's full-rate zone, vr_foveation.h Map's distance): each
+// eye's axis (u, v), then the radius (0: everywhere; foveation off), then the view's share of each
+// side under dynamic resolution (Map's scale; 0 or 1: full scale), in which a pixel's place in the
+// view is measured as the rate map measures it.
+const uint FoveaAt = 144u;
+// A pixel's bits (light_shadow.h SceneMaps::EdgeBits): 8, four pixels a word, two bits for each of
+// four lamps; 16, two pixels a word, for five.
+const uint BitsAt = 150u;
+
+float P(uint i) {
+    return uintBitsToFloat(edges[i]);
+}
+// An image position's place in the view (vr_foveation.h Map): the view fills the middle `s` of
+// each side under dynamic resolution; at full scale (s 1) the position itself.
+float InView(float t, float s) {
+    return s < 1.0 ? 0.5 + (t - 0.5) / s : t;
+}
+vec4 Row(uint at, uint r) {
+    return vec4(P(at + 4u * r), P(at + 4u * r + 1u), P(at + 4u * r + 2u), P(at + 4u * r + 3u));
+}
+
+void main() {
+    const uint eye = gl_GlobalInvocationID.z;
+    const uint qx = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
+    const uint width = edges[HeaderAt + 1u], height = edges[HeaderAt + 2u], wq = edges[HeaderAt + 3u];
+    if (eye > 1u || qx >= wq || y >= height) {
+        return;
+    }
+    const uint out_at = DataAt + (eye * height + y) * wq + qx;
+    const uint bits = edges[BitsAt] == 16u ? 16u : 8u;
+    const uint per = 32u / bits;
+    // (Only in the mask's full-rate centre: beyond it the mask's blocks are coarse, and a sharp
+    // edge drawn from them is their staircase. vr_foveation.h Map's distance from the eye's axis.
+    // A word wholly outside it is left at 0 here, before any other parameter is read: most of the
+    // picture's words.)
+    const float fovea_r = P(FoveaAt + 4u);
+    const vec2 axis = vec2(P(FoveaAt + 2u * eye), P(FoveaAt + 2u * eye + 1u));
+    const float fovea_s = P(FoveaAt + 5u);
+    const float view_scale = fovea_s > 0.0 && fovea_s < 1.0 ? fovea_s : 1.0;
+    const float above = max(axis.y, 1e-3), below = max(1.0 - axis.y, 1e-3);
+    const float v_at = InView((float(y) + 0.5) / float(height), view_scale);
+    const float fovea_dy = (v_at - axis.y) / (v_at < axis.y ? above : below);
+    if (fovea_r > 0.0) {
+        const float u0 = InView((float(qx * per) + 0.5) / float(width), view_scale);
+        const float u1 = InView((float(qx * per + per - 1u) + 0.5) / float(width), view_scale);
+        const float nearest_dx = (clamp(axis.x, u0, u1) - axis.x) / 0.5;
+        if (nearest_dx * nearest_dx + fovea_dy * fovea_dy > fovea_r * fovea_r) {
+            edges[out_at] = 0u;
+            return;
+        }
+    }
+    const uint lamps = min(edges[LampsAt], bits == 16u ? MaxLamps : 4u);
+    const uint mw = mask[0], mh = mask[1], meyes = mask[2];
+    if (lamps == 0u || mw == 0u || mh == 0u || eye >= meyes || mw * mh * meyes > edges[CapacityAt]) {
+        edges[out_at] = 0u;
+        return;
+    }
+    const uint ib = InvAt + 16u * eye, fb = FwdAt + 16u * eye;
+    const vec4 i0 = Row(ib, 0u), i1 = Row(ib, 1u), i2 = Row(ib, 2u), i3 = Row(ib, 3u);
+    const vec4 f0 = Row(fb, 0u), f1 = Row(fb, 1u), f2 = Row(fb, 2u), f3 = Row(fb, 3u);
+    const vec2 na = vec2(P(NdcAt), P(NdcAt + 2u)), nb = vec2(P(NdcAt + 1u), P(NdcAt + 3u));
+    const uint steps = clamp(edges[StepsAt], 2u, 64u);
+    const float range = P(RangeAt), far_in = P(FarInAt), far_out = P(FarOutAt);
+    const float contrast = P(ContrastAt);
+    const bool noise = edges[NoiseAt] != 0u;
+    const float start_m = P(TuneAt), max_m = P(TuneAt + 1u), bias_m = P(TuneAt + 2u);
+    const float bias_eye = P(TuneAt + 3u), bias_per = P(TuneAt + 4u);
+    const float thick_m = P(TuneAt + 5u), thick_per = P(TuneAt + 6u);
+    const ivec2 last = ivec2(int(width) - 1, int(height) - 1);
+    uint word = 0u;
+    for (uint p = 0u; p < per; ++p) {
+        const uint x = qx * per + p;
+        if (x >= width) {
+            break;
+        }
+        if (fovea_r > 0.0) {
+            const float u_at = InView((float(x) + 0.5) / float(width), view_scale);
+            const float fovea_dx = (u_at - axis.x) / 0.5;
+            if (fovea_dx * fovea_dx + fovea_dy * fovea_dy > fovea_r * fovea_r) {
+                continue;
+            }
+        }
+        const float raw = eye == 0u ? texelFetch(depth_left, ivec2(x, y), 0).r
+                                    : texelFetch(depth_right, ivec2(x, y), 0).r;
+        const vec2 ndc = na * (vec2(x, y) + 0.5) + nb;
+        const vec4 h = vec4(ndc, raw, 1.0);
+        const vec4 p4 = vec4(dot(i0, h), dot(i1, h), dot(i2, h), dot(i3, h));
+        if (!(abs(p4.w) > 1e-20)) {
+            continue;
+        }
+        const vec3 pv = p4.xyz / p4.w;
+        const float own_w = dot(f3, vec4(pv, 1.0)); // its clip w (the forward projection's)
+        const float own = length(pv);
+        const float nearness = clamp((far_out - own) / (far_out - far_in), 0.0, 1.0);
+        if (!(nearness > 0.0)) {
+            continue;
+        }
+        // The four half-res mask pixels round this one's centre (the lamp shader's bilinear set).
+        const vec2 g = (vec2(x, y) + 0.5) * 0.5 - 0.5;
+        const ivec2 g0 = ivec2(floor(g));
+        uint first[4];
+        for (uint c = 0u; c < 4u; ++c) {
+            const ivec2 gc = clamp(g0 + ivec2(c & 1u, c >> 1u), ivec2(0), ivec2(int(mw) - 1, int(mh) - 1));
+            first[c] = MaskHeader + ((eye * mh + uint(gc.y)) * mw + uint(gc.x)) * MaskWords;
+        }
+        const float seed = noise ? fract(52.9829189 * fract(dot(vec2(x, y) + 0.5, vec2(0.06711056, 0.00583715))))
+                                 : 0.5;
+        const float bias0 = (bias_m + own * bias_eye) * 1.5;
+        uint code = 0u;
+        for (uint i = 0u; i < lamps; ++i) {
+            const uint la = LampAt + LampWords * i;
+            const uint slot = edges[la + 9u];
+            const uint wi = slot >> 3u, shift = (slot & 7u) * 4u;
+            float lo = 15.0, hi = 0.0;
+            for (uint c = 0u; c < 4u; ++c) {
+                const float v = float((mask[first[c] + wi] >> shift) & 15u);
+                lo = min(lo, v);
+                hi = max(hi, v);
+            }
+            const float spread = hi - lo;
+            if (spread < range) {
+                continue;
+            }
+            const vec3 l = eye == 0u ? vec3(P(la), P(la + 1u), P(la + 2u)) : vec3(P(la + 3u), P(la + 4u), P(la + 5u));
+            const vec3 to = l - pv;
+            const float d2 = dot(to, to);
+            const float dist = sqrt(d2);
+            const float fall = clamp(1.0 - d2 * P(la + 6u), 0.0, 1.0);
+            const float end = min(dist - P(la + 7u), max_m);
+            const float span = end - start_m;
+            if (fall * spread < contrast || !(span > 0.0)) {
+                continue;
+            }
+            const vec3 dir = to / max(dist, 1e-4);
+            bool hit = false, unsure = false;
+            for (uint s = 0u; s < steps; ++s) {
+                const float share = (float(s) + seed) / float(steps);
+                const float t = start_m + span * share * share;
+                const vec4 q = vec4(pv + dir * t, 1.0);
+                const vec4 c = vec4(dot(f0, q), dot(f1, q), dot(f2, q), dot(f3, q));
+                if (!(c.w * own_w > 1e-12)) {
+                    unsure = true; // behind the eye: off the picture
+                    break;
+                }
+                const vec2 qn = c.xy / c.w;
+                const vec2 qp = (qn - nb) / na; // the picture's pixel (its centre at +0.5)
+                if (!(qp.x >= 0.0 && qp.y >= 0.0 && qp.x < float(width) && qp.y < float(height))) {
+                    unsure = true; // left the picture: it cannot say the ray is clear
+                    break;
+                }
+                const ivec2 at = clamp(ivec2(qp), ivec2(0), last);
+                const float r2 = eye == 0u ? texelFetch(depth_left, at, 0).r : texelFetch(depth_right, at, 0).r;
+                const vec4 sh = vec4(qn, r2, 1.0);
+                const vec4 s4 = vec4(dot(i0, sh), dot(i1, sh), dot(i2, sh), dot(i3, sh));
+                if (!(abs(s4.w) > 1e-20)) {
+                    continue;
+                }
+                // The point's distance behind the surface seen there (along the same eye ray).
+                const float gap = length(q.xyz) - length(s4.xyz / s4.w);
+                const float bias = bias0 + t * bias_per * 1.5;
+                const float thick = thick_m + t * thick_per;
+                if (gap > bias) {
+                    if (gap < thick) {
+                        hit = true;
+                        break;
+                    }
+                    unsure = true; // behind something too thick to be the caster
+                }
+            }
+            const uint his = edges[la + 8u];
+            const uint verdict = hit ? 1u : (!unsure && his == 0u ? 2u : 0u);
+            code |= verdict << (2u * i);
+        }
+        word |= code << (bits * p);
+    }
+    edges[out_at] = word;
+}

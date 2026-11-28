@@ -63,9 +63,11 @@ inline float ScanReach(const Rig &rig, Vec3 head, const std::array<Vec3, 2> &han
 }
 
 // Out of reach. A lever no hand can take by its stem and pull to its stop from where the hunter
-// stands keeps the game's own prompt and button, and is never armed (2026-11-10: some
-// Chalice levers are "very high up and the hand cannot reach them"; a prompt only where a hand
-// cannot pull). The XR side publishes how high a hand reaches in the game's frame (ReachTracker):
+// stands keeps the game's own prompt and button (2026-11-10: some Chalice levers are
+// "very high up and the hand cannot reach them"), and stays armed for a hand all the same (the
+// user, 2026-11-26: "if they are tall or unreachable they need to be motion operated AND show the
+// B to operate button"): a player who does reach it pulls it, and its prompt hides only while a
+// hand holds it. (Until then it was never armed.) The XR side publishes how high a hand reaches in the game's frame (ReachTracker):
 // the hunter's feet, his eyes' standing height over them, a raised arm's grip over the eyes and
 // the grab radius. The game side compares it with the highest the stem's lowest grip goes over
 // the pull (LowestGripTop): the hand slides down the stem as it pulls (physical_lever.h Slides).
@@ -109,6 +111,20 @@ private:
 // `reach_top`: the XR side's (infinite: unknown, never out of reach). Both in the rig's units.
 inline bool OutOfReach(const Rig &rig, float reach_top) {
     return std::isfinite(reach_top) && LowestGripTop(rig) > reach_top;
+}
+
+// Tall (2026-11-26: "If we are using the player's height could it be that a tall
+// player still cannot reach and they do not get the B message?"): a lever whose stem's lowest
+// grip rises more than TallAboveFeetM over the hunter's feet through the pull keeps the game's
+// prompt and button as well, whoever plays: the reach above is a generous guess (a raised arm,
+// height only), and a lever near its limit must never leave a player with neither a hand that
+// reaches it nor a button. It stays armed for a hand all the same. The Chalice door levers (their
+// lowest grip tops out 1.66 m over their floor) are tall, and no lever outside the Chalice
+// Dungeons is (the game side asks only there). `tall_top`: the hunter's feet plus TallAboveFeetM,
+// world Y in the rig's units (infinite: unknown, never tall).
+inline constexpr float TallAboveFeetM = 1.6f;
+inline bool Tall(const Rig &rig, float tall_top) {
+    return std::isfinite(tall_top) && LowestGripTop(rig) > tall_top;
 }
 
 // The XR side's view of the armed lever each frame (pure; the presenter maps the game's word,

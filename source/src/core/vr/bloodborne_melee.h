@@ -84,6 +84,12 @@ struct EnemyCapsules {
     size_t count{0};
 };
 size_t GatherEnemyCapsules(Body::Vec3 centre, float reach, float scale, EnemyCapsules& out);
+// A live enemy's hurt capsule within `within_m` of the hunter, level, within 60 degrees of his
+// facing (Game loop only).
+bool EnemyCloseAhead(const u8* player, float within_m);
+// The Chikage draw's dash (chikage.h DashM): asked by the pull's lunge (any thread), played each
+// player update (MeleeSiteA).
+void RequestChikageDash(s64 now);
 bool SphereHitsCapsules(Body::Vec3 from, Body::Vec3 to, float radius, float scale,
                         const EnemyCapsules& caps, float& fraction, Body::Vec3& away,
                         u32* target = nullptr);
@@ -115,6 +121,7 @@ struct MeleeBody {
     const VR::Body::QsTransform* pose_locals{nullptr};
     const VR::Body::ChrFrame* pose_frame{nullptr};
     s64 pose_ns{0};
+    s64 scabbard_burst_ns{};
 };
 
 // The body's pose-copy wrapper, main player only (loop thread), every update, after the gun:
@@ -148,6 +155,7 @@ struct MeleeHitInfo {
                             // one the classifier judged light)
     bool heavy{false};        // its row a heavy or a charged one (whatever the verdict) ...
     bool judged_light{false}; // ... a wind-up the classifier judged light: the light's damage
+    bool chikage_draw{false}; // the Chikage's quick draw (sever_policy.h ChikageDrawChance)
     float tip_speed{0.0f};  // the presenter's tip speed for that window (m/s; 0 unknown)
     float tip_peak{0.0f};   // ... its peak while the window was open (m/s; 0 unknown)
     float arc_deg{0.0f};    // how far its stroke swept the blade (the swing classifier's; 0 unknown)

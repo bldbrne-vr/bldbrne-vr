@@ -4,6 +4,7 @@
 
 #include "video_core/native_stereo/lighting_reconstruction.h"
 #include <algorithm>
+#include "core/vr/honed_steel.h"
 #include <array>
 #include <cstdlib>
 
@@ -98,6 +99,16 @@ void EmitVrCutaway(EmitContext& ctx) {
 void EmitPrologue(EmitContext& ctx) {
     if (ctx.stage == Stage::Fragment) {
         ctx.DefineAmdPerVertexAttribs();
+        if (Sirit::ValidId(ctx.hone_span)) {
+            const Id t = ctx.F32[1];
+            const auto F = [&](float x) { return ctx.Constant(t, x); };
+            const Id u = ctx.OpLoad(t, ctx.hone_span);
+            const Id steel = ctx.OpFClamp(t, ctx.OpFMul(t, u, F(50.f)), F(0.f), F(1.f));
+            const Id d = ctx.OpFAbs(t, ctx.OpFSub(t, u, ctx.PushF32(PushData::YOffsetIndex)));
+            const Id band = ctx.OpFMax(t, F(0.f), ctx.OpFma(t, d, F(-14.f), F(1.f)));
+            ctx.hone_polish = ctx.OpFMul(t, steel, ctx.OpFma(t, band, F(.48f),
+                                              ctx.PushF32(PushData::XOffsetIndex)));
+        }
         if (ctx.runtime_info.native_light_scissor) {
             // Hardware multiview shares one scissor. Its union is conservative;
             // this half-open per-eye test preserves the guest's disjoint light tiles.
@@ -118,7 +129,7 @@ void EmitPrologue(EmitContext& ctx) {
             }
             EmitDiscardCond(ctx,outside);
         }
-        if (ctx.runtime_info.fs_info.vr_cut != 0 && Sirit::ValidId(ctx.frag_coord) &&
+        if (ctx.runtime_info.fs_info.CutsFragments() && Sirit::ValidId(ctx.frag_coord) &&
             Sirit::ValidId(ctx.sample_mask) && !ctx.info.stores.Get(IR::Attribute::SampleMask)) {
             EmitVrCutaway(ctx);
         }
@@ -375,6 +386,27 @@ static_assert(((PushData::NativeWorld | PushData::NativeCameraPaired |
 #include "shader_recompiler/backend/spirv/emit_spirv_vr_motion.inc"
 
 void EmitEpilogue(EmitContext& ctx) {
+    if (ctx.stage == Stage::Vertex && Sirit::ValidId(ctx.hone_span)) {
+        const u32 part = ctx.runtime_info.vs_info.user_clip_plane_mask & 3u;
+        const float guard = VR::HonedSteel::Guard(part);
+        const float inv = 1.f / (VR::HonedSteel::Tip(part) - guard);
+        const Id y = EmitGetAttribute(ctx, IR::Attribute::Param0, 1, 0);
+        ctx.OpStore(ctx.hone_span, ctx.OpFma(ctx.F32[1], y, ctx.Constant(ctx.F32[1], -inv),
+                                             ctx.Constant(ctx.F32[1], -guard * inv)));
+    }
+    if (Sirit::ValidId(ctx.blade_mouth_distance)) {
+        // The native mesh position, before skinning or stereo projection. Perspective draws
+        // do not read the guest's two viewport offsets; this variant receives the plane there.
+        const Id bits = ctx.OpBitcast(ctx.U32[1], ctx.PushF32(PushData::YOffsetIndex));
+        Id distance = ctx.PushF32(PushData::XOffsetIndex);
+        for (u32 i = 0; i < 3; ++i) {
+            const Id q = ctx.OpBitFieldSExtract(ctx.U32[1], bits, ctx.ConstU32(i * 10), ctx.ConstU32(10u));
+            const Id n = ctx.OpConvertSToF(ctx.F32[1], ctx.OpBitcast(ctx.S32[1], q));
+            const Id p = EmitGetAttribute(ctx, IR::Attribute::Param0, i, 0);
+            distance = ctx.OpFma(ctx.F32[1], n, p, distance);
+        }
+        ctx.OpStore(ctx.OpAccessChain(ctx.output_f32, ctx.blade_mouth_distance, ctx.ConstU32(0u)), distance);
+    }
     if (ctx.stage == Stage::Vertex && ctx.runtime_info.vs_info.emulate_depth_negative_one_to_one) {
         ConvertDepthMode(ctx);
     }

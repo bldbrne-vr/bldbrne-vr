@@ -16,14 +16,8 @@
 // how high it is held, and the renderer (vk_rasterizer.cpp, the muzzle flash's slot: the torch and
 // the guns share the left hand) adds a gentle glow there: a share of the game's own torch light,
 // reaching further (shader_recompiler/ir/passes/fog_light.h TorchGlow*).
+// The Tonitrus' charge publishes its head the same way (tonitrus_charge.h HeadGlow).
 namespace VR::TorchGlow {
-
-namespace Detail {
-inline std::mutex mutex;
-inline std::array<float, 3> where{};
-inline int level{};
-inline std::atomic<long long> published_ns{0};
-} // namespace Detail
 
 inline long long NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -31,27 +25,57 @@ inline long long NowNs() {
         .count();
 }
 
+// A place the game thread publishes every update while it glows, read by the renderer while
+// fresh: when it stops publishing, the glow goes with it.
+class Spot {
+public:
+    // At `at` (the game's world space), `level` (> 0: it glows), `strength` (its share, 0..1).
+    void Publish(const std::array<float, 3>& at, int level, float strength = 1.0f) {
+        {
+            std::scoped_lock lock{mutex};
+            where = at;
+            this->level = level;
+            this->strength = strength;
+        }
+        published_ns.store(NowNs(), std::memory_order_release);
+    }
+
+    // The place and its level (and its strength), when published within `fresh_s`.
+    bool Take(float fresh_s, std::array<float, 3>& at, int& level, float* strength = nullptr) {
+        const long long when = published_ns.load(std::memory_order_acquire);
+        if (when == 0 || static_cast<float>(NowNs() - when) * 1e-9f > fresh_s) {
+            return false;
+        }
+        std::scoped_lock lock{mutex};
+        at = where;
+        level = this->level;
+        if (strength != nullptr) {
+            *strength = this->strength;
+        }
+        return level > 0;
+    }
+
+private:
+    std::mutex mutex;
+    std::array<float, 3> where{};
+    int level{};
+    float strength{1.0f};
+    std::atomic<long long> published_ns{0};
+};
+
+namespace Detail {
+inline Spot torch;
+} // namespace Detail
+
 // The flame at `at` (the game's world space), held `level` high (1 raised, 2 held high).
 inline void Publish(const std::array<float, 3>& at, int level) {
-    {
-        std::scoped_lock lock{Detail::mutex};
-        Detail::where = at;
-        Detail::level = level;
-    }
-    Detail::published_ns.store(NowNs(), std::memory_order_release);
+    Detail::torch.Publish(at, level);
 }
 
 // The flame and its level, when published within `fresh_s` (a lowered or put-away torch stops
 // publishing: the glow goes with it).
 inline bool Take(float fresh_s, std::array<float, 3>& at, int& level) {
-    const long long when = Detail::published_ns.load(std::memory_order_acquire);
-    if (when == 0 || static_cast<float>(NowNs() - when) * 1e-9f > fresh_s) {
-        return false;
-    }
-    std::scoped_lock lock{Detail::mutex};
-    at = Detail::where;
-    level = Detail::level;
-    return level > 0;
+    return Detail::torch.Take(fresh_s, at, level);
 }
 
 } // namespace VR::TorchGlow
